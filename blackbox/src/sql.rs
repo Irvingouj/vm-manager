@@ -24,19 +24,67 @@ pub struct Sql {
     runtime: Runtime,
 }
 
+/// An error Postgres answered, by its SQLSTATE and message; `code` is
+/// empty when the error did not come from the server (a timeout, a closed
+/// connection).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DbError {
+    pub code: String,
+    pub message: String,
+}
+
+impl DbError {
+    fn of(e: &tokio_postgres::Error) -> Self {
+        match e.as_db_error() {
+            Some(d) => Self {
+                code: d.code().code().to_owned(),
+                message: d.message().to_owned(),
+            },
+            None => Self {
+                code: String::new(),
+                message: e.to_string(),
+            },
+        }
+    }
+
+    fn other(message: String) -> Self {
+        Self {
+            code: String::new(),
+            message,
+        }
+    }
+}
+
+impl std::fmt::Display for DbError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} ({})", self.message, self.code)
+    }
+}
+
 impl Sql {
     /// Connects to this address (`postgres://role:password@host:port/db`).
     pub fn connect(url: &str) -> Result<Self, String> {
+        Self::connect_coded(url).map_err(|e| format!("cannot connect: {e}"))
+    }
+
+    /// As [`Sql::connect`], with Postgres's SQLSTATE when it refused: to
+    /// tell "permission denied for database" (`42501`) from a wrong
+    /// password (`28P01`).
+    pub fn connect_coded(url: &str) -> Result<Self, DbError> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .map_err(|e| format!("cannot start a runtime for the harness's SQL client: {e}"))?;
+            .map_err(|e| {
+                DbError::other(format!(
+                    "cannot start a runtime for the harness's SQL client: {e}"
+                ))
+            })?;
         let (client, connection) = runtime
             .block_on(async {
                 tokio::time::timeout(SQL_TIMEOUT, tokio_postgres::connect(url, NoTls)).await
             })
-            .map_err(|_| format!("connecting took longer than {SQL_TIMEOUT:?}"))?
-            .map_err(|e| format!("cannot connect: {e}"))?;
+            .map_err(|_| DbError::other(format!("connecting took longer than {SQL_TIMEOUT:?}")))?
+            .map_err(|e| DbError::of(&e))?;
         let connection = runtime.spawn(async move {
             drop(connection.await);
         });
@@ -67,6 +115,28 @@ impl Sql {
                     .unwrap_or_else(|| e.to_string());
                 format!("`{sql}` failed: {detail}")
             })?;
+        Ok(messages
+            .into_iter()
+            .filter_map(|m| match m {
+                SimpleQueryMessage::Row(row) => Some(
+                    (0..row.len())
+                        .map(|i| row.get(i).map(str::to_owned))
+                        .collect(),
+                ),
+                _ => None,
+            })
+            .collect())
+    }
+
+    /// Runs one or more statements; an error is Postgres's SQLSTATE and
+    /// message.
+    pub fn try_coded(&self, sql: &str) -> Result<Vec<Vec<Option<String>>>, DbError> {
+        let client = self.client();
+        let messages = self
+            .runtime
+            .block_on(async { tokio::time::timeout(SQL_TIMEOUT, client.simple_query(sql)).await })
+            .map_err(|_| DbError::other(format!("`{sql}` took longer than {SQL_TIMEOUT:?}")))?
+            .map_err(|e| DbError::of(&e))?;
         Ok(messages
             .into_iter()
             .filter_map(|m| match m {

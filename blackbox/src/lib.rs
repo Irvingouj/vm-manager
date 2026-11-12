@@ -21,7 +21,11 @@
 //!   a Resource, and reads what it received from its server's own log;
 //!   [`sql`] is the harness's own client for that;
 //! - [`scenario`] is what the tests of Resources, Grants, `query` and the
-//!   Operation log share.
+//!   Operation log share;
+//! - [`own_database`] is what the tests of an Application's own database
+//!   share: migrations, Versions that carry them, operations on the own
+//!   database as either actor, and the own database looked at from the
+//!   harness's own superuser connection.
 //!
 //! Every wait has a timeout, so a failing test fails within seconds and
 //! never hangs. Each test starts its own program on its own port, so tests
@@ -38,6 +42,7 @@ pub mod api;
 pub mod expect;
 pub mod http;
 pub mod log;
+pub mod own_database;
 pub mod postgres;
 pub mod program;
 pub mod records;

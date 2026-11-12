@@ -90,7 +90,7 @@ fn an_application_declaring_less_than_write_is_refused_a_write() {
             &s.entry_of(&response),
             &Expected {
                 operation: "execute",
-                resource,
+                resource: Some(resource),
                 application,
                 ..Expected::refused(&id, "wanda", application, reason)
             },
@@ -264,7 +264,7 @@ fn a_resource_without_a_write_login_answers_read_only_resource_and_sends_nothing
         &entries[0],
         &Expected {
             operation: "execute",
-            resource: "archive",
+            resource: Some("archive"),
             ran: Some(false),
             ..Expected::failed(&id, "wanda", "archivist", "read-only-resource")
         },

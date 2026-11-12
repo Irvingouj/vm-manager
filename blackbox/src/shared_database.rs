@@ -200,7 +200,8 @@ pub const LEFT_SETTING: &str = "left-behind";
 /// [`LEAVE_SESSION_STATE`] sets, how many temporary tables, prepared
 /// statements, cursors and channels named `left...` it has, how many
 /// advisory locks it holds, and the identity label (`vm_user`,
-/// `vm_application`, `vm_request`; null when unset). See [`Session`].
+/// `vm_application`, `vm_request`, `vm_actor`; null when unset). See
+/// [`Session`].
 pub const OBSERVE_SESSION: &str = "json_build_object(
   'pid', pg_backend_pid(),
   'current_user', current_user::text,
@@ -217,7 +218,8 @@ pub const OBSERVE_SESSION: &str = "json_build_object(
   'advisory_locks', (SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND pid = pg_backend_pid()),
   'vm_user', nullif(current_setting('vm.user', true), ''),
   'vm_application', nullif(current_setting('vm.application', true), ''),
-  'vm_request', nullif(current_setting('vm.request', true), '')
+  'vm_request', nullif(current_setting('vm.request', true), ''),
+  'vm_actor', nullif(current_setting('vm.actor', true), '')
 )::text";
 
 /// A `SELECT` that answers one row with one column `session`: what its
@@ -261,6 +263,8 @@ pub struct Session {
     pub vm_user: Option<String>,
     pub vm_application: Option<String>,
     pub vm_request: Option<String>,
+    /// `vm.actor` (CONTRACT.md, "Operations on the own database").
+    pub vm_actor: Option<String>,
 }
 
 impl Session {
@@ -287,6 +291,7 @@ impl Session {
             vm_user: s("vm_user"),
             vm_application: s("vm_application"),
             vm_request: s("vm_request"),
+            vm_actor: s("vm_actor"),
         })
     }
 

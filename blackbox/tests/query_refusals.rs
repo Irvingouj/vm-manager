@@ -142,7 +142,7 @@ fn a_resource_the_version_does_not_declare_is_refused_whether_or_not_it_is_regis
         assert_entry(
             &s.entry_of(&response),
             &Expected {
-                resource,
+                resource: Some(resource),
                 ..Expected::refused(&id, "rita", "board", "not-declared")
             },
             &format!("the entry of the refused query on {resource}"),
@@ -172,7 +172,7 @@ fn a_declared_resource_that_is_not_registered_is_refused() {
         assert_entry(
             &s.entry_of(&response),
             &Expected {
-                resource,
+                resource: Some(resource),
                 ..Expected::refused(&id, "rita", "dreamer", "not-registered")
             },
             "the entry of a query on a Resource not registered",

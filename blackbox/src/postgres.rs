@@ -922,6 +922,7 @@ pub fn for_shared_databases() -> &'static PrivatePostgres {
 pub struct Platform {
     name: String,
     url: String,
+    role: String,
 }
 
 impl Platform {
@@ -944,11 +945,41 @@ impl Platform {
         Self {
             name: name.to_owned(),
             url: postgres.url(name),
+            role: SUPERUSER.to_owned(),
+        }
+    }
+
+    /// A fresh name on the shared Postgres, for a role of its own that is
+    /// not a superuser and may only create databases and roles (`LOGIN
+    /// CREATEDB CREATEROLE`): what CONTRACT.md says `VM_DATABASE_URL`'s role
+    /// needs ("The Application's own database: What it looks like in
+    /// Postgres"). The platform database does not exist until the program
+    /// creates it.
+    pub fn fresh_with_limited_role() -> Self {
+        let fresh = Self::fresh();
+        let token = unique().replace('-', "_");
+        let role = format!("vm_limited_{token}");
+        let password = format!("pw-limited-{}", Password::random().expose());
+        let superuser = crate::sql::Sql::connect(&shared().url("postgres"))
+            .unwrap_or_else(|e| panic!("cannot reach the test Postgres: {e}"));
+        superuser.batch(&format!(
+            "CREATE ROLE {role} LOGIN CREATEDB CREATEROLE NOSUPERUSER PASSWORD '{password}'"
+        ));
+        Self {
+            url: shared().url_as(&role, &password, &fresh.name),
+            name: fresh.name,
+            role,
         }
     }
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// The role `VM_DATABASE_URL` names: the superuser, or the limited role
+    /// of [`Platform::fresh_with_limited_role`].
+    pub fn role(&self) -> &str {
+        &self.role
     }
 
     /// The value for `VM_DATABASE_URL`. It holds the password: never print it.

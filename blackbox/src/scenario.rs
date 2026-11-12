@@ -598,7 +598,13 @@ pub struct Expected<'a> {
     pub user: Option<&'a str>,
     pub application: &'a str,
     pub version: u64,
-    pub resource: &'a str,
+    /// The Resource named; `None`: `resource` is null (the own database).
+    pub resource: Option<&'a str>,
+    /// `actor`, `user` or `application` (CONTRACT.md, "The Application's
+    /// own database: In the Operation log"); `None`: not checked.
+    pub actor: Option<&'a str>,
+    /// `own_database`; `None`: not checked.
+    pub own_database: Option<bool>,
     /// `query` or `execute`.
     pub operation: &'a str,
     pub statement: Option<&'a str>,
@@ -621,7 +627,9 @@ impl<'a> Expected<'a> {
             user: Some(user),
             application,
             version: 1,
-            resource: RESOURCE,
+            resource: Some(RESOURCE),
+            actor: None,
+            own_database: None,
             operation: "query",
             statement: None,
             outcome: "allowed",
@@ -667,6 +675,25 @@ impl<'a> Expected<'a> {
         }
     }
 
+    /// An allowed operation on the own database of `application`, its
+    /// Version number 1, by `user` in flight, acting as `actor`, which ran.
+    /// Its `resource` is null and `own_database` true.
+    pub fn own(
+        request: &'a str,
+        user: &'a str,
+        application: &'a str,
+        actor: &'a str,
+        operation: &'a str,
+    ) -> Self {
+        Self {
+            resource: None,
+            actor: Some(actor),
+            own_database: Some(true),
+            operation,
+            ..Self::allowed(request, user, application)
+        }
+    }
+
     /// A query that failed in the database or at a limit.
     pub fn failed(request: &'a str, user: &'a str, application: &'a str, error: &'a str) -> Self {
         Self {
@@ -707,8 +734,24 @@ pub fn assert_entry(entry: &Value, want: &Expected<'_>, context: &str) {
     if entry["version"].as_u64() != Some(want.version) {
         fail("expected `version` to be the Version's number");
     }
-    if entry["resource"].as_str() != Some(want.resource) {
-        fail("expected `resource` to name the Resource asked for");
+    match want.resource {
+        Some(resource) if entry["resource"].as_str() != Some(resource) => {
+            fail("expected `resource` to name the Resource asked for");
+        }
+        None if !absent_or_null(entry, "resource") => {
+            fail("expected `resource` null for the own database");
+        }
+        _ => {}
+    }
+    if let Some(actor) = want.actor
+        && entry["actor"].as_str() != Some(actor)
+    {
+        fail(&format!("expected `actor` {actor:?}"));
+    }
+    if let Some(own) = want.own_database
+        && entry["own_database"].as_bool() != Some(own)
+    {
+        fail(&format!("expected `own_database` {own}"));
     }
     if entry["operation"].as_str() != Some(want.operation) {
         fail(&format!("expected `operation` {:?}", want.operation));
