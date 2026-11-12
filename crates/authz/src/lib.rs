@@ -83,14 +83,22 @@ pub enum Reason {
 /// Decides whether the operation in `question` may run.
 ///
 /// The checks are made in the contract's order, and the first that fails
-/// refuses: a request in flight; a declaration of the Resource; the
-/// Resource registered; declared at the level needed or above; a Grant to
-/// one of the User's Groups at the level needed or above. A User holds the
-/// highest level any of their Groups is granted; Groups are compared
-/// exactly, byte for byte.
+/// refuses: a request in flight; then the Application's own database is
+/// allowed, to either actor, with nothing else asked; then acting as the
+/// Application on a Resource is refused; then, for the User on a Resource: a
+/// declaration of the Resource; the Resource registered; declared at the
+/// level needed or above; a Grant to one of the User's Groups at the level
+/// needed or above. A User holds the highest level any of their Groups is
+/// granted; Groups are compared exactly, byte for byte.
 pub fn decide(question: &Question<'_>) -> Decision {
     if !question.request_in_flight {
         return Decision::Refuse(Reason::NoRequest);
+    }
+    if question.own_database {
+        return Decision::Allow;
+    }
+    if question.actor == Actor::Application {
+        return Decision::Refuse(Reason::NotOwnDatabase);
     }
     let Some(declared) = question.declared else {
         return Decision::Refuse(Reason::NotDeclared);
