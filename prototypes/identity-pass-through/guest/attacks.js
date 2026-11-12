@@ -162,6 +162,18 @@ const routes = {
     return { results: await Promise.all(all) };
   },
 
+  // Outbound fetch: the host answers http://host.test/ with what it attached.
+  async "/fetch-whoami"(url) {
+    const tag = url.searchParams.get("tag");
+    return { fetch: await settle(fetch("http://host.test/", { headers: { "x-tag": tag } }).then((r) => r.json())) };
+  },
+  async "/fetch-flood"(url) {
+    const tag = url.searchParams.get("tag");
+    const n = Number(url.searchParams.get("n") ?? 40);
+    for (let i = 0; i < n; i++) fetch("http://host.test/", { headers: { "x-tag": tag } }).catch(() => {});
+    return { flooded: n };
+  },
+
   // Global state between requests of different Users.
   async "/global-write"(url) {
     globalThis.leak = url.searchParams.get("v");

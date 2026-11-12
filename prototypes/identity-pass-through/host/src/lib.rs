@@ -109,6 +109,34 @@ impl OperationsHandler for HostOps {
         self
     }
 
+    /// Outbound `fetch`, standing in for an egress the host would attach the
+    /// identity to: it answers the identity it attached, and only for
+    /// `http://host.test/`. Same rule: read the slot when entered.
+    fn handle_fetch(
+        &self,
+        request: openworkers_core::HttpRequest,
+    ) -> OpFuture<'_, Result<openworkers_core::HttpResponse, String>> {
+        let attached = self.current();
+        self.audit.lock().unwrap().push(AuditRecord {
+            attached: attached.clone(),
+            binding: "fetch".into(),
+            name: request.url.clone(),
+            args: json!({ "tag": request.headers.get("x-tag") }),
+        });
+
+        Box::pin(async move {
+            if !request.url.starts_with("http://host.test/") {
+                return Err("fetch: only http://host.test/ in this spike".into());
+            }
+            let body = json!({ "attached": attached }).to_string();
+            Ok(openworkers_core::HttpResponse {
+                status: 200,
+                headers: vec![("content-type".into(), "application/json".into())],
+                body: openworkers_core::ResponseBody::Bytes(body.into()),
+            })
+        })
+    }
+
     fn handle_binding_invoke(
         &self,
         binding: &str,

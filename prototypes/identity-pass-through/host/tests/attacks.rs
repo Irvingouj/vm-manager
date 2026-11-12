@@ -79,6 +79,10 @@ fn claim_another_user() {
         }
         assert!(body["fetch"]["err"].is_string(), "fetch must fail: {body}");
 
+        // An awaited outbound fetch: the host's egress attaches alice.
+        let body = call(&mut w, "alice", "/fetch-whoami?tag=f").await;
+        assert_eq!(body["fetch"]["ok"]["attached"]["user"], "alice", "{body}");
+
         // The host's own log: every call of this request was alice's.
         for r in audit.lock().unwrap().iter().filter(|r| r.attached.is_some()) {
             assert_eq!(user_of(r), Some("alice"), "{r:?}");
@@ -357,16 +361,28 @@ fn tampering_with_the_runtime_glue() {
 /// attached to bob.
 #[test]
 fn calls_past_the_budget_current_thread_runtime() {
-    calls_past_the_budget(false);
+    calls_past_the_budget(false, "flood", 2000);
 }
 
 #[test]
 fn calls_past_the_budget_multi_thread_runtime() {
-    calls_past_the_budget(true);
+    calls_past_the_budget(true, "flood", 2000);
 }
 
-fn calls_past_the_budget(multi: bool) {
-    let n: usize = std::env::var("FLOOD_N").ok().and_then(|v| v.parse().ok()).unwrap_or(2000);
+/// The same with outbound `fetch`, which the runtime hands to the host only
+/// from a scheduler task (no inline poll, patched or not).
+#[test]
+fn unawaited_fetches_current_thread_runtime() {
+    calls_past_the_budget(false, "fetch-flood", 200);
+}
+
+#[test]
+fn unawaited_fetches_multi_thread_runtime() {
+    calls_past_the_budget(true, "fetch-flood", 200);
+}
+
+fn calls_past_the_budget(multi: bool, route: &str, n: usize) {
+    let n: usize = std::env::var("FLOOD_N").ok().and_then(|v| v.parse().ok()).unwrap_or(n);
     let rt = if multi {
         tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().unwrap()
     } else {
@@ -379,7 +395,7 @@ fn calls_past_the_budget(multi: bool) {
             let mut w = worker(&audit).await;
             for round in 0..10 {
                 let tag = format!("a{round}");
-                call(&mut w, "alice", &format!("/flood?tag={tag}&n={n}")).await;
+                call(&mut w, "alice", &format!("/{route}?tag={tag}&n={n}")).await;
                 for _ in 0..k {
                     tokio::task::yield_now().await;
                 }
@@ -390,7 +406,7 @@ fn calls_past_the_budget(multi: bool) {
             for r in audit.lock().unwrap().iter().filter(|r| r.args["tag"].as_str().is_some_and(|t| t.starts_with('a'))) {
                 *by.entry(format!("{:?}", user_of(r))).or_default() += 1;
             }
-            let line = format!("multi={multi} k={k}: {} calls by alice, at the host: {by:?}", 10 * n);
+            let line = format!("{route} multi={multi} k={k}: {} calls by alice, at the host: {by:?}", 10 * n);
             eprintln!("{line}");
             if by.len() != 1 || by.get("Some(\"alice\")") != Some(&(10 * n)) {
                 failures.push(line);

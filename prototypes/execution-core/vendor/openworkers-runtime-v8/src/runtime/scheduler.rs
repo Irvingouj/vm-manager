@@ -30,6 +30,9 @@ use openworkers_core::{
 
 pub type CallbackId = u64;
 
+/// An outbound fetch the host was entered for in the guest's call.
+pub type FetchFuture = std::pin::Pin<Box<dyn std::future::Future<Output = OperationResult> + Send>>;
+
 /// A call of a host function through an invoke binding, with its own handle.
 #[cfg(feature = "invoke")]
 pub type InvokeFuture = std::pin::Pin<Box<dyn std::future::Future<Output = InvokeResult> + Send>>;
@@ -85,7 +88,7 @@ pub enum SchedulerMessage {
     ScheduleWritable(CallbackId, stream_manager::StreamId),
     ScheduleInterval(CallbackId, u64),
     ClearTimer(CallbackId),
-    FetchStreaming(CallbackId, HttpRequest),
+    FetchStreaming(CallbackId, FetchFuture),
     BindingFetch(CallbackId, String, HttpRequest),
     BindingStorage(CallbackId, String, StorageOp),
     BindingKv(CallbackId, String, KvOp),
@@ -265,10 +268,9 @@ pub async fn run_event_loop(
                         cancelled.insert(id);
                     }
 
-                    SchedulerMessage::FetchStreaming(promise_id, request) => {
+                    SchedulerMessage::FetchStreaming(promise_id, call) => {
                         let callback_tx = callback_tx.clone();
                         let manager = stream_manager.clone();
-                        let ops = ops.clone();
                         let cancel = request_cancel.clone();
                         let gate = output_gate(&queue);
 
@@ -279,7 +281,7 @@ pub async fn run_event_loop(
                                     let _ = callback_tx.send(CallbackMessage::FetchError(promise_id, CANCELLED.into()));
                                     return;
                                 }
-                                r = after(gate, execute_fetch_via_ops(request, manager, ops, cancel.clone())) => r.unwrap_or_else(|| Err(STORAGE_FAILED.into())),
+                                r = after(gate, execute_fetch_via_ops(call, manager, cancel.clone())) => r.unwrap_or_else(|| Err(STORAGE_FAILED.into())),
                             };
 
                             match result {
@@ -932,15 +934,13 @@ fn spawn_stream_reader(
     });
 }
 
-/// Execute fetch via OperationsHandler
+/// Finish a fetch the host was entered for in the guest's call
 async fn execute_fetch_via_ops(
-    request: HttpRequest,
+    call: FetchFuture,
     stream_manager: Arc<StreamManager>,
-    ops: OperationsHandle,
     cancel: CancellationToken,
 ) -> Result<(HttpResponseMeta, stream_manager::StreamId), String> {
-    let result = ops.handle(Operation::Fetch(request)).await;
-    convert_fetch_result_to_stream(result, stream_manager, cancel).await
+    convert_fetch_result_to_stream(call.await, stream_manager, cancel).await
 }
 
 /// Execute binding fetch via OperationsHandler

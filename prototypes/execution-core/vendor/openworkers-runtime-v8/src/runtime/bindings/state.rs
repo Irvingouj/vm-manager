@@ -34,8 +34,7 @@ pub struct FetchState {
     pub next_id: Rc<RefCell<CallbackId>>,
     /// The bytes of the frames of a Durable Object that wait in its queue
     pub frames: Arc<std::sync::atomic::AtomicUsize>,
-    /// The host, which an invoke binding calls inline (see `setup_invoke`)
-    #[cfg(feature = "invoke")]
+    /// The host, which fetch and invoke enter inside the guest's call
     pub ops: openworkers_core::OperationsHandle,
     /// Calls settled inline since the event loop last polled
     #[cfg(feature = "invoke")]
