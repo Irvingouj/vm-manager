@@ -19,6 +19,8 @@
 //! - [`executor`]: the Database executor: bounded pools of connections to
 //!   shared databases and the limits of one statement.
 //! - [`statement`]: a statement without its values, for the Operation log.
+//! - [`check`]: the statement check, Application SQL's hygiene before it
+//!   is sent.
 //! - [`oplog`]: the Operation log, in the platform database.
 //! - [`platform_db`]: the platform database: connecting (and creating it),
 //!   its structure in numbered steps, a bounded pool.
@@ -30,6 +32,7 @@
 //! - [`server`]: the listening socket and the connections.
 
 pub mod api;
+pub mod check;
 pub mod executor;
 pub mod gateway;
 pub mod ingress;
