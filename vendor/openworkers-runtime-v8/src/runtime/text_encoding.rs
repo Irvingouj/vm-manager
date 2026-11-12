@@ -1,0 +1,133 @@
+use v8;
+
+/// Native TextEncoder.encode: string → Uint8Array (UTF-8)
+///
+/// V8's `to_rust_string_lossy` replaces lone surrogates with U+FFFD,
+/// giving us valid UTF-8 by default. No manual surrogate handling needed.
+fn text_encode(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue,
+) {
+    let input = if let Some(arg) = args.get(0).to_string(scope) {
+        arg.to_rust_string_lossy(scope)
+    } else {
+        String::new()
+    };
+
+    let bytes = input.into_bytes();
+    let len = bytes.len();
+    let buffer = crate::v8_helpers::create_array_buffer_from_vec(scope, bytes);
+    let array = v8::Uint8Array::new(scope, buffer, 0, len).unwrap();
+
+    rv.set(array.into());
+}
+
+/// Native TextDecoder.decode: (Uint8Array, encoding) → string
+///
+/// Uses `encoding_rs` for spec-compliant decoding with proper U+FFFD
+/// replacement for invalid sequences. Supports all Encoding Standard labels.
+fn text_decode(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue,
+) {
+    // arg0: Uint8Array or ArrayBuffer
+    // arg1: encoding label (string)
+    // arg2: fatal (bool) — if true, throw on invalid sequences instead of replacing
+
+    let input = args.get(0);
+
+    if input.is_null_or_undefined() {
+        let empty = v8::String::new(scope, "").unwrap();
+        rv.set(empty.into());
+        return;
+    }
+
+    // Extract bytes from TypedArray or ArrayBuffer
+    let bytes = if let Ok(typed_array) = v8::Local::<v8::TypedArray>::try_from(input) {
+        let len = typed_array.byte_length();
+        let mut buf = vec![0u8; len];
+        typed_array.copy_contents(&mut buf);
+        buf
+    } else if let Ok(array_buffer) = v8::Local::<v8::ArrayBuffer>::try_from(input) {
+        let len = array_buffer.byte_length();
+        let store = array_buffer.get_backing_store();
+        store[..len].iter().map(|c| c.get()).collect()
+    } else {
+        let msg =
+            v8::String::new(scope, "TextDecoder.decode: input must be a BufferSource").unwrap();
+        let exc = v8::Exception::type_error(scope, msg);
+        scope.throw_exception(exc);
+        return;
+    };
+
+    // Get encoding label
+    let encoding_label = if args.length() > 1 && !args.get(1).is_undefined() {
+        if let Some(s) = args.get(1).to_string(scope) {
+            s.to_rust_string_lossy(scope)
+        } else {
+            "utf-8".to_string()
+        }
+    } else {
+        "utf-8".to_string()
+    };
+
+    // Get fatal flag
+    let fatal = if args.length() > 2 {
+        args.get(2).boolean_value(scope)
+    } else {
+        false
+    };
+
+    // Look up encoding
+    let encoding = match encoding_rs::Encoding::for_label(encoding_label.as_bytes()) {
+        Some(enc) => enc,
+        None => {
+            let msg = v8::String::new(
+                scope,
+                &format!(
+                    "TextDecoder: '{}' is not a supported encoding",
+                    encoding_label
+                ),
+            )
+            .unwrap();
+            let exc = v8::Exception::range_error(scope, msg);
+            scope.throw_exception(exc);
+            return;
+        }
+    };
+
+    let result = if fatal {
+        // Fatal mode: return error on invalid sequences
+        let (decoded, had_errors) = encoding.decode_without_bom_handling(&bytes);
+
+        if had_errors {
+            let msg = v8::String::new(scope, "TextDecoder: invalid byte sequence").unwrap();
+            let exc = v8::Exception::type_error(scope, msg);
+            scope.throw_exception(exc);
+            return;
+        }
+
+        decoded.into_owned()
+    } else {
+        // Replacement mode: replace invalid sequences with U+FFFD
+        let (decoded, _) = encoding.decode_without_bom_handling(&bytes);
+        decoded.into_owned()
+    };
+
+    let v8_str = v8::String::new(scope, &result).unwrap();
+    rv.set(v8_str.into());
+}
+
+/// Register the encoding ops.
+///
+/// Must be called at runtime (not in snapshot) because native functions
+/// can't be serialized by the V8 snapshot creator.
+pub fn setup_text_encoding_natives(scope: &mut v8::PinScope) {
+    let encode_fn = v8::Function::new(scope, text_encode).unwrap();
+    crate::runtime::bindings::register_op(scope, "textEncode", encode_fn.into());
+
+    let decode_fn = v8::Function::new(scope, text_decode).unwrap();
+    crate::runtime::bindings::register_op(scope, "textDecode", decode_fn.into());
+}
