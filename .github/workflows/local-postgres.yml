@@ -61,11 +61,11 @@ jobs:
             Windows) powershell -NoProfile -Command "[Environment]::OSVersion.VersionString; ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator); Get-MpComputerStatus | Select-Object AMServiceEnabled,AntivirusEnabled,RealTimeProtectionEnabled,BehaviorMonitorEnabled | Format-List";;
           esac
 
-      - name: Run (two sessions, data path with space and non-ASCII, *.localhost)
+      - name: Run (two sessions, data path with space and non-ASCII except on Windows, *.localhost)
         timeout-minutes: 10
         env:
           LP_KEEP: "1"
-          LP_ROOT: ${{ runner.temp }}/lp spike Zoë 数据
+          LP_ROOT: ${{ runner.temp }}/${{ runner.os == 'Windows' && 'lp spike Zoe' || 'lp spike Zoë 数据' }}
         run: |
           bin=target/release/lp; [ -f "$bin.exe" ] && bin="$bin.exe"
           ./run.sh "$bin" 2>&1 | tee run.log
@@ -74,7 +74,7 @@ jobs:
       - name: Downloaded binaries (signature, quarantine / Mark of the Web)
         if: always()
         env:
-          LP_ROOT: ${{ runner.temp }}/lp spike Zoë 数据
+          LP_ROOT: ${{ runner.temp }}/${{ runner.os == 'Windows' && 'lp spike Zoe' || 'lp spike Zoë 数据' }}
         run: |
           d="$LP_ROOT/pg/$LP_PG_SOURCE-$LP_PG_VERSION/bin"
           ls "$d" | head -40 | tr '\n' ' '; echo
@@ -85,6 +85,12 @@ jobs:
                      powershell -NoProfile -Command "\$s=Get-AuthenticodeSignature -LiteralPath '$w'; 'signature: ' + \$s.Status + ' ' + \$s.SignerCertificate.Subject; 'streams: ' + ((Get-Item -LiteralPath '$w' -Stream *).Stream -join ','); 'Defender detections: ' + ((Get-MpThreatDetection | Measure-Object).Count)";;
           esac
           rm -rf "$LP_ROOT"
+
+      - name: Windows path names (non-ASCII)
+        if: always() && runner.os == 'Windows'
+        timeout-minutes: 10
+        run: |
+          ./ci/windows-paths.sh "$(pwd)/target/release/lp.exe"
 
       - name: Headless browser on *.localhost
         if: always()

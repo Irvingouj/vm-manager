@@ -36,10 +36,12 @@ $null = As-User 'C:\Windows\System32\whoami.exe' @('/priv') 'priv'
 $status = 0
 foreach ($i in 1, 2) {
   "--- non-admin session $i"
-  $rc = As-User "$dir\lp.exe" @('pg', '"~/lp spike Zoë 数据"', $Ver, $Dist) "run$i"
+  # An absolute path: the started process inherits this session's environment
+  # (LOCALAPPDATA of runneradmin), not lpuser's.
+  $rc = As-User "$dir\lp.exe" @('pg', '"C:\Users\lpuser\AppData\Local\lp spike Zoe"', $Ver, $Dist) "run$i"
   if ($rc -ne 0) { $status = 1 }
 }
-$ud = 'C:\Users\lpuser\AppData\Local\lp spike Zoë 数据'
+$ud = 'C:\Users\lpuser\AppData\Local\lp spike Zoe'
 "data dir exists under lpuser's LOCALAPPDATA: $(Test-Path -LiteralPath $ud)"
 if ($status -eq 0) { 'NONADMIN: PASS' } else { 'NONADMIN: FAIL' }
 exit $status

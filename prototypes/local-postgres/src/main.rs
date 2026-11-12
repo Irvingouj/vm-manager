@@ -116,12 +116,13 @@ async fn main() -> Result<()> {
                 Some(rest) => PathBuf::from(std::env::var("HOME")?).join(".local/share").join(rest),
                 None => PathBuf::from(arg),
             };
-            println!(
-                "user: {} os: {} {}",
-                std::env::var("USERNAME").or_else(|_| std::env::var("USER")).unwrap_or_default(),
-                std::env::consts::OS,
-                std::env::consts::ARCH
-            );
+            // The account the process really runs as (environment variables can
+            // be inherited from another user, e.g. Windows Start-Process -Credential).
+            let account = std::process::Command::new("whoami")
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .unwrap_or_default();
+            println!("account: {account} os: {} {}", std::env::consts::OS, std::env::consts::ARCH);
             pg_session(&root).await
         }
         Some("localhost") => localhost(),
@@ -202,7 +203,9 @@ async fn pg_session(root: &Path) -> Result<()> {
     std::fs::create_dir_all(root)?;
     let version = pg_version().trim_start_matches('=').to_string();
     let source = pg_source();
-    let install_dir = root.join("pg").join(format!("{source}-{version}"));
+    // LP_INSTALL_ROOT puts the binaries elsewhere than the data (to test paths).
+    let install_root = std::env::var_os("LP_INSTALL_ROOT").map(PathBuf::from).unwrap_or_else(|| root.join("pg"));
+    let install_dir = install_root.join(format!("{source}-{version}"));
     let data_dir = root.join("data");
     let pw_path = root.join("superuser-password");
     let secret_path = root.join("attach-secret");
@@ -235,7 +238,8 @@ async fn pg_session(root: &Path) -> Result<()> {
             postgresql_archive::configuration::theseus::URL
         };
         let t = Instant::now();
-        let tmp = root.join("pg").join("extracting");
+        let tmp = install_root.join("extracting");
+        std::fs::create_dir_all(&install_root)?;
         let _ = std::fs::remove_dir_all(&tmp);
         postgresql_archive::extract(key, &bytes, &tmp).await?;
         std::fs::rename(&tmp, &install_dir)?;
