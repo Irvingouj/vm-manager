@@ -22,6 +22,9 @@
 //! - [`check`]: the statement check, Application SQL's hygiene before it
 //!   is sent.
 //! - [`oplog`]: the Operation log, in the platform database.
+//! - [`own_db`]: the Own-database provisioner and migrator: each
+//!   Application's own database, its two roles, its migrations, and the
+//!   runtime role's pool.
 //! - [`platform_db`]: the platform database: connecting (and creating it),
 //!   its structure in numbered steps, a bounded pool.
 //! - [`registry`]: the Application registry: Applications, Contributors,
@@ -38,6 +41,7 @@ pub mod gateway;
 pub mod ingress;
 pub mod log;
 pub mod oplog;
+pub mod own_db;
 pub mod platform_db;
 pub mod registry;
 pub mod resources;

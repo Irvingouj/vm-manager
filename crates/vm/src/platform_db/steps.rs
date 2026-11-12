@@ -115,6 +115,35 @@ pub const STEPS: &[Step] = &[
         );
     ",
     },
+    Step {
+        number: 3,
+        name: "own databases, migrations of versions, actors in the operation log",
+        sql: "
+        -- An Application's own database (crate::own_db): its roles'
+        -- passwords, chosen once, before the roles exist; `ready` once the
+        -- database and its privileges are set up. Read by nothing else.
+        CREATE TABLE own_databases (
+            application_id bigint PRIMARY KEY REFERENCES applications (id),
+            owner_password text NOT NULL,
+            runtime_password text NOT NULL,
+            ready boolean NOT NULL DEFAULT false,
+            created_at timestamptz NOT NULL DEFAULT now()
+        );
+        -- A Version's migrations, as its record shows them: [{name, sha256}].
+        ALTER TABLE versions ADD COLUMN migrations jsonb NOT NULL DEFAULT '[]';
+        ALTER TABLE operation_log
+            ALTER COLUMN resource DROP NOT NULL,
+            ADD COLUMN actor text NOT NULL DEFAULT 'user'
+                CHECK (actor IN ('user', 'application')),
+            ADD COLUMN own_database boolean NOT NULL DEFAULT false;
+        -- Only the platform's role connects to the platform database, not
+        -- the roles of Applications' own databases. Without effect (a
+        -- warning) when the platform's role does not own it.
+        DO $$ BEGIN
+            EXECUTE format('REVOKE ALL ON DATABASE %I FROM PUBLIC', current_database());
+        END $$;
+    ",
+    },
 ];
 
 /// The advisory lock every step's transaction takes first: "vm steps".

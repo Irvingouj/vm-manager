@@ -23,7 +23,7 @@ use std::time::Duration;
 use tokio_postgres::error::SqlState;
 
 pub use address::{DatabaseAddress, FORM, Password, VARIABLE};
-use pool::Connection;
+pub(crate) use pool::Connection;
 pub use pool::{Pool, PoolLimits};
 
 use crate::log;
@@ -250,7 +250,7 @@ fn cannot_connect(address: &DatabaseAddress, error: &DbError) -> String {
 }
 
 /// `name` as a Postgres identifier in double quotes.
-fn quote_identifier(name: &str) -> String {
+pub(crate) fn quote_identifier(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 

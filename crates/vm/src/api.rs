@@ -30,6 +30,7 @@ use serde_json::{Value, json};
 
 use crate::log;
 use crate::oplog::{self, OperationLog};
+use crate::own_db::Migration;
 use crate::platform_db::DbError;
 use crate::registry::{
     ApplicationRecord, Created, DeclaredAccess, NameProblem, NewVersion, Registry, Resource, Sent,
@@ -194,7 +195,53 @@ impl CreateApplication {
 }
 
 /// `POST /v1/applications/<name>/versions`
-const VERSION_FORM: &str = r#"{ "bundle": "<the classic script>", "declared_access": { "resources": { "<name>": { "kind": "postgres", "access": "structure|read|write" } } }, "git_commit": "<40 hex characters>" }"#;
+const VERSION_FORM: &str = r#"{ "bundle": "<the classic script>", "declared_access": { "resources": { "<name>": { "kind": "postgres", "access": "structure|read|write" } } }, "git_commit": "<40 hex characters>", "migrations": [ { "name": "<1 to 200 letters, digits, _ and ->", "sql": "<the file drizzle-kit generated>" } ] (optional) }"#;
+
+/// The most characters a migration's name has.
+const MAX_MIGRATION_NAME: usize = 200;
+
+/// A Version's `migrations`: absent or `null`, none; otherwise an array of
+/// `{ name, sql }`, each key once, names of 1 to 200 ASCII letters, digits,
+/// `_` and `-`, unique in the list; no text holding NUL, which Postgres
+/// cannot take.
+fn read_migrations(object: &Object<'_>) -> Result<Vec<Migration>, String> {
+    let Some(value) = object.0.get("migrations") else {
+        return Ok(Vec::new());
+    };
+    if value.get() == "null" {
+        return Ok(Vec::new());
+    }
+    let entries: Vec<&RawValue> =
+        serde_json::from_str(value.get()).map_err(|_| "migrations is not an array".to_owned())?;
+    let mut migrations: Vec<Migration> = Vec::with_capacity(entries.len());
+    for (index, entry) in entries.into_iter().enumerate() {
+        let entry = Object::read_value(entry).map_err(|e| format!("migrations[{index}]: {e}"))?;
+        let name: String = entry
+            .required("name")
+            .map_err(|e| format!("migrations[{index}]: {e}"))?;
+        let sql: String = entry
+            .required("sql")
+            .map_err(|e| format!("migrations[{index}]: {e}"))?;
+        let well_named = !name.is_empty()
+            && name.len() <= MAX_MIGRATION_NAME
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+        if !well_named {
+            return Err(format!(
+                "migrations[{index}].name is not 1 to 200 letters, digits, _ and -"
+            ));
+        }
+        if sql.contains('\0') {
+            return Err(format!("migrations[{index}].sql holds a NUL character"));
+        }
+        if migrations.iter().any(|m| m.name == name) {
+            return Err(format!("migrations[{index}].name is given twice"));
+        }
+        migrations.push(Migration::new(name, sql));
+    }
+    Ok(migrations)
+}
 
 fn read_version(body: &[u8]) -> Result<NewVersion, String> {
     let object = Object::read(body)?;
@@ -217,6 +264,7 @@ fn read_version(body: &[u8]) -> Result<NewVersion, String> {
         bundle: object.required("bundle")?,
         declared_access: DeclaredAccess { resources },
         git_commit,
+        migrations: read_migrations(&object)?,
     })
 }
 
@@ -575,6 +623,36 @@ impl Api {
                 }
                 Sent::NoSuchApplication => no_application(),
                 Sent::NotAContributor => not_a_contributor(),
+                Sent::Diverged => Answer::error(
+                    StatusCode::CONFLICT,
+                    "migrations-diverged",
+                    "the Version's migrations do not begin with exactly the previous Version's (the same names and texts, in the same order): send the Application's whole history of migrations, with new ones only at the end",
+                ),
+                Sent::MigrationFailed {
+                    migration,
+                    code,
+                    message,
+                } => Answer::json(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    &json!({ "error": {
+                        "reason": "migration-failed",
+                        "message": format!("the migration {migration:?} failed in the database ({code}): nothing was applied and the previous Version still serves; correct it and send the Version again"),
+                        "migration": migration,
+                        "code": code,
+                        "database_message": message,
+                    } }),
+                ),
+                Sent::OwnDatabaseUnavailable { step, code } => {
+                    log::record(
+                        "own-database-failed",
+                        json!({ "application": name, "step": step, "code": code }),
+                    );
+                    Answer::error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "unavailable",
+                        "the platform could not prepare the Application's own database: nothing was applied; try again shortly",
+                    )
+                }
             },
         )
     }
@@ -754,6 +832,7 @@ struct VersionView<'a> {
     declared_access: &'a Value,
     git_commit: &'a str,
     bundle_sha256: &'a str,
+    migrations: &'a Value,
     created_by: &'a str,
     created_at: &'a str,
 }
@@ -766,6 +845,7 @@ impl<'a> VersionView<'a> {
             declared_access: &version.declared_access,
             git_commit: &version.git_commit,
             bundle_sha256: &version.bundle_sha256,
+            migrations: &version.migrations,
             created_by: &version.created_by,
             created_at: &version.created_at,
         }

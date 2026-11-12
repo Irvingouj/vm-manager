@@ -19,6 +19,7 @@ use vm::executor;
 use vm::gateway::{Gateway, PlatformGateway};
 use vm::ingress::Ingress;
 use vm::oplog::OperationLog;
+use vm::own_db::OwnDatabases;
 use vm::platform_db::{self, DatabaseAddress, PlatformDatabase, PoolLimits};
 use vm::registry::{Registry, is_dns_label};
 use vm::resources::Resources;
@@ -136,16 +137,21 @@ fn run(serve: &Serve) -> Result<(), String> {
                     address.database()
                 )
             };
-            let registry = Registry::load(Arc::clone(&database))
+            let own = Arc::new(
+                OwnDatabases::load(Arc::clone(&database), &address)
+                    .await
+                    .map_err(unreadable)?,
+            );
+            let registry = Registry::load(Arc::clone(&database), Arc::clone(&own))
                 .await
                 .map_err(unreadable)?;
             let resources = Resources::load(Arc::clone(&database), executor::Limits::default())
                 .await
                 .map_err(unreadable)?;
-            Ok::<_, String>((database, registry, resources))
+            Ok::<_, String>((database, own, registry, resources))
         })
         .await;
-        let (database, registry, resources) = match started {
+        let (database, own, registry, resources) = match started {
             Ok(started) => started?,
             Err(_) => {
                 return Err(format!(
@@ -161,6 +167,7 @@ fn run(serve: &Serve) -> Result<(), String> {
         let log = Arc::new(OperationLog::new(database));
         let gateway: Arc<dyn Gateway> = Arc::new(PlatformGateway::new(
             Arc::clone(&resources),
+            own,
             Arc::clone(&log),
             tokio::runtime::Handle::current(),
         ));

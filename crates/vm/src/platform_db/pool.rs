@@ -80,6 +80,10 @@ impl Connection {
     pub(crate) fn client(&self) -> &Client {
         &self.client
     }
+
+    pub(crate) fn client_mut(&mut self) -> &mut Client {
+        &mut self.client
+    }
 }
 
 /// A bounded pool of connections to one database as one role.

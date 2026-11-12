@@ -31,7 +31,7 @@ use serde::{Deserialize, Serialize};
 use tokio_postgres::types::FromSql;
 use tokio_postgres::{Client, Row};
 
-use crate::executor::{self, Level, Password, Target};
+use crate::executor::{self, Level, Levels, Password, Source, Target};
 use crate::log;
 use crate::platform_db::{DbError, PlatformDatabase, rfc3339};
 
@@ -130,11 +130,17 @@ impl Connection {
             // Copied: each pool owns its target, and this is done once, as
             // the Resource is registered or loaded.
             let target = target(login, self.host.clone(), self.database.clone());
-            executor::Pool::new(resource, Level::Write, target, limits.clone())
+            let source = Source::Resource(resource.to_owned());
+            executor::Pool::new(source, Levels::Only(Level::Write), target, limits.clone())
         });
         let read = target(self.read, self.host, self.database);
         Pools {
-            read: executor::Pool::new(resource, Level::Read, read, limits.clone()),
+            read: executor::Pool::new(
+                Source::Resource(resource.to_owned()),
+                Levels::Only(Level::Read),
+                read,
+                limits.clone(),
+            ),
             write,
         }
     }

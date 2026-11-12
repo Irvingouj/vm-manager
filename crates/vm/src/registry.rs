@@ -15,6 +15,14 @@
 //! on it. Memory only ever moves to a higher Version number, so two Versions
 //! sent at once leave the newest serving whatever order their transactions
 //! report back in.
+//!
+//! Sending a Version (blackbox/CONTRACT.md, "What happens when a Version is
+//! sent"): its migrations must continue the previous Version's (else
+//! diverged, before anything is changed); then the Application's own
+//! database is made ready and the pending migrations applied
+//! (crate::own_db); only then is the Version recorded, in a transaction
+//! that checks again, under the Application's row lock, that it continues
+//! the Version recorded last.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, PoisonError, RwLock};
@@ -27,6 +35,7 @@ use tokio_postgres::types::FromSql;
 use tokio_postgres::{Client, Row};
 
 use crate::log;
+use crate::own_db::{Migration, OwnDatabases, Problem, Recorded, continues};
 use crate::platform_db::{DbError, PlatformDatabase, rfc3339};
 
 /// Names that are the platform's own and can never be an Application's.
@@ -104,6 +113,8 @@ pub struct VersionRecord {
     pub declared_access: Value,
     pub git_commit: String,
     pub bundle_sha256: String,
+    /// `[ { name, sha256 } ]`, in order.
+    pub migrations: Value,
     pub created_by: String,
     /// RFC 3339, UTC.
     pub created_at: String,
@@ -115,6 +126,8 @@ pub struct NewVersion {
     pub bundle: String,
     pub declared_access: DeclaredAccess,
     pub git_commit: String,
+    /// The Application's whole history of migrations, in order.
+    pub migrations: Vec<Migration>,
 }
 
 /// The Resources a Version declares it uses, and how. Read by the API,
@@ -193,10 +206,25 @@ pub enum Sent {
     Sent(VersionRecord),
     NoSuchApplication,
     NotAContributor,
+    /// Its migrations do not continue the previous Version's.
+    Diverged,
+    /// A migration failed in the database; nothing was applied or recorded.
+    MigrationFailed {
+        migration: String,
+        code: String,
+        message: String,
+    },
+    /// The own database could not be made ready or reached: a fixed
+    /// description of the step, and Postgres's SQLSTATE if it gave one.
+    OwnDatabaseUnavailable {
+        step: &'static str,
+        code: Option<String>,
+    },
 }
 
 pub struct Registry {
     database: Arc<PlatformDatabase>,
+    own: Arc<OwnDatabases>,
     /// The serving Version of every Application that has one, by name.
     /// Held only for a lookup or an insert, never across an await.
     serving: RwLock<HashMap<Arc<str>, Arc<Serving>>>,
@@ -204,7 +232,10 @@ pub struct Registry {
 
 impl Registry {
     /// Reads every serving Version from the platform database.
-    pub async fn load(database: Arc<PlatformDatabase>) -> Result<Self, DbError> {
+    pub async fn load(
+        database: Arc<PlatformDatabase>,
+        own: Arc<OwnDatabases>,
+    ) -> Result<Self, DbError> {
         let rows = database
             .pool()
             .run(async |client: &mut Client| {
@@ -226,6 +257,7 @@ impl Registry {
         }
         Ok(Self {
             database,
+            own,
             serving: RwLock::new(serving),
         })
     }
@@ -366,12 +398,72 @@ impl Registry {
         row.map(|row| get(&row, 0)).transpose()
     }
 
-    /// Sends a Version of `name` as `sender`, who must be a Contributor. It
-    /// gets the next number and becomes the serving Version, in the
-    /// database and then in memory, before this returns.
+    /// Sends a Version of `name` as `sender`, who must be a Contributor. Its
+    /// migrations must continue the previous Version's; the own database is
+    /// made ready and the pending ones applied; then it gets the next number
+    /// and becomes the serving Version, in the database and then in memory,
+    /// before this returns.
     pub async fn send_version(
         &self,
         name: &str,
+        version: NewVersion,
+        sender: &str,
+    ) -> Result<Sent, DbError> {
+        let found = self
+            .database
+            .pool()
+            .run(async |client: &mut Client| {
+                client
+                    .query_opt(
+                        "SELECT a.id, EXISTS (SELECT 1 FROM contributors c
+                                              WHERE c.application_id = a.id AND c.user_id = $2),
+                                (SELECT v.migrations FROM versions v WHERE v.application_id = a.id
+                                 ORDER BY v.number DESC LIMIT 1)
+                         FROM applications a WHERE a.name = $1",
+                        &[&name, &sender],
+                    )
+                    .await
+                    .map_err(DbError::from)
+            })
+            .await?;
+        let Some(found) = found else {
+            return Ok(Sent::NoSuchApplication);
+        };
+        let id: i64 = get(&found, 0)?;
+        if !get::<bool>(&found, 1)? {
+            return Ok(Sent::NotAContributor);
+        }
+        let previous = recorded_of(get::<Option<Value>>(&found, 2)?.as_ref());
+        if !continues(&previous, &version.migrations) {
+            return Ok(Sent::Diverged);
+        }
+        match self.own.prepare(id, name, &version.migrations).await {
+            Ok(()) => {}
+            Err(Problem::Diverged) => return Ok(Sent::Diverged),
+            Err(Problem::Failed {
+                migration,
+                code,
+                message,
+            }) => {
+                return Ok(Sent::MigrationFailed {
+                    migration,
+                    code,
+                    message,
+                });
+            }
+            Err(Problem::Unavailable { step, code }) => {
+                return Ok(Sent::OwnDatabaseUnavailable { step, code });
+            }
+        }
+        self.record(name, id, version, sender).await
+    }
+
+    /// Records `version` as the next of the Application `id`, unless a
+    /// Version recorded meanwhile has migrations it does not continue.
+    async fn record(
+        &self,
+        name: &str,
+        id: i64,
         version: NewVersion,
         sender: &str,
     ) -> Result<Sent, DbError> {
@@ -379,53 +471,68 @@ impl Registry {
         let declared = Arc::new(version.declared_access.levels());
         let declared_access = serde_json::to_value(&version.declared_access)
             .map_err(|_| DbError::unexpected("the Declared access cannot be written as JSON"))?;
+        let migrations = Value::Array(
+            version
+                .migrations
+                .iter()
+                .map(|m| serde_json::json!({ "name": m.name, "sha256": m.sha256 }))
+                .collect(),
+        );
         // The one copy of the bundle: into the shared form every request
         // running this Version will use.
         let bundle: Arc<str> = Arc::from(version.bundle);
         let git_commit = version.git_commit;
+        let list = version.migrations;
         let sent = self
             .database
             .pool()
             .run(async |client: &mut Client| {
                 let transaction = client.transaction().await.map_err(DbError::from)?;
                 let found = transaction
-                    .query_opt(
-                        "SELECT a.id, EXISTS (SELECT 1 FROM contributors c
-                                              WHERE c.application_id = a.id AND c.user_id = $2)
-                         FROM applications a WHERE a.name = $1
+                    .query_one(
+                        "SELECT (SELECT v.migrations FROM versions v WHERE v.application_id = a.id
+                                 ORDER BY v.number DESC LIMIT 1)
+                         FROM applications a WHERE a.id = $1
                          FOR UPDATE",
-                        &[&name, &sender],
+                        &[&id],
                     )
                     .await
                     .map_err(DbError::from)?;
-                let Some(found) = found else {
-                    return Ok(Sent::NoSuchApplication);
-                };
-                let id: i64 = get(&found, 0)?;
-                if !get::<bool>(&found, 1)? {
-                    return Ok(Sent::NotAContributor);
+                let previous = recorded_of(get::<Option<Value>>(&found, 0)?.as_ref());
+                if !continues(&previous, &list) {
+                    return Ok(Sent::Diverged);
                 }
                 let row = transaction
                     .query_one(
                         concat!(
                             "WITH sent AS (
                                 INSERT INTO versions (application_id, number, bundle, bundle_sha256,
-                                                      declared_access, git_commit, created_by)
+                                                      declared_access, git_commit, created_by,
+                                                      migrations)
                                 VALUES ($1,
                                         (SELECT coalesce(max(number), 0) + 1 FROM versions
                                          WHERE application_id = $1),
-                                        $2, $3, $4, $5, $6)
+                                        $2, $3, $4, $5, $6, $7)
                                 RETURNING number, declared_access, git_commit, bundle_sha256,
-                                          created_by, created_at
+                                          created_by, created_at, migrations
                             ), serving AS (
                                 UPDATE applications SET serving_version = (SELECT number FROM sent)
                                 WHERE id = $1
                             )
-                            SELECT number, declared_access, git_commit, bundle_sha256, created_by, ",
+                            SELECT number, declared_access, git_commit, bundle_sha256, migrations,
+                                   created_by, ",
                             rfc3339!("created_at"),
                             " FROM sent"
                         ),
-                        &[&id, &&*bundle, &digest, &declared_access, &git_commit, &sender],
+                        &[
+                            &id,
+                            &&*bundle,
+                            &digest,
+                            &declared_access,
+                            &git_commit,
+                            &sender,
+                            &migrations,
+                        ],
                     )
                     .await
                     .map_err(DbError::from)?;
@@ -436,8 +543,9 @@ impl Registry {
                     declared_access: get(&row, 1)?,
                     git_commit: get(&row, 2)?,
                     bundle_sha256: get(&row, 3)?,
-                    created_by: get(&row, 4)?,
-                    created_at: get(&row, 5)?,
+                    migrations: get(&row, 4)?,
+                    created_by: get(&row, 5)?,
+                    created_at: get(&row, 6)?,
                 }))
             })
             .await;
@@ -505,7 +613,7 @@ impl Registry {
                             "SELECT a.name, v.number, v.declared_access, v.git_commit,
                                     v.bundle_sha256, v.created_by, ",
                             rfc3339!("v.created_at"),
-                            " FROM applications a
+                            ", v.migrations FROM applications a
                               LEFT JOIN versions v ON v.application_id = a.id
                               WHERE a.name = $1
                               ORDER BY v.number"
@@ -543,7 +651,7 @@ impl Registry {
                             "SELECT a.name, v.number, v.declared_access, v.git_commit,
                                     v.bundle_sha256, v.created_by, ",
                             rfc3339!("v.created_at"),
-                            " FROM applications a
+                            ", v.migrations FROM applications a
                               JOIN versions v ON v.application_id = a.id
                               WHERE a.name = $1 AND v.number = $2"
                         ),
@@ -566,7 +674,25 @@ fn version_of(row: &Row) -> Result<VersionRecord, DbError> {
         bundle_sha256: get(row, 4)?,
         created_by: get(row, 5)?,
         created_at: get(row, 6)?,
+        migrations: get(row, 7)?,
     })
+}
+
+/// A Version's migrations as stored (`[ { name, sha256 } ]`), read back;
+/// none for no Version. An entry that cannot be read reads as an empty name
+/// and digest, which no migration has: every list diverges from it rather
+/// than skip it.
+fn recorded_of(stored: Option<&Value>) -> Vec<Recorded> {
+    let Some(entries) = stored.and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    entries
+        .iter()
+        .map(|entry| Recorded {
+            name: text_of(entry, "name"),
+            sha256: text_of(entry, "sha256"),
+        })
+        .collect()
 }
 
 fn serving_of(row: &Row) -> Result<Serving, DbError> {
@@ -587,7 +713,16 @@ fn number_of(stored: i32) -> Result<u64, DbError> {
     u64::try_from(stored).map_err(|_| DbError::unexpected("a Version number below 1"))
 }
 
-fn hex(bytes: &[u8]) -> String {
+fn text_of(entry: &Value, key: &str) -> String {
+    entry
+        .get(key)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned()
+}
+
+/// `bytes` in lower-case hex.
+pub(crate) fn hex(bytes: &[u8]) -> String {
     use std::fmt::Write;
     let mut text = String::with_capacity(bytes.len() * 2);
     for byte in bytes {

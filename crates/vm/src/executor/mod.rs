@@ -3,18 +3,21 @@
 //! one transaction on a connection logged in directly as the Access level's
 //! login, never switching role.
 //!
-//! Interface: a [`Pool`] per Resource and [`Level`], made from a [`Target`]
-//! (where the database is and that level's login, which never prints) and
-//! [`Limits`]; [`Pool::run`] runs one statement with its [`Param`]s and the
-//! identity [`Label`] in one transaction, read-only at [`Level::Read`] and
-//! read-write at [`Level::Write`], and answers an [`Outcome`]: the rows, or
+//! Interface: a [`Pool`] per Resource and [`Level`], or one per
+//! Application's own database ([`Levels::Both`]: one runtime role serves
+//! both kinds of transaction), made from a [`Target`] (where the database
+//! is and the login, which never prints) and [`Limits`]; [`Pool::run`] runs
+//! one statement with its [`Param`]s and the identity [`Label`] in one
+//! transaction, read-only at [`Level::Read`] and read-write at
+//! [`Level::Write`], and answers an [`Outcome`]: the rows, or
 //! a [`Failure`] (Postgres refused it, a [`Limit`] ended it, or the
 //! database could not be reached), with when the statement was sent and
 //! ended. A write is committed only when its statement succeeded; otherwise
 //! it is rolled back.
 //!
 //! A connection serves one pool all its life, so it is never shared
-//! between levels or Resources, and it goes back to its pool only shown
+//! between a shared database's levels or between databases, and it goes
+//! back to its pool only shown
 //! clean: its transaction ended and its session state discarded (`DISCARD
 //! ALL`), both answered without error and the connection idle. Otherwise it
 //! is closed. The program never sends `SET ROLE` or `SET SESSION
@@ -28,7 +31,7 @@
 mod wire;
 
 use std::fmt;
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use serde_json::{Map, Value};
@@ -141,14 +144,45 @@ pub enum Level {
 
 /// The identity label (blackbox/CONTRACT.md, "The identity label"): set by
 /// the host's first statement in each transaction as the transaction-local
-/// settings `vm.user`, `vm.application` and `vm.request`, sent as
-/// parameters. A label only: Application SQL can overwrite it in its own
-/// transaction, and nothing on the platform relies on it.
+/// settings `vm.user`, `vm.application` and `vm.request`, and on an
+/// Application's own database `vm.actor` too, sent as parameters. A label
+/// only: Application SQL can overwrite it in its own transaction, and
+/// nothing on the platform relies on it.
 #[derive(Clone, Copy, Debug)]
 pub struct Label<'a> {
     pub user: &'a str,
     pub application: &'a str,
     pub request: &'a str,
+    /// `user` or `application`, on an own database; `None` on a shared one.
+    pub actor: Option<&'a str>,
+}
+
+/// Which transactions a pool's login runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Levels {
+    /// Only this one: a shared database's login of that Access level.
+    Only(Level),
+    /// Both: an own database's runtime role, which is the boundary whatever
+    /// the transaction (ADR 0013), so one pool serves both.
+    Both,
+}
+
+impl Levels {
+    fn permit(self, level: Level) -> bool {
+        match self {
+            Self::Only(only) => only == level,
+            Self::Both => true,
+        }
+    }
+}
+
+/// What a pool connects to, for the program's log. Never a credential.
+#[derive(Clone, Debug)]
+pub enum Source {
+    /// A Resource, by name.
+    Resource(String),
+    /// An Application's own database, by the Application's name.
+    OwnDatabase(Arc<str>),
 }
 
 /// A parameter, sent as text for the server to interpret.
@@ -225,11 +259,11 @@ pub struct Outcome {
     pub duration: Option<Duration>,
 }
 
-/// A bounded pool of connections to one shared database as one login.
+/// A bounded pool of connections to one database as one login.
 pub struct Pool {
-    /// Which Resource, for the program's log. Not a credential.
-    resource: String,
-    level: Level,
+    /// What it connects to, for the program's log. Not a credential.
+    source: Source,
+    levels: Levels,
     target: Target,
     limits: Limits,
     /// Bound: `limits.size` permits, one per connection open or being
@@ -244,20 +278,20 @@ pub struct Pool {
 impl fmt::Debug for Pool {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Pool")
-            .field("resource", &self.resource)
-            .field("level", &self.level)
+            .field("source", &self.source)
+            .field("levels", &self.levels)
             .finish_non_exhaustive()
     }
 }
 
 impl Pool {
-    /// A pool for `resource`'s database at `level`, whose login `target`
-    /// is; it connects on first use.
-    pub fn new(resource: &str, level: Level, target: Target, limits: Limits) -> Self {
+    /// A pool for `source`'s database, running `levels`, whose login
+    /// `target` is; it connects on first use.
+    pub fn new(source: Source, levels: Levels, target: Target, limits: Limits) -> Self {
         let size = limits.size.max(1);
         Self {
-            resource: resource.to_owned(),
-            level,
+            source,
+            levels,
             target,
             limits,
             permits: Semaphore::new(size),
@@ -265,8 +299,19 @@ impl Pool {
         }
     }
 
-    /// Runs `sql` in a transaction of the pool's level, labelled `label`.
-    pub async fn run(&self, sql: &str, params: &[Param], label: Label<'_>) -> Outcome {
+    /// Runs `sql` in a transaction of `level`, labelled `label`. A level
+    /// the pool's login is not for is never run: answered unavailable.
+    pub async fn run(
+        &self,
+        level: Level,
+        sql: &str,
+        params: &[Param],
+        label: Label<'_>,
+    ) -> Outcome {
+        if !self.levels.permit(level) {
+            self.report("an operation of a level this login is not for");
+            return unavailable();
+        }
         let checkout = self.limits.checkout;
         let Ok(Ok(_permit)) = tokio::time::timeout(checkout, self.permits.acquire()).await else {
             self.report("no connection was free in time");
@@ -280,7 +325,7 @@ impl Pool {
             },
         };
         let operation = wire::Operation {
-            level: self.level,
+            level,
             sql,
             params,
             label,
@@ -336,13 +381,20 @@ impl Pool {
         }
     }
 
-    /// A record in the program's log. Names the Resource and a fixed
-    /// description, never anything of its connection.
+    /// A record in the program's log. Names the Resource or the
+    /// Application and a fixed description, never anything of its
+    /// connection.
     fn report(&self, problem: &str) {
-        log::record(
-            "shared-database-unavailable",
-            serde_json::json!({ "resource": self.resource, "problem": problem }),
-        );
+        match &self.source {
+            Source::Resource(resource) => log::record(
+                "shared-database-unavailable",
+                serde_json::json!({ "resource": resource, "problem": problem }),
+            ),
+            Source::OwnDatabase(application) => log::record(
+                "own-database-unavailable",
+                serde_json::json!({ "application": &**application, "problem": problem }),
+            ),
+        }
     }
 
     fn take_idle(&self) -> Option<Connection> {
@@ -390,7 +442,12 @@ mod tests {
         ] {
             assert!(!printed.contains(hidden), "{printed}");
         }
-        let pool = Pool::new("devops", Level::Write, target, Limits::default());
+        let pool = Pool::new(
+            Source::Resource("devops".into()),
+            Levels::Only(Level::Write),
+            target,
+            Limits::default(),
+        );
         assert!(!format!("{pool:?}").contains("secret"));
     }
 }

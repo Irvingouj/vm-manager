@@ -515,13 +515,16 @@ fn encode_operation(operation: &Operation<'_>, out: &mut BytesMut) -> Result<(),
         Level::Write => "BEGIN READ WRITE",
     };
     let label = operation.label;
-    let host: [(&str, &[&str]); 2] = [
-        (begin, &[]),
-        (
-            HOST_FIRST_STATEMENT,
-            &[label.user, label.application, label.request],
-        ),
-    ];
+    let shared = [label.user, label.application, label.request];
+    let own;
+    let (first, values): (&str, &[&str]) = match label.actor {
+        None => (HOST_FIRST_STATEMENT, &shared),
+        Some(actor) => {
+            own = [label.user, label.application, label.request, actor];
+            (HOST_FIRST_STATEMENT_OWN, &own)
+        }
+    };
+    let host: [(&str, &[&str]); 2] = [(begin, &[]), (first, values)];
     for (sql, values) in host {
         frontend::parse("", sql, values.iter().map(|_| 0), out).map_err(protocol)?;
         frontend::bind(
@@ -574,6 +577,14 @@ fn encode_operation(operation: &Operation<'_>, out: &mut BytesMut) -> Result<(),
 /// TRANSACTION READ WRITE` fails with 25001).
 const HOST_FIRST_STATEMENT: &str = "SELECT set_config('vm.user', $1, true), \
      set_config('vm.application', $2, true), set_config('vm.request', $3, true)";
+
+/// The same on an Application's own database, with the fourth setting
+/// `vm.actor` (blackbox/CONTRACT.md, "Operations on the own database"). A
+/// label still: the ticket on identity and Change history replaces it there
+/// with one that cannot be forged.
+const HOST_FIRST_STATEMENT_OWN: &str = "SELECT set_config('vm.user', $1, true), \
+     set_config('vm.application', $2, true), set_config('vm.request', $3, true), \
+     set_config('vm.actor', $4, true)";
 
 /// What to do after a message.
 enum Step {

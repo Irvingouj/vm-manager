@@ -1,6 +1,6 @@
 //! The Operation log (ADR 0005; blackbox/CONTRACT.md, "The Operation log"):
-//! one entry per operation on a Resource, allowed or refused, kept in the
-//! platform database. Written by the Operation gateway, read through the
+//! one entry per operation on a Resource or on an Application's own
+//! database, allowed or refused, kept in the platform database. Written by the Operation gateway, read through the
 //! platform's API.
 //!
 //! Interface: [`OperationLog::refused`] writes a refused operation's entry
@@ -35,7 +35,10 @@ pub struct Entry<'a> {
     pub user: Option<&'a str>,
     pub application: &'a str,
     pub version: u64,
-    pub resource: &'a str,
+    /// The Resource; `None` on the Application's own database.
+    pub resource: Option<&'a str>,
+    /// `user` or `application`.
+    pub actor: &'a str,
     pub operation: &'a str,
     /// Without its values.
     pub statement: &'a str,
@@ -70,14 +73,17 @@ impl OperationLog {
             client
                 .execute(
                     "INSERT INTO operation_log (request, user_id, application, version, resource,
-                                                operation, statement, outcome, reason)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, 'refused', $8)",
+                                                actor, own_database, operation, statement,
+                                                outcome, reason)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'refused', $10)",
                     &[
                         &entry.request,
                         &entry.user,
                         &entry.application,
                         &version,
                         &entry.resource,
+                        &entry.actor,
+                        &entry.resource.is_none(),
                         &entry.operation,
                         &entry.statement,
                         &reason,
@@ -99,14 +105,17 @@ impl OperationLog {
             client
                 .execute(
                     "INSERT INTO operation_log (request, user_id, application, version, resource,
-                                                operation, statement, outcome, error)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, 'failed', $8)",
+                                                actor, own_database, operation, statement,
+                                                outcome, error)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'failed', $10)",
                     &[
                         &entry.request,
                         &entry.user,
                         &entry.application,
                         &version,
                         &entry.resource,
+                        &entry.actor,
+                        &entry.resource.is_none(),
                         &entry.operation,
                         &entry.statement,
                         &error,
@@ -127,8 +136,9 @@ impl OperationLog {
             let row = client
                 .query_one(
                     "INSERT INTO operation_log (request, user_id, application, version, resource,
-                                                operation, statement, outcome)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, 'unfinished')
+                                                actor, own_database, operation, statement,
+                                                outcome)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'unfinished')
                      RETURNING id",
                     &[
                         &entry.request,
@@ -136,6 +146,8 @@ impl OperationLog {
                         &entry.application,
                         &version,
                         &entry.resource,
+                        &entry.actor,
+                        &entry.resource.is_none(),
                         &entry.operation,
                         &entry.statement,
                     ],
@@ -196,7 +208,8 @@ impl OperationLog {
                             "SELECT id, ",
                             rfc3339!("time"),
                             ", request, user_id, application, version, resource, operation,
-                               statement, outcome, reason, error, rows, duration_ms
+                               statement, outcome, reason, error, rows, duration_ms,
+                               actor, own_database
                              FROM (SELECT * FROM operation_log ORDER BY id DESC LIMIT $1) newest
                              ORDER BY id"
                         ),
@@ -208,14 +221,16 @@ impl OperationLog {
             .await?;
         let mut entries = Vec::with_capacity(rows.len());
         for row in &rows {
-            let mut entry = Map::with_capacity(14);
+            let mut entry = Map::with_capacity(16);
             entry.insert("id".into(), get::<i64>(row, 0)?.into());
             entry.insert("time".into(), get::<String>(row, 1)?.into());
             entry.insert("request".into(), get::<Option<String>>(row, 2)?.into());
             entry.insert("user".into(), get::<Option<String>>(row, 3)?.into());
             entry.insert("application".into(), get::<String>(row, 4)?.into());
             entry.insert("version".into(), get::<i32>(row, 5)?.into());
-            entry.insert("resource".into(), get::<String>(row, 6)?.into());
+            entry.insert("resource".into(), get::<Option<String>>(row, 6)?.into());
+            entry.insert("actor".into(), get::<String>(row, 14)?.into());
+            entry.insert("own_database".into(), get::<bool>(row, 15)?.into());
             entry.insert("operation".into(), get::<String>(row, 7)?.into());
             entry.insert("statement".into(), get::<String>(row, 8)?.into());
             entry.insert("outcome".into(), get::<String>(row, 9)?.into());

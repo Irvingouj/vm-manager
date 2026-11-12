@@ -9,16 +9,18 @@
 //! Application code will receive, as a future. Who is asking is never read
 //! from anything the Application passes.
 //!
-//! Operations: `whoami`, and on a shared database `query` (needs `read`;
-//! the read login, a read-only transaction) and `execute` (needs `write`;
-//! the write login, a read-write transaction). Either goes:
+//! Operations: `whoami`, and `query` (needs `read`; a read-only
+//! transaction) and `execute` (needs `write`; a read-write transaction),
+//! each either on a shared database (the read or the write login) or on the
+//! Application's own database (its runtime role, crate::own_db), as the
+//! User or, on the own database only, as the Application. Either goes:
 //!
 //! 1. its arguments are read (malformed: answered so, nothing logged or
 //!    sent);
 //! 2. the Authorization decision ([`authz::decide`]), from the request in
-//!    flight, the serving Version's Declared access, and the Resources and
-//!    Grants in memory (crate::resources), for the level the operation
-//!    needs;
+//!    flight, who it acts as, its target, and for a Resource the serving
+//!    Version's Declared access and the Resources and Grants in memory
+//!    (crate::resources), for the level the operation needs;
 //! 3. the statement without its values (crate::statement);
 //! 4. the rest runs as a task on the program's runtime, owned here: a
 //!    refused operation's Operation log entry is written whole and the
@@ -36,7 +38,7 @@
 //! are bounded ([`OPERATIONS_AT_ONCE`]); past the bound an operation waits
 //! up to [`PERMIT_WAIT`] to start, within the Application's call.
 //!
-//! Later tickets add the own database and outbound calls here.
+//! Later tickets add outbound calls here.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -50,9 +52,10 @@ use tokio::sync::{Semaphore, oneshot};
 use tokio::task::JoinSet;
 
 use crate::check;
-use crate::executor::{Failure, Label, Param};
+use crate::executor::{Failure, Label, Level, Param, Pool};
 use crate::log;
 use crate::oplog::{Ending, Entry, OperationLog};
+use crate::own_db::OwnDatabases;
 use crate::resources::{Resource, Resources, level_name};
 use crate::runner::InFlight;
 use crate::statement;
@@ -103,17 +106,21 @@ impl Refusal {
         )
     }
 
-    fn log_unavailable(resource: &str) -> Self {
+    /// `resource` is `None` on the own database.
+    fn log_unavailable(resource: Option<&str>) -> Self {
         let mut refusal = Self::new(
             LOG_UNAVAILABLE,
             "the platform could not write the Operation log entry, so the operation was not run: try again shortly".into(),
         );
-        refusal.details.insert("resource".into(), resource.into());
+        if let Some(resource) = resource {
+            refusal.details.insert("resource".into(), resource.into());
+        }
         refusal
     }
 
     /// The refusal of the Authorization decision's `reason`, for an
-    /// operation needing `needed` on `name` by `user`.
+    /// operation needing `needed` on the Resource `name` by `user`. On the
+    /// own database only `no-request` refuses, and it names no Resource.
     fn of(
         reason: authz::Reason,
         needed: AccessLevel,
@@ -284,6 +291,7 @@ impl Operations {
 /// The platform's operations.
 pub struct PlatformGateway {
     resources: Arc<Resources>,
+    own: Arc<OwnDatabases>,
     log: Arc<OperationLog>,
     operations: Arc<Operations>,
 }
@@ -291,9 +299,15 @@ pub struct PlatformGateway {
 impl PlatformGateway {
     /// `runtime` is where operations run: the program's own, where the
     /// platform database's and the shared databases' connections live.
-    pub fn new(resources: Arc<Resources>, log: Arc<OperationLog>, runtime: Handle) -> Self {
+    pub fn new(
+        resources: Arc<Resources>,
+        own: Arc<OwnDatabases>,
+        log: Arc<OperationLog>,
+        runtime: Handle,
+    ) -> Self {
         Self {
             resources,
+            own,
             log,
             operations: Arc::new(Operations {
                 runtime,
@@ -323,33 +337,62 @@ impl PlatformGateway {
                 };
             }
         };
-        let resource = self.resources.get(call.resource);
         let groups: Vec<&str> = in_flight.user.groups.iter().map(String::as_str).collect();
-        let decide = |grants: &[authz::Grant<'_>]| {
-            authz::decide(&Question {
-                request_in_flight: active,
-                actor: authz::Actor::User,
-                own_database: false,
-                groups: &groups,
-                declared: in_flight.declared.get(call.resource).copied(),
-                registered: resource.is_some(),
-                grants,
-                needed: kind.needed(),
-            })
-        };
-        let decision = match &resource {
-            Some(resource) => resource.with_grants(decide),
-            None => decide(&[]),
-        };
-        let refusal = match decision {
-            authz::Decision::Allow => None,
-            authz::Decision::Refuse(reason) => Some(Refusal::of(
-                reason,
-                kind.needed(),
-                call.resource,
-                &in_flight.user.id,
-                resource.as_deref(),
-            )),
+        let (target, refusal) = match call.target {
+            Target::Own => {
+                let decision = authz::decide(&Question {
+                    request_in_flight: active,
+                    actor: call.actor,
+                    own_database: true,
+                    groups: &groups,
+                    declared: None,
+                    registered: false,
+                    grants: &[],
+                    needed: kind.needed(),
+                });
+                let refusal = match decision {
+                    authz::Decision::Allow => None,
+                    // Only `no-request` refuses on the own database.
+                    authz::Decision::Refuse(_) => Some(Refusal::no_request()),
+                };
+                (On::Own, refusal)
+            }
+            Target::Resource(name) => {
+                let resource = self.resources.get(name);
+                let decide = |grants: &[authz::Grant<'_>]| {
+                    authz::decide(&Question {
+                        request_in_flight: active,
+                        actor: call.actor,
+                        own_database: false,
+                        groups: &groups,
+                        declared: in_flight.declared.get(name).copied(),
+                        registered: resource.is_some(),
+                        grants,
+                        needed: kind.needed(),
+                    })
+                };
+                let decision = match &resource {
+                    Some(resource) => resource.with_grants(decide),
+                    None => decide(&[]),
+                };
+                let refusal = match decision {
+                    authz::Decision::Allow => None,
+                    authz::Decision::Refuse(reason) => Some(Refusal::of(
+                        reason,
+                        kind.needed(),
+                        name,
+                        &in_flight.user.id,
+                        resource.as_deref(),
+                    )),
+                };
+                // Copied: the operation runs on another thread, beyond the
+                // Application's call that lent the name.
+                let on = On::Resource {
+                    name: name.to_owned(),
+                    resource,
+                };
+                (on, refusal)
+            }
         };
         let refused = refusal.as_ref().map(|r| r.reason);
         // What is sent is kept only for an operation that will be sent.
@@ -361,15 +404,14 @@ impl PlatformGateway {
             kind,
             in_flight: Arc::clone(in_flight),
             active,
-            // Copied: the operation runs on another thread, beyond the
-            // Application's call that lent these.
-            name: call.resource.to_owned(),
+            actor: call.actor,
+            target,
             sql,
             params,
             statement: statement::without_values(call.sql),
-            resource,
             refusal,
             log: Arc::clone(&self.log),
+            own: Arc::clone(&self.own),
         };
         if !active {
             // Refused (`no-request` comes first). Answered at once: the
@@ -450,12 +492,14 @@ impl Gateway for PlatformGateway {
     }
 }
 
-/// An operation on a shared database.
+/// An operation on a database.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
-    /// `query`: needs `read`; the read login, a read-only transaction.
+    /// `query`: needs `read`; a read-only transaction, as the read login of
+    /// a shared database or the own database's runtime role.
     Query,
-    /// `execute`: needs `write`; the write login, a read-write transaction.
+    /// `execute`: needs `write`; a read-write transaction, as the write
+    /// login or the runtime role.
     Execute,
 }
 
@@ -475,22 +519,52 @@ impl Kind {
     }
 }
 
+/// What an operation is on.
+#[derive(Clone, Copy, Debug)]
+enum Target<'a> {
+    /// The Application's own database.
+    Own,
+    /// A Resource, by name.
+    Resource(&'a str),
+}
+
 /// The arguments of `query` and `execute`, read strictly (blackbox/CONTRACT.md,
-/// "Operations on a shared database"). Fields it does not have are
-/// ignored.
+/// "Operations on a shared database" and "Operations on the own database"):
+/// exactly one of `own: true` and `resource`; `as` absent, `"user"` or
+/// `"application"`. Fields it does not have are ignored.
 struct Call<'a> {
-    resource: &'a str,
+    target: Target<'a>,
+    actor: authz::Actor,
     sql: &'a str,
     params: Vec<Param>,
 }
 
 impl<'a> Call<'a> {
     fn read(args: &'a Value) -> Result<Self, &'static str> {
+        const TARGET: &str = "name exactly one target: `own: true` for the Application's own database, or `resource` with the name of a Resource";
         let Some(args) = args.as_object() else {
-            return Err("the arguments must be an object: { resource, sql, params }");
+            return Err(
+                "the arguments must be an object: { own: true, as, sql, params } or { resource, as, sql, params }",
+            );
         };
-        let Some(resource) = args.get("resource").and_then(Value::as_str) else {
-            return Err("`resource` must be the name of a Resource, as a string");
+        let own = match args.get("own") {
+            None => false,
+            Some(Value::Bool(true)) => true,
+            Some(_) => return Err("`own` must be exactly true, and then no `resource` is given"),
+        };
+        let target = match (own, args.get("resource")) {
+            (true, None) => Target::Own,
+            (false, Some(Value::String(name))) => Target::Resource(name),
+            (false, Some(_)) => {
+                return Err("`resource` must be the name of a Resource, as a string");
+            }
+            (true, Some(_)) | (false, None) => return Err(TARGET),
+        };
+        let actor = match args.get("as") {
+            None => authz::Actor::User,
+            Some(Value::String(actor)) if actor == "user" => authz::Actor::User,
+            Some(Value::String(actor)) if actor == "application" => authz::Actor::Application,
+            Some(_) => return Err("`as` must be \"user\" (the default) or \"application\""),
         };
         let Some(sql) = args.get("sql").and_then(Value::as_str) else {
             return Err("`sql` must be one statement, as a string");
@@ -517,10 +591,28 @@ impl<'a> Call<'a> {
             Some(_) => return Err("`params` must be an array"),
         };
         Ok(Self {
-            resource,
+            target,
+            actor,
             sql,
             params,
         })
+    }
+}
+
+/// What a decided operation is on.
+enum On {
+    Own,
+    Resource {
+        name: String,
+        /// `None` when not registered (then it was refused).
+        resource: Option<Arc<Resource>>,
+    },
+}
+
+fn actor_name(actor: authz::Actor) -> &'static str {
+    match actor {
+        authz::Actor::User => "user",
+        authz::Actor::Application => "application",
     }
 }
 
@@ -529,23 +621,33 @@ struct Work {
     kind: Kind,
     in_flight: Arc<InFlight>,
     active: bool,
-    name: String,
+    actor: authz::Actor,
+    target: On,
     sql: String,
     params: Vec<Param>,
     statement: String,
-    resource: Option<Arc<Resource>>,
     refusal: Option<Refusal>,
     log: Arc<OperationLog>,
+    own: Arc<OwnDatabases>,
 }
 
 impl Work {
+    /// The Resource's name; `None` on the own database.
+    fn resource_name(&self) -> Option<&str> {
+        match &self.target {
+            On::Own => None,
+            On::Resource { name, .. } => Some(name),
+        }
+    }
+
     fn entry(&self) -> Entry<'_> {
         Entry {
             request: self.active.then_some(&*self.in_flight.request),
             user: self.active.then_some(self.in_flight.user.id.as_str()),
             application: &self.in_flight.application,
             version: self.in_flight.version,
-            resource: &self.name,
+            resource: self.resource_name(),
+            actor: actor_name(self.actor),
             operation: self.kind.name(),
             statement: &self.statement,
         }
@@ -558,22 +660,40 @@ impl Work {
             }
             return refusal.to_wire();
         }
-        let Some(resource) = &self.resource else {
-            // Allowed means registered; this is not reached.
-            return error_to_wire(json!({ "kind": "unavailable" }));
-        };
-        let pool = match self.kind {
-            Kind::Query => resource.read_pool(),
-            Kind::Execute => match resource.write_pool() {
-                Some(pool) => pool,
-                None => {
-                    let answer = error_to_wire(json!({
-                        "kind": "read-only-resource",
-                        "message": "the Resource was registered without a write login, so nothing can be written to it: ask a Platform administrator to register its write login, or use query",
-                    }));
-                    return self.failed_unsent("read-only-resource", answer).await;
-                }
+        let own_pool;
+        let pool: &Pool = match &self.target {
+            On::Resource { resource: None, .. } => {
+                // Allowed means registered; this is not reached.
+                return error_to_wire(json!({ "kind": "unavailable" }));
+            }
+            On::Resource {
+                resource: Some(resource),
+                ..
+            } => match self.kind {
+                Kind::Query => resource.read_pool(),
+                Kind::Execute => match resource.write_pool() {
+                    Some(pool) => pool,
+                    None => {
+                        let answer = error_to_wire(json!({
+                            "kind": "read-only-resource",
+                            "message": "the Resource was registered without a write login, so nothing can be written to it: ask a Platform administrator to register its write login, or use query",
+                        }));
+                        return self.failed_unsent("read-only-resource", answer).await;
+                    }
+                },
             },
+            On::Own => {
+                own_pool = self.own.pool(&self.in_flight.application);
+                match &own_pool {
+                    Some(pool) => pool,
+                    // A serving Version means a ready own database; this is
+                    // not reached.
+                    None => {
+                        let answer = error_to_wire(json!({ "kind": "unavailable" }));
+                        return self.failed_unsent("unavailable", answer).await;
+                    }
+                }
+            }
         };
         if let Err(refused) = check::check(&self.sql) {
             let answer = error_to_wire(json!({
@@ -587,15 +707,23 @@ impl Work {
             Ok(id) => id,
             Err(error) => {
                 self.unlogged(&error);
-                return Refusal::log_unavailable(&self.name).to_wire();
+                return Refusal::log_unavailable(self.resource_name()).to_wire();
             }
         };
         let label = Label {
             user: &self.in_flight.user.id,
             application: &self.in_flight.application,
             request: &self.in_flight.request,
+            actor: match self.target {
+                On::Own => Some(actor_name(self.actor)),
+                On::Resource { .. } => None,
+            },
         };
-        let outcome = pool.run(&self.sql, &self.params, label).await;
+        let level = match self.kind {
+            Kind::Query => Level::Read,
+            Kind::Execute => Level::Write,
+        };
+        let outcome = pool.run(level, &self.sql, &self.params, label).await;
         let duration_ms = outcome
             .duration
             .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
@@ -647,7 +775,7 @@ impl Work {
             Ok(()) => answer,
             Err(failure) => {
                 self.unlogged(&failure);
-                Refusal::log_unavailable(&self.name).to_wire()
+                Refusal::log_unavailable(self.resource_name()).to_wire()
             }
         }
     }
@@ -657,7 +785,11 @@ impl Work {
     fn busy(&self) -> Value {
         log::record(
             "operations-busy",
-            json!({ "application": &*self.in_flight.application, "resource": self.name }),
+            json!({
+                "application": &*self.in_flight.application,
+                "resource": self.resource_name(),
+                "own_database": self.resource_name().is_none(),
+            }),
         );
         match &self.refusal {
             Some(refusal) => refusal.to_wire(),
@@ -672,7 +804,8 @@ impl Work {
             "operation-log-failed",
             json!({
                 "application": &*self.in_flight.application,
-                "resource": self.name,
+                "resource": self.resource_name(),
+                "own_database": self.resource_name().is_none(),
                 "error": error.to_string(),
             }),
         );

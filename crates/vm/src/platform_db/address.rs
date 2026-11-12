@@ -112,6 +112,15 @@ impl DatabaseAddress {
         &self.role
     }
 
+    /// The server's host name or address. Holds no secret.
+    pub(crate) fn host(&self) -> &str {
+        &self.host
+    }
+
+    pub(crate) fn port(&self) -> u16 {
+        self.port
+    }
+
     /// `host:port`, with brackets around an IPv6 address. Holds no secret.
     pub fn server(&self) -> String {
         if self.host.contains(':') {
