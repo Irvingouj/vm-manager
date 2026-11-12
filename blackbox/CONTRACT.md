@@ -589,7 +589,7 @@ export default defineApp(manifest, {
 - `ctx.user()`: the User of the request in flight. `id: string`, `groups: readonly string[]`. (The sign-in ticket adds the email and the display name.)
 - `ctx.user().db(name)`: a shared database declared in the Manifest, as the User. `ctx.user().ownDb()`: the own database, as the User. `ctx.app().ownDb()`: the own database, as the Application. In the types `ctx.app()` has nothing else. At run time `ctx.app().db(name)` exists all the same, so that code forced past the types gets the host's refusal `not-own-database` and its fix, not a `TypeError`.
 - A handle is a Drizzle database (`drizzle-orm/pg-proxy`), typed with that database's structure, relational queries (`db.query.<table>`) included.
-- **Every statement Drizzle sends is exactly one host operation**: `query` when the statement is a `select` (also one that begins with `with` and whose main statement is a `select`), `execute` otherwise; with `resource: <name>` or `own: true`, and `as: "user"` or `"application"`. So each shows as one Operation log entry, with the statement Drizzle built, without values.
+- **Every statement Drizzle sends is exactly one host operation**: `query` when the statement is a `select` (also one that begins with `with` and whose main statement is a `select`, and a set operation of selects such as `union`), `execute` otherwise; with `resource: <name>` or `own: true`, and `as: "user"` or `"application"`. So each shows as one Operation log entry, with the statement Drizzle built, without values.
 - The handles offer no raw SQL: there is no `execute` on them. (Drizzle's `sql` fragments inside a typed query remain, as ADR 0012 says; the database role is the boundary, not the types.) `transaction` comes with its own ticket.
 - A context holds no identity. Application code gets a context only in `fetch`, so it has no handle at the top level. A handle kept and used after its request is over is refused by the host with `no-request`, like any operation (or its code simply never runs, as "The raw host interface" says).
 
@@ -613,12 +613,17 @@ Rows come back as Drizzle's column types promise, and values written through Dri
 | `text[]`, `integer[]` and other arrays | `.array()` | array; elements with commas, quotes, backslashes, braces, empty strings and nulls intact |
 | any, null | | `null` |
 
-The same holds for parameters: in `values(...)`, `set(...)` and `where(...)`, and for what `returning()` gives. If the answers of "Operations on a shared database" must change for this, they change for the raw interface too and this document says how.
+The same holds for parameters: in `values(...)`, `set(...)` and `where(...)`, and for what `returning()` gives.
+
+For this the raw interface gained one optional argument; its answers without it are unchanged:
+
+- `query` and `execute` take `values: "text"`. With it, every non-null value in `rows` is the text Postgres printed, as a string, and the answer gains `"types": [<the type OID of each column>, ...]`, numbers in the order of `columns`. The SDK asks for this on every operation and reads the values as Drizzle's columns expect them.
+- Any other `values` (another string, not a string, `null`) is `{ error: { kind: "malformed", ... } }`.
 
 ### Refusals and failures
 
 - An operation the host refuses rejects with `Refused`: `error instanceof Refused` is true in Application code, also for an operation made through Drizzle (the SDK takes Drizzle's own error wrapper off). `error.refusal` is the refusal as the host gave it (`reason` and its details), `error.fix` the sentence that says what to do, `error.name` is `"Refused"`, and `error.message` is `"<reason>: <fix>"`.
-- Application code cannot make a `Refused`: `new Refused(...)` is a compile error, and at run time it throws a `TypeError`.
+- Application code cannot make a `Refused` or an `OperationFailed`: `new Refused(...)` is a compile error, and at run time it throws a `TypeError`.
 - A `Refused` that escapes `fetch` becomes the response `403` with `content-type: application/json` and the body `{ "refusal": { ... }, "fix": "..." }`.
 - An operation that fails without being refused rejects with `OperationFailed` (also an `Error`, also `instanceof`-checkable through Drizzle): `error.kind` is the host's `error.kind` (`database`, `statement`, `limit`, `unavailable`, ...), `error.code` the SQLSTATE when `kind` is `database`, `error.detail` the host's whole error object. Escaping `fetch`, it is an uncaught error like any other: the program's fixed `500`.
 
