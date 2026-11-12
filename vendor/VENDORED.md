@@ -50,3 +50,13 @@ Upstream reported an error thrown by a script's top level as the error's text al
 | File | Change |
 |---|---|
 | `src/execution_context.rs` (`evaluate_script`, both the source and the code-cache branch) | `TerminationReason::Exception` carries the error's stack (`TryCatch::stack_trace`) when it has one, and its text otherwise, as before. |
+
+### Patch 5: arguments of a host call that throw while read do not abort the process
+
+Upstream read the arguments of `__nativeBindingInvoke` with `serde_v8`, which unwraps every property read. A property read that throws (a getter, a Proxy trap) panicked inside the V8 callback, and a panic there cannot unwind, so the whole process aborted: one Application could stop every other one. Found by the hostile fixture's "an argument whose getter throws".
+
+| File | Change |
+|---|---|
+| `src/runtime/bindings/fetch.rs` (`setup_invoke`) | The arguments are read with `v8::json::stringify` and parsed with `serde_json`. What the guest's code throws while they are read goes back to the guest as the call's exception; `undefined` and what JSON cannot hold become `null`. |
+
+The runtime's other natives (`__nativeBindingFetch`, the KV, storage and database ones) still read their arguments with `serde_v8`. This program serves no binding of those kinds, and the hostile fixture calls them with plain values only, so they were not changed here; they are worth the same patch before any of them is served.

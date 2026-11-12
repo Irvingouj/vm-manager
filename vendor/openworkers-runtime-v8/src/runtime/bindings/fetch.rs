@@ -699,9 +699,24 @@ fn setup_invoke(scope: &mut v8::PinScope) {
                 return throw_type_error(scope, "invoke: the command is not a string");
             };
 
-            let call_args = match serde_v8::from_v8_any::<serde_json::Value>(scope, args.get(2)) {
-                Ok(call_args) => call_args,
-                Err(e) => return throw_type_error(scope, &format!("invoke: bad arguments: {e}")),
+            // Patched (vendor/VENDORED.md): the arguments are read as
+            // JSON.stringify reads them. serde_v8 unwraps a property read
+            // that throws (a getter, a Proxy trap), and a panic inside this
+            // callback aborts the process; here, what the guest's code
+            // throws goes back to the guest.
+            let call_args = {
+                let value = args.get(2);
+                if value.is_undefined() {
+                    serde_json::Value::Null
+                } else {
+                    let Some(text) = v8::json::stringify(scope, value) else {
+                        return;
+                    };
+                    match serde_json::from_str(&text.to_rust_string_lossy(scope)) {
+                        Ok(call_args) => call_args,
+                        Err(_) => serde_json::Value::Null,
+                    }
+                }
             };
 
             let Some((resolve_fn, reject_fn)) = resolve_reject(scope, args.get(3), args.get(4))
