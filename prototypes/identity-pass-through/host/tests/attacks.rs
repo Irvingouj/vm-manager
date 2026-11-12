@@ -211,9 +211,8 @@ fn no_request_in_flight_at_load_and_between_requests() {
         w.worker().process_callbacks();
         let between = records(&audit, "between");
         eprintln!("between after process_callbacks: {between:?}");
-        for r in &between {
-            assert_eq!(r.attached, None, "{r:?}");
-        }
+        assert_eq!(between.len(), 1, "the timer ran once, outside any request");
+        assert_eq!(between[0].attached, None);
     });
 }
 
