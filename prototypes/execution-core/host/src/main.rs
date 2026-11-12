@@ -9,8 +9,9 @@
 //! ```
 //!
 //! The listen address defaults to 127.0.0.1:8787. Environment knobs:
-//! `EC_CPU_MS` (CPU limit per request, default 50) and `EC_WALL_MS` (wall
-//! clock per request, default 10000).
+//! `EC_CPU_MS` (CPU limit per request, default 50), `EC_WALL_MS` (wall
+//! clock per request, default 10000), `EC_SNAPSHOT` (path of the V8 snapshot
+//! to load at start, instead of the path compiled into the runtime).
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -279,6 +280,31 @@ fn main() {
     }
 }
 
+/// `EC_SNAPSHOT=<path>` gives the runtime its snapshot at run time (patched
+/// runtime API); otherwise the runtime reads the compile-time path.
+fn choose_snapshot() {
+    match std::env::var("EC_SNAPSHOT") {
+        Ok(path) => match std::fs::read(&path) {
+            Ok(bytes) => {
+                let len = bytes.len();
+                let set = openworkers_runtime_v8::platform::set_snapshot(Box::leak(
+                    bytes.into_boxed_slice(),
+                ));
+                eprintln!("snapshot: {len} bytes from EC_SNAPSHOT={path} (set: {set})");
+            }
+            Err(e) => eprintln!("snapshot: cannot read EC_SNAPSHOT={path}: {e}; none used"),
+        },
+        Err(_) => {
+            let path = env!("RUNTIME_SNAPSHOT_PATH");
+            match std::fs::metadata(path) {
+                Ok(m) if m.len() > 0 => eprintln!("snapshot: {} bytes at compiled-in {path}", m.len()),
+                Ok(_) => eprintln!("snapshot: compiled-in {path} is empty; none used"),
+                Err(e) => eprintln!("snapshot: compiled-in {path}: {e}; none used"),
+            }
+        }
+    }
+}
+
 fn serve(code: String, addr: SocketAddr) {
     eprintln!(
         "ec-host on {} {}; snapshot path compiled in: {}",
@@ -286,6 +312,7 @@ fn serve(code: String, addr: SocketAddr) {
         std::env::consts::ARCH,
         env!("RUNTIME_SNAPSHOT_PATH")
     );
+    choose_snapshot();
     let engine = spawn_engine(code);
 
     let rt = tokio::runtime::Builder::new_multi_thread()

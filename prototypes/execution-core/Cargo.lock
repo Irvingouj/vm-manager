@@ -828,7 +828,6 @@ dependencies = [
 [[package]]
 name = "openworkers-runtime-v8"
 version = "0.18.7"
-source = "git+https://github.com/openworkers/openworkers-runtime-v8?tag=v0.18.7#4ea28c1c26ea10920ad71b8e7bec264f735f7e6e"
 dependencies = [
  "bytes",
  "encoding_rs",
@@ -853,12 +852,12 @@ dependencies = [
  "url",
  "urlpattern",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "openworkers-runtime-v8-gc-derive"
 version = "0.1.0"
-source = "git+https://github.com/openworkers/openworkers-runtime-v8?tag=v0.18.7#4ea28c1c26ea10920ad71b8e7bec264f735f7e6e"
 dependencies = [
  "proc-macro2",
  "quote",

@@ -48,6 +48,17 @@ pub fn get_platform() -> &'static v8::SharedRef<v8::Platform> {
     })
 }
 
+/// Gives the runtime its snapshot from the host, instead of the file at the
+/// compile-time `RUNTIME_SNAPSHOT_PATH`. Call it before the first isolate is
+/// made. Answers false when the snapshot was already chosen (by an earlier
+/// call, or because an isolate already loaded it from the file).
+///
+/// The bytes must come from `snapshot::create_runtime_snapshot` of the same
+/// build of this crate.
+pub fn set_snapshot(bytes: &'static [u8]) -> bool {
+    SNAPSHOT.set((!bytes.is_empty()).then_some(bytes)).is_ok()
+}
+
 /// Get the runtime snapshot, loading it once from disk.
 ///
 /// Returns `None` if:

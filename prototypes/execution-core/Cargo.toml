@@ -1,6 +1,8 @@
 [workspace]
 resolver = "3"
 members = ["host"]
+# The vendored crates are workspace roots of their own.
+exclude = ["vendor"]
 
 [workspace.package]
 edition = "2024"
@@ -9,3 +11,7 @@ license = "MIT"
 [profile.release]
 # Fast enough to build in CI, small enough to ship.
 strip = "debuginfo"
+
+# Patched upstream crates; see vendor/VENDORED.md.
+[patch."https://github.com/openworkers/openworkers-runtime-v8"]
+openworkers-runtime-v8 = { path = "vendor/openworkers-runtime-v8" }

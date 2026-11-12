@@ -10,9 +10,17 @@ fn main() {
 
     let path = PathBuf::from(RUNTIME_SNAPSHOT_PATH);
 
-    // Create the file if it doesn't exist
+    // Create the file if it doesn't exist. The runtime runs without a
+    // snapshot when the file is missing, so a path whose directory does not
+    // exist on the build machine (a deploy path such as /app/..., or /tmp/...
+    // on Windows) is not a build failure.
     if !path.exists() {
         println!("Creating empty snapshot file: {:?}", path);
-        File::create(&path).unwrap();
+        if let Err(e) = File::create(&path) {
+            println!(
+                "cargo:warning=cannot create {}: {e}; the runtime starts without a snapshot unless the file exists at run time or the host calls platform::set_snapshot",
+                path.display()
+            );
+        }
     }
 }

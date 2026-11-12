@@ -41,6 +41,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: prototypes/execution-core -> target
+          cache-on-failure: true
 
       - name: Build host (release)
         run: |
@@ -59,6 +60,13 @@ jobs:
         run: |
           bin=target/release/ec-host; [ -f "$bin.exe" ] && bin="$bin.exe"
           ./smoke.sh "$bin"
+
+      - name: Smoke test, snapshot given at run time (EC_SNAPSHOT)
+        run: |
+          bin=target/release/ec-host; [ -f "$bin.exe" ] && bin="$bin.exe"
+          snap="$(pwd -W 2>/dev/null || pwd)/runtime-snapshot.bin"
+          EC_SNAPSHOT="$snap" SMOKE_LOG=smoke-env.log ./smoke.sh "$bin" 8788
+          grep -q "(set: true)" smoke-env.log
 
       - name: CPU-limit test
         run: cargo test --release --locked -- --nocapture

@@ -13,7 +13,7 @@ use std::time::Duration;
 /// # Platform Support
 ///
 /// - **Unix (Linux, macOS, BSD)**: Supported via `CLOCK_THREAD_CPUTIME_ID`
-/// - **Windows**: Not supported (returns None)
+/// - **Windows**: Supported via `GetThreadTimes` (tick resolution)
 ///
 /// # Returns
 ///
@@ -40,7 +40,44 @@ pub fn get_thread_cpu_time() -> Option<Duration> {
     }
 }
 
-#[cfg(not(unix))]
+/// Windows: user plus kernel time of the calling thread from `GetThreadTimes`.
+/// The clock advances in scheduler ticks (about 15.6 ms by default), not
+/// continuously.
+#[cfg(windows)]
+pub fn get_thread_cpu_time() -> Option<Duration> {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadTimes};
+
+    let zero = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let (mut creation, mut exit, mut kernel, mut user) = (zero, zero, zero, zero);
+
+    // SAFETY: GetCurrentThread returns a pseudo-handle that is always valid
+    // for the caller; the four pointers are to live FILETIMEs
+    let ok = unsafe {
+        GetThreadTimes(
+            GetCurrentThread(),
+            &mut creation,
+            &mut exit,
+            &mut kernel,
+            &mut user,
+        )
+    };
+
+    if ok == 0 {
+        return None;
+    }
+
+    let hundred_ns = |t: FILETIME| ((t.dwHighDateTime as u64) << 32) | t.dwLowDateTime as u64;
+
+    Some(Duration::from_nanos(
+        (hundred_ns(kernel) + hundred_ns(user)) * 100,
+    ))
+}
+
+#[cfg(not(any(unix, windows)))]
 pub fn get_thread_cpu_time() -> Option<Duration> {
     // CPU time measurement not supported on this platform
     None

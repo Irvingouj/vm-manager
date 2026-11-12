@@ -68,6 +68,10 @@ uuid = { version = "1", features = ["v4"] }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.180"
 
+# Thread CPU time and the CPU watchdog on Windows
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading"] }
+
 # Signal handling (for CPU time enforcement on Linux)
 [target.'cfg(target_os = "linux")'.dependencies]
 signal-hook = "0.4.1"
