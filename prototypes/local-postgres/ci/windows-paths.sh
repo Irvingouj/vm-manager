@@ -13,14 +13,31 @@ try() {
     "$BIN" pg "$root" > case.log 2>&1
   fi
   local rc=$?
-  grep -E "^(FAIL|Error|Caused|    Command error|METRIC (init_time|first_start_time))" case.log | head -6
-  [ $rc -eq 0 ] && echo "CASE PASS: $label" || echo "CASE FAIL: $label"
+  if [ $rc -eq 0 ]; then
+    grep -E "^METRIC (init_time|first_start_time)" case.log
+    echo "CASE PASS: $label"
+  else
+    sed -n '/^Error/,$p' case.log | head -40
+    echo "CASE FAIL: $label"
+  fi
   rm -rf "$root" case.log
 }
-echo "active code page: $(cmd //c chcp)"
+echo "console code page: $(cmd //c chcp)"
+echo "ANSI code page (GetACP): $(powershell -NoProfile -Command '[System.Text.Encoding]::Default.CodePage')"
 try "ASCII with space"               "$t/lp spike Zoe"
 try "Latin-1 (cp1252) e-diaeresis"   "$t/lp spike Zoë"
 try "CJK"                            "$t/lp spike 数据"
 try "CJK data dir, ASCII binaries"   "$t/lp spike 数据 data" "$t/lp-bin ascii"
 rm -rf "$t/lp-bin ascii"
+# Workaround candidate: the 8.3 short name of a non-ASCII directory, if the
+# volume generates them (often off on non-system volumes).
+for base in "$t" "$LOCALAPPDATA"; do
+  long="$base/lp spike 数据 short"
+  mkdir -p "$long"
+  w=$(cygpath -w "$long")
+  short=$(powershell -NoProfile -Command "(New-Object -ComObject Scripting.FileSystemObject).GetFolder('$w').ShortPath" | tr -d '\r')
+  echo "8.3 short path of [$w]: [$short]"
+  try "CJK via 8.3 short path under $base" "$short"
+  rm -rf "$long"
+done
 exit 0
