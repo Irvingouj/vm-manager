@@ -197,10 +197,25 @@ pub enum Param {
     Text(String),
 }
 
+/// How the values of a result reach Application code.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Values {
+    /// Typed as blackbox/CONTRACT.md, "Operations on a shared database",
+    /// says: booleans, some numbers and JSON as themselves, the rest as text.
+    #[default]
+    Typed,
+    /// Every value as the text Postgres printed for it, and the type of
+    /// each column, for the SDK to read as Drizzle's columns expect
+    /// (blackbox/CONTRACT.md, "The SDK: Values").
+    Text,
+}
+
 /// A result's columns and rows; each row is a JSON array.
 #[derive(Debug)]
 pub struct Rows {
     pub columns: Vec<String>,
+    /// The type (its OID) of each column, in the order of `columns`.
+    pub types: Vec<u32>,
     pub rows: Vec<Value>,
     /// The count in Postgres's command tag (`INSERT 0 3`, `UPDATE 2`,
     /// `SELECT 5`), if it gave one.
@@ -208,10 +223,11 @@ pub struct Rows {
 }
 
 impl Rows {
-    /// `{ columns, rows, row_count }`, and `rows_affected` when `affected`
-    /// is asked for, as Application code receives it.
-    pub fn into_wire(self, affected: bool) -> Value {
-        let mut wire = Map::with_capacity(4);
+    /// `{ columns, rows, row_count }`, `rows_affected` when `affected` is
+    /// asked for, and `types` when the values are [`Values::Text`], as
+    /// Application code receives it.
+    pub fn into_wire(self, affected: bool, values: Values) -> Value {
+        let mut wire = Map::with_capacity(5);
         wire.insert("row_count".into(), self.rows.len().into());
         if affected {
             let count = self
@@ -220,6 +236,9 @@ impl Rows {
             wire.insert("rows_affected".into(), count.into());
         }
         wire.insert("columns".into(), self.columns.into());
+        if values == Values::Text {
+            wire.insert("types".into(), self.types.into());
+        }
         wire.insert("rows".into(), Value::Array(self.rows));
         Value::Object(wire)
     }
@@ -316,13 +335,15 @@ impl Pool {
         self
     }
 
-    /// Runs `sql` in a transaction of `level`, labelled `label`. A level
-    /// the pool's login is not for is never run: answered unavailable.
+    /// Runs `sql` in a transaction of `level`, labelled `label`, its
+    /// result's values read as `values` says. A level the pool's login is
+    /// not for is never run: answered unavailable.
     pub async fn run(
         &self,
         level: Level,
         sql: &str,
         params: &[Param],
+        values: Values,
         label: Label<'_>,
     ) -> Outcome {
         if !self.levels.permit(level) {
@@ -345,6 +366,7 @@ impl Pool {
             level,
             sql,
             params,
+            values,
             label,
             key: self.key.as_deref(),
         };

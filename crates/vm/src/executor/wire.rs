@@ -27,7 +27,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{Instant, timeout, timeout_at};
 
-use super::{Failure, IdentityKey, Label, Level, Limit, Limits, Param, Rows, Target, identity};
+use super::{
+    Failure, IdentityKey, Label, Level, Limit, Limits, Param, Rows, Target, Values, identity,
+};
 
 /// The largest message other than a row that is read. A larger one is a
 /// protocol error and the connection is closed.
@@ -92,6 +94,7 @@ pub(super) struct Operation<'a> {
     pub(super) level: Level,
     pub(super) sql: &'a str,
     pub(super) params: &'a [Param],
+    pub(super) values: Values,
     pub(super) label: Label<'a>,
     pub(super) key: Option<&'a IdentityKey>,
 }
@@ -370,7 +373,7 @@ impl Connection {
         }
         let sent = Instant::now();
         let deadline = sent + limits.statement;
-        let mut result = Reading::new(limits, host_left);
+        let mut result = Reading::new(limits, host_left, operation.values);
         // After the key's round trip, the server has answered already.
         let mut answered = host_left < 2;
         let status = loop {
@@ -757,6 +760,7 @@ struct Reading {
     /// Statements of the host's own still to complete.
     host_left: u8,
     columns: Option<Vec<(String, u32)>>,
+    values: Values,
     rows: Vec<Value>,
     /// The count in the statement's command tag.
     affected: Option<u64>,
@@ -769,10 +773,11 @@ struct Reading {
 impl Reading {
     /// `host_left`: the statements of the host's own still to be answered
     /// before the Application's.
-    fn new(limits: &Limits, host_left: u8) -> Self {
+    fn new(limits: &Limits, host_left: u8, values: Values) -> Self {
         Self {
             host_left,
             columns: None,
+            values,
             rows: Vec::new(),
             affected: None,
             bytes: 0,
@@ -882,7 +887,12 @@ impl Reading {
         for (_, oid) in columns {
             let value = match ranges.next() {
                 Ok(Some(Some(range))) => match body.buffer().get(range) {
-                    Some(text) => decode(*oid, text),
+                    Some(text) => match self.values {
+                        Values::Typed => decode(*oid, text),
+                        // Copied out of the message buffer, as `decode` does:
+                        // the answer outlives it.
+                        Values::Text => Value::String(String::from_utf8_lossy(text).into_owned()),
+                    },
                     None => return Step::Broken,
                 },
                 Ok(Some(None)) => Value::Null,
@@ -896,16 +906,15 @@ impl Reading {
 
     fn finish(self) -> Result<Rows, Failure> {
         match self.outcome {
-            Some(Ok(())) => Ok(Rows {
-                columns: self
-                    .columns
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|(name, _)| name)
-                    .collect(),
-                rows: self.rows,
-                affected: self.affected,
-            }),
+            Some(Ok(())) => {
+                let (columns, types) = self.columns.unwrap_or_default().into_iter().unzip();
+                Ok(Rows {
+                    columns,
+                    types,
+                    rows: self.rows,
+                    affected: self.affected,
+                })
+            }
             Some(Err(failure)) => Err(failure),
             None => Err(Failure::Unavailable),
         }

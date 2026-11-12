@@ -52,7 +52,7 @@ use tokio::sync::{Semaphore, oneshot};
 use tokio::task::JoinSet;
 
 use crate::check;
-use crate::executor::{Failure, Label, Level, Param, Pool};
+use crate::executor::{Failure, Label, Level, Param, Pool, Values};
 use crate::log;
 use crate::oplog::{Ending, Entry, OperationLog};
 use crate::own_db::OwnDatabases;
@@ -408,6 +408,7 @@ impl PlatformGateway {
             target,
             sql,
             params,
+            values: call.values,
             statement: statement::without_values(call.sql),
             refusal,
             log: Arc::clone(&self.log),
@@ -531,12 +532,14 @@ enum Target<'a> {
 /// The arguments of `query` and `execute`, read strictly (blackbox/CONTRACT.md,
 /// "Operations on a shared database" and "Operations on the own database"):
 /// exactly one of `own: true` and `resource`; `as` absent, `"user"` or
-/// `"application"`. Fields it does not have are ignored.
+/// `"application"`; `values` absent or `"text"` ("The SDK: Values"). Fields
+/// it does not have are ignored.
 struct Call<'a> {
     target: Target<'a>,
     actor: authz::Actor,
     sql: &'a str,
     params: Vec<Param>,
+    values: Values,
 }
 
 impl<'a> Call<'a> {
@@ -565,6 +568,11 @@ impl<'a> Call<'a> {
             Some(Value::String(actor)) if actor == "user" => authz::Actor::User,
             Some(Value::String(actor)) if actor == "application" => authz::Actor::Application,
             Some(_) => return Err("`as` must be \"user\" (the default) or \"application\""),
+        };
+        let values = match args.get("values") {
+            None => Values::Typed,
+            Some(Value::String(values)) if values == "text" => Values::Text,
+            Some(_) => return Err("`values` must be \"text\", or not given"),
         };
         let Some(sql) = args.get("sql").and_then(Value::as_str) else {
             return Err("`sql` must be one statement, as a string");
@@ -595,6 +603,7 @@ impl<'a> Call<'a> {
             actor,
             sql,
             params,
+            values,
         })
     }
 }
@@ -625,6 +634,7 @@ struct Work {
     target: On,
     sql: String,
     params: Vec<Param>,
+    values: Values,
     statement: String,
     refusal: Option<Refusal>,
     log: Arc<OperationLog>,
@@ -723,7 +733,9 @@ impl Work {
             Kind::Query => Level::Read,
             Kind::Execute => Level::Write,
         };
-        let outcome = pool.run(level, &self.sql, &self.params, label).await;
+        let outcome = pool
+            .run(level, &self.sql, &self.params, self.values, label)
+            .await;
         let duration_ms = outcome
             .duration
             .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
@@ -755,7 +767,7 @@ impl Work {
             self.unlogged(&error);
         }
         match outcome.result {
-            Ok(rows) => ok_to_wire(rows.into_wire(self.kind == Kind::Execute)),
+            Ok(rows) => ok_to_wire(rows.into_wire(self.kind == Kind::Execute, self.values)),
             Err(Failure::Database { code, message }) => {
                 error_to_wire(json!({ "kind": "database", "code": code, "message": message }))
             }
