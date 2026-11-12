@@ -355,7 +355,7 @@ Before a statement is sent, the host parses it with Postgres's own parser and re
 "migrations": [ { "name": "0000_first_tables", "sql": "<the file drizzle-kit generated, as text>" }, ... ]
 ```
 
-- The list is the Application's whole history of migrations, in order, as `drizzle-kit` generates them (statements separated by its `--> statement-breakpoint` line). A name is 1 to 200 characters of letters, digits, `_` and `-`, unique in the list. Otherwise `400 malformed`.
+- The list is the Application's whole history of migrations, in order, as `drizzle-kit` generates them (statements separated by its `--> statement-breakpoint` line). A name is 1 to 200 characters of letters, digits, `_` and `-`, unique in the list. Otherwise `400 malformed`, which is checked before `migrations-diverged`. A migration's `sha256` is of its text's UTF-8 bytes.
 - A Version's list must begin with exactly the previous Version's list (same names, same text) and may add to it. Otherwise `409 migrations-diverged`, and nothing changes. Leaving the field out means an empty list.
 - The Version's record gains `"migrations": [ { "name", "sha256" } ]`.
 
@@ -380,9 +380,11 @@ For an Application the platform numbers `n`, with `<p>` the platform database's 
 
 - database `<p>_app_<n>`, whose comment is `vm application <name>`;
 - role `<p>_app_<n>_owner`: owns every object in it and applies migrations;
-- role `<p>_app_<n>_runtime`: what Application code runs as. It owns nothing. It may read and change rows in the tables the migrations made (`SELECT`, `INSERT`, `UPDATE`, `DELETE`, and use of their sequences), in tables made by later migrations too, and nothing else: it cannot create, alter or drop anything, not even temporary tables; it cannot `TRUNCATE`; it cannot connect to any other database of the instance, and no other Application's roles can connect to this one.
+- role `<p>_app_<n>_runtime`: what Application code runs as. It owns nothing. It may read and change rows in the tables the migrations made (`SELECT`, `INSERT`, `UPDATE`, `DELETE`, and use of their sequences), in tables made by later migrations too, and nothing else: it cannot create, alter or drop anything, not even temporary tables; it cannot `TRUNCATE`; it is a member of no other role; it cannot connect to the platform database or to any other Application's own database, and no other Application's roles can connect to this one.
 - Their passwords are the platform's own and never appear in an answer, a log record or an error message.
 - The platform needs only what `VM_DATABASE_URL`'s role was promised: creating databases and roles. It does not need a superuser.
+- What this does not close, because a role without superuser cannot close it or because it is the Application's own affair: every role of a Postgres instance may connect to `postgres` and `template1` unless the instance's owner revokes that; a role may change its own settings (`ALTER ROLE ... SET`) and create large objects; and a migration is the Contributors' own code, so one that creates a function running with its owner's rights gives the Application whatever that function does. The platform does not defend an Application's own database against its own Contributors.
+- If an Application's first Version fails in a migration, the own database may already exist, empty. A sequence a failed migration advanced stays advanced, as in any Postgres transaction.
 
 ### Operations on the own database
 
@@ -394,7 +396,7 @@ env.VM.invoke("execute", { own: true, as: "application", sql, params })
 env.VM.invoke("query",   { resource: "devops", sql, params })          // as before; `as` defaults to "user"
 ```
 
-- Exactly one of `own: true` and `resource` names the target; both or neither is `malformed`. `as` is `"user"` (the default) or `"application"`; anything else is `malformed`.
+- Exactly one of `own: true` and `resource` names the target; both or neither is `malformed`, and so is an `own` that is not exactly `true`. `as` is `"user"` (the default) or `"application"`; anything else is `malformed`.
 - On the own database no Declared access and no Grant is needed: being served the Application is enough. Both actors are allowed whenever a request is in flight.
 - **Acting as the Application is only for the own database.** `as: "application"` with a `resource` is refused with `not-own-database` (`refusal.resource` names it), whatever is declared or granted: Grants are held by Users. It is checked right after `no-request`, before anything about the Resource.
 - Everything else is as on a shared database: `query` runs in a read-only transaction and `execute` in a read-write one, as the runtime role; one statement; the statement check; the limits; the answers and errors; a connection returned only clean.
