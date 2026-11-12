@@ -133,8 +133,11 @@ fn many_users_at_once_each_see_their_own_label() {
 #[test]
 fn the_next_operation_on_the_same_connection_sees_its_own_label() {
     let s = Scenario::writable();
+    // A second Application declaring write, so that both Users may run
+    // query and execute (viewer declares only read).
+    s.install("ledger", "operations.js", &[(RESOURCE, "write")]);
     let users = [
-        (User::new("ann").in_groups(&[READERS, WRITERS]), "viewer"),
+        (User::new("ann").in_groups(&[READERS, WRITERS]), "ledger"),
         (User::new("ben").in_groups(&[READERS, WRITERS]), "board"),
     ];
     let mut by_connection: BTreeMap<i64, BTreeSet<String>> = BTreeMap::new();
