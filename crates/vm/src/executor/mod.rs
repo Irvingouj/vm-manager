@@ -28,6 +28,7 @@
 //! is hygiene, decided before an operation reaches the executor, and
 //! nothing here relies on it.
 
+mod identity;
 mod wire;
 
 use std::fmt;
@@ -38,6 +39,7 @@ use serde_json::{Map, Value};
 use tokio::sync::Semaphore;
 
 use crate::log;
+pub use identity::{IdentityKey, identity};
 use wire::{Connection, WireError};
 
 /// A password for a shared database. No `Display`; its `Debug` shows
@@ -147,7 +149,10 @@ pub enum Level {
 /// settings `vm.user`, `vm.application` and `vm.request`, and on an
 /// Application's own database `vm.actor` too, sent as parameters. A label
 /// only: Application SQL can overwrite it in its own transaction, and
-/// nothing on the platform relies on it.
+/// nothing on the platform relies on it. On an own database whose pool
+/// has the keys ([`Pool::with_identity_key`]) the same values are also
+/// attached signed, as `vm.ctx`, which is what `vm.identity()` and the
+/// Change history rely on.
 #[derive(Clone, Copy, Debug)]
 pub struct Label<'a> {
     pub user: &'a str,
@@ -273,6 +278,9 @@ pub struct Pool {
     /// Connections not in use: at most `limits.size`, since each stands for
     /// a permit given back.
     idle: Mutex<Vec<Connection>>,
+    /// An own database's keys: with them, every operation whose label has
+    /// an actor gets the signed identity attached, not only the label.
+    key: Option<Arc<IdentityKey>>,
 }
 
 impl fmt::Debug for Pool {
@@ -296,7 +304,16 @@ impl Pool {
             limits,
             permits: Semaphore::new(size),
             idle: Mutex::new(Vec::with_capacity(size)),
+            key: None,
         }
+    }
+
+    /// The same pool, attaching a signed identity with `key` to every
+    /// operation on an own database (blackbox/CONTRACT.md, "Identity").
+    #[must_use]
+    pub fn with_identity_key(mut self, key: Arc<IdentityKey>) -> Self {
+        self.key = Some(key);
+        self
     }
 
     /// Runs `sql` in a transaction of `level`, labelled `label`. A level
@@ -329,6 +346,7 @@ impl Pool {
             sql,
             params,
             label,
+            key: self.key.as_deref(),
         };
         let mut run = connection.operate(&operation, &self.limits).await;
         if run.stale && reused {

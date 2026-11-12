@@ -27,7 +27,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{Instant, timeout, timeout_at};
 
-use super::{Failure, Label, Level, Limit, Limits, Param, Rows, Target};
+use super::{Failure, IdentityKey, Label, Level, Limit, Limits, Param, Rows, Target, identity};
 
 /// The largest message other than a row that is read. A larger one is a
 /// protocol error and the connection is closed.
@@ -86,12 +86,23 @@ enum Incoming {
 }
 
 /// One operation: the Application's statement, its parameters, the level
-/// of its transaction and its identity label.
+/// of its transaction and its identity label; on an own database, the keys
+/// its signed identity is attached with.
 pub(super) struct Operation<'a> {
     pub(super) level: Level,
     pub(super) sql: &'a str,
     pub(super) params: &'a [Param],
     pub(super) label: Label<'a>,
+    pub(super) key: Option<&'a IdentityKey>,
+}
+
+/// Why the transaction's key could not be had.
+enum Exchange {
+    /// The connection failed before the server answered anything: probably
+    /// closed while idle.
+    Stale,
+    /// Anything else: the connection is not to be used again.
+    Failed,
 }
 
 /// How one operation went on the connection.
@@ -301,22 +312,67 @@ impl Connection {
     /// `limits.grace`, it is reported stuck. Nothing is committed unless
     /// the host sends `COMMIT`, so a connection dropped at any point rolls
     /// its transaction back.
+    ///
+    /// On an own database (a key, and a label with an actor) the host's
+    /// part takes one more round trip, before the Application's statement:
+    /// `BEGIN` and a first statement that sets the label and answers the
+    /// transaction's key (`vm.transaction_key()`) are sent and flushed; the
+    /// host then signs the identity over that key ([`IdentityKey::attach`])
+    /// and sends it as `vm.ctx`, as a parameter, together with the
+    /// Application's statement. Nothing of the keys is sent.
     pub(super) async fn operate(&mut self, operation: &Operation<'_>, limits: &Limits) -> Run {
         let mut out = BytesMut::new();
-        if encode_operation(operation, &mut out).is_err() {
-            // The text holds a NUL; checked before, so not expected here.
-            return self.ended(Err(Failure::Unavailable), None, false);
-        }
+        let host_left = match (operation.key, operation.label.actor) {
+            (Some(key), Some(actor)) => {
+                let transaction_key =
+                    match timeout(limits.statement, self.transaction_key(operation)).await {
+                        Ok(Ok(transaction_key)) => transaction_key,
+                        Ok(Err(Exchange::Stale)) => {
+                            return Run {
+                                stale: true,
+                                ..self.ended(Err(Failure::Unavailable), None, false)
+                            };
+                        }
+                        Ok(Err(Exchange::Failed)) | Err(_) => {
+                            return self.ended(Err(Failure::Unavailable), None, false);
+                        }
+                    };
+                let label = operation.label;
+                let who = identity(
+                    label.user,
+                    label.application,
+                    actor,
+                    Some(label.request),
+                    None,
+                );
+                let ctx = key.attach(&transaction_key, &who);
+                if encode_attached(&ctx, operation, &mut out).is_err() {
+                    return self.ended(Err(Failure::Unavailable), None, false);
+                }
+                1
+            }
+            _ => {
+                if encode_operation(operation, &mut out).is_err() {
+                    // The text holds a NUL; checked before, so not expected
+                    // here.
+                    return self.ended(Err(Failure::Unavailable), None, false);
+                }
+                2
+            }
+        };
         if self.send(&mut out).await.is_err() {
             return Run {
-                stale: true,
+                // After the key's round trip the server has answered: the
+                // connection was not stale, it broke.
+                stale: host_left == 2,
                 ..self.ended(Err(Failure::Unavailable), None, false)
             };
         }
         let sent = Instant::now();
         let deadline = sent + limits.statement;
-        let mut result = Reading::new(limits);
-        let mut answered = false;
+        let mut result = Reading::new(limits, host_left);
+        // After the key's round trip, the server has answered already.
+        let mut answered = host_left < 2;
         let status = loop {
             let row_limit = result.bytes_left();
             let incoming = match timeout_at(deadline, self.receive(row_limit)).await {
@@ -364,6 +420,49 @@ impl Connection {
         Run {
             ended: statement_ended,
             ..self.ended(result, Some(sent), clean)
+        }
+    }
+
+    /// Begins the operation's transaction, sets the label, and answers the
+    /// transaction's key: `BEGIN` and the host's first statement, flushed
+    /// without a Sync, so that the transaction stays open for the rest.
+    async fn transaction_key(&mut self, operation: &Operation<'_>) -> Result<String, Exchange> {
+        let mut out = BytesMut::new();
+        encode_keyed_begin(operation, &mut out).map_err(|_| Exchange::Failed)?;
+        frontend::flush(&mut out);
+        self.send(&mut out).await.map_err(|_| Exchange::Stale)?;
+        let mut answered = false;
+        let mut completed = 0_u8;
+        let mut key = None;
+        loop {
+            let incoming = match self.receive(MAX_MESSAGE).await {
+                Ok(incoming) => incoming,
+                Err(_) if !answered => return Err(Exchange::Stale),
+                Err(_) => return Err(Exchange::Failed),
+            };
+            answered = true;
+            match incoming {
+                Incoming::Message(
+                    Message::ParseComplete
+                    | Message::BindComplete
+                    | Message::NoticeResponse(_)
+                    | Message::ParameterStatus(_),
+                ) => {}
+                Incoming::Message(Message::DataRow(body)) if completed == 1 && key.is_none() => {
+                    key = Some(first_text(&body).ok_or(Exchange::Failed)?);
+                }
+                Incoming::Message(Message::CommandComplete(_)) => {
+                    completed += 1;
+                    if completed == 2 {
+                        return key.ok_or(Exchange::Failed);
+                    }
+                }
+                // An error (the server then skips everything up to a Sync,
+                // so the connection is not used again), or anything else.
+                Incoming::Message(_) | Incoming::Oversized { .. } => {
+                    return Err(Exchange::Failed);
+                }
+            }
         }
     }
 
@@ -508,12 +607,9 @@ async fn cancel(peer: SocketAddr, process_id: i32, secret_key: i32) -> Result<()
     Ok(())
 }
 
-/// The messages of one operation, ending in one Sync.
+/// The messages of one operation, ending in one Sync: `BEGIN`, the label,
+/// the Application's statement.
 fn encode_operation(operation: &Operation<'_>, out: &mut BytesMut) -> Result<(), WireError> {
-    let begin = match operation.level {
-        Level::Read => "BEGIN READ ONLY",
-        Level::Write => "BEGIN READ WRITE",
-    };
     let label = operation.label;
     let shared = [label.user, label.application, label.request];
     let own;
@@ -524,24 +620,61 @@ fn encode_operation(operation: &Operation<'_>, out: &mut BytesMut) -> Result<(),
             (HOST_FIRST_STATEMENT_OWN, &own)
         }
     };
-    let host: [(&str, &[&str]); 2] = [(begin, &[]), (first, values)];
-    for (sql, values) in host {
-        frontend::parse("", sql, values.iter().map(|_| 0), out).map_err(protocol)?;
-        frontend::bind(
-            "",
-            "",
-            std::iter::empty(),
-            values.iter(),
-            |value, buf| {
-                buf.put_slice(value.as_bytes());
-                Ok(IsNull::No)
-            },
-            std::iter::empty(),
-            out,
-        )
-        .map_err(protocol)?;
-        frontend::execute("", 0, out).map_err(protocol)?;
+    encode_host(begin_of(operation.level), &[], out)?;
+    encode_host(first, values, out)?;
+    encode_statement(operation, out)
+}
+
+/// `BEGIN` and the host's first statement on an own database, which sets
+/// the label and answers the transaction's key. No Sync.
+fn encode_keyed_begin(operation: &Operation<'_>, out: &mut BytesMut) -> Result<(), WireError> {
+    let label = operation.label;
+    let actor = label.actor.unwrap_or_default();
+    let values = [label.user, label.application, label.request, actor];
+    encode_host(begin_of(operation.level), &[], out)?;
+    encode_host(HOST_FIRST_STATEMENT_KEYED, &values, out)
+}
+
+/// The rest of an operation on an own database, ending in one Sync:
+/// `vm.ctx` set to `ctx`, then the Application's statement.
+fn encode_attached(
+    ctx: &str,
+    operation: &Operation<'_>,
+    out: &mut BytesMut,
+) -> Result<(), WireError> {
+    encode_host(HOST_ATTACH, &[ctx], out)?;
+    encode_statement(operation, out)
+}
+
+fn begin_of(level: Level) -> &'static str {
+    match level {
+        Level::Read => "BEGIN READ ONLY",
+        Level::Write => "BEGIN READ WRITE",
     }
+}
+
+/// One statement of the host's own, its values as text parameters, its
+/// result not described.
+fn encode_host(sql: &str, values: &[&str], out: &mut BytesMut) -> Result<(), WireError> {
+    frontend::parse("", sql, values.iter().map(|_| 0), out).map_err(protocol)?;
+    frontend::bind(
+        "",
+        "",
+        std::iter::empty(),
+        values.iter(),
+        |value, buf| {
+            buf.put_slice(value.as_bytes());
+            Ok(IsNull::No)
+        },
+        std::iter::empty(),
+        out,
+    )
+    .map_err(protocol)?;
+    frontend::execute("", 0, out).map_err(protocol)
+}
+
+/// The Application's statement over the extended protocol, then Sync.
+fn encode_statement(operation: &Operation<'_>, out: &mut BytesMut) -> Result<(), WireError> {
     // Types left for the server to infer (0), every parameter and every
     // result column in text (no format codes means text).
     frontend::parse("", operation.sql, operation.params.iter().map(|_| 0), out)
@@ -568,6 +701,13 @@ fn encode_operation(operation: &Operation<'_>, out: &mut BytesMut) -> Result<(),
     Ok(())
 }
 
+/// The first column of a row, as text.
+fn first_text(body: &DataRowBody) -> Option<String> {
+    let range = body.ranges().next().ok()??;
+    let bytes = body.buffer().get(range?)?;
+    std::str::from_utf8(bytes).ok().map(str::to_owned)
+}
+
 /// The host's own first statement in the transaction, before Application
 /// SQL: it sets the identity label as transaction-local settings, gone
 /// when the transaction ends (ADR 0013: on a shared database, with nothing
@@ -585,6 +725,21 @@ const HOST_FIRST_STATEMENT: &str = "SELECT set_config('vm.user', $1, true), \
 const HOST_FIRST_STATEMENT_OWN: &str = "SELECT set_config('vm.user', $1, true), \
      set_config('vm.application', $2, true), set_config('vm.request', $3, true), \
      set_config('vm.actor', $4, true)";
+
+/// The same on an own database with its keys known (blackbox/CONTRACT.md,
+/// "Identity"), answering the transaction's key in its first column. Every
+/// name is qualified: the runtime role may set its own `search_path` for
+/// its future sessions.
+const HOST_FIRST_STATEMENT_KEYED: &str = "SELECT vm.transaction_key(), \
+     pg_catalog.set_config('vm.user', $1, true), \
+     pg_catalog.set_config('vm.application', $2, true), \
+     pg_catalog.set_config('vm.request', $3, true), \
+     pg_catalog.set_config('vm.actor', $4, true)";
+
+/// The host's second statement on an own database: attaches the signed
+/// identity, valid in this transaction only, as the transaction-local
+/// setting `vm.ctx`.
+const HOST_ATTACH: &str = "SELECT pg_catalog.set_config('vm.ctx', $1, true)";
 
 /// What to do after a message.
 enum Step {
@@ -612,9 +767,11 @@ struct Reading {
 }
 
 impl Reading {
-    fn new(limits: &Limits) -> Self {
+    /// `host_left`: the statements of the host's own still to be answered
+    /// before the Application's.
+    fn new(limits: &Limits, host_left: u8) -> Self {
         Self {
-            host_left: 2,
+            host_left,
             columns: None,
             rows: Vec::new(),
             affected: None,

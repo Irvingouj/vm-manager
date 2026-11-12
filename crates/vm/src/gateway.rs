@@ -683,11 +683,11 @@ impl Work {
                 },
             },
             On::Own => {
-                own_pool = self.own.pool(&self.in_flight.application);
+                own_pool = self.own.pool(&self.in_flight.application).await;
                 match &own_pool {
                     Some(pool) => pool,
-                    // A serving Version means a ready own database; this is
-                    // not reached.
+                    // A serving Version means a ready own database: reached
+                    // only when its keys could not be read (logged).
                     None => {
                         let answer = error_to_wire(json!({ "kind": "unavailable" }));
                         return self.failed_unsent("unavailable", answer).await;

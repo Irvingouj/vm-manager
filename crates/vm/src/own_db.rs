@@ -37,25 +37,35 @@
 //!
 //! Migrations: all pending ones in one transaction on the owner's
 //! connection, each split at `drizzle-kit`'s `--> statement-breakpoint`,
-//! with the record of which are applied (table `vm.migrations`, made by the
-//! first transaction that applies one, which the runtime role cannot read)
-//! written in that same transaction, so the record and the structure cannot
-//! disagree. The transaction takes an advisory lock first, so two Versions
-//! sent at once never interleave their migrations; the second then finds
-//! the first's in the record. A list that does not begin with what the
-//! record holds is [`Problem::Diverged`].
+//! with the record of which are applied (table `vm.migrations`, which the
+//! runtime role cannot read) written in that same transaction, so the
+//! record and the structure cannot disagree. The transaction takes an
+//! advisory lock first, so two Versions sent at once never interleave their
+//! migrations; the second then finds the first's in the record. A list
+//! that does not begin with what the record holds is [`Problem::Diverged`].
+//!
+//! Identity and Change history (blackbox/CONTRACT.md, "Identity and Change
+//! history in the own database"): the platform's schema `vm`
+//! (`own_db_schema.sql`) is made when the own database is, and made sure of
+//! again at the start of every Version's migrations transaction, so an own
+//! database made before it gets it too. Each pending migration runs with
+//! its own signed identity attached (`actor` `migration`, the Contributor
+//! who sent the Version, the migration's name), and right after it the
+//! capture triggers are put on every table it made, in the same
+//! transaction. The own database's keys are read once, over the owner's
+//! connection, and given to its runtime pool.
 
 use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
-use std::sync::{Arc, Mutex, PoisonError, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock};
 use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 use tokio::time::Instant;
-use tokio_postgres::{CancelToken, Client, Config, NoTls};
+use tokio_postgres::{CancelToken, Client, Config, GenericClient, NoTls, Row};
 
-use crate::executor::{self, Levels, Password, Source, Target};
+use crate::executor::{self, IdentityKey, Levels, Password, Source, Target};
 use crate::log;
 use crate::platform_db::{
     Connection, DatabaseAddress, DbError, PlatformDatabase, quote_identifier,
@@ -98,6 +108,43 @@ const MAX_IDENTIFIER: usize = 63;
 /// The advisory lock every migration transaction takes in its own
 /// database: "vmmigrat".
 const MIGRATIONS_LOCK: i64 = 0x766d_6d69_6772_6174;
+
+/// The platform's schema `vm`, made sure of (idempotent).
+const PLATFORM_SCHEMA: &str = include_str!("own_db_schema.sql");
+
+/// The platform's schema `vm` made sure of, and the runtime role `runtime`
+/// (quoted) given what it may do there: use the schema, read `vm.history`,
+/// call `vm.identity()` and `vm.transaction_key()`; nothing else.
+fn platform_schema(runtime: &str) -> String {
+    format!(
+        "{PLATFORM_SCHEMA}
+         GRANT USAGE ON SCHEMA vm TO {runtime};
+         REVOKE ALL ON ALL TABLES IN SCHEMA vm FROM {runtime};
+         REVOKE ALL ON ALL SEQUENCES IN SCHEMA vm FROM {runtime};
+         REVOKE ALL ON ALL FUNCTIONS IN SCHEMA vm FROM {runtime};
+         GRANT SELECT ON TABLE vm.history TO {runtime};
+         GRANT EXECUTE ON FUNCTION vm.identity(), vm.transaction_key() TO {runtime};"
+    )
+}
+
+/// The own database's keys, read over the owner role's connection.
+async fn read_key(client: &impl GenericClient) -> Result<IdentityKey, Problem> {
+    let row: Row = client
+        .query_one("SELECT k1, k2 FROM vm.keys", &[])
+        .await
+        .map_err(|e| Problem::postgres("reading the own database's keys", &e))?;
+    key_of(&row)
+}
+
+fn key_of(row: &Row) -> Result<IdentityKey, Problem> {
+    let unreadable = || Problem::Unavailable {
+        step: "reading the own database's keys",
+        code: None,
+    };
+    let k1: &[u8] = row.try_get(0).map_err(|_| unreadable())?;
+    let k2: &[u8] = row.try_get(1).map_err(|_| unreadable())?;
+    IdentityKey::from_parts(k1, k2).ok_or_else(unreadable)
+}
 
 /// One migration of a Version, as `drizzle-kit` generated it.
 #[derive(Debug)]
@@ -158,6 +205,15 @@ pub enum Problem {
 }
 
 impl Problem {
+    /// A fixed description, for the program's log.
+    fn step(&self) -> &'static str {
+        match self {
+            Self::Diverged => "the migrations diverged",
+            Self::Failed { .. } => "a migration failed",
+            Self::Unavailable { step, .. } => step,
+        }
+    }
+
     fn unavailable(step: &'static str, error: &DbError) -> Self {
         Self::Unavailable {
             step,
@@ -208,6 +264,8 @@ struct Known {
     number: i64,
     owner_password: Secret,
     runtime_password: Secret,
+    /// Its keys, once read.
+    key: OnceLock<Arc<IdentityKey>>,
 }
 
 /// The names of `n`'s database and roles.
@@ -276,6 +334,7 @@ impl OwnDatabases {
                     number: row.try_get(1).map_err(DbError::from)?,
                     owner_password: Secret(row.try_get(2).map_err(DbError::from)?),
                     runtime_password: Secret(row.try_get(3).map_err(DbError::from)?),
+                    key: OnceLock::new(),
                 }),
             );
         }
@@ -298,24 +357,39 @@ impl OwnDatabases {
 
     /// Makes sure the own database of the Application `name`, numbered
     /// `number`, exists, and applies the migrations of `list` it has not
-    /// had, all or none.
+    /// had, all or none, as sent by the Contributor `sender`.
     pub async fn prepare(
         &self,
         number: i64,
         name: &str,
+        sender: &str,
         list: &[Migration],
     ) -> Result<(), Problem> {
         let known = match self.known(name) {
             Some((_, known)) => known,
             None => self.provision(number, name).await?,
         };
-        self.migrate(&known, list).await
+        self.migrate(&known, name, sender, list).await
     }
 
     /// The pool of the runtime role's connections to `application`'s own
-    /// database, if it has one.
-    pub fn pool(&self, application: &str) -> Option<Arc<executor::Pool>> {
+    /// database, if it has one. Its keys are read first if they are not
+    /// known yet (the first operation after the program starts).
+    pub async fn pool(&self, application: &str) -> Option<Arc<executor::Pool>> {
         let (key, known) = self.known(application)?;
+        if let Some(pool) = self.held(application) {
+            return Some(pool);
+        }
+        let identity = match self.identity_key(&known).await {
+            Ok(identity) => identity,
+            Err(problem) => {
+                log::record(
+                    "own-database-unavailable",
+                    serde_json::json!({ "application": application, "problem": problem.step() }),
+                );
+                return None;
+            }
+        };
         let mut pools = self.pools.lock().unwrap_or_else(PoisonError::into_inner);
         pools.clock = pools.clock.saturating_add(1);
         let now = pools.clock;
@@ -333,12 +407,15 @@ impl OwnDatabases {
             names.runtime,
             Password::new(known.runtime_password.0.clone()),
         );
-        let pool = Arc::new(executor::Pool::new(
-            Source::OwnDatabase(Arc::clone(&key)),
-            Levels::Both,
-            target,
-            self.limits.clone(),
-        ));
+        let pool = Arc::new(
+            executor::Pool::new(
+                Source::OwnDatabase(Arc::clone(&key)),
+                Levels::Both,
+                target,
+                self.limits.clone(),
+            )
+            .with_identity_key(identity),
+        );
         if pools.held.len() >= OWN_POOLS_HELD {
             let oldest = pools
                 .held
@@ -357,6 +434,58 @@ impl OwnDatabases {
             },
         );
         Some(pool)
+    }
+
+    /// The pool held for `application`, marked as just used.
+    fn held(&self, application: &str) -> Option<Arc<executor::Pool>> {
+        let mut pools = self.pools.lock().unwrap_or_else(PoisonError::into_inner);
+        pools.clock = pools.clock.saturating_add(1);
+        let now = pools.clock;
+        let held = pools.held.get_mut(application)?;
+        held.used = now;
+        Some(Arc::clone(&held.pool))
+    }
+
+    /// The own database's keys: as known, or read over the owner role's
+    /// connection, making the platform's schema first if the own database
+    /// has none (one made before it, no Version sent since).
+    async fn identity_key(&self, known: &Known) -> Result<Arc<IdentityKey>, Problem> {
+        if let Some(key) = known.key.get() {
+            return Ok(Arc::clone(key));
+        }
+        let names = self.names(known.number)?;
+        let read = tokio::time::timeout(SETUP_TIMEOUT, async {
+            let mut connection = self.connect_owner(&names, known).await?;
+            let client = connection.client_mut();
+            let unavailable =
+                |e: &tokio_postgres::Error| Problem::postgres("reading the own database's keys", e);
+            let transaction = client.transaction().await.map_err(|e| unavailable(&e))?;
+            let present: bool = transaction
+                .query_one("SELECT to_regclass('vm.keys') IS NOT NULL", &[])
+                .await
+                .and_then(|row| row.try_get(0))
+                .map_err(|e| unavailable(&e))?;
+            if !present {
+                let schema = format!(
+                    "SELECT pg_advisory_xact_lock({MIGRATIONS_LOCK});
+                     {}",
+                    platform_schema(&quote_identifier(&names.runtime))
+                );
+                transaction
+                    .batch_execute(&schema)
+                    .await
+                    .map_err(|e| unavailable(&e))?;
+            }
+            let key = read_key(&transaction).await?;
+            transaction.commit().await.map_err(|e| unavailable(&e))?;
+            Ok::<_, Problem>(key)
+        })
+        .await
+        .map_err(|_| Problem::Unavailable {
+            step: "reading the own database's keys: it took too long",
+            code: None,
+        })??;
+        Ok(Arc::clone(known.key.get_or_init(|| Arc::new(read))))
     }
 
     fn known(&self, application: &str) -> Option<(Arc<str>, Arc<Known>)> {
@@ -524,6 +653,7 @@ impl OwnDatabases {
                     number,
                     owner_password: Secret(row.try_get(0).map_err(DbError::from)?),
                     runtime_password: Secret(row.try_get(1).map_err(DbError::from)?),
+                    key: OnceLock::new(),
                 };
                 Ok((known, row.try_get(2).map_err(DbError::from)?))
             })
@@ -563,8 +693,8 @@ impl OwnDatabases {
     }
 
     /// As the owner role, in the own database: its comment, `PUBLIC`'s
-    /// rights taken away, and the runtime role's rights, now and on what
-    /// the owner makes later.
+    /// rights taken away, the runtime role's rights, now and on what the
+    /// owner makes later, and the platform's schema `vm`.
     async fn set_up(&self, names: &Names, application: &str, known: &Known) -> Result<(), Problem> {
         let mut connection = self.connect_owner(names, known).await?;
         let database = quote_identifier(&names.database);
@@ -582,8 +712,10 @@ impl OwnDatabases {
              ALTER DEFAULT PRIVILEGES FOR ROLE {owner}
                  GRANT USAGE, SELECT ON SEQUENCES TO {runtime};
              ALTER DEFAULT PRIVILEGES FOR ROLE {owner}
-                 GRANT USAGE ON SCHEMAS TO {runtime};",
+                 GRANT USAGE ON SCHEMAS TO {runtime};
+             {schema}",
             comment = literal(&format!("vm application {application}")),
+            schema = platform_schema(&runtime),
         );
         let client = connection.client_mut();
         let transaction = client
@@ -619,8 +751,18 @@ impl OwnDatabases {
     }
 
     /// Applies the migrations of `list` the own database has not had, in
-    /// one transaction as the owner role, within [`MIGRATION_TIMEOUT`].
-    async fn migrate(&self, known: &Known, list: &[Migration]) -> Result<(), Problem> {
+    /// one transaction as the owner role, within [`MIGRATION_TIMEOUT`], as
+    /// sent by the Contributor `sender` for the Application `application`.
+    /// The platform's schema is made sure of first, in the same
+    /// transaction; each migration runs with its identity attached, and the
+    /// tables it made are captured right after it.
+    async fn migrate(
+        &self,
+        known: &Known,
+        application: &str,
+        sender: &str,
+        list: &[Migration],
+    ) -> Result<(), Problem> {
         let names = self.names(known.number)?;
         let deadline = Instant::now() + MIGRATION_TIMEOUT;
         let mut connection = self.connect_owner(&names, known).await?;
@@ -635,68 +777,46 @@ impl OwnDatabases {
             .await
             .ok_or_else(timed_out)?
             .map_err(|e| unavailable(&e))?;
-        let lock = format!("SELECT pg_advisory_xact_lock({MIGRATIONS_LOCK})");
-        within(deadline, &cancel, transaction.batch_execute(&lock))
+        let schema = format!(
+            "SELECT pg_advisory_xact_lock({MIGRATIONS_LOCK});
+             {}",
+            platform_schema(&quote_identifier(&names.runtime))
+        );
+        within(deadline, &cancel, transaction.batch_execute(&schema))
             .await
             .ok_or_else(timed_out)?
-            .map_err(|e| unavailable(&e))?;
-        // Before the first migration there is no record.
-        let recorded: bool = within(
+            .map_err(|e| Problem::postgres("making sure of the platform's schema vm", &e))?;
+        let key = within(
             deadline,
             &cancel,
-            transaction.query_one("SELECT to_regclass('vm.migrations') IS NOT NULL", &[]),
+            transaction.query_one("SELECT k1, k2 FROM vm.keys", &[]),
         )
         .await
         .ok_or_else(timed_out)?
-        .and_then(|row| row.try_get(0))
+        .map_err(|e| Problem::postgres("reading the own database's keys", &e))
+        .and_then(|row| key_of(&row))?;
+        let rows = within(
+            deadline,
+            &cancel,
+            transaction.query(
+                "SELECT name, sha256 FROM vm.migrations ORDER BY position",
+                &[],
+            ),
+        )
+        .await
+        .ok_or_else(timed_out)?
         .map_err(|e| unavailable(&e))?;
-        let mut applied = Vec::new();
-        if recorded {
-            let rows = within(
-                deadline,
-                &cancel,
-                transaction.query(
-                    "SELECT name, sha256 FROM vm.migrations ORDER BY position",
-                    &[],
-                ),
-            )
-            .await
-            .ok_or_else(timed_out)?
-            .map_err(|e| unavailable(&e))?;
-            for row in &rows {
-                applied.push(Recorded {
-                    name: row.try_get(0).map_err(|e| unavailable(&e))?,
-                    sha256: row.try_get(1).map_err(|e| unavailable(&e))?,
-                });
-            }
+        let mut applied = Vec::with_capacity(rows.len());
+        for row in &rows {
+            applied.push(Recorded {
+                name: row.try_get(0).map_err(|e| unavailable(&e))?,
+                sha256: row.try_get(1).map_err(|e| unavailable(&e))?,
+            });
         }
         if !continues(&applied, list) {
             return Err(Problem::Diverged);
         }
         let pending = list.get(applied.len()..).unwrap_or_default();
-        if pending.is_empty() {
-            // Nothing is changed; the transaction ends with the connection.
-            return Ok(());
-        }
-        if !recorded {
-            let record = format!(
-                "CREATE SCHEMA IF NOT EXISTS vm;
-                 CREATE TABLE IF NOT EXISTS vm.migrations (
-                     position integer PRIMARY KEY,
-                     name text NOT NULL UNIQUE,
-                     sha256 text NOT NULL,
-                     sql text NOT NULL,
-                     applied_at timestamptz NOT NULL DEFAULT now()
-                 );
-                 REVOKE ALL ON SCHEMA vm FROM {runtime};
-                 REVOKE ALL ON TABLE vm.migrations FROM {runtime};",
-                runtime = quote_identifier(&names.runtime)
-            );
-            within(deadline, &cancel, transaction.batch_execute(&record))
-                .await
-                .ok_or_else(timed_out)?
-                .map_err(|e| unavailable(&e))?;
-        }
         let failed = |migration: &Migration, error: tokio_postgres::Error| match error.as_db_error()
         {
             Some(db) => Problem::Failed {
@@ -706,7 +826,38 @@ impl OwnDatabases {
             },
             None => unavailable(&error),
         };
+        let transaction_key: Option<String> = if pending.is_empty() {
+            None
+        } else {
+            within(
+                deadline,
+                &cancel,
+                transaction.query_one("SELECT vm.transaction_key()", &[]),
+            )
+            .await
+            .ok_or_else(timed_out)?
+            .and_then(|row| row.try_get(0))
+            .map(Some)
+            .map_err(|e| unavailable(&e))?
+        };
         for (index, migration) in pending.iter().enumerate() {
+            // The migration's own identity, valid in this transaction only.
+            let who = executor::identity(
+                sender,
+                application,
+                "migration",
+                None,
+                Some(&migration.name),
+            );
+            let ctx = key.attach(transaction_key.as_deref().unwrap_or_default(), &who);
+            within(
+                deadline,
+                &cancel,
+                transaction.execute("SELECT pg_catalog.set_config('vm.ctx', $1, true)", &[&ctx]),
+            )
+            .await
+            .ok_or_else(timed_out)?
+            .map_err(|e| unavailable(&e))?;
             for statement in migration.sql.split(BREAKPOINT) {
                 if statement.trim().is_empty() {
                     continue;
@@ -716,6 +867,15 @@ impl OwnDatabases {
                     .ok_or_else(timed_out)?
                     .map_err(|e| failed(migration, e))?;
             }
+            // The tables it made are captured from its end on.
+            within(
+                deadline,
+                &cancel,
+                transaction.batch_execute("SELECT vm.capture_new_tables()"),
+            )
+            .await
+            .ok_or_else(timed_out)?
+            .map_err(|e| failed(migration, e))?;
             let position =
                 i32::try_from(applied.len() + index).map_err(|_| Problem::Unavailable {
                     step: "applying migrations: too many",
@@ -744,7 +904,9 @@ impl OwnDatabases {
                 // migration is named, as the one that left it so.
                 Some(last) => failed(last, e),
                 None => unavailable(&e),
-            })
+            })?;
+        known.key.get_or_init(|| Arc::new(key));
+        Ok(())
     }
 }
 

@@ -437,7 +437,11 @@ impl Registry {
         if !continues(&previous, &version.migrations) {
             return Ok(Sent::Diverged);
         }
-        match self.own.prepare(id, name, &version.migrations).await {
+        match self
+            .own
+            .prepare(id, name, sender, &version.migrations)
+            .await
+        {
             Ok(()) => {}
             Err(Problem::Diverged) => return Ok(Sent::Diverged),
             Err(Problem::Failed {
