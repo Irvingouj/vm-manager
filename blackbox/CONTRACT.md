@@ -477,7 +477,7 @@ Every table an Application's migrations make, in any schema but `vm`, is capture
 
 ### A change with no identity fails
 
-A row of a captured table cannot be inserted, updated or deleted, by any role, in a transaction with no verifiable identity: the statement fails with SQLSTATE `VM001`, nothing is changed and nothing is recorded. There is no history row "made by nobody". Through the host this cannot happen to an Application; if it did, the answer would be the usual `{ error: { kind: "database", code: "VM001", ... } }`.
+A row of a captured table cannot be inserted, updated or deleted, by any role, in a transaction with no verifiable identity: the statement fails with SQLSTATE `VM001`, nothing is changed and nothing is recorded. (A superuser, and the role that owns the tables, can still switch the capture itself off; that is not Application code, see "What this does not close".) There is no history row "made by nobody". Through the host this cannot happen to an Application; if it did, the answer would be the usual `{ error: { kind: "database", code: "VM001", ... } }`.
 
 ### What the runtime role cannot do
 
