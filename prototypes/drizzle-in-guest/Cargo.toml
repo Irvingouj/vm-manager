@@ -1,0 +1,16 @@
+[workspace]
+resolver = "3"
+members = ["host"]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+
+[profile.release]
+strip = "debuginfo"
+
+# The runtime vendored (and patched) by the execution-core and identity
+# spikes, used unmodified here; every change is listed in
+# ../execution-core/vendor/VENDORED.md.
+[patch."https://github.com/openworkers/openworkers-runtime-v8"]
+openworkers-runtime-v8 = { path = "../execution-core/vendor/openworkers-runtime-v8" }

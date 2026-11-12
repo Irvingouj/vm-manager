@@ -1,0 +1,28 @@
+[package]
+name = "dig-host"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Spike: does real Drizzle run in the guest, with each statement one host operation?"
+
+[[bin]]
+name = "dig-host"
+path = "src/main.rs"
+
+[dependencies]
+openworkers-core = { git = "https://github.com/openworkers/openworkers-core", tag = "v0.18.1", features = ["invoke"] }
+openworkers-runtime-v8 = { git = "https://github.com/openworkers/openworkers-runtime-v8", tag = "v0.18.7", features = ["invoke"] }
+
+bytes = "1"
+chrono = "0.4"
+hex = "0.4"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+serde_json = "1"
+sha2 = "0.10"
+sqlparser = "0.59"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "sync", "macros", "time"] }
+tokio-postgres = { version = "0.7", features = ["with-chrono-0_4", "with-uuid-1", "with-serde_json-1"] }
+uuid = "1"

@@ -1,0 +1,4 @@
+[env]
+# See ../execution-core/.cargo/config.toml. An empty or missing file means no
+# snapshot; `dig-host snapshot` writes one.
+RUNTIME_SNAPSHOT_PATH = { value = "runtime-snapshot.bin", relative = true }
