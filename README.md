@@ -8,6 +8,14 @@ An open-source, self-hosted platform on which an enterprise's employees and thei
 
 One Cargo workspace at the root; the Rust version is pinned in `rust-toolchain.toml` (rustup installs it). The first build downloads a V8 prebuilt.
 
+Prerequisites: a C compiler and libclang. The statement parser (`pg_query`, Postgres's own parser compiled in) builds C code and runs bindgen, which loads libclang. Either install libclang for the whole system (Debian and Ubuntu: `apt install clang libclang-dev`; macOS: the Xcode Command Line Tools; Windows: LLVM from llvm.org), or, on Linux without root, run
+
+```
+scripts/fetch-libclang.sh   # libclang from the PyPI wheel into .tools/libclang (git-ignored)
+```
+
+`.cargo/config.toml` adds `.tools/libclang` to where the build looks, so a plain `cargo build` and `scripts/gate.sh` find it without any variable exported by hand. A `LIBRARY_PATH` or `CLANG_PATH` already set in your shell takes precedence over that file.
+
 ```
 cargo build              # target/debug/vm
 target/debug/vm --version

@@ -15,6 +15,7 @@ name = "vm"
 path = "src/main.rs"
 
 [dependencies]
+authz = { path = "../authz" }
 openworkers-core.workspace = true
 openworkers-runtime-v8.workspace = true
 
@@ -25,6 +26,9 @@ hyper.workspace = true
 hyper-util.workspace = true
 serde.workspace = true
 serde_json = { workspace = true, features = ["raw_value"] }
+fallible-iterator.workspace = true
+pg_query.workspace = true
+postgres-protocol.workspace = true
 sha2.workspace = true
 tokio-postgres.workspace = true
 tokio.workspace = true

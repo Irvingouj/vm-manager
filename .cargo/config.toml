@@ -4,3 +4,14 @@
 # .cargo/config.toml is not read when it is a dependency, so we must set it.
 # An empty or missing file means no snapshot: a slightly slower context start.
 RUNTIME_SNAPSHOT_PATH = { value = "target/runtime-snapshot.bin", relative = true }
+
+# The statement parser (pg_query) runs bindgen at build time, which needs
+# libclang (README.md, "Build and test"). These add `.tools/libclang`, which
+# scripts/fetch-libclang.sh fills on a machine without one, to the places
+# clang-sys searches; a libclang installed on the system is still found.
+# LIBRARY_PATH is what clang-sys reads beside its own LIBCLANG_PATH, which
+# would replace the system's places instead of adding to them. CLANG_PATH is
+# the compiler bindgen asks for its system include directories; when it does
+# not exist bindgen looks for a clang on PATH as usual.
+LIBRARY_PATH = { value = ".tools/libclang", relative = true }
+CLANG_PATH = { value = ".tools/libclang/system-cc", relative = true }
