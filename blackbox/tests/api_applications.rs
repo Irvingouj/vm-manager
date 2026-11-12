@@ -77,15 +77,18 @@ fn creating_an_application_answers_201_with_the_application() {
 }
 
 #[test]
-fn the_description_is_optional_and_kept_exactly_as_given() {
+fn the_description_is_optional_null_when_not_given_and_kept_exactly_as_given() {
     let vm = vm();
     let api = vm.api_as(&alice());
     let without = api.create_application("no-description");
     without.expect_status(201);
     let description = &without.json()["description"];
     assert!(
-        description.is_null() || description == "",
-        "expected no description to read as null or \"\", got {description}"
+        without
+            .json()
+            .get("description")
+            .is_some_and(Value::is_null),
+        "expected `description: null` when none was given, got {description}"
     );
     let text = "Zoë's board: 数据, \"quotes\", back\\slash, emoji 🚀, a\nnewline";
     let with =
@@ -143,6 +146,8 @@ fn names_that_are_lower_case_dns_labels_of_up_to_63_characters_are_accepted() {
         "my-app",
         "a-b-c-d",
         "x--y",
+        "xn-a",
+        "x-n--a",
         "apis",
         "my-api",
         "www1",
@@ -248,6 +253,48 @@ fn the_platforms_own_names_are_400_reserved_name() {
 }
 
 #[test]
+fn a_name_may_start_with_a_digit() {
+    let vm = vm();
+    for name in ["0", "9", "9lives", "123", "1-2-3", "4u"] {
+        let response = vm.api_as(&alice()).create_application(name);
+        assert_eq!(
+            response.status,
+            201,
+            "expected the name {name:?}, which starts with a digit, to be accepted, got\n{}",
+            response.describe()
+        );
+        assert_new_application(&response.json(), name, "alice");
+        let served_at = vm.get_as(&bob(), name, "/");
+        assert_eq!(
+            served_at.status,
+            404,
+            "expected {name}.vm.test to be the Application's address (404: no Version yet), got\n{}",
+            served_at.describe()
+        );
+        assert_eq!(vm.records_of(&served_at).request["user"], "bob");
+    }
+}
+
+#[test]
+fn names_starting_with_xn_dash_dash_are_400_invalid_name() {
+    let vm = vm();
+    let api = vm.api_as(&alice());
+    // `xn--` is how DNS writes a Unicode label (punycode): `xn--pi-...` could
+    // read as a look-alike of a platform name once decoded.
+    for name in [
+        "xn--",
+        "xn--a",
+        "xn--80ak6aa92e",
+        "xn--pi-6cc",
+        "xn--www-yla",
+        "xn--9lives",
+    ] {
+        assert_api_error(&api.create_application(name), 400, "invalid-name");
+        assert_api_error(&api.get_application(name), 404, "not-found");
+    }
+}
+
+#[test]
 fn look_alikes_of_the_platforms_own_names_are_refused_and_never_take_their_place() {
     let vm = vm();
     let api = vm.api_as(&alice());
@@ -266,16 +313,9 @@ fn look_alikes_of_the_platforms_own_names_are_refused_and_never_take_their_place
         "admin\u{0}",
         "git\n",
     ] {
-        let response = api.create_application(name);
-        let reason = serde_json::from_slice::<Value>(response.body())
-            .ok()
-            .and_then(|b| b["error"]["reason"].as_str().map(str::to_owned));
-        assert!(
-            response.status == 400
-                && matches!(reason.as_deref(), Some("invalid-name" | "reserved-name")),
-            "expected the look-alike {name:?} to be refused `400` (invalid-name or reserved-name), got\n{}",
-            response.describe()
-        );
+        // Only an exact own name is `reserved-name`; these are not
+        // lower-case DNS labels at all.
+        assert_api_error(&api.create_application(name), 400, "invalid-name");
     }
     for name in RESERVED {
         assert_api_error(&api.get_application(name), 404, "not-found");

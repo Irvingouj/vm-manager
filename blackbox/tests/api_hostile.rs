@@ -40,6 +40,12 @@ fn state_of(api: &Api<'_>, name: &str) -> (Value, Vec<Value>) {
     (api.application(name), api.versions(name))
 }
 
+/// mallory owns `board`, with one Version.
+fn mallory_owns_board(vm: &Vm) {
+    vm.api_as(&mallory())
+        .create_with_bundle("board", &marked_bundle("board"));
+}
+
 /// The `reason` of an API error answer, if it is one.
 fn reason_of(response: &Response) -> Option<String> {
     serde_json::from_slice::<Value>(response.body())
@@ -160,14 +166,12 @@ fn fields_the_platform_sets_cannot_be_chosen_when_creating_an_application() {
         "address": "api.vm.test",
         "created_at": "1999-01-01T00:00:00Z",
     }));
-    let reason = reason_of(&response);
     assert!(
-        response.status == 201
-            || (response.status == 400 && reason.as_deref() == Some("malformed")),
-        "expected extra fields to be ignored (201) or refused (400 malformed), got\n{}",
+        response.status == 201,
+        "expected fields the request does not have to be ignored (201), got\n{}",
         response.describe()
     );
-    if response.status == 201 {
+    {
         let application = vm.api_as(&alice()).application("smuggled");
         assert_eq!(application["created_by"], "mallory", "in {application}");
         assert_eq!(
@@ -213,14 +217,12 @@ fn fields_the_platform_sets_cannot_be_chosen_when_sending_a_version() {
     }
     let before = state_of(&vm.api_as(&alice()), "theirs");
     let response = vm.api_as(&mallory()).send_version("mine", &body);
-    let reason = reason_of(&response);
     assert!(
-        response.status == 201
-            || (response.status == 400 && reason.as_deref() == Some("malformed")),
-        "expected extra fields to be ignored (201) or refused (400 malformed), got\n{}",
+        response.status == 201,
+        "expected fields the request does not have to be ignored (201), got\n{}",
         response.describe()
     );
-    if response.status == 201 {
+    {
         let version = response.json();
         assert_eq!(version["number"], 2, "in {version}");
         assert_eq!(version["application"], "mine", "in {version}");
@@ -246,7 +248,7 @@ fn fields_the_platform_sets_cannot_be_chosen_when_sending_a_version() {
 }
 
 #[test]
-fn duplicate_keys_never_let_a_platform_name_through() {
+fn a_key_given_twice_is_400_malformed_and_never_lets_a_name_through() {
     let vm = vm();
     let api = vm.api_as(&mallory());
     for body in [
@@ -254,22 +256,41 @@ fn duplicate_keys_never_let_a_platform_name_through() {
         r#"{"name":"dup-last-reserved","name":"api"}"#,
         r#"{"name":"Not_Valid","name":"dup-first-invalid"}"#,
         r#"{"name":"dup-last-invalid","name":"Not_Valid"}"#,
+        r#"{"name":"dup-same","name":"dup-same"}"#,
+        r#"{"name":"dup-desc","description":"a","description":"b"}"#,
     ] {
         let response = api.post_raw("/v1/applications", body);
         assert!(
-            response.status == 400 || response.status == 201,
-            "expected a body with a duplicate key to be refused (400) or taken as one name, got\n{}",
+            response.status == 400,
+            "expected `400 malformed` for {body}, got\n{}",
             response.describe()
         );
-        if response.status == 201 {
-            let name = response.json()["name"].as_str().unwrap().to_owned();
-            assert!(
-                name.starts_with("dup-"),
-                "expected only a valid, free name to be created from {body}, got {name:?}"
-            );
-        }
+        assert_api_error(&response, 400, "malformed");
     }
-    for name in ["api", "Not_Valid", "not-valid"] {
+    mallory_owns_board(&vm);
+    for body in [
+        r#"{"bundle":"a","bundle":"b","declared_access":{"resources":{}},"git_commit":"0123456789abcdef0123456789abcdef01234567"}"#,
+        r#"{"bundle":"a","declared_access":{"resources":{"r":{"kind":"postgres","access":"read","access":"write"}}},"git_commit":"0123456789abcdef0123456789abcdef01234567"}"#,
+    ] {
+        let response = api.post_raw("/v1/applications/board/versions", body);
+        assert_api_error(&response, 400, "malformed");
+    }
+    assert_eq!(
+        api.versions("board").len(),
+        1,
+        "expected no Version from a body with a key given twice"
+    );
+    for name in [
+        "api",
+        "Not_Valid",
+        "not-valid",
+        "dup-first-reserved",
+        "dup-last-reserved",
+        "dup-first-invalid",
+        "dup-last-invalid",
+        "dup-same",
+        "dup-desc",
+    ] {
         let response = api.get(&format!("/v1/applications/{name}"));
         assert_eq!(
             response.status,
