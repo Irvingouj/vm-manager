@@ -66,9 +66,43 @@ pub enum Reason {
 
 /// Decides whether the operation in `question` may run.
 ///
-/// PLACEHOLDER, not the decision: it refuses everything as if no request
-/// were in flight, so that the tests in `tests/` can be seen failing before
-/// the decision is written. The implementation replaces this body.
-pub fn decide(_question: &Question<'_>) -> Decision {
-    Decision::Refuse(Reason::NoRequest)
+/// The checks are made in the contract's order, and the first that fails
+/// refuses: a request in flight; a declaration of the Resource; the
+/// Resource registered; declared at the level needed or above; a Grant to
+/// one of the User's Groups at the level needed or above. A User holds the
+/// highest level any of their Groups is granted; Groups are compared
+/// exactly, byte for byte.
+pub fn decide(question: &Question<'_>) -> Decision {
+    if !question.request_in_flight {
+        return Decision::Refuse(Reason::NoRequest);
+    }
+    let Some(declared) = question.declared else {
+        return Decision::Refuse(Reason::NotDeclared);
+    };
+    if !question.registered {
+        return Decision::Refuse(Reason::NotRegistered);
+    }
+    if declared < question.needed {
+        return Decision::Refuse(Reason::DeclaredLower {
+            declared,
+            needed: question.needed,
+        });
+    }
+    let held = held(question.groups, question.grants);
+    match held {
+        Some(level) if level >= question.needed => Decision::Allow,
+        _ => Decision::Refuse(Reason::NoGrant {
+            held,
+            needed: question.needed,
+        }),
+    }
+}
+
+/// The highest level any of `groups` is granted, if any.
+fn held(groups: &[&str], grants: &[Grant<'_>]) -> Option<AccessLevel> {
+    grants
+        .iter()
+        .filter(|grant| groups.contains(&grant.group))
+        .map(|grant| grant.level)
+        .max()
 }
