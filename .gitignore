@@ -3,3 +3,5 @@ node_modules/
 .env
 .env.*
 .claude/worktrees/
+/target/
+/vendor/*/Cargo.lock

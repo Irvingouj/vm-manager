@@ -1,0 +1,6 @@
+[env]
+# openworkers-runtime-v8 bakes this path into the binary at compile time and
+# reads a V8 startup snapshot from it when the program starts. Its own
+# .cargo/config.toml is not read when it is a dependency, so we must set it.
+# An empty or missing file means no snapshot: a slightly slower context start.
+RUNTIME_SNAPSHOT_PATH = { value = "target/runtime-snapshot.bin", relative = true }

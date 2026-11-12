@@ -1,0 +1,61 @@
+name: gate
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    name: gate (linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@v4
+
+      # rust-toolchain.toml pins the version and the components.
+      - name: Rust toolchain
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustc -vV
+          cargo -V
+
+      # Caches ~/.cargo and target/, which also holds the downloaded V8
+      # prebuilt (openworkers-v8's build script puts it under OUT_DIR).
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: blackbox depends on no product crate
+        run: |
+          set -euo pipefail
+          products=$(cargo tree --workspace --locked --depth 0 --prefix none \
+            | awk 'NF {print $1}' | grep -vx blackbox)
+          deps=$(cargo tree -p blackbox --locked -e normal,dev,build --prefix none \
+            | awk 'NF {print $1}' | sort -u)
+          bad=0
+          for p in $products; do
+            if grep -qx "$p" <<<"$deps"; then
+              echo "::error::blackbox depends on the product crate $p"
+              bad=1
+            fi
+          done
+          exit $bad
+
+      - name: cargo fmt
+        run: cargo fmt --all --check
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: cargo test
+        run: cargo test --workspace --locked

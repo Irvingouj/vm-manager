@@ -1,0 +1,135 @@
+//! Per-request state for V8 execution contexts.
+//!
+//! RequestContext holds all state specific to a single HTTP request or task
+//! execution. Multiple RequestContexts share one V8 isolate when
+//! `max_concurrent_per_isolate` is above 1.
+//!
+//! Binding state isolation is automatic: `store_state!`/`get_state!` macros
+//! reach the `ContextSlots` this struct owns, one per v8::Context.
+
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use tokio::sync::{Notify, mpsc};
+use tokio_util::sync::{CancellationToken, DropGuard};
+use tokio_util::task::AbortOnDropHandle;
+
+use crate::runtime::stream_manager::StreamManager;
+use crate::runtime::{CallbackId, CallbackMessage, SchedulerMessage};
+use openworkers_core::WebSocketId;
+
+/// Per-request execution state.
+///
+/// Each request gets its own v8::Context, event loop channels, and callback
+/// storage. The V8 isolate and platform are shared (held by ExecutionContext).
+pub struct RequestContext {
+    /// V8 context for this request (isolated global scope)
+    pub context: v8::Global<v8::Context>,
+
+    /// Binding state for `context`; must outlive it.
+    _slots: Rc<crate::context_slots::ContextSlots>,
+
+    /// The `{ fetch, task }` object src/js/dispatch.js evaluates to in
+    /// `context`, kept here so the guest cannot reach it.
+    pub dispatch: v8::Global<v8::Object>,
+
+    /// The handle `dispatch` answered for the event in flight.
+    pub pending: Option<v8::Global<v8::Object>>,
+
+    /// Channel to send messages to this request's event loop
+    pub scheduler_tx: mpsc::UnboundedSender<SchedulerMessage>,
+
+    /// Channel to receive callback results from the event loop
+    pub callback_rx: mpsc::UnboundedReceiver<CallbackMessage>,
+
+    /// Notification for callback arrival (wakes poll_fn)
+    pub callback_notify: Arc<Notify>,
+
+    /// Fetch promise callbacks (resolve side)
+    pub fetch_callbacks: Rc<RefCell<HashMap<CallbackId, v8::Global<v8::Function>>>>,
+
+    /// Fetch promise callbacks (reject side)
+    pub fetch_error_callbacks: Rc<RefCell<HashMap<CallbackId, v8::Global<v8::Function>>>>,
+
+    /// Calls of invoke bindings settled inline since the event loop last
+    /// polled (see `setup_invoke`)
+    #[cfg(feature = "invoke")]
+    pub inline_calls: Rc<std::cell::Cell<u32>>,
+
+    /// Clears the timers and the async context of the guest at each reset
+    pub clear_guest_state: v8::Global<v8::Function>,
+
+    /// Stream read callbacks
+    pub stream_callbacks: Rc<RefCell<HashMap<CallbackId, v8::Global<v8::Function>>>>,
+
+    /// WebSocket event dispatcher callbacks (keyed by WebSocketId, persistent)
+    pub ws_event_callbacks: Rc<RefCell<HashMap<WebSocketId, v8::Global<v8::Function>>>>,
+
+    /// Monotonic callback ID counter
+    pub next_callback_id: Rc<RefCell<CallbackId>>,
+
+    /// One-shot channel for respondWith() response
+    pub fetch_response_tx: Rc<RefCell<Option<tokio::sync::oneshot::Sender<String>>>>,
+
+    /// Stream manager for body streaming
+    pub stream_manager: Arc<StreamManager>,
+
+    /// Event loop task handle — automatically aborted on drop
+    pub event_loop_handle: AbortOnDropHandle<()>,
+
+    /// Abort flag (set on client disconnect or explicit abort)
+    pub aborted: Arc<AtomicBool>,
+
+    /// Cancellation token for all spawned I/O tasks — automatically cancelled on drop
+    _cancel_guard: DropGuard,
+}
+
+impl RequestContext {
+    /// Create a new RequestContext. Takes ownership of the CancellationToken
+    /// and returns a clone for the caller to pass to the event loop.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        context: v8::Global<v8::Context>,
+        slots: Rc<crate::context_slots::ContextSlots>,
+        dispatch: v8::Global<v8::Object>,
+        clear_guest_state: v8::Global<v8::Function>,
+        scheduler_tx: mpsc::UnboundedSender<SchedulerMessage>,
+        callback_rx: mpsc::UnboundedReceiver<CallbackMessage>,
+        callback_notify: Arc<Notify>,
+        fetch_callbacks: Rc<RefCell<HashMap<CallbackId, v8::Global<v8::Function>>>>,
+        fetch_error_callbacks: Rc<RefCell<HashMap<CallbackId, v8::Global<v8::Function>>>>,
+        stream_callbacks: Rc<RefCell<HashMap<CallbackId, v8::Global<v8::Function>>>>,
+        ws_event_callbacks: Rc<RefCell<HashMap<WebSocketId, v8::Global<v8::Function>>>>,
+        next_callback_id: Rc<RefCell<CallbackId>>,
+        fetch_response_tx: Rc<RefCell<Option<tokio::sync::oneshot::Sender<String>>>>,
+        stream_manager: Arc<StreamManager>,
+        event_loop_handle: tokio::task::JoinHandle<()>,
+        cancel: CancellationToken,
+        #[cfg(feature = "invoke")] inline_calls: Rc<std::cell::Cell<u32>>,
+    ) -> Self {
+        Self {
+            context,
+            _slots: slots,
+            dispatch,
+            pending: None,
+            scheduler_tx,
+            callback_rx,
+            callback_notify,
+            fetch_callbacks,
+            fetch_error_callbacks,
+            #[cfg(feature = "invoke")]
+            inline_calls,
+            clear_guest_state,
+            stream_callbacks,
+            ws_event_callbacks,
+            next_callback_id,
+            fetch_response_tx,
+            stream_manager,
+            event_loop_handle: AbortOnDropHandle::new(event_loop_handle),
+            aborted: Arc::new(AtomicBool::new(false)),
+            _cancel_guard: cancel.drop_guard(),
+        }
+    }
+}

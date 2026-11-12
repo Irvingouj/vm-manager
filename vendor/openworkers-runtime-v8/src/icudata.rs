@@ -1,0 +1,207 @@
+//! Embedded ICU data for V8's Intl support.
+//!
+//! This module embeds the ICU data file (icudtl.dat) which is required for
+//! V8's internationalization features (Intl.DateTimeFormat, Intl.NumberFormat, etc.).
+//!
+//! Without this data, V8 tries to load ICU data at runtime which can cause
+//! memory issues and OOM crashes.
+//!
+//! ## Source
+//!
+//! The `icudtl.dat` file comes from Chromium's ICU repository:
+//! <https://chromium.googlesource.com/chromium/deps/icu/+/main/common/icudtl.dat>
+//!
+//! Its major version must match the `icu::set_common_data_NN` call in
+//! `platform.rs`, which is dictated by the `v8` crate.
+//!
+//! ICU 78, SHA256: `9f48c7f9c7c94d516a14870707e910ab94d75ae640ff6842c4af53276cd26ebe`
+
+/// ICU data must be 16-byte aligned per ICU requirements.
+/// See: https://unicode-org.github.io/icu/userguide/icu_data/
+#[repr(C, align(16))]
+struct IcuData<T: ?Sized>(T);
+
+static ICU_DATA_RAW: &IcuData<[u8]> = &IcuData(*include_bytes!("icudtl.dat"));
+
+/// Raw ICU data, properly aligned for V8/ICU.
+pub static ICU_DATA: &[u8] = &ICU_DATA_RAW.0;
+
+#[cfg(test)]
+mod tests {
+    use std::pin::pin;
+
+    use openworkers_core::RuntimeLimits;
+
+    use crate::LockerManagedIsolate;
+
+    #[test]
+    fn test_icu_data_is_loaded() {
+        assert!(
+            super::ICU_DATA.len() > 1_000_000,
+            "ICU data should be at least 1MB"
+        );
+        // ICU data header: 0x90 0x00 followed by 0xda 0x27 (little-endian magic)
+        assert_eq!(
+            &super::ICU_DATA[0..4],
+            &[0x90, 0x00, 0xda, 0x27],
+            "ICU data should have correct header"
+        );
+    }
+
+    #[test]
+    fn test_intl_datetimeformat_works() {
+        let limits = RuntimeLimits::default();
+        let isolate_wrapper = LockerManagedIsolate::new(limits);
+
+        let mut locker = isolate_wrapper.isolate.lock();
+        let scope = pin!(v8::HandleScope::new(&mut *locker));
+        let mut scope = scope.init();
+        let context = v8::Context::new(&scope, Default::default());
+        let scope = &mut v8::ContextScope::new(&mut scope, context);
+
+        // Test Intl.DateTimeFormat with multiple timezones (this was causing OOM before)
+        let code = v8::String::new(
+            scope,
+            r#"
+            const timezones = [
+                'Europe/Paris',
+                'America/New_York',
+                'Asia/Tokyo',
+                'Australia/Sydney',
+                'America/Los_Angeles'
+            ];
+
+            const results = timezones.map(tz => {
+                const formatter = new Intl.DateTimeFormat('en-US', {
+                    timeZone: tz,
+                    hour: 'numeric',
+                    minute: 'numeric',
+                    second: 'numeric',
+                    hour12: false
+                });
+                return formatter.resolvedOptions().timeZone;
+            });
+
+            JSON.stringify(results);
+            "#,
+        )
+        .unwrap();
+
+        let script = v8::Script::compile(scope, code, None).expect("Failed to compile script");
+        let result = script.run(scope).expect("Script should not OOM");
+
+        let result_str = result.to_string(scope).unwrap().to_rust_string_lossy(scope);
+
+        assert!(
+            result_str.contains("Europe/Paris"),
+            "Should contain Paris timezone"
+        );
+        assert!(
+            result_str.contains("America/New_York"),
+            "Should contain New York timezone"
+        );
+    }
+
+    #[test]
+    fn test_intl_numberformat_works() {
+        let limits = RuntimeLimits::default();
+        let isolate_wrapper = LockerManagedIsolate::new(limits);
+
+        let mut locker = isolate_wrapper.isolate.lock();
+        let scope = pin!(v8::HandleScope::new(&mut *locker));
+        let mut scope = scope.init();
+        let context = v8::Context::new(&scope, Default::default());
+        let scope = &mut v8::ContextScope::new(&mut scope, context);
+
+        let code = v8::String::new(
+            scope,
+            r#"
+            const formatter = new Intl.NumberFormat('de-DE', {
+                style: 'currency',
+                currency: 'EUR'
+            });
+            formatter.format(1234.56);
+            "#,
+        )
+        .unwrap();
+
+        let script = v8::Script::compile(scope, code, None).expect("Failed to compile script");
+        let result = script.run(scope).expect("Script should execute");
+
+        let result_str = result.to_string(scope).unwrap().to_rust_string_lossy(scope);
+
+        // German format: 1.234,56 €
+        assert!(
+            result_str.contains("1.234,56") || result_str.contains("€"),
+            "Should format as German currency: {}",
+            result_str
+        );
+    }
+
+    /// Same Intl tests with OwnedIsolate (auto-entered) to ensure consistent behavior.
+    #[test]
+    fn test_intl_datetimeformat_owned_isolate() {
+        crate::platform::get_platform();
+
+        let mut isolate = crate::v8_helpers::new_isolate(Default::default());
+
+        let scope = pin!(v8::HandleScope::new(&mut isolate));
+        let mut scope = scope.init();
+        let context = v8::Context::new(&scope, Default::default());
+        let scope = &mut v8::ContextScope::new(&mut scope, context);
+
+        let code = v8::String::new(
+            scope,
+            r#"
+            const formatter = new Intl.DateTimeFormat('en-US', {
+                timeZone: 'Europe/Paris',
+                hour: 'numeric',
+                minute: 'numeric',
+                hour12: false
+            });
+            formatter.resolvedOptions().timeZone;
+            "#,
+        )
+        .unwrap();
+
+        let script = v8::Script::compile(scope, code, None).expect("Failed to compile script");
+        let result = script.run(scope).expect("Script should not OOM");
+
+        let result_str = result.to_string(scope).unwrap().to_rust_string_lossy(scope);
+        assert_eq!(result_str, "Europe/Paris");
+    }
+
+    #[test]
+    fn test_intl_numberformat_owned_isolate() {
+        crate::platform::get_platform();
+
+        let mut isolate = crate::v8_helpers::new_isolate(Default::default());
+
+        let scope = pin!(v8::HandleScope::new(&mut isolate));
+        let mut scope = scope.init();
+        let context = v8::Context::new(&scope, Default::default());
+        let scope = &mut v8::ContextScope::new(&mut scope, context);
+
+        let code = v8::String::new(
+            scope,
+            r#"
+            const formatter = new Intl.NumberFormat('de-DE', {
+                style: 'currency',
+                currency: 'EUR'
+            });
+            formatter.format(1234.56);
+            "#,
+        )
+        .unwrap();
+
+        let script = v8::Script::compile(scope, code, None).expect("Failed to compile script");
+        let result = script.run(scope).expect("Script should execute");
+
+        let result_str = result.to_string(scope).unwrap().to_rust_string_lossy(scope);
+        assert!(
+            result_str.contains("1.234,56") || result_str.contains("€"),
+            "Should format as German currency: {}",
+            result_str
+        );
+    }
+}

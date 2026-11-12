@@ -1,0 +1,152 @@
+use super::super::SchedulerMessage;
+use super::state::TimerState;
+use std::rc::Rc;
+use tokio::sync::mpsc;
+use v8;
+
+// Native timer functions using glue_v8 macro with Fast API
+//
+// These functions use primitive types (u64) and Fast API with state.
+// State is passed via FunctionTemplate data (External containing Rc<TimerState>).
+
+#[glue_v8::method(fast, state = Rc<TimerState>)]
+fn native_schedule_timeout(state: &Rc<TimerState>, id: u64, delay: u64) {
+    let _ = state
+        .scheduler_tx
+        .send(SchedulerMessage::ScheduleTimeout(id, delay));
+}
+
+#[glue_v8::method(fast, state = Rc<TimerState>)]
+fn native_schedule_interval(state: &Rc<TimerState>, id: u64, interval: u64) {
+    let _ = state
+        .scheduler_tx
+        .send(SchedulerMessage::ScheduleInterval(id, interval));
+}
+
+#[glue_v8::method(fast, state = Rc<TimerState>)]
+fn native_schedule_writable(state: &Rc<TimerState>, id: u64, stream_id: u64) {
+    let _ = state
+        .scheduler_tx
+        .send(SchedulerMessage::ScheduleWritable(id, stream_id));
+}
+
+#[glue_v8::method(fast, state = Rc<TimerState>)]
+fn native_clear_timer(state: &Rc<TimerState>, id: u64) {
+    let _ = state.scheduler_tx.send(SchedulerMessage::ClearTimer(id));
+}
+
+pub fn setup_timers(
+    scope: &mut v8::PinScope,
+    scheduler_tx: mpsc::UnboundedSender<SchedulerMessage>,
+) {
+    // Create state for timer functions
+    let state = Rc::new(TimerState {
+        scheduler_tx: scheduler_tx.clone(),
+    });
+
+    // Keeps the Rc alive for the context; the templates below only borrow it.
+    crate::context_slots::set(scope, state.clone());
+
+    // Register native functions using Fast API templates
+    let schedule_timeout_fn = native_schedule_timeout_v8_template(scope, &state)
+        .get_function(scope)
+        .unwrap();
+    let schedule_interval_fn = native_schedule_interval_v8_template(scope, &state)
+        .get_function(scope)
+        .unwrap();
+    let clear_timer_fn = native_clear_timer_v8_template(scope, &state)
+        .get_function(scope)
+        .unwrap();
+    let schedule_writable_fn = native_schedule_writable_v8_template(scope, &state)
+        .get_function(scope)
+        .unwrap();
+
+    register_fn!(scope, "__nativeScheduleTimeout", schedule_timeout_fn);
+    register_fn!(scope, "__nativeScheduleInterval", schedule_interval_fn);
+    register_fn!(scope, "__nativeClearTimer", clear_timer_fn);
+    register_fn!(scope, "__nativeScheduleWritable", schedule_writable_fn);
+
+    // JavaScript timer wrappers
+    exec_js!(
+        scope,
+        r#"
+        globalThis.__timerCallbacks = new Map();
+        globalThis.__nextTimerId = 1;
+        globalThis.__intervalIds = new Set();
+
+        // Coerce a delay/timeout to a non-negative integer (ms), per the HTML spec.
+        // The native scheduler args are u64; passing a float, negative, NaN or
+        // non-numeric value would fail serde_v8 conversion and throw.
+        function __coerceDelay(delay) {
+            delay = Number(delay);
+            return Number.isFinite(delay) && delay > 0 ? Math.trunc(delay) : 0;
+        }
+
+        // A timer runs in the async context of the code that set it.
+        function __inSettingFrame(callback, args) {
+            const frame = globalThis.__ow.asyncContextGet();
+
+            return () => {
+                const previous = globalThis.__ow.asyncContextGet();
+                globalThis.__ow.asyncContextSet(frame);
+
+                try {
+                    callback(...args);
+                } finally {
+                    globalThis.__ow.asyncContextSet(previous);
+                }
+            };
+        }
+
+        globalThis.setTimeout = function(callback, delay, ...args) {
+            const id = globalThis.__nextTimerId++;
+            globalThis.__timerCallbacks.set(id, __inSettingFrame(callback, args));
+            __nativeScheduleTimeout(id, __coerceDelay(delay));
+            return id;
+        };
+
+        globalThis.setInterval = function(callback, interval, ...args) {
+            const id = globalThis.__nextTimerId++;
+            globalThis.__timerCallbacks.set(id, __inSettingFrame(callback, args));
+            globalThis.__intervalIds.add(id);
+            __nativeScheduleInterval(id, __coerceDelay(interval));
+            return id;
+        };
+
+        globalThis.clearTimeout = function(id) {
+            // Per the HTML spec, clearing an unknown/invalid id is a no-op.
+            // Guard before the native call, whose arg is u64 (undefined/NaN/negative
+            // would otherwise throw a serde_v8 conversion error).
+            id = Number(id);
+            if (!Number.isInteger(id) || id < 0) {
+                return;
+            }
+            globalThis.__timerCallbacks.delete(id);
+            globalThis.__intervalIds.delete(id);
+            __nativeClearTimer(id);
+        };
+
+        globalThis.clearInterval = globalThis.clearTimeout;
+
+        globalThis.queueMicrotask = function queueMicrotask(callback) {
+            // then() ignores an argument it cannot call, so the refusal has to
+            // happen here or it never happens at all.
+            if (typeof callback !== 'function') {
+                throw new TypeError('queueMicrotask expects a function');
+            }
+
+            Promise.resolve().then(callback);
+        };
+
+        globalThis.__executeTimer = function(id) {
+            const callback = globalThis.__timerCallbacks.get(id);
+            if (callback) {
+                callback();
+                if (!globalThis.__intervalIds.has(id)) {
+                    globalThis.__timerCallbacks.delete(id);
+                }
+            }
+        };
+    "#
+    );
+}
