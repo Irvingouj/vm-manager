@@ -93,6 +93,7 @@ impl Gateway for PlatformGateway {
                 let answer = json!({
                     "user": in_flight.user.to_json(),
                     "application": &*in_flight.application,
+                    "version": in_flight.version,
                     "request": &*in_flight.request,
                 });
                 Decision::Allowed(Box::pin(std::future::ready(Ok(answer))))

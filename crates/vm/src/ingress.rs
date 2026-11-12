@@ -1,8 +1,10 @@
 //! Ingress: takes an HTTP request off the wire and answers it.
 //!
 //! In order (blackbox/CONTRACT.md, "Responses the program itself gives"):
-//! a request id; the `Host`; who the User is ([`SignIn`]); which
-//! Application (`<application>.<domain>`); then the Request runner. Its own
+//! a request id; the `Host`; who the User is ([`SignIn`]); then either the
+//! platform's API (`api.<domain>`, [`Api`]) or an Application
+//! (`<application>.<domain>`), whose serving Version the Application
+//! registry holds in memory, run by the Request runner. Its own
 //! refusals are short plain text. Every answer carries `x-vm-request-id`,
 //! and the request's `request` record is written just before the answer
 //! goes, after everything the Application did with it.
@@ -19,20 +21,26 @@ use hyper::{HeaderMap, Request, Response, StatusCode};
 use openworkers_core::{HttpMethod, HttpRequest, RequestBody};
 use serde_json::json;
 
-use crate::applications::Applications;
+use crate::api::Api;
 use crate::log;
+use crate::registry::Registry;
 use crate::runner::{InFlight, Outcome, RequestRunner};
 use crate::sign_in::{RESERVED_HEADER_PREFIX, SignIn, SignedIn, remove_reserved_headers};
 
 /// The header that names a request, in every answer and every record.
 pub const REQUEST_ID_HEADER: &str = "x-vm-request-id";
 
+/// The name under the domain where the platform's API is.
+const API_NAME: &str = "api";
+
 /// The longest a client may take to send a request's body.
 const BODY_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct Ingress {
-    pub domain: String,
-    pub applications: Applications,
+    /// The installation's domain, in lower case.
+    pub domain: Arc<str>,
+    pub registry: Arc<Registry>,
+    pub api: Api,
     pub sign_in: Box<dyn SignIn>,
     pub runner: RequestRunner,
     /// The largest request body read; past it the answer is 413.
@@ -43,6 +51,7 @@ pub struct Ingress {
 struct Known<'a> {
     request: &'a str,
     application: Option<&'a str>,
+    version: Option<u64>,
     user: Option<&'a str>,
     method: &'a str,
     path: &'a str,
@@ -55,6 +64,7 @@ impl Ingress {
         let known = Known {
             request: &id,
             application: None,
+            version: None,
             user: None,
             method: parts.method.as_str(),
             path: parts.uri.path(),
@@ -82,12 +92,29 @@ impl Ingress {
             }
         };
 
-        let application = host
-            .strip_suffix(self.domain.as_str())
+        let name = host
+            .strip_suffix(&*self.domain)
             .and_then(|rest| rest.strip_suffix('.'))
-            .filter(|name| !name.contains('.'))
-            .and_then(|name| self.applications.get(name));
-        let Some(application) = application else {
+            .filter(|name| !name.contains('.'));
+        if name == Some(API_NAME) {
+            let known = Known {
+                user: Some(&user.id),
+                ..known
+            };
+            let answer = self
+                .api
+                .handle(&user, &parts.method, parts.uri.path(), body)
+                .await;
+            let mut response = Response::new(Full::new(answer.body));
+            *response.status_mut() = answer.status;
+            response
+                .headers_mut()
+                .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+            return finish(&known, response);
+        }
+        // From memory: no round trip to the platform database. The request
+        // holds this Version until it ends, whatever is sent meanwhile.
+        let Some(serving) = name.and_then(|name| self.registry.serving(name)) else {
             let known = Known {
                 user: Some(&user.id),
                 ..known
@@ -103,11 +130,13 @@ impl Ingress {
         let in_flight = Arc::new(InFlight {
             request: Arc::clone(&id),
             user,
-            application: Arc::clone(&application.name),
+            application: Arc::clone(&serving.application),
+            version: serving.version,
         });
         let known = Known {
             user: Some(&in_flight.user.id),
             application: Some(&in_flight.application),
+            version: Some(serving.version),
             ..known
         };
 
@@ -145,7 +174,7 @@ impl Ingress {
             method: http_method,
             url: format!(
                 "http://{}.{}{}",
-                application.name, self.domain, path_and_query
+                serving.application, self.domain, path_and_query
             ),
             headers: for_application(&parts.headers),
             body: if body.is_empty() {
@@ -157,7 +186,7 @@ impl Ingress {
 
         let outcome = self
             .runner
-            .run(Arc::clone(&in_flight), Arc::clone(application), request)
+            .run(Arc::clone(&in_flight), serving, request)
             .await;
         let response = match outcome {
             Outcome::Answered(answer) => {
@@ -237,6 +266,7 @@ fn finish(known: &Known<'_>, mut response: Response<Full<Bytes>>) -> Response<Fu
         json!({
             "request": known.request,
             "application": known.application,
+            "version": known.version,
             "user": known.user,
             "method": known.method,
             "path": known.path,

@@ -1,5 +1,7 @@
-//! The platform program (ADR 0015). In this first form it serves fixture
-//! Applications, each on its own subdomain (ADR 0011), to signed-in Users.
+//! The platform program (ADR 0015). It keeps Applications and their
+//! Versions in the platform database, takes them in through the platform's
+//! API, and serves each Application's serving Version on its own subdomain
+//! (ADR 0011) to signed-in Users.
 //!
 //! The parts, each behind a small interface:
 //!
@@ -12,18 +14,21 @@
 //!   held by the host.
 //! - [`gateway`]: where every operation from Application code enters the
 //!   host, and is decided.
-//! - [`applications`]: the Applications this program serves, named at
-//!   start-up.
 //! - [`platform_db`]: the platform database: connecting (and creating it),
 //!   its structure in numbered steps, a bounded pool.
+//! - [`registry`]: the Application registry: Applications, Contributors,
+//!   Versions, and the serving Version of each, held in memory too.
+//! - [`api`]: the platform's API at `api.<domain>`: HTTP in, registry
+//!   calls, JSON out.
 //! - [`log`]: the program's log, one JSON record per line.
 //! - [`server`]: the listening socket and the connections.
 
-pub mod applications;
+pub mod api;
 pub mod gateway;
 pub mod ingress;
 pub mod log;
 pub mod platform_db;
+pub mod registry;
 pub mod runner;
 pub mod server;
 pub mod sign_in;

@@ -3,8 +3,9 @@
 //!
 //! Interface: [`RequestRunner::start`] once, then [`RequestRunner::run`]
 //! per request with the request in flight ([`InFlight`]: whose request,
-//! for which Application), the Application, and the request as the
-//! Application should see it. It answers an [`Outcome`].
+//! for which Application and Version), the serving Version to run
+//! ([`Serving`], shared with the Application registry), and the request as
+//! the Application should see it. It answers an [`Outcome`].
 //!
 //! Every request gets a new V8 isolate and context: the Application's
 //! script runs from its top level for that request, and everything the
@@ -36,8 +37,8 @@ use openworkers_runtime_v8::Worker;
 use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio::task::JoinSet;
 
-use crate::applications::Application;
 use crate::gateway::Gateway;
+use crate::registry::Serving;
 use crate::user::User;
 use host::{APPLICATION_BINDING, HostOps};
 
@@ -49,6 +50,8 @@ pub struct InFlight {
     pub request: Arc<str>,
     pub user: User,
     pub application: Arc<str>,
+    /// The Version running the request.
+    pub version: u64,
 }
 
 /// What the Application answered.
@@ -111,7 +114,7 @@ impl Default for Limits {
 /// One request handed to an engine thread.
 struct Job {
     in_flight: Arc<InFlight>,
-    application: Arc<Application>,
+    serving: Arc<Serving>,
     request: HttpRequest,
     reply: oneshot::Sender<Outcome>,
 }
@@ -158,13 +161,13 @@ impl RequestRunner {
     pub async fn run(
         &self,
         in_flight: Arc<InFlight>,
-        application: Arc<Application>,
+        serving: Arc<Serving>,
         request: HttpRequest,
     ) -> Outcome {
         let (reply, answer) = oneshot::channel();
         let mut job = Job {
             in_flight,
-            application,
+            serving,
             request,
             reply,
         };
@@ -238,7 +241,7 @@ impl Engine {
                         let Ok(permit) = Arc::clone(&permits).acquire_owned().await else { break };
                         let engine = Arc::clone(&engine);
                         running.spawn_local(async move {
-                            let outcome = engine.serve(job.in_flight, &job.application, job.request).await;
+                            let outcome = engine.serve(job.in_flight, &job.serving, job.request).await;
                             // The waiter may have given up; then nobody needs it.
                             job.reply.send(outcome).ok();
                             drop(permit);
@@ -253,7 +256,7 @@ impl Engine {
     async fn serve(
         &self,
         in_flight: Arc<InFlight>,
-        application: &Application,
+        serving: &Serving,
         request: HttpRequest,
     ) -> Outcome {
         let host = Arc::new(HostOps::new(
@@ -261,7 +264,7 @@ impl Engine {
             Arc::clone(&self.gateway),
         ));
         let deadline = self.limits.deadline;
-        match tokio::time::timeout(deadline, self.serve_in(&host, application, request)).await {
+        match tokio::time::timeout(deadline, self.serve_in(&host, serving, request)).await {
             Ok(outcome) => {
                 host.end();
                 outcome
@@ -280,11 +283,11 @@ impl Engine {
     async fn serve_in(
         &self,
         host: &Arc<HostOps>,
-        application: &Application,
+        serving: &Serving,
         request: HttpRequest,
     ) -> Outcome {
         let script = Script::with_bindings(
-            glue::script(&application.script),
+            glue::script(&serving.bundle),
             None,
             vec![BindingInfo::invoke(APPLICATION_BINDING)],
         );

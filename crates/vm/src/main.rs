@@ -1,20 +1,24 @@
 //! The platform program (ADR 0015).
 //!
-//! `vm serve --domain <domain> --listen <ip:port> --application <name>=<path>
-//! [--application ...] [--stand-in-sign-in]` serves fixture Applications
-//! (blackbox/CONTRACT.md). `vm --version` names the execution core.
+//! `VM_DATABASE_URL=postgres://... vm serve --domain <domain> --listen
+//! <ip:port> [--stand-in-sign-in]` serves the Applications kept in the
+//! platform database, and the platform's API (blackbox/CONTRACT.md).
+//! `vm --version` names the execution core.
 
 use std::net::SocketAddr;
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use serde_json::json;
 use tokio::net::TcpListener;
 
-use vm::applications::{Applications, check_name};
+use vm::api::Api;
 use vm::gateway::{Gateway, PlatformGateway};
 use vm::ingress::Ingress;
+use vm::platform_db::{self, DatabaseAddress, PlatformDatabase, PoolLimits};
+use vm::registry::{Registry, is_dns_label};
 use vm::runner::{self, RequestRunner};
 use vm::sign_in::{NoSignIn, SignIn, StandInSignIn};
 use vm::{log, server};
@@ -29,9 +33,14 @@ struct Cli {
     command: Option<Command>,
 }
 
+/// The longest start-up may spend on the platform database: connecting,
+/// creating it, bringing its structure up to date, reading what serves.
+const DATABASE_START_TIMEOUT: Duration = Duration::from_secs(12);
+
 #[derive(Subcommand)]
 enum Command {
-    /// Serve Applications, each on <name>.<domain>.
+    /// Serve Applications, each on <name>.<domain>, and the platform's API
+    /// on api.<domain>. The platform database is named by VM_DATABASE_URL.
     Serve(Serve),
 }
 
@@ -43,16 +52,6 @@ struct Serve {
     /// The address to listen on; port 0 picks a free one.
     #[arg(long)]
     listen: SocketAddr,
-    /// A fixture Application, as <name>=<path to one JavaScript file>.
-    /// At least one.
-    // A value may start with a hyphen, so that a bad name is reported as a
-    // bad name.
-    #[arg(
-        long = "application",
-        value_name = "NAME=PATH",
-        allow_hyphen_values = true
-    )]
-    applications: Vec<String>,
     /// Development only: the caller states the User in x-vm-stand-in-* headers.
     #[arg(long)]
     stand_in_sign_in: bool,
@@ -104,13 +103,13 @@ fn version() {
 
 fn run(serve: &Serve) -> Result<(), String> {
     let domain = serve.domain.trim_end_matches('.').to_ascii_lowercase();
-    if domain.is_empty() || domain.split('.').any(|label| check_name(label).is_err()) {
+    if domain.is_empty() || !domain.split('.').all(is_dns_label) {
         return Err(format!(
             "the domain {:?} is not a domain name: use DNS labels joined by dots",
             serve.domain
         ));
     }
-    let applications = Applications::from_specs(&serve.applications)?;
+    let address = database_address()?;
     let sign_in: Box<dyn SignIn> = if serve.stand_in_sign_in {
         Box::new(StandInSignIn)
     } else {
@@ -125,29 +124,75 @@ fn run(serve: &Serve) -> Result<(), String> {
         .build()
         .map_err(|e| format!("cannot start the server's runtime: {e}"))?;
     runtime.block_on(async move {
+        let started = tokio::time::timeout(DATABASE_START_TIMEOUT, async {
+            let database = PlatformDatabase::open(&address, &PoolLimits::default()).await?;
+            Registry::load(Arc::new(database)).await.map_err(|e| {
+                format!(
+                    "cannot read the Applications from the platform database \"{}\": {e}",
+                    address.database()
+                )
+            })
+        })
+        .await;
+        let registry = match started {
+            Ok(registry) => Arc::new(registry?),
+            Err(_) => {
+                return Err(format!(
+                    "the platform database \"{}\" on Postgres at {} was not ready within {} s",
+                    address.database(),
+                    address.server(),
+                    DATABASE_START_TIMEOUT.as_secs()
+                ));
+            }
+        };
+        let domain: Arc<str> = Arc::from(domain);
         let listener = TcpListener::bind(serve.listen)
             .await
             .map_err(|e| format!("cannot listen on {}: {e}", serve.listen))?;
         let address = listener
             .local_addr()
             .map_err(|e| format!("cannot read the listening address: {e}"))?;
+        let serving = registry.serving_names();
+        let serving: Vec<&str> = serving.iter().map(AsRef::as_ref).collect();
         log::record(
             "listening",
             json!({
                 "address": address.to_string(),
-                "domain": &domain,
-                "applications": applications.names(),
+                "domain": &*domain,
+                "applications": serving,
                 "stand_in_sign_in": sign_in.is_stand_in(),
             }),
         );
         let ingress = Arc::new(Ingress {
+            api: Api::new(Arc::clone(&registry), Arc::clone(&domain)),
             domain,
-            applications,
+            registry,
             sign_in,
             runner,
             max_request_body_bytes: 1024 * 1024,
         });
         server::serve(listener, ingress, server::Limits::default()).await;
         Ok(())
+    })
+}
+
+/// `VM_DATABASE_URL`, read. The message never repeats its value, which
+/// holds a password.
+fn database_address() -> Result<DatabaseAddress, String> {
+    let variable = platform_db::VARIABLE;
+    let Some(value) = std::env::var_os(variable) else {
+        return Err(format!(
+            "{variable} is not set: set it to {}",
+            platform_db::FORM
+        ));
+    };
+    let value = value
+        .into_string()
+        .map_err(|_| format!("{variable} is not UTF-8: set it to {}", platform_db::FORM))?;
+    DatabaseAddress::parse(&value).map_err(|problem| {
+        format!(
+            "{variable} cannot be read: {problem}. Set it to {}",
+            platform_db::FORM
+        )
     })
 }
