@@ -1,0 +1,19 @@
+[package]
+name = "vm"
+version = "0.0.0"
+description = "The platform program (ADR 0015)"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "vm"
+path = "src/main.rs"
+
+[dependencies]
+openworkers-core.workspace = true
+openworkers-runtime-v8.workspace = true
+
+[lints]
+workspace = true

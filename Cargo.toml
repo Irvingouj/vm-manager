@@ -1,0 +1,65 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "blackbox"]
+# The vendored runtime is a workspace of its own: not ours to restyle, and not
+# held to our lints (vendor/VENDORED.md).
+exclude = ["vendor"]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+rust-version = "1.99"
+publish = false
+
+[workspace.dependencies]
+# The execution core (ADR 0002): openworkers-core at a pinned tag, and
+# openworkers-runtime-v8 at a pinned tag, replaced by the patched copy in
+# vendor/ (see [patch] below and vendor/VENDORED.md).
+openworkers-core = { git = "https://github.com/openworkers/openworkers-core", tag = "v0.18.1", features = ["invoke"] }
+openworkers-runtime-v8 = { git = "https://github.com/openworkers/openworkers-runtime-v8", tag = "v0.18.7", features = ["invoke"] }
+
+# Lints are set here once; every crate of ours inherits them with
+# `[lints] workspace = true`. See "Rust rules" in AGENTS.md, and clippy.toml.
+[workspace.lints.rust]
+unsafe_code = "forbid"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+# No panic on the serving path (tests are allowed these through clippy.toml).
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+indexing_slicing = "deny"
+string_slice = "deny"
+mem_forget = "deny"
+exit = "deny"
+# No lock held across an await.
+await_holding_lock = "deny"
+await_holding_refcell_ref = "deny"
+let_underscore_future = "deny"
+let_underscore_must_use = "deny"
+# Minimize clone; a cheap Arc clone reads as Arc::clone(&x).
+clone_on_ref_ptr = "deny"
+redundant_clone = "deny"
+implicit_clone = "deny"
+unnecessary_to_owned = "deny"
+needless_pass_by_value = "deny"
+# No `as` cast that can truncate or change sign.
+cast_possible_truncation = "deny"
+cast_possible_wrap = "deny"
+cast_sign_loss = "deny"
+# The lists in clippy.toml: no unbounded channel.
+disallowed_methods = "deny"
+disallowed_types = "deny"
+# An exception says why.
+allow_attributes_without_reason = "deny"
+
+[profile.release]
+strip = "debuginfo"
+
+[patch."https://github.com/openworkers/openworkers-runtime-v8"]
+openworkers-runtime-v8 = { path = "vendor/openworkers-runtime-v8" }

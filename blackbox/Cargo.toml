@@ -1,0 +1,15 @@
+[package]
+name = "blackbox"
+version = "0.0.0"
+description = "Black-box tests of the vm program, from outside (AGENTS.md: How code gets written)"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# This crate must depend on no product crate (CI checks it): it reaches the
+# program only by starting the real `vm` binary and talking to it.
+[dependencies]
+
+[lints]
+workspace = true

@@ -1,0 +1,31 @@
+# Clippy configuration for our crates (the vendored runtime has its own).
+# The lint levels are in [workspace.lints] in Cargo.toml.
+
+# A failed expectation in a test is the test failing.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-indexing-slicing-in-tests = true
+
+# Never an unbounded channel (AGENTS.md, Rust rules): every queue has a stated
+# bound and a stated behaviour when full. `allow-invalid` keeps the entries for
+# crates we do not depend on (yet) from being reported as unresolved paths.
+disallowed-methods = [
+  { path = "tokio::sync::mpsc::unbounded_channel", reason = "unbounded: use tokio::sync::mpsc::channel with a stated bound" },
+  { path = "std::sync::mpsc::channel", reason = "unbounded: use std::sync::mpsc::sync_channel with a stated bound" },
+  { path = "futures::channel::mpsc::unbounded", reason = "unbounded: use futures::channel::mpsc::channel with a stated bound", allow-invalid = true },
+  { path = "futures_channel::mpsc::unbounded", reason = "unbounded: use futures_channel::mpsc::channel with a stated bound", allow-invalid = true },
+  { path = "crossbeam_channel::unbounded", reason = "unbounded: use crossbeam_channel::bounded", allow-invalid = true },
+  { path = "flume::unbounded", reason = "unbounded: use flume::bounded", allow-invalid = true },
+  { path = "async_channel::unbounded", reason = "unbounded: use async_channel::bounded", allow-invalid = true },
+]
+
+disallowed-types = [
+  { path = "tokio::sync::mpsc::UnboundedSender", reason = "unbounded: use tokio::sync::mpsc::Sender with a stated bound" },
+  { path = "tokio::sync::mpsc::UnboundedReceiver", reason = "unbounded: use tokio::sync::mpsc::Receiver with a stated bound" },
+  { path = "std::sync::mpsc::Sender", reason = "the sender of an unbounded channel: use std::sync::mpsc::SyncSender" },
+  { path = "futures::channel::mpsc::UnboundedSender", reason = "unbounded: use futures::channel::mpsc::Sender", allow-invalid = true },
+  { path = "futures::channel::mpsc::UnboundedReceiver", reason = "unbounded: use futures::channel::mpsc::Receiver", allow-invalid = true },
+  { path = "futures_channel::mpsc::UnboundedSender", reason = "unbounded: use futures_channel::mpsc::Sender", allow-invalid = true },
+  { path = "futures_channel::mpsc::UnboundedReceiver", reason = "unbounded: use futures_channel::mpsc::Receiver", allow-invalid = true },
+]
