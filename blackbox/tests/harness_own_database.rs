@@ -25,9 +25,10 @@ use blackbox::sql::Sql;
 
 /// An own database made by hand for `application`, as number 1 of a fresh
 /// platform database's name: the database owned by the owner role and
-/// commented, CONNECT for its two roles only, the runtime role given rows
-/// in what the owner makes, and the standard migrations applied as the
-/// owner. Returns it and the runtime role's password.
+/// commented, CONNECT for its two roles only, the platform's schema `vm`
+/// (owned by the owner, usable by the runtime role), the runtime role
+/// given rows in what the owner makes, and the standard migrations applied
+/// as the owner. Returns it and the runtime role's password.
 fn made_by_hand(application: &str) -> (OwnDatabase, String) {
     let platform = Platform::fresh();
     let name = format!("{}_app_1", platform.name());
@@ -60,6 +61,8 @@ fn made_by_hand(application: &str) -> (OwnDatabase, String) {
     db.batch(&format!(
         "REVOKE ALL ON SCHEMA public FROM PUBLIC;
          GRANT USAGE ON SCHEMA public TO {r};
+         CREATE SCHEMA vm AUTHORIZATION {o};
+         GRANT USAGE ON SCHEMA vm TO {r};
          ALTER DEFAULT PRIVILEGES FOR ROLE {o} IN SCHEMA public
            GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO {r};
          ALTER DEFAULT PRIVILEGES FOR ROLE {o} IN SCHEMA public
@@ -108,6 +111,44 @@ fn an_own_database_made_as_the_contract_says_is_found_and_read() {
     );
     assert!(!db.owned_by(&db.owner).is_empty());
     assert!(OwnDatabase::find(&Platform::fresh(), "sim").is_none());
+    // The platform's schema `vm` is not the Application's: its tables are
+    // left out of the Application's tables and fingerprint, and what the
+    // runtime role may do there is reported.
+    let before = db.fingerprint();
+    let platform_before = db.platform_schema();
+    db.superuser().batch(&format!(
+        "CREATE TABLE vm.platform_notes (x int);
+         ALTER TABLE vm.platform_notes OWNER TO {o};
+         INSERT INTO vm.platform_notes VALUES (1);
+         GRANT SELECT ON vm.platform_notes TO {r};",
+        o = ident(&db.owner),
+        r = ident(&db.runtime),
+    ));
+    assert_eq!(
+        db.fingerprint(),
+        before,
+        "vm is left out of the fingerprint"
+    );
+    assert!(
+        !db.tables().iter().any(|t| t.starts_with("vm.")),
+        "{:?}",
+        db.tables()
+    );
+    assert!(db.objects_not_owned_by_the_owner().is_empty());
+    assert_ne!(
+        db.platform_schema(),
+        platform_before,
+        "a table in vm is seen"
+    );
+    assert!(db.powers_in_platform_schema(&db.runtime).is_empty());
+    db.superuser().batch(&format!(
+        "GRANT INSERT ON vm.platform_notes TO {}",
+        ident(&db.runtime)
+    ));
+    assert_eq!(
+        db.powers_in_platform_schema(&db.runtime),
+        vec!["INSERT on vm.platform_notes"]
+    );
 }
 
 #[test]

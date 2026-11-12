@@ -128,7 +128,7 @@ fn a_first_version_without_migrations_also_creates_the_own_database() {
         let db = own.own_database(name);
         assert!(
             db.tables().is_empty(),
-            "expected no tables in the own database of {name:?}, which has no migrations, got {:?}",
+            "expected no table of the Application's (outside the platform's schema vm) in the own database of {name:?}, which has no migrations, got {:?}",
             db.tables()
         );
         assert!(db.role_exists(&db.owner) && db.role_exists(&db.runtime));

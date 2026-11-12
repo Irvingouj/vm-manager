@@ -163,6 +163,50 @@ fn an_identity_claimed_in_the_arguments_changes_nothing() {
 }
 
 #[test]
+fn an_identity_claimed_through_the_real_as_argument_gains_nothing() {
+    // `as` is an argument the operation has (CONTRACT.md, "Operations on
+    // the own database"): `"application"` on a Resource is refused with
+    // `not-own-database`, and anything but `"user"` or `"application"` is
+    // malformed. Neither sends anything, and the log names the real User.
+    let s = hostile_scenario();
+    let (marker, sql) = probe("claim-as");
+    for (user, application) in [(rita(), "loud"), (nobody(), "loud"), (rita(), "sneak")] {
+        let (response, body) = s.post(
+            &user,
+            application,
+            "/claim-as",
+            &json!({ "args": ask(RESOURCE, &sql) }),
+        );
+        let answers = body["answers"].as_array().unwrap();
+        assert_eq!(answers.len(), 2, "{body}");
+        let context = format!("{} in {application}", user.id);
+        assert_refusal(
+            &answers[0],
+            "not-own-database",
+            &json!({ "resource": RESOURCE }),
+            &format!("{context}, claiming to act as the Application on a Resource"),
+        );
+        assert_eq!(
+            answers[1]["error"]["kind"].as_str(),
+            Some("malformed"),
+            "{context}, claiming an identity object as `as`: expected {{ error: {{ kind: \"malformed\" }} }}, got {}",
+            answers[1]
+        );
+        // One entry, for the refusal (a malformed operation has none),
+        // naming the real User.
+        let entries = s.entries_of(&response);
+        assert_eq!(entries.len(), 1, "{}", lines(&entries));
+        assert_entries_name(&s, &response, &user.id, application);
+        assert_eq!(entries[0]["reason"], "not-own-database", "{}", entries[0]);
+        assert_eq!(entries[0]["actor"], "application", "{}", entries[0]);
+        // Every host call is recorded as the real User's.
+        s.vm.records_of(&response)
+            .assert_host_saw_only(&user.id, application);
+    }
+    s.db.assert_not_received(&marker, "queries claiming through `as`");
+}
+
+#[test]
 fn overwritten_globals_and_built_ins_change_nothing() {
     let s = hostile_scenario();
     let (marker, sql) = probe("tamper");

@@ -19,6 +19,9 @@
 //   POST /claim   {args}   the query with an identity claimed in the
 //                          arguments, in a third argument, and on the
 //                          arguments' prototype: { answers: [3 readings] }
+//   POST /claim-as {args}  the query claiming through the real `as`: as
+//                          the Application, and as an identity object:
+//                          { answers: [2 readings] }
 //   POST /tamper  {args}   globals and built-ins overwritten, then the
 //                          query: { answer, tampered: { what: outcome } }
 //   POST /later   {args, delayMs}
@@ -55,8 +58,15 @@ const CLAIMS = {
   needed: "structure",
   declared: "write",
   request: "req-of-someone-else",
-  as: CLAIMED_USER,
+  actingAs: CLAIMED_USER,
+  actor: CLAIMED_USER.id,
+  onBehalfOf: CLAIMED_USER,
 };
+
+// Claims through the real argument `as` (CONTRACT.md, "Operations on the
+// own database"): acting as the Application on a Resource, and an
+// identity where an actor's name belongs.
+const CLAIMS_THROUGH_AS = [{ as: "application" }, { as: CLAIMED_USER }];
 
 const message = (e) => {
   try {
@@ -167,6 +177,14 @@ globalThis.default = {
       const inThird = await query(args, CLAIMS);
       const onPrototype = await query(real.assign(real.create(CLAIMS), args));
       return json({ answers: [inArgs, inThird, onPrototype] });
+    }
+
+    if (url.pathname === "/claim-as") {
+      const answers = [];
+      for (const claim of CLAIMS_THROUGH_AS) {
+        answers[answers.length] = await query(real.assign({}, args, claim));
+      }
+      return json({ answers });
     }
 
     if (url.pathname === "/tamper") {

@@ -316,14 +316,16 @@ impl OwnDatabase {
             == Some("1")
     }
 
-    /// The tables and partitioned tables in this database outside Postgres's
-    /// own schemas, as `schema.table`, ordered.
+    /// The Application's tables and partitioned tables in this database:
+    /// outside Postgres's own schemas and the platform's schema `vm`
+    /// (CONTRACT.md: "The schema `vm` in an own database is the
+    /// platform's"), as `schema.table`, ordered.
     pub fn tables(&self) -> Vec<String> {
         self.column(
             "SELECT n.nspname || '.' || c.relname FROM pg_class c
                JOIN pg_namespace n ON n.oid = c.relnamespace
               WHERE c.relkind IN ('r', 'p')
-                AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+                AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'vm')
                 AND n.nspname NOT LIKE 'pg\\_toast%' AND n.nspname NOT LIKE 'pg\\_temp%'
               ORDER BY 1",
         )
@@ -334,8 +336,9 @@ impl OwnDatabase {
         self.tables().contains(&format!("public.{table}"))
     }
 
-    /// Every object in this database outside Postgres's own schemas that
-    /// is NOT owned by the owner role, as `kind name owner`: relations,
+    /// Every object of the Application's in this database (outside
+    /// Postgres's own schemas and the platform's schema `vm`) that is NOT
+    /// owned by the owner role, as `kind name owner`: relations,
     /// schemas made by migrations, functions, types. Large objects are left
     /// out: any role may create one, which CONTRACT.md names as not closed.
     pub fn objects_not_owned_by_the_owner(&self) -> Vec<String> {
@@ -343,24 +346,24 @@ impl OwnDatabase {
         self.column(&format!(
             "SELECT 'relation ' || n.nspname || '.' || c.relname || ' ' || pg_get_userbyid(c.relowner)
                FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-              WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')
+              WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'vm')
                 AND n.nspname NOT LIKE 'pg\\_toast%'
                 AND pg_get_userbyid(c.relowner) <> {owner}
              UNION ALL
              SELECT 'function ' || p.oid::regprocedure::text || ' ' || pg_get_userbyid(p.proowner)
                FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
-              WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')
+              WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'vm')
                 AND pg_get_userbyid(p.proowner) <> {owner}
              UNION ALL
              SELECT 'type ' || n.nspname || '.' || t.typname || ' ' || pg_get_userbyid(t.typowner)
                FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace
-              WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')
+              WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'vm')
                 AND n.nspname NOT LIKE 'pg\\_toast%'
                 AND pg_get_userbyid(t.typowner) <> {owner}
              UNION ALL
              SELECT 'schema ' || n.nspname || ' ' || pg_get_userbyid(n.nspowner)
                FROM pg_namespace n
-              WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'public')
+              WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'public', 'vm')
                 AND n.nspname NOT LIKE 'pg\\_%'
                 AND pg_get_userbyid(n.nspowner) <> {owner}
              ORDER BY 1"
@@ -387,7 +390,9 @@ impl OwnDatabase {
         ))
     }
 
-    /// Everything a statement could change in this database, as one text:
+    /// Everything a statement could change in this database, as one text,
+    /// leaving out the platform's schema `vm` (which may change when the
+    /// platform sets itself up; see [`OwnDatabase::platform_schema`]):
     /// the database's owner, privileges, comment and settings; its schemas,
     /// relations (with kind, owner and privileges), columns, constraints,
     /// indexes, functions, types, triggers, rules, default privileges,
@@ -397,7 +402,7 @@ impl OwnDatabase {
     pub fn fingerprint(&self) -> String {
         let sql = self.superuser();
         let roles = format!("{}, {}", literal(&self.owner), literal(&self.runtime));
-        let user_schemas = "n.nspname NOT IN ('pg_catalog', 'information_schema') AND n.nspname NOT LIKE 'pg\\_toast%'";
+        let user_schemas = "n.nspname NOT IN ('pg_catalog', 'information_schema', 'vm') AND n.nspname NOT LIKE 'pg\\_toast%'";
         let parts: Vec<(&str, String)> = vec![
             (
                 "database",
@@ -422,7 +427,7 @@ impl OwnDatabase {
                 "SELECT string_agg(n.nspname || ' owner=' || pg_get_userbyid(n.nspowner)
                                    || ' acl=' || coalesce(array_to_string(n.nspacl, ';'), ''), ',' ORDER BY n.nspname)
                    FROM pg_namespace n
-                  WHERE n.nspname NOT LIKE 'pg\\_%' AND n.nspname <> 'information_schema'"
+                  WHERE n.nspname NOT LIKE 'pg\\_%' AND n.nspname NOT IN ('information_schema', 'vm')"
                     .to_owned(),
             ),
             (
@@ -457,7 +462,7 @@ impl OwnDatabase {
                 "SELECT string_agg(co.conrelid::regclass::text || '.' || co.conname || ' ' || pg_get_constraintdef(co.oid), ','
                                    ORDER BY co.conrelid::regclass::text, co.conname)
                    FROM pg_constraint co JOIN pg_namespace n ON n.oid = co.connamespace
-                  WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')"
+                  WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'vm')"
                     .to_owned(),
             ),
             (
@@ -477,7 +482,7 @@ impl OwnDatabase {
                                    || ' src=' || md5(coalesce(p.prosrc, '')), ','
                                    ORDER BY p.oid::regprocedure::text)
                    FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
-                  WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')"
+                  WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'vm')"
                     .to_owned(),
             ),
             (
@@ -493,13 +498,15 @@ impl OwnDatabase {
                 "triggers",
                 "SELECT string_agg(tgrelid::regclass::text || '.' || tgname || ' ' || tgenabled::text, ','
                                    ORDER BY tgrelid::regclass::text, tgname)
-                   FROM pg_trigger WHERE NOT tgisinternal"
+                   FROM pg_trigger
+                  WHERE NOT tgisinternal
+                    AND tgrelid NOT IN (SELECT c.oid FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'vm')"
                     .to_owned(),
             ),
             (
                 "rules",
                 "SELECT string_agg(schemaname || '.' || tablename || '.' || rulename, ',' ORDER BY schemaname, tablename, rulename)
-                   FROM pg_rules WHERE schemaname NOT IN ('pg_catalog', 'information_schema')"
+                   FROM pg_rules WHERE schemaname NOT IN ('pg_catalog', 'information_schema', 'vm')"
                     .to_owned(),
             ),
             (
@@ -507,7 +514,8 @@ impl OwnDatabase {
                 "SELECT string_agg(pg_get_userbyid(defaclrole) || ':' || defaclnamespace::text || ':' || defaclobjtype::text
                                    || ':' || array_to_string(defaclacl, ';'), ','
                                    ORDER BY pg_get_userbyid(defaclrole), defaclnamespace, defaclobjtype)
-                   FROM pg_default_acl"
+                   FROM pg_default_acl
+                  WHERE defaclnamespace NOT IN (SELECT oid FROM pg_namespace WHERE nspname = 'vm')"
                     .to_owned(),
             ),
             (
@@ -555,7 +563,7 @@ impl OwnDatabase {
             "SELECT format('%I.%I', n.nspname, c.relname), c.relkind::text FROM pg_class c
                JOIN pg_namespace n ON n.oid = c.relnamespace
               WHERE c.relkind IN ('r', 'p', 'S', 'm')
-                AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+                AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'vm')
                 AND n.nspname NOT LIKE 'pg\\_toast%' AND n.nspname NOT LIKE 'pg\\_temp%'
               ORDER BY 1",
         );
@@ -574,6 +582,68 @@ impl OwnDatabase {
             text.push_str(&format!("rows of {name}: {value}\n"));
         }
         text
+    }
+
+    /// The structure of the platform's schema `vm`, as one text: the
+    /// schema's owner and privileges, its relations (kind, owner,
+    /// privileges), columns, functions (owner, rights, privileges, body).
+    /// No rows: the platform may write them. Empty when there is no `vm`.
+    pub fn platform_schema(&self) -> String {
+        let sql = self.superuser();
+        let parts = [
+            "SELECT string_agg(n.nspname || ' owner=' || pg_get_userbyid(n.nspowner)
+                               || ' acl=' || coalesce(array_to_string(n.nspacl, ';'), ''), ',')
+               FROM pg_namespace n WHERE n.nspname = 'vm'",
+            "SELECT string_agg(c.relname || ':' || c.relkind::text || ' owner=' || pg_get_userbyid(c.relowner)
+                               || ' acl=' || coalesce(array_to_string(c.relacl, ';'), ''), ',' ORDER BY c.relname)
+               FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'vm'",
+            "SELECT string_agg(c.relname || '.' || a.attname || ' ' || format_type(a.atttypid, a.atttypmod)
+                               || ' acl=' || coalesce(array_to_string(a.attacl, ';'), ''), ','
+                               ORDER BY c.relname, a.attnum)
+               FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid
+               JOIN pg_namespace n ON n.oid = c.relnamespace
+              WHERE n.nspname = 'vm' AND a.attnum > 0 AND NOT a.attisdropped",
+            "SELECT string_agg(p.oid::regprocedure::text || ' owner=' || pg_get_userbyid(p.proowner)
+                               || ' definer=' || p.prosecdef::text
+                               || ' acl=' || coalesce(array_to_string(p.proacl, ';'), '')
+                               || ' src=' || md5(coalesce(p.prosrc, '')), ',' ORDER BY p.oid::regprocedure::text)
+               FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'vm'",
+            "SELECT string_agg(t.tgrelid::regclass::text || '.' || t.tgname, ',' ORDER BY t.tgrelid::regclass::text, t.tgname)
+               FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid
+               JOIN pg_namespace n ON n.oid = c.relnamespace
+              WHERE n.nspname = 'vm' AND NOT t.tgisinternal",
+        ];
+        parts
+            .iter()
+            .map(|query| sql.value(query).unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// What `role` may do to the platform's schema `vm` beyond reading and
+    /// calling, as Postgres's privileges say: `CREATE` on the schema, and
+    /// any of `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE`, `REFERENCES`,
+    /// `TRIGGER` on a relation in it, or `UPDATE` on a sequence in it.
+    /// Empty when it can change nothing there (or there is no `vm`).
+    pub fn powers_in_platform_schema(&self, role: &str) -> Vec<String> {
+        let role = literal(role);
+        self.column(&format!(
+            "SELECT 'CREATE on schema vm' FROM pg_namespace
+              WHERE nspname = 'vm' AND has_schema_privilege({role}, oid, 'CREATE')
+             UNION ALL
+             SELECT p.privilege || ' on vm.' || c.relname
+               FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace,
+                    unnest(ARRAY['INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER']) AS p(privilege)
+              WHERE n.nspname = 'vm'
+                AND CASE WHEN c.relkind IN ('r', 'p', 'v', 'm', 'f')
+                         THEN has_table_privilege({role}, c.oid, p.privilege) ELSE false END
+             UNION ALL
+             SELECT 'UPDATE on sequence vm.' || c.relname
+               FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+              WHERE n.nspname = 'vm'
+                AND CASE WHEN c.relkind = 'S' THEN has_sequence_privilege({role}, c.oid, 'UPDATE') ELSE false END
+             ORDER BY 1"
+        ))
     }
 
     /// Runs each statement in this database as the runtime role (the
@@ -678,6 +748,11 @@ pub fn forbidden_statements(db: &OwnDatabase) -> Vec<String> {
         format!("ALTER ROLE {} CREATEDB", ident(&db.runtime)),
         format!("GRANT {} TO {}", ident(&db.owner), ident(&db.runtime)),
         "REINDEX TABLE items".to_owned(),
+        // The platform's schema.
+        "CREATE TABLE vm.sneaky (x int)".to_owned(),
+        "CREATE FUNCTION vm.sneaky_fn() RETURNS int LANGUAGE sql AS 'SELECT 1'".to_owned(),
+        "DROP SCHEMA vm CASCADE".to_owned(),
+        "ALTER SCHEMA vm RENAME TO sneaky_vm".to_owned(),
         "CLUSTER items USING items_pkey".to_owned(),
     ]
 }

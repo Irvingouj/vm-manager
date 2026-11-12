@@ -264,7 +264,7 @@ fn a_first_version_whose_migration_fails_is_422_and_records_no_version() {
     if let Some(db) = own.find_own_database("board") {
         assert!(
             db.tables().is_empty(),
-            "expected the own database left by a failed first Version to hold nothing of the migration, got {:?}",
+            "expected the own database left by a failed first Version to hold no table of the Application's (outside the platform's schema vm), got {:?}",
             db.tables()
         );
     }

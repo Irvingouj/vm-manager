@@ -215,6 +215,13 @@ fn the_runtime_role_owns_nothing_and_holds_no_power_beyond_rows() {
         "expected the runtime role to use the sequence of a table a later migration made"
     );
     assert!(db.owned_by(&db.runtime).is_empty());
+    // The platform's schema `vm`: the runtime role can change nothing there.
+    let powers = db.powers_in_platform_schema(&db.runtime);
+    assert!(
+        powers.is_empty(),
+        "expected the runtime role to be unable to change anything in the platform's schema vm, but Postgres says it holds:\n{}",
+        powers.join("\n")
+    );
 }
 
 #[test]
@@ -222,6 +229,7 @@ fn as_the_runtime_role_postgres_refuses_every_change_of_structure() {
     let own = Own::start();
     let db = own.install("board", &standard());
     let before = db.fingerprint();
+    let platform_before = db.platform_schema();
     let statements = forbidden_statements(&db);
     let results = db.as_runtime(&statements);
     let allowed: Vec<String> = statements
@@ -240,6 +248,11 @@ fn as_the_runtime_role_postgres_refuses_every_change_of_structure() {
         db.fingerprint(),
         before,
         "expected the own database unchanged after the runtime role's attempts"
+    );
+    assert_eq!(
+        db.platform_schema(),
+        platform_before,
+        "expected the platform's schema vm unchanged after the runtime role's attempts"
     );
     // Rows, it may change.
     let rows = db.as_runtime(&[
@@ -261,6 +274,7 @@ fn application_code_cannot_change_the_structure_through_the_program() {
     let own = Own::start();
     let db = own.install("board", &standard());
     let before = db.fingerprint();
+    let platform_before = db.platform_schema();
     let mut reached_the_database = BTreeSet::new();
     for actor in ACTORS {
         let mut calls: Vec<Value> = Vec::new();
@@ -289,6 +303,11 @@ fn application_code_cannot_change_the_structure_through_the_program() {
             db.fingerprint(),
             before,
             "expected the own database unchanged after every attempt as the {actor}"
+        );
+        assert_eq!(
+            db.platform_schema(),
+            platform_before,
+            "expected the platform's schema vm unchanged after every attempt as the {actor}"
         );
     }
     assert!(
