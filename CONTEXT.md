@@ -18,6 +18,10 @@ _Avoid_: Plugin, connector, external API (an outbound HTTP endpoint is a differe
 A named piece of enterprise infrastructure that IT registers and governs, and that an Application reaches through the SDK by its logical name alone.
 _Avoid_: Binding (the Cloudflare and OpenWorkers term), service, backend
 
+**Schema owner**:
+The one party allowed to change a database's structure: the Application itself for its own database, and someone outside the Application for a shared one.
+_Avoid_: DBA, admin, maintainer
+
 **Trusted context**:
 The platform-created value that says which User, Application and request an operation belongs to. Application code receives it and cannot construct one.
 _Avoid_: Session, token, credentials
