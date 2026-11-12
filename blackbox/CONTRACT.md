@@ -565,7 +565,7 @@ export default defineManifest({
   ```
 
   `declared_access` is exactly what `POST /v1/applications/<name>/versions` takes.
-- A Manifest that cannot be taken: exit code 2, and on standard output `{ "error": { "reason", "message", "file", "line", "column" } }`. Reasons: `manifest-missing` (no `manifest.ts`, or no `defineManifest(...)` call in it, or more than one); `manifest-not-literal` (the message says what was found and where, and that the Manifest must be a plain literal because the platform reads it without running code); `manifest-invalid` (a plain literal of the wrong shape: the message names the field). `line` and `column` start at 1 and point at the offending expression.
+- A Manifest that cannot be taken: exit code 2, and on standard output `{ "error": { "reason", "message", "file", "line", "column" } }`. Reasons: `manifest-missing` (no `manifest.ts`, or no `defineManifest(...)` call in it, or more than one); `manifest-not-literal` (the message says what was found and where, and that the Manifest must be a plain literal because the platform reads it without running code); `manifest-invalid` (a plain literal of the wrong shape: the message names the field). `line` and `column` start at 1 and point at the offending expression; they are `null` when there is nothing to point at (no file, no call). `file` is always the path of `manifest.ts`, as it was looked for.
 - `node <sdk>/tooling/main.js bundle <project directory>` prints the Application's bundle on standard output, exit code 0: one classic script with no `import` and no `export`, which assigns `globalThis.default`, containing the Application, the SDK's runtime, Drizzle and the structures. A project that does not build: exit code 2 and `{ "error": { "reason": "build-failed", "message", "errors": [ { "file", "line", "message" } ] } }`. `bundle` does not type-check; that is `tsc`'s job.
 - Any other failure: exit code 1 and a message on standard error.
 
@@ -587,11 +587,11 @@ export default defineApp(manifest, {
 ```
 
 - `ctx.user()`: the User of the request in flight. `id: string`, `groups: readonly string[]`. (The sign-in ticket adds the email and the display name.)
-- `ctx.user().db(name)`: a shared database declared in the Manifest, as the User. `ctx.user().ownDb()`: the own database, as the User. `ctx.app().ownDb()`: the own database, as the Application. `ctx.app()` has nothing else.
+- `ctx.user().db(name)`: a shared database declared in the Manifest, as the User. `ctx.user().ownDb()`: the own database, as the User. `ctx.app().ownDb()`: the own database, as the Application. In the types `ctx.app()` has nothing else. At run time `ctx.app().db(name)` exists all the same, so that code forced past the types gets the host's refusal `not-own-database` and its fix, not a `TypeError`.
 - A handle is a Drizzle database (`drizzle-orm/pg-proxy`), typed with that database's structure, relational queries (`db.query.<table>`) included.
 - **Every statement Drizzle sends is exactly one host operation**: `query` when the statement is a `select` (also one that begins with `with` and whose main statement is a `select`), `execute` otherwise; with `resource: <name>` or `own: true`, and `as: "user"` or `"application"`. So each shows as one Operation log entry, with the statement Drizzle built, without values.
 - The handles offer no raw SQL: there is no `execute` on them. (Drizzle's `sql` fragments inside a typed query remain, as ADR 0012 says; the database role is the boundary, not the types.) `transaction` comes with its own ticket.
-- A context holds no identity. A handle used when no request is in flight (at the top level, or after the response) is refused by the host with `no-request`, like any operation.
+- A context holds no identity. Application code gets a context only in `fetch`, so it has no handle at the top level. A handle kept and used after its request is over is refused by the host with `no-request`, like any operation (or its code simply never runs, as "The raw host interface" says).
 
 ### Values
 
