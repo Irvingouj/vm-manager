@@ -32,6 +32,10 @@ _Avoid_: Session, token, credentials
 IT's statement that a User or a group may reach a Resource at a given access level. It holds in every Application.
 _Avoid_: Permission, ACL, role
 
+**Group**:
+A set of Users defined in the enterprise directory and reported by the identity provider. The platform does not define its own. Grants are given to Groups.
+_Avoid_: Role, team, access list
+
 **Declared access**:
 The list, fixed in an Application's manifest at deploy, of the Resources it uses and at what access level. Nothing outside it is reachable.
 _Avoid_: Binding, scope, app permission
