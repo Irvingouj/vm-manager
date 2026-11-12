@@ -32,6 +32,10 @@ _Avoid_: Session, token, credentials
 IT's statement that a Group may reach a Resource at a given access level. It holds in every Application, and it also decides who may build against the Resource.
 _Avoid_: Permission, ACL, role
 
+**Access level**:
+How much of a Resource a Grant opens. For a database there are three, each including the one before: structure (discover it and pull its table structure, no rows), read, and write.
+_Avoid_: Role, permission set, scope
+
 **Group**:
 A set of Users defined in the enterprise directory and reported by the identity provider. The platform does not define its own. Grants are given to Groups.
 _Avoid_: Role, team, access list
