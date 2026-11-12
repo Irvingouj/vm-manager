@@ -1,0 +1,26 @@
+{
+  "name": "@vm/sdk",
+  "version": "0.0.0",
+  "private": true,
+  "description": "What an Application is written with (blackbox/CONTRACT.md, \"The SDK\"): the Manifest, the Trusted context with Drizzle handles, and the build tooling.",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "default": "./index.js"
+    },
+    "./runtime": "./runtime.js",
+    "./package.json": "./package.json"
+  },
+  "types": "./index.d.ts",
+  "scripts": {
+    "test": "node check.js"
+  },
+  "peerDependencies": {
+    "drizzle-orm": ">=0.45.0 <1.0.0"
+  },
+  "dependencies": {
+    "esbuild": "0.28.2",
+    "typescript": "5.9.3"
+  }
+}
