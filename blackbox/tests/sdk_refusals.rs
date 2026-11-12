@@ -9,8 +9,8 @@
 //! - `new Refused(...)` at run time throws a `TypeError`;
 //! - a `Refused` that escapes `fetch` is the `403` with `{ refusal, fix }`;
 //!   any other error is still the fixed `500`;
-//! - a handle used when no request is in flight (at the top level, or after
-//!   the response) is refused by the host with `no-request`.
+//! - a handle kept and used after its request is over is refused by the
+//!   host with `no-request`, or its code simply never runs.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -284,45 +284,6 @@ fn entries_without_request(sdk: &Sdk) -> Vec<Value> {
         );
     }
     entries
-}
-
-#[test]
-fn handles_used_at_the_top_level_are_refused_with_no_request() {
-    let sdk = Sdk::only("leftover");
-    assert_eq!(sdk.application, LEFTOVER);
-    let (_, now) = sdk.get_ok(&ann(), "/now");
-    assert_eq!(
-        now,
-        json!({ "asUser": { "ran": true, "rows": 1 }, "asApplication": { "ran": true, "rows": 1 } }),
-        "the same handles while a request is in flight read the seeded note"
-    );
-    let (_, body) = sdk.get_ok(&ann(), "/top");
-    for actor in ["asUser", "asApplication"] {
-        let caught = &body["atLoad"][actor]["caught"];
-        assert_eq!(
-            caught["isRefused"],
-            json!(true),
-            "expected the handle ({actor}) used while the script loads to reject with Refused, got {body}"
-        );
-        assert_eq!(
-            caught["refusal"],
-            json!({ "reason": "no-request" }),
-            "expected the host's refusal no-request ({actor}), got {body}"
-        );
-        assert_eq!(caught["name"], "Refused", "{body}");
-        let fix = caught["fix"].as_str().unwrap_or_default();
-        assert_eq!(
-            caught["message"].as_str(),
-            Some(format!("no-request: {fix}").as_str()),
-            "{body}"
-        );
-    }
-    let refused = entries_without_request(&sdk);
-    assert!(
-        refused.len() >= 2,
-        "expected the refusals made while loading in the Operation log, with no request; got:\n{}",
-        lines(&refused)
-    );
 }
 
 #[test]

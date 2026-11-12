@@ -82,11 +82,22 @@ fn run_manifest(manifest: &str, others: &[(&str, &str)]) -> (TempProject, Tooled
     (project, run)
 }
 
+/// Where a Manifest error must point.
+#[derive(Clone, Copy, Debug)]
+enum At<'a> {
+    /// Nothing to point at: `line` and `column` null.
+    Nothing,
+    /// Not said by CONTRACT.md (two calls): null, or a position.
+    Either,
+    /// One of these positions.
+    One(&'a [Position]),
+}
+
 /// Fails unless the run exited 2 with exactly `{ error: { reason, message,
-/// file, line, column } }` on standard output, this reason, a message, and
-/// (when `at` is not empty) the file `manifest.ts` and one of these
-/// positions. Returns the error.
-fn assert_manifest_error(run: &Tooled, reason: &str, at: &[Position], context: &str) -> Value {
+/// file, line, column } }` on standard output, this reason, a message,
+/// `file` the path of `manifest.ts`, and `line` and `column` as `at` says.
+/// Returns the error.
+fn assert_manifest_error(run: &Tooled, reason: &str, at: At<'_>, context: &str) -> Value {
     assert_eq!(
         run.code,
         Some(2),
@@ -120,18 +131,27 @@ fn assert_manifest_error(run: &Tooled, reason: &str, at: &[Position], context: &
             .is_some_and(|m| m.trim().len() >= 10),
         "{context}: expected a message a Coding agent can act on, got {answer}"
     );
-    if !at.is_empty() {
-        assert!(
-            error["file"]
-                .as_str()
-                .is_some_and(|f| f.ends_with("manifest.ts")),
-            "{context}: expected `file` to name manifest.ts, got {answer}"
-        );
-        let got = (error["line"].as_u64(), error["column"].as_u64());
-        assert!(
+    assert!(
+        error["file"]
+            .as_str()
+            .is_some_and(|f| f.ends_with("manifest.ts")),
+        "{context}: expected `file` to be the path of manifest.ts as it was looked for, got {answer}"
+    );
+    let got = (error["line"].as_u64(), error["column"].as_u64());
+    match at {
+        At::Nothing => assert!(
+            error["line"].is_null() && error["column"].is_null(),
+            "{context}: with nothing to point at, expected `line` and `column` null, got {answer}"
+        ),
+        At::Either => assert!(
+            (error["line"].is_null() && error["column"].is_null())
+                || (got.0.is_some_and(|l| l >= 1) && got.1.is_some_and(|c| c >= 1)),
+            "{context}: expected `line` and `column` both null or both positions from 1, got {answer}"
+        ),
+        At::One(at) => assert!(
             at.iter().any(|(l, c)| got == (Some(*l), Some(*c))),
             "{context}: expected line and column (from 1) at the offending expression, one of {at:?}, got {got:?} in {answer}"
-        );
+        ),
     }
     error.clone()
 }
@@ -236,7 +256,7 @@ fn an_identifier_is_not_a_plain_literal() {
         "{HEAD}const level = \"read\";\nexport default defineManifest({{\n  name: \"board\",\n  description: \"Open incidents.\",\n  resources: {{ devops: {{ kind: \"postgres\", access: /*@*/level }} }},\n}});\n"
     ));
     let (_p, run) = run_manifest(&text, &[]);
-    let error = assert_manifest_error(&run, "manifest-not-literal", &at, "an identifier");
+    let error = assert_manifest_error(&run, "manifest-not-literal", At::One(&at), "an identifier");
     let message = error["message"].as_str().unwrap_or_default();
     assert!(
         message.contains("plain literal"),
@@ -250,7 +270,7 @@ fn a_call_is_not_a_plain_literal() {
         "{HEAD}function pick(level: \"read\" | \"write\") {{ return level; }}\nexport default defineManifest({{\n  name: \"board\",\n  description: \"Open incidents.\",\n  resources: {{ devops: {{ kind: \"postgres\", access: /*@*/pick(\"read\") }} }},\n}});\n"
     ));
     let (_p, run) = run_manifest(&text, &[]);
-    assert_manifest_error(&run, "manifest-not-literal", &at, "a call");
+    assert_manifest_error(&run, "manifest-not-literal", At::One(&at), "a call");
 }
 
 #[test]
@@ -259,7 +279,7 @@ fn a_spread_is_not_a_plain_literal() {
         "{HEAD}const shared = {{ devops: {{ kind: \"postgres\", access: \"read\" }} }} as const;\nexport default defineManifest({{\n  name: \"board\",\n  description: \"Open incidents.\",\n  resources: {{ /*@*/.../*@alt*/shared }},\n}});\n"
     ));
     let (_p, run) = run_manifest(&text, &[]);
-    assert_manifest_error(&run, "manifest-not-literal", &at, "a spread");
+    assert_manifest_error(&run, "manifest-not-literal", At::One(&at), "a spread");
 }
 
 #[test]
@@ -268,7 +288,7 @@ fn a_computed_key_is_not_a_plain_literal() {
         "{HEAD}export default defineManifest({{\n  name: \"board\",\n  description: \"Open incidents.\",\n  resources: {{ /*@*/[/*@alt*/\"devops\"]: {{ kind: \"postgres\", access: \"read\" }} }},\n}});\n"
     ));
     let (_p, run) = run_manifest(&text, &[]);
-    assert_manifest_error(&run, "manifest-not-literal", &at, "a computed key");
+    assert_manifest_error(&run, "manifest-not-literal", At::One(&at), "a computed key");
 }
 
 #[test]
@@ -277,7 +297,12 @@ fn a_shorthand_property_is_not_a_plain_literal() {
         "{HEAD}const name = \"board\";\nexport default defineManifest({{\n  /*@*/name,\n  description: \"Open incidents.\",\n  resources: {{}},\n}});\n"
     ));
     let (_p, run) = run_manifest(&text, &[]);
-    assert_manifest_error(&run, "manifest-not-literal", &at, "a shorthand property");
+    assert_manifest_error(
+        &run,
+        "manifest-not-literal",
+        At::One(&at),
+        "a shorthand property",
+    );
 }
 
 #[test]
@@ -289,7 +314,7 @@ fn a_template_with_a_substitution_is_not_a_plain_literal() {
     assert_manifest_error(
         &run,
         "manifest-not-literal",
-        &at,
+        At::One(&at),
         "a template with a substitution",
     );
 }
@@ -303,7 +328,12 @@ fn an_imported_value_is_not_a_plain_literal() {
         &text,
         &[("levels.ts", "export const level = \"read\" as const;\n")],
     );
-    assert_manifest_error(&run, "manifest-not-literal", &at, "an imported value");
+    assert_manifest_error(
+        &run,
+        "manifest-not-literal",
+        At::One(&at),
+        "an imported value",
+    );
 }
 
 #[test]
@@ -318,7 +348,12 @@ fn an_imported_manifest_is_not_a_plain_literal() {
             "export default { name: \"board\", description: \"d\", resources: {} } as const;\n",
         )],
     );
-    assert_manifest_error(&run, "manifest-not-literal", &at, "an imported Manifest");
+    assert_manifest_error(
+        &run,
+        "manifest-not-literal",
+        At::One(&at),
+        "an imported Manifest",
+    );
 }
 
 #[test]
@@ -327,7 +362,12 @@ fn structure_is_not_a_level_an_application_declares() {
         "{ devops: { kind: \"postgres\", access: /*@*/\"structure\" } }",
     ));
     let (_p, run) = run_manifest(&text, &[]);
-    let error = assert_manifest_error(&run, "manifest-invalid", &at, "access: \"structure\"");
+    let error = assert_manifest_error(
+        &run,
+        "manifest-invalid",
+        At::One(&at),
+        "access: \"structure\"",
+    );
     assert!(
         error["message"]
             .as_str()
@@ -343,7 +383,7 @@ fn an_unknown_kind_is_invalid() {
         "{ devops: { kind: /*@*/\"mysql\", access: \"read\" } }",
     ));
     let (_p, run) = run_manifest(&text, &[]);
-    let error = assert_manifest_error(&run, "manifest-invalid", &at, "kind: \"mysql\"");
+    let error = assert_manifest_error(&run, "manifest-invalid", At::One(&at), "kind: \"mysql\"");
     assert!(
         error["message"]
             .as_str()
@@ -359,7 +399,7 @@ fn a_missing_name_is_invalid() {
         "{HEAD}export default /*@alt*/defineManifest(/*@*/{{\n  description: \"Open incidents.\",\n  resources: {{}},\n}});\n"
     ));
     let (_p, run) = run_manifest(&text, &[]);
-    let error = assert_manifest_error(&run, "manifest-invalid", &at, "no `name`");
+    let error = assert_manifest_error(&run, "manifest-invalid", At::One(&at), "no `name`");
     assert!(
         error["message"]
             .as_str()
@@ -376,8 +416,12 @@ fn a_name_the_api_would_not_take_is_invalid() {
             "{HEAD}export default defineManifest({{\n  name: /*@*/\"{bad}\",\n  description: \"Open incidents.\",\n  resources: {{}},\n}});\n"
         ));
         let (_p, run) = run_manifest(&text, &[]);
-        let error =
-            assert_manifest_error(&run, "manifest-invalid", &at, &format!("the name {bad:?}"));
+        let error = assert_manifest_error(
+            &run,
+            "manifest-invalid",
+            At::One(&at),
+            &format!("the name {bad:?}"),
+        );
         assert!(
             error["message"]
                 .as_str()
@@ -393,7 +437,7 @@ fn a_project_without_manifest_ts_is_manifest_missing() {
     let project = TempProject::new("no-manifest");
     project.write("src/index.ts", "export {};\n");
     let run = project.manifest();
-    assert_manifest_error(&run, "manifest-missing", &[], "no manifest.ts");
+    assert_manifest_error(&run, "manifest-missing", At::Nothing, "no manifest.ts");
 }
 
 #[test]
@@ -402,7 +446,12 @@ fn a_manifest_ts_without_define_manifest_is_manifest_missing() {
         "export default { name: \"board\", description: \"d\", resources: {} };\n",
         &[],
     );
-    assert_manifest_error(&run, "manifest-missing", &[], "no defineManifest(...) call");
+    assert_manifest_error(
+        &run,
+        "manifest-missing",
+        At::Nothing,
+        "no defineManifest(...) call",
+    );
 }
 
 #[test]
@@ -416,7 +465,7 @@ fn two_define_manifest_calls_are_manifest_missing() {
     assert_manifest_error(
         &run,
         "manifest-missing",
-        &[],
+        At::Either,
         "two defineManifest(...) calls",
     );
 }
