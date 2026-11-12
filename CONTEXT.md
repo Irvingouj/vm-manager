@@ -15,12 +15,16 @@ The page every employee signs in to, listing the Applications they can contribut
 _Avoid_: Portal, console (IT's admin surface), app store
 
 **Integration**:
-Separately trusted code that exposes a few narrow business functions and reaches Resources as itself. Applications call it instead of holding privileged access; each of its functions is a Resource.
+Separately trusted code that exposes a few narrow business functions and reaches Resources as itself. Applications call it instead of holding privileged access. Anyone may write one; each function takes effect only once the Resource owner releases it.
 _Avoid_: Plugin, connector, external API (an outbound HTTP endpoint is a different thing)
 
 **Resource**:
 A named piece of enterprise infrastructure that IT registers and governs, and that an Application reaches through the SDK by its logical name alone.
 _Avoid_: Binding (the Cloudflare and OpenWorkers term), service, backend
+
+**Resource owner**:
+The person or Group answerable for a Resource. They, or a top-level IT administrator, release the Integration functions that reach it.
+_Avoid_: Data owner, steward, admin
 
 **Schema owner**:
 The one party allowed to change a database's structure: the Application itself for its own database, and someone outside the Application for a shared one.
