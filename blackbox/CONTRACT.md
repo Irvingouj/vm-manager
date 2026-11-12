@@ -315,6 +315,7 @@ env.VM.invoke("execute", { resource: "devops", sql: "update incidents set open =
 - A `SELECT` through `execute` is allowed: it runs as the write login, and `rows` are its rows.
 - Order for any operation: who is allowed (a refusal) first, then `read-only-resource`, then the statement check, then the database.
 - The row and byte limits count the rows `RETURNING` gives.
+- SQL that holds no statement is `kind-not-allowed`; a statement longer than 1 MiB is `unparsed`.
 - `query` is unchanged: `read`, the read login, a read-only transaction, whatever the User's and the Version's levels are.
 - In the Operation log, `operation` is `execute`, and `rows` is the rows affected. A failed `execute` records the SQLSTATE; a statement that never reached the database records why.
 
