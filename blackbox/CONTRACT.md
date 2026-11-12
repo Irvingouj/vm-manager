@@ -401,7 +401,7 @@ env.VM.invoke("query",   { resource: "devops", sql, params })          // as bef
 - On the own database no Declared access and no Grant is needed: being served the Application is enough. Both actors are allowed whenever a request is in flight.
 - **Acting as the Application is only for the own database.** `as: "application"` with a `resource` is refused with `not-own-database` (`refusal.resource` names it), whatever is declared or granted: Grants are held by Users. It is checked right after `no-request`, before anything about the Resource.
 - Everything else is as on a shared database: `query` runs in a read-only transaction and `execute` in a read-write one, as the runtime role; one statement; the statement check; the limits; the answers and errors; a connection returned only clean.
-- The identity label has a fourth setting, `vm.actor`: `user` or `application`. `vm.user` is the User in flight for both actors. (The ticket on identity and Change history replaces the label in own databases with one that cannot be forged.)
+- The identity label has a fourth setting, `vm.actor`: `user` or `application`. `vm.user` is the User in flight for both actors. It stays a label here too; what cannot be forged is `vm.identity()` ("Identity and Change history in the own database").
 - Before an Application's first Version there is no own database; there is also no Version to serve, so no operation can reach that state.
 
 ### In the Operation log
@@ -434,3 +434,70 @@ pub enum Reason { NoRequest, NotOwnDatabase, NotDeclared, NotRegistered, Declare
 ```
 
 Order: `NoRequest`; then the own database is allowed; then `NotOwnDatabase` for `Actor::Application` on a Resource; then the rest as before.
+
+## Identity and Change history in the own database (ticket: Identity in the own database, and Change history)
+
+The platform keeps its own things in the schema `vm` of every own database, from the moment the database is made. Three of them are part of this contract: the function `vm.identity()`, the table `vm.history`, and the setting `vm.ctx`. The rest of the schema is the platform's own affair and may change.
+
+### Identity
+
+For every operation on the own database the host attaches who the operation is for, before the Application's statement runs, in a way Application SQL can read and cannot make.
+
+- `SELECT * FROM vm.identity()` gives one row: `user_id` (the User in flight), `application`, `actor` (`user` or `application`), `request`. All are text. It works in `query` and in `execute`, for both actors.
+- When no identity is attached, or what is attached does not verify, `vm.identity()` raises an error with SQLSTATE `VM001`. It never answers with an empty or made-up identity.
+- The attached identity lives in the transaction-local setting `vm.ctx`, as opaque text. Application SQL may read it. It is bound to the transaction it was attached in: the same text set in any other transaction, on the same connection or another, does not verify.
+- Only the host can attach. Whatever the runtime role sends (setting `vm.ctx` or any other setting, calling any function in `vm` with any arguments, anything else), `vm.identity()` afterwards gives the identity the host attached to that transaction, or raises `VM001`.
+- What the platform keeps secret for this is in tables of schema `vm` that the runtime role cannot read, and nowhere else in the own database.
+- The label of "Operations on the own database" (`vm.user`, `vm.application`, `vm.request`, `vm.actor`) is still set, and is still only a label.
+
+### Change history
+
+Every table an Application's migrations make, in any schema but `vm`, is captured from the end of the migration that made it, with nothing done by the Contributor. Each row inserted, updated or deleted leaves one row in `vm.history`, written in the same transaction as the change:
+
+| Column | Type | What |
+|---|---|---|
+| `id` | `bigint` | Increasing in the order the changes were recorded. |
+| `at` | `timestamptz` | When the change was made. |
+| `schema_name`, `table_name` | `text` | The table. |
+| `kind` | `text` | `insert`, `update` or `delete`. |
+| `key` | `jsonb` | The row's primary key as `{ "<column>": value, ... }`, as it was before the change (for an insert: of the new row). Null for a table without a primary key. |
+| `old` | `jsonb` | The whole row before, as `to_jsonb` gives it. Null for an insert. |
+| `new` | `jsonb` | The whole row after. Null for a delete. |
+| `changed` | `jsonb` | For an update: the names of the columns whose value differs, as an array, in the table's column order; empty when none does. Null for an insert and a delete. |
+| `user_id` | `text` | The User in flight, for both actors. |
+| `application` | `text` | The Application. |
+| `actor` | `text` | `user`, `application` or `migration`. |
+| `request` | `text` | The request's id, as in the Operation log. Null for `migration`. |
+| `migration` | `text` | For `migration`: the migration's name. Null otherwise. |
+
+- A statement that changes many rows leaves one history row per changed row. A row changed because of another (a cascading delete, an `ON CONFLICT DO UPDATE`) is recorded like any other, under the same identity.
+- A change that is rolled back leaves no history row; a history row is never left for a change that did not happen.
+- Rows a migration changes in a table that an earlier migration made are recorded with `actor` `migration`, `user_id` the Contributor who sent the Version, the migration's name, and no request. Rows a migration puts into a table it makes itself are not recorded: that table's history begins when the migration ends.
+- The runtime role may read `vm.history` (`SELECT`), so an Application can show its own history through `query`, under the usual limits. Whoever can use the Application can therefore read its history, as ADR 0005 says.
+
+### A change with no identity fails
+
+A row of a captured table cannot be inserted, updated or deleted, by any role, in a transaction with no verifiable identity: the statement fails with SQLSTATE `VM001`, nothing is changed and nothing is recorded. There is no history row "made by nobody". Through the host this cannot happen to an Application; if it did, the answer would be the usual `{ error: { kind: "database", code: "VM001", ... } }`.
+
+### What the runtime role cannot do
+
+These hold in the database itself, for anyone logged in as, or become, the runtime role, with or without the statement check. Tests assert them there.
+
+- Make `vm.identity()` answer anything but what the host attached: not by forging `vm.ctx`, not by replaying a `vm.ctx` read in another transaction, not by calling whatever the host calls to attach.
+- Read what the platform keeps secret in `vm`.
+- Stop the capture: disable, drop or replace a capture trigger or any function in `vm`; change `session_replication_role`; `TRUNCATE` a captured table or `vm.history`.
+- Insert, update or delete a row of `vm.history`, other than by changing a captured row.
+- Create anything in `vm`, or anything anywhere that is found before `vm`'s or the catalog's own names.
+
+It can read: `vm.identity()`, `vm.ctx`, `vm.history`.
+
+### The server log
+
+With statement logging fully on in the own database (`log_statement = all`, `log_min_duration_statement = 0`, parameters logged whole), the Postgres server log gives its reader nothing to attach an identity with:
+
+- no value the platform keeps secret in `vm` appears in it, whole or as the hex or base64 of it;
+- sending again what the log shows the host sent, as the runtime role, in another transaction, attaches nothing: `vm.identity()` raises `VM001` or the statement itself fails.
+
+### What this does not close
+
+A migration is the Contributors' own code and runs as the role that owns the database (ADR 0013), `vm` included. A migration can therefore read the platform's secret, change `vm.history` and remove the capture. The platform records every migration's text (`vm.migrations`), so this is visible afterwards, not prevented.
