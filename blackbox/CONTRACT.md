@@ -108,7 +108,7 @@ Kebab-case strings, the same everywhere a refusal is reported (to Application co
 
 ## The platform's API (ticket: Applications and their Versions live in the platform database)
 
-Served at `api.<domain>`. Requests and answers are JSON. The caller is a signed-in User, by the same sign-in as everywhere (for now the stand-in); the checks for a missing `Host`, a malformed sign-in and not being signed in are the ones in "Responses the program itself gives", and come first. Requests to the API have `request` records like any other, with `application` and `version` null.
+Served at `api.<domain>`; letter case and a port in `Host` are ignored, as for Applications. Requests and answers are JSON. The caller is a signed-in User, by the same sign-in as everywhere (for now the stand-in). The checks for a missing `Host`, a malformed sign-in and not being signed in are the ones in "Responses the program itself gives", with their plain-text bodies, and come before everything below, whatever the request's path or body. Requests to the API have `request` records like any other, with `application` and `version` null.
 
 An answer that is not a success is:
 
@@ -119,12 +119,17 @@ An answer that is not a success is:
 | Status | When | `reason` |
 |---|---|---|
 | 400 | The body is not the JSON asked for | `malformed` |
-| 400 | An Application name that is not a lower-case DNS label of 1 to 63 characters | `invalid-name` |
-| 400 | An Application name that is one of the platform's own | `reserved-name` |
+| 400 | An Application name that is not a lower-case DNS label of 1 to 63 characters (letters, digits and hyphens; it may start with a digit; not starting or ending with a hyphen), or that starts with `xn--` | `invalid-name` |
+| 400 | An Application name that is exactly one of the platform's own (`apis` or `my-api` are fine) | `reserved-name` |
 | 403 | The User is not a Contributor of the Application | `not-a-contributor` |
 | 404 | No such Application, Version or path | `not-found` |
+| 405 | A path the API has, with a method it does not have there | `method-not-allowed` |
 | 409 | The Application's name is taken | `name-taken` |
-| 413 | A body larger than 16 MiB | `too-large` |
+| 413 | A body larger than 16 MiB (exactly 16 MiB is accepted) | `too-large` |
+
+When several apply, the first of these wins: `too-large`, `not-found`, `method-not-allowed`, `not-a-contributor`, `malformed`, then the rest. So someone who is not a Contributor learns nothing about whether their body was well formed.
+
+- A body with a missing or wrongly typed field, a key given twice, or JSON that does not parse is `malformed`. Fields the request does not have (also ones the platform sets, like `created_by` or `number`) are ignored.
 
 ### Applications
 
@@ -136,7 +141,7 @@ An answer that is not a success is:
   "created_by": "<user id>", "created_at": "<RFC 3339 time>" }
 ```
 
-The creator is its first Contributor. Names are unique in the installation.
+The creator is its first Contributor. Names are unique in the installation. `description` is null when none was given; `serving_version` is a number, or null before the first Version.
 
 `GET /v1/applications/<name>` answers `200` with the same object. In this ticket every signed-in User may read it; who may see an Application is settled by the ticket on Contributors and sharing.
 
@@ -150,14 +155,14 @@ The creator is its first Contributor. Names are unique in the installation.
   "git_commit": "<40 hex characters>" }
 ```
 
-`declared_access.resources` may be empty; `access` is `structure`, `read` or `write`. Answers `201` with the Version, which from then on is the Application's serving Version:
+All three fields are required. `declared_access.resources` may be an empty object; `kind` is `postgres`; `access` is `structure`, `read` or `write`. `bundle` may be any text, also empty: what does not run is still a Version. Answers `201` with the Version, which from then on is the Application's serving Version:
 
 ```json
 { "application": "incident-board", "number": 1, "declared_access": { ... }, "git_commit": "...",
   "bundle_sha256": "<hex>", "created_by": "<user id>", "created_at": "<RFC 3339 time>" }
 ```
 
-- Versions of an Application are numbered 1, 2, 3, ... in the order they were sent.
+- Versions of an Application are numbered 1, 2, 3, ... in the order they were sent. `bundle_sha256` is the SHA-256 of the bundle's UTF-8 bytes.
 - A Version is immutable: `GET /v1/applications/<name>/versions/<number>` answers the same object for ever, whatever is sent later. Which Version serves is a fact about the Application (`serving_version`), not about the Version.
 - `GET /v1/applications/<name>/versions` answers `{ "versions": [ ... ] }`, oldest first.
 - Once the `201` has been received, every new request to the Application is served by the new Version. Requests already in flight finish on the Version they started on.
