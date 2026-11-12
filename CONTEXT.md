@@ -10,6 +10,14 @@ An open-source, self-hosted platform on which an enterprise's employees and thei
 A stateless program, deployed by a Builder, that answers web requests and reaches enterprise infrastructure only through the SDK. It follows the Cloudflare Workers execution model without being Cloudflare-compatible.
 _Avoid_: Worker (reserved for future background compute), service, project
 
+**Manifest**:
+The TypeScript value in an Application's project that names the Application and lists the Resources it uses. Deploy turns it into the Application's Declared access.
+_Avoid_: Config, bindings file, wrangler file
+
+**Version**:
+One deploy of an Application, kept unchanged: its bundled code, its Declared access and the Git commit it was built from. An Application serves exactly one Version at a time, and going back means serving the previous one.
+_Avoid_: Release, build, revision, deployment (for the thing; deploy is the act)
+
 **Dashboard**:
 The page every employee signs in to, listing the Applications they can contribute to and the Applications shared with them. The same list is available to their agent.
 _Avoid_: Portal, console (IT's admin surface), app store
@@ -49,7 +57,7 @@ A set of Users defined in the enterprise directory and reported by the identity 
 _Avoid_: Role, team, access list
 
 **Declared access**:
-The list, fixed in an Application's manifest at deploy, of the Resources it uses and at what access level. Nothing outside it is reachable.
+The list, taken from an Application's Manifest at deploy and fixed for that Version, of the Resources it uses and at what access level. Nothing outside it is reachable.
 _Avoid_: Binding, scope, app permission
 
 **Autonomous grant**:

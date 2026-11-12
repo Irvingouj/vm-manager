@@ -1,5 +1,5 @@
 ---
-status: accepted by the agent on prototype evidence; not yet reviewed by the product owner
+status: accepted
 ---
 
 # The database role is the boundary, and identity is unforgeable only where the platform owns the database

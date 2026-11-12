@@ -1,5 +1,5 @@
 ---
-status: proposed, waiting for the product owner
+status: accepted
 ---
 
 # Queries are written in Drizzle itself
