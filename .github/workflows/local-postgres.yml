@@ -13,12 +13,15 @@ permissions:
 
 jobs:
   pg:
-    name: ${{ matrix.os }} pg ${{ matrix.pg }}
+    name: ${{ matrix.os }} ${{ matrix.source }} ${{ matrix.pg }}
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        pg: ["18.6.0", "18.6.1"]
+        source: [zonky, theseus]
+        include:
+          - { source: zonky, pg: "18.6.0" }
+          - { source: theseus, pg: "18.6.1" }
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -28,6 +31,7 @@ jobs:
       CARGO_TERM_COLOR: never
       RUST_TOOLCHAIN: "1.99.1"
       LP_PG_VERSION: ${{ matrix.pg }}
+      LP_PG_SOURCE: ${{ matrix.source }}
     steps:
       - uses: actions/checkout@v4
 
@@ -71,7 +75,7 @@ jobs:
         env:
           LP_ROOT: ${{ runner.temp }}/lp spike Zoë 数据
         run: |
-          d="$LP_ROOT/pg/$LP_PG_VERSION/bin"
+          d="$LP_ROOT/pg/$LP_PG_SOURCE-$LP_PG_VERSION/bin"
           ls "$d" | head -40 | tr '\n' ' '; echo
           case "$RUNNER_OS" in
             Linux) file "$d/postgres";;
@@ -90,10 +94,10 @@ jobs:
       - name: Non-admin user (Linux, macOS)
         if: always() && runner.os != 'Windows'
         run: |
-          ./ci/nonadmin-unix.sh "$(pwd)/target/release/lp" "$LP_PG_VERSION"
+          ./ci/nonadmin-unix.sh "$(pwd)/target/release/lp" "$LP_PG_VERSION" "$LP_PG_SOURCE"
 
       - name: Non-admin user (Windows)
         if: always() && runner.os == 'Windows'
         shell: pwsh
         run: |
-          ./ci/nonadmin-windows.ps1 -Bin "$PWD\target\release\lp.exe" -Ver $env:LP_PG_VERSION
+          ./ci/nonadmin-windows.ps1 -Bin "$PWD\target\release\lp.exe" -Ver $env:LP_PG_VERSION -Dist $env:LP_PG_SOURCE

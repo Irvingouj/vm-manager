@@ -17,15 +17,62 @@ use anyhow::{Context, Result, bail};
 use postgresql_embedded::{PostgreSQL, SettingsBuilder, VersionReq};
 use tokio_postgres::{Client, NoTls};
 
-/// Exact theseus-rs/postgresql-binaries release; override with LP_PG_VERSION.
-/// (A third argument to `lp pg` also sets it, for runs that do not inherit the
-/// environment, such as a process started as another Windows user.)
+/// Exact release; override with LP_PG_VERSION. (A third argument to `lp pg`
+/// also sets it, for runs that do not inherit the environment, such as a
+/// process started as another Windows user.)
 fn pg_version() -> String {
     let v = std::env::args()
         .nth(3)
         .or_else(|| std::env::var("LP_PG_VERSION").ok())
         .unwrap_or_else(|| "18.6.0".into());
     format!("={v}")
+}
+
+/// Which binary distribution: "zonky" (default; Maven Central) or "theseus"
+/// (GitHub releases). Fourth argument to `lp pg`, or LP_PG_SOURCE.
+fn pg_source() -> String {
+    std::env::args()
+        .nth(4)
+        .or_else(|| std::env::var("LP_PG_SOURCE").ok())
+        .unwrap_or_else(|| "zonky".into())
+}
+
+/// Direct download URL (no GitHub API: it is rate-limited per IP), and the URL
+/// of a checksum file if the distribution publishes one.
+fn archive_url(source: &str, v: &str) -> Result<(String, Option<String>)> {
+    match source {
+        "theseus" => {
+            let target = env!("LP_TARGET");
+            let u = format!(
+                "https://github.com/theseus-rs/postgresql-binaries/releases/download/{v}/postgresql-{v}-{target}.tar.gz"
+            );
+            Ok((u.clone(), Some(format!("{u}.sha256"))))
+        }
+        "zonky" => {
+            let plat = match (std::env::consts::OS, std::env::consts::ARCH) {
+                ("linux", "x86_64") => "linux-amd64",
+                ("linux", "aarch64") => "linux-arm64v8",
+                ("macos", "x86_64") => "darwin-amd64",
+                ("macos", "aarch64") => "darwin-arm64v8",
+                ("windows", "x86_64") => "windows-amd64",
+                (o, a) => bail!("zonky has no build for {o}/{a}"),
+            };
+            let u = format!(
+                "https://repo1.maven.org/maven2/io/zonky/test/postgres/embedded-postgres-binaries-{plat}/{v}/embedded-postgres-binaries-{plat}-{v}.jar"
+            );
+            Ok((u.clone(), Some(format!("{u}.sha1"))))
+        }
+        s => bail!("unknown source {s}"),
+    }
+}
+
+async fn download(url: &str) -> Result<Vec<u8>> {
+    let r = reqwest::get(url).await?.error_for_status()?;
+    Ok(r.bytes().await?.to_vec())
+}
+
+fn first_hex_token(s: &str) -> String {
+    s.split_whitespace().next().unwrap_or("").to_ascii_lowercase()
 }
 
 const CLUSTER_SQL: &str = include_str!("../sql/cluster.sql");
@@ -57,6 +104,7 @@ fn mib(b: u64) -> String {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         Some("pg") => {
@@ -103,7 +151,10 @@ fn localhost() -> Result<()> {
     let l = TcpListener::bind("127.0.0.1:0")?;
     let port = l.local_addr()?.port();
     std::thread::spawn(move || {
+        // One thread per connection: browsers open speculative connections that
+        // never send a request, which would block a sequential server.
         for s in l.incoming().flatten() {
+          std::thread::spawn(move || {
             let mut s = s;
             // Read the whole request head before answering (closing with unread
             // input makes the kernel send RST).
@@ -118,6 +169,7 @@ fn localhost() -> Result<()> {
             let host = req.lines().find(|l| l.to_ascii_lowercase().starts_with("host:")).unwrap_or("").to_string();
             let body = format!("hello from {host}");
             let _ = write!(s, "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len());
+          });
         }
     });
     let name = "my-app.localhost";
@@ -148,7 +200,9 @@ fn localhost() -> Result<()> {
 
 async fn pg_session(root: &Path) -> Result<()> {
     std::fs::create_dir_all(root)?;
-    let install_dir = root.join("pg").join(pg_version().trim_start_matches('='));
+    let version = pg_version().trim_start_matches('=').to_string();
+    let source = pg_source();
+    let install_dir = root.join("pg").join(format!("{source}-{version}"));
     let data_dir = root.join("data");
     let pw_path = root.join("superuser-password");
     let secret_path = root.join("attach-secret");
@@ -156,17 +210,34 @@ async fn pg_session(root: &Path) -> Result<()> {
 
     // 1. Obtain Postgres (first run only).
     if !install_dir.join("bin").exists() {
-        let url = postgresql_archive::configuration::theseus::URL;
-        let req = VersionReq::parse(&pg_version())?;
+        let (url, sum_url) = archive_url(&source, &version)?;
+        println!("downloading {url}");
         let t = Instant::now();
-        let (version, bytes) = postgresql_archive::get_archive(url, &req).await?;
+        let bytes = download(&url).await.with_context(|| format!("download {url}"))?;
         metric("download_time", ms(t.elapsed()));
         metric("download_size", mib(bytes.len() as u64));
-        metric("archive_version", &version);
+        if let Some(sum_url) = sum_url {
+            use sha1::Digest as _;
+            let want = first_hex_token(&String::from_utf8_lossy(&download(&sum_url).await?));
+            let got = if want.len() == 40 {
+                hex::encode(sha1::Sha1::digest(&bytes))
+            } else {
+                hex::encode(sha2::Sha256::digest(&bytes))
+            };
+            if got != want {
+                bail!("checksum mismatch for {url}: want {want}, got {got}");
+            }
+            println!("checksum ok ({} hex digits, from {sum_url})", want.len());
+        }
+        let key = if source == "zonky" {
+            postgresql_archive::configuration::zonky::URL
+        } else {
+            postgresql_archive::configuration::theseus::URL
+        };
         let t = Instant::now();
         let tmp = root.join("pg").join("extracting");
         let _ = std::fs::remove_dir_all(&tmp);
-        postgresql_archive::extract(url, &bytes, &tmp).await?;
+        postgresql_archive::extract(key, &bytes, &tmp).await?;
         std::fs::rename(&tmp, &install_dir)?;
         metric("extract_time", ms(t.elapsed()));
     } else {

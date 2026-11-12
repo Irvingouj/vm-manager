@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Create a standard (non-admin, no sudo) local user and run two Postgres
 # sessions as that user, in its own per-user directory.
-# usage: ci/nonadmin-unix.sh <lp-binary> <pg-version>
+# usage: ci/nonadmin-unix.sh <lp-binary> <pg-version> <zonky|theseus>
 set -uo pipefail
-BIN="$1"; VER="$2"
+BIN="$1"; VER="$2"; SRC="$3"
 U=lpuser
 case "$(uname)" in
   Linux)
@@ -23,7 +23,7 @@ cp "$BIN" /tmp/lp-nonadmin && chmod 755 /tmp/lp-nonadmin
 status=0
 for i in 1 2; do
   echo "--- non-admin session $i"
-  sudo -u "$U" -H env HOME="$HOMEDIR" /tmp/lp-nonadmin pg "~/lp spike Zoë 数据" "$VER" || status=1
+  sudo -u "$U" -H env HOME="$HOMEDIR" /tmp/lp-nonadmin pg "~/lp spike Zoë 数据" "$VER" "$SRC" || status=1
 done
 sudo -u "$U" ls -la "$HOMEDIR/.local/share/lp spike Zoë 数据" || true
 sudo rm -rf "$HOMEDIR/.local/share/lp spike Zoë 数据" /tmp/lp-nonadmin

@@ -22,13 +22,13 @@ for b in google-chrome chromium microsoft-edge \
   prof="$(mktemp -d)"
   ver=$("$b" --version 2>/dev/null | head -1)
   out=$(timeout 60 "$b" --headless=new --disable-gpu --no-first-run --no-default-browser-check \
-        --user-data-dir="$prof" --dump-dom "$url" 2>/dev/null)
+        --user-data-dir="$prof" --dump-dom "$url" 2>"$prof.err")
   if echo "$out" | grep -q "hello from Host: my-app.localhost:$port"; then
     echo "PASS browser $(basename "$b") [$ver] $url -> $(echo "$out" | grep -o 'hello from[^<]*')"
   else
-    echo "FAIL browser $(basename "$b") [$ver] $url -> $(echo "$out" | head -c 300)"
+    echo "FAIL browser $(basename "$b") [$ver] $url -> $(echo "$out" | head -c 300) stderr: $(tail -c 600 "$prof.err")"
   fi
-  rm -rf "$prof"
+  rm -rf "$prof" "$prof.err"
 done
 [ $found -eq 0 ] && echo "SKIP no Chromium-family browser found"
 kill $srv 2>/dev/null

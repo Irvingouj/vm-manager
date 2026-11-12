@@ -1,7 +1,7 @@
 # Create a standard local user (member of Users only, not Administrators) and
 # run two Postgres sessions as that user, with its own profile and LOCALAPPDATA.
-# usage: pwsh ci/nonadmin-windows.ps1 <lp.exe> <pg-version>
-param([string]$Bin, [string]$Ver)
+# usage: pwsh ci/nonadmin-windows.ps1 <lp.exe> <pg-version> <zonky|theseus>
+param([string]$Bin, [string]$Ver, [string]$Dist)
 $ErrorActionPreference = 'Continue'
 
 $pw = 'Lp-' + [guid]::NewGuid().ToString('N') + 'a1!'   # throwaway
@@ -36,7 +36,7 @@ $null = As-User 'C:\Windows\System32\whoami.exe' @('/priv') 'priv'
 $status = 0
 foreach ($i in 1, 2) {
   "--- non-admin session $i"
-  $rc = As-User "$dir\lp.exe" @('pg', '"~/lp spike Zoë 数据"', $Ver) "run$i"
+  $rc = As-User "$dir\lp.exe" @('pg', '"~/lp spike Zoë 数据"', $Ver, $Dist) "run$i"
   if ($rc -ne 0) { $status = 1 }
 }
 $ud = 'C:\Users\lpuser\AppData\Local\lp spike Zoë 数据'
