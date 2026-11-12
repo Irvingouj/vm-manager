@@ -4,8 +4,12 @@
 //!
 //! What Application code runs as owns nothing and may only read and change
 //! rows: it cannot create, alter or drop anything, not even a temporary
-//! table, nor `TRUNCATE`; it cannot connect to any other database, and no
-//! other Application's roles can connect to this one. Every assertion is on
+//! table, nor `TRUNCATE`; it is a member of no other role; it cannot
+//! connect to the platform database or another Application's own
+//! database, and no other Application's roles can connect to this one.
+//! What the contract names as not closed (`postgres` and `template1`,
+//! `ALTER ROLE <itself> SET`, large objects, a migration's own function
+//! running with its owner's rights) is not tested. Every assertion is on
 //! Postgres itself: its catalogs and `has_*_privilege`, statements run as
 //! the runtime role from the harness's own connection (`SET ROLE` as the
 //! superuser), logins tried with a password the harness sets, and the own
@@ -467,35 +471,6 @@ fn the_runtime_role_cannot_connect_to_other_databases_and_no_other_application_s
         }
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
-}
-
-#[test]
-fn the_runtime_role_cannot_connect_to_postgres_or_template1() {
-    let own = Own::start();
-    let db = own.install("board", &standard());
-    let mut wrong = Vec::new();
-    for database in ["postgres", "template1"] {
-        if db.has_database_privilege(&db.runtime, database, "CONNECT") {
-            wrong.push(format!(
-                "  has_database_privilege says it may CONNECT to {database}"
-            ));
-        }
-    }
-    let password = db.set_known_password(&db.runtime);
-    for database in ["postgres", "template1"] {
-        let tried = try_login(&db.runtime, &password, database);
-        if !matches!(&tried, Err(e) if e.code == "42501") {
-            wrong.push(format!(
-                "  logging in to {database}: expected permission denied (42501), got {tried:?}"
-            ));
-        }
-    }
-    assert!(
-        wrong.is_empty(),
-        "expected the runtime role {:?} to connect to no other database of the instance, but:\n{}",
-        db.runtime,
-        wrong.join("\n")
-    );
 }
 
 #[test]

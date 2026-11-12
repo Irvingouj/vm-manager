@@ -336,7 +336,8 @@ impl OwnDatabase {
 
     /// Every object in this database outside Postgres's own schemas that
     /// is NOT owned by the owner role, as `kind name owner`: relations,
-    /// schemas made by migrations, functions, types, large objects.
+    /// schemas made by migrations, functions, types. Large objects are left
+    /// out: any role may create one, which CONTRACT.md names as not closed.
     pub fn objects_not_owned_by_the_owner(&self) -> Vec<String> {
         let owner = literal(&self.owner);
         self.column(&format!(
@@ -362,16 +363,14 @@ impl OwnDatabase {
               WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'public')
                 AND n.nspname NOT LIKE 'pg\\_%'
                 AND pg_get_userbyid(n.nspowner) <> {owner}
-             UNION ALL
-             SELECT 'large object ' || oid || ' ' || pg_get_userbyid(lomowner)
-               FROM pg_largeobject_metadata WHERE pg_get_userbyid(lomowner) <> {owner}
              ORDER BY 1"
         ))
     }
 
     /// Everything `role` owns in this database (relations, functions,
-    /// types, schemas, large objects) and whether it owns the database
-    /// itself, as `kind name`.
+    /// types, schemas) and whether it owns the database itself, as `kind
+    /// name`. Large objects are left out: any role may create one, which
+    /// CONTRACT.md names as not closed.
     pub fn owned_by(&self, role: &str) -> Vec<String> {
         let role = literal(role);
         self.column(&format!(
@@ -382,8 +381,6 @@ impl OwnDatabase {
              SELECT 'type ' || t.oid::regtype::text FROM pg_type t WHERE pg_get_userbyid(t.typowner) = {role}
              UNION ALL
              SELECT 'schema ' || n.nspname FROM pg_namespace n WHERE pg_get_userbyid(n.nspowner) = {role}
-             UNION ALL
-             SELECT 'large object ' || oid FROM pg_largeobject_metadata WHERE pg_get_userbyid(lomowner) = {role}
              UNION ALL
              SELECT 'database ' || datname FROM pg_database WHERE pg_get_userbyid(datdba) = {role}
              ORDER BY 1"
