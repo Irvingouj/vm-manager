@@ -28,7 +28,10 @@
 //!   harness's own superuser connection;
 //! - [`history`] is what the tests of identity and Change history in the
 //!   own database share, and [`server_log`] reads the test Postgres's
-//!   server log as the statements each role sent.
+//!   server log as the statements each role sent;
+//! - [`sdk`] is what the tests of the SDK share: its tooling, the fixture
+//!   projects under `fixtures/sdk/` built with it, and the Applications
+//!   installed from them.
 //!
 //! Every wait has a timeout, so a failing test fails within seconds and
 //! never hangs. Each test starts its own program on its own port, so tests
@@ -51,6 +54,7 @@ pub mod postgres;
 pub mod program;
 pub mod records;
 pub mod scenario;
+pub mod sdk;
 pub mod server_log;
 pub mod shared_database;
 pub mod sql;
