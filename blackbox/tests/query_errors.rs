@@ -31,17 +31,28 @@ fn ask(sql: &str) -> Value {
     json!({ "resource": RESOURCE, "sql": sql })
 }
 
+/// Changed by "Write access, and the database role as the boundary": a
+/// statement that cannot be parsed used to be sent for Postgres to refuse
+/// (SQLSTATE 42601); the statement check now refuses it before it is sent
+/// (CONTRACT.md, "The statement check"). Still logged as `<unparsed>`.
 #[test]
-fn a_statement_with_a_syntax_error_fails_with_its_sqlstate_and_is_logged_unparsed() {
+fn a_statement_with_a_syntax_error_is_refused_unsent_and_logged_unparsed() {
     let s = Scenario::ready();
-    let (response, answer) = s.query(&rita(), "board", &ask("selec title from incidents"));
-    assert_database_error(&answer, "42601", "a syntax error");
+    let marker = format!("syntax-{}", blackbox::shared_database::token());
+    let (response, answer) = s.query(
+        &rita(),
+        "board",
+        &ask(&format!("selec title, '{marker}' from incidents")),
+    );
+    blackbox::scenario::assert_statement_refused(&answer, "unparsed", "a syntax error");
+    s.db.assert_not_received(&marker, "a statement that cannot be parsed");
     let id = response.request_id();
     assert_entry(
         &s.entry_of(&response),
         &Expected {
             statement: Some("<unparsed>"),
-            ..Expected::failed(&id, "rita", "board", "42601")
+            ran: Some(false),
+            ..Expected::failed(&id, "rita", "board", "statement")
         },
         "the entry of a statement that cannot be parsed",
     );

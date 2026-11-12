@@ -255,6 +255,10 @@ fn careless_scenario() -> Scenario {
 /// The superuser of the harness's instances.
 const SUPERUSER: &str = blackbox::postgres::SUPERUSER;
 
+/// Since "Write access, and the database role as the boundary" the
+/// statement check refuses many of these before they reach the database;
+/// the last ones are hidden from it, so that the database's own refusal is
+/// still tested here (the full list is in `boundary_writes_through_query.rs`).
 fn writes() -> Vec<String> {
     [
         "insert into incidents values (9, 'injected', true, 1, now())",
@@ -276,6 +280,10 @@ fn writes() -> Vec<String> {
         "set role SUPERUSER",
         "set session authorization SUPERUSER",
         "select set_config('role', 'SUPERUSER', false)",
+        "select close_every_incident()",
+        "select * from ts_stat($vm$select to_tsvector('simple', 'n ' || nextval('ticket_numbers')::text)$vm$)",
+        "select * from ts_stat($vm$select to_tsvector('simple', 'n ' || close_every_incident()::text)$vm$)",
+        "select * from ts_stat($vm$select to_tsvector('simple', 'r ' || set_config('role', 'SUPERUSER', false))$vm$)",
     ]
     .iter()
     .map(|w| w.replace("SUPERUSER", SUPERUSER))
@@ -323,11 +331,31 @@ fn a_write_through_a_read_login_that_could_write_fails_as_read_only() {
     assert_eq!(s.db.fingerprint(), before);
 }
 
+/// `set_config` run by `ts_stat`: SQL text a statement check does not see
+/// (docs/research/what-postgres-sees.md).
+fn hidden_set(name: &str, value: &str) -> String {
+    format!(
+        "select * from ts_stat($vm$select to_tsvector('simple', 'set ' || set_config('{name}', '{value}', false))$vm$) limit 1"
+    )
+}
+
+/// Since "Write access, and the database role as the boundary" the
+/// statement check refuses these openers before they reach the database, so
+/// the ones that change a setting are also sent hidden from the check, to
+/// keep this test about what the database allows.
 #[test]
 fn nothing_a_statement_sets_in_its_session_lets_a_later_one_write() {
     let s = careless_scenario();
     let before = s.db.fingerprint();
+    let hidden = [
+        hidden_set("default_transaction_read_only", "off"),
+        hidden_set("transaction_read_only", "off"),
+        hidden_set("default_transaction_isolation", "serializable"),
+    ];
     let openers = [
+        hidden[0].as_str(),
+        hidden[1].as_str(),
+        hidden[2].as_str(),
         "set session characteristics as transaction read write",
         "set default_transaction_read_only = off",
         "select set_config('default_transaction_read_only', 'off', false)",
