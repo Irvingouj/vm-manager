@@ -11,7 +11,7 @@ We chose it because OpenWorkers already provides most of the plumbing Milestone 
 ## Security posture for Milestone 1
 
 - Who may publish an Application is strictly internal: Builders are authenticated, accountable employees.
-- What the code contains is only semi-trusted: it is AI-generated and carries npm dependencies.
+- What the code contains is unreliable but assumed not hostile: it is AI-generated and carries npm dependencies, yet it broadly does what its Builder intended. We defend against accident and against a dependency overreaching, not against a Builder acting in bad faith.
 - A V8 sandbox escape is an accepted risk. It is mitigated by running the runner in a tightly restricted container: read-only filesystem, no writable volumes, network limited to the ingress port and Postgres.
 
 ## Considered Options

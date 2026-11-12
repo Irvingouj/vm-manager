@@ -29,12 +29,16 @@ _Avoid_: Session, token, credentials
 ### Authorization
 
 **Grant**:
-IT's statement that a User, a group or an Application may reach a Resource at a given access level.
+IT's statement that a User or a group may reach a Resource at a given access level. It holds in every Application.
 _Avoid_: Permission, ACL, role
 
-**Delegated grant**:
-A Grant that lets an Application reach a Resource on behalf of the User it is serving. It only takes effect where that User also holds a Grant on the same Resource.
-_Avoid_: App permission, on-behalf-of token
+**Declared access**:
+The list, fixed in an Application's manifest at deploy, of the Resources it uses and at what access level. Nothing outside it is reachable.
+_Avoid_: Binding, scope, app permission
+
+**Restricted Resource**:
+A Resource that IT has marked so that only the Applications IT lists may use it, whatever they declare.
+_Avoid_: Sensitive resource, protected resource
 
 **Autonomous grant**:
 A Grant that lets code reach a Resource as itself, whatever the User it is serving may access. Only an Integration can hold one on a shared Resource; an Application acts as itself only in its own database.
