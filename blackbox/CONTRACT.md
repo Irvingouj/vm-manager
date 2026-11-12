@@ -18,6 +18,7 @@ vm serve --domain <domain> --listen <ip:port> --application <name>=<path> [--app
 
 - `--domain` is the installation's domain. `--listen 127.0.0.1:0` picks a free port.
 - `--application <name>=<path>` names a fixture Application: `<path>` is one JavaScript file, a classic script. At least one is required. This option exists only until Applications live in the platform database.
+- An Application's name is a DNS label in lower case: letters, digits and hyphens, 1 to 63 characters, not starting or ending with a hyphen.
 - A start-up that cannot work exits non-zero with a message on standard error naming the problem: a name that is not a DNS label, a name given twice, a file that cannot be read, no Application.
 - The program writes its log to standard error, one JSON object per line, each with `"event"` and `"time_ms"`.
 - When it is ready to serve it writes `{"event":"listening","address":"127.0.0.1:<port>","stand_in_sign_in":<bool>, ...}`.
@@ -34,7 +35,9 @@ A development-only way for a caller to state who the User is. Real sessions repl
 
 - It does nothing unless the program was started with `--stand-in-sign-in`.
 - `x-vm-stand-in-user: <id>` states the User, exactly once. `x-vm-stand-in-groups: g1,g2` states their Groups; optional, at most once; entries are trimmed, empty ones dropped, repeats kept once.
-- Malformed (two User headers, an empty User, control characters, a value longer than 256 bytes): `400`.
+- Values are UTF-8 and are handed over unchanged; a User id need not be ASCII. A value of 256 bytes is accepted.
+- Malformed (two User headers, two Groups headers, an empty User, control characters, bytes that are not UTF-8, a value longer than 256 bytes): `400`. When the stand-in is off these headers are not looked at, so they are never malformed.
+- Groups keep the order in which they were first stated.
 - Every request header whose name starts with `x-vm-`, in any letter case, is removed before the request reaches Application code, whether the stand-in is on or off.
 
 ### Responses the program itself gives
@@ -50,7 +53,7 @@ Checked in this order:
 | The Application threw, rejected, answered with something that is not a `Response`, or failed while loading | 500 |
 
 - Sign-in is checked before the Application is looked up, so someone who is not signed in cannot learn which Applications exist.
-- These bodies are short plain text. The `500` body is fixed: it holds neither the error's message nor its stack.
+- These bodies are `text/plain`, between 1 and 200 bytes. The `401` body is the same whatever was asked for. The `500` body is fixed: it holds neither the error's message nor its stack.
 - Every response carries `x-vm-request-id`, unique per request.
 
 ### What the log records per request
@@ -62,14 +65,16 @@ Checked in this order:
 | `host-call` | `request` (or null), `application`, `user` (or null), `operation`, `outcome` (`allowed` or `refused`), `reason` (when refused) |
 | `request` | `request`, `application` (or null), `user` (or null), `method`, `path`, `status` |
 
-- `request` in these records is the value of `x-vm-request-id`.
-- The `request` record is written last for its request, before the response is sent.
+- `request` in these records is the value of `x-vm-request-id`. `user` is the User's id. `level` is the name of the console method. `path` is the path without the query.
+- For a `400` or `401`, `application` and `user` are null. For a `404`, `user` is the signed-in User's id and `application` is null.
+- The `request` record is written last for its request, before the response is sent: no record carrying a request's id comes after it, also when the Application left calls unawaited. A `host-call` record is written when the host decides, and an allowed one always names its request.
+- A `printed` record from code that runs after its request ended, or while a script loads, has a null `request`.
 - "No Application code ran" for a request means: no `printed`, `uncaught` or `host-call` record carries its id.
 
 ### What an Application is handed
 
 - An Application is a classic script that registers its handler by assigning `globalThis.default = { fetch(request, ctx) { ... } }`. `fetch` may be async and returns a `Response`.
-- Every request gets a fresh context. The script's top level runs again for each request, before the handler, **with no request in flight**. Nothing in memory survives from one request to another.
+- Every request gets a fresh context. The script's top level runs again for each request, before the handler, **with no request in flight**. Nothing in memory survives from one request to another. The program may also run a script's top level when it starts, equally with no request in flight.
 - `request` is a standard `Request`: the method, `http://<host><path-and-query>`, the headers without any `x-vm-*`, and the body.
 - `ctx` is frozen. `ctx.user()` returns a frozen `{ id: string, groups: string[] }`: the User of the request in flight, as the host knows it. Called when the request is over, it throws an `Error` whose message starts with `no request in flight`.
 - What the Application prints with `console.log` / `info` / `warn` / `error` / `debug` appears as `printed` records.
