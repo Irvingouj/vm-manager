@@ -20,15 +20,22 @@ for b in google-chrome chromium microsoft-edge \
   command -v "$b" >/dev/null 2>&1 || [ -x "$b" ] || continue
   found=1
   prof="$(mktemp -d)"
-  ver=$("$b" --version 2>/dev/null | head -1)
-  out=$(timeout 60 "$b" --headless=new --disable-gpu --no-first-run --no-default-browser-check \
-        --user-data-dir="$prof" --dump-dom "$url" 2>"$prof.err")
+  case "$b" in
+    *.exe) ver=$(powershell -NoProfile -Command "(Get-Item -LiteralPath '$(cygpath -w "$b")').VersionInfo.ProductVersion" | tr -d '\r');;
+    *) ver=$("$b" --version 2>/dev/null | head -1);;
+  esac
+  # Output to files, not a pipe: on Windows the browser's child processes
+  # inherit a pipe and keep $(...) waiting forever.
+  timeout 60 "$b" --headless=new --disable-gpu --no-first-run --no-default-browser-check \
+        --user-data-dir="$prof" --dump-dom "$url" >"$prof.out" 2>"$prof.err" </dev/null
+  out=$(cat "$prof.out")
+  case "$b" in *.exe) taskkill //F //T //IM "$(basename "$b")" >/dev/null 2>&1;; esac
   if echo "$out" | grep -q "hello from Host: my-app.localhost:$port"; then
     echo "PASS browser $(basename "$b") [$ver] $url -> $(echo "$out" | grep -o 'hello from[^<]*')"
   else
     echo "FAIL browser $(basename "$b") [$ver] $url -> $(echo "$out" | head -c 300) stderr: $(tail -c 600 "$prof.err")"
   fi
-  rm -rf "$prof" "$prof.err"
+  rm -rf "$prof" "$prof.err" "$prof.out"
 done
 [ $found -eq 0 ] && echo "SKIP no Chromium-family browser found"
 kill $srv 2>/dev/null

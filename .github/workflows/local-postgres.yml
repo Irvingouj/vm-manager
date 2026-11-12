@@ -62,6 +62,7 @@ jobs:
           esac
 
       - name: Run (two sessions, data path with space and non-ASCII, *.localhost)
+        timeout-minutes: 10
         env:
           LP_KEEP: "1"
           LP_ROOT: ${{ runner.temp }}/lp spike Zoë 数据
@@ -87,17 +88,20 @@ jobs:
 
       - name: Headless browser on *.localhost
         if: always()
+        timeout-minutes: 6
         run: |
           bin=target/release/lp; [ -f "$bin.exe" ] && bin="$bin.exe"
           ./ci/browser.sh "$bin"
 
       - name: Non-admin user (Linux, macOS)
         if: always() && runner.os != 'Windows'
+        timeout-minutes: 10
         run: |
           ./ci/nonadmin-unix.sh "$(pwd)/target/release/lp" "$LP_PG_VERSION" "$LP_PG_SOURCE"
 
       - name: Non-admin user (Windows)
         if: always() && runner.os == 'Windows'
+        timeout-minutes: 10
         shell: pwsh
         run: |
           ./ci/nonadmin-windows.ps1 -Bin "$PWD\target\release\lp.exe" -Ver $env:LP_PG_VERSION -Dist $env:LP_PG_SOURCE
