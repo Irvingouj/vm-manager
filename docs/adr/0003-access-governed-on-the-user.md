@@ -10,6 +10,15 @@ The same Grant governs building. A Builder can discover a Resource and pull its 
 
 An Application never acts as itself on a shared Resource. The only thing it reaches as itself is its own database. Anything that must go beyond the User's own access is done by calling an Integration, which is Milestone 2.
 
+## Who holds what
+
+- A Grant names a Group, never a single User. The directory stays the one place that answers who can reach a Resource; giving one person access means adding them to a Group there.
+- A Grant covers the whole Resource. To open only part of a database, a narrower Resource is registered, or an Integration is used.
+- Platform administrators are the members of one directory Group named when the platform is installed. They register Resources, write Grants and can disable any Application. The platform keeps no administrator accounts of its own.
+- In Milestone 1 only Platform administrators write Grants. The Resource owner is recorded on the Resource and gains the power to release Integration functions in Milestone 2; whether they also manage Grants is decided then.
+- Any signed-in employee may create an Application. After that, only its Contributors may deploy it.
+- Milestone 1 stores Grants as plain rows (Resource, Group, access level). No policy engine: the rule has two conditions and both are lookups.
+
 ## What this defends against
 
 We assume Application code is unreliable but not hostile: it is AI-generated and carries npm dependencies, yet it broadly does what its Builder intended. Declared access therefore guards against accident and against a poisoned dependency widening an Application's reach at runtime, since the manifest is fixed at deploy. A Resource is never read directly by someone outside its Groups. What is not prevented is an Application copying what an authorized User read into its own database, where others may later see it; that is visible in the manifest, recorded in the audit trail and attributable to the Builder.

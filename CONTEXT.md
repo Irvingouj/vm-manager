@@ -23,7 +23,7 @@ A named piece of enterprise infrastructure that IT registers and governs, and th
 _Avoid_: Binding (the Cloudflare and OpenWorkers term), service, backend
 
 **Resource owner**:
-The person or Group answerable for a Resource. They, or a top-level IT administrator, release the Integration functions that reach it.
+The person or Group answerable for a Resource. They, or a Platform administrator, release the Integration functions that reach it. In Milestone 1 the owner is recorded only; Grants are written by Platform administrators.
 _Avoid_: Data owner, steward, admin
 
 **Schema owner**:
@@ -37,7 +37,7 @@ _Avoid_: Session, token, credentials
 ### Authorization
 
 **Grant**:
-IT's statement that a Group may reach a Resource at a given access level. It holds in every Application, and it also decides who may build against the Resource.
+A Platform administrator's statement that a Group may reach a Resource at a given access level. It names a Group, never a single User, and covers the whole Resource. It holds in every Application, and it also decides who may build against the Resource.
 _Avoid_: Permission, ACL, role
 
 **Access level**:
@@ -68,8 +68,12 @@ _Avoid_: Audit log, versioning, revision table
 
 ### People
 
+**Platform administrator**:
+A member of the one directory Group named when the platform is installed. They register Resources, write Grants, see every Application and can disable any of them. The platform keeps no administrator accounts of its own.
+_Avoid_: Superuser, root, IT (when this specific role is meant)
+
 **Builder**:
-An employee who creates and deploys an Application, normally by directing a Coding agent.
+An employee who creates and deploys an Application, normally by directing a Coding agent. Any signed-in employee may create one.
 _Avoid_: Developer, author, employee (when the building role is meant)
 
 **Contributor**:
