@@ -123,6 +123,12 @@ impl Refusal {
     ) -> Self {
         let mut refusal = match reason {
             authz::Reason::NoRequest => return Self::no_request(),
+            authz::Reason::NotOwnDatabase => Self::new(
+                "not-own-database",
+                format!(
+                    "acting as the Application is only for its own database, not the Resource {name:?}: act as the User"
+                ),
+            ),
             authz::Reason::NotDeclared => Self::new(
                 "not-declared",
                 format!(
@@ -322,6 +328,8 @@ impl PlatformGateway {
         let decide = |grants: &[authz::Grant<'_>]| {
             authz::decide(&Question {
                 request_in_flight: active,
+                actor: authz::Actor::User,
+                own_database: false,
                 groups: &groups,
                 declared: in_flight.declared.get(call.resource).copied(),
                 registered: resource.is_some(),

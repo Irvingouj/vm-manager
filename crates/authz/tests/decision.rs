@@ -1,21 +1,29 @@
 //! The Authorization decision, tested below the program's outside (the
 //! spec's Testing Decisions; blackbox/CONTRACT.md, "Lower seam: the
-//! Authorization decision" and "Who is allowed").
+//! Authorization decision", "Who is allowed", and "The Application's own
+//! database: The Authorization decision").
+//!
+//! The order of checks: `NoRequest`; then the own database is allowed; then
+//! `NotOwnDatabase` for `Actor::Application` on a Resource; then the table
+//! of "Who is allowed" as before.
 //!
 //! Three kinds of test:
 //!
 //! - exhaustive: every question over a small universe (request in flight or
-//!   not; every `declared`; registered or not; every `needed`; the User's
-//!   Groups and the Grants as lists over a few Groups, with none, one,
-//!   several, repeats and look-alike names) is checked against [`rule`], an
-//!   independent statement of the contract's table;
-//! - one named test per row of the table, and for the ways Groups are
+//!   not; either actor; the own database or a Resource; every `declared`;
+//!   registered or not; every `needed`; the User's Groups and the Grants as
+//!   lists over a few Groups, with none, one, several, repeats and
+//!   look-alike names) is checked against [`rule`], an independent
+//!   statement of the contract's order;
+//! - one named test per row of the order, and for the ways Groups are
 //!   compared;
 //! - properties: more Groups or more Grants never turn an Allow into a
 //!   Refuse; raising `needed` never turns a Refuse into an Allow; nothing
-//!   but the request in flight, `declared`, `registered`, `needed` and the
-//!   Grants of the User's own Groups affects the answer. Each property also
-//!   checks that it was not satisfied vacuously.
+//!   but the request in flight, the actor, the target, `declared`,
+//!   `registered`, `needed` and the Grants of the User's own Groups affects
+//!   the answer; on the own database nothing but the request in flight
+//!   matters; `Actor::Application` on a Resource is never allowed. Each
+//!   property also checks that it was not satisfied vacuously.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -24,7 +32,9 @@
     reason = "test code: a failed expectation is a failing test"
 )]
 
-use authz::{AccessLevel, Decision, Grant, Question, Reason, decide};
+use authz::{AccessLevel, Actor, Decision, Grant, Question, Reason, decide};
+
+const ACTORS: [Actor; 2] = [Actor::User, Actor::Application];
 
 const LEVELS: [AccessLevel; 3] = [
     AccessLevel::Structure,
@@ -38,12 +48,20 @@ const LEVELS: [AccessLevel; 3] = [
 /// different Groups.
 const UNIVERSE: [&str; 4] = ["ops", "OPS", "ops ", "оps"];
 
-/// The contract's table, stated on its own terms: the first row that
-/// applies refuses; a User holds the highest level any of their Groups is
-/// granted, Groups compared byte for byte.
+/// The contract's order, stated on its own terms: no request refuses
+/// first; the own database is then allowed to either actor; the
+/// Application acting on a Resource is refused; then the first row of the
+/// table that applies refuses; a User holds the highest level any of their
+/// Groups is granted, Groups compared byte for byte.
 fn rule(q: &Question<'_>) -> Decision {
     if !q.request_in_flight {
         return Decision::Refuse(Reason::NoRequest);
+    }
+    if q.own_database {
+        return Decision::Allow;
+    }
+    if q.actor == Actor::Application {
+        return Decision::Refuse(Reason::NotOwnDatabase);
     }
     let Some(declared) = q.declared else {
         return Decision::Refuse(Reason::NotDeclared);
@@ -123,21 +141,27 @@ fn for_every_question(mut check: impl FnMut(&Question<'_>)) -> usize {
     let grant_lists = lists(&all_grants(), 2);
     let mut count = 0;
     for request_in_flight in [false, true] {
-        for declared in declared_options() {
-            for registered in [false, true] {
-                for needed in LEVELS {
-                    for groups in &group_lists {
-                        for grants in &grant_lists {
-                            let q = Question {
-                                request_in_flight,
-                                groups,
-                                declared,
-                                registered,
-                                grants,
-                                needed,
-                            };
-                            check(&q);
-                            count += 1;
+        for actor in ACTORS {
+            for own_database in [false, true] {
+                for declared in declared_options() {
+                    for registered in [false, true] {
+                        for needed in LEVELS {
+                            for groups in &group_lists {
+                                for grants in &grant_lists {
+                                    let q = Question {
+                                        request_in_flight,
+                                        actor,
+                                        own_database,
+                                        groups,
+                                        declared,
+                                        registered,
+                                        grants,
+                                        needed,
+                                    };
+                                    check(&q);
+                                    count += 1;
+                                }
+                            }
                         }
                     }
                 }
@@ -171,7 +195,7 @@ fn every_question_is_answered_as_the_contracts_table_says() {
         }
     });
     assert!(
-        count > 100_000,
+        count > 1_000_000,
         "the space is smaller than intended: {count}"
     );
     assert!(
@@ -188,8 +212,10 @@ fn every_kind_of_answer_occurs_in_the_exhaustive_space() {
     let mut seen = std::collections::BTreeSet::new();
     for_every_question(|q| {
         let kind = match rule(q) {
+            Decision::Allow if q.own_database => "allow, own database",
             Decision::Allow => "allow",
             Decision::Refuse(Reason::NoRequest) => "no-request",
+            Decision::Refuse(Reason::NotOwnDatabase) => "not-own-database",
             Decision::Refuse(Reason::NotDeclared) => "not-declared",
             Decision::Refuse(Reason::NotRegistered) => "not-registered",
             Decision::Refuse(Reason::DeclaredLower { .. }) => "declared-lower",
@@ -198,17 +224,19 @@ fn every_kind_of_answer_occurs_in_the_exhaustive_space() {
         };
         seen.insert(kind);
     });
-    assert_eq!(seen.len(), 7, "the space covers only {seen:?}");
+    assert_eq!(seen.len(), 9, "the space covers only {seen:?}");
 }
 
 // --- One test per row of the table ----------------------------------------
 
-/// A question that is allowed: a request in flight, `read` declared and
-/// registered, the User in `ops`, which is granted `read`, and `read`
-/// needed. Each named test changes one thing.
+/// A question that is allowed: a request in flight, acting as the User on
+/// a Resource, `read` declared and registered, the User in `ops`, which is
+/// granted `read`, and `read` needed. Each named test changes one thing.
 fn allowed<'a>(groups: &'a [&'a str], grants: &'a [Grant<'a>]) -> Question<'a> {
     Question {
         request_in_flight: true,
+        actor: Actor::User,
+        own_database: false,
         groups,
         declared: Some(AccessLevel::Read),
         registered: true,
@@ -243,6 +271,8 @@ fn row_no_request_with_no_request_in_flight_whatever_else_holds() {
     // It comes first: also with nothing declared, nothing registered, no Grant.
     let q = Question {
         request_in_flight: false,
+        actor: Actor::User,
+        own_database: false,
         groups: &[],
         declared: None,
         registered: false,
@@ -252,6 +282,192 @@ fn row_no_request_with_no_request_in_flight_whatever_else_holds() {
     assert_eq!(
         decide(&q),
         Decision::Refuse(Reason::NoRequest),
+        "{}",
+        describe(&q)
+    );
+}
+
+/// A question on the own database, by this actor, with nothing declared,
+/// nothing registered, no Group and no Grant.
+fn on_own_database(actor: Actor, needed: AccessLevel) -> Question<'static> {
+    Question {
+        request_in_flight: true,
+        actor,
+        own_database: true,
+        groups: &[],
+        declared: None,
+        registered: false,
+        grants: &[],
+        needed,
+    }
+}
+
+#[test]
+fn row_no_request_comes_first_also_on_the_own_database_and_for_the_application() {
+    for actor in ACTORS {
+        for own_database in [true, false] {
+            for needed in LEVELS {
+                let q = Question {
+                    request_in_flight: false,
+                    actor,
+                    own_database,
+                    ..allowed(&["ops"], &OPS_READ)
+                };
+                assert_eq!(
+                    decide(&q),
+                    Decision::Refuse(Reason::NoRequest),
+                    "{}",
+                    describe(&q)
+                );
+                let q = Question {
+                    request_in_flight: false,
+                    ..on_own_database(actor, needed)
+                };
+                assert_eq!(
+                    decide(&q),
+                    Decision::Refuse(Reason::NoRequest),
+                    "{}",
+                    describe(&q)
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn row_own_database_the_user_is_allowed_with_nothing_declared_registered_or_granted() {
+    for needed in LEVELS {
+        let q = on_own_database(Actor::User, needed);
+        assert_eq!(decide(&q), Decision::Allow, "{}", describe(&q));
+    }
+}
+
+#[test]
+fn row_own_database_the_application_is_allowed_with_nothing_declared_registered_or_granted() {
+    for needed in LEVELS {
+        let q = on_own_database(Actor::Application, needed);
+        assert_eq!(decide(&q), Decision::Allow, "{}", describe(&q));
+    }
+}
+
+#[test]
+fn row_own_database_what_would_refuse_on_a_resource_does_not_matter_there() {
+    // Every refusal of the table below, turned to the own database: a
+    // Resource not declared, declared lower, not registered, no Grant.
+    let structure_only = [Grant {
+        group: "ops",
+        level: AccessLevel::Structure,
+    }];
+    let variants = [
+        Question {
+            declared: None,
+            ..allowed(&["ops"], &OPS_READ)
+        },
+        Question {
+            registered: false,
+            ..allowed(&["ops"], &OPS_READ)
+        },
+        Question {
+            declared: Some(AccessLevel::Structure),
+            needed: AccessLevel::Write,
+            ..allowed(&["ops"], &OPS_READ)
+        },
+        allowed(&[], &[]),
+        allowed(&["finance"], &OPS_READ),
+        allowed(&["ops"], &structure_only),
+    ];
+    for actor in ACTORS {
+        for variant in variants {
+            let on_resource = Question { actor, ..variant };
+            assert_ne!(
+                decide(&on_resource),
+                Decision::Allow,
+                "a check on the test itself: refused on a Resource: {}",
+                describe(&on_resource)
+            );
+            let q = Question {
+                own_database: true,
+                ..on_resource
+            };
+            assert_eq!(decide(&q), Decision::Allow, "{}", describe(&q));
+        }
+    }
+}
+
+#[test]
+fn row_not_own_database_for_the_application_on_a_resource_whatever_is_declared_and_granted() {
+    // Declared at write, registered, the User granted write: still refused.
+    let ops_write = [Grant {
+        group: "ops",
+        level: AccessLevel::Write,
+    }];
+    for needed in LEVELS {
+        let q = Question {
+            actor: Actor::Application,
+            declared: Some(AccessLevel::Write),
+            needed,
+            ..allowed(&["ops"], &ops_write)
+        };
+        assert_eq!(
+            decide(&q),
+            Decision::Refuse(Reason::NotOwnDatabase),
+            "{}",
+            describe(&q)
+        );
+    }
+}
+
+#[test]
+fn not_own_database_comes_before_anything_about_the_resource() {
+    // Not declared, not registered, declared lower, no Grant: each would
+    // refuse on its own, and `NotOwnDatabase` comes first.
+    let variants = [
+        Question {
+            declared: None,
+            registered: false,
+            ..allowed(&[], &[])
+        },
+        Question {
+            declared: None,
+            ..allowed(&["ops"], &OPS_READ)
+        },
+        Question {
+            registered: false,
+            ..allowed(&["ops"], &OPS_READ)
+        },
+        Question {
+            declared: Some(AccessLevel::Structure),
+            ..allowed(&["ops"], &OPS_READ)
+        },
+        allowed(&["finance"], &OPS_READ),
+    ];
+    for variant in variants {
+        let q = Question {
+            actor: Actor::Application,
+            ..variant
+        };
+        assert_eq!(
+            decide(&q),
+            Decision::Refuse(Reason::NotOwnDatabase),
+            "{}",
+            describe(&q)
+        );
+    }
+}
+
+#[test]
+fn the_user_on_a_resource_is_decided_by_the_table_as_before() {
+    let q = allowed(&["ops"], &OPS_READ);
+    assert_eq!(q.actor, Actor::User);
+    assert!(!q.own_database);
+    assert_eq!(decide(&q), Decision::Allow, "{}", describe(&q));
+    let q = Question {
+        declared: None,
+        ..allowed(&["ops"], &OPS_READ)
+    };
+    assert_eq!(
+        decide(&q),
+        Decision::Refuse(Reason::NotDeclared),
         "{}",
         describe(&q)
     );
@@ -741,6 +957,116 @@ fn nothing_but_the_inputs_the_contract_names_affects_the_answer() {
     assert!(
         broken.is_empty(),
         "expected the same answer when only things the decision must ignore change, got:\n{}",
+        broken.join("\n")
+    );
+}
+
+#[test]
+fn on_the_own_database_nothing_but_the_request_in_flight_matters() {
+    let mut allowed_seen = 0_usize;
+    let mut refused_seen = 0_usize;
+    let mut broken = Vec::new();
+    for_every_question(|q| {
+        if !q.own_database {
+            return;
+        }
+        let want = if q.request_in_flight {
+            allowed_seen += 1;
+            Decision::Allow
+        } else {
+            refused_seen += 1;
+            Decision::Refuse(Reason::NoRequest)
+        };
+        let got = decide(q);
+        if got != want && broken.len() < 5 {
+            broken.push(format!("{}: expected {want:?}, got {got:?}", describe(q)));
+        }
+    });
+    assert!(
+        allowed_seen > 0 && refused_seen > 0,
+        "expected questions on the own database with and without a request in flight (with: {allowed_seen}, without: {refused_seen})"
+    );
+    assert!(
+        broken.is_empty(),
+        "expected the own database to depend on the request in flight alone (Allow with one, NoRequest without), whatever the actor, Groups, Declared access, registration, Grants and level, got:\n{}",
+        broken.join("\n")
+    );
+}
+
+#[test]
+fn acting_as_the_application_on_a_resource_is_never_allowed() {
+    let mut checked = 0_usize;
+    let mut broken = Vec::new();
+    for_every_question(|q| {
+        if q.own_database || q.actor != Actor::Application {
+            return;
+        }
+        checked += 1;
+        let want = if q.request_in_flight {
+            Decision::Refuse(Reason::NotOwnDatabase)
+        } else {
+            Decision::Refuse(Reason::NoRequest)
+        };
+        let got = decide(q);
+        if got != want && broken.len() < 5 {
+            broken.push(format!("{}: expected {want:?}, got {got:?}", describe(q)));
+        }
+        // The same question for the User is allowed somewhere in the
+        // space, so that the refusal is not merely the table's.
+    });
+    let mut user_allowed = 0_usize;
+    for_every_question(|q| {
+        if !q.own_database && q.actor == Actor::User && decide(q) == Decision::Allow {
+            user_allowed += 1;
+        }
+    });
+    assert!(
+        checked > 0 && user_allowed > 0,
+        "expected questions of the Application on a Resource ({checked}) and Users allowed on a Resource ({user_allowed}), so that the property is not satisfied vacuously"
+    );
+    assert!(
+        broken.is_empty(),
+        "expected the Application acting on a Resource to be refused with NotOwnDatabase (NoRequest with no request in flight), whatever is declared, registered and granted, got:\n{}",
+        broken.join("\n")
+    );
+}
+
+#[test]
+fn the_actor_changes_nothing_on_the_own_database_and_only_refuses_on_a_resource() {
+    let mut broken = Vec::new();
+    let mut differ = 0_usize;
+    for_every_question(|q| {
+        if q.actor != Actor::User {
+            return;
+        }
+        let as_application = Question {
+            actor: Actor::Application,
+            ..*q
+        };
+        let user = decide(q);
+        let application = decide(&as_application);
+        if user != application {
+            differ += 1;
+        }
+        let wrong = if q.own_database {
+            user != application
+        } else {
+            application == Decision::Allow
+        };
+        if wrong && broken.len() < 5 {
+            broken.push(format!(
+                "{}: as the User {user:?}, as the Application {application:?}",
+                describe(q)
+            ));
+        }
+    });
+    assert!(
+        differ > 0,
+        "expected the actor to change some answer on a Resource, so that this property is not satisfied by ignoring it"
+    );
+    assert!(
+        broken.is_empty(),
+        "expected the actor to change nothing on the own database and never to turn a Resource's answer into Allow, got:\n{}",
         broken.join("\n")
     );
 }
