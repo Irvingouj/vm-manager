@@ -10,7 +10,7 @@ The harness runs `cargo build -p vm --bin vm` once and starts `target/debug/vm`,
 
 ## How the tests get a Postgres
 
-The harness runs a private Postgres of its own, never through the program under test: from the binaries in the directory `VM_TEST_PG_BIN` names (`postgres`, `initdb`, `pg_ctl`), else from a Postgres found on the machine, else from prebuilt binaries it downloads once to a cache (`docs/research/local-postgres-without-docker.md`). No Docker, no administrator rights. It hands the program a superuser's connection address. Each test's program gets a platform database of its own name on that instance.
+The harness runs a private Postgres of its own, never through the program under test: from the binaries in the directory `VM_TEST_PG_BIN` names (`postgres`, `initdb`, `pg_ctl`), else from a Postgres found on the machine, else from prebuilt binaries it downloads once to a cache (`docs/research/local-postgres-without-docker.md`). No Docker, no administrator rights. `VM_TEST_PG_VERSION` (16, 17 or 18; default 18) chooses the version it downloads, so the whole suite can be run against each. It hands the program a superuser's connection address. Each test's program gets a platform database of its own name on that instance.
 
 ## Serving (ticket: Walking skeleton)
 
@@ -182,8 +182,11 @@ On the platform's API. Writing is for Platform administrators only; everyone els
 ```json
 { "name": "devops", "kind": "postgres", "description": "...", "owner": "...", "contact": "whom to ask for access",
   "connection": { "host": "...", "port": 5432, "database": "...",
-                  "read": { "role": "...", "password": "..." } } }
+                  "read": { "role": "...", "password": "..." },
+                  "write": { "role": "...", "password": "..." } } }
 ```
+
+`connection.write` is optional (ticket: Write access, and the database role as the boundary). The platform installs nothing in a shared database and never changes role in it: what each login may do there is the Platform administrator's to set with ordinary Postgres privileges.
 
 - A Resource's name is 1 to 63 characters: lower-case letters, digits and underscores, starting with a letter. Otherwise `400 invalid-name`. A taken name is `409 name-taken`. `kind` is `postgres`.
 - `name`, `kind`, `description`, `owner`, `contact` and `connection` with its `read` login are required.
@@ -298,3 +301,40 @@ pub fn decide(question: &Question<'_>) -> Decision;
 ```
 
 The order of checks is the order of the table in "Who is allowed". It knows nothing of HTTP, Postgres or V8.
+
+## Writing to a shared database, and the role as the boundary (ticket: Write access, and the database role as the boundary)
+
+```js
+env.VM.invoke("execute", { resource: "devops", sql: "update incidents set open = false where id = $1 returning id", params: [7] })
+```
+
+- `execute` needs Access level `write`: the Version must declare the Resource at `write` (else `declared-lower`) and a Group of the User must hold a Grant at `write` (else `no-grant`, with `held` and `needed`). Arguments and malformed arguments are as for `query`.
+- It runs in one read-write transaction as the Resource's **write** login, committed when the statement succeeds and rolled back when it fails or a limit ends it.
+- Answer: `{ ok: { columns, rows, row_count, rows_affected } }`. `rows` are what `RETURNING` gave (empty without it); `rows_affected` is Postgres's count for the statement.
+- On a Resource registered without a write login: `{ error: { kind: "read-only-resource" } }`; nothing is sent.
+- `query` is unchanged: `read`, the read login, a read-only transaction, whatever the User's and the Version's levels are.
+- In the Operation log, `operation` is `execute`, and `rows` is the rows affected. A failed `execute` records the SQLSTATE; a statement that never reached the database records why.
+
+### The login is the boundary
+
+Each Access level has its own connections, logged in directly as that level's login. The program never issues `SET ROLE` or `SET SESSION AUTHORIZATION`, and connections are never shared between levels or Resources. Whatever Application SQL does:
+
+- `current_user` and `session_user` are the level's login in every operation, and no statement of an operation at `read` changes a row, a table or a sequence in the shared database, also when the read login itself would be allowed to write.
+- Nothing one operation leaves in its session reaches a later operation: settings, the search path, temporary tables, prepared statements, cursors, session advisory locks, `LISTEN`. A connection that cannot be shown clean is closed, not reused.
+- The limits of "Operations on a shared database" hold whatever settings Application SQL changes.
+
+These must hold in the database itself. Tests assert them on the shared database, not on the statement check below.
+
+### The identity label
+
+The host's first statement in each transaction on a shared database sets three transaction-local settings, readable by Application SQL and by the database owner's own triggers: `vm.user` (the User's id), `vm.application`, `vm.request`. They are a label: Application SQL can overwrite them inside its own transaction, and nothing on the platform relies on them. They are gone when the transaction ends.
+
+### The statement check
+
+Before a statement is sent, the host parses it with Postgres's own parser and refuses what the platform never needs. This is hygiene, not the boundary: SQL exists that passes it and still does what it tries to stop (`docs/research/what-postgres-sees.md`).
+
+- Allowed: exactly one statement that is a `SELECT`, `INSERT`, `UPDATE` or `DELETE`, with or without `WITH` and `RETURNING`.
+- Refused: several statements; a statement that cannot be parsed; every other kind (`CREATE`/`ALTER`/`DROP`, `TRUNCATE`, `SET`/`RESET`, `DO`, `CALL`, `COPY`, `EXPLAIN`, `PREPARE`/`EXECUTE`/`DEALLOCATE`, `LISTEN`/`NOTIFY`, `LOCK`, transaction control, `SELECT ... INTO`, and the rest); a call, anywhere in the statement, of `set_config`, `pg_terminate_backend`, `pg_cancel_backend`, `pg_notify`, `pg_reload_conf`, `query_to_xml` and its family, `dblink` and its family, the large-object functions (`lo_*`), the server file functions (`pg_read_file`, `pg_read_binary_file`, `pg_ls_dir`, `pg_stat_file`); a reference to `pg_authid`, `pg_shadow` or `pg_stat_activity`.
+- Answer: `{ error: { kind: "statement", reason: "several-statements" | "unparsed" | "kind-not-allowed" | "function-not-allowed" | "relation-not-allowed", message } }`. Nothing is sent to the shared database.
+- The Operation log entry has outcome `failed` and `error` `statement`; its `statement` is recorded without values as always (`<unparsed>` when it could not be parsed).
+- This replaces what the first ticket did with a statement that cannot be parsed: it is no longer sent for Postgres to refuse.
