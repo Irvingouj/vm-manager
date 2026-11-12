@@ -23,7 +23,13 @@ clap = { version = "4", features = ["derive"] }
 http-body-util = "0.1"
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
+# The platform database (ADR 0015): the protocol-level client, so that later
+# tickets can send one statement over the extended protocol, cancel a
+# request, and keep a pool per database and Access level.
+tokio-postgres = { version = "0.7", features = ["with-serde_json-1"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "sync", "macros", "time"] }
 uuid = { version = "1", features = ["v4"] }
 
