@@ -12,34 +12,83 @@
 // a JSON string "123" is parsed once and stays a string), arrays as arrays
 // of their elements read the same way. Pure functions, no host, no Drizzle.
 
-/** `query` for a select (also one whose main statement after `with` is a select), `execute` otherwise. */
+/**
+ * `query` for a select (also one whose main statement after `with` is a
+ * select, and a set operation of selects, which Drizzle writes as
+ * `(select ...) union (select ...)`), `execute` otherwise.
+ */
 export function operationOf(sql) {
   return mainVerb(sql) === "select" ? "query" : "execute";
 }
 
 /**
- * The first word at the top level of `sql` that names what the statement
- * does, after any `with` list: `select`, `insert`, `update`, `delete`, ...;
- * lower-cased. Skips comments, quoted identifiers, string constants
- * (also E'' and dollar-quoted) and everything inside parentheses. Null when
- * there is none.
+ * The word that says what the statement does (`select`, `insert`,
+ * `update`, `delete`, ...), lower-cased: its first word, or, after a `with`
+ * list, the main statement's; looking inside a statement that begins with a
+ * parenthesis. Comments, quoted identifiers, string constants (also E''
+ * and dollar-quoted) and parameters are skipped. Null when there is none.
  */
 export function mainVerb(sql) {
   const text = String(sql);
-  let depth = 0;
-  let first = null;
-  let i = 0;
-  const n = text.length;
-  while (i < n) {
+  return verbIn(text, tokens(text, 0, text.length));
+}
+
+function verbIn(text, list) {
+  const first = list[0];
+  if (first === undefined) return null;
+  if (first.type === "group") return verbIn(text, tokens(text, first.start, first.end));
+  if (first.type !== "word") return null;
+  if (first.text !== "with") return first.text;
+  // with [recursive] name [(columns)] as [not] [materialized] (body) [, ...] main
+  let i = 1;
+  const word = (w) => list[i]?.type === "word" && list[i].text === w;
+  if (word("recursive")) i += 1;
+  for (;;) {
+    if (list[i]?.type !== "word" && list[i]?.type !== "ident") return fallback(list);
+    i += 1;
+    if (list[i]?.type === "group") i += 1;
+    if (!word("as")) return fallback(list);
+    i += 1;
+    if (word("not")) i += 1;
+    if (word("materialized")) i += 1;
+    if (list[i]?.type !== "group") return fallback(list);
+    i += 1;
+    if (list[i]?.type === "punct" && list[i].text === ",") {
+      i += 1;
+      continue;
+    }
+    break;
+  }
+  return verbIn(text, list.slice(i));
+}
+
+/** For a `with` list that does not read as one: the first statement word at its level. */
+function fallback(list) {
+  const found = list.find((t) => t.type === "word" && VERBS.has(t.text));
+  return found === undefined ? null : found.text;
+}
+
+const VERBS = new Set(["select", "insert", "update", "delete", "merge", "values", "table"]);
+
+/**
+ * The tokens of `text` from `start` to `end` at their own level: words
+ * (lower-cased), quoted identifiers, parenthesised groups (their inside not
+ * read), and single punctuation characters. Comments, string constants and
+ * parameters give no token.
+ */
+function tokens(text, start, end) {
+  const out = [];
+  let i = start;
+  while (i < end) {
     const c = text[i];
     if (c === "-" && text[i + 1] === "-") {
-      const end = text.indexOf("\n", i);
-      i = end === -1 ? n : end + 1;
+      const eol = text.indexOf("\n", i);
+      i = eol === -1 || eol > end ? end : eol + 1;
     } else if (c === "/" && text[i + 1] === "*") {
       // Postgres block comments nest.
       let level = 1;
       i += 2;
-      while (i < n && level > 0) {
+      while (i < end && level > 0) {
         if (text[i] === "/" && text[i + 1] === "*") {
           level += 1;
           i += 2;
@@ -51,52 +100,89 @@ export function mainVerb(sql) {
         }
       }
     } else if (c === '"') {
-      i = skipQuoted(text, i, '"', false);
+      const after = skipQuoted(text, i, '"', false);
+      out.push({ type: "ident" });
+      i = after;
     } else if (c === "'") {
-      const escapes = i > 0 && (text[i - 1] === "e" || text[i - 1] === "E") && !isWordChar(text[i - 2]);
+      const escapes = (text[i - 1] === "e" || text[i - 1] === "E") && !isWordChar(text[i - 2]);
       i = skipQuoted(text, i, "'", escapes);
     } else if (c === "$" && !isWordChar(text[i - 1])) {
       const tag = /^\$([A-Za-z_][A-Za-z0-9_]*)?\$/.exec(text.slice(i, i + 66));
       if (tag) {
-        const end = text.indexOf(tag[0], i + tag[0].length);
-        i = end === -1 ? n : end + tag[0].length;
+        const close = text.indexOf(tag[0], i + tag[0].length);
+        i = close === -1 ? end : close + tag[0].length;
       } else {
+        // A parameter, $1.
         i += 1;
+        while (i < end && /[0-9]/.test(text[i])) i += 1;
       }
     } else if (c === "(") {
+      const close = closing(text, i, end);
+      out.push({ type: "group", start: i + 1, end: close });
+      i = close + 1;
+    } else if (isWordStart(c)) {
+      let j = i + 1;
+      while (j < end && isWordChar(text[j])) j += 1;
+      out.push({ type: "word", text: text.slice(i, j).toLowerCase() });
+      i = j;
+    } else if (/\s/.test(c)) {
+      i += 1;
+    } else {
+      out.push({ type: "punct", text: c });
+      i += 1;
+    }
+  }
+  return out;
+}
+
+/** The index of the parenthesis that closes the one at `open` (or `end`), skipping what `tokens` skips. */
+function closing(text, open, end) {
+  let depth = 0;
+  let i = open;
+  while (i < end) {
+    const c = text[i];
+    if (c === "(") {
       depth += 1;
       i += 1;
     } else if (c === ")") {
-      depth = Math.max(0, depth - 1);
+      depth -= 1;
+      if (depth === 0) return i;
       i += 1;
-    } else if (isWordStart(c) && !isWordChar(text[i - 1])) {
-      let j = i + 1;
-      while (j < n && isWordChar(text[j])) j += 1;
-      if (depth === 0) {
-        const word = text.slice(i, j).toLowerCase();
-        if (first === null) {
-          first = word;
-          if (word !== "with") return word;
-        } else if (VERBS.has(word)) {
-          return word;
-        }
+    } else if (c === "-" && text[i + 1] === "-") {
+      const eol = text.indexOf("\n", i);
+      i = eol === -1 || eol > end ? end : eol + 1;
+    } else if (c === "/" && text[i + 1] === "*") {
+      const close = text.indexOf("*/", i + 2);
+      i = close === -1 ? end : close + 2;
+    } else if (c === '"') {
+      i = skipQuoted(text, i, '"', false);
+    } else if (c === "'") {
+      const escapes = (text[i - 1] === "e" || text[i - 1] === "E") && !isWordChar(text[i - 2]);
+      i = skipQuoted(text, i, "'", escapes);
+    } else if (c === "$" && !isWordChar(text[i - 1])) {
+      const tag = /^\$([A-Za-z_][A-Za-z0-9_]*)?\$/.exec(text.slice(i, i + 66));
+      if (tag) {
+        const close = text.indexOf(tag[0], i + tag[0].length);
+        i = close === -1 ? end : close + tag[0].length;
+      } else {
+        i += 1;
       }
-      i = j;
+    } else if (isWordStart(c)) {
+      i += 1;
+      while (i < end && isWordChar(text[i])) i += 1;
     } else {
       i += 1;
     }
   }
-  return null;
+  return end;
 }
 
-const VERBS = new Set(["select", "insert", "update", "delete", "merge", "values", "table"]);
-
 function isWordStart(c) {
-  return c !== undefined && /[A-Za-z_\u0080-￿]/.test(c);
+  return c !== undefined && /[A-Za-z_\u0080-\uffff]/.test(c);
 }
 
 function isWordChar(c) {
-  return c !== undefined && /[A-Za-z0-9_$\u0080-￿]/.test(c);
+  return c !== undefined && /[A-Za-z0-9_$\u0080-\uffff]/.test(c);
 }
 
 /** The index just past the quoted text that starts at `i`; a doubled quote stays inside. */
