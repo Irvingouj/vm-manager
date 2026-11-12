@@ -275,9 +275,9 @@ fn interleaved_requests_on_two_workers() {
             }
             assert_eq!(body["slept"]["ok"]["attached"]["user"], user, "{body}");
         }
-        // Each takes >= 250 ms (150 host op + 100 timer): together < 500 ms
-        // means they were in flight at once.
-        assert!(took < Duration::from_millis(450), "not concurrent: {took:?}");
+        // Each takes >= 250 ms (150 host op + 100 timer): one after the other >= 500 ms,
+        // so < 495 ms means they were in flight at once.
+        assert!(took < Duration::from_millis(495), "not concurrent: {took:?}");
 
         for r in audit.lock().unwrap().iter() {
             let tag = r.args["tag"].as_str().unwrap_or("");

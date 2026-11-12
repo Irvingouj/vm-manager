@@ -1,0 +1,63 @@
+name: identity pass-through spike
+
+on:
+  push:
+    branches: [spike/identity-pass-through]
+    paths:
+      - "prototypes/identity-pass-through/**"
+      - "prototypes/execution-core/vendor/**"
+      - ".github/workflows/identity-pass-through.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  host:
+    name: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: prototypes/identity-pass-through
+    env:
+      CARGO_TERM_COLOR: never
+      RUST_TOOLCHAIN: "1.99.1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+          rustc -vV
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: prototypes/identity-pass-through -> target
+          cache-on-failure: true
+
+      - name: Build host (release)
+        run: cargo build --release --locked
+
+      - name: Attack tests (one worker, two workers, multi-thread runtime)
+        run: cargo test --release --locked --test attacks -- --nocapture
+
+      - name: Attack tests through the isolate pool
+        run: cargo test --release --locked --test pool -- --nocapture
+
+      - name: Smoke test over HTTP
+        run: |
+          bin=target/release/idp-host; [ -f "$bin.exe" ] && bin="$bin.exe"
+          ./smoke.sh "$bin"
+
+      - name: Cost of a fresh isolate / context per request vs reuse
+        run: |
+          bin=target/release/idp-host; [ -f "$bin.exe" ] && bin="$bin.exe"
+          for mode in warm fresh-isolate pool-warm pool-fresh-context; do
+            "$bin" bench guest/attacks.js "$mode" 300 2>/dev/null
+          done
