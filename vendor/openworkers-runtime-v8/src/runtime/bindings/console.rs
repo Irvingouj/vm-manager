@@ -32,6 +32,9 @@ fn console_log(_scope: &mut v8::PinScope, state: &Rc<ConsoleState>, level: i32, 
         2 => LogLevel::Info,
         3 => LogLevel::Debug,
         4 => LogLevel::Trace,
+        // Patched (vendor/VENDORED.md): console.log reaches the host as Log,
+        // not as Info, so the host can tell the two apart.
+        5 => LogLevel::Log,
         _ => LogLevel::Info,
     };
 
@@ -74,7 +77,7 @@ pub fn setup_console(scope: &mut v8::PinScope, log_callback: LogCallback) {
 
         globalThis.console = {
             log: function(...args) {
-                __console_log(2, args.map(__formatArg).join(' '));
+                __console_log(5, args.map(__formatArg).join(' '));
             },
             info: function(...args) {
                 __console_log(2, args.map(__formatArg).join(' '));

@@ -34,3 +34,11 @@ Upstream sent an `invoke` call past the inline budget (16 per turn), and every o
 | `src/runtime/bindings/fetch.rs` (`__nativeFetchStreaming`), `src/runtime/bindings/state.rs`, `src/runtime/scheduler.rs` | Outbound `fetch` likewise enters the host (`ops.handle(Operation::Fetch)`) inside the guest's call and polls it once; `SchedulerMessage::FetchStreaming` carries that future instead of the request. `FetchState::ops` is no longer behind the `invoke` feature. |
 
 Only these two operation kinds (host functions through `invoke`, and outbound `fetch`) are patched. Every other operation kind of the runtime (binding fetch, storage, KV, database, D1, worker, Durable Objects, WebSocket connect) still enters the host from a scheduler task, so the host must not expose them to Applications.
+
+### Patch 3: `console.log` reaches the host as `Log`
+
+Upstream sent `console.log` and `console.info` to the host with the same level (`Info`), so a host could not report which one the Application called. `openworkers-core`'s `LogLevel` already has a `Log` variant that nothing produced.
+
+| File | Change |
+|---|---|
+| `src/runtime/bindings/console.rs` | `console.log` passes level code 5, and the native side maps 5 to `LogLevel::Log`. The other methods are unchanged. |
