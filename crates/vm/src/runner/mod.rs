@@ -38,7 +38,7 @@ use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio::task::JoinSet;
 
 use crate::gateway::Gateway;
-use crate::registry::Serving;
+use crate::registry::{Declared, Serving};
 use crate::user::User;
 use host::{APPLICATION_BINDING, HostOps};
 
@@ -52,6 +52,8 @@ pub struct InFlight {
     pub application: Arc<str>,
     /// The Version running the request.
     pub version: u64,
+    /// That Version's Declared access.
+    pub declared: Arc<Declared>,
 }
 
 /// What the Application answered.
@@ -103,7 +105,9 @@ impl Default for Limits {
             threads: NonZeroUsize::new(threads).unwrap_or(NonZeroUsize::MIN),
             requests_per_thread: 32,
             queue_per_thread: 64,
-            deadline: Duration::from_secs(8),
+            // Longer than a query may run (10 s, crate::executor) and be
+            // logged, so that an Application waiting on one gets its answer.
+            deadline: Duration::from_secs(30),
             cpu_ms: 2_000,
             heap_max_mb: 64,
             max_body_bytes: 8 * 1024 * 1024,

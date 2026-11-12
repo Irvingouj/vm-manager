@@ -86,17 +86,17 @@ impl HostOps {
         );
     }
 
-    fn host_call(&self, operation: &str, refusal: Option<&Refusal>) {
+    fn host_call(&self, operation: &str, refused: Option<&str>) {
         let in_flight = self.is_active().then_some(&*self.in_flight);
         let mut record = json!({
             "request": in_flight.map(|f| &*f.request),
             "application": &*self.in_flight.application,
             "user": in_flight.map(|f| f.user.id.as_str()),
             "operation": operation,
-            "outcome": if refusal.is_some() { "refused" } else { "allowed" },
+            "outcome": if refused.is_some() { "refused" } else { "allowed" },
         });
-        if let (Some(refusal), Some(object)) = (refusal, record.as_object_mut()) {
-            object.insert("reason".into(), refusal.reason.into());
+        if let (Some(reason), Some(object)) = (refused, record.as_object_mut()) {
+            object.insert("reason".into(), reason.into());
         }
         log::record("host-call", record);
     }
@@ -123,7 +123,7 @@ impl HostOps {
             }
             other => {
                 let refusal = Refusal::unknown_operation(other);
-                self.host_call(other, Some(&refusal));
+                self.host_call(other, Some(refusal.reason));
                 InvokeResult::Value(refusal.to_wire())
             }
         }
@@ -157,31 +157,22 @@ impl OperationsHandler for HostOps {
             let result = self.platform_call(name, &args);
             return Box::pin(std::future::ready(result));
         }
-        if !self.is_active() {
-            let refusal = Refusal::no_request();
-            self.host_call(name, Some(&refusal));
-            return Box::pin(std::future::ready(InvokeResult::Value(refusal.to_wire())));
-        }
+        let active = self.is_active();
         if binding != APPLICATION_BINDING {
-            let refusal = Refusal::unknown_operation(name);
-            self.host_call(name, Some(&refusal));
+            let refusal = if active {
+                Refusal::unknown_operation(name)
+            } else {
+                Refusal::no_request()
+            };
+            self.host_call(name, Some(refusal.reason));
             return Box::pin(std::future::ready(InvokeResult::Value(refusal.to_wire())));
         }
-        match self.gateway.operate(&self.in_flight, name, &args) {
-            Decision::Refused(refusal) => {
-                self.host_call(name, Some(&refusal));
-                Box::pin(std::future::ready(InvokeResult::Value(refusal.to_wire())))
-            }
-            Decision::Allowed(operation) => {
-                self.host_call(name, None);
-                Box::pin(async move {
-                    match operation.await {
-                        Ok(value) => InvokeResult::Value(ok_to_wire(value)),
-                        Err(refusal) => InvokeResult::Value(refusal.to_wire()),
-                    }
-                })
-            }
-        }
+        // The gateway reads `active` too: a `query` with no request in
+        // flight is refused and still has its Operation log entry.
+        let Decision { refused, answer } =
+            self.gateway.operate(&self.in_flight, active, name, &args);
+        self.host_call(name, refused);
+        Box::pin(async move { InvokeResult::Value(answer.await) })
     }
 
     fn handle_fetch(&self, _request: HttpRequest) -> OpFuture<'_, Result<HttpResponse, String>> {

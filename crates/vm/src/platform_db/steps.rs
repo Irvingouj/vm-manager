@@ -30,10 +30,11 @@ pub struct Step {
 }
 
 /// The structure this program expects, oldest step first.
-pub const STEPS: &[Step] = &[Step {
-    number: 1,
-    name: "applications, contributors and versions",
-    sql: "
+pub const STEPS: &[Step] = &[
+    Step {
+        number: 1,
+        name: "applications, contributors and versions",
+        sql: "
         CREATE TABLE applications (
             id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
             name text NOT NULL UNIQUE,
@@ -65,7 +66,56 @@ pub const STEPS: &[Step] = &[Step {
         ALTER TABLE applications
             ADD FOREIGN KEY (id, serving_version) REFERENCES versions (application_id, number);
     ",
-}];
+    },
+    Step {
+        number: 2,
+        name: "resources, grants and the operation log",
+        sql: "
+        CREATE TABLE resources (
+            id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+            name text NOT NULL UNIQUE,
+            kind text NOT NULL,
+            description text NOT NULL,
+            owner text NOT NULL,
+            contact text NOT NULL,
+            -- Where the database is and its logins, in the form
+            -- resources::Sealed writes; read by nothing else.
+            connection bytea NOT NULL,
+            created_by text NOT NULL,
+            created_at timestamptz NOT NULL DEFAULT now()
+        );
+        -- Rises with every write of a Grant, taken under the row's lock, so
+        -- the program's memory keeps the latest whatever order writes
+        -- report back in.
+        CREATE SEQUENCE grant_revisions;
+        CREATE TABLE grants (
+            resource_id bigint NOT NULL REFERENCES resources (id),
+            group_name text NOT NULL,
+            access text NOT NULL CHECK (access IN ('structure', 'read', 'write')),
+            revision bigint NOT NULL,
+            PRIMARY KEY (resource_id, group_name)
+        );
+        CREATE TABLE operation_log (
+            id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+            time timestamptz NOT NULL DEFAULT now(),
+            request text,
+            user_id text,
+            application text NOT NULL,
+            version integer NOT NULL,
+            resource text NOT NULL,
+            operation text NOT NULL,
+            -- Without its values (crate::statement).
+            statement text NOT NULL,
+            outcome text NOT NULL
+                CHECK (outcome IN ('allowed', 'refused', 'failed', 'unfinished')),
+            reason text,
+            error text,
+            rows bigint,
+            duration_ms bigint
+        );
+    ",
+    },
+];
 
 /// The advisory lock every step's transaction takes first: "vm steps".
 const LOCK: i64 = 0x766d_5f73_7465_7073;

@@ -28,6 +28,19 @@ pub use pool::{Pool, PoolLimits};
 
 use crate::log;
 
+/// `created_at` and the like as RFC 3339 in UTC, with microseconds, for
+/// the tables' queries.
+macro_rules! rfc3339 {
+    ($column:literal) => {
+        concat!(
+            "to_char(",
+            $column,
+            " AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')"
+        )
+    };
+}
+pub(crate) use rfc3339;
+
 /// What went wrong talking to Postgres. Its text comes from Postgres's
 /// own message or from this program; it never holds the password.
 #[derive(Debug)]

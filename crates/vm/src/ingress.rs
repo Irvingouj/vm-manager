@@ -103,7 +103,13 @@ impl Ingress {
             };
             let answer = self
                 .api
-                .handle(&user, &parts.method, parts.uri.path(), body)
+                .handle(
+                    &user,
+                    &parts.method,
+                    parts.uri.path(),
+                    parts.uri.query(),
+                    body,
+                )
                 .await;
             let mut response = Response::new(Full::new(answer.body));
             *response.status_mut() = answer.status;
@@ -132,6 +138,7 @@ impl Ingress {
             user,
             application: Arc::clone(&serving.application),
             version: serving.version,
+            declared: Arc::clone(&serving.declared),
         });
         let known = Known {
             user: Some(&in_flight.user.id),

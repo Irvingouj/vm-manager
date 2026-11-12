@@ -37,7 +37,7 @@ pub struct PoolLimits {
 impl Default for PoolLimits {
     fn default() -> Self {
         Self {
-            size: 10,
+            size: 16,
             checkout: Duration::from_secs(5),
             connect: Duration::from_secs(5),
             operation: Duration::from_secs(20),

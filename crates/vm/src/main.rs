@@ -1,7 +1,7 @@
 //! The platform program (ADR 0015).
 //!
 //! `VM_DATABASE_URL=postgres://... vm serve --domain <domain> --listen
-//! <ip:port> [--stand-in-sign-in]` serves the Applications kept in the
+//! <ip:port> [--stand-in-sign-in] [--administrators-group <Group>]` serves the Applications kept in the
 //! platform database, and the platform's API (blackbox/CONTRACT.md).
 //! `vm --version` names the execution core.
 
@@ -15,10 +15,13 @@ use serde_json::json;
 use tokio::net::TcpListener;
 
 use vm::api::Api;
+use vm::executor;
 use vm::gateway::{Gateway, PlatformGateway};
 use vm::ingress::Ingress;
+use vm::oplog::OperationLog;
 use vm::platform_db::{self, DatabaseAddress, PlatformDatabase, PoolLimits};
 use vm::registry::{Registry, is_dns_label};
+use vm::resources::Resources;
 use vm::runner::{self, RequestRunner};
 use vm::sign_in::{NoSignIn, SignIn, StandInSignIn};
 use vm::{log, server};
@@ -55,6 +58,10 @@ struct Serve {
     /// Development only: the caller states the User in x-vm-stand-in-* headers.
     #[arg(long)]
     stand_in_sign_in: bool,
+    /// The Group whose members are Platform administrators. Without it no
+    /// one is.
+    #[arg(long)]
+    administrators_group: Option<String>,
 }
 
 fn main() -> ExitCode {
@@ -115,27 +122,31 @@ fn run(serve: &Serve) -> Result<(), String> {
     } else {
         Box::new(NoSignIn)
     };
-    let gateway: Arc<dyn Gateway> = Arc::new(PlatformGateway);
-    let runner = RequestRunner::start(&runner::Limits::default(), &gateway)
-        .map_err(|e| format!("cannot start the engine threads: {e}"))?;
-
+    let administrators: Option<Arc<str>> = serve.administrators_group.as_deref().map(Arc::from);
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(|e| format!("cannot start the server's runtime: {e}"))?;
     runtime.block_on(async move {
         let started = tokio::time::timeout(DATABASE_START_TIMEOUT, async {
-            let database = PlatformDatabase::open(&address, &PoolLimits::default()).await?;
-            Registry::load(Arc::new(database)).await.map_err(|e| {
+            let database = Arc::new(PlatformDatabase::open(&address, &PoolLimits::default()).await?);
+            let unreadable = |e: platform_db::DbError| {
                 format!(
-                    "cannot read the Applications from the platform database \"{}\": {e}",
+                    "cannot read the Applications and Resources from the platform database \"{}\": {e}",
                     address.database()
                 )
-            })
+            };
+            let registry = Registry::load(Arc::clone(&database))
+                .await
+                .map_err(unreadable)?;
+            let resources = Resources::load(Arc::clone(&database), executor::Limits::default())
+                .await
+                .map_err(unreadable)?;
+            Ok::<_, String>((database, registry, resources))
         })
         .await;
-        let registry = match started {
-            Ok(registry) => Arc::new(registry?),
+        let (database, registry, resources) = match started {
+            Ok(started) => started?,
             Err(_) => {
                 return Err(format!(
                     "the platform database \"{}\" on Postgres at {} was not ready within {} s",
@@ -145,6 +156,16 @@ fn run(serve: &Serve) -> Result<(), String> {
                 ));
             }
         };
+        let registry = Arc::new(registry);
+        let resources = Arc::new(resources);
+        let log = Arc::new(OperationLog::new(database));
+        let gateway: Arc<dyn Gateway> = Arc::new(PlatformGateway::new(
+            Arc::clone(&resources),
+            Arc::clone(&log),
+            tokio::runtime::Handle::current(),
+        ));
+        let runner = RequestRunner::start(&runner::Limits::default(), &gateway)
+            .map_err(|e| format!("cannot start the engine threads: {e}"))?;
         let domain: Arc<str> = Arc::from(domain);
         let listener = TcpListener::bind(serve.listen)
             .await
@@ -164,7 +185,13 @@ fn run(serve: &Serve) -> Result<(), String> {
             }),
         );
         let ingress = Arc::new(Ingress {
-            api: Api::new(Arc::clone(&registry), Arc::clone(&domain)),
+            api: Api::new(
+                Arc::clone(&registry),
+                resources,
+                log,
+                Arc::clone(&domain),
+                administrators,
+            ),
             domain,
             registry,
             sign_in,

@@ -4,9 +4,15 @@
 //! Interface: [`Api::handle`], for a request whose caller Ingress has
 //! already signed in. It reads the body (up to [`MAX_BODY_BYTES`]), finds
 //! the route, and answers. Refusals are decided in the contract's order:
-//! `too-large`, `not-found`, `method-not-allowed`, `not-a-contributor`,
-//! `malformed`, then the rest. Adding an endpoint is a [`Route`] and a
-//! handler.
+//! `too-large`, `not-an-administrator`, `not-found`, `method-not-allowed`,
+//! `not-a-contributor`, `malformed`, then the rest. Adding an endpoint is a
+//! [`Route`] and a handler.
+//!
+//! Resources, Grants and the Operation log are here too. A Platform
+//! administrator is a member of the Group named at start
+//! (`--administrators-group`); without one, no one is. A body that registers
+//! a Resource holds a password, so no message about it repeats anything
+//! from it: its problems are told in fixed words.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -23,10 +29,14 @@ use serde_json::value::RawValue;
 use serde_json::{Value, json};
 
 use crate::log;
+use crate::oplog::{self, OperationLog};
 use crate::platform_db::DbError;
 use crate::registry::{
     ApplicationRecord, Created, DeclaredAccess, NameProblem, NewVersion, Registry, Resource, Sent,
     VersionRecord, check_name,
+};
+use crate::resources::{
+    self, Connection, GrantWritten, NewResource, Registered, Resources, is_resource_name, level_of,
 };
 use crate::user::User;
 
@@ -112,6 +122,25 @@ enum Route<'a> {
     /// `/v1/applications/<name>/versions/<number>`; `None` when the number
     /// cannot name a Version.
     Version(&'a str, Option<u64>),
+    /// `/v1/resources`
+    Resources,
+    /// `/v1/resources/<name>`
+    Resource(&'a str),
+    /// `/v1/resources/<name>/grants`
+    Grants(&'a str),
+    /// `/v1/operation-log`
+    OperationLog,
+}
+
+impl Route<'_> {
+    /// Only Platform administrators may use it, whatever the method.
+    fn for_administrators(&self, method: &Method) -> bool {
+        match self {
+            Self::Resources => method != Method::GET,
+            Self::Grants(_) | Self::OperationLog => true,
+            _ => false,
+        }
+    }
 }
 
 impl<'a> Route<'a> {
@@ -128,6 +157,10 @@ impl<'a> Route<'a> {
             ["applications", name, "versions", number] => {
                 Some(Self::Version(name, version_number(number)))
             }
+            ["resources"] => Some(Self::Resources),
+            ["resources", name] => Some(Self::Resource(name)),
+            ["resources", name, "grants"] => Some(Self::Grants(name)),
+            ["operation-log"] => Some(Self::OperationLog),
             _ => None,
         }
     }
@@ -186,6 +219,92 @@ fn read_version(body: &[u8]) -> Result<NewVersion, String> {
     })
 }
 
+/// `POST /v1/resources`
+const RESOURCE_FORM: &str = r#"{ "name": "<name>", "kind": "postgres", "description": "<text>", "owner": "<text>", "contact": "<whom to ask for access>", "connection": { "host": "<host>", "port": <1 to 65535>, "database": "<database>", "read": { "role": "<role>", "password": "<password>" } } }"#;
+
+/// Reads a Resource to register. Its problems are told in fixed words that
+/// name a field, never anything the body holds.
+fn read_resource(body: &[u8]) -> Result<NewResource, &'static str> {
+    const PORT: &str = "connection.port is missing or not a number from 1 to 65535";
+    let object =
+        Object::read(body).map_err(|_| "the body is not a JSON object with each key once")?;
+    let kind: String = object.fixed("kind", "kind is missing or not a string")?;
+    let name = object.fixed("name", "name is missing or not a string")?;
+    let description = object.fixed("description", "description is missing or not a string")?;
+    let owner = object.fixed("owner", "owner is missing or not a string")?;
+    let contact = object.fixed("contact", "contact is missing or not a string")?;
+    let connection = object
+        .object("connection")
+        .map_err(|_| "connection is missing or not an object with each key once")?;
+    let host = connection.fixed("host", "connection.host is missing or not a string")?;
+    let port: u16 = connection.fixed("port", PORT)?;
+    let database =
+        connection.fixed("database", "connection.database is missing or not a string")?;
+    let read = connection
+        .object("read")
+        .map_err(|_| "connection.read is missing or not an object with each key once")?;
+    let role = read.fixed("role", "connection.read.role is missing or not a string")?;
+    let password = read.fixed(
+        "password",
+        "connection.read.password is missing or not a string",
+    )?;
+    if port == 0 {
+        return Err(PORT);
+    }
+    if kind != "postgres" {
+        return Err("kind is not \"postgres\"");
+    }
+    Ok(NewResource {
+        name,
+        description,
+        owner,
+        contact,
+        connection: Connection::new(host, port, database, role, password),
+    })
+}
+
+/// `POST /v1/resources/<name>/grants`
+const GRANT_FORM: &str = r#"{ "group": "<Group: 1 to 256 bytes, no control characters>", "access": "structure|read|write" }"#;
+
+fn read_grant(body: &[u8]) -> Result<(String, authz::AccessLevel), String> {
+    let object = Object::read(body)?;
+    let group: String = object.required("group")?;
+    let access: String = object.required("access")?;
+    if group.is_empty() || group.len() > 256 || group.chars().any(char::is_control) {
+        return Err("group is not 1 to 256 bytes without control characters".into());
+    }
+    let level = level_of(&access)
+        .ok_or_else(|| "access is not one of structure, read, write".to_owned())?;
+    Ok((group, level))
+}
+
+/// `?limit=<n>` of `GET /v1/operation-log`: 1 to 1000, written plainly;
+/// absent, 100. `None` for anything else. Other parameters are ignored.
+fn log_limit(query: Option<&str>) -> Option<u16> {
+    let mut limit = None;
+    for pair in query.unwrap_or("").split('&') {
+        let Some(value) = pair.strip_prefix("limit=") else {
+            if pair == "limit" {
+                return None;
+            }
+            continue;
+        };
+        if limit.is_some() {
+            return None;
+        }
+        limit = Some(value);
+    }
+    let Some(text) = limit else {
+        return Some(100);
+    };
+    let canonical = !text.is_empty()
+        && !text.starts_with('0')
+        && text.len() <= 4
+        && text.bytes().all(|b| b.is_ascii_digit());
+    let limit: u16 = canonical.then(|| text.parse().ok()).flatten()?;
+    (1..=oplog::MAX_READ).contains(&limit).then_some(limit)
+}
+
 /// A JSON object read strictly: an object (never an array standing in for
 /// one), each key at most once, and its values kept as text until asked
 /// for by type. Keys the request does not have are ignored.
@@ -238,6 +357,15 @@ impl<'a> Object<'a> {
         }
     }
 
+    /// Like [`Object::required`], with `problem` as the only message.
+    fn fixed<T: DeserializeOwned>(
+        &self,
+        key: &str,
+        problem: &'static str,
+    ) -> Result<T, &'static str> {
+        self.required(key).map_err(|_| problem)
+    }
+
     fn object(&self, key: &str) -> Result<Object<'a>, String> {
         let value = self.0.get(key).ok_or_else(|| format!("{key} is missing"))?;
         Self::read_value(value).map_err(|e| format!("{key}: {e}"))
@@ -246,16 +374,45 @@ impl<'a> Object<'a> {
 
 pub struct Api {
     registry: Arc<Registry>,
+    resources: Arc<Resources>,
+    log: Arc<OperationLog>,
     domain: Arc<str>,
+    /// The Group whose members are Platform administrators, if any.
+    administrators: Option<Arc<str>>,
 }
 
 impl Api {
-    pub fn new(registry: Arc<Registry>, domain: Arc<str>) -> Self {
-        Self { registry, domain }
+    pub fn new(
+        registry: Arc<Registry>,
+        resources: Arc<Resources>,
+        log: Arc<OperationLog>,
+        domain: Arc<str>,
+        administrators: Option<Arc<str>>,
+    ) -> Self {
+        Self {
+            registry,
+            resources,
+            log,
+            domain,
+            administrators,
+        }
+    }
+
+    fn is_administrator(&self, user: &User) -> bool {
+        self.administrators
+            .as_deref()
+            .is_some_and(|group| user.groups.iter().any(|g| g == group))
     }
 
     /// Answers one request of a signed-in `user`.
-    pub async fn handle(&self, user: &User, method: &Method, path: &str, body: Incoming) -> Answer {
+    pub async fn handle(
+        &self,
+        user: &User,
+        method: &Method,
+        path: &str,
+        query: Option<&str>,
+        body: Incoming,
+    ) -> Answer {
         let read = Limited::new(body, MAX_BODY_BYTES).collect();
         let body = match tokio::time::timeout(BODY_READ_TIMEOUT, read).await {
             Ok(Ok(collected)) => collected.to_bytes(),
@@ -276,10 +433,21 @@ impl Api {
         };
         let Some(route) = Route::of(path) else {
             return Answer::not_found(
-                "the API has no such path: its paths are /v1/applications, /v1/applications/<name>, /v1/applications/<name>/versions and /v1/applications/<name>/versions/<number>",
+                "the API has no such path: its paths are /v1/applications, /v1/applications/<name>, /v1/applications/<name>/versions, /v1/applications/<name>/versions/<number>, /v1/resources, /v1/resources/<name>, /v1/resources/<name>/grants and /v1/operation-log",
             );
         };
+        if route.for_administrators(method) && !self.is_administrator(user) {
+            return Answer::error(
+                StatusCode::FORBIDDEN,
+                "not-an-administrator",
+                "only Platform administrators may do this: ask one",
+            );
+        }
         let answer = match route {
+            Route::Resources => self.resources_route(user, method, &body).await,
+            Route::Resource(name) => Ok(self.resource(method, name)),
+            Route::Grants(name) => self.grants(method, name, &body).await,
+            Route::OperationLog => self.operation_log(method, query).await,
             Route::Applications => self.applications(user, method, &body).await,
             Route::Application(name) => self.application(method, name).await,
             Route::Versions(name) => self.versions(user, method, name, &body).await,
@@ -419,6 +587,108 @@ impl Api {
         })
     }
 
+    async fn resources_route(
+        &self,
+        user: &User,
+        method: &Method,
+        body: &[u8],
+    ) -> Result<Answer, DbError> {
+        if method == Method::GET {
+            let all = self.resources.list();
+            let resources = ResourcesView {
+                resources: all.iter().map(|r| ResourceView::of(r)).collect(),
+            };
+            return Ok(Answer::json(StatusCode::OK, &resources));
+        }
+        if method != Method::POST {
+            return Ok(Answer::method_not_allowed(method, "GET or POST"));
+        }
+        let new = match read_resource(body) {
+            Ok(new) => new,
+            Err(problem) => return Ok(Answer::malformed(problem, RESOURCE_FORM)),
+        };
+        if !is_resource_name(&new.name) {
+            return Ok(Answer::error(
+                StatusCode::BAD_REQUEST,
+                "invalid-name",
+                "a Resource's name is 1 to 63 lower-case letters, digits and underscores, starting with a letter",
+            ));
+        }
+        Ok(match self.resources.register(new, &user.id).await? {
+            Registered::Registered(resource) => {
+                Answer::json(StatusCode::CREATED, &ResourceView::of(&resource))
+            }
+            Registered::NameTaken => Answer::error(
+                StatusCode::CONFLICT,
+                "name-taken",
+                "a Resource with this name is registered: choose another name",
+            ),
+        })
+    }
+
+    fn resource(&self, method: &Method, name: &str) -> Answer {
+        let Some(resource) = self.resources.get(name) else {
+            return no_resource();
+        };
+        if method == Method::GET {
+            Answer::json(StatusCode::OK, &ResourceView::of(&resource))
+        } else {
+            Answer::method_not_allowed(method, "GET")
+        }
+    }
+
+    async fn grants(&self, method: &Method, name: &str, body: &[u8]) -> Result<Answer, DbError> {
+        let Some(resource) = self.resources.get(name) else {
+            return Ok(no_resource());
+        };
+        if method == Method::GET {
+            let grants = resource.grants();
+            let view = GrantsView {
+                grants: grants
+                    .iter()
+                    .map(|(group, level)| GrantView {
+                        group,
+                        access: resources::level_name(*level),
+                    })
+                    .collect(),
+            };
+            return Ok(Answer::json(StatusCode::OK, &view));
+        }
+        if method != Method::POST {
+            return Ok(Answer::method_not_allowed(method, "GET or POST"));
+        }
+        let (group, level) = match read_grant(body) {
+            Ok(grant) => grant,
+            Err(problem) => return Ok(Answer::malformed(&problem, GRANT_FORM)),
+        };
+        Ok(match self.resources.grant(name, &group, level).await? {
+            GrantWritten::Written => Answer::json(
+                StatusCode::OK,
+                &GrantSet {
+                    resource: &resource.name,
+                    group: &group,
+                    access: resources::level_name(level),
+                },
+            ),
+            GrantWritten::NoSuchResource => no_resource(),
+        })
+    }
+
+    async fn operation_log(&self, method: &Method, query: Option<&str>) -> Result<Answer, DbError> {
+        if method != Method::GET {
+            return Ok(Answer::method_not_allowed(method, "GET"));
+        }
+        let Some(limit) = log_limit(query) else {
+            return Ok(Answer::error(
+                StatusCode::BAD_REQUEST,
+                "malformed",
+                "?limit must be a whole number from 1 to 1000",
+            ));
+        };
+        let entries = self.log.newest(limit).await?;
+        Ok(Answer::json(StatusCode::OK, &EntriesView { entries }))
+    }
+
     /// The Application `name`; `None` also for a name no Application can
     /// have, without asking the database.
     async fn find(&self, name: &str) -> Result<Option<ApplicationRecord>, DbError> {
@@ -493,6 +763,64 @@ struct VersionsView<'a> {
     versions: Vec<VersionView<'a>>,
 }
 
+/// A Resource as every signed-in User sees it.
+#[derive(Serialize)]
+struct ResourceView<'a> {
+    name: &'a str,
+    kind: &'static str,
+    description: &'a str,
+    owner: &'a str,
+    contact: &'a str,
+    created_by: &'a str,
+    created_at: &'a str,
+}
+
+impl<'a> ResourceView<'a> {
+    fn of(resource: &'a resources::Resource) -> Self {
+        Self {
+            name: &resource.name,
+            kind: "postgres",
+            description: &resource.description,
+            owner: &resource.owner,
+            contact: &resource.contact,
+            created_by: &resource.created_by,
+            created_at: &resource.created_at,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct ResourcesView<'a> {
+    resources: Vec<ResourceView<'a>>,
+}
+
+#[derive(Serialize)]
+struct GrantView<'a> {
+    group: &'a str,
+    access: &'static str,
+}
+
+#[derive(Serialize)]
+struct GrantsView<'a> {
+    grants: Vec<GrantView<'a>>,
+}
+
+#[derive(Serialize)]
+struct GrantSet<'a> {
+    resource: &'a str,
+    group: &'a str,
+    access: &'static str,
+}
+
+#[derive(Serialize)]
+struct EntriesView {
+    entries: Vec<Value>,
+}
+
+fn no_resource() -> Answer {
+    Answer::not_found("no such Resource: list them at /v1/resources")
+}
+
 fn no_application() -> Answer {
     Answer::not_found("no such Application: create it with POST /v1/applications")
 }
@@ -554,6 +882,43 @@ mod tests {
         ] {
             assert!(read_version(body.as_bytes()).is_err(), "{body}");
         }
+    }
+
+    #[test]
+    fn operation_log_limits_are_plain_numbers_from_1_to_1000() {
+        assert_eq!(log_limit(None), Some(100));
+        assert_eq!(log_limit(Some("")), Some(100));
+        assert_eq!(log_limit(Some("limit=1")), Some(1));
+        assert_eq!(log_limit(Some("limit=1000")), Some(1000));
+        for query in [
+            "limit=0",
+            "limit=1001",
+            "limit=-1",
+            "limit=abc",
+            "limit=",
+            "limit",
+            "limit=01",
+            "limit=5&limit=6",
+        ] {
+            assert_eq!(log_limit(Some(query)), None, "{query}");
+        }
+    }
+
+    #[test]
+    fn a_resource_body_problem_never_repeats_the_body() {
+        let body =
+            br#"{"name":"devops","kind":"postgres","description":"d","owner":"o","contact":"c",
+            "connection":{"host":"secret-host","port":"secret-port","database":"secret-db",
+            "read":{"role":"secret-role","password":"secret-password"}}}"#;
+        let problem = read_resource(body).err().unwrap_or_default();
+        assert!(
+            problem.contains("port") && !problem.contains("secret"),
+            "{problem}"
+        );
+        let problem = read_resource(br#""secret-password""#)
+            .err()
+            .unwrap_or_default();
+        assert!(!problem.contains("secret"), "{problem}");
     }
 
     #[test]

@@ -1,0 +1,343 @@
+//! The Database executor for shared databases (ADR 0013;
+//! docs/research/what-postgres-sees.md): runs one Application statement as
+//! one transaction on a connection logged in directly as the Access level's
+//! login, never switching role.
+//!
+//! Interface: a [`Pool`] per Resource and Access level, made from a
+//! [`Target`] (where the database is and the login, which never prints) and
+//! [`Limits`]; [`Pool::read`] runs one statement with its [`Param`]s in a
+//! read-only transaction and answers an [`Outcome`]: the rows, or a
+//! [`Failure`] (Postgres refused it, a [`Limit`] ended it, or the database
+//! could not be reached), with when the statement was sent and ended.
+//!
+//! A pool opens no connection until it is used (registering a Resource
+//! does not connect). Only `read` exists in this ticket; the ticket "Write
+//! access, and the database role as the boundary" adds the write pool and
+//! the statement check.
+
+mod wire;
+
+use std::fmt;
+use std::sync::{Mutex, PoisonError};
+use std::time::Duration;
+
+use serde_json::{Map, Value};
+use tokio::sync::Semaphore;
+
+use crate::log;
+use wire::{Connection, WireError};
+
+/// A password for a shared database. No `Display`; its `Debug` shows
+/// nothing of it.
+pub struct Password(String);
+
+impl Password {
+    pub fn new(password: String) -> Self {
+        Self(password)
+    }
+
+    fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for Password {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Password(<hidden>)")
+    }
+}
+
+/// Where a shared database is and the login to use. None of it is ever
+/// printed: its `Debug` shows nothing, and no error made from it repeats
+/// any of it.
+pub struct Target {
+    host: String,
+    port: u16,
+    database: String,
+    role: String,
+    password: Password,
+}
+
+impl fmt::Debug for Target {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Target(<hidden>)")
+    }
+}
+
+impl Target {
+    pub fn new(
+        host: String,
+        port: u16,
+        database: String,
+        role: String,
+        password: Password,
+    ) -> Self {
+        Self {
+            host,
+            port,
+            database,
+            role,
+            password,
+        }
+    }
+}
+
+/// The pool's bounds and the limits of one statement.
+#[derive(Clone, Debug)]
+pub struct Limits {
+    /// Connections open at once, idle or in use.
+    pub size: usize,
+    /// The longest an operation waits for a free connection.
+    pub checkout: Duration,
+    /// The longest opening a connection may take, login included.
+    pub connect: Duration,
+    /// The longest a statement may run, from when it is sent.
+    pub statement: Duration,
+    /// After a cancel, how long the connection has to come back before its
+    /// backend is ended from another connection; also the time allowed for
+    /// ending a transaction.
+    pub grace: Duration,
+    /// The most rows a result may have.
+    pub max_rows: usize,
+    /// The most bytes a result's rows may take as they arrive.
+    pub max_bytes: usize,
+}
+
+impl Default for Limits {
+    /// blackbox/CONTRACT.md, "Operations on a shared database": 10,000 rows,
+    /// 8 MiB, 10 seconds.
+    fn default() -> Self {
+        Self {
+            size: 8,
+            checkout: Duration::from_secs(5),
+            connect: Duration::from_secs(5),
+            statement: Duration::from_secs(10),
+            grace: Duration::from_secs(2),
+            max_rows: 10_000,
+            max_bytes: 8 * 1024 * 1024,
+        }
+    }
+}
+
+/// A parameter, sent as text for the server to interpret.
+#[derive(Debug)]
+pub enum Param {
+    Null,
+    Text(String),
+}
+
+/// A result's columns and rows; each row is a JSON array.
+#[derive(Debug)]
+pub struct Rows {
+    pub columns: Vec<String>,
+    pub rows: Vec<Value>,
+}
+
+impl Rows {
+    /// `{ columns, rows, row_count }`, as Application code receives it.
+    pub fn into_wire(self) -> Value {
+        let mut wire = Map::with_capacity(3);
+        wire.insert("row_count".into(), self.rows.len().into());
+        wire.insert("columns".into(), self.columns.into());
+        wire.insert("rows".into(), Value::Array(self.rows));
+        Value::Object(wire)
+    }
+}
+
+/// Which limit ended a statement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Limit {
+    Rows,
+    Bytes,
+    Time,
+}
+
+impl Limit {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Rows => "rows",
+            Self::Bytes => "bytes",
+            Self::Time => "time",
+        }
+    }
+}
+
+/// Why a statement gave no rows.
+#[derive(Debug)]
+pub enum Failure {
+    /// Postgres refused or failed it: its SQLSTATE and primary message.
+    Database { code: String, message: String },
+    /// A limit ended it.
+    Limit(Limit),
+    /// The database could not be reached, refused the login, or the
+    /// connection failed. Nothing about the connection is said.
+    Unavailable,
+}
+
+/// What came of one operation.
+#[derive(Debug)]
+pub struct Outcome {
+    pub result: Result<Rows, Failure>,
+    /// From when the statement was sent until it ended; `None` if it was
+    /// never sent.
+    pub duration: Option<Duration>,
+}
+
+/// A bounded pool of connections to one shared database as one login.
+pub struct Pool {
+    /// Which Resource, for the program's log. Not a credential.
+    resource: String,
+    target: Target,
+    limits: Limits,
+    /// Bound: `limits.size` permits, one per connection open or being
+    /// opened. When all are taken an operation waits up to
+    /// `limits.checkout`, then is answered unavailable.
+    permits: Semaphore,
+    /// Connections not in use: at most `limits.size`, since each stands for
+    /// a permit given back.
+    idle: Mutex<Vec<Connection>>,
+}
+
+impl fmt::Debug for Pool {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Pool")
+            .field("resource", &self.resource)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Pool {
+    /// A pool for `resource`'s database; it connects on first use.
+    pub fn new(resource: &str, target: Target, limits: Limits) -> Self {
+        let size = limits.size.max(1);
+        Self {
+            resource: resource.to_owned(),
+            target,
+            limits,
+            permits: Semaphore::new(size),
+            idle: Mutex::new(Vec::with_capacity(size)),
+        }
+    }
+
+    /// Runs `sql` in a read-only transaction.
+    pub async fn read(&self, sql: &str, params: &[Param]) -> Outcome {
+        let checkout = self.limits.checkout;
+        let Ok(Ok(_permit)) = tokio::time::timeout(checkout, self.permits.acquire()).await else {
+            self.report("no connection was free in time");
+            return unavailable();
+        };
+        let (mut connection, reused) = match self.take_idle() {
+            Some(connection) => (connection, true),
+            None => match self.open().await {
+                Ok(connection) => (connection, false),
+                Err(()) => return unavailable(),
+            },
+        };
+        let mut run = connection.read_only(sql, params, &self.limits).await;
+        if run.stale && reused {
+            // An idle connection the server had closed: the statement did
+            // not reach it, so it goes once more on a new one.
+            drop(connection);
+            connection = match self.open().await {
+                Ok(connection) => connection,
+                Err(()) => return unavailable(),
+            };
+            run = connection.read_only(sql, params, &self.limits).await;
+        }
+        if matches!(run.result, Err(Failure::Unavailable)) {
+            self.report("the connection failed during the statement");
+        }
+        if let Some(process_id) = run.stuck {
+            drop(connection);
+            self.terminate(process_id).await;
+        } else if run.reusable {
+            self.give_back(connection);
+        }
+        Outcome {
+            duration: run
+                .sent
+                .map(|sent| run.ended.saturating_duration_since(sent)),
+            result: run.result,
+        }
+    }
+
+    async fn open(&self) -> Result<Connection, ()> {
+        Connection::open(&self.target, self.limits.connect)
+            .await
+            .map_err(|error| self.report(error.describe()))
+    }
+
+    /// Ends the backend `process_id` from a connection of its own, as the
+    /// same login (a role may end its own backends), within the connect
+    /// limit and the grace period.
+    async fn terminate(&self, process_id: i32) {
+        let ended = async {
+            let mut connection = Connection::open(&self.target, self.limits.connect).await?;
+            let sql = format!("SELECT pg_terminate_backend({process_id})");
+            tokio::time::timeout(self.limits.grace, connection.simple(&sql))
+                .await
+                .map_err(|_| WireError::TimedOut)?
+        };
+        if !matches!(ended.await, Ok(true)) {
+            self.report("a statement past its limit could not be ended");
+        }
+    }
+
+    /// A record in the program's log. Names the Resource and a fixed
+    /// description, never anything of its connection.
+    fn report(&self, problem: &str) {
+        log::record(
+            "shared-database-unavailable",
+            serde_json::json!({ "resource": self.resource, "problem": problem }),
+        );
+    }
+
+    fn take_idle(&self) -> Option<Connection> {
+        self.idle
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop()
+    }
+
+    fn give_back(&self, connection: Connection) {
+        self.idle
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(connection);
+    }
+}
+
+fn unavailable() -> Outcome {
+    Outcome {
+        result: Err(Failure::Unavailable),
+        duration: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nothing_of_a_target_is_printed() {
+        let target = Target::new(
+            "db.example".into(),
+            6543,
+            "secret_db".into(),
+            "secret_role".into(),
+            Password::new("secret-password".into()),
+        );
+        let printed = format!("{target:?}");
+        for hidden in [
+            "db.example",
+            "6543",
+            "secret_db",
+            "secret_role",
+            "secret-password",
+        ] {
+            assert!(!printed.contains(hidden), "{printed}");
+        }
+        let pool = Pool::new("devops", target, Limits::default());
+        assert!(!format!("{pool:?}").contains("secret"));
+    }
+}

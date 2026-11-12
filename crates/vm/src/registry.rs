@@ -19,6 +19,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, PoisonError, RwLock};
 
+use authz::AccessLevel;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -26,7 +27,7 @@ use tokio_postgres::types::FromSql;
 use tokio_postgres::{Client, Row};
 
 use crate::log;
-use crate::platform_db::{DbError, PlatformDatabase};
+use crate::platform_db::{DbError, PlatformDatabase, rfc3339};
 
 /// Names that are the platform's own and can never be an Application's.
 pub const RESERVED_NAMES: [&str; 6] = ["api", "auth", "dashboard", "git", "admin", "www"];
@@ -65,6 +66,10 @@ pub fn check_name(name: &str) -> Result<(), NameProblem> {
     }
 }
 
+/// The Resources a Version declares, with the Access level of each: what
+/// the Authorization decision reads.
+pub type Declared = BTreeMap<String, AccessLevel>;
+
 /// The Version that serves an Application: what the Request runner runs.
 /// Shared, never copied, between the registry and the requests running it.
 #[derive(Debug)]
@@ -74,6 +79,8 @@ pub struct Serving {
     /// One classic script that registers
     /// `globalThis.default = { fetch(request, ctx) }`.
     pub bundle: Arc<str>,
+    /// Its Declared access.
+    pub declared: Arc<Declared>,
 }
 
 /// An Application as the registry reports it.
@@ -129,12 +136,48 @@ pub enum ResourceKind {
     Postgres,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Access {
     Structure,
     Read,
     Write,
+}
+
+impl From<Access> for AccessLevel {
+    fn from(access: Access) -> Self {
+        match access {
+            Access::Structure => Self::Structure,
+            Access::Read => Self::Read,
+            Access::Write => Self::Write,
+        }
+    }
+}
+
+impl DeclaredAccess {
+    /// Each declared Resource's Access level.
+    fn levels(&self) -> Declared {
+        self.resources
+            .iter()
+            .map(|(name, resource)| (name.clone(), resource.access.into()))
+            .collect()
+    }
+}
+
+/// The Declared access as stored (`{ "resources": { name: { kind, access }
+/// } }`), read back. A Resource whose entry cannot be read is left out: it is
+/// then not declared, and so refused.
+fn declared_of(stored: &Value) -> Declared {
+    let mut declared = Declared::new();
+    if let Some(resources) = stored.get("resources").and_then(Value::as_object) {
+        for (name, resource) in resources {
+            let access = resource.get("access").and_then(Value::as_str);
+            if let Some(access) = access.and_then(crate::resources::level_of) {
+                declared.insert(name.clone(), access);
+            }
+        }
+    }
+    declared
 }
 
 /// What creating an Application came to.
@@ -152,17 +195,6 @@ pub enum Sent {
     NotAContributor,
 }
 
-/// `created_at` and the like as RFC 3339 in UTC, with microseconds.
-macro_rules! rfc3339 {
-    ($column:literal) => {
-        concat!(
-            "to_char(",
-            $column,
-            " AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')"
-        )
-    };
-}
-
 pub struct Registry {
     database: Arc<PlatformDatabase>,
     /// The serving Version of every Application that has one, by name.
@@ -178,7 +210,7 @@ impl Registry {
             .run(async |client: &mut Client| {
                 client
                     .query(
-                        "SELECT a.name, v.number, v.bundle
+                        "SELECT a.name, v.number, v.bundle, v.declared_access
                          FROM applications a
                          JOIN versions v ON v.application_id = a.id AND v.number = a.serving_version",
                         &[],
@@ -344,6 +376,7 @@ impl Registry {
         sender: &str,
     ) -> Result<Sent, DbError> {
         let digest = hex(&Sha256::digest(version.bundle.as_bytes()));
+        let declared = Arc::new(version.declared_access.levels());
         let declared_access = serde_json::to_value(&version.declared_access)
             .map_err(|_| DbError::unexpected("the Declared access cannot be written as JSON"))?;
         // The one copy of the bundle: into the shared form every request
@@ -414,6 +447,7 @@ impl Registry {
                     application: Arc::from(name),
                     version: record.number,
                     bundle,
+                    declared,
                 });
                 Ok(Sent::Sent(record))
             }
@@ -435,7 +469,7 @@ impl Registry {
             .run(async |client: &mut Client| {
                 client
                     .query_opt(
-                        "SELECT a.name, v.number, v.bundle
+                        "SELECT a.name, v.number, v.bundle, v.declared_access
                          FROM applications a
                          JOIN versions v ON v.application_id = a.id AND v.number = a.serving_version
                          WHERE a.name = $1",
@@ -540,6 +574,7 @@ fn serving_of(row: &Row) -> Result<Serving, DbError> {
         application: Arc::from(get::<&str>(row, 0)?),
         version: number_of(get(row, 1)?)?,
         bundle: Arc::from(get::<&str>(row, 2)?),
+        declared: Arc::new(declared_of(&get::<Value>(row, 3)?)),
     })
 }
 

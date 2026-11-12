@@ -14,6 +14,12 @@
 //!   held by the host.
 //! - [`gateway`]: where every operation from Application code enters the
 //!   host, and is decided.
+//! - [`resources`]: the Resources (shared databases) and their Grants,
+//!   held in memory in step with the platform database.
+//! - [`executor`]: the Database executor: bounded pools of connections to
+//!   shared databases and the limits of one statement.
+//! - [`statement`]: a statement without its values, for the Operation log.
+//! - [`oplog`]: the Operation log, in the platform database.
 //! - [`platform_db`]: the platform database: connecting (and creating it),
 //!   its structure in numbered steps, a bounded pool.
 //! - [`registry`]: the Application registry: Applications, Contributors,
@@ -24,12 +30,16 @@
 //! - [`server`]: the listening socket and the connections.
 
 pub mod api;
+pub mod executor;
 pub mod gateway;
 pub mod ingress;
 pub mod log;
+pub mod oplog;
 pub mod platform_db;
 pub mod registry;
+pub mod resources;
 pub mod runner;
 pub mod server;
 pub mod sign_in;
+pub mod statement;
 pub mod user;
