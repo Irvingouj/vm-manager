@@ -193,7 +193,7 @@ On the platform's API. Writing is for Platform administrators only; everyone els
 
 `GET /v1/resources/<name>` and `GET /v1/resources` (`{ "resources": [ ... ] }`, by name): the same object, for every signed-in User. A Resource's existence, description and whom to ask are visible to all; nothing else is.
 
-`POST /v1/resources/<name>/grants`, by a Platform administrator, with `{ "group": "<Group>", "access": "structure" | "read" | "write" }`: sets that Group's Grant on the Resource, replacing the level if the Group already had one. Answers `200` with `{ "resource", "group", "access" }`. A Group is 1 to 256 bytes with no control characters, compared exactly.
+`POST /v1/resources/<name>/grants`, by a Platform administrator, with `{ "group": "<Group>", "access": "structure" | "read" | "write" }`: sets that Group's Grant on the Resource, replacing the level if the Group already had one. Answers `200` with `{ "resource", "group", "access" }`. A Group is 1 to 256 bytes with no control characters, compared exactly; anything else, or an unknown `access`, is `400 malformed`.
 
 `GET /v1/resources/<name>/grants`, by a Platform administrator: `{ "grants": [ { "group", "access" } ] }`, by Group.
 
@@ -212,7 +212,9 @@ env.VM.invoke("query", { resource: "devops", sql: "select id, title from inciden
 - Answer when it ran: `{ ok: { columns: ["id", "title"], rows: [[1, "..."], ...], row_count: 2 } }`. A value is `null`, a boolean, a number (for `int2`, `int4`, `float4`, `float8`), parsed JSON (for `json`, `jsonb`), and otherwise the text Postgres prints for it (so `int8`, `numeric`, timestamps and `uuid` are strings). The SDK ticket may refine this.
 - Answer when Postgres refused or failed the statement: `{ error: { kind: "database", code: "<SQLSTATE>", message: "<Postgres's message>" } }`.
 - A result of more than 10,000 rows or 8 MiB, or a statement running longer than 10 seconds, is ended: `{ error: { kind: "limit", limit: "rows" | "bytes" | "time" } }`. (The ticket on limits makes these settable.)
-- Malformed arguments (no `resource`, no `sql`, a param that is an object): `{ error: { kind: "malformed", message } }`, and nothing reaches any database.
+- Malformed arguments (arguments that are not an object; `resource` or `sql` missing or not a string; `params` not an array; a param that is an object or an array): `{ error: { kind: "malformed", message } }`, and nothing reaches any database. Arguments the operation does not have are ignored and never take effect.
+- A shared database that cannot be reached or refuses the Resource's login: `{ error: { kind: "unavailable" } }`, with nothing about the connection in it.
+- The program does not change the session's `TimeZone` or `DateStyle`: values print as the shared database is set to print them.
 
 ### Who is allowed
 
@@ -229,12 +231,14 @@ Decided by the host from the request in flight, the serving Version's Declared a
 
 - `fix` is a sentence a Coding agent can act on. For `no-grant` it names the Resource's contact.
 - A User holds the highest level any of their Groups is granted. `structure` < `read` < `write`.
+- A Grant written or changed applies from the next request.
+- The program decides from what it holds in memory (Applications, Versions, Resources, Grants), which it keeps exactly in step with the platform database it alone writes. So while the platform database cannot be reached, Applications are still routed and operations are still decided; what cannot be logged is refused.
 - A refused or malformed operation sends nothing to the shared database.
 
 ## The Operation log (same ticket)
 
 - Every `query` operation, allowed or refused, has one entry, written to the platform database **before** the statement is sent to the shared database and completed when it ends. If the entry cannot be written the operation is refused with `log-unavailable` and the statement is not sent.
-- `GET /v1/operation-log`, by a Platform administrator: `{ "entries": [ ... ] }`, oldest first. `?limit=<n>` gives the newest `n` (1 to 1000, default 100), still oldest first.
+- `GET /v1/operation-log`, by a Platform administrator: `{ "entries": [ ... ] }`, oldest first. `?limit=<n>` gives the newest `n` (1 to 1000, default 100), still oldest first; any other value is `400 malformed`.
 
 ```json
 { "id": 17, "time": "<RFC 3339>", "request": "<request id or null>", "user": "<user id or null>",
@@ -246,7 +250,7 @@ Decided by the host from the request in flight, the serving Version's Declared a
 ```
 
 - `statement` is the statement **without its values**: every constant written into the SQL text is replaced by a placeholder, and parameters are never recorded. A statement that cannot be parsed is recorded as `"<unparsed>"`. No field of any entry holds a value from a statement, a parameter, or a row.
-- `rows` and `duration_ms` are null unless the statement ran. `outcome` is `unfinished` while it runs, and stays so if the program died meanwhile.
+- `reason` and `error` are null when they do not apply. For a `failed` entry `error` is the SQLSTATE, the limit's name, or `unavailable`. `rows` is null unless the statement ran to its end; `duration_ms` is null unless the statement was sent. `outcome` is `unfinished` while it runs, and stays so if the program died meanwhile.
 - A malformed operation has no entry. `whoami` is not an operation on a Resource and has none.
 - The program's own log still gets its `host-call` record for each call, as before.
 
