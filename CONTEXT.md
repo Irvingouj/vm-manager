@@ -19,7 +19,7 @@ Separately trusted code that exposes a few narrow business functions and reaches
 _Avoid_: Plugin, connector, external API (an outbound HTTP endpoint is a different thing)
 
 **Resource**:
-A named piece of enterprise infrastructure that IT registers and governs, and that an Application reaches through the SDK by its logical name alone.
+A named piece of enterprise infrastructure that IT registers and governs, and that an Application reaches through the SDK by its logical name alone. Every signed-in employee can see that a Resource exists (its name, a description and whom to ask for access); anything more needs a Grant.
 _Avoid_: Binding (the Cloudflare and OpenWorkers term), service, backend
 
 **Resource owner**:
@@ -41,7 +41,7 @@ A Platform administrator's statement that a Group may reach a Resource at a give
 _Avoid_: Permission, ACL, role
 
 **Access level**:
-How much of a Resource a Grant opens. For a database there are three, each including the one before: structure (discover it and pull its table structure, no rows), read, and write.
+How much of a Resource a Grant opens. For a database there are three, each including the one before: structure (pull its table structure, no rows), read, and write.
 _Avoid_: Role, permission set, scope
 
 **Group**:
