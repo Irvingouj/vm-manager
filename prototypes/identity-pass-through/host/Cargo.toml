@@ -1,0 +1,26 @@
+[package]
+name = "idp-host"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Spike: does the host know which User and Application an operation belongs to?"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "idp-host"
+path = "src/main.rs"
+
+[dependencies]
+openworkers-core = { git = "https://github.com/openworkers/openworkers-core", tag = "v0.18.1", features = ["invoke"] }
+openworkers-runtime-v8 = { git = "https://github.com/openworkers/openworkers-runtime-v8", tag = "v0.18.7", features = ["invoke"] }
+
+bytes = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "sync", "macros", "time"] }
