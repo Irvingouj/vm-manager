@@ -126,6 +126,8 @@ An answer that is not a success is:
 | 405 | A path the API has, with a method it does not have there | `method-not-allowed` |
 | 409 | The Application's name is taken | `name-taken` |
 | 413 | A body larger than 16 MiB (exactly 16 MiB is accepted) | `too-large` |
+| 408 | The body did not arrive in time | `timed-out` |
+| 503 | The platform database cannot be reached or did not answer in time | `unavailable` |
 
 When several apply, the first of these wins: `too-large`, `not-found`, `method-not-allowed`, `not-a-contributor`, `malformed`, then the rest. So someone who is not a Contributor learns nothing about whether their body was well formed.
 
@@ -141,7 +143,7 @@ When several apply, the first of these wins: `too-large`, `not-found`, `method-n
   "created_by": "<user id>", "created_at": "<RFC 3339 time>" }
 ```
 
-The creator is its first Contributor. Names are unique in the installation. `description` is null when none was given; `serving_version` is a number, or null before the first Version.
+The creator is its first Contributor. A `description` of `null` is the same as none. Names are unique in the installation. `description` is null when none was given; `serving_version` is a number, or null before the first Version.
 
 `GET /v1/applications/<name>` answers `200` with the same object. In this ticket every signed-in User may read it; who may see an Application is settled by the ticket on Contributors and sharing.
 
