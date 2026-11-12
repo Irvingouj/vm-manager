@@ -42,3 +42,11 @@ Upstream sent `console.log` and `console.info` to the host with the same level (
 | File | Change |
 |---|---|
 | `src/runtime/bindings/console.rs` | `console.log` passes level code 5, and the native side maps 5 to `LogLevel::Log`. The other methods are unchanged. |
+
+### Patch 4: a script that throws while loading reports its stack
+
+Upstream reported an error thrown by a script's top level as the error's text alone (`Error: message`), so a host could not say where the script failed.
+
+| File | Change |
+|---|---|
+| `src/execution_context.rs` (`evaluate_script`, both the source and the code-cache branch) | `TerminationReason::Exception` carries the error's stack (`TryCatch::stack_trace`) when it has one, and its text otherwise, as before. |

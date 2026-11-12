@@ -422,11 +422,21 @@ impl ExecutionContext {
                 match script_obj.run(&tc_scope) {
                     Some(_) => Ok(()),
                     None => {
-                        let msg = tc_scope
-                            .exception()
-                            .and_then(|e| e.to_string(&tc_scope))
+                        // Patched (vendor/VENDORED.md): the error's stack when
+                        // it has one, so the host can say where the script
+                        // failed while loading; its text otherwise.
+                        let stack = tc_scope
+                            .stack_trace()
+                            .and_then(|s| s.to_string(&tc_scope))
                             .map(|s| s.to_rust_string_lossy(&tc_scope))
-                            .unwrap_or_else(|| "Unknown runtime error".to_string());
+                            .filter(|s| !s.is_empty());
+                        let msg = stack.unwrap_or_else(|| {
+                            tc_scope
+                                .exception()
+                                .and_then(|e| e.to_string(&tc_scope))
+                                .map(|s| s.to_rust_string_lossy(&tc_scope))
+                                .unwrap_or_else(|| "Unknown runtime error".to_string())
+                        });
                         Err(TerminationReason::Exception(msg))
                     }
                 }
@@ -478,11 +488,21 @@ impl ExecutionContext {
                 match script_obj.run(&tc_scope) {
                     Some(_) => Ok(()),
                     None => {
-                        let msg = tc_scope
-                            .exception()
-                            .and_then(|e| e.to_string(&tc_scope))
+                        // Patched (vendor/VENDORED.md): the error's stack when
+                        // it has one, so the host can say where the script
+                        // failed while loading; its text otherwise.
+                        let stack = tc_scope
+                            .stack_trace()
+                            .and_then(|s| s.to_string(&tc_scope))
                             .map(|s| s.to_rust_string_lossy(&tc_scope))
-                            .unwrap_or_else(|| "Unknown runtime error".to_string());
+                            .filter(|s| !s.is_empty());
+                        let msg = stack.unwrap_or_else(|| {
+                            tc_scope
+                                .exception()
+                                .and_then(|e| e.to_string(&tc_scope))
+                                .map(|s| s.to_rust_string_lossy(&tc_scope))
+                                .unwrap_or_else(|| "Unknown runtime error".to_string())
+                        });
                         Err(TerminationReason::Exception(msg))
                     }
                 }
