@@ -97,3 +97,32 @@ fn the_shared_postgres_serves_the_platform_databases_of_this_test_binary() {
         "expected a Platform's Debug not to show the password"
     );
 }
+
+#[test]
+fn the_postgres_runs_the_version_asked_for() {
+    let shared = postgres::shared();
+    let sql = blackbox::sql::Sql::connect(&shared.url("postgres")).unwrap();
+    let number: u32 = sql
+        .value("show server_version_num")
+        .and_then(|v| v.parse().ok())
+        .expect("expected a numeric server_version_num");
+    let binaries = shared.binaries();
+    eprintln!(
+        "the shared Postgres is {} (server_version_num {number}) from {:?} at {}: initdb {:?}, start {:?}",
+        sql.value("show server_version").unwrap_or_default(),
+        binaries.origin,
+        binaries.bin.display(),
+        shared.initdb_took,
+        shared.start_took,
+    );
+    if binaries.origin == Origin::Variable {
+        eprintln!("VM_TEST_PG_BIN chose the binaries: their version is the caller's choice");
+        return;
+    }
+    assert_eq!(
+        number / 10_000,
+        postgres::wanted_major(),
+        "expected the Postgres major version VM_TEST_PG_VERSION asks for (or {} when unset)",
+        postgres::DEFAULT_MAJOR
+    );
+}

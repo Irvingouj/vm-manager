@@ -2,10 +2,14 @@
 //! Postgres"), and the platform databases the programs under test get on it.
 //!
 //! The binaries come from the directory `VM_TEST_PG_BIN` names, else from a
-//! Postgres 18 found on the machine, else from zonky's prebuilt binaries on
+//! Postgres found on the machine, else from zonky's prebuilt binaries on
 //! Maven Central, downloaded once to a per-user cache and checked against
-//! the SHA-256 published beside them (`docs/research/local-postgres-without-docker.md`).
-//! No Docker, no administrator rights.
+//! the SHA-256 pinned here and published beside them
+//! (`docs/research/local-postgres-without-docker.md`). No Docker, no
+//! administrator rights. `VM_TEST_PG_VERSION` (16, 17 or 18; default 18)
+//! chooses the version: a Postgres on the machine is used only if it is
+//! exactly that version (at least 18 when the variable is unset), and the
+//! download is of that version.
 //!
 //! [`PrivatePostgres::start`] runs `initdb` into a fresh directory under the
 //! system temp directory and starts `postgres` on a free 127.0.0.1 port, with
@@ -36,41 +40,144 @@ use sha2::{Digest, Sha256};
 
 use crate::program::run_to_exit;
 
-/// The Postgres major version the harness wants: a Postgres found on the
-/// machine is used only if it is at least this.
-pub const MAJOR: u32 = 18;
+/// The Postgres major version the harness runs when `VM_TEST_PG_VERSION`
+/// does not say.
+pub const DEFAULT_MAJOR: u32 = 18;
 
-/// The version of zonky's build that is downloaded.
-const ZONKY_VERSION: &str = "18.6.0";
+/// The major versions `VM_TEST_PG_VERSION` may choose.
+pub const MAJORS: [u32; 3] = [16, 17, 18];
 
-/// Per platform: Rust's `(OS, ARCH)`, zonky's name for it, and the SHA-256
-/// of its archive as published on Maven Central (`<jar>.sha256`) when this
-/// was written. Pinned, so that an archive that changes under the same
-/// version is refused rather than run.
-const ARCHIVES: &[(&str, &str, &str, &str)] = &[
+/// The Postgres major version the harness wants: `VM_TEST_PG_VERSION` (16,
+/// 17 or 18), else [`DEFAULT_MAJOR`]. Any other value fails the test that
+/// asks, saying what is allowed.
+pub fn wanted_major() -> u32 {
+    match chosen_major() {
+        Ok(Some(major)) => major,
+        Ok(None) => DEFAULT_MAJOR,
+        Err(problem) => panic!("{problem}"),
+    }
+}
+
+/// The version `VM_TEST_PG_VERSION` chooses, if it is set.
+fn chosen_major() -> Result<Option<u32>, String> {
+    let Some(value) = std::env::var_os("VM_TEST_PG_VERSION") else {
+        return Ok(None);
+    };
+    let text = value.to_string_lossy();
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(None);
+    }
+    text.parse::<u32>()
+        .ok()
+        .filter(|major| MAJORS.contains(major))
+        .map(Some)
+        .ok_or_else(|| {
+            format!("VM_TEST_PG_VERSION is {text:?}: it must be one of {MAJORS:?}, or unset for {DEFAULT_MAJOR}")
+        })
+}
+
+/// Per major version and platform: the major, the version of zonky's build
+/// that is downloaded, Rust's `(OS, ARCH)`, zonky's name for the platform,
+/// and the SHA-256 of its archive as published on Maven Central
+/// (`<jar>.sha256`) when this was written. Pinned, so that an archive that
+/// changes under the same version is refused rather than run.
+const ARCHIVES: &[(u32, &str, &str, &str, &str, &str)] = &[
     (
+        18,
+        "18.6.0",
         "linux",
         "x86_64",
         "linux-amd64",
         "008ee189eaa7ca2b58bd01dd950291e638b998392cf982297acd4779ec898ac1",
     ),
     (
+        18,
+        "18.6.0",
         "linux",
         "aarch64",
         "linux-arm64v8",
         "5f54e016723afa6213925a8acb939bac52944b1d348f65c7a20f0cd2928c31be",
     ),
     (
+        18,
+        "18.6.0",
         "macos",
         "x86_64",
         "darwin-amd64",
         "690941008aac9ee360820fde9bb7870a4f3dcac5e9e2f9e45e42333a436ad0f9",
     ),
     (
+        18,
+        "18.6.0",
         "macos",
         "aarch64",
         "darwin-arm64v8",
         "8f6ed6f38195b50a40712ada8b2a12060b6193c1a6977a6eb5cff053bb5a1b89",
+    ),
+    (
+        17,
+        "17.11.0",
+        "linux",
+        "x86_64",
+        "linux-amd64",
+        "0dd7b72b6f335b8ecfb355fa24c5781e8a93edd09880bb77eb52ebbf29b3e96d",
+    ),
+    (
+        17,
+        "17.11.0",
+        "linux",
+        "aarch64",
+        "linux-arm64v8",
+        "8b042e0ea418b1927d95399207950da0734d27fe01e29503ade3bdc464ad4c2b",
+    ),
+    (
+        17,
+        "17.11.0",
+        "macos",
+        "x86_64",
+        "darwin-amd64",
+        "d464ff178e9860ba204662ac23fa547504b7fd392392ff2fb92e3fd73b5bdb64",
+    ),
+    (
+        17,
+        "17.11.0",
+        "macos",
+        "aarch64",
+        "darwin-arm64v8",
+        "a1c2786acb0c398f9b2d76806fc52f5dc8b222cbc8e9383a9b9702084daaf3a5",
+    ),
+    (
+        16,
+        "16.15.0",
+        "linux",
+        "x86_64",
+        "linux-amd64",
+        "653abc065c682b85d3da50168fb95dc524bd85426cdec9ce3695a550ef431df2",
+    ),
+    (
+        16,
+        "16.15.0",
+        "linux",
+        "aarch64",
+        "linux-arm64v8",
+        "f846a9989d686b7977d6eca9bc9d8b2b69e3f70c7eb60e032197d9c574a6136c",
+    ),
+    (
+        16,
+        "16.15.0",
+        "macos",
+        "x86_64",
+        "darwin-amd64",
+        "1229188b99515d2160d5cb6222bc96d9c5f3a248268df3bc2dfe0047e6c233d8",
+    ),
+    (
+        16,
+        "16.15.0",
+        "macos",
+        "aarch64",
+        "darwin-arm64v8",
+        "65b953905f0a4d46030767a6b44a52360170d69a7985f1b02aa435f2f6256a83",
     ),
 ];
 
@@ -144,6 +251,7 @@ pub fn binaries() -> &'static Binaries {
 }
 
 fn find_binaries() -> Result<Binaries, String> {
+    let chosen = chosen_major()?;
     if let Some(dir) = std::env::var_os("VM_TEST_PG_BIN") {
         let bin = PathBuf::from(dir);
         return if has_all_three(&bin) {
@@ -158,22 +266,24 @@ fn find_binaries() -> Result<Binaries, String> {
             ))
         };
     }
-    if let Some(bin) = on_the_machine() {
+    if let Some(bin) = on_the_machine(chosen) {
         return Ok(Binaries {
             bin,
             origin: Origin::OnTheMachine,
         });
     }
-    let bin = downloaded()?;
+    let bin = downloaded(chosen.unwrap_or(DEFAULT_MAJOR))?;
     Ok(Binaries {
         bin,
         origin: Origin::Cache,
     })
 }
 
-/// A directory on the machine with all three binaries, of a Postgres at
-/// least [`MAJOR`]: on `PATH`, or where packages and installers put them.
-fn on_the_machine() -> Option<PathBuf> {
+/// A directory on the machine with all three binaries: of exactly the
+/// version `VM_TEST_PG_VERSION` chose, or, when it is unset, of a Postgres
+/// at least [`DEFAULT_MAJOR`]. On `PATH`, or where packages and installers
+/// put them.
+fn on_the_machine(chosen: Option<u32>) -> Option<PathBuf> {
     let mut candidates: Vec<PathBuf> = std::env::var_os("PATH")
         .map(|path| std::env::split_paths(&path).collect())
         .unwrap_or_default();
@@ -193,7 +303,12 @@ fn on_the_machine() -> Option<PathBuf> {
     candidates
         .into_iter()
         .filter(|bin| has_all_three(bin))
-        .find(|bin| major_version(&bin.join(exe("postgres"))).is_some_and(|m| m >= MAJOR))
+        .find(|bin| {
+            major_version(&bin.join(exe("postgres"))).is_some_and(|m| match chosen {
+                Some(chosen) => m == chosen,
+                None => m >= DEFAULT_MAJOR,
+            })
+        })
 }
 
 /// The major version `postgres --version` reports ("postgres (PostgreSQL) 18.1").
@@ -224,22 +339,25 @@ pub fn cache_dir() -> Result<PathBuf, String> {
     Ok(base.join("vm-blackbox"))
 }
 
-/// zonky's binaries for this platform, downloaded and unpacked into the
-/// cache unless they are there already. Returns their `bin` directory.
-fn downloaded() -> Result<PathBuf, String> {
-    let (platform, sha256) = ARCHIVES
+/// zonky's binaries of this major version for this platform, downloaded
+/// and unpacked into the cache unless they are there already. Returns their
+/// `bin` directory.
+fn downloaded(major: u32) -> Result<PathBuf, String> {
+    let (zonky_version, platform, sha256) = ARCHIVES
         .iter()
-        .find(|(os, arch, _, _)| *os == std::env::consts::OS && *arch == std::env::consts::ARCH)
-        .map(|(_, _, platform, sha256)| (*platform, *sha256))
+        .find(|(m, _, os, arch, _, _)| {
+            *m == major && *os == std::env::consts::OS && *arch == std::env::consts::ARCH
+        })
+        .map(|(_, version, _, _, platform, sha256)| (*version, *platform, *sha256))
         .ok_or_else(|| {
             format!(
-                "no prebuilt Postgres is known for {} {}: install Postgres {MAJOR} or set VM_TEST_PG_BIN",
+                "no prebuilt Postgres {major} is known for {} {}: install Postgres {major} or set VM_TEST_PG_BIN",
                 std::env::consts::OS,
                 std::env::consts::ARCH
             )
         })?;
     let cache = cache_dir()?;
-    let home = cache.join(format!("postgres-{ZONKY_VERSION}-{platform}"));
+    let home = cache.join(format!("postgres-{zonky_version}-{platform}"));
     // The directory is only ever created by a rename of a complete unpack,
     // so if it is there, it is whole.
     if has_all_three(&home.join("bin")) {
@@ -249,12 +367,13 @@ fn downloaded() -> Result<PathBuf, String> {
         .map_err(|e| format!("cannot create the cache {}: {e}", cache.display()))?;
     let artifact = format!("embedded-postgres-binaries-{platform}");
     let url = format!(
-        "https://repo1.maven.org/maven2/io/zonky/test/postgres/{artifact}/{ZONKY_VERSION}/{artifact}-{ZONKY_VERSION}.jar"
+        "https://repo1.maven.org/maven2/io/zonky/test/postgres/{artifact}/{zonky_version}/{artifact}-{zonky_version}.jar"
     );
     eprintln!(
-        "blackbox: downloading Postgres {ZONKY_VERSION} once, from {url}, to {}",
+        "blackbox: downloading Postgres {zonky_version} once, from {url}, to {}",
         home.display()
     );
+    let began = Instant::now();
     let published = fetch(&format!("{url}.sha256"), 1024)?;
     let published = String::from_utf8_lossy(&published);
     let published = published.split_whitespace().next().unwrap_or_default();
@@ -264,6 +383,11 @@ fn downloaded() -> Result<PathBuf, String> {
         ));
     }
     let archive = fetch(&url, MAX_ARCHIVE_BYTES)?;
+    eprintln!(
+        "blackbox: downloaded {} bytes of Postgres {zonky_version} in {:?}",
+        archive.len(),
+        began.elapsed()
+    );
     let actual = hex(&Sha256::digest(&archive));
     if actual != sha256 {
         return Err(format!(
@@ -271,7 +395,7 @@ fn downloaded() -> Result<PathBuf, String> {
         ));
     }
     let unpacking = cache.join(format!(
-        ".postgres-{ZONKY_VERSION}-{platform}.unpacking-{}-{}",
+        ".postgres-{zonky_version}-{platform}.unpacking-{}-{}",
         std::process::id(),
         unique()
     ));
@@ -293,6 +417,10 @@ fn downloaded() -> Result<PathBuf, String> {
         drop(fs::remove_dir_all(&unpacking));
     }
     if has_all_three(&home.join("bin")) {
+        eprintln!(
+            "blackbox: Postgres {zonky_version} downloaded and unpacked in {:?}",
+            began.elapsed()
+        );
         Ok(home.join("bin"))
     } else {
         Err(format!(

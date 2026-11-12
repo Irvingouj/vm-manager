@@ -1,9 +1,14 @@
 //! What the tests of "A User's read of a shared database is authorized and
-//! logged" share: a program with a Platform administrators' Group, a shared
-//! database registered as a Resource, Grants, fixture Applications that
-//! declare it, and checks on what `query` answers and on Operation log
-//! entries (CONTRACT.md, "Resources and Grants", "Operations on a shared
-//! database", "The Operation log").
+//! logged" and "Write access, and the database role as the boundary" share:
+//! a program with a Platform administrators' Group, a shared database
+//! registered as a Resource (with or without a write login), Grants, fixture
+//! Applications that declare it, and checks on what `query` and `execute`
+//! answer and on Operation log entries (CONTRACT.md, "Resources and
+//! Grants", "Operations on a shared database", "The Operation log",
+//! "Writing to a shared database, and the role as the boundary").
+
+use std::sync::Barrier;
+use std::thread;
 
 use serde_json::{Value, json};
 
@@ -20,6 +25,9 @@ pub const RESOURCE: &str = "devops";
 
 /// The Group most tests grant `read`.
 pub const READERS: &str = "readers";
+
+/// The Group most write tests grant `write`.
+pub const WRITERS: &str = "writers";
 
 /// Whom to ask for access to the Resource: a `no-grant` refusal names it.
 pub const CONTACT: &str = "Dana Ops, #devops-access on chat";
@@ -40,6 +48,40 @@ pub fn resource_body(name: &str, database: &SharedDatabase, login: &Login) -> Va
         "contact": CONTACT,
         "connection": database.connection(login),
     })
+}
+
+/// The body that registers a Resource of this name over `database` with
+/// these `read` and `write` logins.
+pub fn resource_body_with_write(
+    name: &str,
+    database: &SharedDatabase,
+    read: &Login,
+    write: &Login,
+) -> Value {
+    let mut body = resource_body(name, database, read);
+    body["connection"] = database.connection_with_write(read, write);
+    body
+}
+
+/// One call for `fixtures/operations.js`: this operation with these
+/// arguments.
+pub fn op(operation: &str, arguments: &Value) -> Value {
+    json!({ "operation": operation, "arguments": arguments })
+}
+
+/// `{ resource, sql }`.
+pub fn sql_on(resource: &str, sql: &str) -> Value {
+    json!({ "resource": resource, "sql": sql })
+}
+
+/// A call of `execute` on [`RESOURCE`] with this statement.
+pub fn execute_sql(sql: &str) -> Value {
+    op("execute", &sql_on(RESOURCE, sql))
+}
+
+/// A call of `query` on [`RESOURCE`] with this statement.
+pub fn query_sql(sql: &str) -> Value {
+    op("query", &sql_on(RESOURCE, sql))
 }
 
 /// A program started with the stand-in sign-in and [`ADMINISTRATORS`] as
@@ -79,6 +121,82 @@ impl Scenario {
         scenario.grant(RESOURCE, READERS, "read");
         scenario.install("board", "query.js", &[(RESOURCE, "read")]);
         scenario
+    }
+
+    /// The setting of the write tests: [`RESOURCE`] registered with the
+    /// read and the write login, [`READERS`] granted `read` and [`WRITERS`]
+    /// granted `write` on it, the Application `board`
+    /// (`fixtures/operations.js`) declaring it at `write`, and `viewer`
+    /// (the same fixture) declaring it at `read`.
+    pub fn writable() -> Self {
+        let scenario = Self::start();
+        scenario.register_writable(RESOURCE);
+        scenario.grant(RESOURCE, READERS, "read");
+        scenario.grant(RESOURCE, WRITERS, "write");
+        scenario.install("board", "operations.js", &[(RESOURCE, "write")]);
+        scenario.install("viewer", "operations.js", &[(RESOURCE, "read")]);
+        scenario
+    }
+
+    /// Registers `name` over the shared database with its read and write
+    /// logins, failing the test unless it is `201`.
+    pub fn register_writable(&self, name: &str) -> Value {
+        self.register_body(
+            name,
+            &resource_body_with_write(name, &self.db, &self.db.reader, &self.db.writer),
+        )
+    }
+
+    /// Registers this body, failing the test unless it is `201`.
+    pub fn register_body(&self, name: &str, body: &Value) -> Value {
+        let answer = self.admin().create_resource(body);
+        if answer.status != 201 {
+            self.vm.fail(&format!(
+                "expected `201` registering the Resource {name:?} as a Platform administrator, got\n{}",
+                answer.describe()
+            ));
+        }
+        answer.json()
+    }
+
+    /// One `execute` with these arguments through `fixtures/operations.js`;
+    /// returns the request's answer and what the host answered.
+    pub fn execute(&self, user: &User, application: &str, args: &Value) -> (Response, Value) {
+        self.one(user, application, &op("execute", args))
+    }
+
+    /// One call through `fixtures/operations.js` (see [`op`]); returns the
+    /// request's answer and what the host answered.
+    pub fn one(&self, user: &User, application: &str, call: &Value) -> (Response, Value) {
+        let (response, answers) = self.run(user, application, &json!({ "calls": [call] }));
+        let answer = answers.into_iter().next().unwrap_or(Value::Null);
+        (response, answer)
+    }
+
+    /// Requests sent at once from as many threads, each `(user,
+    /// application, body)` as for [`Scenario::run`]; returns each one's
+    /// answer and the answers of its calls, in the order given.
+    pub fn at_once(&self, requests: &[(User, &str, Value)]) -> Vec<(Response, Vec<Value>)> {
+        let start = Barrier::new(requests.len());
+        thread::scope(|scope| {
+            let handles: Vec<_> = requests
+                .iter()
+                .map(|(user, application, body)| {
+                    let start = &start;
+                    scope.spawn(move || {
+                        start.wait();
+                        self.run(user, application, body)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| {
+                    h.join()
+                        .unwrap_or_else(|_| panic!("a request thread failed"))
+                })
+                .collect()
+        })
     }
 
     /// The platform's API as the Platform administrator.
@@ -321,6 +439,58 @@ pub fn assert_limit(answer: &Value, limit: &str, context: &str) {
     );
 }
 
+/// Fails unless `answer` is `{ ok: { columns, rows, row_count,
+/// rows_affected } }` with these columns, rows and rows affected,
+/// `row_count` being the number of rows.
+pub fn assert_executed(
+    answer: &Value,
+    columns: &[&str],
+    rows: &Value,
+    rows_affected: u64,
+    context: &str,
+) {
+    assert!(
+        answer["ok"].is_object(),
+        "{context}: expected the statement to run and answer {{ ok: {{ columns, rows, row_count, rows_affected }} }}, got {answer}"
+    );
+    assert_rows(answer, columns, rows, context);
+    assert_eq!(
+        answer["ok"]["rows_affected"].as_u64(),
+        Some(rows_affected),
+        "{context}: expected rows_affected {rows_affected}, got {answer}"
+    );
+}
+
+/// Fails unless `answer` is `{ error: { kind: <kind>, ... } }`.
+pub fn assert_error_kind(answer: &Value, kind: &str, context: &str) {
+    assert_eq!(
+        answer["error"]["kind"].as_str(),
+        Some(kind),
+        "{context}: expected {{ error: {{ kind: {kind:?} }} }}, got {answer}"
+    );
+    assert!(
+        answer.get("ok").is_none() && answer.get("refused").is_none(),
+        "{context}: expected only an error, got {answer}"
+    );
+}
+
+/// Fails unless `answer` is the statement check's refusal, `{ error: {
+/// kind: "statement", reason, message } }`, with this reason.
+pub fn assert_statement_refused(answer: &Value, reason: &str, context: &str) {
+    assert_error_kind(answer, "statement", context);
+    assert_eq!(
+        answer["error"]["reason"].as_str(),
+        Some(reason),
+        "{context}: expected the statement check to refuse with reason {reason:?}, got {answer}"
+    );
+    assert!(
+        answer["error"]["message"]
+            .as_str()
+            .is_some_and(|m| !m.trim().is_empty()),
+        "{context}: expected a message saying what the check refused, got {answer}"
+    );
+}
+
 /// Fails unless `answer` is `{ error: { kind: "malformed", message } }`.
 pub fn assert_malformed(answer: &Value, context: &str) {
     assert_eq!(
@@ -345,6 +515,8 @@ pub struct Expected<'a> {
     pub application: &'a str,
     pub version: u64,
     pub resource: &'a str,
+    /// `query` or `execute`.
+    pub operation: &'a str,
     pub statement: Option<&'a str>,
     pub outcome: &'a str,
     pub reason: Option<&'a str>,
@@ -366,6 +538,7 @@ impl<'a> Expected<'a> {
             application,
             version: 1,
             resource: RESOURCE,
+            operation: "query",
             statement: None,
             outcome: "allowed",
             reason: None,
@@ -382,6 +555,31 @@ impl<'a> Expected<'a> {
             reason: Some(reason),
             ran: Some(false),
             ..Self::allowed(request, user, application)
+        }
+    }
+
+    /// An allowed `execute` of `user` in `application` (Version 1) on
+    /// [`RESOURCE`], which ran and affected `rows` rows.
+    pub fn executed(request: &'a str, user: &'a str, application: &'a str, rows: u64) -> Self {
+        Self {
+            operation: "execute",
+            rows: Some(rows),
+            ..Self::allowed(request, user, application)
+        }
+    }
+
+    /// An operation the statement check refused: `failed`, error
+    /// `statement`, never sent.
+    pub fn check_refused(
+        request: &'a str,
+        user: &'a str,
+        application: &'a str,
+        operation: &'a str,
+    ) -> Self {
+        Self {
+            operation,
+            ran: Some(false),
+            ..Self::failed(request, user, application, "statement")
         }
     }
 
@@ -428,8 +626,8 @@ pub fn assert_entry(entry: &Value, want: &Expected<'_>, context: &str) {
     if entry["resource"].as_str() != Some(want.resource) {
         fail("expected `resource` to name the Resource asked for");
     }
-    if entry["operation"].as_str() != Some("query") {
-        fail("expected `operation` \"query\"");
+    if entry["operation"].as_str() != Some(want.operation) {
+        fail(&format!("expected `operation` {:?}", want.operation));
     }
     match want.statement {
         Some(statement) if entry["statement"].as_str() != Some(statement) => {
