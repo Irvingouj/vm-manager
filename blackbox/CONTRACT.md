@@ -18,10 +18,11 @@ The harness runs a private Postgres of its own, never through the program under 
 
 ```
 VM_DATABASE_URL=postgres://<role>:<password>@<host>:<port>/<platform database> \
-vm serve --domain <domain> --listen <ip:port> [--stand-in-sign-in]
+vm serve --domain <domain> --listen <ip:port> [--stand-in-sign-in] [--administrators-group <group>]
 ```
 
 - `--domain` is the installation's domain. `--listen 127.0.0.1:0` picks a free port.
+- `--administrators-group` names the Group whose members are Platform administrators. Without it nobody is one.
 - `VM_DATABASE_URL`, in the environment and never on the command line, names the platform database and a role that may create databases and roles. See "The platform database".
 - A start-up that cannot work exits non-zero, within 15 seconds, with a message on standard error naming the problem: no `VM_DATABASE_URL`, one that cannot be parsed, a Postgres that cannot be reached or refuses the role, a platform database written by a newer program. The message never shows the password.
 - (Ticket: Walking skeleton named fixture Applications with `--application <name>=<path>`. That option is gone: Applications enter through the platform's API.)
@@ -91,6 +92,7 @@ The SDK wraps this later; Application authors never write it by hand. Fixture Ap
 
 - `env.VM.invoke(operation, args)` returns a Promise of either `{ ok: <value> }` or `{ refused: { refusal: { reason: <string>, ... }, fix: <string> } }`. It does not reject for a refusal.
 - The host decides who is asking from the request in flight, read on entry. Nothing the Application passes, sets or overwrites changes that.
+- An operation may also fail without being refused: `{ error: { kind: <string>, ... } }`. See "Operations on a shared database".
 - Operation `whoami` (no arguments) answers `{ ok: { user: { id, groups }, application: <name>, version: <number>, request: <request id> } }`.
 - Called with no request in flight (at the top level while loading, or from a timer or a kept reference after the request ended): refused with reason `no-request`. Code left running after its request may also simply never run; what must not happen is a call that is allowed.
 - An operation the host does not know: refused with reason `unknown-operation`.
@@ -98,7 +100,7 @@ The SDK wraps this later; Application authors never write it by hand. Fixture Ap
 
 ### Refusal reasons
 
-Kebab-case strings, the same everywhere a refusal is reported (to Application code, in the log, later in the Operation log and in the tool's output). Known so far: `no-request`, `unknown-operation`. Reserved for the tickets that introduce them, as tried with Coding agents in `docs/research/agent-facing-discovery.md`: `not-declared`, `declared-lower`, `no-grant`, `not-registered`, `not-own-database`.
+Kebab-case strings, the same everywhere a refusal is reported (to Application code, in the log, later in the Operation log and in the tool's output). Known so far: `no-request`, `unknown-operation`, `not-declared`, `not-registered`, `declared-lower`, `no-grant`, `log-unavailable`. Reserved for the ticket that introduces it: `not-own-database`.
 
 ## The platform database (ticket: Applications and their Versions live in the platform database)
 
@@ -122,6 +124,7 @@ An answer that is not a success is:
 | 400 | An Application name that is not a lower-case DNS label of 1 to 63 characters (letters, digits and hyphens; it may start with a digit; not starting or ending with a hyphen), or that starts with `xn--` | `invalid-name` |
 | 400 | An Application name that is exactly one of the platform's own (`apis` or `my-api` are fine) | `reserved-name` |
 | 403 | The User is not a Contributor of the Application | `not-a-contributor` |
+| 403 | The request is for Platform administrators and the User is not one | `not-an-administrator` |
 | 404 | No such Application, Version or path | `not-found` |
 | 405 | A path the API has, with a method it does not have there | `method-not-allowed` |
 | 409 | The Application's name is taken | `name-taken` |
@@ -129,7 +132,7 @@ An answer that is not a success is:
 | 408 | The body did not arrive in time | `timed-out` |
 | 503 | The platform database cannot be reached or did not answer in time | `unavailable` |
 
-When several apply, the first of these wins: `too-large`, `not-found`, `method-not-allowed`, `not-a-contributor`, `malformed`, then the rest. So someone who is not a Contributor learns nothing about whether their body was well formed.
+When several apply, the first of these wins: `too-large`, `not-an-administrator`, `not-found`, `method-not-allowed`, `not-a-contributor`, `malformed`, then the rest. `not-an-administrator` comes before `not-found` so that someone who is not a Platform administrator learns nothing from an administrators' path. So someone who is not a Contributor learns nothing about whether their body was well formed.
 
 - A body with a missing or wrongly typed field, a key given twice, or JSON that does not parse is `malformed`. Fields the request does not have (also ones the platform sets, like `created_by` or `number`) are ignored.
 
@@ -169,3 +172,124 @@ All three fields are required. `declared_access.resources` may be an empty objec
 - `GET /v1/applications/<name>/versions` answers `{ "versions": [ ... ] }`, oldest first.
 - Once the `201` has been received, every new request to the Application is served by the new Version. Requests already in flight finish on the Version they started on.
 - A bundle that fails when it runs is still a Version; its requests get the fixed `500`.
+
+## Resources and Grants (ticket: A User's read of a shared database is authorized and logged)
+
+On the platform's API. Writing is for Platform administrators only; everyone else gets `403 not-an-administrator`.
+
+`POST /v1/resources`, by a Platform administrator:
+
+```json
+{ "name": "devops", "kind": "postgres", "description": "...", "owner": "...", "contact": "whom to ask for access",
+  "connection": { "host": "...", "port": 5432, "database": "...",
+                  "read": { "role": "...", "password": "..." } } }
+```
+
+- A Resource's name is 1 to 63 characters: lower-case letters, digits and underscores, starting with a letter. Otherwise `400 invalid-name`. A taken name is `409 name-taken`. `kind` is `postgres`.
+- `name`, `kind`, `description`, `owner`, `contact` and `connection` with its `read` login are required.
+- Answers `201` with `{ "name", "kind", "description", "owner", "contact", "created_by", "created_at" }`.
+- **No answer of the API, no log record and no error message ever holds a Resource's password**, and none holds its host, port, database or role either.
+- Registering does not connect to the database (the ticket on Resources in full adds that check).
+
+`GET /v1/resources/<name>` and `GET /v1/resources` (`{ "resources": [ ... ] }`, by name): the same object, for every signed-in User. A Resource's existence, description and whom to ask are visible to all; nothing else is.
+
+`POST /v1/resources/<name>/grants`, by a Platform administrator, with `{ "group": "<Group>", "access": "structure" | "read" | "write" }`: sets that Group's Grant on the Resource, replacing the level if the Group already had one. Answers `200` with `{ "resource", "group", "access" }`. A Group is 1 to 256 bytes with no control characters, compared exactly.
+
+`GET /v1/resources/<name>/grants`, by a Platform administrator: `{ "grants": [ { "group", "access" } ] }`, by Group.
+
+A Grant holds in every Application: nothing is set up per Application.
+
+## Operations on a shared database (same ticket)
+
+Through the raw host interface:
+
+```js
+env.VM.invoke("query", { resource: "devops", sql: "select id, title from incidents where open = $1", params: [true] })
+```
+
+- `sql` is one statement. `params` is optional; each is `null`, a string, a number or a boolean, and is sent to Postgres as text for the server to interpret.
+- The operation needs Access level `read`. It runs in a read-only transaction as the Resource's read login, so a statement that writes fails in the database.
+- Answer when it ran: `{ ok: { columns: ["id", "title"], rows: [[1, "..."], ...], row_count: 2 } }`. A value is `null`, a boolean, a number (for `int2`, `int4`, `float4`, `float8`), parsed JSON (for `json`, `jsonb`), and otherwise the text Postgres prints for it (so `int8`, `numeric`, timestamps and `uuid` are strings). The SDK ticket may refine this.
+- Answer when Postgres refused or failed the statement: `{ error: { kind: "database", code: "<SQLSTATE>", message: "<Postgres's message>" } }`.
+- A result of more than 10,000 rows or 8 MiB, or a statement running longer than 10 seconds, is ended: `{ error: { kind: "limit", limit: "rows" | "bytes" | "time" } }`. (The ticket on limits makes these settable.)
+- Malformed arguments (no `resource`, no `sql`, a param that is an object): `{ error: { kind: "malformed", message } }`, and nothing reaches any database.
+
+### Who is allowed
+
+Decided by the host from the request in flight, the serving Version's Declared access, and the Grants of the User's Groups; never from anything the Application passes. Checked in this order, the first that applies refuses:
+
+| Reason | When | Also in `refusal` |
+|---|---|---|
+| `no-request` | No request in flight | |
+| `not-declared` | The Version does not declare a Resource of this name (whether or not one is registered) | `resource` |
+| `not-registered` | Declared, but no such Resource is registered | `resource` |
+| `declared-lower` | Declared at a level below what the operation needs | `resource`, `declared`, `needed` |
+| `no-grant` | No Group of the User holds a Grant at the level needed | `resource`, `user`, `needed`, `held` (the highest level the User's Groups hold, or null), `contact` |
+| `log-unavailable` | The Operation log entry could not be written | `resource` |
+
+- `fix` is a sentence a Coding agent can act on. For `no-grant` it names the Resource's contact.
+- A User holds the highest level any of their Groups is granted. `structure` < `read` < `write`.
+- A refused or malformed operation sends nothing to the shared database.
+
+## The Operation log (same ticket)
+
+- Every `query` operation, allowed or refused, has one entry, written to the platform database **before** the statement is sent to the shared database and completed when it ends. If the entry cannot be written the operation is refused with `log-unavailable` and the statement is not sent.
+- `GET /v1/operation-log`, by a Platform administrator: `{ "entries": [ ... ] }`, oldest first. `?limit=<n>` gives the newest `n` (1 to 1000, default 100), still oldest first.
+
+```json
+{ "id": 17, "time": "<RFC 3339>", "request": "<request id or null>", "user": "<user id or null>",
+  "application": "incident-board", "version": 2, "resource": "devops", "operation": "query",
+  "statement": "select id, title from incidents where open = $1",
+  "outcome": "allowed" | "refused" | "failed" | "unfinished",
+  "reason": "<refusal reason, when refused>", "error": "<SQLSTATE, or the limit, when failed>",
+  "rows": 2, "duration_ms": 3 }
+```
+
+- `statement` is the statement **without its values**: every constant written into the SQL text is replaced by a placeholder, and parameters are never recorded. A statement that cannot be parsed is recorded as `"<unparsed>"`. No field of any entry holds a value from a statement, a parameter, or a row.
+- `rows` and `duration_ms` are null unless the statement ran. `outcome` is `unfinished` while it runs, and stays so if the program died meanwhile.
+- A malformed operation has no entry. `whoami` is not an operation on a Resource and has none.
+- The program's own log still gets its `host-call` record for each call, as before.
+
+## Lower seam: the Authorization decision (same ticket)
+
+The one place tests go below the program's outside in this ticket (spec, Testing Decisions). A crate `authz` under `crates/`, depending on nothing, with exactly this interface; its tests live in `crates/authz/tests/` and are written by the test agent.
+
+```rust
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum AccessLevel { Structure, Read, Write }
+
+#[derive(Clone, Copy, Debug)]
+pub struct Grant<'a> { pub group: &'a str, pub level: AccessLevel }
+
+#[derive(Clone, Copy, Debug)]
+pub struct Question<'a> {
+    /// Is there a request in flight?
+    pub request_in_flight: bool,
+    /// The Groups of the User whose request it is.
+    pub groups: &'a [&'a str],
+    /// What the serving Version declares for the Resource asked for, if anything.
+    pub declared: Option<AccessLevel>,
+    /// Is a Resource of that name registered?
+    pub registered: bool,
+    /// The Grants on that Resource.
+    pub grants: &'a [Grant<'a>],
+    /// The level the operation needs.
+    pub needed: AccessLevel,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Decision { Allow, Refuse(Reason) }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reason {
+    NoRequest,
+    NotDeclared,
+    NotRegistered,
+    DeclaredLower { declared: AccessLevel, needed: AccessLevel },
+    NoGrant { held: Option<AccessLevel>, needed: AccessLevel },
+}
+
+pub fn decide(question: &Question<'_>) -> Decision;
+```
+
+The order of checks is the order of the table in "Who is allowed". It knows nothing of HTTP, Postgres or V8.
