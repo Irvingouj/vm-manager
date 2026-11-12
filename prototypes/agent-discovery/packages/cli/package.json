@@ -1,0 +1,20 @@
+{
+  "name": "@vm/cli",
+  "version": "0.4.1",
+  "description": "Command-line tool for building, running and deploying Applications on the platform.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "bin": { "vm": "bin/vm.mjs" },
+  "files": ["bin", "lib"],
+  "engines": { "node": ">=22" },
+  "dependencies": {
+    "@electric-sql/pglite": "0.5.16",
+    "acorn": "8.19.0",
+    "drizzle-kit": "0.31.11",
+    "esbuild": "0.28.2"
+  },
+  "peerDependencies": {
+    "drizzle-orm": ">=0.45.0 <1.0.0",
+    "typescript": ">=5.5"
+  }
+}

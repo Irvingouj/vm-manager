@@ -1,0 +1,7 @@
+{
+  "about": "Test Users, their Groups, and the Grants those Groups hold on the local stand-ins. Used only by `vm dev`, never by the deployed Application.",
+  "users": [
+    { "id": "builder", "displayName": "Test Builder", "email": "builder@example.com", "groups": [] }
+  ],
+  "grants": []
+}

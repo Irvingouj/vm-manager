@@ -1,0 +1,109 @@
+{
+  "installation": {
+    "url": "https://platform.example.com",
+    "appsDomain": "apps.example.com"
+  },
+  "signedIn": "dana",
+  "users": {
+    "dana": { "displayName": "Dana Whitfield", "email": "dana@example.com", "groups": ["facilities", "all-staff"] },
+    "ines": { "displayName": "Ines Moreau", "email": "ines@example.com", "groups": ["facilities", "all-staff"] },
+    "marco": { "displayName": "Marco Bianchi", "email": "marco@example.com", "groups": ["sre", "all-staff"] },
+    "li": { "displayName": "Li Wei", "email": "li@example.com", "groups": ["sre", "all-staff"] },
+    "noor": { "displayName": "Noor Haddad", "email": "noor@example.com", "groups": ["people-ops", "all-staff"] },
+    "olga": { "displayName": "Olga Petrova", "email": "olga@example.com", "groups": ["finance-systems", "all-staff"] }
+  },
+  "groups": {
+    "all-staff": "Every employee",
+    "facilities": "Facilities team",
+    "sre": "Site Reliability Engineering",
+    "it-support": "IT service desk",
+    "people-ops": "People Operations (HR)",
+    "finance": "Finance",
+    "finance-systems": "Finance systems team",
+    "platform-admins": "Platform administrators"
+  },
+  "resources": {
+    "facilities": {
+      "kind": "postgres",
+      "description": "Buildings, rooms, assets (equipment with an asset tag) and maintenance requests for every office.",
+      "owner": "Facilities team",
+      "ask": "Ines Moreau, Head of Facilities (ines@example.com)",
+      "structure": "catalog/facilities.structure.sql",
+      "sample": "catalog/facilities.sample.sql"
+    },
+    "devops": {
+      "kind": "postgres",
+      "description": "Engineering services, the teams that run them, and incidents with their updates. Kept up to date by the on-call tooling.",
+      "owner": "Site Reliability Engineering",
+      "ask": "SRE team, #sre-help on chat or sre@example.com",
+      "structure": "catalog/devops.structure.sql",
+      "sample": "catalog/devops.sample.sql"
+    },
+    "hr_directory": {
+      "kind": "postgres",
+      "description": "The employee directory: employees, their job titles, managers, offices and teams. Synchronised nightly from the HR system.",
+      "owner": "People Operations",
+      "ask": "Noor Haddad, People Operations (people-systems@example.com)",
+      "structure": "catalog/hr_directory.structure.sql",
+      "sample": "catalog/hr_directory.sample.sql"
+    },
+    "payroll": {
+      "kind": "postgres",
+      "description": "Pay runs and payslips. Restricted.",
+      "owner": "Finance",
+      "ask": "Finance systems team, Olga Petrova (finance-systems@example.com)",
+      "structure": "catalog/payroll.structure.sql",
+      "sample": null
+    }
+  },
+  "grants": [
+    { "group": "facilities", "resource": "facilities", "access": "write" },
+    { "group": "it-support", "resource": "facilities", "access": "read" },
+    { "group": "facilities", "resource": "devops", "access": "read" },
+    { "group": "it-support", "resource": "devops", "access": "read" },
+    { "group": "sre", "resource": "devops", "access": "write" },
+    { "group": "facilities", "resource": "hr_directory", "access": "structure" },
+    { "group": "people-ops", "resource": "hr_directory", "access": "write" },
+    { "group": "it-support", "resource": "hr_directory", "access": "read" },
+    { "group": "finance", "resource": "payroll", "access": "read" },
+    { "group": "finance-systems", "resource": "payroll", "access": "write" }
+  ],
+  "applications": [
+    {
+      "name": "room-issues",
+      "description": "Report a problem with a meeting room or its equipment, and follow it until it is fixed.",
+      "contributors": ["dana", "group:facilities"],
+      "sharedWith": ["everyone"],
+      "resources": { "facilities": "write" },
+      "version": 7,
+      "updated": "2026-10-28"
+    },
+    {
+      "name": "incident-board",
+      "description": "See and acknowledge open devops incidents.",
+      "contributors": ["marco", "group:sre"],
+      "sharedWith": ["group:sre", "group:it-support", "group:facilities"],
+      "resources": { "devops": "write" },
+      "version": 12,
+      "updated": "2026-11-03"
+    },
+    {
+      "name": "new-starter-checklist",
+      "description": "Checklist for a new employee's first week: desk, laptop, badge and introductions.",
+      "contributors": ["noor", "group:people-ops"],
+      "sharedWith": ["group:people-ops", "group:facilities", "group:it-support"],
+      "resources": { "hr_directory": "read", "facilities": "write" },
+      "version": 3,
+      "updated": "2026-09-30"
+    },
+    {
+      "name": "payslip-viewer",
+      "description": "Employees see their own payslips.",
+      "contributors": ["olga", "group:finance-systems"],
+      "sharedWith": ["group:finance"],
+      "resources": { "payroll": "read" },
+      "version": 5,
+      "updated": "2026-08-14"
+    }
+  ]
+}
