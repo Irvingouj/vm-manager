@@ -48,6 +48,16 @@ _Avoid_: Binding, scope, app permission
 A Grant that lets code reach a Resource as itself, whatever the User it is serving may access. Only an Integration can hold one on a shared Resource; an Application acts as itself only in its own database.
 _Avoid_: Service account, elevated access, bypass
 
+### Audit
+
+**Operation log**:
+The platform's record of every operation on a Resource: who, through which Application, what statement, how many rows, and whether it succeeded. It contains none of the Resource's data.
+_Avoid_: Audit trail (ambiguous between the two layers), access log
+
+**Change history**:
+The record, kept beside the data, of each row that was changed: old value, new value, who and through which Application. Readable by whoever may read the data.
+_Avoid_: Audit log, versioning, revision table
+
 ### People
 
 **Builder**:
