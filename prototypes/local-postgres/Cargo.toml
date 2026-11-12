@@ -1,0 +1,19 @@
+[package]
+name = "local-postgres-spike"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "lp"
+path = "src/main.rs"
+
+[dependencies]
+postgresql_embedded = { version = "0.22", default-features = false, features = ["theseus", "tls-rustls-ring", "tokio"] }
+postgresql_archive = { version = "0.22", default-features = false, features = ["theseus", "tls-rustls-ring"] }
+tokio = { version = "1", features = ["full"] }
+tokio-postgres = "0.7"
+anyhow = "1"
+rand = "0.9"
+hex = "0.4"
+sysinfo = "0.37"

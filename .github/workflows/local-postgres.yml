@@ -1,0 +1,99 @@
+name: local-postgres spike
+
+on:
+  push:
+    branches: [spike/local-postgres]
+    paths:
+      - "prototypes/local-postgres/**"
+      - ".github/workflows/local-postgres.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pg:
+    name: ${{ matrix.os }} pg ${{ matrix.pg }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        pg: ["18.6.0", "18.6.1"]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: prototypes/local-postgres
+    env:
+      CARGO_TERM_COLOR: never
+      RUST_TOOLCHAIN: "1.99.1"
+      LP_PG_VERSION: ${{ matrix.pg }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+          rustc -vV
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: prototypes/local-postgres -> target
+          cache-on-failure: true
+
+      - name: Build (release)
+        run: |
+          cargo build --release --locked
+          ls -l target/release/ | grep -E ' lp(\.exe)?$'
+
+      - name: Machine facts
+        run: |
+          uname -a; whoami
+          case "$RUNNER_OS" in
+            Linux) cat /etc/os-release | head -2; ldd --version | head -1
+                   grep '^hosts' /etc/nsswitch.conf; getent hosts app.localhost || echo "getent: app.localhost not resolved";;
+            macOS) sw_vers; id; dscacheutil -q host -a name app.localhost || true;;
+            Windows) powershell -NoProfile -Command "[Environment]::OSVersion.VersionString; ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator); Get-MpComputerStatus | Select-Object AMServiceEnabled,AntivirusEnabled,RealTimeProtectionEnabled,BehaviorMonitorEnabled | Format-List";;
+          esac
+
+      - name: Run (two sessions, data path with space and non-ASCII, *.localhost)
+        env:
+          LP_KEEP: "1"
+          LP_ROOT: ${{ runner.temp }}/lp spike Zoë 数据
+        run: |
+          bin=target/release/lp; [ -f "$bin.exe" ] && bin="$bin.exe"
+          ./run.sh "$bin" 2>&1 | tee run.log
+          exit ${PIPESTATUS[0]}
+
+      - name: Downloaded binaries (signature, quarantine / Mark of the Web)
+        if: always()
+        env:
+          LP_ROOT: ${{ runner.temp }}/lp spike Zoë 数据
+        run: |
+          d="$LP_ROOT/pg/$LP_PG_VERSION/bin"
+          ls "$d" | head -40 | tr '\n' ' '; echo
+          case "$RUNNER_OS" in
+            Linux) file "$d/postgres";;
+            macOS) file "$d/postgres"; echo "xattrs:"; xattr -l "$d/postgres"; codesign -dv "$d/postgres" 2>&1 | head -5; spctl -a -vv -t exec "$d/postgres" 2>&1 | head -3 || true;;
+            Windows) w=$(cygpath -w "$d/postgres.exe")
+                     powershell -NoProfile -Command "\$s=Get-AuthenticodeSignature -LiteralPath '$w'; 'signature: ' + \$s.Status + ' ' + \$s.SignerCertificate.Subject; 'streams: ' + ((Get-Item -LiteralPath '$w' -Stream *).Stream -join ','); 'Defender detections: ' + ((Get-MpThreatDetection | Measure-Object).Count)";;
+          esac
+          rm -rf "$LP_ROOT"
+
+      - name: Headless browser on *.localhost
+        if: always()
+        run: |
+          bin=target/release/lp; [ -f "$bin.exe" ] && bin="$bin.exe"
+          ./ci/browser.sh "$bin"
+
+      - name: Non-admin user (Linux, macOS)
+        if: always() && runner.os != 'Windows'
+        run: |
+          ./ci/nonadmin-unix.sh "$(pwd)/target/release/lp" "$LP_PG_VERSION"
+
+      - name: Non-admin user (Windows)
+        if: always() && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          ./ci/nonadmin-windows.ps1 -Bin "$PWD\target\release\lp.exe" -Ver $env:LP_PG_VERSION
