@@ -36,7 +36,8 @@ use crate::registry::{
     VersionRecord, check_name,
 };
 use crate::resources::{
-    self, Connection, GrantWritten, NewResource, Registered, Resources, is_resource_name, level_of,
+    self, Connection, GrantWritten, Login, NewResource, Registered, Resources, is_resource_name,
+    level_of,
 };
 use crate::user::User;
 
@@ -220,7 +221,7 @@ fn read_version(body: &[u8]) -> Result<NewVersion, String> {
 }
 
 /// `POST /v1/resources`
-const RESOURCE_FORM: &str = r#"{ "name": "<name>", "kind": "postgres", "description": "<text>", "owner": "<text>", "contact": "<whom to ask for access>", "connection": { "host": "<host>", "port": <1 to 65535>, "database": "<database>", "read": { "role": "<role>", "password": "<password>" } } }"#;
+const RESOURCE_FORM: &str = r#"{ "name": "<name>", "kind": "postgres", "description": "<text>", "owner": "<text>", "contact": "<whom to ask for access>", "connection": { "host": "<host>", "port": <1 to 65535>, "database": "<database>", "read": { "role": "<role>", "password": "<password>" }, "write": { "role": "<role>", "password": "<password>" } (optional) } }"#;
 
 /// Reads a Resource to register. Its problems are told in fixed words that
 /// name a field, never anything the body holds.
@@ -248,6 +249,19 @@ fn read_resource(body: &[u8]) -> Result<NewResource, &'static str> {
         "password",
         "connection.read.password is missing or not a string",
     )?;
+    // Optional; `null` is the same as none.
+    let write = match connection.0.get("write") {
+        None => None,
+        Some(value) if value.get() == "null" => None,
+        Some(value) => {
+            const WRITE: &str = "connection.write is not an object with each key once, holding role and password as strings";
+            let write = Object::read_value(value).map_err(|_| WRITE)?;
+            Some(Login::new(
+                write.fixed("role", WRITE)?,
+                write.fixed("password", WRITE)?,
+            ))
+        }
+    };
     if port == 0 {
         return Err(PORT);
     }
@@ -259,7 +273,7 @@ fn read_resource(body: &[u8]) -> Result<NewResource, &'static str> {
         description,
         owner,
         contact,
-        connection: Connection::new(host, port, database, role, password),
+        connection: Connection::new(host, port, database, Login::new(role, password), write),
     })
 }
 
@@ -919,6 +933,15 @@ mod tests {
             .err()
             .unwrap_or_default();
         assert!(!problem.contains("secret"), "{problem}");
+        let body =
+            br#"{"name":"devops","kind":"postgres","description":"d","owner":"o","contact":"c",
+            "connection":{"host":"h","port":5432,"database":"d",
+            "read":{"role":"r","password":"p"},"write":{"role":"secret-role","password":7}}}"#;
+        let problem = read_resource(body).err().unwrap_or_default();
+        assert!(
+            problem.contains("connection.write") && !problem.contains("secret"),
+            "{problem}"
+        );
     }
 
     #[test]

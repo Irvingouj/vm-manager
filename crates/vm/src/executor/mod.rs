@@ -3,17 +3,27 @@
 //! one transaction on a connection logged in directly as the Access level's
 //! login, never switching role.
 //!
-//! Interface: a [`Pool`] per Resource and Access level, made from a
-//! [`Target`] (where the database is and the login, which never prints) and
-//! [`Limits`]; [`Pool::read`] runs one statement with its [`Param`]s in a
-//! read-only transaction and answers an [`Outcome`]: the rows, or a
-//! [`Failure`] (Postgres refused it, a [`Limit`] ended it, or the database
-//! could not be reached), with when the statement was sent and ended.
+//! Interface: a [`Pool`] per Resource and [`Level`], made from a [`Target`]
+//! (where the database is and that level's login, which never prints) and
+//! [`Limits`]; [`Pool::run`] runs one statement with its [`Param`]s and the
+//! identity [`Label`] in one transaction, read-only at [`Level::Read`] and
+//! read-write at [`Level::Write`], and answers an [`Outcome`]: the rows, or
+//! a [`Failure`] (Postgres refused it, a [`Limit`] ended it, or the
+//! database could not be reached), with when the statement was sent and
+//! ended. A write is committed only when its statement succeeded; otherwise
+//! it is rolled back.
+//!
+//! A connection serves one pool all its life, so it is never shared
+//! between levels or Resources, and it goes back to its pool only shown
+//! clean: its transaction ended and its session state discarded (`DISCARD
+//! ALL`), both answered without error and the connection idle. Otherwise it
+//! is closed. The program never sends `SET ROLE` or `SET SESSION
+//! AUTHORIZATION`.
 //!
 //! A pool opens no connection until it is used (registering a Resource
-//! does not connect). Only `read` exists in this ticket; the ticket "Write
-//! access, and the database role as the boundary" adds the write pool and
-//! the statement check.
+//! does not connect). The statement check (crate::check) is not here: it
+//! is hygiene, decided before an operation reaches the executor, and
+//! nothing here relies on it.
 
 mod wire;
 
@@ -119,6 +129,28 @@ impl Default for Limits {
     }
 }
 
+/// Which login a pool logs in as, and the transaction its operations run
+/// in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Level {
+    /// The read login, in a read-only transaction.
+    Read,
+    /// The write login, in a read-write transaction.
+    Write,
+}
+
+/// The identity label (blackbox/CONTRACT.md, "The identity label"): set by
+/// the host's first statement in each transaction as the transaction-local
+/// settings `vm.user`, `vm.application` and `vm.request`, sent as
+/// parameters. A label only: Application SQL can overwrite it in its own
+/// transaction, and nothing on the platform relies on it.
+#[derive(Clone, Copy, Debug)]
+pub struct Label<'a> {
+    pub user: &'a str,
+    pub application: &'a str,
+    pub request: &'a str,
+}
+
 /// A parameter, sent as text for the server to interpret.
 #[derive(Debug)]
 pub enum Param {
@@ -131,13 +163,23 @@ pub enum Param {
 pub struct Rows {
     pub columns: Vec<String>,
     pub rows: Vec<Value>,
+    /// The count in Postgres's command tag (`INSERT 0 3`, `UPDATE 2`,
+    /// `SELECT 5`), if it gave one.
+    pub affected: Option<u64>,
 }
 
 impl Rows {
-    /// `{ columns, rows, row_count }`, as Application code receives it.
-    pub fn into_wire(self) -> Value {
-        let mut wire = Map::with_capacity(3);
+    /// `{ columns, rows, row_count }`, and `rows_affected` when `affected`
+    /// is asked for, as Application code receives it.
+    pub fn into_wire(self, affected: bool) -> Value {
+        let mut wire = Map::with_capacity(4);
         wire.insert("row_count".into(), self.rows.len().into());
+        if affected {
+            let count = self
+                .affected
+                .unwrap_or_else(|| u64::try_from(self.rows.len()).unwrap_or(u64::MAX));
+            wire.insert("rows_affected".into(), count.into());
+        }
         wire.insert("columns".into(), self.columns.into());
         wire.insert("rows".into(), Value::Array(self.rows));
         Value::Object(wire)
@@ -187,6 +229,7 @@ pub struct Outcome {
 pub struct Pool {
     /// Which Resource, for the program's log. Not a credential.
     resource: String,
+    level: Level,
     target: Target,
     limits: Limits,
     /// Bound: `limits.size` permits, one per connection open or being
@@ -202,16 +245,19 @@ impl fmt::Debug for Pool {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Pool")
             .field("resource", &self.resource)
+            .field("level", &self.level)
             .finish_non_exhaustive()
     }
 }
 
 impl Pool {
-    /// A pool for `resource`'s database; it connects on first use.
-    pub fn new(resource: &str, target: Target, limits: Limits) -> Self {
+    /// A pool for `resource`'s database at `level`, whose login `target`
+    /// is; it connects on first use.
+    pub fn new(resource: &str, level: Level, target: Target, limits: Limits) -> Self {
         let size = limits.size.max(1);
         Self {
             resource: resource.to_owned(),
+            level,
             target,
             limits,
             permits: Semaphore::new(size),
@@ -219,8 +265,8 @@ impl Pool {
         }
     }
 
-    /// Runs `sql` in a read-only transaction.
-    pub async fn read(&self, sql: &str, params: &[Param]) -> Outcome {
+    /// Runs `sql` in a transaction of the pool's level, labelled `label`.
+    pub async fn run(&self, sql: &str, params: &[Param], label: Label<'_>) -> Outcome {
         let checkout = self.limits.checkout;
         let Ok(Ok(_permit)) = tokio::time::timeout(checkout, self.permits.acquire()).await else {
             self.report("no connection was free in time");
@@ -233,16 +279,23 @@ impl Pool {
                 Err(()) => return unavailable(),
             },
         };
-        let mut run = connection.read_only(sql, params, &self.limits).await;
+        let operation = wire::Operation {
+            level: self.level,
+            sql,
+            params,
+            label,
+        };
+        let mut run = connection.operate(&operation, &self.limits).await;
         if run.stale && reused {
             // An idle connection the server had closed: the statement did
-            // not reach it, so it goes once more on a new one.
+            // not reach it (and nothing is committed without the host's own
+            // COMMIT), so it goes once more on a new one.
             drop(connection);
             connection = match self.open().await {
                 Ok(connection) => connection,
                 Err(()) => return unavailable(),
             };
-            run = connection.read_only(sql, params, &self.limits).await;
+            run = connection.operate(&operation, &self.limits).await;
         }
         if matches!(run.result, Err(Failure::Unavailable)) {
             self.report("the connection failed during the statement");
@@ -337,7 +390,7 @@ mod tests {
         ] {
             assert!(!printed.contains(hidden), "{printed}");
         }
-        let pool = Pool::new("devops", target, Limits::default());
+        let pool = Pool::new("devops", Level::Write, target, Limits::default());
         assert!(!format!("{pool:?}").contains("secret"));
     }
 }

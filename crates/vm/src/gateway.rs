@@ -9,27 +9,34 @@
 //! Application code will receive, as a future. Who is asking is never read
 //! from anything the Application passes.
 //!
-//! Operations: `whoami`, and `query` on a shared database. A `query` goes:
+//! Operations: `whoami`, and on a shared database `query` (needs `read`;
+//! the read login, a read-only transaction) and `execute` (needs `write`;
+//! the write login, a read-write transaction). Either goes:
 //!
 //! 1. its arguments are read (malformed: answered so, nothing logged or
 //!    sent);
 //! 2. the Authorization decision ([`authz::decide`]), from the request in
 //!    flight, the serving Version's Declared access, and the Resources and
-//!    Grants in memory (crate::resources);
+//!    Grants in memory (crate::resources), for the level the operation
+//!    needs;
 //! 3. the statement without its values (crate::statement);
 //! 4. the rest runs as a task on the program's runtime, owned here: a
 //!    refused operation's Operation log entry is written whole and the
-//!    refusal answered; an allowed one's entry is written `unfinished`
-//!    before anything is sent (if that fails: refused `log-unavailable`),
-//!    the statement runs through the Database executor (crate::executor)
-//!    and the entry is completed, before the answer.
+//!    refusal answered. An allowed one is then stopped, with a whole
+//!    `failed` entry and nothing sent, if it is an `execute` on a Resource
+//!    without a write login (`read-only-resource`) or if the statement
+//!    check (crate::check) refuses it (`statement`). Otherwise its entry is
+//!    written `unfinished` before anything is sent (if that fails: refused
+//!    `log-unavailable`), the statement runs through the Database executor
+//!    (crate::executor) labelled with the request in flight, and the entry
+//!    is completed, before the answer.
 //!
 //! The task does not depend on the request: an operation the Application
 //! did not wait for still runs to its end and completes its entry. Tasks
 //! are bounded ([`OPERATIONS_AT_ONCE`]); past the bound an operation waits
 //! up to [`PERMIT_WAIT`] to start, within the Application's call.
 //!
-//! Later tickets add write, the own database and outbound calls here.
+//! Later tickets add the own database and outbound calls here.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -42,7 +49,8 @@ use tokio::runtime::Handle;
 use tokio::sync::{Semaphore, oneshot};
 use tokio::task::JoinSet;
 
-use crate::executor::{Failure, Param};
+use crate::check;
+use crate::executor::{Failure, Label, Param};
 use crate::log;
 use crate::oplog::{Ending, Entry, OperationLog};
 use crate::resources::{Resource, Resources, level_name};
@@ -98,21 +106,28 @@ impl Refusal {
     fn log_unavailable(resource: &str) -> Self {
         let mut refusal = Self::new(
             LOG_UNAVAILABLE,
-            "the platform could not write the Operation log entry, so the query was not run: try again shortly".into(),
+            "the platform could not write the Operation log entry, so the operation was not run: try again shortly".into(),
         );
         refusal.details.insert("resource".into(), resource.into());
         refusal
     }
 
-    /// The refusal of the Authorization decision's `reason`, for a query on
-    /// `name` by `user`.
-    fn of(reason: authz::Reason, name: &str, user: &str, resource: Option<&Resource>) -> Self {
+    /// The refusal of the Authorization decision's `reason`, for an
+    /// operation needing `needed` on `name` by `user`.
+    fn of(
+        reason: authz::Reason,
+        needed: AccessLevel,
+        name: &str,
+        user: &str,
+        resource: Option<&Resource>,
+    ) -> Self {
         let mut refusal = match reason {
             authz::Reason::NoRequest => return Self::no_request(),
             authz::Reason::NotDeclared => Self::new(
                 "not-declared",
                 format!(
-                    "the serving Version does not declare the Resource {name:?}: add it to declared_access.resources (kind \"postgres\", access \"read\" or higher) and send a new Version"
+                    "the serving Version does not declare the Resource {name:?}: add it to declared_access.resources (kind \"postgres\", access {:?} or higher) and send a new Version",
+                    level_name(needed)
                 ),
             ),
             authz::Reason::NotRegistered => Self::new(
@@ -282,7 +297,13 @@ impl PlatformGateway {
         }
     }
 
-    fn query(&self, in_flight: &Arc<InFlight>, active: bool, args: &Value) -> Decision {
+    fn on_database(
+        &self,
+        kind: Kind,
+        in_flight: &Arc<InFlight>,
+        active: bool,
+        args: &Value,
+    ) -> Decision {
         let call = match Call::read(args) {
             Ok(call) => call,
             // With no request in flight nothing is answered but that.
@@ -305,7 +326,7 @@ impl PlatformGateway {
                 declared: in_flight.declared.get(call.resource).copied(),
                 registered: resource.is_some(),
                 grants,
-                needed: AccessLevel::Read,
+                needed: kind.needed(),
             })
         };
         let decision = match &resource {
@@ -316,6 +337,7 @@ impl PlatformGateway {
             authz::Decision::Allow => None,
             authz::Decision::Refuse(reason) => Some(Refusal::of(
                 reason,
+                kind.needed(),
                 call.resource,
                 &in_flight.user.id,
                 resource.as_deref(),
@@ -328,6 +350,7 @@ impl PlatformGateway {
             Some(_) => (String::new(), Vec::new()),
         };
         let work = Work {
+            kind,
             in_flight: Arc::clone(in_flight),
             active,
             // Copied: the operation runs on another thread, beyond the
@@ -403,7 +426,8 @@ impl Gateway for PlatformGateway {
         args: &Value,
     ) -> Decision {
         match operation {
-            "query" => self.query(in_flight, active, args),
+            "query" => self.on_database(Kind::Query, in_flight, active, args),
+            "execute" => self.on_database(Kind::Execute, in_flight, active, args),
             _ if !active => Decision::refused(&Refusal::no_request()),
             // Nothing the Application passes is read: who is asking is the
             // request in flight.
@@ -418,7 +442,32 @@ impl Gateway for PlatformGateway {
     }
 }
 
-/// The arguments of `query`, read strictly (blackbox/CONTRACT.md,
+/// An operation on a shared database.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kind {
+    /// `query`: needs `read`; the read login, a read-only transaction.
+    Query,
+    /// `execute`: needs `write`; the write login, a read-write transaction.
+    Execute,
+}
+
+impl Kind {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Query => "query",
+            Self::Execute => "execute",
+        }
+    }
+
+    fn needed(self) -> AccessLevel {
+        match self {
+            Self::Query => AccessLevel::Read,
+            Self::Execute => AccessLevel::Write,
+        }
+    }
+}
+
+/// The arguments of `query` and `execute`, read strictly (blackbox/CONTRACT.md,
 /// "Operations on a shared database"). Fields it does not have are
 /// ignored.
 struct Call<'a> {
@@ -467,8 +516,9 @@ impl<'a> Call<'a> {
     }
 }
 
-/// One `query`, decided, to be logged and run.
+/// One `query` or `execute`, decided, to be logged and run.
 struct Work {
+    kind: Kind,
     in_flight: Arc<InFlight>,
     active: bool,
     name: String,
@@ -488,7 +538,7 @@ impl Work {
             application: &self.in_flight.application,
             version: self.in_flight.version,
             resource: &self.name,
-            operation: "query",
+            operation: self.kind.name(),
             statement: &self.statement,
         }
     }
@@ -504,6 +554,27 @@ impl Work {
             // Allowed means registered; this is not reached.
             return error_to_wire(json!({ "kind": "unavailable" }));
         };
+        let pool = match self.kind {
+            Kind::Query => resource.read_pool(),
+            Kind::Execute => match resource.write_pool() {
+                Some(pool) => pool,
+                None => {
+                    let answer = error_to_wire(json!({
+                        "kind": "read-only-resource",
+                        "message": "the Resource was registered without a write login, so nothing can be written to it: ask a Platform administrator to register its write login, or use query",
+                    }));
+                    return self.failed_unsent("read-only-resource", answer).await;
+                }
+            },
+        };
+        if let Err(refused) = check::check(&self.sql) {
+            let answer = error_to_wire(json!({
+                "kind": "statement",
+                "reason": refused.reason.name(),
+                "message": refused.message,
+            }));
+            return self.failed_unsent("statement", answer).await;
+        }
         let id = match self.log.begin(&self.entry()).await {
             Ok(id) => id,
             Err(error) => {
@@ -511,7 +582,12 @@ impl Work {
                 return Refusal::log_unavailable(&self.name).to_wire();
             }
         };
-        let outcome = resource.read_pool().read(&self.sql, &self.params).await;
+        let label = Label {
+            user: &self.in_flight.user.id,
+            application: &self.in_flight.application,
+            request: &self.in_flight.request,
+        };
+        let outcome = pool.run(&self.sql, &self.params, label).await;
         let duration_ms = outcome
             .duration
             .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
@@ -519,7 +595,13 @@ impl Work {
             Ok(rows) => Ending {
                 outcome: "allowed",
                 error: None,
-                rows: u64::try_from(rows.rows.len()).ok(),
+                rows: match self.kind {
+                    // The rows affected, as Postgres counted them.
+                    Kind::Execute => rows
+                        .affected
+                        .or_else(|| u64::try_from(rows.rows.len()).ok()),
+                    Kind::Query => u64::try_from(rows.rows.len()).ok(),
+                },
                 duration_ms,
             },
             Err(failure) => Ending {
@@ -537,7 +619,7 @@ impl Work {
             self.unlogged(&error);
         }
         match outcome.result {
-            Ok(rows) => ok_to_wire(rows.into_wire()),
+            Ok(rows) => ok_to_wire(rows.into_wire(self.kind == Kind::Execute)),
             Err(Failure::Database { code, message }) => {
                 error_to_wire(json!({ "kind": "database", "code": code, "message": message }))
             }
@@ -545,6 +627,20 @@ impl Work {
                 error_to_wire(json!({ "kind": "limit", "limit": limit.name() }))
             }
             Err(Failure::Unavailable) => error_to_wire(json!({ "kind": "unavailable" })),
+        }
+    }
+
+    /// An allowed operation that ends before anything is sent: its whole
+    /// entry is written, `failed` with `error`, and `answer` given. If the
+    /// entry cannot be written, refused `log-unavailable` instead, as every
+    /// operation that cannot be logged is.
+    async fn failed_unsent(&self, error: &str, answer: Value) -> Value {
+        match self.log.failed(&self.entry(), error).await {
+            Ok(()) => answer,
+            Err(failure) => {
+                self.unlogged(&failure);
+                Refusal::log_unavailable(&self.name).to_wire()
+            }
         }
     }
 

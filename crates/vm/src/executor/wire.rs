@@ -27,7 +27,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{Instant, timeout, timeout_at};
 
-use super::{Failure, Limit, Limits, Param, Rows, Target};
+use super::{Failure, Label, Level, Limit, Limits, Param, Rows, Target};
 
 /// The largest message other than a row that is read. A larger one is a
 /// protocol error and the connection is closed.
@@ -83,6 +83,15 @@ enum Incoming {
     Oversized {
         tag: u8,
     },
+}
+
+/// One operation: the Application's statement, its parameters, the level
+/// of its transaction and its identity label.
+pub(super) struct Operation<'a> {
+    pub(super) level: Level,
+    pub(super) sql: &'a str,
+    pub(super) params: &'a [Param],
+    pub(super) label: Label<'a>,
 }
 
 /// How one operation went on the connection.
@@ -272,22 +281,29 @@ impl Connection {
         Ok(())
     }
 
-    /// Runs `sql` with `params` as one read-only transaction (ADR 0013):
-    /// `BEGIN READ ONLY`, the host's own first statement, then the
-    /// Application's statement over the extended protocol, all in one
-    /// write ending in one Sync, so that if the host's part fails the
-    /// Application's statement is skipped. Then, when the statement ended on
-    /// its own, `COMMIT` and `DISCARD ALL` are sent together and the
-    /// connection is reusable only if both succeeded and it is idle again.
+    /// Runs one operation as one transaction (ADR 0013), all in one write
+    /// ending in one Sync: `BEGIN READ ONLY` at [`Level::Read`] or `BEGIN
+    /// READ WRITE` at [`Level::Write`]; the host's own first statement,
+    /// which sets the identity label (its values as parameters); then the
+    /// Application's statement over the extended protocol. If the host's
+    /// part fails, the Application's statement is skipped. Then, when the
+    /// statement ended on its own, the transaction is ended, `COMMIT` if
+    /// the statement succeeded and `ROLLBACK` if it failed, together with
+    /// `DISCARD ALL`; the connection is reusable only if both were answered
+    /// without error and it is idle again. A `COMMIT` that fails turns the
+    /// answer into that failure.
     ///
     /// The limits of `limits` are kept here: rows and bytes are counted as
     /// the result arrives; the statement has `limits.statement` from when
-    /// it is sent. Past any of them the statement is cancelled, and the
-    /// connection is never reused (a cancel may still be on its way). If it
-    /// does not come back within `limits.grace`, it is reported stuck.
-    pub(super) async fn read_only(&mut self, sql: &str, params: &[Param], limits: &Limits) -> Run {
+    /// it is sent. Past any of them the statement is cancelled, its
+    /// transaction rolled back, and the connection is never reused (a
+    /// cancel may still be on its way). If it does not come back within
+    /// `limits.grace`, it is reported stuck. Nothing is committed unless
+    /// the host sends `COMMIT`, so a connection dropped at any point rolls
+    /// its transaction back.
+    pub(super) async fn operate(&mut self, operation: &Operation<'_>, limits: &Limits) -> Run {
         let mut out = BytesMut::new();
-        if encode_read_only(sql, params, &mut out).is_err() {
+        if encode_operation(operation, &mut out).is_err() {
             // The text holds a NUL; checked before, so not expected here.
             return self.ended(Err(Failure::Unavailable), None, false);
         }
@@ -329,15 +345,26 @@ impl Connection {
                 }
             }
         };
+        let statement_ended = Instant::now();
         let result = result.finish();
         // The statement ran, or Postgres refused it: the connection is as
         // good as before, once its transaction is ended and its session
-        // state discarded.
+        // state discarded. Otherwise (the host's own part failed, or the
+        // server is somewhere unexpected) it is closed, which rolls back.
         let ran_or_refused = matches!(result, Ok(_) | Err(Failure::Database { .. }));
-        let reusable = matches!(status, b'T' | b'E' | b'I')
-            && ran_or_refused
-            && self.end_transaction(limits.grace).await;
-        self.ended(result, Some(sent), reusable)
+        if !(matches!(status, b'T' | b'E' | b'I') && ran_or_refused) {
+            return self.ended(result, Some(sent), false);
+        }
+        let commit = result.is_ok();
+        let (ending, clean) = self.end_transaction(commit, limits.grace).await;
+        let result = match (result, ending) {
+            (Ok(_), Err(failure)) => Err(failure),
+            (result, _) => result,
+        };
+        Run {
+            ended: statement_ended,
+            ..self.ended(result, Some(sent), clean)
+        }
     }
 
     fn ended(&self, result: Result<Rows, Failure>, sent: Option<Instant>, reusable: bool) -> Run {
@@ -351,34 +378,55 @@ impl Connection {
         }
     }
 
-    /// `COMMIT` and `DISCARD ALL`, sent together; whether both succeeded
-    /// and the connection is idle, outside any transaction, within `limit`.
-    async fn end_transaction(&mut self, limit: Duration) -> bool {
+    /// `COMMIT` (or `ROLLBACK`) and `DISCARD ALL`, sent together, within
+    /// `limit`. Answers how the transaction ended (a `COMMIT` Postgres
+    /// refused is its failure; no answer is unavailable), and whether the
+    /// connection is shown clean: both answered, neither with an error, and
+    /// idle outside any transaction after each. `DISCARD ALL` ends what a
+    /// session can hold: settings and the search path, temporary tables,
+    /// prepared statements, cursors (`WITH HOLD` too), session advisory
+    /// locks, `LISTEN`, and any change of role.
+    async fn end_transaction(
+        &mut self,
+        commit: bool,
+        limit: Duration,
+    ) -> (Result<(), Failure>, bool) {
         let mut out = BytesMut::new();
-        if frontend::query("COMMIT", &mut out).is_err()
+        let end = if commit { "COMMIT" } else { "ROLLBACK" };
+        if frontend::query(end, &mut out).is_err()
             || frontend::query("DISCARD ALL", &mut out).is_err()
         {
-            return false;
+            return (Err(Failure::Unavailable), false);
         }
-        let ended = async {
+        let mut ending: Result<(), Failure> = Err(Failure::Unavailable);
+        let mut clean = true;
+        let exchange = async {
             self.send(&mut out).await?;
-            let mut clean = true;
+            let mut failed: Option<Failure> = None;
             let mut ready = 0;
             while ready < 2 {
                 match self.receive(MAX_MESSAGE).await? {
                     Incoming::Message(Message::ReadyForQuery(body)) => {
+                        if ready == 0 {
+                            ending = failed.take().map_or(Ok(()), Err);
+                        }
                         ready += 1;
                         clean &= body.status() == b'I';
                     }
-                    Incoming::Message(Message::ErrorResponse(_)) | Incoming::Oversized { .. } => {
+                    Incoming::Message(Message::ErrorResponse(body)) => {
+                        if ready == 0 {
+                            failed = Some(database_error(&body));
+                        }
                         clean = false;
                     }
+                    Incoming::Oversized { .. } => clean = false,
                     Incoming::Message(_) => {}
                 }
             }
-            Ok::<bool, WireError>(clean)
+            Ok::<(), WireError>(())
         };
-        matches!(timeout(limit, ended).await, Ok(Ok(true)))
+        let answered = matches!(timeout(limit, exchange).await, Ok(Ok(())));
+        (ending, answered && clean)
     }
 
     /// Past a limit: cancels the statement and waits up to `limits.grace`
@@ -396,6 +444,22 @@ impl Connection {
             && timeout_at(grace, self.drain())
                 .await
                 .is_ok_and(|r| r.is_ok());
+        if back {
+            // Its transaction rolled back now, rather than when the
+            // connection is closed, so that what it holds is let go at
+            // once. Not committed either way.
+            let rolled_back = timeout_at(grace, self.simple("ROLLBACK")).await;
+            if !matches!(rolled_back, Ok(Ok(true))) {
+                return Run {
+                    result: Err(Failure::Limit(limit)),
+                    sent: Some(sent),
+                    ended,
+                    reusable: false,
+                    stuck: self.process_id,
+                    stale: false,
+                };
+            }
+        }
         Run {
             result: Err(Failure::Limit(limit)),
             sent: Some(sent),
@@ -444,16 +508,31 @@ async fn cancel(peer: SocketAddr, process_id: i32, secret_key: i32) -> Result<()
     Ok(())
 }
 
-/// The messages of one read-only operation, ending in one Sync.
-fn encode_read_only(sql: &str, params: &[Param], out: &mut BytesMut) -> Result<(), WireError> {
-    for host in ["BEGIN READ ONLY", HOST_FIRST_STATEMENT] {
-        frontend::parse("", host, std::iter::empty(), out).map_err(protocol)?;
+/// The messages of one operation, ending in one Sync.
+fn encode_operation(operation: &Operation<'_>, out: &mut BytesMut) -> Result<(), WireError> {
+    let begin = match operation.level {
+        Level::Read => "BEGIN READ ONLY",
+        Level::Write => "BEGIN READ WRITE",
+    };
+    let label = operation.label;
+    let host: [(&str, &[&str]); 2] = [
+        (begin, &[]),
+        (
+            HOST_FIRST_STATEMENT,
+            &[label.user, label.application, label.request],
+        ),
+    ];
+    for (sql, values) in host {
+        frontend::parse("", sql, values.iter().map(|_| 0), out).map_err(protocol)?;
         frontend::bind(
             "",
             "",
             std::iter::empty(),
-            std::iter::empty::<&Param>(),
-            |_, _| Ok(IsNull::Yes),
+            values.iter(),
+            |value, buf| {
+                buf.put_slice(value.as_bytes());
+                Ok(IsNull::No)
+            },
             std::iter::empty(),
             out,
         )
@@ -462,12 +541,13 @@ fn encode_read_only(sql: &str, params: &[Param], out: &mut BytesMut) -> Result<(
     }
     // Types left for the server to infer (0), every parameter and every
     // result column in text (no format codes means text).
-    frontend::parse("", sql, params.iter().map(|_| 0), out).map_err(protocol)?;
+    frontend::parse("", operation.sql, operation.params.iter().map(|_| 0), out)
+        .map_err(protocol)?;
     frontend::bind(
         "",
         "",
         std::iter::empty(),
-        params,
+        operation.params,
         |param, buf| match param {
             Param::Null => Ok(IsNull::Yes),
             Param::Text(text) => {
@@ -486,10 +566,14 @@ fn encode_read_only(sql: &str, params: &[Param], out: &mut BytesMut) -> Result<(
 }
 
 /// The host's own first statement in the transaction, before Application
-/// SQL: once a statement has run, the transaction can no longer be made
-/// read-write (`SET TRANSACTION READ WRITE` fails with 25001). On a shared
-/// database nothing is installed, so it attaches no identity (ADR 0013).
-const HOST_FIRST_STATEMENT: &str = "SELECT 1";
+/// SQL: it sets the identity label as transaction-local settings, gone
+/// when the transaction ends (ADR 0013: on a shared database, with nothing
+/// installed, a label Application SQL could overwrite). Its values are
+/// parameters, never part of the text. Once a statement has run, a
+/// read-only transaction can no longer be made read-write (`SET
+/// TRANSACTION READ WRITE` fails with 25001).
+const HOST_FIRST_STATEMENT: &str = "SELECT set_config('vm.user', $1, true), \
+     set_config('vm.application', $2, true), set_config('vm.request', $3, true)";
 
 /// What to do after a message.
 enum Step {
@@ -508,6 +592,8 @@ struct Reading {
     host_left: u8,
     columns: Option<Vec<(String, u32)>>,
     rows: Vec<Value>,
+    /// The count in the statement's command tag.
+    affected: Option<u64>,
     bytes: usize,
     max_rows: usize,
     max_bytes: usize,
@@ -520,6 +606,7 @@ impl Reading {
             host_left: 2,
             columns: None,
             rows: Vec::new(),
+            affected: None,
             bytes: 0,
             max_rows: limits.max_rows,
             max_bytes: limits.max_bytes,
@@ -550,7 +637,16 @@ impl Reading {
             | Message::NotificationResponse(_)
             | Message::CopyDone
             | Message::CopyOutResponse(_) => Step::Go,
-            Message::CommandComplete(_) | Message::EmptyQueryResponse => {
+            Message::CommandComplete(body) => {
+                if self.host_left > 0 {
+                    self.host_left -= 1;
+                } else if self.outcome.is_none() {
+                    self.affected = body.tag().ok().and_then(count_of);
+                    self.outcome = Some(Ok(()));
+                }
+                Step::Go
+            }
+            Message::EmptyQueryResponse => {
                 if self.host_left > 0 {
                     self.host_left -= 1;
                 } else if self.outcome.is_none() {
@@ -640,11 +736,17 @@ impl Reading {
                     .map(|(name, _)| name)
                     .collect(),
                 rows: self.rows,
+                affected: self.affected,
             }),
             Some(Err(failure)) => Err(failure),
             None => Err(Failure::Unavailable),
         }
     }
+}
+
+/// The count a command tag ends with: `INSERT 0 3`, `UPDATE 2`, `SELECT 5`.
+fn count_of(tag: &str) -> Option<u64> {
+    tag.rsplit(' ').next()?.parse().ok()
 }
 
 fn columns_of(body: &RowDescriptionBody) -> Result<Vec<(String, u32)>, std::io::Error> {
@@ -704,6 +806,15 @@ fn decode(oid: u32, text: &[u8]) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_count_is_read_from_the_command_tag() {
+        assert_eq!(count_of("INSERT 0 3"), Some(3));
+        assert_eq!(count_of("UPDATE 12"), Some(12));
+        assert_eq!(count_of("DELETE 0"), Some(0));
+        assert_eq!(count_of("SELECT 10000"), Some(10_000));
+        assert_eq!(count_of("COMMIT"), None);
+    }
 
     #[test]
     fn values_are_decoded_as_the_contract_says() {

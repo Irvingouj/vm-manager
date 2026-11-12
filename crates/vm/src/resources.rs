@@ -18,8 +18,9 @@
 //! A Resource's connection and logins are held as a [`Connection`], which
 //! never prints, and stored as the [`sealed`] module writes them, the one
 //! place that knows the stored form (the ticket "Resources and Grants in
-//! full" encrypts it there). Each Resource holds its read pool (crate::
-//! executor), which connects on first use.
+//! full" encrypts it there). Each Resource holds a pool per login (crate::
+//! executor): its read pool, and its write pool when it was registered
+//! with a write login. A pool connects on first use.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -30,7 +31,7 @@ use serde::{Deserialize, Serialize};
 use tokio_postgres::types::FromSql;
 use tokio_postgres::{Client, Row};
 
-use crate::executor::{self, Password, Target};
+use crate::executor::{self, Level, Password, Target};
 use crate::log;
 use crate::platform_db::{DbError, PlatformDatabase, rfc3339};
 
@@ -63,19 +64,31 @@ pub fn is_resource_name(name: &str) -> bool {
 }
 
 /// Where a Resource's database is and its logins, as the Platform
-/// administrator gave them. Never printed: its `Debug` shows nothing.
+/// administrator gave them: the read login, and optionally the write login.
+/// Never printed: its `Debug` shows nothing.
 #[derive(Serialize, Deserialize)]
 pub struct Connection {
     host: String,
     port: u16,
     database: String,
     read: Login,
+    /// Absent in what was stored before write logins existed.
+    #[serde(default)]
+    write: Option<Login>,
 }
 
+/// A login to a shared database. Never printed: it has no `Debug` of its
+/// own, and the [`Connection`] that holds it shows nothing.
 #[derive(Serialize, Deserialize)]
-struct Login {
+pub struct Login {
     role: String,
     password: String,
+}
+
+impl Login {
+    pub fn new(role: String, password: String) -> Self {
+        Self { role, password }
+    }
 }
 
 impl fmt::Debug for Connection {
@@ -89,30 +102,50 @@ impl Connection {
         host: String,
         port: u16,
         database: String,
-        read_role: String,
-        read_password: String,
+        read: Login,
+        write: Option<Login>,
     ) -> Self {
         Self {
             host,
             port,
             database,
-            read: Login {
-                role: read_role,
-                password: read_password,
-            },
+            read,
+            write,
         }
     }
 
-    /// The read login's target, for its pool.
-    fn into_read(self) -> Target {
-        Target::new(
-            self.host,
-            self.port,
-            self.database,
-            self.read.role,
-            Password::new(self.read.password),
-        )
+    /// The pools of `resource`: the read login's, and the write login's if
+    /// there is one, each with `limits`.
+    fn into_pools(self, resource: &str, limits: &executor::Limits) -> Pools {
+        let target = |login: Login, host: String, database: String| {
+            Target::new(
+                host,
+                self.port,
+                database,
+                login.role,
+                Password::new(login.password),
+            )
+        };
+        let write = self.write.map(|login| {
+            // Copied: each pool owns its target, and this is done once, as
+            // the Resource is registered or loaded.
+            let target = target(login, self.host.clone(), self.database.clone());
+            executor::Pool::new(resource, Level::Write, target, limits.clone())
+        });
+        let read = target(self.read, self.host, self.database);
+        Pools {
+            read: executor::Pool::new(resource, Level::Read, read, limits.clone()),
+            write,
+        }
     }
+}
+
+/// A Resource's pools, one per login. Their `Debug` names the Resource
+/// and the level only.
+#[derive(Debug)]
+struct Pools {
+    read: executor::Pool,
+    write: Option<executor::Pool>,
 }
 
 /// The stored form of a [`Connection`]: the one place that writes and reads
@@ -160,7 +193,8 @@ pub struct Resource {
     pub created_by: String,
     /// RFC 3339, UTC.
     pub created_at: String,
-    read: executor::Pool,
+    /// One pool per login: a connection of one never serves the other.
+    pools: Pools,
     /// By Group. Held only for a lookup or a change, never across an await.
     grants: RwLock<BTreeMap<String, Granted>>,
 }
@@ -168,7 +202,12 @@ pub struct Resource {
 impl Resource {
     /// The pool of the read login.
     pub fn read_pool(&self) -> &executor::Pool {
-        &self.read
+        &self.pools.read
+    }
+
+    /// The pool of the write login, if the Resource has one.
+    pub fn write_pool(&self) -> Option<&executor::Pool> {
+        self.pools.write.as_ref()
     }
 
     /// Runs `decide` with the Grants on this Resource, as the Authorization
@@ -292,7 +331,7 @@ impl Resources {
             .ok_or_else(|| DbError::unexpected("a Resource's stored connection cannot be read"))?;
         Ok(Resource {
             id: get(row, 0)?,
-            read: executor::Pool::new(&name, connection.into_read(), self.limits.clone()),
+            pools: connection.into_pools(&name, &self.limits),
             name,
             description: get(row, 2)?,
             owner: get(row, 3)?,
@@ -367,7 +406,7 @@ impl Resources {
         let resource = Arc::new(Resource {
             id: get(&row, 0)?,
             created_at: get(&row, 1)?,
-            read: executor::Pool::new(&new.name, new.connection.into_read(), self.limits.clone()),
+            pools: new.connection.into_pools(&new.name, &self.limits),
             name: new.name,
             description: new.description,
             owner: new.owner,
@@ -534,14 +573,25 @@ mod tests {
             "db.example".into(),
             6543,
             "secret_db".into(),
-            "secret_role".into(),
-            "secret-password".into(),
+            Login::new("secret_role".into(), "secret-password".into()),
+            Some(Login::new(
+                "secret_writer".into(),
+                "secret-write-password".into(),
+            )),
         );
         assert_eq!(format!("{connection:?}"), "Connection(<hidden>)");
         let stored = sealed::seal(&connection).unwrap();
         let opened = sealed::open(&stored).unwrap();
         assert_eq!(opened.port, 6543);
         assert_eq!(opened.read.role, "secret_role");
+        assert_eq!(
+            opened.write.map(|w| w.role).as_deref(),
+            Some("secret_writer")
+        );
         assert!(sealed::open(b"not what was stored").is_none());
+        // What was stored before write logins existed still opens.
+        let older = br#"{"host":"h","port":1,"database":"d","read":{"role":"r","password":"p"}}"#;
+        let opened = sealed::open(older).unwrap();
+        assert!(opened.write.is_none());
     }
 }

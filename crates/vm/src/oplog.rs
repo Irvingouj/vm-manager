@@ -4,7 +4,8 @@
 //! platform's API.
 //!
 //! Interface: [`OperationLog::refused`] writes a refused operation's entry
-//! whole; [`OperationLog::begin`] writes an allowed one's as `unfinished`
+//! whole, and [`OperationLog::failed`] the whole entry of an allowed one
+//! that failed before its statement was sent; [`OperationLog::begin`] writes an allowed one's as `unfinished`
 //! before its statement is sent, and [`OperationLog::finish`] completes it.
 //! Each write has [`WRITE_TIMEOUT`]. [`OperationLog::newest`] reads.
 //!
@@ -80,6 +81,35 @@ impl OperationLog {
                         &entry.operation,
                         &entry.statement,
                         &reason,
+                    ],
+                )
+                .await
+                .map_err(DbError::from)?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Writes the whole entry of an allowed operation that failed before
+    /// its statement was sent (the statement check refused it, the Resource
+    /// has no login for it): `failed`, with `error` saying why.
+    pub async fn failed(&self, entry: &Entry<'_>, error: &str) -> Result<(), DbError> {
+        let version = version_of(entry.version)?;
+        self.write(async |client: &mut Client| {
+            client
+                .execute(
+                    "INSERT INTO operation_log (request, user_id, application, version, resource,
+                                                operation, statement, outcome, error)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, 'failed', $8)",
+                    &[
+                        &entry.request,
+                        &entry.user,
+                        &entry.application,
+                        &version,
+                        &entry.resource,
+                        &entry.operation,
+                        &entry.statement,
+                        &error,
                     ],
                 )
                 .await
