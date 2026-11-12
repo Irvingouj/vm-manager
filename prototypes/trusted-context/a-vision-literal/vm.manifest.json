@@ -1,0 +1,9 @@
+{
+  "application": "incident-board",
+  "signIn": "optional",
+  "ownDatabase": true,
+  "resources": {
+    "devops": { "kind": "postgres", "access": "read" },
+    "facilities": { "kind": "postgres", "access": "write" }
+  }
+}

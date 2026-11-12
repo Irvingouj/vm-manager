@@ -1,0 +1,15 @@
+{
+  "name": "trusted-context-prototype",
+  "private": true,
+  "type": "module",
+  "description": "Throwaway prototype: candidate TypeScript shapes for the Trusted context and SDK (map ticket \"Trusted context and SDK type shape\").",
+  "scripts": {
+    "gen": "node gen-env.mjs a-vision-literal && node gen-env.mjs c-principal-argument",
+    "check": "tsc -p a-vision-literal && tsc -p b-define-app && tsc -p c-principal-argument",
+    "errors": "node show-errors.mjs a-vision-literal b-define-app c-principal-argument",
+    "run-b": "node b-define-app/runtime/run.mjs"
+  },
+  "devDependencies": {
+    "typescript": "^7.0.2"
+  }
+}

@@ -1,0 +1,7 @@
+{
+  "extends": "../tsconfig.base.json",
+  "compilerOptions": {
+    "paths": { "@vm/sdk": ["./sdk.ts"] }
+  },
+  "include": ["sdk.ts", "vm-env.d.ts", "src/**/*.ts", "type-tests.ts"]
+}
