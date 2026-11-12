@@ -10,6 +10,10 @@ An open-source, self-hosted platform on which an enterprise's employees and thei
 A stateless program, deployed by a Builder, that answers web requests and reaches enterprise infrastructure only through the SDK. It follows the Cloudflare Workers execution model without being Cloudflare-compatible.
 _Avoid_: Worker (reserved for future background compute), service, project
 
+**Integration**:
+Separately trusted code that exposes a few narrow business functions and reaches Resources as itself. Applications call it instead of holding privileged access; each of its functions is a Resource.
+_Avoid_: Plugin, connector, external API (an outbound HTTP endpoint is a different thing)
+
 **Resource**:
 A named piece of enterprise infrastructure that IT registers and governs, and that an Application reaches through the SDK by its logical name alone.
 _Avoid_: Binding (the Cloudflare and OpenWorkers term), service, backend
@@ -29,7 +33,7 @@ A Grant that lets an Application reach a Resource on behalf of the User it is se
 _Avoid_: App permission, on-behalf-of token
 
 **Autonomous grant**:
-A Grant, given separately and explicitly by IT, that lets an Application reach a Resource as itself, whatever the User it is serving may access.
+A Grant that lets code reach a Resource as itself, whatever the User it is serving may access. Only an Integration can hold one on a shared Resource; an Application acts as itself only in its own database.
 _Avoid_: Service account, elevated access, bypass
 
 ### People
