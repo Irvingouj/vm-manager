@@ -443,6 +443,8 @@ pub struct PrivatePostgres {
     root: PathBuf,
     data: PathBuf,
     port: u16,
+    /// A second loopback address it also listens on, if any.
+    also_on: Option<Ipv4Addr>,
     password: Password,
     binaries: &'static Binaries,
     server: Option<Child>,
@@ -466,6 +468,12 @@ impl PrivatePostgres {
     /// and starts the server on a free 127.0.0.1 port. It listens on no
     /// Unix socket and only on loopback.
     pub fn start() -> Result<Self, String> {
+        Self::start_also_on(None)
+    }
+
+    /// As [`PrivatePostgres::start`], listening also on this second loopback
+    /// address (on Linux all of 127.0.0.0/8 is loopback).
+    pub fn start_also_on(also_on: Option<Ipv4Addr>) -> Result<Self, String> {
         let binaries = binaries();
         let root = std::env::temp_dir().join(format!(
             "vm-blackbox-pg-{}-{}",
@@ -478,6 +486,7 @@ impl PrivatePostgres {
             root,
             data,
             port: 0,
+            also_on,
             password: Password::random(),
             binaries,
             server: None,
@@ -544,14 +553,24 @@ impl PrivatePostgres {
             let log_too = log
                 .try_clone()
                 .map_err(|e| format!("cannot open {}: {e}", log_path.display()))?;
+            let listen = match self.also_on {
+                Some(other) => format!("listen_addresses=127.0.0.1,{other}"),
+                None => "listen_addresses=127.0.0.1".to_owned(),
+            };
             let server = Command::new(self.binaries.postgres())
                 .arg("-D")
                 .arg(&self.data)
                 .arg("-p")
                 .arg(port.to_string())
+                .arg("-c")
+                .arg(listen)
                 .args([
+                    // Each line of the server's log says which database and
+                    // role it is about, so that a test can read what one
+                    // database received (statements are logged only for
+                    // databases that ask for it: see `shared_database`).
                     "-c",
-                    "listen_addresses=127.0.0.1",
+                    "log_line_prefix=%m [%p] db=%d user=%u: ",
                     "-c",
                     "unix_socket_directories=",
                     "-c",
@@ -612,6 +631,13 @@ impl PrivatePostgres {
         }
     }
 
+    /// Stops the server now, as abruptly as a crash (`pg_ctl stop -m
+    /// immediate`): to show what the program does when its Postgres goes
+    /// away.
+    pub fn stop(&mut self) {
+        self.stop_server();
+    }
+
     fn stop_server(&mut self) {
         let Some(mut server) = self.server.take() else {
             return;
@@ -638,6 +664,20 @@ impl PrivatePostgres {
         self.port
     }
 
+    /// The address a client connects to: the second loopback address when
+    /// there is one, else 127.0.0.1.
+    pub fn host(&self) -> String {
+        self.also_on
+            .map_or_else(|| "127.0.0.1".to_owned(), |a| a.to_string())
+    }
+
+    /// Everything the server has written to its log so far.
+    pub fn server_log(&self) -> String {
+        let path = self.root.join("postgres.log");
+        let bytes = fs::read(&path).unwrap_or_default();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
     pub fn password(&self) -> &Password {
         &self.password
     }
@@ -659,7 +699,8 @@ impl PrivatePostgres {
     /// A connection address to `database` as `role` with `password`.
     pub fn url_as(&self, role: &str, password: &str, database: &str) -> String {
         format!(
-            "postgres://{role}:{password}@127.0.0.1:{}/{database}",
+            "postgres://{role}:{password}@{}:{}/{database}",
+            self.host(),
             self.port
         )
     }
@@ -721,6 +762,31 @@ pub fn shared() -> &'static PrivatePostgres {
     }
 }
 
+/// A second loopback address that is not 127.0.0.1, if this machine has one
+/// (Linux routes all of 127.0.0.0/8 to loopback; macOS by default does not).
+/// The instance shared databases live on listens there too, so that their
+/// host is a value nothing else the program handles contains.
+pub const DISTINCT_LOOPBACK: Ipv4Addr = Ipv4Addr::new(127, 71, 43, 29);
+
+fn distinct_loopback() -> Option<Ipv4Addr> {
+    TcpListener::bind((DISTINCT_LOOPBACK, 0))
+        .ok()
+        .map(|_| DISTINCT_LOOPBACK)
+}
+
+/// A second instance for this test binary, where the shared databases the
+/// tests register as Resources live: a different port from the platform
+/// databases, and on Linux a different host, so that neither appears in
+/// anything the program says unless it leaked a Resource's connection.
+/// Never dropped; its guardian stops it when the test process exits.
+pub fn for_shared_databases() -> &'static PrivatePostgres {
+    static OTHER: OnceLock<Result<PrivatePostgres, String>> = OnceLock::new();
+    match OTHER.get_or_init(|| PrivatePostgres::start_also_on(distinct_loopback())) {
+        Ok(postgres) => postgres,
+        Err(problem) => panic!("{problem}"),
+    }
+}
+
 /// A platform database on the shared Postgres: the name a program is given
 /// in `VM_DATABASE_URL`. A fresh one does not exist until the program
 /// creates it.
@@ -742,9 +808,14 @@ impl Platform {
 
     /// This name, on the shared Postgres, as its superuser.
     pub fn named(name: &str) -> Self {
+        Self::on(shared(), name)
+    }
+
+    /// This name, on another of the harness's instances, as its superuser.
+    pub fn on(postgres: &PrivatePostgres, name: &str) -> Self {
         Self {
             name: name.to_owned(),
-            url: shared().url(name),
+            url: postgres.url(name),
         }
     }
 

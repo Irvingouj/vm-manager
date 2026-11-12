@@ -21,6 +21,11 @@ sha2 = "0.10"
 zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
 liblzma = { version = "0.4", default-features = false, features = ["static"] }
 tar = { version = "0.4", default-features = false }
+# To set up the shared databases the tests register as Resources, and to
+# look at them from outside the program: a client of the harness's own,
+# never the program's.
+tokio = { version = "1", features = ["rt", "net", "time"] }
+tokio-postgres = "0.7"
 
 [lints]
 workspace = true

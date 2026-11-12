@@ -45,7 +45,8 @@ fn find_or_build() -> Result<PathBuf, String> {
             ))
         };
     }
-    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+    let manifest = manifest_dir();
+    let workspace = manifest
         .parent()
         .ok_or("the blackbox crate has no parent directory")?;
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
@@ -73,6 +74,16 @@ fn find_or_build() -> Result<PathBuf, String> {
         .filter(|m| m["reason"] == "compiler-artifact" && m["target"]["name"] == "vm")
         .find_map(|m| m["executable"].as_str().map(PathBuf::from))
         .ok_or_else(|| "cargo built no `vm` executable".to_owned())
+}
+
+/// The `blackbox` crate's directory in the checkout being tested: the value
+/// cargo gives the test process at run time, else the one this crate was
+/// compiled in. Run time first, so that two checkouts sharing one `target/`
+/// each test their own program and fixtures.
+pub fn manifest_dir() -> PathBuf {
+    std::env::var_os("CARGO_MANIFEST_DIR")
+        .filter(|dir| !dir.is_empty())
+        .map_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")), PathBuf::from)
 }
 
 /// What a program run to its exit left behind.

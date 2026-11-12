@@ -16,7 +16,12 @@
 //! - [`http`] sends requests as a named [`User`] with full control of the
 //!   headers;
 //! - [`log`] and [`records`] collect the log records and let a test wait
-//!   for the records of one request.
+//!   for the records of one request;
+//! - [`shared_database`] makes a shared database for a test to register as
+//!   a Resource, and reads what it received from its server's own log;
+//!   [`sql`] is the harness's own client for that;
+//! - [`scenario`] is what the tests of Resources, Grants, `query` and the
+//!   Operation log share.
 //!
 //! Every wait has a timeout, so a failing test fails within seconds and
 //! never hangs. Each test starts its own program on its own port, so tests
@@ -36,6 +41,9 @@ pub mod log;
 pub mod postgres;
 pub mod program;
 pub mod records;
+pub mod scenario;
+pub mod shared_database;
+pub mod sql;
 pub mod vm;
 
 pub use api::{Api, assert_api_error};

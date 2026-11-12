@@ -22,6 +22,25 @@ pub fn version_body(bundle: &str) -> Value {
     })
 }
 
+/// The body of a Version: this bundle, declaring these Resources as
+/// (name, access level), all of kind `postgres`, and [`SOME_GIT_COMMIT`].
+pub fn version_body_declaring(bundle: &str, declared: &[(&str, &str)]) -> Value {
+    let resources: serde_json::Map<String, Value> = declared
+        .iter()
+        .map(|(name, access)| {
+            (
+                (*name).to_owned(),
+                json!({ "kind": "postgres", "access": access }),
+            )
+        })
+        .collect();
+    json!({
+        "bundle": bundle,
+        "declared_access": { "resources": resources },
+        "git_commit": SOME_GIT_COMMIT,
+    })
+}
+
 /// The bundle of `fixtures/which-version.js` with its marker set: an
 /// Application that answers which bundle it is (`marker`) and what the host
 /// says (`whoami`, which names the Version).
@@ -94,6 +113,63 @@ impl<'a> Api<'a> {
     /// `GET /v1/applications/<application>/versions`.
     pub fn list_versions(&self, application: &str) -> Response {
         self.get(&format!("/v1/applications/{application}/versions"))
+    }
+
+    /// `POST /v1/resources` with this body.
+    pub fn create_resource(&self, body: &Value) -> Response {
+        self.post("/v1/resources", body)
+    }
+
+    /// `GET /v1/resources/<name>`.
+    pub fn get_resource(&self, name: &str) -> Response {
+        self.get(&format!("/v1/resources/{name}"))
+    }
+
+    /// `GET /v1/resources`.
+    pub fn list_resources(&self) -> Response {
+        self.get("/v1/resources")
+    }
+
+    /// `POST /v1/resources/<resource>/grants` with `{ group, access }`.
+    pub fn grant(&self, resource: &str, group: &str, access: &str) -> Response {
+        self.post(
+            &format!("/v1/resources/{resource}/grants"),
+            &json!({ "group": group, "access": access }),
+        )
+    }
+
+    /// `GET /v1/resources/<resource>/grants`.
+    pub fn list_grants(&self, resource: &str) -> Response {
+        self.get(&format!("/v1/resources/{resource}/grants"))
+    }
+
+    /// `GET /v1/operation-log`, with `?limit=<limit>` when given.
+    pub fn operation_log(&self, limit: Option<&str>) -> Response {
+        match limit {
+            Some(limit) => self.get(&format!("/v1/operation-log?limit={limit}")),
+            None => self.get("/v1/operation-log"),
+        }
+    }
+
+    /// The Operation log's entries, which this User must be allowed to read
+    /// (`200`, `{ "entries": [ ... ] }`), oldest first, at most 1000.
+    pub fn operation_log_entries(&self) -> Vec<Value> {
+        let answer = self.operation_log(Some("1000"));
+        answer.expect_status(200);
+        let body = answer.json();
+        body["entries"].as_array().cloned().unwrap_or_else(|| {
+            panic!("expected {{ \"entries\": [ ... ] }} from the Operation log, got {body}")
+        })
+    }
+
+    /// Creates `name` and sends `bundle` as its first Version declaring
+    /// these Resources as (name, access level), failing the test unless both
+    /// are `201`. Returns the Version's record.
+    pub fn create_declaring(&self, name: &str, bundle: &str, declared: &[(&str, &str)]) -> Value {
+        self.create_application(name).expect_status(201);
+        self.send_version(name, &version_body_declaring(bundle, declared))
+            .expect_status(201)
+            .json()
     }
 
     /// A `GET` of any target on the API.

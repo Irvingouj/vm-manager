@@ -5,7 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
@@ -39,9 +39,7 @@ pub const FIXTURE_VERSION: u64 = 1;
 
 /// The path of a fixture Application under `blackbox/fixtures/`.
 pub fn fixture(file: &str) -> PathBuf {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("fixtures")
-        .join(file);
+    let path = crate::program::manifest_dir().join("fixtures").join(file);
     assert!(path.is_file(), "no fixture Application {}", path.display());
     path
 }
@@ -60,6 +58,7 @@ pub struct VmOptions {
     domain: String,
     applications: Vec<(String, PathBuf)>,
     stand_in_sign_in: bool,
+    administrators_group: Option<String>,
     platform: Option<Platform>,
 }
 
@@ -69,6 +68,7 @@ impl Default for VmOptions {
             domain: DOMAIN.to_owned(),
             applications: Vec::new(),
             stand_in_sign_in: false,
+            administrators_group: None,
             platform: None,
         }
     }
@@ -96,6 +96,13 @@ impl VmOptions {
         self
     }
 
+    /// Starts the program with `--administrators-group <group>`.
+    #[must_use]
+    pub fn administrators_group(mut self, group: &str) -> Self {
+        self.administrators_group = Some(group.to_owned());
+        self
+    }
+
     /// Starts the program against this platform database rather than a
     /// fresh one: to start it again on what an earlier program left.
     #[must_use]
@@ -116,6 +123,10 @@ impl VmOptions {
         ];
         if self.stand_in_sign_in {
             args.push("--stand-in-sign-in".to_owned());
+        }
+        if let Some(group) = &self.administrators_group {
+            args.push("--administrators-group".to_owned());
+            args.push(group.clone());
         }
         args
     }
@@ -144,6 +155,9 @@ pub struct Vm {
     listening_at: usize,
     listening: Value,
     platform: Platform,
+    /// What it was started with, the fixture Applications left out: what a
+    /// restart starts again with.
+    options: VmOptions,
 }
 
 impl Vm {
@@ -187,13 +201,19 @@ impl Vm {
         Self::start(&VmOptions::new().stand_in_sign_in().platform(platform))
     }
 
-    /// Ends this program and starts it again, stand-in on, against the same
-    /// platform database.
+    /// Ends this program and starts it again with the same options,
+    /// against the same platform database.
     #[must_use]
     pub fn restart(self) -> Self {
-        let platform = self.platform.clone();
+        let options = self.options.clone().platform(&self.platform);
         drop(self);
-        Self::start_on(&platform)
+        Self::start(&options)
+    }
+
+    /// The options this program was started with, without its fixture
+    /// Applications.
+    pub fn options(&self) -> &VmOptions {
+        &self.options
     }
 
     fn install_all(&self, applications: &[(String, PathBuf)]) {
@@ -295,6 +315,10 @@ impl Vm {
             listening_at,
             listening,
             platform: platform.clone(),
+            options: VmOptions {
+                applications: Vec::new(),
+                ..options.clone()
+            },
         }
     }
 
