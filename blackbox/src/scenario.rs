@@ -9,12 +9,13 @@
 
 use std::sync::Barrier;
 use std::thread;
+use std::time::Duration;
 
 use serde_json::{Value, json};
 
 use crate::api::{Api, assert_recent_rfc3339, version_body_declaring};
-use crate::http::{Response, User};
-use crate::shared_database::{Login, SharedDatabase};
+use crate::http::{REQUEST_TIMEOUT, Response, User};
+use crate::shared_database::{Login, Session, SharedDatabase};
 use crate::vm::{INSTALLER, Vm, VmOptions, fixture_bundle};
 
 /// The Group named with `--administrators-group`.
@@ -177,6 +178,15 @@ impl Scenario {
     /// application, body)` as for [`Scenario::run`]; returns each one's
     /// answer and the answers of its calls, in the order given.
     pub fn at_once(&self, requests: &[(User, &str, Value)]) -> Vec<(Response, Vec<Value>)> {
+        self.at_once_within(requests, REQUEST_TIMEOUT)
+    }
+
+    /// As [`Scenario::at_once`], waiting up to `timeout` for each answer.
+    pub fn at_once_within(
+        &self,
+        requests: &[(User, &str, Value)],
+        timeout: Duration,
+    ) -> Vec<(Response, Vec<Value>)> {
         let start = Barrier::new(requests.len());
         thread::scope(|scope| {
             let handles: Vec<_> = requests
@@ -185,7 +195,7 @@ impl Scenario {
                     let start = &start;
                     scope.spawn(move || {
                         start.wait();
-                        self.run(user, application, body)
+                        self.run_within(user, application, body, timeout)
                     })
                 })
                 .collect();
@@ -197,6 +207,55 @@ impl Scenario {
                 })
                 .collect()
         })
+    }
+
+    /// Makes `per_request` calls of `call` together in each of
+    /// `requests.len()` requests sent at once, `(user, application)` each:
+    /// enough operations at the same time to take every connection a pool
+    /// of that many or fewer holds. Returns every answer, failing the test
+    /// unless each request was answered `200`.
+    pub fn spread(
+        &self,
+        requests: &[(User, &str)],
+        call: &Value,
+        per_request: usize,
+    ) -> Vec<Value> {
+        let bodies: Vec<(User, &str, Value)> = requests
+            .iter()
+            .map(|(user, application)| {
+                (
+                    user.clone(),
+                    *application,
+                    json!({ "calls": vec![call; per_request], "mode": "together" }),
+                )
+            })
+            .collect();
+        self.at_once(&bodies)
+            .into_iter()
+            .flat_map(|(_, answers)| answers)
+            .collect()
+    }
+
+    /// As [`Scenario::spread`] with a call that observes its session
+    /// ([`crate::shared_database::observe_select`] or `observe_insert`):
+    /// what each session said, failing the test unless every call answered
+    /// one.
+    pub fn observe_spread(
+        &self,
+        requests: &[(User, &str)],
+        call: &Value,
+        per_request: usize,
+    ) -> Vec<Session> {
+        self.spread(requests, call, per_request)
+            .iter()
+            .map(|answer| {
+                Session::from_answer(answer).unwrap_or_else(|| {
+                    self.vm.fail(&format!(
+                        "expected an observation of the session, {{ ok: {{ rows: [[<json>]] }} }}, got {answer}"
+                    ))
+                })
+            })
+            .collect()
     }
 
     /// The platform's API as the Platform administrator.
@@ -269,12 +328,26 @@ impl Scenario {
         path: &str,
         body: &Value,
     ) -> (Response, Value) {
+        self.post_within(user, application, path, body, REQUEST_TIMEOUT)
+    }
+
+    /// As [`Scenario::post`], waiting up to `timeout` for the answer (for
+    /// statements ended at the time limit).
+    pub fn post_within(
+        &self,
+        user: &User,
+        application: &str,
+        path: &str,
+        body: &Value,
+        timeout: Duration,
+    ) -> (Response, Value) {
         let response = self
             .vm
             .request(application, path)
             .as_user(user)
             .method("POST")
             .json(body)
+            .timeout(timeout)
             .send();
         if response.status != 200 {
             self.vm.fail(&format!(
@@ -291,7 +364,18 @@ impl Scenario {
     /// `mode` and the rest) and returns the request's answer and the
     /// answers of the calls.
     pub fn run(&self, user: &User, application: &str, body: &Value) -> (Response, Vec<Value>) {
-        let (response, json) = self.post(user, application, "/", body);
+        self.run_within(user, application, body, REQUEST_TIMEOUT)
+    }
+
+    /// As [`Scenario::run`], waiting up to `timeout` for the answer.
+    pub fn run_within(
+        &self,
+        user: &User,
+        application: &str,
+        body: &Value,
+        timeout: Duration,
+    ) -> (Response, Vec<Value>) {
+        let (response, json) = self.post_within(user, application, "/", body, timeout);
         let answers = json["answers"].as_array().cloned().unwrap_or_else(|| {
             self.vm.fail(&format!(
                 "expected {{ answers: [...] }} from {application:?}, got {json}"

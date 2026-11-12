@@ -221,16 +221,25 @@ pub const OBSERVE_SESSION: &str = "json_build_object(
 )::text";
 
 /// A `SELECT` that answers one row with one column `session`: what its
-/// session holds ([`OBSERVE_SESSION`]). For `query`.
-pub fn observe_select() -> String {
-    format!("select {OBSERVE_SESSION} as session")
+/// session holds ([`OBSERVE_SESSION`]), after sleeping `pause_ms` (so that
+/// observations made together overlap and each takes a connection of its
+/// own). For `query`.
+pub fn observe_select(pause_ms: u32) -> String {
+    format!(
+        "select {OBSERVE_SESSION} as session from pg_sleep({})",
+        f64::from(pause_ms) / 1000.0
+    )
 }
 
 /// An `INSERT ... RETURNING` into `notes` that answers one row with one
-/// column `session`: what its session holds ([`OBSERVE_SESSION`]). For
-/// `execute`, whose rows are what `RETURNING` gives.
-pub fn observe_insert() -> String {
-    format!("insert into notes (body) select {OBSERVE_SESSION} returning body as session")
+/// column `session`: what its session holds ([`OBSERVE_SESSION`]), after
+/// sleeping `pause_ms`. For `execute`, whose rows are what `RETURNING`
+/// gives.
+pub fn observe_insert(pause_ms: u32) -> String {
+    format!(
+        "insert into notes (body) select {OBSERVE_SESSION} from pg_sleep({}) returning body as session",
+        f64::from(pause_ms) / 1000.0
+    )
 }
 
 /// What [`OBSERVE_SESSION`] said, read from its JSON text.
