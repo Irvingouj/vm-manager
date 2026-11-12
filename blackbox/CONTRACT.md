@@ -252,7 +252,8 @@ Decided by the host from the request in flight, the serving Version's Declared a
 - `statement` is the statement **without its values**: every constant written into the SQL text is replaced by a placeholder, and parameters are never recorded. A statement that cannot be parsed is recorded as `"<unparsed>"`. No field of any entry holds a value from a statement, a parameter, or a row.
 - `reason` and `error` are null when they do not apply. For a `failed` entry `error` is the SQLSTATE, the limit's name, or `unavailable`. `rows` is null unless the statement ran to its end; `duration_ms` is null unless the statement was sent. `outcome` is `unfinished` while it runs, and stays so if the program died meanwhile.
 - A malformed operation has no entry. `whoami` is not an operation on a Resource and has none.
-- The program's own log still gets its `host-call` record for each call, as before.
+- An entry for a refusal made with no request in flight is written beside the answer, not before it, and may be dropped when the program is saturated; the program's log then has an `operations-busy` record.
+- The program's own log still gets its `host-call` record for each call, as before. It records the Authorization decision at the moment of the call: a malformed call is `refused` with reason `malformed`; a call later refused with `log-unavailable` was recorded as `allowed`.
 
 ## Lower seam: the Authorization decision (same ticket)
 
