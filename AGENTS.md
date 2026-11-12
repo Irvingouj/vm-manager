@@ -26,19 +26,28 @@ Single-context: one `CONTEXT.md` glossary and `docs/adr/` at the repo root. See 
 
 ## How code gets written
 
-### Black-box tests first, written by a different agent
+### The loop for every ticket
 
-Every ticket is built by two agents in turn, never by one.
+The driving session orchestrates; one agent works at a time.
 
-1. **The test agent** writes tests from the ticket's acceptance criteria against the program from outside. It does not read the implementation.
-2. **The implementation agent** makes those tests pass. It does not edit them. If it believes a test is wrong, it says so and the driving session decides.
+1. **Spec.** The driving session writes the outside interface the ticket needs into `blackbox/CONTRACT.md`, from the ticket's acceptance criteria.
+2. **Red tests.** A test agent writes black-box tests from the contract and the acceptance criteria. It does not read the implementation. The tests are seen failing.
+3. **Implementation.** A different agent makes them pass. It does not edit the tests or the contract; if it believes one is wrong, it says so and the driving session decides.
+4. **Review.** The driving session reads the diff against the Rust rules below and the ticket.
+5. **Green.** The driving session runs the gate itself. If it fails, back to the implementation agent until it is green.
+
+Then the ticket's commits are pushed and the issue is closed with what was run.
 
 - Black-box tests live in the `blackbox` crate. That crate depends on no product crate, so it cannot reach inside: it starts the real `vm` binary beside a real Postgres, drives it with commands and HTTP as different Users, and asserts on what an outsider can observe (a response, a command's output and exit code, an Operation log entry, a Change history row, a refusal's reason). Fixture Applications, hostile ones included, live there too.
-- The outside interface the tests assume (start-up options, commands, addresses, what an Application is handed) is written down in `blackbox/CONTRACT.md` and changed there first.
 - Tests below that seam are allowed only where the spec's Testing Decisions name one (the Authorization decision as a pure function, the Request runner with a scripted Application, the SDK's type tests). The test agent still writes them first.
-- A ticket is done when its tests were seen failing before the implementation and passing after, and the gate is clean.
+
+### Git
+
+Work on `main` and push to `main`. No pull requests. No branch unless something truly needs one, and then it is deleted when merged. There is no continuous integration for now: the gate is run locally, and nothing ever waits on a remote check.
 
 ### The gate
+
+`scripts/gate.sh` checks that `blackbox` depends on no product crate, then runs:
 
 ```
 cargo fmt --all --check

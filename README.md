@@ -13,7 +13,7 @@ cargo build              # target/debug/vm
 target/debug/vm --version
 ```
 
-The gate, as continuous integration runs it (`.github/workflows/ci.yml`):
+The gate is `scripts/gate.sh`: it checks that `blackbox` depends on no product crate, then runs
 
 ```
 cargo fmt --all --check
