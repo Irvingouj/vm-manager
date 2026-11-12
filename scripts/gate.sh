@@ -18,5 +18,23 @@ echo "== cargo fmt"
 cargo fmt --all --check
 echo "== cargo clippy"
 cargo clippy --workspace --all-targets --locked -- -D warnings
+# The SDK, its type tests and the fixture projects are one npm workspace at
+# the root. With --no-fail-fast a failure here does not hide what cargo test
+# has to say; the gate still fails.
+npm_failed=0
+if [ -f package.json ]; then
+  echo "== npm ci, npm test"
+  if [ ! -d node_modules ] || [ package-lock.json -nt node_modules/.package-lock.json ]; then
+    npm ci --no-audit --no-fund || npm_failed=1
+  fi
+  if [ "$npm_failed" = 0 ]; then
+    npm test || npm_failed=1
+  fi
+  if [ "$npm_failed" = 1 ] && [[ " $* " != *" --no-fail-fast "* ]]; then
+    exit 1
+  fi
+fi
+
 echo "== cargo test"
-cargo test --workspace --locked "$@"
+cargo test --workspace --locked "$@" || exit 1
+exit "$npm_failed"

@@ -501,3 +501,137 @@ With statement logging fully on in the own database (`log_statement = all`, `log
 ### What this does not close
 
 A migration is the Contributors' own code and runs as the role that owns the database (ADR 0013), `vm` included. A migration can therefore read the platform's secret, change `vm.history` and remove the capture. The platform records every migration's text (`vm.migrations`), so this is visible afterwards, not prevented.
+
+## The SDK (ticket: The SDK: a typed Manifest and Trusted context, queried with Drizzle)
+
+From this ticket on, an Application is a TypeScript project written with the SDK and Drizzle (ADR 0012, ADR 0014), built into the one classic script of "What an Application is handed". New fixture Applications are written this way; the raw host interface stays what the SDK itself is built on.
+
+### Where things are, and what the gate needs
+
+- The SDK is the npm package `@vm/sdk`, in `sdk/`. It has `drizzle-orm` as a peer dependency (0.45 or later, below 1.0).
+- The repository root is an npm workspace (`package.json`, `package-lock.json`): `sdk`, the type tests in `blackbox/sdk-types`, and the fixture projects under `blackbox/fixtures/sdk/`. One `node_modules` at the root, so there is one copy of `drizzle-orm`.
+- The gate needs Node 22 or later and `npm`. It runs `npm ci` when the lock file is newer than `node_modules`, then `npm test` at the root (the type tests, and the SDK's own checks), before `cargo test`. The black-box tests build their fixture projects with the SDK's tooling (below) and send the result to the real program.
+
+### A project
+
+Until the ticket on the project template, a project is these files:
+
+```
+manifest.ts                    export default defineManifest({ ... })
+src/index.ts                   export default defineApp(manifest, { fetch(request, ctx) { ... } })
+src/db/schema.ts               the own database's structure, as a Drizzle schema (optional)
+resources/<name>/schema.ts     a shared database's structure, as a Drizzle schema (pulled; hand-written until pull exists)
+resources/<name>/relations.ts  its Drizzle relations (optional)
+resources/<name>/index.ts      the generated link, below
+tsconfig.json                  with "paths": { "@vm/own-structure": ["./src/db/schema.ts"] }
+```
+
+The generated link from a Resource's name to its structure is exactly this file, with the name filled in (and without the `relations` lines when there is no `relations.ts`):
+
+```ts
+// Generated. Do not edit.
+import type * as schema from "./schema.ts";
+import type * as relations from "./relations.ts";
+
+declare module "@vm/sdk" {
+  interface SharedStructures {
+    "devops": typeof schema & typeof relations;
+  }
+}
+```
+
+### The Manifest
+
+```ts
+import { defineManifest } from "@vm/sdk";
+export default defineManifest({
+  name: "incident-board",
+  description: "Open incidents, for the people on call.",
+  resources: { devops: { kind: "postgres", access: "read" } },
+});
+```
+
+- `name`: as the API takes an Application's name. `description`: a string. `resources`: each `{ kind: "postgres", access: "read" | "write" }`; `structure` is not something an Application declares.
+- The argument of `defineManifest` must be a **plain literal**: object literals with plain or quoted keys, string literals, numbers, booleans, `null`, arrays, and `as const`. No identifier, call, spread, computed key, shorthand property or template with a substitution. The file may hold other code; it is never run.
+
+### The tooling
+
+`@vm/sdk` ships a Node program for the build side. It is what the tool's deploy will call; nothing of it is in an Application's bundle.
+
+- `node <sdk>/tooling/main.js manifest <project directory>` reads `manifest.ts` **without running it or anything it imports**, and prints on standard output, exit code 0:
+
+  ```json
+  { "name": "incident-board", "description": "...", "declared_access": { "resources": { "devops": { "kind": "postgres", "access": "read" } } } }
+  ```
+
+  `declared_access` is exactly what `POST /v1/applications/<name>/versions` takes.
+- A Manifest that cannot be taken: exit code 2, and on standard output `{ "error": { "reason", "message", "file", "line", "column" } }`. Reasons: `manifest-missing` (no `manifest.ts`, or no `defineManifest(...)` call in it, or more than one); `manifest-not-literal` (the message says what was found and where, and that the Manifest must be a plain literal because the platform reads it without running code); `manifest-invalid` (a plain literal of the wrong shape: the message names the field). `line` and `column` start at 1 and point at the offending expression.
+- `node <sdk>/tooling/main.js bundle <project directory>` prints the Application's bundle on standard output, exit code 0: one classic script with no `import` and no `export`, which assigns `globalThis.default`, containing the Application, the SDK's runtime, Drizzle and the structures. A project that does not build: exit code 2 and `{ "error": { "reason": "build-failed", "message", "errors": [ { "file", "line", "message" } ] } }`. `bundle` does not type-check; that is `tsc`'s job.
+- Any other failure: exit code 1 and a message on standard error.
+
+### What Application code is given
+
+```ts
+import { defineApp, Refused } from "@vm/sdk";
+import manifest from "../manifest.ts";
+
+export default defineApp(manifest, {
+  async fetch(request, ctx) {
+    const user = ctx.user();                    // { id, groups, db(name), ownDb() }
+    const open = await user.db("devops").select().from(incidents).where(eq(incidents.open, true));
+    await user.ownDb().insert(notes).values({ incident: 1, text: "seen" });   // as the User
+    await ctx.app().ownDb().update(counters).set({ n: sql`${counters.n} + 1` }); // as the Application
+    return Response.json(open);
+  },
+});
+```
+
+- `ctx.user()`: the User of the request in flight. `id: string`, `groups: readonly string[]`. (The sign-in ticket adds the email and the display name.)
+- `ctx.user().db(name)`: a shared database declared in the Manifest, as the User. `ctx.user().ownDb()`: the own database, as the User. `ctx.app().ownDb()`: the own database, as the Application. `ctx.app()` has nothing else.
+- A handle is a Drizzle database (`drizzle-orm/pg-proxy`), typed with that database's structure, relational queries (`db.query.<table>`) included.
+- **Every statement Drizzle sends is exactly one host operation**: `query` when the statement is a `select` (also one that begins with `with` and whose main statement is a `select`), `execute` otherwise; with `resource: <name>` or `own: true`, and `as: "user"` or `"application"`. So each shows as one Operation log entry, with the statement Drizzle built, without values.
+- The handles offer no raw SQL: there is no `execute` on them. (Drizzle's `sql` fragments inside a typed query remain, as ADR 0012 says; the database role is the boundary, not the types.) `transaction` comes with its own ticket.
+- A context holds no identity. A handle used when no request is in flight (at the top level, or after the response) is refused by the host with `no-request`, like any operation.
+
+### Values
+
+Rows come back as Drizzle's column types promise, and values written through Drizzle come back equal. At least:
+
+| Postgres | Drizzle column | In Application code |
+|---|---|---|
+| `integer`, `smallint`, `serial` | `integer()`, `smallint()`, `serial()` | number |
+| `bigint` | `bigint({ mode: "bigint" })` | `BigInt`, exact beyond 2^53 |
+| `bigint` | `bigint({ mode: "number" })` | number |
+| `numeric` | `numeric()` | string, every digit kept |
+| `real`, `double precision` | `real()`, `doublePrecision()` | number |
+| `boolean` | `boolean()` | boolean |
+| `text`, `varchar`, `uuid` | `text()`, `varchar()`, `uuid()` | string |
+| `timestamp`, `timestamptz` | `timestamp()`, `timestamp({ withTimezone: true })` | `Date`, the same instant to the millisecond, whatever the database's `TimeZone` |
+| the same | `{ mode: "string" }` | the text Postgres prints |
+| `date` | `date()` | `"YYYY-MM-DD"` |
+| `json`, `jsonb` | `json()`, `jsonb()` | the value: object, array, string, number, boolean or null, each as itself (a JSON string `"123"` stays the string `"123"`) |
+| `text[]`, `integer[]` and other arrays | `.array()` | array; elements with commas, quotes, backslashes, braces, empty strings and nulls intact |
+| any, null | | `null` |
+
+The same holds for parameters: in `values(...)`, `set(...)` and `where(...)`, and for what `returning()` gives. If the answers of "Operations on a shared database" must change for this, they change for the raw interface too and this document says how.
+
+### Refusals and failures
+
+- An operation the host refuses rejects with `Refused`: `error instanceof Refused` is true in Application code, also for an operation made through Drizzle (the SDK takes Drizzle's own error wrapper off). `error.refusal` is the refusal as the host gave it (`reason` and its details), `error.fix` the sentence that says what to do, `error.name` is `"Refused"`, and `error.message` is `"<reason>: <fix>"`.
+- Application code cannot make a `Refused`: `new Refused(...)` is a compile error, and at run time it throws a `TypeError`.
+- A `Refused` that escapes `fetch` becomes the response `403` with `content-type: application/json` and the body `{ "refusal": { ... }, "fix": "..." }`.
+- An operation that fails without being refused rejects with `OperationFailed` (also an `Error`, also `instanceof`-checkable through Drizzle): `error.kind` is the host's `error.kind` (`database`, `statement`, `limit`, `unavailable`, ...), `error.code` the SQLSTATE when `kind` is `database`, `error.detail` the host's whole error object. Escaping `fetch`, it is an uncaught error like any other: the program's fixed `500`.
+
+### The types
+
+The types are guidance for the Coding agent, not the boundary (ADR 0014). These are compile errors, and the tests assert the compiler's words, because a Coding agent reads them:
+
+- `ctx.user().db("payroll")` when the Manifest does not declare `payroll`: the message lists the declared names (`... is not assignable to parameter of type '"devops" | "hr"'`).
+- `insert`, `update` or `delete` through a handle declared at `read`: the message contains `'devops' is declared at 'read' in manifest.ts. Declare it at 'write' to change rows.`
+- `ctx.user().db("devops")` when `devops` is declared and its structure has no generated link: using the handle fails with a message that contains `The structure of 'devops' has not been pulled.`
+- `ctx.app().db(...)`: `Property 'db' does not exist on type 'ActingAsApplication'.`
+- `new Refused(...)`: the constructor is private.
+- `execute` on any handle: it does not exist.
+- A context cannot be made by Application code from an object literal.
+
+Forced past the types (a cast), each of these still ends at the host: `not-declared`, `declared-lower`, `not-own-database`.

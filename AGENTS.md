@@ -52,8 +52,11 @@ Work on `main` and push to `main`. No pull requests. No branch unless something 
 ```
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
+npm ci && npm test          # once the root npm workspace exists; needs Node 22 or later
 cargo test --workspace
 ```
+
+The SDK (`sdk/`), its type tests and the fixture projects written with it are one npm workspace at the repository root. The black-box tests build those fixture projects with the SDK's tooling and send them to the real program.
 
 ### Rust rules
 
