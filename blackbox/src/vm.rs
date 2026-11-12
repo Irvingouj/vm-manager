@@ -30,6 +30,10 @@ pub const LOG_TIMEOUT: Duration = Duration::from_secs(5);
 /// How many lines of the program's log a failure message shows.
 const LOG_LINES_SHOWN: usize = 200;
 
+/// How many lines of the test Postgres's server log a failure to start
+/// shows.
+const POSTGRES_LOG_LINES_SHOWN: usize = 40;
+
 /// The User who installs fixture Applications for the tests, and so is
 /// their creator and only Contributor.
 pub const INSTALLER: &str = "fixture-installer";
@@ -288,8 +292,9 @@ impl Vm {
                     }
                 };
                 let message = format!(
-                    "expected `vm serve` to write a `listening` record, but it {why}.\ncommand: {command_line}\nits standard error:\n{}",
-                    log.tail(LOG_LINES_SHOWN)
+                    "expected `vm serve` to write a `listening` record, but it {why}.\ncommand: {command_line}\nits standard error:\n{}\nthe last {POSTGRES_LOG_LINES_SHOWN} lines of the test Postgres's server log:\n{}",
+                    log.tail(LOG_LINES_SHOWN),
+                    crate::postgres::shared_log_tail(POSTGRES_LOG_LINES_SHOWN)
                 );
                 // End the process before the log reader is joined, so that
                 // the reader sees the end of the stream at once.

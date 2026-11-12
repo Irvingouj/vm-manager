@@ -25,7 +25,10 @@
 //! - [`own_database`] is what the tests of an Application's own database
 //!   share: migrations, Versions that carry them, operations on the own
 //!   database as either actor, and the own database looked at from the
-//!   harness's own superuser connection.
+//!   harness's own superuser connection;
+//! - [`history`] is what the tests of identity and Change history in the
+//!   own database share, and [`server_log`] reads the test Postgres's
+//!   server log as the statements each role sent.
 //!
 //! Every wait has a timeout, so a failing test fails within seconds and
 //! never hangs. Each test starts its own program on its own port, so tests
@@ -40,6 +43,7 @@
 
 pub mod api;
 pub mod expect;
+pub mod history;
 pub mod http;
 pub mod log;
 pub mod own_database;
@@ -47,6 +51,7 @@ pub mod postgres;
 pub mod program;
 pub mod records;
 pub mod scenario;
+pub mod server_log;
 pub mod shared_database;
 pub mod sql;
 pub mod vm;

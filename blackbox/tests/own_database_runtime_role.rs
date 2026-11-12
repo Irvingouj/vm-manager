@@ -254,17 +254,29 @@ fn as_the_runtime_role_postgres_refuses_every_change_of_structure() {
         platform_before,
         "expected the platform's schema vm unchanged after the runtime role's attempts"
     );
-    // Rows, it may change.
-    let rows = db.as_runtime(&[
+    // Rows, it may change, but only with an identity attached (CONTRACT.md,
+    // "A change with no identity fails"): from the harness, with none, a
+    // change of a captured table fails with VM001, not for want of a
+    // privilege (42501). Reading rows and using a sequence need no identity.
+    let changes = [
         "INSERT INTO items (title) VALUES ('as the runtime role') RETURNING written_by".to_owned(),
         "UPDATE seeded SET label = label WHERE id = 1".to_owned(),
-        "DELETE FROM items".to_owned(),
+        "DELETE FROM seeded WHERE id = 1".to_owned(),
+    ];
+    for (statement, result) in changes.iter().zip(db.as_runtime(&changes)) {
+        assert!(
+            matches!(&result, Err(e) if e.code == "VM001"),
+            "expected {statement:?} as the runtime role with no identity attached to fail with VM001 (allowed by its privileges, refused for want of an identity), got {result:?}"
+        );
+    }
+    let reads = [
+        "SELECT title FROM items".to_owned(),
         "SELECT nextval('items_id_seq')".to_owned(),
-    ]);
-    for result in &rows {
+    ];
+    for result in &db.as_runtime(&reads) {
         assert!(
             result.is_ok(),
-            "expected the runtime role to read and change rows, got {result:?}"
+            "expected the runtime role to read rows and use a sequence, got {result:?}"
         );
     }
 }

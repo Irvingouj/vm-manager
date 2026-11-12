@@ -883,11 +883,38 @@ pub fn free_port() -> Result<u16, String> {
 /// The instance all tests of this test binary share. It is never dropped;
 /// its guardian stops it when the test process exits.
 pub fn shared() -> &'static PrivatePostgres {
-    static SHARED: OnceLock<Result<PrivatePostgres, String>> = OnceLock::new();
     match SHARED.get_or_init(PrivatePostgres::start) {
         Ok(postgres) => postgres,
         Err(problem) => panic!("{problem}"),
     }
+}
+
+static SHARED: OnceLock<Result<PrivatePostgres, String>> = OnceLock::new();
+
+/// The instance of [`shared`] if it has been started, without starting
+/// it: for failure messages.
+pub fn shared_if_started() -> Option<&'static PrivatePostgres> {
+    SHARED.get().and_then(|started| started.as_ref().ok())
+}
+
+/// The last `lines` lines of the shared instance's server log, or a note
+/// saying why there are none: for failure messages.
+pub fn shared_log_tail(lines: usize) -> String {
+    let Some(postgres) = shared_if_started() else {
+        return "(the test Postgres was not started)\n".to_owned();
+    };
+    let log = postgres.server_log();
+    let all: Vec<&str> = log.lines().collect();
+    let from = all.len().saturating_sub(lines);
+    let mut tail = String::new();
+    for line in all.get(from..).unwrap_or_default() {
+        tail.push_str(line);
+        tail.push('\n');
+    }
+    if tail.is_empty() {
+        tail.push_str("(empty)\n");
+    }
+    tail
 }
 
 /// A second loopback address that is not 127.0.0.1, if this machine has one
