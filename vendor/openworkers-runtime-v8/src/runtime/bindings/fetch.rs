@@ -1,5 +1,6 @@
 #[cfg(feature = "invoke")]
 use super::super::scheduler::{InvokeFuture, PANICKED};
+use super::super::scheduler::FetchFuture;
 use super::super::{CallbackId, SchedulerMessage};
 use super::state::FetchState;
 use crate::v8_helpers::throw_type_error;
@@ -200,7 +201,7 @@ pub fn setup_fetch(
     callbacks: Rc<RefCell<HashMap<CallbackId, v8::Global<v8::Function>>>>,
     error_callbacks: Rc<RefCell<HashMap<CallbackId, v8::Global<v8::Function>>>>,
     next_id: Rc<RefCell<CallbackId>>,
-    #[cfg_attr(not(feature = "invoke"), allow(unused_variables))] ops: OperationsHandle,
+    ops: OperationsHandle,
     #[cfg(feature = "invoke")] inline_calls: Rc<std::cell::Cell<u32>>,
 ) {
     let state = FetchState {
@@ -209,7 +210,6 @@ pub fn setup_fetch(
         error_callbacks,
         next_id,
         frames: std::sync::Arc::default(),
-        #[cfg(feature = "invoke")]
         ops,
         #[cfg(feature = "invoke")]
         inline_calls,
@@ -238,9 +238,25 @@ pub fn setup_fetch(
 
             let callback_id = register_callbacks_with_error(&state, scope, resolve, reject);
 
+            // Enter the host now, inside the guest's call, so it sees the
+            // request in flight (see setup_invoke); the scheduler drives the rest
+            let ops = state.ops.clone();
+            let mut call: FetchFuture =
+                Box::pin(async move { ops.handle(openworkers_core::Operation::Fetch(request)).await });
+            let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+            let call: FetchFuture = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                call.as_mut().poll(&mut context)
+            })) {
+                Ok(std::task::Poll::Ready(result)) => Box::pin(async move { result }),
+                Ok(std::task::Poll::Pending) => call,
+                Err(_) => Box::pin(async {
+                    openworkers_core::OperationResult::Http(Err("fetch: the host panicked".into()))
+                }),
+            };
+
             let _ = state
                 .scheduler_tx
-                .send(SchedulerMessage::FetchStreaming(callback_id, request));
+                .send(SchedulerMessage::FetchStreaming(callback_id, call));
         },
     )
     .unwrap();
@@ -708,21 +724,24 @@ fn setup_invoke(scope: &mut v8::PinScope) {
                 }
             });
 
-            // Past the budget, the scheduler settles the call, so the turn ends
-            if state.inline_calls.get() >= MAX_INLINE_CALLS {
-                let _ = state
-                    .scheduler_tx
-                    .send(SchedulerMessage::BindingInvoke(callback_id, call));
-
-                return;
-            }
-
+            // Always poll once here, inside the guest's call, so the host's
+            // handler is entered while the request that made the call is the
+            // one in flight (a host reads its per-request state there). Past
+            // the budget, the scheduler still settles the call, so the turn ends.
             let mut context = std::task::Context::from_waker(std::task::Waker::noop());
             let polled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 call.as_mut().poll(&mut context)
             }));
 
             let result = match polled {
+                Ok(std::task::Poll::Ready(result)) if state.inline_calls.get() >= MAX_INLINE_CALLS => {
+                    let ready: InvokeFuture = Box::pin(async move { result });
+                    let _ = state
+                        .scheduler_tx
+                        .send(SchedulerMessage::BindingInvoke(callback_id, ready));
+
+                    return;
+                }
                 Ok(std::task::Poll::Ready(result)) => {
                     state.inline_calls.set(state.inline_calls.get() + 1);
 

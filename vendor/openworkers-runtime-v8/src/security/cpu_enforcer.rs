@@ -18,6 +18,10 @@
 //! most. Code that does not return to V8 (a Rust function that never ends) is
 //! cut when it returns.
 //!
+//! On Windows, the same watchdog reads the thread's CPU time with
+//! `GetThreadTimes`. That clock advances in scheduler ticks (about 15.6 ms by
+//! default), so a turn overshoots by one tick plus one watchdog tick at most.
+//!
 //! Elsewhere such a turn runs until the wall clock stops it.
 //!
 //! Wall-clock time alone does not catch a worker that computes without
@@ -37,8 +41,8 @@ pub struct CpuEnforcer {
     terminated: Arc<AtomicBool>,
     #[cfg(target_os = "linux")]
     timer: linux::Timer,
-    #[cfg(target_os = "macos")]
-    target: macos::Target,
+    #[cfg(any(target_os = "macos", windows))]
+    target: watchdog::Target,
 }
 
 impl CpuEnforcer {
@@ -56,10 +60,10 @@ impl CpuEnforcer {
         #[cfg(target_os = "linux")]
         let timer = linux::Timer::new(turn, request, Arc::clone(&terminated))?;
 
-        #[cfg(target_os = "macos")]
-        let target = macos::Target::new(turn, request, Arc::clone(&terminated));
+        #[cfg(any(target_os = "macos", windows))]
+        let target = watchdog::Target::new(turn, request, Arc::clone(&terminated));
 
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
         let _ = (turn, request);
 
         let budget = Duration::from_millis(timeout_ms);
@@ -71,7 +75,7 @@ impl CpuEnforcer {
             terminated,
             #[cfg(target_os = "linux")]
             timer,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", windows))]
             target,
         })
     }
@@ -83,9 +87,9 @@ impl CpuEnforcer {
         #[cfg(target_os = "linux")]
         self.timer.arm(self.remaining.get());
 
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         if let Some(started) = self.turn_started.get() {
-            macos::arm(&self.target, started, self.remaining.get());
+            watchdog::arm(&self.target, started, self.remaining.get());
         }
     }
 
@@ -94,8 +98,8 @@ impl CpuEnforcer {
         #[cfg(target_os = "linux")]
         self.timer.disarm();
 
-        #[cfg(target_os = "macos")]
-        macos::disarm();
+        #[cfg(any(target_os = "macos", windows))]
+        watchdog::disarm();
 
         let (Some(started), Some(now)) = (self.turn_started.take(), get_thread_cpu_time()) else {
             return;
@@ -275,8 +279,10 @@ mod linux {
     }
 }
 
-/// The CPU limit on macOS: a watchdog thread reads the CPU time of the threads
-/// that run a turn, and terminates the turn of a request that spent its budget.
+/// The CPU limit on macOS and Windows: a watchdog thread reads the CPU time of
+/// the threads that run a turn, and terminates the turn of a request that
+/// spent its budget. Only the reading of a thread's CPU time differs between
+/// the two, in `sys`.
 ///
 /// Each thread that runs a turn has one slot, made on its first turn and
 /// dropped with the thread. A turn arms the slot with its start, its budget
@@ -285,17 +291,18 @@ mod linux {
 /// turns.
 ///
 /// Failures fail closed: when the watchdog thread cannot start or has ended,
-/// a new request starts terminated. When `thread_info` fails for a slot, the
+/// a new request starts terminated. When reading the CPU time fails for a slot, the
 /// watchdog logs it once with its code and counts it; that turn is not cut,
 /// and the end-of-turn accounting still ends the request at its next turn.
-#[cfg(target_os = "macos")]
-pub(crate) mod macos {
+#[cfg(any(target_os = "macos", windows))]
+pub(crate) mod watchdog {
     use std::cell::RefCell;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
     use std::time::Duration;
 
     use super::Turn;
+    use sys::Port;
 
     /// The time between two checks, and so the overshoot of a turn at most.
     const TICK: Duration = Duration::from_millis(5);
@@ -303,11 +310,125 @@ pub(crate) mod macos {
     /// Ticks with nothing armed before the watchdog parks.
     const IDLE_TICKS: u32 = 100;
 
-    unsafe extern "C" {
-        fn mach_port_deallocate(
-            task: libc::mach_port_t,
-            name: libc::mach_port_t,
-        ) -> libc::kern_return_t;
+    /// macOS: the Mach port of a thread, read with `thread_info`.
+    #[cfg(target_os = "macos")]
+    mod sys {
+        unsafe extern "C" {
+            fn mach_port_deallocate(
+                task: libc::mach_port_t,
+                name: libc::mach_port_t,
+            ) -> libc::kern_return_t;
+        }
+
+        pub type Port = libc::mach_port_t;
+
+        /// A send right to the calling thread, released with `release`.
+        pub fn this_thread() -> Port {
+            // SAFETY: mach_thread_self has no precondition; the slot keeps
+            // the send right and deallocates it when it drops
+            #[allow(deprecated)]
+            unsafe {
+                libc::mach_thread_self()
+            }
+        }
+
+        pub fn release(port: Port) {
+            // SAFETY: the port is the send right that mach_thread_self gave
+            // the slot; nothing uses it after the slot drops
+            #[allow(deprecated)]
+            unsafe {
+                mach_port_deallocate(libc::mach_task_self(), port)
+            };
+        }
+
+        /// The user and system CPU time of a thread, in microseconds, or the
+        /// kern_return_t of the failure.
+        pub fn cpu_time_or_code(port: Port) -> Result<u64, i64> {
+            // SAFETY: thread_basic_info is plain integers, valid when all zero
+            let mut info: libc::thread_basic_info = unsafe { std::mem::zeroed() };
+            let mut count = libc::THREAD_BASIC_INFO_COUNT;
+
+            // SAFETY: info is a thread_basic_info and count its size in integer_t
+            let code = unsafe {
+                libc::thread_info(
+                    port,
+                    libc::THREAD_BASIC_INFO as libc::thread_flavor_t,
+                    &mut info as *mut _ as libc::thread_info_t,
+                    &mut count,
+                )
+            };
+
+            if code != libc::KERN_SUCCESS {
+                return Err(code as i64);
+            }
+
+            let micros = |time: libc::time_value_t| {
+                time.seconds.max(0) as u64 * 1_000_000 + time.microseconds.max(0) as u64
+            };
+
+            Ok(micros(info.user_time) + micros(info.system_time))
+        }
+    }
+
+    /// Windows: a handle to a thread, read with `GetThreadTimes`.
+    #[cfg(windows)]
+    mod sys {
+        use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, GetLastError, HANDLE};
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentThreadId, GetThreadTimes, OpenThread, THREAD_QUERY_LIMITED_INFORMATION,
+        };
+
+        /// The HANDLE as an integer, so that a slot is Send and Sync. Zero
+        /// when OpenThread failed: reading it then fails, and is logged.
+        pub type Port = usize;
+
+        /// A real handle to the calling thread (not the pseudo-handle of
+        /// GetCurrentThread, which means "the caller" on the watchdog
+        /// thread), closed with `release`.
+        pub fn this_thread() -> Port {
+            // SAFETY: OpenThread has no precondition; a failure returns null
+            unsafe { OpenThread(THREAD_QUERY_LIMITED_INFORMATION, 0, GetCurrentThreadId()) as Port }
+        }
+
+        pub fn release(port: Port) {
+            if port != 0 {
+                // SAFETY: the handle came from OpenThread and is closed once,
+                // when its slot drops
+                unsafe { CloseHandle(port as HANDLE) };
+            }
+        }
+
+        /// The user and kernel CPU time of a thread, in microseconds, or the
+        /// GetLastError code of the failure.
+        pub fn cpu_time_or_code(port: Port) -> Result<u64, i64> {
+            let zero = FILETIME {
+                dwLowDateTime: 0,
+                dwHighDateTime: 0,
+            };
+            let (mut creation, mut exit, mut kernel, mut user) = (zero, zero, zero, zero);
+
+            // SAFETY: the four pointers are to live FILETIMEs; a bad handle
+            // makes the call fail, it does not write
+            let ok = unsafe {
+                GetThreadTimes(
+                    port as HANDLE,
+                    &mut creation,
+                    &mut exit,
+                    &mut kernel,
+                    &mut user,
+                )
+            };
+
+            if ok == 0 {
+                // SAFETY: GetLastError has no precondition
+                return Err(unsafe { GetLastError() } as i64);
+            }
+
+            let hundred_ns =
+                |t: FILETIME| ((t.dwHighDateTime as u64) << 32) | t.dwLowDateTime as u64;
+
+            Ok((hundred_ns(kernel) + hundred_ns(user)) / 10)
+        }
     }
 
     /// What a turn stops when it spends its budget.
@@ -355,19 +476,14 @@ pub(crate) mod macos {
     }
 
     struct Slot {
-        port: libc::mach_port_t,
+        port: Port,
         armed: Mutex<Option<Armed>>,
         errors: AtomicU64,
     }
 
     impl Drop for Slot {
         fn drop(&mut self) {
-            // SAFETY: the port is the send right that mach_thread_self gave
-            // this slot; nothing uses it after the slot drops
-            #[allow(deprecated)]
-            unsafe {
-                mach_port_deallocate(libc::mach_task_self(), self.port)
-            };
+            sys::release(self.port);
         }
     }
 
@@ -410,10 +526,7 @@ pub(crate) mod macos {
         SLOT.with(|slot| {
             slot.borrow_mut()
                 .get_or_insert_with(|| {
-                    // SAFETY: mach_thread_self has no precondition; the slot
-                    // keeps the send right and deallocates it when it drops
-                    #[allow(deprecated)]
-                    let port = unsafe { libc::mach_thread_self() };
+                    let port = sys::this_thread();
                     let slot = Arc::new(Slot {
                         port,
                         armed: Mutex::new(None),
@@ -431,9 +544,10 @@ pub(crate) mod macos {
     }
 
     /// Arms the slot of this thread for a turn that started at `start`, the CPU
-    /// time of the thread from `get_thread_cpu_time` (clock_gettime), with
-    /// `budget` left. The watchdog compares it with `thread_info`; the two
-    /// agree within some microseconds.
+    /// time of the thread from `get_thread_cpu_time`, with `budget` left. The
+    /// watchdog compares it with `sys::cpu_time_or_code`. On macOS the two
+    /// are clock_gettime and thread_info, which agree within some
+    /// microseconds; on Windows both are GetThreadTimes.
     pub fn arm(target: &Target, start: Duration, budget: Duration) {
         let slot = slot();
 
@@ -464,36 +578,10 @@ pub(crate) mod macos {
         });
     }
 
-    /// The user and system CPU time of a thread, in microseconds.
+    /// The CPU time of a thread, in microseconds.
     #[cfg(test)]
-    fn cpu_time(port: libc::mach_port_t) -> Option<u64> {
-        cpu_time_or_code(port).ok()
-    }
-
-    fn cpu_time_or_code(port: libc::mach_port_t) -> Result<u64, libc::kern_return_t> {
-        // SAFETY: thread_basic_info is plain integers, valid when all zero
-        let mut info: libc::thread_basic_info = unsafe { std::mem::zeroed() };
-        let mut count = libc::THREAD_BASIC_INFO_COUNT;
-
-        // SAFETY: info is a thread_basic_info and count its size in integer_t
-        let code = unsafe {
-            libc::thread_info(
-                port,
-                libc::THREAD_BASIC_INFO as libc::thread_flavor_t,
-                &mut info as *mut _ as libc::thread_info_t,
-                &mut count,
-            )
-        };
-
-        if code != libc::KERN_SUCCESS {
-            return Err(code);
-        }
-
-        let micros = |time: libc::time_value_t| {
-            time.seconds.max(0) as u64 * 1_000_000 + time.microseconds.max(0) as u64
-        };
-
-        Ok(micros(info.user_time) + micros(info.system_time))
+    fn cpu_time(port: Port) -> Option<u64> {
+        sys::cpu_time_or_code(port).ok()
     }
 
     /// Checks one slot: terminates its turn when the budget is spent. Answers
@@ -506,7 +594,7 @@ pub(crate) mod macos {
             return false;
         };
 
-        match cpu_time_or_code(slot.port) {
+        match sys::cpu_time_or_code(slot.port) {
             Ok(now) => {
                 if now.saturating_sub(armed.start) >= armed.budget
                     && !armed.target.terminated.swap(true, Ordering::SeqCst)
@@ -521,7 +609,7 @@ pub(crate) mod macos {
             Err(code) => {
                 if slot.errors.fetch_add(1, Ordering::Relaxed) == 0 {
                     tracing::error!(
-                        "CPU watchdog: thread_info failed with {code}; this turn is not cut"
+                        "CPU watchdog: reading the thread's CPU time failed with {code}; this turn is not cut"
                     );
                 }
             }
