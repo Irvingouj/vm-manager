@@ -1,0 +1,97 @@
+mod aes;
+mod digest;
+mod ecdsa;
+mod hmac;
+mod pbkdf2;
+mod random;
+mod rsa;
+
+/// Copies a Uint8Array argument out of the V8 heap, or names the argument
+/// that is not one.
+pub(super) fn uint8_array_arg(
+    op: &str,
+    args: &v8::FunctionCallbackArguments,
+    index: i32,
+) -> Result<Vec<u8>, String> {
+    let Ok(array) = v8::Local::<v8::Uint8Array>::try_from(args.get(index)) else {
+        return Err(format!("{op}: argument {index} is not a Uint8Array"));
+    };
+    let mut bytes = vec![0u8; array.byte_length()];
+    array.copy_contents(&mut bytes);
+
+    Ok(bytes)
+}
+
+/// Setup crypto global object with getRandomValues and subtle
+pub fn setup_crypto(scope: &mut v8::PinScope) {
+    let context = scope.get_current_context();
+    let global = context.global(scope);
+
+    // Create crypto object and add it to global FIRST
+    let crypto_obj = v8::Object::new(scope);
+    let crypto_key = v8::String::new(scope, "crypto").unwrap();
+    global.set(scope, crypto_key.into(), crypto_obj.into());
+
+    // Create crypto.subtle object
+    let subtle_obj = v8::Object::new(scope);
+    let subtle_key = v8::String::new(scope, "subtle").unwrap();
+    crypto_obj.set(scope, subtle_key.into(), subtle_obj.into());
+
+    // Define the crypto classes (must be before importKey implementations)
+    setup_crypto_classes(scope);
+
+    // crypto.getRandomValues + crypto.randomUUID
+    random::setup_get_random_values(scope, crypto_obj);
+    random::setup_random_uuid(scope, crypto_obj);
+
+    // crypto.subtle.digest
+    digest::setup_digest(scope, subtle_obj);
+
+    // crypto.subtle.sign/verify/importKey, chained: HMAC -> ECDSA -> RSA -> PBKDF2 -> AES
+    hmac::setup_hmac(scope, subtle_obj);
+    ecdsa::setup_ecdsa(scope, subtle_obj);
+    rsa::setup_rsa(scope, subtle_obj);
+    pbkdf2::setup_pbkdf2(scope, subtle_obj);
+    aes::setup_aes(scope, subtle_obj);
+}
+
+/// Define the globalThis crypto classes and a helper to create keys from importKey.
+fn setup_crypto_classes(scope: &mut v8::PinScope) {
+    let code = r#"
+        globalThis.Crypto = class Crypto {
+            constructor() {
+                throw new TypeError('Illegal constructor');
+            }
+        };
+
+        globalThis.SubtleCrypto = class SubtleCrypto {
+            constructor() {
+                throw new TypeError('Illegal constructor');
+            }
+        };
+
+        // crypto and crypto.subtle are native plain objects, so instanceof only
+        // answers once they carry the matching prototype.
+        Object.setPrototypeOf(crypto, Crypto.prototype);
+        Object.setPrototypeOf(crypto.subtle, SubtleCrypto.prototype);
+
+        globalThis.CryptoKey = class CryptoKey {
+            constructor(type, extractable, algorithm, usages, keyData) {
+                this.type = type;
+                this.extractable = extractable;
+                this.algorithm = algorithm;
+                this.usages = Object.freeze([...usages]);
+                this.__keyData = keyData;
+            }
+        };
+
+        // Helper used by all importKey implementations
+        globalThis.__createCryptoKey = function(type, extractable, algorithm, usages, keyData) {
+            return new CryptoKey(type, extractable, algorithm, usages, keyData);
+        };
+    "#;
+
+    let code_str = v8::String::new(scope, code).unwrap();
+    let script = v8::Script::compile(scope, code_str, None).unwrap();
+    script.run(scope).unwrap();
+}

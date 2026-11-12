@@ -1,0 +1,296 @@
+//! One answer per callback message, whoever owns the tables.
+//!
+//! Three event loops answer the same messages: the runtime drains its
+//! channel, the runtime steps one message, and a pooled request does the same
+//! per context. What differed was only where the tables live.
+
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::pin::pin;
+use std::rc::Rc;
+use std::sync::Arc;
+
+use openworkers_core::D1Result;
+use openworkers_core::DatabaseResult;
+use openworkers_core::KvResult;
+use openworkers_core::ObjectStorageResult;
+use openworkers_core::StorageResult;
+
+use super::CallbackId;
+use super::CallbackMessage;
+use super::WebSocketId;
+use super::callback_handlers;
+use super::dispatch_binding_callbacks;
+use super::dispatch_ws_event;
+use super::stream_manager::StreamManager;
+
+type Callbacks = Rc<RefCell<HashMap<CallbackId, v8::Global<v8::Function>>>>;
+type WebSocketCallbacks = Rc<RefCell<HashMap<WebSocketId, v8::Global<v8::Function>>>>;
+
+/// What guest code did when called.
+pub(crate) enum Guest {
+    Returned,
+    /// Threw; the value goes to the other half of a resolve/reject pair.
+    Threw(v8::Global<v8::Value>),
+    /// The isolate is being terminated: run no more guest code.
+    Terminated,
+}
+
+/// Call guest code under a TryCatch. A throw that escaped a bare call was
+/// dropped along with the promise it owed, and a termination caught by a
+/// TryCatch is cleared when it drops, so that one is thrown again instead.
+pub(crate) fn call_guest(
+    scope: &mut v8::PinScope,
+    function: v8::Local<v8::Function>,
+    args: &[v8::Local<v8::Value>],
+) -> Guest {
+    let tc = pin!(v8::TryCatch::new(scope));
+    let mut tc = tc.init();
+    let recv = v8::undefined(&tc);
+    function.call(&tc, recv.into(), args);
+
+    if tc.has_terminated() {
+        tc.rethrow();
+        return Guest::Terminated;
+    }
+
+    let Some(exception) = tc.exception() else {
+        return Guest::Returned;
+    };
+
+    let text = tc
+        .message()
+        .map(|m| m.get(&tc).to_rust_string_lossy(&tc))
+        .unwrap_or_else(|| "unknown exception".to_string());
+    tracing::warn!("guest callback threw: {text}");
+
+    Guest::Threw(v8::Global::new(&tc, exception))
+}
+
+/// The tables a dispatch reaches for.
+pub(crate) struct Tables<'a> {
+    pub fetch: &'a Callbacks,
+    pub fetch_error: &'a Callbacks,
+    pub stream: &'a Callbacks,
+    pub ws_event: &'a WebSocketCallbacks,
+    pub stream_manager: &'a Arc<StreamManager>,
+}
+
+/// Answer one message, inside a scope whose context is already entered.
+pub(crate) fn dispatch(
+    scope: &mut v8::ContextScope<v8::HandleScope>,
+    tables: &Tables<'_>,
+    msg: CallbackMessage,
+) {
+    match msg {
+        CallbackMessage::ExecuteTimeout(callback_id)
+        | CallbackMessage::ExecuteInterval(callback_id) => {
+            let context = scope.get_current_context();
+            let global = context.global(scope);
+            let key = v8::String::new(scope, "__executeTimer").unwrap();
+
+            if let Some(execute_fn_val) = global.get(scope, key.into())
+                && execute_fn_val.is_function()
+            {
+                let execute_fn: v8::Local<v8::Function> = execute_fn_val.try_into().unwrap();
+                let id_val = v8::Number::new(scope, callback_id as f64);
+                call_guest(scope, execute_fn, &[id_val.into()]);
+            }
+        }
+
+        // A fetch settles once, so the side that does not answer is dropped with it.
+        CallbackMessage::FetchError(callback_id, error_msg) => {
+            tables.fetch.borrow_mut().remove(&callback_id);
+            let callback = tables.fetch_error.borrow_mut().remove(&callback_id);
+
+            if let Some(callback) = callback {
+                let message = v8::String::new(scope, &error_msg).unwrap();
+                let error = v8::Exception::error(scope, message);
+                let callback = v8::Local::new(scope, &callback);
+                call_guest(scope, callback, &[error]);
+            }
+        }
+
+        CallbackMessage::FetchStreamingSuccess(callback_id, meta, stream_id) => {
+            let callback = tables.fetch.borrow_mut().remove(&callback_id);
+            let on_error = tables.fetch_error.borrow_mut().remove(&callback_id);
+
+            if let Some(callback) = callback {
+                let meta_obj = v8::Object::new(scope);
+                callback_handlers::populate_fetch_meta(scope, meta_obj, &meta, stream_id);
+                let callback = v8::Local::new(scope, &callback);
+
+                // Resolving builds the Response, which can refuse what it is given.
+                if let (Guest::Threw(thrown), Some(on_error)) =
+                    (call_guest(scope, callback, &[meta_obj.into()]), on_error)
+                {
+                    let on_error = v8::Local::new(scope, &on_error);
+                    let exception = v8::Local::new(scope, &thrown);
+                    call_guest(scope, on_error, &[exception]);
+                }
+            }
+        }
+
+        CallbackMessage::BindingUpgrade(callback_id, meta, ws_id) => {
+            let callback = tables.fetch.borrow_mut().remove(&callback_id);
+            tables.fetch_error.borrow_mut().remove(&callback_id);
+
+            if let Some(callback) = callback {
+                let meta_obj = v8::Object::new(scope);
+                callback_handlers::populate_upgrade_meta(scope, meta_obj, &meta, ws_id);
+                let callback = v8::Local::new(scope, &callback);
+                call_guest(scope, callback, &[meta_obj.into()]);
+            }
+        }
+
+        CallbackMessage::StreamChunk(callback_id, chunk) => {
+            let callback = tables.stream.borrow_mut().remove(&callback_id);
+
+            if let Some(callback) = callback {
+                let result_obj = v8::Object::new(scope);
+                callback_handlers::populate_stream_chunk_result(scope, result_obj, chunk);
+                let callback = v8::Local::new(scope, &callback);
+                call_guest(scope, callback, &[result_obj.into()]);
+            }
+        }
+
+        CallbackMessage::StorageResult(callback_id, result) => {
+            let (error_msg, value) = if let StorageResult::Error(err) = &result {
+                (Some(err.as_str()), None)
+            } else {
+                let result_obj = v8::Object::new(scope);
+                callback_handlers::populate_storage_result(
+                    scope,
+                    result_obj,
+                    result,
+                    tables.stream_manager,
+                );
+
+                (None, Some(result_obj.into()))
+            };
+
+            settle(scope, tables, callback_id, error_msg, value);
+        }
+
+        CallbackMessage::KvResult(callback_id, result) => {
+            let (error_msg, value) = if let KvResult::Error(err) = &result {
+                (Some(err.as_str()), None)
+            } else {
+                let result_obj = v8::Object::new(scope);
+                callback_handlers::populate_kv_result(scope, result_obj, result);
+
+                (None, Some(result_obj.into()))
+            };
+
+            settle(scope, tables, callback_id, error_msg, value);
+        }
+
+        CallbackMessage::DatabaseResult(callback_id, result) => {
+            let (error_msg, value) = if let DatabaseResult::Error(err) = &result {
+                (Some(err.as_str()), None)
+            } else {
+                let result_obj = v8::Object::new(scope);
+                callback_handlers::populate_database_result(scope, result_obj, result);
+
+                (None, Some(result_obj.into()))
+            };
+
+            settle(scope, tables, callback_id, error_msg, value);
+        }
+
+        #[cfg(feature = "invoke")]
+        CallbackMessage::InvokeResult(callback_id, result) => {
+            super::settle_invoke(scope, callback_id, tables.fetch, tables.fetch_error, result);
+        }
+
+        CallbackMessage::D1Result(callback_id, result) => {
+            let (error_msg, value) = if let D1Result::Error(err) = &result {
+                (Some(callback_handlers::d1_error_message(err)), None)
+            } else {
+                let result_obj = v8::Object::new(scope);
+                callback_handlers::populate_d1_result(scope, result_obj, result);
+
+                (None, Some(result_obj.into()))
+            };
+
+            settle(scope, tables, callback_id, error_msg.as_deref(), value);
+        }
+
+        CallbackMessage::ObjectStorage(callback_id, result) => {
+            let value = match result {
+                ObjectStorageResult::Error(message) => {
+                    settle(scope, tables, callback_id, Some(&message), None);
+                    return;
+                }
+                ObjectStorageResult::Values(values) => {
+                    let values: Vec<v8::Local<v8::Value>> = values
+                        .iter()
+                        .map(|bytes| match bytes {
+                            Some(bytes) => stored_value(scope, bytes),
+                            None => v8::undefined(scope).into(),
+                        })
+                        .collect();
+
+                    v8::Array::new_with_elements(scope, &values).into()
+                }
+                ObjectStorageResult::Entries(entries) => {
+                    let entries: Vec<v8::Local<v8::Value>> = entries
+                        .iter()
+                        .map(|(key, bytes)| {
+                            let key = v8::String::new(scope, key).unwrap().into();
+                            let value = stored_value(scope, bytes);
+
+                            v8::Array::new_with_elements(scope, &[key, value]).into()
+                        })
+                        .collect();
+
+                    v8::Array::new_with_elements(scope, &entries).into()
+                }
+                ObjectStorageResult::Written { deleted } => {
+                    v8::Number::new(scope, deleted as f64).into()
+                }
+                ObjectStorageResult::Alarm(Some(at)) => v8::Number::new(scope, at as f64).into(),
+                ObjectStorageResult::Alarm(None) => v8::null(scope).into(),
+            };
+
+            settle(scope, tables, callback_id, None, Some(value));
+        }
+
+        CallbackMessage::WebSocketConnected(callback_id, ws_id) => {
+            let ws_id_val: v8::Local<v8::Value> = v8::Number::new(scope, ws_id as f64).into();
+
+            settle(scope, tables, callback_id, None, Some(ws_id_val));
+        }
+
+        CallbackMessage::WebSocketConnectError(callback_id, error_msg) => {
+            settle(scope, tables, callback_id, Some(&error_msg), None);
+        }
+
+        CallbackMessage::WebSocketEvent(ws_id, incoming) => {
+            dispatch_ws_event(scope, tables.ws_event, ws_id, incoming);
+        }
+    }
+}
+
+/// A stored value, or undefined for bytes that do not read back, which only
+/// a store that changed them can give.
+fn stored_value<'s>(scope: &mut v8::PinScope<'s, '_>, bytes: &[u8]) -> v8::Local<'s, v8::Value> {
+    super::bindings::deserialize(scope, bytes).unwrap_or_else(|| v8::undefined(scope).into())
+}
+
+fn settle(
+    scope: &mut v8::PinScope,
+    tables: &Tables<'_>,
+    callback_id: CallbackId,
+    error_msg: Option<&str>,
+    value: Option<v8::Local<v8::Value>>,
+) {
+    dispatch_binding_callbacks(
+        scope,
+        callback_id,
+        tables.fetch,
+        tables.fetch_error,
+        error_msg,
+        value,
+    );
+}
