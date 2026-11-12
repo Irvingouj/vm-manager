@@ -201,7 +201,7 @@ So verifying identity costs about 28–38 µs **per row**, and bulk writes need 
 ## 5. Still unknown
 
 - Cost over a real network, and with PgBouncer (`DISCARD ALL` and the pinned interactive transaction will affect it).
-- Whether server logging (`log_statement` or the duration log) records the attach secret, since it is a bind parameter. **Not verified, and a real risk.**
+- Whether server logging records the attach secret, since it is a bind parameter. **Checked afterwards by the driving session on Postgres 18:** with `log_statement=all` the server log contains the bind parameter's value (`DETAIL:  Parameters: $1 = '...'`); after `log_parameter_max_length=0` the same statement is logged without it. So on a database where statement logging is on, the secret reaches the server log unless that setting is applied, or the secret is passed another way. The duration log and `log_parameter_max_length_on_error` were not checked.
 - Statement-level or cached identity checking to cut the per-row cost.
 - A function allow-list and IT-side REVOKEs to close the `ts_stat` path.
 - A cap on single huge values that applies before the value is fully received.
