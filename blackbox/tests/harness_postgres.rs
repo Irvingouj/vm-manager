@@ -32,8 +32,8 @@ fn a_private_postgres_starts_on_loopback_and_is_gone_once_dropped() {
     let root = postgres.root().to_path_buf();
     assert!(postgres.is_running(), "expected the server to be running");
     assert!(
-        root.starts_with(std::env::temp_dir()),
-        "expected the data under the system temp directory, got {}",
+        root.starts_with("/dev/shm") || root.starts_with(std::env::temp_dir()),
+        "expected the data in memory (/dev/shm) or under the system temp directory, got {}",
         root.display()
     );
     TcpStream::connect_timeout(&([127, 0, 0, 1], port).into(), Duration::from_secs(5))

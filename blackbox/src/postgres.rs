@@ -591,6 +591,20 @@ impl fmt::Debug for PrivatePostgres {
     }
 }
 
+/// Where an instance's files go: memory (`/dev/shm`) when the machine has
+/// it, else the temporary directory. On a disk, the instance's writes wait
+/// behind whatever else is being written out, and right after a large build
+/// that made the first connections to it take seconds: `vm serve` then gave
+/// up at start ("opening a connection took longer than 5000 ms").
+fn scratch_dir() -> PathBuf {
+    let memory = Path::new("/dev/shm");
+    if memory.is_dir() {
+        memory.to_path_buf()
+    } else {
+        std::env::temp_dir()
+    }
+}
+
 impl PrivatePostgres {
     /// Runs `initdb` into a new directory under the system temp directory
     /// and starts the server on a free 127.0.0.1 port. It listens on no
@@ -603,7 +617,7 @@ impl PrivatePostgres {
     /// address (on Linux all of 127.0.0.0/8 is loopback).
     pub fn start_also_on(also_on: Option<Ipv4Addr>) -> Result<Self, String> {
         let binaries = binaries();
-        let root = std::env::temp_dir().join(format!(
+        let root = scratch_dir().join(format!(
             "vm-blackbox-pg-{}-{}",
             std::process::id(),
             unique()
