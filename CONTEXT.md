@@ -18,6 +18,20 @@ _Avoid_: Binding (the Cloudflare and OpenWorkers term), service, backend
 The platform-created value that says which User, Application and request an operation belongs to. Application code receives it and cannot construct one.
 _Avoid_: Session, token, credentials
 
+### Authorization
+
+**Grant**:
+IT's statement that a User, a group or an Application may reach a Resource at a given access level.
+_Avoid_: Permission, ACL, role
+
+**Delegated grant**:
+A Grant that lets an Application reach a Resource on behalf of the User it is serving. It only takes effect where that User also holds a Grant on the same Resource.
+_Avoid_: App permission, on-behalf-of token
+
+**Autonomous grant**:
+A Grant, given separately and explicitly by IT, that lets an Application reach a Resource as itself, whatever the User it is serving may access.
+_Avoid_: Service account, elevated access, bypass
+
 ### People
 
 **Builder**:
