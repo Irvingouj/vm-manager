@@ -100,7 +100,7 @@ The SDK wraps this later; Application authors never write it by hand. Fixture Ap
 
 ### Refusal reasons
 
-Kebab-case strings, the same everywhere a refusal is reported (to Application code, in the log, later in the Operation log and in the tool's output). Known so far: `no-request`, `unknown-operation`, `not-declared`, `not-registered`, `declared-lower`, `no-grant`, `log-unavailable`. Reserved for the ticket that introduces it: `not-own-database`.
+Kebab-case strings, the same everywhere a refusal is reported (to Application code, in the log, later in the Operation log and in the tool's output). Known so far: `no-request`, `unknown-operation`, `not-own-database`, `not-declared`, `not-registered`, `declared-lower`, `no-grant`, `log-unavailable`.
 
 ## The platform database (ticket: Applications and their Versions live in the platform database)
 
@@ -128,7 +128,9 @@ An answer that is not a success is:
 | 404 | No such Application, Version or path | `not-found` |
 | 405 | A path the API has, with a method it does not have there | `method-not-allowed` |
 | 409 | The Application's name is taken | `name-taken` |
+| 409 | A Version's migrations do not continue the Application's earlier ones | `migrations-diverged` |
 | 413 | A body larger than 16 MiB (exactly 16 MiB is accepted) | `too-large` |
+| 422 | A Version's migration failed in the database | `migration-failed` |
 | 408 | The body did not arrive in time | `timed-out` |
 | 503 | The platform database cannot be reached or did not answer in time | `unavailable` |
 
@@ -342,3 +344,90 @@ Before a statement is sent, the host parses it with Postgres's own parser and re
 - Answer: `{ error: { kind: "statement", reason: "several-statements" | "unparsed" | "kind-not-allowed" | "function-not-allowed" | "relation-not-allowed", message } }`. Nothing is sent to the shared database.
 - The Operation log entry has outcome `failed` and `error` `statement`; its `statement` is recorded without values as always (`<unparsed>` when it could not be parsed).
 - This replaces what the first ticket did with a statement that cannot be parsed: it is no longer sent for Postgres to refuse.
+
+## The Application's own database (ticket: An Application's own database)
+
+### Migrations travel with the Version
+
+`POST /v1/applications/<name>/versions` takes one more field, optional:
+
+```json
+"migrations": [ { "name": "0000_first_tables", "sql": "<the file drizzle-kit generated, as text>" }, ... ]
+```
+
+- The list is the Application's whole history of migrations, in order, as `drizzle-kit` generates them (statements separated by its `--> statement-breakpoint` line). A name is 1 to 200 characters of letters, digits, `_` and `-`, unique in the list. Otherwise `400 malformed`.
+- A Version's list must begin with exactly the previous Version's list (same names, same text) and may add to it. Otherwise `409 migrations-diverged`, and nothing changes. Leaving the field out means an empty list.
+- The Version's record gains `"migrations": [ { "name", "sha256" } ]`.
+
+### What happens when a Version is sent
+
+1. With an Application's first Version, the platform creates the Application's own database on the platform's Postgres instance, whether or not there are migrations.
+2. The migrations not yet applied are applied, in order, in **one transaction**, by the platform; the platform runs no `drizzle-kit` and no Node.
+3. Only then is the Version recorded and made the serving one, and the `201` answered.
+
+If a migration fails: the transaction is rolled back, so the own database is exactly as before; no Version is recorded and no number is used up; the previous Version goes on serving; the answer is
+
+```json
+{ "error": { "reason": "migration-failed", "message": "...", "migration": "<name>",
+             "code": "<SQLSTATE>", "database_message": "<Postgres's message>" } }
+```
+
+with status `422`.
+
+### What it looks like in Postgres
+
+For an Application the platform numbers `n`, with `<p>` the platform database's name:
+
+- database `<p>_app_<n>`, whose comment is `vm application <name>`;
+- role `<p>_app_<n>_owner`: owns every object in it and applies migrations;
+- role `<p>_app_<n>_runtime`: what Application code runs as. It owns nothing. It may read and change rows in the tables the migrations made (`SELECT`, `INSERT`, `UPDATE`, `DELETE`, and use of their sequences), in tables made by later migrations too, and nothing else: it cannot create, alter or drop anything, not even temporary tables; it cannot `TRUNCATE`; it cannot connect to any other database of the instance, and no other Application's roles can connect to this one.
+- Their passwords are the platform's own and never appear in an answer, a log record or an error message.
+- The platform needs only what `VM_DATABASE_URL`'s role was promised: creating databases and roles. It does not need a superuser.
+
+### Operations on the own database
+
+`query` and `execute` take a target and an actor:
+
+```js
+env.VM.invoke("query",   { own: true, as: "user",        sql, params })
+env.VM.invoke("execute", { own: true, as: "application", sql, params })
+env.VM.invoke("query",   { resource: "devops", sql, params })          // as before; `as` defaults to "user"
+```
+
+- Exactly one of `own: true` and `resource` names the target; both or neither is `malformed`. `as` is `"user"` (the default) or `"application"`; anything else is `malformed`.
+- On the own database no Declared access and no Grant is needed: being served the Application is enough. Both actors are allowed whenever a request is in flight.
+- **Acting as the Application is only for the own database.** `as: "application"` with a `resource` is refused with `not-own-database` (`refusal.resource` names it), whatever is declared or granted: Grants are held by Users. It is checked right after `no-request`, before anything about the Resource.
+- Everything else is as on a shared database: `query` runs in a read-only transaction and `execute` in a read-write one, as the runtime role; one statement; the statement check; the limits; the answers and errors; a connection returned only clean.
+- The identity label has a fourth setting, `vm.actor`: `user` or `application`. `vm.user` is the User in flight for both actors. (The ticket on identity and Change history replaces the label in own databases with one that cannot be forged.)
+- Before an Application's first Version there is no own database; there is also no Version to serve, so no operation can reach that state.
+
+### In the Operation log
+
+Every entry gains `"actor": "user" | "application"` and `"own_database": true | false`. For the own database `resource` is null. `user` is the User in flight for both actors.
+
+### The Authorization decision
+
+The interface of `authz` gains the actor and the own database:
+
+```rust
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Actor { User, Application }
+
+pub struct Question<'a> {
+    pub request_in_flight: bool,
+    /// Who the operation acts as.
+    pub actor: Actor,
+    /// Is the target the Application's own database? When true, `declared`,
+    /// `registered`, `grants` and `groups` do not matter.
+    pub own_database: bool,
+    pub groups: &'a [&'a str],
+    pub declared: Option<AccessLevel>,
+    pub registered: bool,
+    pub grants: &'a [Grant<'a>],
+    pub needed: AccessLevel,
+}
+
+pub enum Reason { NoRequest, NotOwnDatabase, NotDeclared, NotRegistered, DeclaredLower { .. }, NoGrant { .. } }
+```
+
+Order: `NoRequest`; then the own database is allowed; then `NotOwnDatabase` for `Actor::Application` on a Resource; then the rest as before.
