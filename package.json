@@ -1,0 +1,13 @@
+{
+  "name": "vm-workspace",
+  "private": true,
+  "description": "The npm workspace of the repository (blackbox/CONTRACT.md, \"The SDK\"): the SDK, its type tests, and the SDK fixture projects of the black-box tests.",
+  "workspaces": [
+    "sdk",
+    "blackbox/sdk-types",
+    "blackbox/fixtures/sdk/*"
+  ],
+  "scripts": {
+    "test": "npm test --workspaces --if-present"
+  }
+}
