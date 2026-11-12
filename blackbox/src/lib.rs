@@ -6,9 +6,13 @@
 //!
 //! - [`program`] gets the binary (`VM_BIN`, or a build of `vm` once per test
 //!   binary) and runs it to its exit for start-up checks;
-//! - [`Vm`] starts `vm serve` on a free port with fixture Applications from
-//!   `fixtures/`, waits for its `listening` record and ends the process
-//!   when dropped, showing the program's log if the test is failing;
+//! - [`postgres`] runs the harness's private Postgres, one per test binary,
+//!   and hands each test's program a platform database of its own;
+//! - [`Vm`] starts `vm serve` on a free port against a platform database,
+//!   waits for its `listening` record, installs fixture Applications from
+//!   `fixtures/` through the platform's API, and ends the process when
+//!   dropped, showing the program's log if the test is failing;
+//! - [`api`] is a client for the platform's API as a named [`User`];
 //! - [`http`] sends requests as a named [`User`] with full control of the
 //!   headers;
 //! - [`log`] and [`records`] collect the log records and let a test wait
@@ -25,13 +29,17 @@
     reason = "test code: a failed expectation here is a failing test, not a crash on the serving path"
 )]
 
+pub mod api;
 pub mod expect;
 pub mod http;
 pub mod log;
+pub mod postgres;
 pub mod program;
 pub mod records;
 pub mod vm;
 
+pub use api::{Api, assert_api_error};
 pub use http::{Request, Response, User};
+pub use postgres::Platform;
 pub use records::RequestRecords;
-pub use vm::{DOMAIN, Vm, VmOptions, fixture};
+pub use vm::{DOMAIN, FIXTURE_VERSION, INSTALLER, Vm, VmOptions, fixture, fixture_bundle};

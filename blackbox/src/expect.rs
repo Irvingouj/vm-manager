@@ -41,9 +41,16 @@ pub fn assert_user(value: &Value, user: &User, context: &str) {
 }
 
 /// Fails unless `answer` is `whoami`'s
-/// `{ ok: { user: { id, groups }, application, request } }` for this User,
-/// Application and request.
-pub fn assert_whoami(answer: &Value, user: &User, application: &str, request: &str, context: &str) {
+/// `{ ok: { user: { id, groups }, application, version, request } }` for
+/// this User, Application, Version number and request.
+pub fn assert_whoami(
+    answer: &Value,
+    user: &User,
+    application: &str,
+    version: u64,
+    request: &str,
+    context: &str,
+) {
     let ok = &answer["ok"];
     assert!(
         ok.is_object(),
@@ -54,6 +61,11 @@ pub fn assert_whoami(answer: &Value, user: &User, application: &str, request: &s
         ok["application"].as_str(),
         Some(application),
         "{context}: expected whoami to name the Application {application:?}, got {answer}"
+    );
+    assert_eq!(
+        ok["version"].as_u64(),
+        Some(version),
+        "{context}: expected whoami to name the Version {version} of {application:?}, got {answer}"
     );
     assert_eq!(
         ok["request"].as_str(),
@@ -69,11 +81,12 @@ pub fn assert_whoami_names_no_one_else(
     answer: &Value,
     user: &User,
     application: &str,
+    version: u64,
     request: &str,
     context: &str,
 ) {
     if answer.get("ok").is_some() {
-        assert_whoami(answer, user, application, request, context);
+        assert_whoami(answer, user, application, version, request, context);
     }
 }
 

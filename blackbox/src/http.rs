@@ -4,11 +4,17 @@
 //!
 //! Every request is sent on a fresh connection with `Connection: close`, and
 //! every step has a deadline: a request that gets no complete answer within
-//! [`REQUEST_TIMEOUT`] fails with a message saying so.
+//! [`REQUEST_TIMEOUT`] (or the request's own timeout) fails with a message
+//! saying so.
+//!
+//! A large body is written on a second thread while the answer is read, so
+//! that a program that answers before reading the whole body (a `413`) is
+//! heard rather than lost in a reset connection.
 
 use std::fmt;
 use std::io::{ErrorKind, Read, Write};
-use std::net::{SocketAddr, TcpStream};
+use std::net::{Shutdown, SocketAddr, TcpStream};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -20,6 +26,12 @@ pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// The largest answer the client reads. A larger one is an error, not a
 /// bigger buffer.
 const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+
+/// A request this large or larger is written on its own thread.
+const WRITE_ON_A_THREAD_FROM: usize = 64 * 1024;
+
+/// The size of each chunk of a chunked body.
+const CHUNK_BYTES: usize = 64 * 1024;
 
 /// A User as the stand-in sign-in states them.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -57,6 +69,8 @@ pub struct Request {
     host: Option<Vec<u8>>,
     headers: Vec<(String, Vec<u8>)>,
     body: Vec<u8>,
+    chunked: bool,
+    timeout: Duration,
 }
 
 impl Request {
@@ -70,6 +84,8 @@ impl Request {
             host: Some(host.as_bytes().to_vec()),
             headers: Vec::new(),
             body: Vec::new(),
+            chunked: false,
+            timeout: REQUEST_TIMEOUT,
         }
     }
 
@@ -119,6 +135,29 @@ impl Request {
         self
     }
 
+    /// A JSON body, with `content-type: application/json`.
+    #[must_use]
+    pub fn json(self, value: &Value) -> Self {
+        self.header("content-type", "application/json")
+            .body(value.to_string())
+    }
+
+    /// Sends the body with `Transfer-Encoding: chunked` instead of a
+    /// `Content-Length`, so that the program learns its size only by
+    /// reading it.
+    #[must_use]
+    pub fn chunked(mut self) -> Self {
+        self.chunked = true;
+        self
+    }
+
+    /// Allows this request longer than [`REQUEST_TIMEOUT`] (a large body).
+    #[must_use]
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
     /// Sends the request and returns the answer, or fails the test with a
     /// message that says which request got no answer and why.
     pub fn send(&self) -> Response {
@@ -130,17 +169,39 @@ impl Request {
 
     /// Sends the request; an error says what went wrong on the wire.
     pub fn try_send(&self) -> Result<Response, String> {
-        let deadline = Instant::now() + REQUEST_TIMEOUT;
-        let mut stream = TcpStream::connect_timeout(&self.address, REQUEST_TIMEOUT)
+        let deadline = Instant::now() + self.timeout;
+        let mut stream = TcpStream::connect_timeout(&self.address, self.timeout)
             .map_err(|e| format!("cannot connect to {}: {e}", self.address))?;
         stream
-            .set_write_timeout(Some(REQUEST_TIMEOUT))
+            .set_write_timeout(Some(self.timeout))
             .map_err(|e| e.to_string())?;
-        stream
-            .write_all(&self.wire_bytes())
-            .map_err(|e| format!("cannot send the request: {e}"))?;
-        let raw = read_to_end_before(&mut stream, deadline)?;
-        Response::parse(&raw, self.to_string())
+        let wire = self.wire_bytes();
+        if wire.len() < WRITE_ON_A_THREAD_FROM {
+            stream
+                .write_all(&wire)
+                .map_err(|e| format!("cannot send the request: {e}"))?;
+            let raw = read_to_end_before(&mut stream, deadline, self.timeout)?;
+            return Response::parse(&raw, self.to_string());
+        }
+        let mut writer = stream.try_clone().map_err(|e| e.to_string())?;
+        let (read, wrote) = thread::scope(|scope| {
+            let writing = scope.spawn(move || writer.write_all(&wire));
+            let read = read_to_end_before(&mut stream, deadline, self.timeout);
+            // Unblocks the writer if the program answered without reading
+            // everything and left the connection open.
+            drop(stream.shutdown(Shutdown::Both));
+            let wrote = writing
+                .join()
+                .unwrap_or_else(|_| Err(std::io::Error::other("the writer panicked")));
+            (read, wrote)
+        });
+        match read {
+            Ok(raw) if !raw.is_empty() => Response::parse(&raw, self.to_string()),
+            Ok(_) => Err(format!(
+                "the connection closed with no answer (writing the request: {wrote:?})"
+            )),
+            Err(problem) => Err(format!("{problem} (writing the request: {wrote:?})")),
+        }
     }
 
     fn wire_bytes(&self) -> Vec<u8> {
@@ -157,11 +218,22 @@ impl Request {
             wire.extend_from_slice(value);
             wire.extend_from_slice(b"\r\n");
         }
-        if !self.body.is_empty() || self.method != "GET" {
+        if self.chunked {
+            wire.extend_from_slice(b"Transfer-Encoding: chunked\r\n");
+        } else if !self.body.is_empty() || self.method != "GET" {
             wire.extend_from_slice(format!("Content-Length: {}\r\n", self.body.len()).as_bytes());
         }
         wire.extend_from_slice(b"Connection: close\r\n\r\n");
-        wire.extend_from_slice(&self.body);
+        if self.chunked {
+            for chunk in self.body.chunks(CHUNK_BYTES) {
+                wire.extend_from_slice(format!("{:x}\r\n", chunk.len()).as_bytes());
+                wire.extend_from_slice(chunk);
+                wire.extend_from_slice(b"\r\n");
+            }
+            wire.extend_from_slice(b"0\r\n\r\n");
+        } else {
+            wire.extend_from_slice(&self.body);
+        }
         wire
     }
 }
@@ -187,14 +259,18 @@ impl fmt::Display for Request {
     }
 }
 
-fn read_to_end_before(stream: &mut TcpStream, deadline: Instant) -> Result<Vec<u8>, String> {
+fn read_to_end_before(
+    stream: &mut TcpStream,
+    deadline: Instant,
+    timeout: Duration,
+) -> Result<Vec<u8>, String> {
     let mut raw = Vec::new();
     let mut chunk = [0_u8; 16 * 1024];
     loop {
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
             return Err(format!(
-                "no complete answer within {REQUEST_TIMEOUT:?} (received so far: {:?})",
+                "no complete answer within {timeout:?} (received so far: {:?})",
                 String::from_utf8_lossy(&raw)
             ));
         }
@@ -421,6 +497,20 @@ mod tests {
         assert_eq!(
             String::from_utf8(wire).unwrap(),
             "GET /p?q=1 HTTP/1.1\r\nHost: app.vm.test\r\nX-VM-Stand-In-User: a\r\nx-vm-stand-in-user: b\r\nConnection: close\r\n\r\n"
+        );
+    }
+
+    #[test]
+    fn a_chunked_body_goes_on_the_wire_in_chunks() {
+        let address: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let wire = Request::new(address, "/", "x")
+            .method("POST")
+            .body("abc")
+            .chunked()
+            .wire_bytes();
+        assert_eq!(
+            String::from_utf8(wire).unwrap(),
+            "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n3\r\nabc\r\n0\r\n\r\n"
         );
     }
 

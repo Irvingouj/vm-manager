@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use blackbox::expect::{assert_refused, assert_user, assert_whoami};
 use blackbox::records::{application_of, event, user_of};
-use blackbox::{User, Vm};
+use blackbox::{FIXTURE_VERSION, User, Vm};
 
 fn vm() -> Vm {
     Vm::with_stand_in(&[("honest", "honest.js"), ("second", "honest.js")])
@@ -55,6 +55,7 @@ fn whoami_through_the_raw_host_interface_agrees_with_ctx_user() {
             &body["whoami"],
             &user,
             "honest",
+            FIXTURE_VERSION,
             &answer.request_id(),
             "whoami",
         );
@@ -71,6 +72,7 @@ fn whoami_names_the_application_the_request_went_to() {
         &answer.json()["whoami"],
         &alice,
         "second",
+        FIXTURE_VERSION,
         &answer.request_id(),
         "whoami in `second`",
     );
@@ -115,7 +117,7 @@ fn the_application_is_handed_the_method_url_headers_and_body() {
 }
 
 #[test]
-fn the_request_record_names_the_request_application_user_method_path_and_status() {
+fn the_request_record_names_the_request_application_version_user_method_path_and_status() {
     let vm = vm();
     let answer = vm.get_as(
         &User::new("alice").in_groups(&["staff"]),
@@ -134,6 +136,11 @@ fn the_request_record_names_the_request_application_user_method_path_and_status(
         application_of(record),
         Some("honest"),
         "application in {record}"
+    );
+    assert_eq!(
+        record["version"].as_u64(),
+        Some(FIXTURE_VERSION),
+        "expected the `request` record to name the Version that served it, in {record}"
     );
     assert_eq!(user_of(record), Some("alice"), "user in {record}");
     assert_eq!(record["method"], "GET", "method in {record}");

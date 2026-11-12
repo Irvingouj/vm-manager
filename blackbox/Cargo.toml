@@ -12,6 +12,15 @@ publish.workspace = true
 [dependencies]
 # To read the program's JSON log records and the fixtures' JSON answers.
 serde_json = "1"
+# The harness's private Postgres (CONTRACT.md, "How the tests get a
+# Postgres"): fetching zonky's prebuilt binaries from Maven Central once,
+# checking them against the published SHA-256, and unpacking them (a jar,
+# which is a zip, holding a .tar.xz).
+ureq = "3"
+sha2 = "0.10"
+zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
+liblzma = { version = "0.4", default-features = false, features = ["static"] }
+tar = { version = "0.4", default-features = false }
 
 [lints]
 workspace = true

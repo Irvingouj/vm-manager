@@ -1,5 +1,7 @@
 //! Starting and stopping `vm serve` (CONTRACT.md, "Serving: Starting and
-//! stopping"), and the shape of its log.
+//! stopping"), the shape of its log, and the start-ups that cannot work
+//! (no `VM_DATABASE_URL`, one that cannot be parsed, a Postgres that cannot
+//! be reached or that refuses the role).
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -9,10 +11,11 @@
 )]
 
 use std::net::TcpStream;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use blackbox::program::run_vm_to_exit;
-use blackbox::{DOMAIN, Vm, VmOptions, fixture};
+use blackbox::postgres::{self, Platform};
+use blackbox::program::{EXIT_TIMEOUT, run_vm_to_exit};
+use blackbox::{DOMAIN, User, Vm, VmOptions};
 
 #[test]
 fn the_listening_record_gives_the_address_and_says_the_stand_in_is_on() {
@@ -105,32 +108,53 @@ fn the_program_stops_when_its_process_is_ended() {
     );
 }
 
-/// Runs `vm serve` with these extra arguments and fails unless it exits
-/// non-zero, within the timeout, without listening, with a message on
-/// standard error that mentions each of `named`.
-fn assert_start_up_fails(case: &str, application_args: &[String], named: &[&str]) {
-    let mut args = vec![
-        "serve".to_owned(),
-        "--domain".to_owned(),
-        DOMAIN.to_owned(),
-        "--listen".to_owned(),
-        "127.0.0.1:0".to_owned(),
-        "--stand-in-sign-in".to_owned(),
+#[test]
+fn with_no_applications_the_program_starts_and_every_application_address_is_404() {
+    let vm = Vm::start(&VmOptions::new().stand_in_sign_in());
+    let alice = User::new("alice");
+    for application in ["honest", "anything"] {
+        let response = vm.get_as(&alice, application, "/");
+        response.expect_status(404);
+        vm.records_of(&response).assert_no_application_code_ran();
+    }
+}
+
+/// Runs `vm serve` with `VM_DATABASE_URL` set to `database_url` (or unset)
+/// and fails unless it exits non-zero by itself within the contract's 15
+/// seconds, without listening, with a message on standard error that
+/// mentions each of `named` and shows none of `secrets` anywhere.
+fn assert_start_up_fails(case: &str, database_url: Option<&str>, named: &[&str], secrets: &[&str]) {
+    let args = [
+        "serve",
+        "--domain",
+        DOMAIN,
+        "--listen",
+        "127.0.0.1:0",
+        "--stand-in-sign-in",
     ];
-    args.extend_from_slice(application_args);
-    let finished = run_vm_to_exit(&args);
+    let began = Instant::now();
+    let finished = run_vm_to_exit(args, database_url);
+    let took = began.elapsed();
     let shown = format!(
-        "case: {case}\nargs: {args:?}\nexit: {}\nstandard error:\n{}",
+        "case: {case}\nargs: {args:?}\nexit: {} after {took:?}\nstandard error:\n{}",
         finished.status_text(),
-        finished.stderr
+        // Never show a secret in the test's own message either.
+        secrets
+            .iter()
+            .fold(finished.stderr.clone(), |text, secret| text
+                .replace(secret, "<SECRET>"))
     );
     assert!(
         finished.status.is_some_and(|s| !s.success()),
-        "expected `vm serve` to exit non-zero by itself\n{shown}"
+        "expected `vm serve` to exit non-zero by itself within {EXIT_TIMEOUT:?}\n{shown}"
     );
     assert!(
         !finished.stderr.contains("\"listening\""),
         "expected no `listening` record from a start-up that cannot work\n{shown}"
+    );
+    assert!(
+        !finished.stderr.trim().is_empty(),
+        "expected a message on standard error naming the problem\n{shown}"
     );
     for name in named {
         assert!(
@@ -141,76 +165,126 @@ fn assert_start_up_fails(case: &str, application_args: &[String], named: &[&str]
             "expected the message on standard error to name the problem ({name:?})\n{shown}"
         );
     }
-}
-
-fn application(name: &str, file: &str) -> Vec<String> {
-    vec![
-        "--application".to_owned(),
-        format!("{name}={}", fixture(file).display()),
-    ]
-}
-
-#[test]
-fn start_up_fails_for_an_application_name_that_is_not_a_dns_label() {
-    let too_long = "a".repeat(64);
-    for name in [
-        "Bad_Name",
-        "-starts-with-a-dash",
-        "ends-with-a-dash-",
-        "has.a.dot",
-        "has space",
-        too_long.as_str(),
-    ] {
-        let mut args = application("honest", "honest.js");
-        args.extend(application(name, "honest.js"));
-        assert_start_up_fails(&format!("the name {name:?}"), &args, &[name]);
+    for secret in secrets {
+        assert!(
+            !finished.stderr.contains(secret) && !finished.stdout.contains(secret),
+            "expected the password never to be shown, but it is in the program's output\n{shown}"
+        );
     }
 }
 
 #[test]
-fn start_up_fails_for_an_empty_application_name() {
-    let args = vec![
-        "--application".to_owned(),
-        format!("={}", fixture("honest.js").display()),
-    ];
-    assert_start_up_fails("an empty name", &args, &["application"]);
+fn start_up_fails_without_vm_database_url() {
+    assert_start_up_fails("VM_DATABASE_URL unset", None, &["VM_DATABASE_URL"], &[]);
 }
 
 #[test]
-fn start_up_fails_for_an_application_name_given_twice() {
-    let mut args = application("twice", "honest.js");
-    args.extend(application("twice", "errors.js"));
-    assert_start_up_fails("the name `twice` given twice", &args, &["twice"]);
+fn start_up_fails_for_a_vm_database_url_that_cannot_be_parsed() {
+    let secret = "pw-unparseable-7Hq2Zx";
+    let cases = [
+        ("empty".to_owned(), String::new()),
+        (
+            "not a URL".to_owned(),
+            format!("this is not a url {secret}"),
+        ),
+        (
+            "a port that is not a number".to_owned(),
+            format!("postgres://vm_test:{secret}@127.0.0.1:not-a-port/vm_platform"),
+        ),
+        (
+            "a port out of range".to_owned(),
+            format!("postgres://vm_test:{secret}@127.0.0.1:99999999/vm_platform"),
+        ),
+        (
+            "an unclosed IPv6 bracket".to_owned(),
+            format!("postgres://vm_test:{secret}@[::1/vm_platform"),
+        ),
+    ];
+    for (case, url) in &cases {
+        assert_start_up_fails(case, Some(url), &["VM_DATABASE_URL"], &[secret]);
+    }
 }
 
 #[test]
-fn start_up_fails_for_an_application_file_that_cannot_be_read() {
-    let missing = std::env::temp_dir().join("blackbox-no-such-dir/no-such-application.js");
-    let args = vec![
-        "--application".to_owned(),
-        format!("missing={}", missing.display()),
-    ];
+fn start_up_fails_when_postgres_cannot_be_reached_on_a_closed_port() {
+    let secret = "pw-unreachable-c4Lm9";
+    let port = postgres::free_port().unwrap();
+    let url = format!("postgres://vm_test:{secret}@127.0.0.1:{port}/vm_platform");
     assert_start_up_fails(
-        "a file that does not exist",
-        &args,
-        &["no-such-application.js"],
+        "nothing listens on the port",
+        Some(&url),
+        &[&port.to_string()],
+        &[secret],
     );
 }
 
 #[test]
-fn start_up_fails_with_no_application() {
-    assert_start_up_fails("no --application at all", &[], &["application"]);
+fn start_up_fails_within_the_time_when_postgres_cannot_be_reached_at_all() {
+    // TEST-NET-1 (RFC 5737): no host answers there, so a connection
+    // attempt hangs until the program gives up.
+    let secret = "pw-blackhole-Vb81q";
+    let url = format!("postgres://vm_test:{secret}@192.0.2.1:5432/vm_platform");
+    assert_start_up_fails(
+        "an address no host answers",
+        Some(&url),
+        &["192.0.2.1"],
+        &[secret],
+    );
 }
 
 #[test]
-fn a_maximal_dns_label_is_a_valid_application_name() {
-    let name = format!("a{}c9", "-b".repeat(30));
-    assert_eq!(name.len(), 63);
-    let vm = Vm::start(
-        &VmOptions::new()
-            .application(&name, "honest.js")
-            .stand_in_sign_in(),
+fn start_up_fails_when_postgres_refuses_a_role_that_does_not_exist() {
+    let postgres = postgres::shared();
+    let secret = "pw-no-such-role-Qe5r";
+    let url = postgres.url_as("no_such_role_t24", secret, Platform::fresh().name());
+    assert_start_up_fails(
+        "a role Postgres does not know",
+        Some(&url),
+        &["no_such_role_t24"],
+        &[secret, postgres.password().expose()],
     );
-    vm.get_as(&blackbox::User::new("alice"), &name, "/hello")
+}
+
+#[test]
+fn start_up_fails_when_postgres_refuses_the_password() {
+    let postgres = postgres::shared();
+    let wrong = format!("{}-wrong", postgres.password().expose());
+    let url = postgres.url_as(postgres::SUPERUSER, &wrong, Platform::fresh().name());
+    assert_start_up_fails(
+        "the superuser with a wrong password",
+        Some(&url),
+        &[postgres::SUPERUSER],
+        &[&wrong, postgres.password().expose()],
+    );
+}
+
+#[test]
+fn the_password_in_vm_database_url_never_appears_in_the_log() {
+    let vm = Vm::with_stand_in(&[("honest", "honest.js"), ("broken", "throws-at-load.js")]);
+    let alice = User::new("alice");
+    vm.get_as(&alice, "honest", "/print").expect_status(200);
+    vm.get_as(&alice, "broken", "/").expect_status(500);
+    vm.get_as(&alice, "nowhere", "/").expect_status(404);
+    let api = vm.api_as(&alice);
+    api.create_application("Not A Name").expect_status(400);
+    api.create_application("honest").expect_status(409);
+    let last = api.post_raw("/v1/applications", "{ not json");
+    vm.records_of(&last);
+    let password = postgres::shared().password().expose().to_owned();
+    let mut lines = vm.lines();
+    let restarted = vm.restart();
+    restarted
+        .get_as(&alice, "honest", "/hello")
         .expect_status(200);
+    lines.extend(restarted.lines());
+    let shown: Vec<String> = lines
+        .into_iter()
+        .filter(|l| l.raw.contains(&password))
+        .map(|l| l.raw.replace(&password, "<PASSWORD>"))
+        .collect();
+    assert!(
+        shown.is_empty(),
+        "expected the password never to appear in the program's log, but these lines hold it:\n{}",
+        shown.join("\n")
+    );
 }

@@ -94,14 +94,18 @@ impl Finished {
 }
 
 /// Runs `vm` with these arguments until it exits by itself, killing it at
-/// [`EXIT_TIMEOUT`].
-pub fn run_vm_to_exit<I, S>(args: I) -> Finished
+/// [`EXIT_TIMEOUT`]. `VM_DATABASE_URL` is set to `database_url`, or unset
+/// when it is `None`, whatever the test's own environment holds.
+pub fn run_vm_to_exit<I, S>(args: I, database_url: Option<&str>) -> Finished
 where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
     let mut command = Command::new(vm_binary());
-    command.args(args);
+    command.args(args).env_remove("VM_DATABASE_URL");
+    if let Some(url) = database_url {
+        command.env("VM_DATABASE_URL", url);
+    }
     run_to_exit(command, EXIT_TIMEOUT)
         .unwrap_or_else(|problem| panic!("cannot run {}: {problem}", vm_binary().display()))
 }

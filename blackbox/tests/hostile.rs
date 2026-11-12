@@ -15,7 +15,7 @@
 )]
 
 use blackbox::expect::{assert_user, assert_whoami, assert_whoami_names_no_one_else, is_user};
-use blackbox::{Response, User, Vm};
+use blackbox::{FIXTURE_VERSION, Response, User, Vm};
 use serde_json::Value;
 
 fn vm() -> Vm {
@@ -77,7 +77,14 @@ fn assert_later_requests_are_still_themselves(vm: &Vm) {
         } else {
             &body["whoami"]
         };
-        assert_whoami(whoami, &user, application, &response.request_id(), &context);
+        assert_whoami(
+            whoami,
+            &user,
+            application,
+            FIXTURE_VERSION,
+            &response.request_id(),
+            &context,
+        );
         vm.records_of(&response)
             .assert_host_saw_only(&user.id, application);
     }
@@ -94,6 +101,7 @@ fn claiming_another_user_through_globals_and_arguments_changes_nothing() {
         &body["whoami"]["answer"],
         &alice(),
         "hostile",
+        FIXTURE_VERSION,
         &id,
         "whoami after the claims",
     );
@@ -107,6 +115,7 @@ fn claiming_another_user_through_globals_and_arguments_changes_nothing() {
             &answer["answer"],
             &alice(),
             "hostile",
+            FIXTURE_VERSION,
             &id,
             &format!("whoami with {claim}"),
         );
@@ -124,6 +133,7 @@ fn claiming_another_application_changes_nothing() {
         &body["whoami"]["answer"],
         &alice(),
         "hostile",
+        FIXTURE_VERSION,
         &id,
         "whoami after the claims",
     );
@@ -132,6 +142,7 @@ fn claiming_another_application_changes_nothing() {
             &answer["answer"],
             &alice(),
             "hostile",
+            FIXTURE_VERSION,
             &id,
             &format!("whoami through {claim}"),
         );
@@ -165,6 +176,7 @@ fn replacing_redefining_or_detaching_ctx_user_never_yields_another_user() {
         &body["whoami"]["answer"],
         &alice(),
         "hostile",
+        FIXTURE_VERSION,
         &response.request_id(),
         "whoami after the attempts",
     );
@@ -180,6 +192,7 @@ fn a_ctx_forged_by_the_application_does_not_fool_the_host() {
         &body["inner"]["whoami"]["answer"],
         &alice(),
         "hostile",
+        FIXTURE_VERSION,
         &id,
         "whoami inside the handler called with a forged ctx",
     );
@@ -194,6 +207,7 @@ fn a_ctx_forged_by_the_application_does_not_fool_the_host() {
         &body["whoami"]["answer"],
         &alice(),
         "hostile",
+        FIXTURE_VERSION,
         &id,
         "whoami",
     );
@@ -221,6 +235,7 @@ fn changing_the_returned_user_object_changes_nothing() {
         &body["whoami"]["answer"],
         &alice(),
         "hostile",
+        FIXTURE_VERSION,
         &response.request_id(),
         "whoami after the changes",
     );
@@ -295,6 +310,7 @@ fn replacing_the_handler_during_a_request_does_not_reach_the_next_request() {
         &body["whoami"]["answer"],
         &alice(),
         "hostile",
+        FIXTURE_VERSION,
         &response.request_id(),
         "whoami",
     );

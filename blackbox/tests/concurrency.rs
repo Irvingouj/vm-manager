@@ -14,7 +14,7 @@ use std::thread;
 
 use blackbox::expect::{assert_user, assert_whoami};
 use blackbox::records::user_of;
-use blackbox::{Response, User, Vm};
+use blackbox::{FIXTURE_VERSION, Response, User, Vm};
 
 const USERS: usize = 24;
 const ROUNDS: usize = 3;
@@ -46,6 +46,7 @@ fn assert_saw_only_itself(vm: &Vm, response: &Response, user: &User) {
             answer,
             user,
             "interleaves",
+            FIXTURE_VERSION,
             &response.request_id(),
             &format!("{}'s whoami {n}", user.id),
         );

@@ -205,6 +205,12 @@ fn the_request_record_of_a_refused_request_names_what_is_known() {
             record["application"].is_null(),
             "expected `application: null` in {record}"
         );
+        assert!(
+            record
+                .get("version")
+                .is_some_and(serde_json::Value::is_null),
+            "expected `version: null` in {record}"
+        );
         assert_eq!(record["method"], "GET", "method in {record}");
         assert_eq!(record["path"], "/somewhere", "path in {record}");
     };

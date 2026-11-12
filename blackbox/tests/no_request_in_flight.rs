@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use blackbox::expect::{assert_refused, assert_user, assert_whoami};
 use blackbox::records::{application_of, describe, event, request_of, user_of};
-use blackbox::{Response, User, Vm};
+use blackbox::{FIXTURE_VERSION, Response, User, Vm};
 use serde_json::Value;
 
 /// Long enough for every timer the leftover code arms (the last at 700 ms)
@@ -156,6 +156,7 @@ fn assert_victim_saw_only_itself(vm: &Vm, response: &Response, user: &User) {
         &body["whoami"],
         user,
         "outlives-request",
+        FIXTURE_VERSION,
         &response.request_id(),
         &context,
     );

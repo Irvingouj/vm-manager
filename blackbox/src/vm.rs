@@ -1,6 +1,7 @@
-//! A running `vm serve` (CONTRACT.md, "Serving"): started on a free port with
-//! chosen fixture Applications, ended when the handle is dropped, also when
-//! the test panics.
+//! A running `vm serve` (CONTRACT.md, "Serving"): started on a free port
+//! against a platform database on the harness's Postgres, with chosen
+//! fixture Applications installed through the platform's API, and ended when
+//! the handle is dropped, also when the test panics.
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -10,8 +11,10 @@ use std::time::Duration;
 
 use serde_json::Value;
 
+use crate::api::{Api, version_body};
 use crate::http::{Request, Response, User};
 use crate::log::{Line, LogCollector, WaitFailure};
+use crate::postgres::Platform;
 use crate::program::vm_binary;
 use crate::records::{self, RequestRecords, describe, event, request_of, user_of};
 
@@ -27,6 +30,13 @@ pub const LOG_TIMEOUT: Duration = Duration::from_secs(5);
 /// How many lines of the program's log a failure message shows.
 const LOG_LINES_SHOWN: usize = 200;
 
+/// The User who installs fixture Applications for the tests, and so is
+/// their creator and only Contributor.
+pub const INSTALLER: &str = "fixture-installer";
+
+/// A fixture Application installed by the harness is its first Version.
+pub const FIXTURE_VERSION: u64 = 1;
+
 /// The path of a fixture Application under `blackbox/fixtures/`.
 pub fn fixture(file: &str) -> PathBuf {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -36,12 +46,21 @@ pub fn fixture(file: &str) -> PathBuf {
     path
 }
 
-/// How to start `vm serve`.
+/// The text of a fixture Application: the bundle a Version is sent with.
+pub fn fixture_bundle(file: &str) -> String {
+    let path = fixture(file);
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("cannot read the fixture {}: {e}", path.display()))
+}
+
+/// How to start `vm serve`: "this program, with these fixture
+/// Applications".
 #[derive(Clone, Debug)]
 pub struct VmOptions {
     domain: String,
     applications: Vec<(String, PathBuf)>,
     stand_in_sign_in: bool,
+    platform: Option<Platform>,
 }
 
 impl Default for VmOptions {
@@ -50,18 +69,20 @@ impl Default for VmOptions {
             domain: DOMAIN.to_owned(),
             applications: Vec::new(),
             stand_in_sign_in: false,
+            platform: None,
         }
     }
 }
 
 impl VmOptions {
-    /// No Applications yet, and the stand-in sign-in off.
+    /// A fresh platform database, no Applications, the stand-in sign-in off.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Adds a fixture Application: `file` under `blackbox/fixtures/`, served
-    /// as `name`.
+    /// Installs a fixture Application at start: `file` under
+    /// `blackbox/fixtures/`, created as `name` by [`INSTALLER`] and sent as
+    /// its first Version.
     #[must_use]
     pub fn application(mut self, name: &str, file: &str) -> Self {
         self.applications.push((name.to_owned(), fixture(file)));
@@ -75,7 +96,16 @@ impl VmOptions {
         self
     }
 
-    /// The `vm` arguments for these options.
+    /// Starts the program against this platform database rather than a
+    /// fresh one: to start it again on what an earlier program left.
+    #[must_use]
+    pub fn platform(mut self, platform: &Platform) -> Self {
+        self.platform = Some(platform.clone());
+        self
+    }
+
+    /// The `vm` arguments for these options. `VM_DATABASE_URL` goes in the
+    /// environment, never here.
     pub fn args(&self) -> Vec<String> {
         let mut args = vec![
             "serve".to_owned(),
@@ -84,10 +114,6 @@ impl VmOptions {
             "--listen".to_owned(),
             "127.0.0.1:0".to_owned(),
         ];
-        for (name, path) in &self.applications {
-            args.push("--application".to_owned());
-            args.push(format!("{name}={}", path.display()));
-        }
         if self.stand_in_sign_in {
             args.push("--stand-in-sign-in".to_owned());
         }
@@ -117,17 +143,100 @@ pub struct Vm {
     /// The index of the `listening` line in the log.
     listening_at: usize,
     listening: Value,
+    platform: Platform,
 }
 
 impl Vm {
-    /// Starts `vm serve` with these options and waits for its `listening`
-    /// record, failing the test with the program's log if it does not come
-    /// within [`START_TIMEOUT`].
+    /// Starts `vm serve` with these options, waits for its `listening`
+    /// record, and installs the fixture Applications through the platform's
+    /// API. Fails the test with the program's log if any of it goes wrong.
+    ///
+    /// The platform's API needs a signed-in User, so with the stand-in off
+    /// the fixtures are installed by an earlier start of the program with
+    /// the stand-in on, against the same platform database, which is then
+    /// ended (CONTRACT.md: a restart loses nothing).
     pub fn start(options: &VmOptions) -> Self {
+        let platform = options.platform.clone().unwrap_or_else(Platform::fresh);
+        if options.stand_in_sign_in {
+            let vm = Self::launch(options, &platform);
+            vm.install_all(&options.applications);
+            return vm;
+        }
+        if !options.applications.is_empty() {
+            let installer = Self::launch(&options.clone().stand_in_sign_in(), &platform);
+            installer.install_all(&options.applications);
+            drop(installer);
+        }
+        Self::launch(options, &platform)
+    }
+
+    /// Starts the program with the stand-in sign-in on and these
+    /// Applications, given as (name, fixture file).
+    pub fn with_stand_in(applications: &[(&str, &str)]) -> Self {
+        let options = applications
+            .iter()
+            .fold(VmOptions::new().stand_in_sign_in(), |o, (name, file)| {
+                o.application(name, file)
+            });
+        Self::start(&options)
+    }
+
+    /// Starts the program with the stand-in sign-in on, against what an
+    /// earlier program left in this platform database.
+    pub fn start_on(platform: &Platform) -> Self {
+        Self::start(&VmOptions::new().stand_in_sign_in().platform(platform))
+    }
+
+    /// Ends this program and starts it again, stand-in on, against the same
+    /// platform database.
+    #[must_use]
+    pub fn restart(self) -> Self {
+        let platform = self.platform.clone();
+        drop(self);
+        Self::start_on(&platform)
+    }
+
+    fn install_all(&self, applications: &[(String, PathBuf)]) {
+        for (name, path) in applications {
+            let bundle = std::fs::read_to_string(path)
+                .unwrap_or_else(|e| panic!("cannot read the fixture {}: {e}", path.display()));
+            self.install(name, &bundle);
+        }
+    }
+
+    /// Creates the Application `name` as [`INSTALLER`] and sends `bundle` as
+    /// a Version, failing the test with the program's log unless both are
+    /// answered `201`.
+    pub fn install(&self, name: &str, bundle: &str) {
+        let api = self.api_as(&User::new(INSTALLER));
+        let created = api.create_application(name);
+        if created.status != 201 {
+            self.fail(&format!(
+                "expected `201` creating the fixture Application {name:?} through the platform's API, got\n{}",
+                created.describe()
+            ));
+        }
+        let sent = api.send_version(name, &version_body(bundle));
+        if sent.status != 201 {
+            self.fail(&format!(
+                "expected `201` sending the fixture Application {name:?}'s bundle as a Version, got\n{}",
+                sent.describe()
+            ));
+        }
+    }
+
+    /// Starts `vm serve` and waits for its `listening` record.
+    fn launch(options: &VmOptions, platform: &Platform) -> Self {
         let args = options.args();
-        let command_line = format!("{} {}", vm_binary().display(), args.join(" "));
+        let command_line = format!(
+            "VM_DATABASE_URL=<{} on the test Postgres> {} {}",
+            platform.name(),
+            vm_binary().display(),
+            args.join(" ")
+        );
         let mut child = Command::new(vm_binary())
             .args(&args)
+            .env("VM_DATABASE_URL", platform.url())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -185,18 +294,28 @@ impl Vm {
             command_line,
             listening_at,
             listening,
+            platform: platform.clone(),
         }
     }
 
-    /// Starts the program with the stand-in sign-in on and these
-    /// Applications, given as (name, fixture file).
-    pub fn with_stand_in(applications: &[(&str, &str)]) -> Self {
-        let options = applications
-            .iter()
-            .fold(VmOptions::new().stand_in_sign_in(), |o, (name, file)| {
-                o.application(name, file)
-            });
-        Self::start(&options)
+    /// The platform database this program was started against.
+    pub fn platform(&self) -> &Platform {
+        &self.platform
+    }
+
+    /// The platform's API, as this User (stand-in sign-in).
+    pub fn api_as(&self, user: &User) -> Api<'_> {
+        Api::new(self, user)
+    }
+
+    /// The `Host` of the platform's API: `api.<domain>`.
+    pub fn api_host(&self) -> String {
+        format!("api.{}", self.domain)
+    }
+
+    /// A `GET` of `target` on the platform's API, not signed in.
+    pub fn api_request(&self, target: &str) -> Request {
+        Request::new(self.address, target, &self.api_host())
     }
 
     pub fn address(&self) -> SocketAddr {
