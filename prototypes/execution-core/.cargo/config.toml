@@ -1,0 +1,7 @@
+[env]
+# openworkers-runtime-v8 bakes this path into the binary at compile time
+# (env! in its build.rs and src/platform.rs) and reads the V8 snapshot from it
+# at start. Its own .cargo/config.toml is not read when it is a dependency, so
+# the host must set it. `ec-host snapshot` writes the file; an empty or
+# missing file means no snapshot (slower start, still works).
+RUNTIME_SNAPSHOT_PATH = { value = "runtime-snapshot.bin", relative = true }

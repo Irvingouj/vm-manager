@@ -1,0 +1,64 @@
+name: execution-core spike
+
+on:
+  push:
+    branches: [spike/execution-core-cross-platform]
+    paths:
+      - "prototypes/execution-core/**"
+      - ".github/workflows/execution-core.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  host:
+    name: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: prototypes/execution-core
+    env:
+      CARGO_TERM_COLOR: never
+      RUST_TOOLCHAIN: "1.99.1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+          rustc -vV
+          cargo -V
+
+      # Caches ~/.cargo and target/, which holds the downloaded V8 prebuilt
+      # (the build script of openworkers-v8 puts it under OUT_DIR).
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: prototypes/execution-core -> target
+
+      - name: Build host (release)
+        run: |
+          start=$(date +%s)
+          cargo build --release --locked
+          echo "build seconds: $(( $(date +%s) - start ))"
+          ls -l target/release/ | grep -E 'ec-host(\.exe)?$'
+
+      - name: Write V8 snapshot
+        run: |
+          bin=target/release/ec-host; [ -f "$bin.exe" ] && bin="$bin.exe"
+          "$bin" snapshot
+          ls -l runtime-snapshot.bin
+
+      - name: Smoke test
+        run: |
+          bin=target/release/ec-host; [ -f "$bin.exe" ] && bin="$bin.exe"
+          ./smoke.sh "$bin"
+
+      - name: CPU-limit test
+        run: cargo test --release --locked -- --nocapture
