@@ -11,7 +11,7 @@ A stateless program, deployed by a Builder, that answers web requests and reache
 _Avoid_: Worker (reserved for future background compute), service, project
 
 **Dashboard**:
-The page every employee signs in to, listing the Applications they built and the Applications shared with them. The same list is available to their agent.
+The page every employee signs in to, listing the Applications they can contribute to and the Applications shared with them. The same list is available to their agent.
 _Avoid_: Portal, console (IT's admin surface), app store
 
 **Integration**:
@@ -67,6 +67,10 @@ _Avoid_: Audit log, versioning, revision table
 **Builder**:
 An employee who creates and deploys an Application, normally by directing a Coding agent.
 _Avoid_: Developer, author, employee (when the building role is meant)
+
+**Contributor**:
+A person or Group allowed to change and deploy a given Application. An Application has no owner: it belongs to the company, and what is controlled is who may contribute to it.
+_Avoid_: Owner, maintainer, author
 
 **User**:
 An employee who signs in to a deployed Application and uses it.

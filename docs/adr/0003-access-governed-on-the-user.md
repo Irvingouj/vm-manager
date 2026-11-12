@@ -23,6 +23,6 @@ We assume Application code is unreliable but not hostile: it is AI-generated and
 ## Consequences
 
 - IT's work is the work it already does: deciding which Groups reach which Resource.
-- Who may open an Application carries no privilege and is its Builder's call, defaulting to the Builder alone.
+- Who may open an Application carries no privilege and is its Contributors' call, defaulting to the Builder who created it.
 - A refusal must say which condition failed (no Grant, not declared), so that a Coding agent can tell a missing declaration from a bug.
 - Because a deploy pulls the structure again to type-check, a Builder who has lost their Grant on a Resource can no longer deploy an Application that declares it.
