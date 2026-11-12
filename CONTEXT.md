@@ -10,6 +10,10 @@ An open-source, self-hosted platform on which an enterprise's employees and thei
 A stateless program, deployed by a Builder, that answers web requests and reaches enterprise infrastructure only through the SDK. It follows the Cloudflare Workers execution model without being Cloudflare-compatible.
 _Avoid_: Worker (reserved for future background compute), service, project
 
+**Dashboard**:
+The page every employee signs in to, listing the Applications they built and the Applications shared with them. The same list is available to their agent.
+_Avoid_: Portal, console (IT's admin surface), app store
+
 **Integration**:
 Separately trusted code that exposes a few narrow business functions and reaches Resources as itself. Applications call it instead of holding privileged access; each of its functions is a Resource.
 _Avoid_: Plugin, connector, external API (an outbound HTTP endpoint is a different thing)
