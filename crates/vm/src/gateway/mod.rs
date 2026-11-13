@@ -71,7 +71,7 @@ use crate::check;
 use crate::executor::{Failure, Held, Isolation, Label, Level, Outcome, Param, Pool, Values};
 use crate::log;
 use crate::oplog::{Ending, Entry, OperationLog};
-use crate::own_db::OwnDatabases;
+use crate::own_db::{HistoryRead, OwnDatabases};
 use crate::resources::{Resource, Resources, level_name};
 use crate::runner::InFlight;
 use crate::statement;
@@ -337,6 +337,10 @@ pub const OPERATIONS_AT_ONCE: usize = 256;
 /// under way; then it is answered `{ error: { kind: "unavailable" } }`.
 pub const PERMIT_WAIT: Duration = Duration::from_secs(5);
 
+/// The longest a `history` read may take, the shipment before it included
+/// (blackbox/CONTRACT.md, "Reading: the operation `history`: Limits").
+const HISTORY_TIME: Duration = Duration::from_secs(10);
+
 /// The backstop on waiting for an operation's answer. Every step of the
 /// task has its own limit (the log's writes, the pool's checkout and
 /// connect, the statement and its grace period), which together stay
@@ -485,6 +489,7 @@ impl PlatformGateway {
             statement: "begin".to_owned(),
             refusal,
             transaction: None,
+            history: None,
             log: Arc::clone(&self.log),
             own: Arc::clone(&self.own),
         };
@@ -557,6 +562,40 @@ impl PlatformGateway {
             commit,
             reply,
         })
+    }
+
+    /// `history` (blackbox/CONTRACT.md, "Reading: the operation `history`"):
+    /// decided as a `query` on the own database is; then, in a task of its
+    /// own, logged, and the history read ([`OwnDatabases::read_history`]).
+    fn history(&self, in_flight: &Arc<InFlight>, active: bool, args: &Value) -> Decision {
+        let (actor, read) = match read_history(args) {
+            Ok(read) => read,
+            Err(_) if !active => return Decision::refused(&Refusal::no_request()),
+            Err(problem) => return malformed(problem),
+        };
+        let (on, refusal) = self.decide(AccessLevel::Read, actor, Target::Own, in_flight, active);
+        let statement = format!("history \"{}\".\"{}\"", read.schema, read.table);
+        let work = Work {
+            kind: Kind::History,
+            in_flight: Arc::clone(in_flight),
+            active,
+            actor,
+            target: on,
+            sql: String::new(),
+            params: Vec::new(),
+            values: read.values,
+            statement,
+            refusal,
+            transaction: None,
+            history: Some(Box::new(read)),
+            log: Arc::clone(&self.log),
+            own: Arc::clone(&self.own),
+        };
+        if !active {
+            return self.refused_unawaited(work);
+        }
+        let refused = work.refusal.as_ref().map(|r| r.reason);
+        self.dispatch(work, refused, Work::run)
     }
 
     /// The Authorization decision for an operation needing `needed` on
@@ -662,6 +701,7 @@ impl PlatformGateway {
             statement: statement::without_values(call.sql),
             refusal,
             transaction: None,
+            history: None,
             log: Arc::clone(&self.log),
             own: Arc::clone(&self.own),
         }
@@ -734,6 +774,7 @@ impl Gateway for PlatformGateway {
         match operation {
             "query" => self.on_database(Kind::Query, in_flight, active, args),
             "execute" => self.on_database(Kind::Execute, in_flight, active, args),
+            "history" => self.history(in_flight, active, args),
             "tx.begin" => self.begin(in_flight, active, args),
             "tx.commit" => self.end(in_flight, active, args, true),
             "tx.rollback" => self.end(in_flight, active, args, false),
@@ -764,6 +805,8 @@ enum Kind {
     /// failures before anything is sent run as a [`Work`]; the rest is the
     /// transaction's own task.
     Begin(AccessLevel),
+    /// `history`: needs `read`, on the own database only.
+    History,
 }
 
 impl Kind {
@@ -772,12 +815,13 @@ impl Kind {
             Self::Query => "query",
             Self::Execute => "execute",
             Self::Begin(_) => "begin",
+            Self::History => "history",
         }
     }
 
     fn needed(self) -> AccessLevel {
         match self {
-            Self::Query => AccessLevel::Read,
+            Self::Query | Self::History => AccessLevel::Read,
             Self::Execute => AccessLevel::Write,
             Self::Begin(access) => access,
         }
@@ -937,6 +981,98 @@ impl<'a> Call<'a> {
     }
 }
 
+/// The most changes one `history` answers; and how many when `limit` is
+/// not given (blackbox/CONTRACT.md, "Reading: the operation `history`").
+const HISTORY_LIMIT: i64 = 1000;
+const HISTORY_DEFAULT_LIMIT: i64 = 100;
+
+/// The arguments of `history`, read strictly: `own` exactly `true`; `as`
+/// as for `query`; `table` a string; `schema` a string, `public` when not
+/// given; `key` an object whose values are each null, a string, a number or
+/// a boolean; `limit` an integer from 1 to 1000; `before` a string of
+/// decimal digits; `values` as for `query`. Arguments it does not have are
+/// ignored (`resource`, `tx`, `sql`, ...).
+fn read_history(args: &Value) -> Result<(authz::Actor, HistoryRead), &'static str> {
+    let Some(args) = args.as_object() else {
+        return Err(
+            "the arguments must be an object: { own: true, as, schema, table, key, limit, before, values }",
+        );
+    };
+    if args.get("own") != Some(&Value::Bool(true)) {
+        return Err(
+            "`own` must be exactly true: the Change history is kept only for the own database",
+        );
+    }
+    let actor = match args.get("as") {
+        None => authz::Actor::User,
+        Some(Value::String(actor)) if actor == "user" => authz::Actor::User,
+        Some(Value::String(actor)) if actor == "application" => authz::Actor::Application,
+        Some(_) => return Err("`as` must be \"user\" (the default) or \"application\""),
+    };
+    let Some(Value::String(table)) = args.get("table") else {
+        return Err("`table` must be the table's name, as a string");
+    };
+    let schema = match args.get("schema") {
+        None => "public",
+        Some(Value::String(schema)) => schema.as_str(),
+        Some(_) => {
+            return Err("`schema` must be the schema's name, as a string (public when not given)");
+        }
+    };
+    let key = match args.get("key") {
+        None => None,
+        Some(Value::Object(key))
+            if key.values().all(|v| {
+                matches!(
+                    v,
+                    Value::Null | Value::String(_) | Value::Number(_) | Value::Bool(_)
+                )
+            }) =>
+        {
+            // Copied: read on another thread, after the call.
+            Some(key.clone())
+        }
+        Some(_) => {
+            return Err(
+                "`key` must be an object naming the row by its primary key's columns, each value null, a string, a number or a boolean",
+            );
+        }
+    };
+    let limit = match args.get("limit") {
+        None => HISTORY_DEFAULT_LIMIT,
+        Some(Value::Number(n)) => match n.as_i64() {
+            Some(limit) if (1..=HISTORY_LIMIT).contains(&limit) => limit,
+            _ => return Err("`limit` must be an integer from 1 to 1000 (100 when not given)"),
+        },
+        Some(_) => return Err("`limit` must be an integer from 1 to 1000 (100 when not given)"),
+    };
+    let before = match args.get("before") {
+        None => i64::MAX,
+        Some(Value::String(id)) if !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()) => {
+            // An id past the greatest there can be leaves nothing out.
+            id.parse::<i64>().unwrap_or(i64::MAX)
+        }
+        Some(_) => return Err("`before` must be a change's id: a string of decimal digits"),
+    };
+    let values = match args.get("values") {
+        None => Values::Typed,
+        Some(Value::String(values)) if values == "text" => Values::Text,
+        Some(_) => return Err("`values` must be \"text\", or not given"),
+    };
+    Ok((
+        actor,
+        HistoryRead {
+            // Copied: read on another thread, after the call.
+            schema: schema.to_owned(),
+            table: table.clone(),
+            key,
+            limit,
+            before,
+            values,
+        },
+    ))
+}
+
 /// What a decided operation is on.
 enum On {
     Own,
@@ -969,6 +1105,8 @@ struct Work {
     /// The transaction it runs in (blackbox/CONTRACT.md, "Transactions"),
     /// by its id; `None` outside one.
     transaction: Option<Arc<str>>,
+    /// What a `history` reads; `None` for every other operation.
+    history: Option<Box<HistoryRead>>,
     log: Arc<OperationLog>,
     own: Arc<OwnDatabases>,
 }
@@ -1013,7 +1151,7 @@ impl Work {
                 resource: Some(resource),
                 ..
             } => match self.kind {
-                Kind::Query | Kind::Begin(_) => resource.read_pool(),
+                Kind::Query | Kind::Begin(_) | Kind::History => resource.read_pool(),
                 Kind::Execute => match resource.write_pool() {
                     Some(pool) => pool,
                     None => {
@@ -1044,6 +1182,9 @@ impl Work {
                 }
             }
         };
+        if let Some(read) = &self.history {
+            return self.read_history(pool, read).await;
+        }
         if let Err(refused) = check::check(&self.sql) {
             let answer = error_to_wire(json!({
                 "kind": "statement",
@@ -1069,17 +1210,79 @@ impl Work {
             },
         };
         let level = match self.kind {
-            Kind::Query | Kind::Begin(_) => Level::Read,
+            Kind::Query | Kind::Begin(_) | Kind::History => Level::Read,
             Kind::Execute => Level::Write,
         };
         let outcome = pool
             .run(level, &self.sql, &self.params, self.values, label)
             .await;
+        // What a write committed on the own database is shipped to the
+        // Change history once it is answered: asked for now, not waited for
+        // (blackbox/CONTRACT.md, "Shipping: When").
+        if self.kind == Kind::Execute && matches!(self.target, On::Own) && outcome.result.is_ok() {
+            self.own.ship(&self.in_flight.application);
+        }
         let ending = self.ending_of(&outcome);
         if let Err(error) = self.log.finish(id, &ending).await {
             self.unlogged(&error);
         }
         self.answer_of(outcome)
+    }
+
+    /// `history`, allowed: its entry written before anything is read, the
+    /// read ([`OwnDatabases::read_history`]) within [`HISTORY_TIME`],
+    /// shipment included, and the entry completed with the number of
+    /// changes answered.
+    async fn read_history(&self, pool: &Pool, read: &HistoryRead) -> Value {
+        let id = match self.log.begin(&self.entry()).await {
+            Ok(id) => id,
+            Err(error) => {
+                self.unlogged(&error);
+                return Refusal::log_unavailable(None).to_wire();
+            }
+        };
+        let label = Label {
+            user: &self.in_flight.user.id,
+            application: &self.in_flight.application,
+            request: &self.in_flight.request,
+            actor: Some(actor_name(self.actor)),
+        };
+        let started = tokio::time::Instant::now();
+        let deadline = started + HISTORY_TIME;
+        let read = tokio::time::timeout_at(
+            deadline,
+            self.own
+                .read_history(&self.in_flight.application, pool, read, label, deadline),
+        )
+        .await
+        .unwrap_or(Err(Failure::Limit(crate::executor::Limit::Time)));
+        let duration_ms = Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
+        let (changes, answer, error) = match read {
+            Ok(read) => (Some(read.changes), ok_to_wire(read.answer), None),
+            Err(failure) => {
+                let error = match &failure {
+                    Failure::Database { code, .. } => code.clone(),
+                    Failure::Limit(limit) => limit.name().to_owned(),
+                    Failure::Unavailable => "unavailable".to_owned(),
+                };
+                let answer = self.answer_of(crate::executor::Outcome {
+                    result: Err(failure),
+                    duration: None,
+                });
+                (None, answer, Some(error))
+            }
+        };
+        let ending = Ending {
+            outcome: if error.is_none() { "allowed" } else { "failed" },
+            error: error.as_deref(),
+            rows: changes,
+            duration_ms,
+            began_nothing: false,
+        };
+        if let Err(error) = self.log.finish(id, &ending).await {
+            self.unlogged(&error);
+        }
+        answer
     }
 
     /// A statement in its transaction, on the transaction's connection
@@ -1171,7 +1374,9 @@ impl Work {
                     Kind::Execute => rows
                         .affected
                         .or_else(|| u64::try_from(rows.rows.len()).ok()),
-                    Kind::Query | Kind::Begin(_) => u64::try_from(rows.rows.len()).ok(),
+                    Kind::Query | Kind::Begin(_) | Kind::History => {
+                        u64::try_from(rows.rows.len()).ok()
+                    }
                 },
                 duration_ms,
                 began_nothing: false,

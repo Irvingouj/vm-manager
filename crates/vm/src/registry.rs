@@ -476,7 +476,10 @@ impl Registry {
             .prepare(id, name, sender, &version.migrations)
             .await
         {
-            Ok(()) => {}
+            // What the migrations changed is shipped to the Change history:
+            // asked for now, not waited for (blackbox/CONTRACT.md,
+            // "Shipping: When").
+            Ok(()) => self.own.ship(name),
             Err(Problem::Diverged) => return Ok(Sent::Diverged),
             Err(Problem::Failed {
                 migration,

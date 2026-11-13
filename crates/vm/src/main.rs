@@ -165,6 +165,9 @@ fn run(serve: &Serve) -> Result<(), String> {
         // Before serving: every own database in this program's form, its
         // migration role closed (each within its own time limits).
         own.bring_to_form().await;
+        // Then what every outbox holds is shipped, without delaying serving
+        // (blackbox/CONTRACT.md, "Shipping: When").
+        own.ship_all();
         let registry = Arc::new(registry);
         let resources = Arc::new(resources);
         let log = Arc::new(OperationLog::new(database));

@@ -459,6 +459,12 @@ impl Opened {
         let started = Instant::now();
         let ended = held.end(commit && !aborted).await;
         let duration_ms = Some(millis(started.elapsed()));
+        // What it committed is shipped to the Change history once it is
+        // answered: asked for now, not waited for (blackbox/CONTRACT.md,
+        // "Shipping: When").
+        if commit && !aborted && ended.is_ok() && self.resource_name().is_none() {
+            self.own.ship(&self.in_flight.application);
+        }
         let (outcome, error, answer) = match &ended {
             Ok(()) if aborted => (
                 "failed",
