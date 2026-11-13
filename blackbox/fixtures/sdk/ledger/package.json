@@ -1,0 +1,9 @@
+{
+  "name": "vm-fixture-sdk-ledger",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@vm/sdk": "file:../../../../sdk",
+    "drizzle-orm": "0.45.4"
+  }
+}

@@ -62,6 +62,10 @@ pub const BOARD: &str = "sdk-board";
 /// The Application name of `fixtures/sdk/leftover`.
 pub const LEFTOVER: &str = "sdk-leftover";
 
+/// The Application name of `fixtures/sdk/ledger`, the fixture of
+/// transactions.
+pub const LEDGER: &str = "sdk-ledger";
+
 /// The repository's root: the npm workspace, and where the tooling is run
 /// from.
 pub fn repository_root() -> PathBuf {
@@ -377,7 +381,14 @@ impl Sdk {
     /// `devops` and [`WRITERS`] `write` on `ops`, and `fixtures/sdk/board`
     /// installed.
     pub fn board() -> Self {
-        let built = built("board");
+        Self::with_shared("board")
+    }
+
+    /// As [`Sdk::board`], with the fixture project `fixtures/sdk/<name>`
+    /// installed instead: one that declares `devops` and [`OPS`] as
+    /// `board` does.
+    pub fn with_shared(name: &str) -> Self {
+        let built = built(name);
         let scenario = Scenario::start();
         scenario.db.superuser().batch(
             &SHARED_SETUP
