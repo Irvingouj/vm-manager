@@ -478,7 +478,7 @@ Every table an Application's migrations make, in any schema but `vm`, is capture
 
 ### A change with no identity fails
 
-A row of a captured table cannot be inserted, updated or deleted, by any role, in a transaction with no verifiable identity: the statement fails with SQLSTATE `VM001`, nothing is changed and nothing is recorded. (A superuser, and the role that owns the tables, can still switch the capture itself off; that is not Application code, see "What this does not close".) There is no history row "made by nobody". Through the host this cannot happen to an Application; if it did, the answer would be the usual `{ error: { kind: "database", code: "VM001", ... } }`.
+A row of a captured table cannot be inserted, updated or deleted, by any role, in a transaction with no verifiable identity: the statement fails with SQLSTATE `VM001`, nothing is changed and nothing is recorded. (A superuser, and the role that owns the tables, can still switch the capture itself off; for what Application code can make of the owner's rights, see "What a migration leaves behind".) There is no history row "made by nobody". Through the host this cannot happen to an Application; if it did, the answer would be the usual `{ error: { kind: "database", code: "VM001", ... } }`.
 
 ### What the runtime role cannot do
 
@@ -701,7 +701,7 @@ ADR 0017. A migration is a Contributor's code. From this ticket on it cannot rea
 For an Application the platform numbers `n`, with `<p>` the platform database's name:
 
 - `<p>_app_<n>_platform`: the platform's own role for this database. It owns the database and the schema `vm` with everything in it.
-- `<p>_app_<n>_owner`: what migrations run as. It owns what the migrations make and nothing else. **It cannot log in** (`rolcanlogin` false) except while the platform is applying migrations; whatever password it gave itself is of no use.
+- `<p>_app_<n>_owner`: what migrations run as. It owns what the migrations make and nothing else. **It cannot log in** (`rolcanlogin` false) except while the platform is applying migrations, and **no password a migration gave it is ever good**: see "The migration role's password" below.
 - `<p>_app_<n>_runtime`: as before.
 - The platform still needs only `CREATEDB` and `CREATEROLE`.
 - An own database in the earlier form (its `vm` owned by `_owner`) is brought to this form when the program starts, before it serves; its history, its keys and its tables' rows are unchanged.
@@ -714,7 +714,8 @@ Each of these, in a migration's text, fails in the database: the answer is `422 
 - Insert, update, delete or truncate `vm.history` or the platform's record of migrations (`vm.migrations`); lock them; put a rule, a trigger or a child table on them (`42501`).
 - Create, replace, alter, rename, take over or drop anything in `vm`, or `vm` itself; move a table into it (`42501`).
 - Become the platform's role or the runtime role, give itself their rights or theirs to another, change the database's settings or owner (`42501`, or another refusal of Postgres's own; a few such attempts Postgres answers with a warning and does nothing, and then the Version applies and the platform's part is as before).
-- A migration may change the migration role's own password or settings (Postgres lets any role); it is not refused and is of no use: the role cannot log in, and the platform sets what it needs each time.
+- A migration may change the migration role's own password or settings (Postgres lets any role); it is not refused and is of no use: the platform sets what it needs each time, and see "The migration role's password" below.
+- Make a trigger of its own that calls a function of `vm` (`42501`): the capture's functions are the platform's alone to attach. So a capture trigger that a migration drops cannot be made again by it, in the right form or with old and new exchanged.
 - `TRUNCATE` a table that has history, directly, through `CASCADE` or through a partition (`VM002`; the message says to `DELETE`, which is recorded).
 
 It can still read `vm.history`, and `vm.identity()`, which during a migration answers the Contributor who sent the Version as `user_id`, `actor` `migration` and no request.
@@ -733,18 +734,20 @@ Whatever else a migration tries that Postgres refuses to a role without superuse
   when a rule of the platform's is broken. When several are broken the answer names one of them. `migration` is the migration whose text broke the rule, or after which the check failed. Nothing is kept, no Version is recorded, the previous Version goes on serving, exactly as for `migration-failed`. In the order of "The platform's API", `migration-refused` stands where `migration-failed` does.
 - Rules checked on the text, before any statement of any migration is sent:
   - `transaction-control`: a statement that begins, ends, chains, prepares or savepoints a transaction (`BEGIN`, `START TRANSACTION`, `COMMIT`, `END`, `ROLLBACK`, `ABORT`, `COMMIT AND CHAIN`, `ROLLBACK AND CHAIN`, `PREPARE TRANSACTION`, `COMMIT PREPARED`, `ROLLBACK PREPARED`, `SAVEPOINT`, `RELEASE`, `ROLLBACK TO`). The word inside a string, a comment, a dollar-quoted body or an identifier is not one.
-  - `unparseable`: text the parser cannot read. The message gives Postgres's own words and position.
+  - `unparseable`: text the parser cannot read. The message gives Postgres's own words and the line of the migration.
+  - `copy-stream`: `COPY ... FROM STDIN` or `COPY ... TO STDOUT`. A migration is sent statement by statement and has no stream to give or take; rows are put in with `INSERT`.
 - A `DO` block or a procedure that tries to commit fails in the database (`2D000`), which is `migration-failed`.
 
 ### What is checked before a Version's migrations are committed
 
 After the last migration's last statement, and before the commit, the platform makes sure nothing of the migration's can still run, then checks. A broken rule is `migration-refused`:
 
-- `capture-changed`: a capture trigger that existed before one of the Version's migrations (the capture of a table is made at the end of the migration that makes the table) was disabled, dropped, renamed or replaced during a later one, **also when it was put back** (disable, change rows, enable). The message names the table.
+- `capture-changed`: a capture trigger that existed before one of the Version's migrations (the capture of a table is made at the end of the migration that makes the table) was disabled, dropped or renamed during a later one, **also when it was put back** (disable, change rows, enable). The message names the table. (A migration that drops one and tries to make it again fails at that statement with `42501`, which is `migration-failed`.)
 - `capture-missing`: a table outside `vm` is without its whole capture at the end, or carries another trigger that calls a function of `vm`.
 - `deferrable`: a trigger or a constraint that is `DEFERRABLE`. Their work would run at the commit, after the checks. (A constraint that failed when made immediate is `migration-failed` with its own SQLSTATE.)
 - `json-cast`: a cast from one of the Application's types to `json` or `jsonb` whose function is not Postgres's own. Postgres would call it inside the capture, with the platform's rights.
 - `in-vm`: an extension, or any object the platform did not make, in schema `vm` (`CREATE EXTENSION hstore SCHEMA vm` is allowed by Postgres to this role).
+- `security-definer`, `index-code`: see "What a migration leaves behind" below.
 
 A cursor left open `WITH HOLD` is closed by the platform before the checks; its query never runs, and the Version applies.
 
@@ -755,9 +758,66 @@ A cast of the `json-cast` kind followed by a change of a captured table in the s
 - A row of a table with a column named `t`, `vm_row`, `vm_new` or `vm_old`, of any type, is recorded whole, like any row.
 - What is recorded does not depend on the writer's session settings: with `extra_float_digits`, `TimeZone`, `IntervalStyle`, `DateStyle` or `bytea_output` set otherwise in the transaction that writes (a migration can set them; the runtime role can through its own role settings), the history row holds every digit, and times with the offset `+00:00`.
 - While a cast of the `json-cast` kind exists, every change of a captured table fails with `VM003`, whoever makes it. (A migration that makes one is refused, so this is seen only if one was made otherwise.)
+- A virtual generated column (Postgres 18) is recorded as null: it holds no data of its own, and the capture computes nothing. Postgres itself refuses one that calls a function of the Application's.
+
+### The migration role's password
+
+A migration can give the migration role a password (`ALTER ROLE CURRENT_USER PASSWORD '...'`), hoping to log in as the owner of the Application's tables once the migrations are committed.
+
+- No login as `_owner` with a password a migration set ever succeeds: not while the Version is being applied, not after it is accepted or refused, **not when the platform is held up or stopped between committing the migrations and closing the role**. From the commit on, the role has no password.
+- When closing the role is held up (the platform's `ALTER ROLE` waits on a lock, or fails), the Version is still answered as its migrations ended, the role is closed before the own database is next used, and the program's log has an `own-database-migration-role-not-closed` record naming the Application.
+- When the program is stopped while a Version's migrations are being applied: nothing of the Version is kept (or all of it, if the commit was made); at the next start, before the program serves, `_owner` cannot log in and has no session; the same Version can be sent again.
+- When the client that sent the Version goes away before the answer: the same, without a restart. Within 15 seconds `_owner` cannot log in and has no session, and the migrations were applied whole or not at all.
+- Two first Versions of one Application sent at once: one own database and one set of roles are made; each is answered `201` or with a refusal of "The platform's API" (`migrations-diverged` when their lists differ), never `500`; those accepted are numbered 1 and 2; `_owner` cannot log in afterwards.
+
+### What a migration leaves behind
+
+Code a migration leaves in the database can run later with the migration role's rights, though the role cannot log in: Postgres runs a `SECURITY DEFINER` function as its owner, and it runs the triggers, constraints and index expressions of a table as the table's owner while it carries out a foreign key's `ON DELETE` or `ON UPDATE` action, analyzes the table or refreshes a materialized view (`docs/research/change-history-out-of-reach.md`, part F). As the owner such code could switch the capture off, change rows and switch it on again, with no migration running. The platform holds run time to what it holds a migration to.
+
+**Refused when the migration is applied** (`migration-refused`, checked before the commit with the other rules):
+
+- `security-definer`: a function or a procedure marked `SECURITY DEFINER`, in any schema. The message names it and says the runtime role may already read and write every table the migrations make.
+- `index-code`: an index (in an expression or in its `WHERE`) or an extended statistic that calls a function the migrations wrote, directly or through an operator, a cast or a domain's constraint of theirs. Postgres's autovacuum would run it as the owner. The message names the index or statistic and the function. Indexes on Postgres's own functions and operators (`lower(name)`, `(a + b)`, `WHERE deleted_at IS NULL`) are allowed.
+
+**Checked before every commit that could carry a change.** On the own database, an `execute` outside a transaction, and the commit of a transaction begun with `access: "write"`, end like this: the host makes deferred constraints immediate, closes every cursor (one declared `WITH HOLD` never runs its query), and checks that the structure of the Application's tables and the capture on them are **the very same as when the last Version's migrations ended**. If they are not:
+
+- everything the statement or the transaction did is rolled back, what it did to the structure and the capture included;
+- the answer is `{ error: { kind: "database", code: "VM004", message } }`, from `execute` or from `tx.commit` (through the SDK: `OperationFailed` of kind `database` with that code); the message says that an Application's structure changes in migrations only;
+- the Operation log entry (of the `execute`, or of the `commit`) is `failed` with `error` `VM004`; the transaction is over, as after any commit.
+
+At the least these are such a change, whoever's rights the statement that made them ran with and however it came to run:
+
+- a capture trigger disabled, dropped or renamed, **also when it was put back** in the same transaction;
+- a table (outside `vm`) made, dropped, renamed or moved to another schema;
+- a column added, dropped, or given another type;
+- a trigger or a constraint made that is `DEFERRABLE`;
+- a partition attached or detached.
+
+The platform may refuse other changes of definitions at run time too. What an Application does at run time otherwise is as before: a foreign key's cascade with the Application's own triggers and constraints, a function that only reads and writes rows, a materialized view refreshed by the runtime role where a migration granted it `MAINTAIN` (Postgres 17 and later).
+
+A `query` outside such a transaction is in a read-only transaction, where Postgres itself refuses such a change (`25006`).
+
+This is the host's doing, on every connection it gives an Application; the runtime role's password is the host's alone.
+
+**What something else changed.** A change made by something that is not a transaction of the host's (a way nobody foresaw; a superuser or somebody else with the database's own rights) cannot be rolled back by the platform. It is found and said:
+
+- The platform keeps, in the platform database, what the structure and the capture of each own database were when the last Version's migrations ended. When it finds them otherwise (at the latest at the next write to that own database, or when the next Version is sent; also when the change was made while the program was not running, and then at the first use after it starts), it
+  - writes an Operation log entry: `operation` and `statement` `capture-check`, `outcome` `failed`, `error` `changed-outside`, `application`, `own_database` true, `actor` `platform`, and null `user`, `request`, `resource`, `transaction`, `rows`;
+  - writes a `capture-changed-outside` record to the program's log, with `application` and `tables`: the tables, as `"<schema>.<table>"`, whose structure or capture is not what it was (one that was dropped or made is named too);
+  - puts the capture back whole on every table: a capture trigger found disabled is enabled, one missing is made, a table found without capture is given it;
+  - and goes on from what it now finds.
+- The write that finds it may itself be answered `VM004` and rolled back. The next write is not, and is recorded in the history.
+- One change is said once: not again at the next write, nor after a restart.
+- Ordinary maintenance is not a change: after `VACUUM (FREEZE, ANALYZE)`, `VACUUM FULL` (of a table, of the catalogs), `REINDEX`, `CLUSTER` and `ANALYZE` by a superuser, no such entry is written and writes go on.
+- After the Postgres under the platform is replaced (a restore of a dump, `pg_upgrade`), each own database is found changed once.
+- A Version sent while writes are being made does not make them fail: a write is checked against what holds for the Version whose migrations were last committed, and none is answered `VM004` for the Version's own change.
+
+**The platform's own sessions run nothing of the Application's.** Whatever a migration left in `public` or any schema of its own (functions, operators, types of any name), no session the platform opens as `_platform` in the own database calls it: not when the database is brought from an earlier form, not when the keys are read, not when the migration role is closed.
 
 ### What this does not close
 
+- A superuser, and whoever else holds the database's own rights outside the platform, can still switch the capture off. The platform says so when it finds it ("What something else changed"); it cannot say which rows were changed meanwhile.
+- On Postgres 16 the runtime role cannot refresh a materialized view (only its owner can, and `SECURITY DEFINER` is refused); on 17 and later a migration grants `MAINTAIN`.
 - **Changes of structure that change data** leave no history row per changed row: a column's type changed with `USING`, a column or a table dropped, a table replaced under its name. The next ticket (the Change history in the platform database) records each as an entry of the table's history with the Contributor and the migration's name; the one after records each row a rewrite changed.
 - The Application's own triggers, which a migration may make on its own tables, change rows under the User in flight and are recorded so. That is the Application's behaviour, as any of its code is.
 - Until the next ticket the history is still in the own database, in `vm.history`, owned by the platform's role: no migration can touch it, but it is not yet outside.

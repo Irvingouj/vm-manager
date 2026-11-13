@@ -1,0 +1,322 @@
+######## Postgres 16 (16.15.0), part F, vectors
+-- at rest, before
+trigger row: 16461 xmin=740 ctid=(0,10) enabled=O
+victim: honest
+captured: 0
+-- control: the runtime role's own update is captured
+trigger row: 16461 xmin=740 ctid=(0,10) enabled=O
+victim: by the runtime role
+captured: 1
+-- control: the runtime role itself may not disable
+ERROR 42501: must be owner of table victim
+-- V1 security definer, called by the runtime role
+
+trigger row: 16461 xmin=743 ctid=(0,12) enabled=O
+victim: changed unseen via security definer
+captured: 1
+-- V2 fk cascade, a delete by the runtime role
+trigger row: 16461 xmin=745 ctid=(0,14) enabled=O
+victim: changed unseen via before trigger in fk cascade DELETE
+captured: 1
+-- V7 check constraint in fk cascade, an update by the runtime role
+trigger row: 16461 xmin=747 ctid=(0,16) enabled=O
+victim: changed unseen via check constraint in fk cascade
+captured: 1
+-- V3 index expression: the runtime role sets the flag and changes rows; autovacuum analyzes
+trigger row: 16461 xmin=751 ctid=(0,18) enabled=O
+victim: changed unseen via index expression in analyze
+captured: 1
+-- V4 the migration role lets the runtime role create; a table made at run time
+loose rows: 1
+-- the witness
+security definer | ran as a1_mig | 
+security definer (done) | ran as a1_mig | tampered
+before trigger in fk cascade DELETE | ran as a1_mig | 
+before trigger in fk cascade DELETE (done) | ran as a1_mig | tampered
+check constraint in fk cascade | ran as a1_mig | 
+check constraint in fk cascade (done) | ran as a1_mig | tampered
+index expression in analyze | ran as a1_mig | 
+index expression in analyze (done) | ran as a1_mig | tampered
+######## Postgres 16 (16.15.0), part F, checks
+baseline a490e53cd25bad8779b18b6074fed3aa
+== F1: read-only transaction and the security definer function
+begin ro: ok BEGIN []
+v1 in read-only: ERROR 25006 cannot execute ALTER TABLE in a read-only transaction
+rollback: ok ROLLBACK []
+witness []
+== F2: in a read-write transaction the digest differs before commit; rollback undoes all
+begin: ok BEGIN []
+v1: ok SELECT 1 [('',)]
+digest inside equals baseline: False
+victim inside: changed unseen in a transaction
+rollback: ok ROLLBACK []
+digest after rollback equals baseline: True
+victim after rollback: honest
+== F3: a WITH HOLD cursor runs its query at COMMIT, after any check
+begin: ok BEGIN []
+declare: ok DECLARE CURSOR []
+digest before commit equals baseline: True
+commit: ok COMMIT []
+digest after commit equals baseline: False
+victim: changed unseen at commit by a held cursor 1
+  the same, with CLOSE ALL before the check
+begin: ok BEGIN []
+declare: ok DECLARE CURSOR []
+close all: ok CLOSE CURSOR ALL []
+digest before commit equals baseline: True
+commit: ok COMMIT []
+digest after commit equals baseline: True
+== F4: the migration role's own password, set to NULL by the host as the last act
+begin: ok BEGIN []
+migration sets a password: ok ALTER ROLE []
+migration tries more: ERROR 42501 permission denied to alter role
+migration tries connection limit: ERROR 42501 permission denied to alter role
+host: password null: ok ALTER ROLE []
+commit: ok COMMIT []
+login with 'known': refused: connection to server at "127.0.0.1", port 47095 failed: FATAL:  password authentication failed for user "a1_mig"
+login with 'a1_mig': refused: connection to server at "127.0.0.1", port 47095 failed: FATAL:  password authentication failed for user "a1_mig"
+session still alive: ok SELECT 1 [('a1_mig',)]
+== F5: stretching the window between commit and NOLOGIN (the test's technique)
+platform restores a password: ok ALTER ROLE []
+mig begin: ok BEGIN []
+mig sets a password: ok ALTER ROLE []
+mig commits: ok COMMIT []
+superuser holds the row: ok SELECT 1 [('1',)]
+login with the migration's password while the close waits: SUCCEEDED
+the close: ERROR 57014 canceling statement due to statement timeout
+== F6: what an index, a statistic depends on, from the catalogs
+   ('idx_dom', 'pg_type', '16486', None)
+   ('idx_e', 'pg_proc', 'v3(integer)', 'plpgsql')
+   ('idx_op', 'pg_operator', '16483', None)
+   ('idx_p', 'pg_proc', 'v3(integer)', 'plpgsql')
+   ('st_e', 'pg_proc', 'v3(integer)')
+######## Postgres 16 (16.15.0), part F, maintenance
+before             [('16461', '740', '(0,10)', 'O')] [('1', '739', '(57,11)'), ('2', '739', '(57,12)')] [('740', '(1,10)', '16404')]
+VACUUM (FREEZE, ANALYZE)           ok [('16461', '740', '(0,10)', 'O')] [('1', '739', '(57,11)'), ('2', '739', '(57,12)')] [('740', '(1,10)', '16404')]
+VACUUM FULL public.victim          ok [('16461', '740', '(0,10)', 'O')] [('1', '739', '(57,11)'), ('2', '739', '(57,12)')] [('791', '(1,5)', '16470')]
+REINDEX TABLE public.victim        ok [('16461', '740', '(0,10)', 'O')] [('1', '739', '(57,11)'), ('2', '739', '(57,12)')] [('791', '(1,5)', '16470')]
+CLUSTER public.victim USING victim ok [('16461', '740', '(0,10)', 'O')] [('1', '739', '(57,11)'), ('2', '739', '(57,12)')] [('793', '(1,47)', '16478')]
+VACUUM FULL pg_catalog.pg_trigger  ok [('16461', '740', '(0,10)', 'O')] [('1', '739', '(57,11)'), ('2', '739', '(57,12)')] [('793', '(1,47)', '16478')]
+VACUUM FULL pg_catalog.pg_attribut ok [('16461', '740', '(0,10)', 'O')] [('1', '739', '(57,10)'), ('2', '739', '(57,11)')] [('793', '(1,47)', '16478')]
+VACUUM (FREEZE) pg_catalog.pg_trig ok [('16461', '740', '(0,10)', 'O')] [('1', '739', '(57,10)'), ('2', '739', '(57,11)')] [('793', '(1,47)', '16478')]
+ANALYZE                            ok [('16461', '740', '(0,10)', 'O')] [('1', '739', '(57,10)'), ('2', '739', '(57,11)')] [('793', '(1,47)', '16478')]
+######## Postgres 17 (17.11.0), part F, vectors
+-- at rest, before
+trigger row: 16461 xmin=748 ctid=(0,10) enabled=O
+victim: honest
+captured: 0
+-- control: the runtime role's own update is captured
+trigger row: 16461 xmin=748 ctid=(0,10) enabled=O
+victim: by the runtime role
+captured: 1
+-- control: the runtime role itself may not disable
+ERROR 42501: must be owner of table victim
+-- V1 security definer, called by the runtime role
+
+trigger row: 16461 xmin=751 ctid=(0,12) enabled=O
+victim: changed unseen via security definer
+captured: 1
+-- V2 fk cascade, a delete by the runtime role
+trigger row: 16461 xmin=753 ctid=(0,14) enabled=O
+victim: changed unseen via before trigger in fk cascade DELETE
+captured: 1
+-- V7 check constraint in fk cascade, an update by the runtime role
+trigger row: 16461 xmin=755 ctid=(0,16) enabled=O
+victim: changed unseen via check constraint in fk cascade
+captured: 1
+-- V3 index expression: the runtime role sets the flag and changes rows; autovacuum analyzes
+trigger row: 16461 xmin=759 ctid=(0,18) enabled=O
+victim: changed unseen via index expression in analyze
+captured: 1
+-- V4 the migration role lets the runtime role create; a table made at run time
+loose rows: 1
+-- V5 MAINTAIN: the runtime role refreshes a materialized view
+trigger row: 16461 xmin=782 ctid=(0,20) enabled=O
+victim: changed unseen via materialized view refresh
+captured: 1
+-- the witness
+security definer | ran as a1_mig | 
+security definer (done) | ran as a1_mig | tampered
+before trigger in fk cascade DELETE | ran as a1_mig | 
+before trigger in fk cascade DELETE (done) | ran as a1_mig | tampered
+check constraint in fk cascade | ran as a1_mig | 
+check constraint in fk cascade (done) | ran as a1_mig | tampered
+index expression in analyze | ran as a1_mig | 
+index expression in analyze (done) | ran as a1_mig | tampered
+materialized view refresh | ran as a1_mig | 
+materialized view refresh (done) | ran as a1_mig | tampered
+######## Postgres 17 (17.11.0), part F, checks
+baseline b237796f1ff8dba206eb27b00e8977b6
+== F1: read-only transaction and the security definer function
+begin ro: ok BEGIN []
+v1 in read-only: ERROR 25006 cannot execute ALTER TABLE in a read-only transaction
+rollback: ok ROLLBACK []
+witness []
+== F2: in a read-write transaction the digest differs before commit; rollback undoes all
+begin: ok BEGIN []
+v1: ok SELECT 1 [('',)]
+digest inside equals baseline: False
+victim inside: changed unseen in a transaction
+rollback: ok ROLLBACK []
+digest after rollback equals baseline: True
+victim after rollback: honest
+== F3: a WITH HOLD cursor runs its query at COMMIT, after any check
+begin: ok BEGIN []
+declare: ok DECLARE CURSOR []
+digest before commit equals baseline: True
+commit: ok COMMIT []
+digest after commit equals baseline: False
+victim: changed unseen at commit by a held cursor 1
+  the same, with CLOSE ALL before the check
+begin: ok BEGIN []
+declare: ok DECLARE CURSOR []
+close all: ok CLOSE CURSOR ALL []
+digest before commit equals baseline: True
+commit: ok COMMIT []
+digest after commit equals baseline: True
+== F4: the migration role's own password, set to NULL by the host as the last act
+begin: ok BEGIN []
+migration sets a password: ok ALTER ROLE []
+migration tries more: ERROR 42501 permission denied to alter role
+migration tries connection limit: ERROR 42501 permission denied to alter role
+host: password null: ok ALTER ROLE []
+commit: ok COMMIT []
+login with 'known': refused: connection to server at "127.0.0.1", port 33547 failed: FATAL:  password authentication failed for user "a1_mig"
+login with 'a1_mig': refused: connection to server at "127.0.0.1", port 33547 failed: FATAL:  password authentication failed for user "a1_mig"
+session still alive: ok SELECT 1 [('a1_mig',)]
+== F5: stretching the window between commit and NOLOGIN (the test's technique)
+platform restores a password: ok ALTER ROLE []
+mig begin: ok BEGIN []
+mig sets a password: ok ALTER ROLE []
+mig commits: ok COMMIT []
+superuser holds the row: ok SELECT 1 [('1',)]
+login with the migration's password while the close waits: SUCCEEDED
+the close: ERROR 57014 canceling statement due to statement timeout
+== F6: what an index, a statistic depends on, from the catalogs
+   ('idx_dom', 'pg_type', '16486', None)
+   ('idx_e', 'pg_proc', 'v3(integer)', 'plpgsql')
+   ('idx_op', 'pg_operator', '16483', None)
+   ('idx_p', 'pg_proc', 'v3(integer)', 'plpgsql')
+   ('st_e', 'pg_proc', 'v3(integer)')
+######## Postgres 17 (17.11.0), part F, maintenance
+before             [('16461', '748', '(0,10)', 'O')] [('1', '747', '(54,32)'), ('2', '747', '(54,33)')] [('748', '(1,10)', '16404')]
+VACUUM (FREEZE, ANALYZE)           ok [('16461', '748', '(0,10)', 'O')] [('1', '747', '(54,32)'), ('2', '747', '(54,33)')] [('748', '(1,10)', '16404')]
+VACUUM FULL public.victim          ok [('16461', '748', '(0,10)', 'O')] [('1', '747', '(54,32)'), ('2', '747', '(54,33)')] [('799', '(1,5)', '16470')]
+REINDEX TABLE public.victim        ok [('16461', '748', '(0,10)', 'O')] [('1', '747', '(54,32)'), ('2', '747', '(54,33)')] [('799', '(1,5)', '16470')]
+CLUSTER public.victim USING victim ok [('16461', '748', '(0,10)', 'O')] [('1', '747', '(54,32)'), ('2', '747', '(54,33)')] [('801', '(1,47)', '16478')]
+VACUUM FULL pg_catalog.pg_trigger  ok [('16461', '748', '(0,10)', 'O')] [('1', '747', '(54,32)'), ('2', '747', '(54,33)')] [('801', '(1,47)', '16478')]
+VACUUM FULL pg_catalog.pg_attribut ok [('16461', '748', '(0,10)', 'O')] [('1', '747', '(54,31)'), ('2', '747', '(54,32)')] [('801', '(1,47)', '16478')]
+VACUUM (FREEZE) pg_catalog.pg_trig ok [('16461', '748', '(0,10)', 'O')] [('1', '747', '(54,31)'), ('2', '747', '(54,32)')] [('801', '(1,47)', '16478')]
+ANALYZE                            ok [('16461', '748', '(0,10)', 'O')] [('1', '747', '(54,31)'), ('2', '747', '(54,32)')] [('801', '(1,47)', '16478')]
+######## Postgres 18 (18.6.0), part F, vectors
+-- at rest, before
+trigger row: 16467 xmin=762 ctid=(0,10) enabled=O
+victim: honest
+captured: 0
+-- control: the runtime role's own update is captured
+trigger row: 16467 xmin=762 ctid=(0,10) enabled=O
+victim: by the runtime role
+captured: 1
+-- control: the runtime role itself may not disable
+ERROR 42501: must be owner of table victim
+-- V1 security definer, called by the runtime role
+
+trigger row: 16467 xmin=765 ctid=(0,12) enabled=O
+victim: changed unseen via security definer
+captured: 1
+-- V2 fk cascade, a delete by the runtime role
+trigger row: 16467 xmin=767 ctid=(0,14) enabled=O
+victim: changed unseen via before trigger in fk cascade DELETE
+captured: 1
+-- V7 check constraint in fk cascade, an update by the runtime role
+trigger row: 16467 xmin=769 ctid=(0,16) enabled=O
+victim: changed unseen via check constraint in fk cascade
+captured: 1
+-- V3 index expression: the runtime role sets the flag and changes rows; autovacuum analyzes
+trigger row: 16467 xmin=773 ctid=(0,18) enabled=O
+victim: changed unseen via index expression in analyze
+captured: 1
+-- V4 the migration role lets the runtime role create; a table made at run time
+loose rows: 1
+-- V5 MAINTAIN: the runtime role refreshes a materialized view
+trigger row: 16467 xmin=796 ctid=(0,20) enabled=O
+victim: changed unseen via materialized view refresh
+captured: 1
+-- V8 a virtual generated column calling a function of the migration's
+ERROR 0A000: generation expression uses user-defined function
+ERROR 0A000: virtual generated column "g" cannot have a domain type
+gen3 row as captured: {"g": null, "id": 5}
+-- the witness
+security definer | ran as a1_mig | 
+security definer (done) | ran as a1_mig | tampered
+before trigger in fk cascade DELETE | ran as a1_mig | 
+before trigger in fk cascade DELETE (done) | ran as a1_mig | tampered
+check constraint in fk cascade | ran as a1_mig | 
+check constraint in fk cascade (done) | ran as a1_mig | tampered
+index expression in analyze | ran as a1_mig | 
+index expression in analyze (done) | ran as a1_mig | tampered
+materialized view refresh | ran as a1_mig | 
+materialized view refresh (done) | ran as a1_mig | tampered
+######## Postgres 18 (18.6.0), part F, checks
+baseline 7eea132db30778be2db96abf87295b49
+== F1: read-only transaction and the security definer function
+begin ro: ok BEGIN []
+v1 in read-only: ERROR 25006 cannot execute ALTER TABLE in a read-only transaction
+rollback: ok ROLLBACK []
+witness []
+== F2: in a read-write transaction the digest differs before commit; rollback undoes all
+begin: ok BEGIN []
+v1: ok SELECT 1 [('',)]
+digest inside equals baseline: False
+victim inside: changed unseen in a transaction
+rollback: ok ROLLBACK []
+digest after rollback equals baseline: True
+victim after rollback: honest
+== F3: a WITH HOLD cursor runs its query at COMMIT, after any check
+begin: ok BEGIN []
+declare: ok DECLARE CURSOR []
+digest before commit equals baseline: True
+commit: ok COMMIT []
+digest after commit equals baseline: False
+victim: changed unseen at commit by a held cursor 1
+  the same, with CLOSE ALL before the check
+begin: ok BEGIN []
+declare: ok DECLARE CURSOR []
+close all: ok CLOSE CURSOR ALL []
+digest before commit equals baseline: True
+commit: ok COMMIT []
+digest after commit equals baseline: True
+== F4: the migration role's own password, set to NULL by the host as the last act
+begin: ok BEGIN []
+migration sets a password: ok ALTER ROLE []
+migration tries more: ERROR 42501 permission denied to alter role
+migration tries connection limit: ERROR 42501 permission denied to alter role
+host: password null: ok ALTER ROLE []
+commit: ok COMMIT []
+login with 'known': refused: connection to server at "127.0.0.1", port 48023 failed: FATAL:  password authentication failed for user "a1_mig"
+login with 'a1_mig': refused: connection to server at "127.0.0.1", port 48023 failed: FATAL:  password authentication failed for user "a1_mig"
+session still alive: ok SELECT 1 [('a1_mig',)]
+== F5: stretching the window between commit and NOLOGIN (the test's technique)
+platform restores a password: ok ALTER ROLE []
+mig begin: ok BEGIN []
+mig sets a password: ok ALTER ROLE []
+mig commits: ok COMMIT []
+superuser holds the row: ok SELECT 1 [('1',)]
+login with the migration's password while the close waits: SUCCEEDED
+the close: ERROR 57014 canceling statement due to statement timeout
+== F6: what an index, a statistic depends on, from the catalogs
+   ('idx_dom', 'pg_type', '16494', None)
+   ('idx_e', 'pg_proc', 'v3(integer)', 'plpgsql')
+   ('idx_op', 'pg_operator', '16491', None)
+   ('idx_p', 'pg_proc', 'v3(integer)', 'plpgsql')
+   ('st_e', 'pg_proc', 'v3(integer)')
+######## Postgres 18 (18.6.0), part F, maintenance
+before             [('16467', '762', '(0,10)', 'O')] [('1', '761', '(55,10)'), ('2', '761', '(55,11)')] [('762', '(1,10)', '16405')]
+VACUUM (FREEZE, ANALYZE)           ok [('16467', '762', '(0,10)', 'O')] [('1', '761', '(55,10)'), ('2', '761', '(55,11)')] [('762', '(1,10)', '16405')]
+VACUUM FULL public.victim          ok [('16467', '762', '(0,10)', 'O')] [('1', '761', '(55,10)'), ('2', '761', '(55,11)')] [('813', '(1,5)', '16476')]
+REINDEX TABLE public.victim        ok [('16467', '762', '(0,10)', 'O')] [('1', '761', '(55,10)'), ('2', '761', '(55,11)')] [('813', '(1,5)', '16476')]
+CLUSTER public.victim USING victim ok [('16467', '762', '(0,10)', 'O')] [('1', '761', '(55,10)'), ('2', '761', '(55,11)')] [('815', '(1,47)', '16484')]
+VACUUM FULL pg_catalog.pg_trigger  ok [('16467', '762', '(0,10)', 'O')] [('1', '761', '(55,10)'), ('2', '761', '(55,11)')] [('815', '(1,47)', '16484')]
+VACUUM FULL pg_catalog.pg_attribut ok [('16467', '762', '(0,10)', 'O')] [('1', '761', '(55,8)'), ('2', '761', '(55,9)')] [('815', '(1,47)', '16484')]
+VACUUM (FREEZE) pg_catalog.pg_trig ok [('16467', '762', '(0,10)', 'O')] [('1', '761', '(55,8)'), ('2', '761', '(55,9)')] [('815', '(1,47)', '16484')]
+ANALYZE                            ok [('16467', '762', '(0,10)', 'O')] [('1', '761', '(55,8)'), ('2', '761', '(55,9)')] [('815', '(1,47)', '16484')]

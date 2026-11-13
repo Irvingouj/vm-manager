@@ -250,3 +250,42 @@ On a cluster started with `wal_level=logical`, with a superuser's `test_decoding
 - Enum `RENAME VALUE`, `ATTACH`/`DETACH PARTITION`, `INHERIT` detection by the structure digest: not run.
 - PG 18 virtual generated columns in transition tables and in `to_jsonb`: not looked at.
 - Throughput on a dedicated machine; the numbers here are from one noisy shared VM.
+
+## 11. F. Code a migration leaves behind (added 2026-11-13 by the driving session, in review of the first slice)
+
+Provenance of this part: written by the driving session, which ran `docs/research/change-history-out-of-reach/f-left-behind.sh` on Postgres 16.15, 17.11 and 18.6; its whole output is `f-left-behind.log` (exit 0). The roles are the same as above; the capture is a stand-in (one statement trigger `vm_capture_update` on `victim`, owned by `a1_vm`).
+
+Parts A and B asked what a migration can do while it runs. They did not ask what the code it leaves in the database can do afterwards. The migration role cannot log in between migrations, but **Postgres runs code with that role's rights without any login** [verified, `vectors`, same on each version unless said]:
+
+| Way | Who starts it | Ran as | Capture switched off, row changed, switched on, no history |
+|---|---|---|---|
+| A function marked `SECURITY DEFINER`, called in a statement | the runtime role | `a1_mig` | yes |
+| A `BEFORE` row trigger on the referencing table of a foreign key `ON DELETE CASCADE`, when a referenced row is deleted | the runtime role | `a1_mig` | yes |
+| A `CHECK` constraint on the referencing table of a foreign key `ON UPDATE CASCADE`, when a referenced key is updated | the runtime role | `a1_mig` | yes |
+| An index expression, when autovacuum analyzes the table (the runtime role only inserted rows) | autovacuum | `a1_mig` | yes |
+| A materialized view's query, refreshed by a role granted `MAINTAIN` (17 and 18; the privilege does not exist on 16) | the runtime role | `a1_mig` | yes |
+
+Postgres carries out a foreign key's action, analyzes a table and refreshes a materialized view as the table's owner, and runs whatever user code is attached with those rights. None of these is refused by a privilege, because the code is the owner's and the owner may disable a trigger on its own table. Also [verified]: a migration can let the runtime role create tables (`GRANT CREATE ON SCHEMA`), which then have no capture.
+
+In every case the trigger's catalog row was a new row afterwards (another `xmin`), as B1 found for a migration.
+
+What a fix can rest on [verified, `checks`, 16/17/18]:
+
+- **A read-only transaction refuses it**: `ALTER TABLE` inside a `SECURITY DEFINER` function called in `BEGIN READ ONLY` fails with `25006`. Reads are safe as they are.
+- **Inside the transaction that did it, the change shows before the commit**: the digest of the capture triggers' rows (`oid`, `xmin`, `tgenabled`) differs from the one taken before, and a rollback undoes the change of the row and of the trigger alike.
+- **A cursor `WITH HOLD` runs its query at `COMMIT`**, after any check: declared over a function that deletes a referenced row, it switched the capture off and on at the commit (digest equal before the commit, different after). `CLOSE ALL` before the check prevents it.
+- **The migration role's password**: the role may set its own password in a migration; it may not set its own `VALID UNTIL` or `CONNECTION LIMIT` (`42501`). `ALTER ROLE CURRENT_USER PASSWORD NULL` sent on the same session as the last act before `COMMIT` leaves no password: a login with the migration's password is refused after the commit. Without it, the password is good from the commit until the platform's `ALTER ROLE ... NOLOGIN` commits; that window can be held open (the run holds the role's row with `SELECT ... FOR UPDATE` as a superuser, standing for a program stopped at that moment), and **a login with the migration's password succeeded in it**.
+- **The catalogs say what an index or an extended statistic calls**: `pg_depend` has a row from the index to the function (expression and `WHERE` alike), to the operator, or to the domain; from the statistic to the function.
+- **Postgres 18's virtual generated columns** cannot call a user-defined function (`0A000`, "generation expression uses user-defined function") nor have a domain type, and in a transition table read by a trigger their value is null (`to_jsonb` gave `{"g": null, "id": 5}` for `g int GENERATED ALWAYS AS (id * 2) VIRTUAL`). So the capture runs no code for them and records null. This answers the item of section 10.
+
+What ordinary maintenance does to the rows such a digest reads [verified, `maintenance`, 16/17/18]: `VACUUM (FREEZE, ANALYZE)`, `VACUUM FULL` of a table, `REINDEX`, `CLUSTER`, `VACUUM FULL` of `pg_trigger` and of `pg_attribute`, `ANALYZE` leave the `xmin` of the table's `pg_trigger` and `pg_attribute` rows unchanged. `VACUUM FULL` of a catalog moves its rows (`ctid`); `VACUUM FULL` and `CLUSTER` of a table give its `pg_class` row a new `xmin` and `relfilenode`. So a digest that is to hold between transactions may use `oid` and `xmin` of `pg_trigger` and `pg_attribute` rows and the values of `pg_class` columns, and must not use `ctid`, nor `xmin` or `relfilenode` of `pg_class`.
+
+[not verified]: that these five are all the ways. Others reasoned, not run: a stored generated column, a default (`ON ... SET DEFAULT`), an index expression or a partition key on the referencing table of a cascading foreign key; an extended statistic's expression under autovacuum; `REINDEX`, `CLUSTER` and `ANALYZE` by a role with `MAINTAIN`. The fix below does not depend on the list being complete.
+
+### What follows for the design
+
+1. The checks of part B must be made **before every commit that could carry such a change, not only a migration's**: every read-write transaction the host runs for an Application ends with `SET CONSTRAINTS ALL IMMEDIATE`, `CLOSE ALL`, the check, `COMMIT`; a transaction that changed the structure of a table or the capture is rolled back. This covers every way that starts from the Application's own statements, known or not.
+2. Autovacuum is not a transaction of the host's. An index or an extended statistic that calls code of the Application's is refused when the migration is applied.
+3. A function marked `SECURITY DEFINER` is refused when the migration is applied: the runtime role may already read and write every table, so it serves nothing here, and it is the shortest way to the owner's rights.
+4. What was changed by something the host does not run (a way nobody foresaw, or somebody with the database's own rights) cannot be undone. The platform keeps the digest of each own database in the platform database, compares when it next uses the own database, and when they differ says so in the Operation log and puts the capture back.
+5. The host sets the migration role's password to null as its last act in the migration's transaction.
