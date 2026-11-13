@@ -61,6 +61,13 @@ CREATE TABLE IF NOT EXISTS vm.history (
     migration text
 );
 
+-- A row's changes, newest first (the SDK's `history(table, key)`, ticket
+-- "Read a row's Change history through the SDK"). The key is indexed by its
+-- hash, not itself: a btree entry has a size limit, and a long key in it
+-- would make the change itself fail. The reader compares the key too.
+CREATE INDEX IF NOT EXISTS history_row ON vm.history
+    (schema_name, table_name, pg_catalog.jsonb_hash_extended(key, 0), id);
+
 -- What makes the transaction it is called in different from every other:
 -- the backend, the virtual transaction id (unique in the backend's slot
 -- until the server restarts) and the transaction's start, in
