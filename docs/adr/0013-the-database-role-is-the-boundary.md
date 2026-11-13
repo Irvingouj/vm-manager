@@ -4,6 +4,8 @@ status: accepted
 
 # The database role is the boundary, and identity is unforgeable only where the platform owns the database
 
+> Amended by ADR 0017: an own database has three roles; the role that applies migrations owns only what they make.
+
 When an Application reaches a database, what holds the Access level is the Postgres role the host logged in with, not an inspection of the SQL. The host keeps a separate login, and a separate connection pool, for each Access level of each database, and never switches role inside a session. A read is additionally run in a read-only transaction. The host still parses every statement and refuses kinds and functions an Application has no business with, but that check is hygiene: a spike found SQL that passes any such check and still runs other SQL (`docs/research/what-postgres-sees.md`).
 
 For a shared database, the Platform administrator who registers it supplies two logins, one that can read and one that can also write, and optionally a third that can see structure and no rows. The platform installs nothing in a database it does not own.

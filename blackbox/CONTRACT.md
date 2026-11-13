@@ -131,6 +131,7 @@ An answer that is not a success is:
 | 409 | A Version's migrations do not continue the Application's earlier ones | `migrations-diverged` |
 | 413 | A body larger than 16 MiB (exactly 16 MiB is accepted) | `too-large` |
 | 422 | A Version's migration failed in the database | `migration-failed` |
+| 422 | A Version's migration breaks a rule of the platform's | `migration-refused` |
 | 408 | The body did not arrive in time | `timed-out` |
 | 503 | The platform database cannot be reached or did not answer in time | `unavailable` |
 
@@ -379,7 +380,7 @@ with status `422`.
 For an Application the platform numbers `n`, with `<p>` the platform database's name:
 
 - database `<p>_app_<n>`, whose comment is `vm application <name>`;
-- role `<p>_app_<n>_owner`: owns every object in it and applies migrations;
+- role `<p>_app_<n>_owner`: applies migrations and owns what they make (and, from the ticket "The Change history is kept out of a Contributor's reach" on, nothing of the platform's: see that section for the third role);
 - role `<p>_app_<n>_runtime`: what Application code runs as. It owns nothing. It may read and change rows in the tables the migrations made (`SELECT`, `INSERT`, `UPDATE`, `DELETE`, and use of their sequences), in tables made by later migrations too, and nothing else: it cannot create, alter or drop anything, not even temporary tables; it cannot `TRUNCATE`; it is a member of no other role; it cannot connect to the platform database or to any other Application's own database, and no other Application's roles can connect to this one.
 - The schema `vm` in an own database is the platform's: it may hold the platform's own tables and functions, which the runtime role cannot change. Everything the Application's migrations make is its own, by default in `public`.
 - Their passwords are the platform's own and never appear in an answer, a log record or an error message.
@@ -499,6 +500,8 @@ With statement logging fully on in the own database (`log_statement = all`, `log
 - sending again what the log shows the host sent, as the runtime role, in another transaction, attaches nothing: `vm.identity()` raises `VM001` or the statement itself fails.
 
 ### What this does not close
+
+(Closed by the ticket "The Change history is kept out of a Contributor's reach"; what follows is how it stood before.)
 
 A migration is the Contributors' own code and runs as the role that owns the database (ADR 0013), `vm` included. A migration can therefore read the platform's secret, change `vm.history` and remove the capture. The platform records every migration's text (`vm.migrations`), so this is visible afterwards, not prevented.
 
@@ -688,6 +691,71 @@ Three operations and one argument. A transaction belongs to the request that beg
 - The label, and on the own database the attached identity, are set once when the transaction begins and hold for all of it: `vm.identity()` answers the same in every statement, and every change is in the Change history with the User, the Application, the actor and the request, as outside a transaction.
 - Every Operation log entry gains `"transaction": "<id>" | null`. Each statement in a transaction has its own entry, as before. `tx.begin`, `tx.commit` and `tx.rollback` have entries too, with `operation` `begin`, `commit` and `rollback`, `statement` the same word, and `rows` null; a refused `tx.begin` is logged like any refusal, with `transaction` null. A rollback the host makes on its own has a `rollback` entry with `outcome` `allowed` whose `error` says why: `request-ended`, `time` or the limit's name. A commit of an aborted transaction is `failed` with `error` `transaction-aborted`. A `tx.begin` that could not begin is `failed` with `transaction` null and `error` `transactions` (the fifth at once) or `unavailable` (no connection to give). A use of `tx` with no request in flight is refused `no-request` and has no entry, since no target is known.
 - The id in the Operation log is the id Application code holds. Knowing an id gives nothing: it works only inside the request that began it.
+
+## The platform's part of an own database is out of a migration's reach (ticket: The Change history is kept out of a Contributor's reach)
+
+ADR 0017. A migration is a Contributor's code. From this ticket on it cannot read or change what the platform keeps in the own database, cannot end the platform's transaction, and cannot leave a table without its capture. This section replaces what earlier sections say of the role `_owner`, and "What this does not close" under "Identity and Change history in the own database".
+
+### Three roles
+
+For an Application the platform numbers `n`, with `<p>` the platform database's name:
+
+- `<p>_app_<n>_platform`: the platform's own role for this database. It owns the database and the schema `vm` with everything in it.
+- `<p>_app_<n>_owner`: what migrations run as. It owns what the migrations make and nothing else. **It cannot log in** (`rolcanlogin` false) except while the platform is applying migrations; whatever password it gave itself is of no use.
+- `<p>_app_<n>_runtime`: as before.
+- The platform still needs only `CREATEDB` and `CREATEROLE`.
+- An own database in the earlier form (its `vm` owned by `_owner`) is brought to this form when the program starts, before it serves; its history, its keys and its tables' rows are unchanged.
+
+### What a migration cannot do
+
+Each of these, in a migration's text, fails in the database: the answer is `422 migration-failed` with the SQLSTATE given, nothing the Version's migrations did is kept, and the keys, the history, the record of migrations and the capture are as before.
+
+- Read `vm.keys` (`42501`).
+- Insert, update, delete or truncate `vm.history` or the platform's record of migrations; lock them; put a rule, a trigger or a child table on them (`42501`).
+- Create, replace, alter, rename, take over or drop anything in `vm`, or `vm` itself; move a table into it (`42501`).
+- Become the platform's role or the runtime role, give itself their rights or theirs to another, change the database's settings or owner (`42501`).
+- `TRUNCATE` a table that has history, directly, through `CASCADE` or through a partition (`VM002`; the message says to `DELETE`, which is recorded).
+
+It can still read `vm.identity()` and call what the runtime role may call.
+
+### How migrations are sent, and what is refused before anything is sent
+
+- The platform splits each migration at `drizzle-kit`'s breakpoint lines and then into single statements with its own Postgres parser, and sends them one at a time.
+- A Version is refused with `422` and
+
+  ```json
+  { "error": { "reason": "migration-refused", "rule": "<kebab-case>", "message": "<what was found, where, and what to do instead>", "migration": "<name>" } }
+  ```
+
+  when a rule of the platform's is broken. Nothing is kept, no Version is recorded, the previous Version goes on serving, exactly as for `migration-failed`. In the order of "The platform's API", `migration-refused` stands where `migration-failed` does.
+- Rules checked on the text, before any statement of any migration is sent:
+  - `transaction-control`: a statement that begins, ends, chains, prepares or savepoints a transaction (`BEGIN`, `START TRANSACTION`, `COMMIT`, `END`, `ROLLBACK`, `ABORT`, `COMMIT AND CHAIN`, `ROLLBACK AND CHAIN`, `PREPARE TRANSACTION`, `COMMIT PREPARED`, `ROLLBACK PREPARED`, `SAVEPOINT`, `RELEASE`, `ROLLBACK TO`). The word inside a string, a comment, a dollar-quoted body or an identifier is not one.
+  - `unparseable`: text the parser cannot read. The message gives Postgres's own words and position.
+- A `DO` block or a procedure that tries to commit fails in the database (`2D000`), which is `migration-failed`.
+
+### What is checked before a Version's migrations are committed
+
+After the last migration's last statement, and before the commit, the platform makes sure nothing of the migration's can still run, then checks. A broken rule is `migration-refused`:
+
+- `capture-changed`: a capture trigger that existed before the Version's migrations was disabled, dropped, renamed or replaced during them, **also when it was put back** (disable, change rows, enable). The message names the table.
+- `capture-missing`: a table outside `vm` is without its whole capture at the end, or carries another trigger that calls a function of `vm`.
+- `deferrable`: a trigger or a constraint that is `DEFERRABLE`. Their work would run at the commit, after the checks. (A constraint that failed when made immediate is `migration-failed` with its own SQLSTATE.)
+- `json-cast`: a cast from one of the Application's types to `json` or `jsonb` whose function is not Postgres's own. Postgres would call it inside the capture, with the platform's rights.
+- `in-vm`: an extension, or any object the platform did not make, in schema `vm` (`CREATE EXTENSION hstore SCHEMA vm` is allowed by Postgres to this role).
+
+A cursor left open `WITH HOLD` is closed by the platform before the checks; its query never runs.
+
+### The capture itself
+
+- A row of a table with a column named `t`, `vm_row`, `vm_new` or `vm_old`, of any type, is recorded whole, like any row.
+- What is recorded does not depend on the writer's session settings: with `extra_float_digits`, `TimeZone`, `IntervalStyle`, `DateStyle` or `bytea_output` set otherwise in the transaction that writes (a migration can set them; the runtime role can through its own role settings), the history row holds every digit, and times with the offset `+00:00`.
+- While a cast of the `json-cast` kind exists, every change of a captured table fails with `VM003`, whoever makes it. (A migration that makes one is refused, so this is seen only if one was made otherwise.)
+
+### What this does not close
+
+- **Changes of structure that change data** leave no history row per changed row: a column's type changed with `USING`, a column or a table dropped, a table replaced under its name. The next ticket (the Change history in the platform database) records each as an entry of the table's history with the Contributor and the migration's name; the one after records each row a rewrite changed.
+- The Application's own triggers, which a migration may make on its own tables, change rows under the User in flight and are recorded so. That is the Application's behaviour, as any of its code is.
+- Until the next ticket the history is still in the own database, in `vm.history`, owned by the platform's role: no migration can touch it, but it is not yet outside.
 
 ## Reading the Change history (ticket: Read a row's Change history through the SDK)
 
