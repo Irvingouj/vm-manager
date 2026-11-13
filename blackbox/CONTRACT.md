@@ -784,8 +784,8 @@ Code a migration leaves in the database can run later with the migration role's 
 **Checked before every commit that could carry a change.** On the own database, an `execute` outside a transaction, and the commit of a transaction begun with `access: "write"`, end like this: the host makes deferred constraints immediate, closes every cursor (one declared `WITH HOLD` never runs its query), and checks that **the statement or the transaction changed neither the structure of a table nor the capture on one**. If it did:
 
 - everything the statement or the transaction did is rolled back, what it did to the structure and the capture included;
-- the answer is `{ error: { kind: "database", code: "VM004", message } }` (or, when a deferred trigger that such code queued fails while the host makes deferred constraints immediate, Postgres's own error for that, as on Postgres 16 and 17 where it runs without the owner's rights), from `execute` or from `tx.commit` (through the SDK: `OperationFailed` of kind `database` with that code); the message says that an Application's structure changes in migrations only;
-- the Operation log entry (of the `execute`, or of the `commit`) is `failed` with `error` `VM004` (or that SQLSTATE); the transaction is over, as after any commit.
+- the answer is `{ error: { kind: "database", code: "VM004", message } }` (or, when a deferred trigger that such code queued fails while the host makes deferred constraints immediate, Postgres's own error for that: `42501` on Postgres 16 and 17, where the trigger runs without the owner's rights), from `execute` or from `tx.commit` (through the SDK: `OperationFailed` of kind `database` with that code); the message says that an Application's structure changes in migrations only;
+- the Operation log entry (of the `execute`, or of the `commit`) is `failed` with `error` `VM004` (or `42501` in that case); the transaction is over, as after any commit.
 
 At the least these are such a change, whoever's rights the statement that made them ran with, whoever comes to own what it made, and however it came to run:
 
