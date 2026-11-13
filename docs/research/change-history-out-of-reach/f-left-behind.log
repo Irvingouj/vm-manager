@@ -73,8 +73,8 @@ migration tries more: ERROR 42501 permission denied to alter role
 migration tries connection limit: ERROR 42501 permission denied to alter role
 host: password null: ok ALTER ROLE []
 commit: ok COMMIT []
-login with 'known': refused: connection to server at "127.0.0.1", port 46705 failed: FATAL:  password authentication failed for user "a1_mig"
-login with 'a1_mig': refused: connection to server at "127.0.0.1", port 46705 failed: FATAL:  password authentication failed for user "a1_mig"
+login with 'known': refused: connection to server at "127.0.0.1", port 57377 failed: FATAL:  password authentication failed for user "a1_mig"
+login with 'a1_mig': refused: connection to server at "127.0.0.1", port 57377 failed: FATAL:  password authentication failed for user "a1_mig"
 session still alive: ok SELECT 1 [('a1_mig',)]
 == F5: stretching the window between commit and NOLOGIN (the test's technique)
 platform restores a password: ok ALTER ROLE []
@@ -145,10 +145,21 @@ as-expected  strong= 0                                               serializabl
 as-expected  strong= 0                                               lock table row exclusive
 as-expected  strong= 0                                               advisory lock
 as-expected  strong= 0                                               partitioned insert
+######## Postgres 16 (16.15.0), part F, extension
+ok CREATE EXTENSION []                                                                                           <- CREATE EXTENSION pg_trgm
+ok CREATE FUNCTION []                                                                                            <- CREATE FUNCTION evil(int) RETURNS int LANGUAGE plpgsql IMMUTABLE AS $f
+ok ALTER EXTENSION []                                                                                            <- ALTER EXTENSION pg_trgm ADD FUNCTION evil(int)
+ok CREATE FUNCTION []                                                                                            <- CREATE OR REPLACE FUNCTION evil(int) RETURNS int LANGUAGE plpgsql IMMU
+ERROR 42501 must be owner of function similarity                                                                 <- CREATE OR REPLACE FUNCTION similarity(text, text) RETURNS real LANGUAG
+ERROR 42501 must be owner of function similarity                                                                 <- ALTER FUNCTION similarity(text, text) OWNER TO a1_mig
+ok CREATE TABLE []                                                                                               <- CREATE TABLE te (id int)
+ok CREATE INDEX []                                                                                               <- CREATE INDEX te_evil ON te (evil(id))
+[('plpgsql', 'postgres'), ('pg_trgm', 'a1_mig')]
+[('similarity', 'postgres', 't', 't'), ('evil', 'a1_mig', 'f', 't')]
 ######## Postgres 16 (16.15.0), part F, cost
-tables=  10  round trip alone     61 us   digest     800 us more   own strong locks from pg_locks     81 us more
-tables= 100  round trip alone     61 us   digest    1562 us more   own strong locks from pg_locks     68 us more
-tables= 500  round trip alone     61 us   digest    5212 us more   own strong locks from pg_locks     66 us more
+tables=  10  round trip alone     64 us   digest     790 us more   own strong locks from pg_locks     77 us more
+tables= 100  round trip alone     64 us   digest    1541 us more   own strong locks from pg_locks     66 us more
+tables= 500  round trip alone     64 us   digest    5159 us more   own strong locks from pg_locks     63 us more
 ######## Postgres 17 (17.11.0), part F, vectors
 -- at rest, before
 trigger row: 16461 xmin=748 ctid=(0,10) enabled=O
@@ -230,8 +241,8 @@ migration tries more: ERROR 42501 permission denied to alter role
 migration tries connection limit: ERROR 42501 permission denied to alter role
 host: password null: ok ALTER ROLE []
 commit: ok COMMIT []
-login with 'known': refused: connection to server at "127.0.0.1", port 41919 failed: FATAL:  password authentication failed for user "a1_mig"
-login with 'a1_mig': refused: connection to server at "127.0.0.1", port 41919 failed: FATAL:  password authentication failed for user "a1_mig"
+login with 'known': refused: connection to server at "127.0.0.1", port 46251 failed: FATAL:  password authentication failed for user "a1_mig"
+login with 'a1_mig': refused: connection to server at "127.0.0.1", port 46251 failed: FATAL:  password authentication failed for user "a1_mig"
 session still alive: ok SELECT 1 [('a1_mig',)]
 == F5: stretching the window between commit and NOLOGIN (the test's technique)
 platform restores a password: ok ALTER ROLE []
@@ -302,10 +313,21 @@ as-expected  strong= 0                                               serializabl
 as-expected  strong= 0                                               lock table row exclusive
 as-expected  strong= 0                                               advisory lock
 as-expected  strong= 0                                               partitioned insert
+######## Postgres 17 (17.11.0), part F, extension
+ok CREATE EXTENSION []                                                                                           <- CREATE EXTENSION pg_trgm
+ok CREATE FUNCTION []                                                                                            <- CREATE FUNCTION evil(int) RETURNS int LANGUAGE plpgsql IMMUTABLE AS $f
+ok ALTER EXTENSION []                                                                                            <- ALTER EXTENSION pg_trgm ADD FUNCTION evil(int)
+ok CREATE FUNCTION []                                                                                            <- CREATE OR REPLACE FUNCTION evil(int) RETURNS int LANGUAGE plpgsql IMMU
+ERROR 42501 must be owner of function similarity                                                                 <- CREATE OR REPLACE FUNCTION similarity(text, text) RETURNS real LANGUAG
+ERROR 42501 must be owner of function similarity                                                                 <- ALTER FUNCTION similarity(text, text) OWNER TO a1_mig
+ok CREATE TABLE []                                                                                               <- CREATE TABLE te (id int)
+ok CREATE INDEX []                                                                                               <- CREATE INDEX te_evil ON te (evil(id))
+[('plpgsql', 'postgres'), ('pg_trgm', 'a1_mig')]
+[('similarity', 'postgres', 't', 't'), ('evil', 'a1_mig', 'f', 't')]
 ######## Postgres 17 (17.11.0), part F, cost
-tables=  10  round trip alone     64 us   digest     779 us more   own strong locks from pg_locks     84 us more
-tables= 100  round trip alone     64 us   digest    1486 us more   own strong locks from pg_locks     64 us more
-tables= 500  round trip alone     64 us   digest    4940 us more   own strong locks from pg_locks     63 us more
+tables=  10  round trip alone     65 us   digest     763 us more   own strong locks from pg_locks     75 us more
+tables= 100  round trip alone     65 us   digest    1507 us more   own strong locks from pg_locks     64 us more
+tables= 500  round trip alone     65 us   digest    4986 us more   own strong locks from pg_locks     63 us more
 ######## Postgres 18 (18.6.0), part F, vectors
 -- at rest, before
 trigger row: 16467 xmin=762 ctid=(0,10) enabled=O
@@ -391,8 +413,8 @@ migration tries more: ERROR 42501 permission denied to alter role
 migration tries connection limit: ERROR 42501 permission denied to alter role
 host: password null: ok ALTER ROLE []
 commit: ok COMMIT []
-login with 'known': refused: connection to server at "127.0.0.1", port 49933 failed: FATAL:  password authentication failed for user "a1_mig"
-login with 'a1_mig': refused: connection to server at "127.0.0.1", port 49933 failed: FATAL:  password authentication failed for user "a1_mig"
+login with 'known': refused: connection to server at "127.0.0.1", port 35857 failed: FATAL:  password authentication failed for user "a1_mig"
+login with 'a1_mig': refused: connection to server at "127.0.0.1", port 35857 failed: FATAL:  password authentication failed for user "a1_mig"
 session still alive: ok SELECT 1 [('a1_mig',)]
 == F5: stretching the window between commit and NOLOGIN (the test's technique)
 platform restores a password: ok ALTER ROLE []
@@ -463,7 +485,18 @@ as-expected  strong= 0                                               serializabl
 as-expected  strong= 0                                               lock table row exclusive
 as-expected  strong= 0                                               advisory lock
 as-expected  strong= 0                                               partitioned insert
+######## Postgres 18 (18.6.0), part F, extension
+ok CREATE EXTENSION []                                                                                           <- CREATE EXTENSION pg_trgm
+ok CREATE FUNCTION []                                                                                            <- CREATE FUNCTION evil(int) RETURNS int LANGUAGE plpgsql IMMUTABLE AS $f
+ok ALTER EXTENSION []                                                                                            <- ALTER EXTENSION pg_trgm ADD FUNCTION evil(int)
+ok CREATE FUNCTION []                                                                                            <- CREATE OR REPLACE FUNCTION evil(int) RETURNS int LANGUAGE plpgsql IMMU
+ERROR 42501 must be owner of function similarity                                                                 <- CREATE OR REPLACE FUNCTION similarity(text, text) RETURNS real LANGUAG
+ERROR 42501 must be owner of function similarity                                                                 <- ALTER FUNCTION similarity(text, text) OWNER TO a1_mig
+ok CREATE TABLE []                                                                                               <- CREATE TABLE te (id int)
+ok CREATE INDEX []                                                                                               <- CREATE INDEX te_evil ON te (evil(id))
+[('plpgsql', 'postgres'), ('pg_trgm', 'a1_mig')]
+[('similarity', 'postgres', 't', 't'), ('evil', 'a1_mig', 'f', 't')]
 ######## Postgres 18 (18.6.0), part F, cost
-tables=  10  round trip alone     65 us   digest     783 us more   own strong locks from pg_locks     86 us more
-tables= 100  round trip alone     65 us   digest    1493 us more   own strong locks from pg_locks     73 us more
-tables= 500  round trip alone     65 us   digest    5040 us more   own strong locks from pg_locks     73 us more
+tables=  10  round trip alone     67 us   digest     755 us more   own strong locks from pg_locks    103 us more
+tables= 100  round trip alone     67 us   digest    1485 us more   own strong locks from pg_locks     69 us more
+tables= 500  round trip alone     67 us   digest    4935 us more   own strong locks from pg_locks     70 us more
