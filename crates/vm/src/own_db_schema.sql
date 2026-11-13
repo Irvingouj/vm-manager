@@ -294,8 +294,11 @@ $f$;
 -- tables and partitions both, since a statement fires the statement
 -- triggers of the table it names only. Runs with the platform's role's
 -- rights, which may make triggers on the migration role's tables through
--- its inheriting membership. Called by the host after each migration,
--- inside the migrations' transaction; answers how many triggers it made.
+-- its inheriting membership; a table of another role's (a superuser made
+-- it there) is left as it is, and `vm.capture_problems()` names it.
+-- Called by the host after each migration, inside the migrations'
+-- transaction, and when the capture is put back; answers how many
+-- triggers it made.
 CREATE OR REPLACE FUNCTION vm.capture_new_tables() RETURNS integer
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER PARALLEL UNSAFE
 SET search_path = pg_catalog, pg_temp
@@ -316,6 +319,7 @@ BEGIN
          WHERE c.relkind IN ('r', 'p')
            AND n.nspname <> 'vm' AND n.nspname <> 'information_schema'
            AND pg_catalog.left(n.nspname, 3) <> 'pg_'
+           AND pg_catalog.pg_has_role(c.relowner, 'USAGE')
            AND NOT EXISTS (SELECT FROM pg_catalog.pg_trigger t
                             WHERE t.tgrelid = c.oid AND t.tgname = 'vm_capture_' || e.event)
          ORDER BY c.oid, e.event
@@ -327,6 +331,142 @@ BEGIN
         v_made := v_made + 1;
     END LOOP;
     RETURN v_made;
+END
+$f$;
+
+-- Whether the table `p_table` has its whole capture: the four triggers as
+-- `vm.capture_new_tables()` makes them, enabled, and no other trigger
+-- calling a function of `vm`.
+CREATE OR REPLACE FUNCTION vm.capture_whole(p_table oid) RETURNS boolean
+LANGUAGE sql STABLE PARALLEL UNSAFE
+SET search_path = pg_catalog, pg_temp
+AS $f$
+SELECT NOT EXISTS (
+    SELECT FROM (VALUES
+        ('vm_capture_insert', 4, 'vm.capture()'::pg_catalog.regprocedure, NULL, 'vm_new'),
+        ('vm_capture_update', 16, 'vm.capture()'::pg_catalog.regprocedure, 'vm_old', 'vm_new'),
+        ('vm_capture_delete', 8, 'vm.capture()'::pg_catalog.regprocedure, 'vm_old', NULL),
+        ('vm_capture_truncate', 34, 'vm.capture_truncate()'::pg_catalog.regprocedure, NULL, NULL))
+        AS w(name, tgtype, fn, oldt, newt)
+     WHERE NOT EXISTS (
+        SELECT FROM pg_catalog.pg_trigger g
+         WHERE g.tgrelid = p_table AND g.tgname = w.name
+           AND g.tgtype = w.tgtype AND g.tgfoid = w.fn
+           AND g.tgenabled IN ('O', 'A') AND g.tgqual IS NULL
+           AND g.tgnargs = 0 AND coalesce(pg_catalog.array_length(g.tgattr::int2[], 1), 0) = 0
+           AND NOT g.tgdeferrable AND g.tgconstraint = 0
+           AND g.tgoldtable IS NOT DISTINCT FROM w.oldt
+           AND g.tgnewtable IS NOT DISTINCT FROM w.newt))
+   AND NOT EXISTS (
+    SELECT FROM pg_catalog.pg_trigger g
+      JOIN pg_catalog.pg_proc p ON p.oid = g.tgfoid
+     WHERE g.tgrelid = p_table AND p.pronamespace = 'vm'::pg_catalog.regnamespace
+       AND g.tgname NOT LIKE 'vm\_capture\_%')
+$f$;
+
+-- Puts the capture back whole (blackbox/CONTRACT.md, "What something else
+-- changed"): on every table of the migration role's without its whole
+-- capture, every trigger calling a function of `vm` is dropped and the
+-- four are made again (so one found disabled, missing, renamed or
+-- replaced is as the platform makes it). Answers the tables the platform
+-- may not put the capture on (another role's) that are without it.
+-- Called by the host as the platform's role, outside any migration.
+CREATE OR REPLACE FUNCTION vm.restore_capture() RETURNS TABLE (uncaptured text)
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER PARALLEL UNSAFE
+SET search_path = pg_catalog, pg_temp
+AS $f$
+DECLARE
+    v_trigger record;
+BEGIN
+    FOR v_trigger IN
+        SELECT g.tgname, g.tgrelid::pg_catalog.regclass AS relation
+          FROM pg_catalog.pg_trigger g
+          JOIN pg_catalog.pg_proc p ON p.oid = g.tgfoid
+          JOIN pg_catalog.pg_class c ON c.oid = g.tgrelid
+          JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+         WHERE p.pronamespace = 'vm'::pg_catalog.regnamespace AND NOT g.tgisinternal
+           AND c.relkind IN ('r', 'p')
+           AND n.nspname <> 'vm' AND n.nspname <> 'information_schema'
+           AND pg_catalog.left(n.nspname, 3) <> 'pg_'
+           AND pg_catalog.pg_has_role(c.relowner, 'USAGE')
+           AND NOT vm.capture_whole(c.oid)
+         ORDER BY g.tgrelid, g.tgname
+    LOOP
+        EXECUTE pg_catalog.format('DROP TRIGGER %I ON %s', v_trigger.tgname, v_trigger.relation);
+    END LOOP;
+    PERFORM vm.capture_new_tables();
+    RETURN QUERY
+        SELECT n.nspname::text || '.' || c.relname::text
+          FROM pg_catalog.pg_class c
+          JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+         WHERE c.relkind IN ('r', 'p')
+           AND n.nspname <> 'vm' AND n.nspname <> 'information_schema'
+           AND pg_catalog.left(n.nspname, 3) <> 'pg_'
+           AND NOT vm.capture_whole(c.oid)
+         ORDER BY 1;
+END
+$f$;
+
+-- What the structure and the capture of every table outside `vm` are, as
+-- a digest per table (blackbox/CONTRACT.md, "What something else
+-- changed"; research part F): the values of its `pg_class` row that make
+-- it what it is (object id, name, schema, owner, kind, persistence,
+-- partition), the object id and `xmin` of each of its `pg_attribute` and
+-- `pg_trigger` rows, and its `pg_inherits` rows. Ordinary maintenance
+-- (`VACUUM`, `VACUUM FULL`, `CLUSTER`, `REINDEX`, `ANALYZE`) changes none of
+-- these; disabling, enabling, dropping, renaming or making a trigger, and
+-- adding, dropping or retyping a column, change one. Neither `ctid` nor
+-- `pg_class`'s `xmin` is used: maintenance moves them. The host keeps the
+-- answer in the platform database and compares.
+CREATE OR REPLACE FUNCTION vm.structure_state() RETURNS TABLE (table_name text, digest text)
+LANGUAGE sql STABLE PARALLEL UNSAFE
+SET search_path = pg_catalog, pg_temp
+AS $f$
+SELECT n.nspname::text || '.' || c.relname::text,
+       pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(pg_catalog.concat_ws('|',
+           c.oid::text, c.relname::text, n.nspname::text, c.relowner::text, c.relkind::text,
+           c.relpersistence::text, c.relispartition::text,
+           (SELECT pg_catalog.string_agg(a.attnum::text || ':' || a.xmin::text, ',' ORDER BY a.attnum)
+              FROM pg_catalog.pg_attribute a WHERE a.attrelid = c.oid),
+           (SELECT pg_catalog.string_agg(g.oid::text || ':' || g.xmin::text, ',' ORDER BY g.oid)
+              FROM pg_catalog.pg_trigger g WHERE g.tgrelid = c.oid),
+           (SELECT pg_catalog.string_agg(i.inhparent::text || ':' || i.inhseqno::text, ',' ORDER BY i.inhseqno)
+              FROM pg_catalog.pg_inherits i WHERE i.inhrelid = c.oid)), 'UTF8')), 'hex')
+  FROM pg_catalog.pg_class c
+  JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+ WHERE c.relkind IN ('r', 'p')
+   AND n.nspname <> 'vm' AND n.nspname <> 'information_schema'
+   AND pg_catalog.left(n.nspname, 3) <> 'pg_'
+ ORDER BY 1
+$f$;
+
+-- The check before the commit of every read-write transaction the host
+-- runs on the own database (blackbox/CONTRACT.md, "Checked before every
+-- commit that could carry a change"; ADR 0017; research part F): raises
+-- VM004 while this session holds a lock on a relation of a mode that
+-- reading and writing rows never takes (`SHARE UPDATE EXCLUSIVE` or
+-- stronger). Every change of a table's structure or of the capture takes
+-- one and keeps it until the transaction ends; one made in a
+-- subtransaction that was rolled back was let go with it, and so was what
+-- it changed. The host sends it in the same simple query as the `COMMIT`,
+-- after `SET CONSTRAINTS ALL IMMEDIATE` and `CLOSE ALL`, so a raised error
+-- turns the commit into a rollback and nothing runs in between. The
+-- runtime role may call it itself, to no end: it reads the lock manager's
+-- own view of this session, and it cannot be replaced (the platform's
+-- role owns it and `vm`).
+CREATE OR REPLACE FUNCTION vm.before_commit() RETURNS void
+LANGUAGE plpgsql VOLATILE PARALLEL UNSAFE
+SET search_path = pg_catalog, pg_temp
+AS $f$
+BEGIN
+    IF EXISTS (SELECT FROM pg_catalog.pg_locks l
+                WHERE l.locktype = 'relation'
+                  AND l.pid = pg_catalog.pg_backend_pid()
+                  AND l.mode IN ('ShareUpdateExclusiveLock', 'ShareLock', 'ShareRowExclusiveLock',
+                                 'ExclusiveLock', 'AccessExclusiveLock')) THEN
+        RAISE EXCEPTION USING ERRCODE = 'VM004',
+            MESSAGE = 'the transaction changed the structure of a table or the Change history capture, or locked, analyzed or refreshed a table, which only a migration may: an Application''s structure changes in migrations only. Everything the transaction did was rolled back';
+    END IF;
 END
 $f$;
 
@@ -359,7 +499,11 @@ $f$;
 
 -- What the platform refuses at the end of a migration, one row per
 -- finding: the rule (as the answer names it) and what was found, where,
--- and what to do instead. No row: nothing to refuse.
+-- and what to do instead. No row: nothing to refuse. Called on the
+-- migration role's own session: "the migrations wrote" is "the session's
+-- user owns" (`SESSION_USER`, which no statement of a non-superuser
+-- changes), so an extension's functions (owned by the bootstrap
+-- superuser) are not counted.
 CREATE OR REPLACE FUNCTION vm.capture_problems()
 RETURNS TABLE (rule text, message text)
 LANGUAGE sql STABLE PARALLEL UNSAFE
@@ -465,6 +609,55 @@ SELECT 'in-vm',
         SELECT 'statistics object', se.stxname::text, se.stxowner
           FROM pg_catalog.pg_statistic_ext se WHERE se.stxnamespace = 'vm'::pg_catalog.regnamespace) o
  WHERE o.owner <> (SELECT n.nspowner FROM pg_catalog.pg_namespace n WHERE n.nspname = 'vm')
+UNION ALL
+SELECT 'security-definer',
+       pg_catalog.format('the %s %s is SECURITY DEFINER: Postgres would run it with the rights of the role that owns the Application''s tables, which can switch the Change history capture off, whoever calls it. The runtime role may already read and write every table the migrations make: declare it SECURITY INVOKER (the default)',
+                         CASE p.prokind WHEN 'p' THEN 'procedure' ELSE 'function' END,
+                         p.oid::pg_catalog.regprocedure)
+  FROM pg_catalog.pg_proc p
+ WHERE p.prosecdef AND pg_catalog.pg_get_userbyid(p.proowner) = SESSION_USER
+UNION ALL
+SELECT 'index-code',
+       pg_catalog.format('the %s %s calls %s, which the migrations wrote: Postgres''s autovacuum would run it with the rights of the role that owns the Application''s tables, outside any transaction of the platform''s. Index or analyze Postgres''s own functions and operators only (or an extension''s), or keep the computed value in a column of its own',
+                         x.what, x.name, x.called)
+  FROM (SELECT DISTINCT
+               CASE d.classid WHEN 'pg_catalog.pg_class'::pg_catalog.regclass THEN 'index'
+                              WHEN 'pg_catalog.pg_constraint'::pg_catalog.regclass THEN 'exclusion constraint'
+                              ELSE 'extended statistic' END AS what,
+               CASE d.classid WHEN 'pg_catalog.pg_class'::pg_catalog.regclass
+                                   THEN d.objid::pg_catalog.regclass::text
+                              WHEN 'pg_catalog.pg_constraint'::pg_catalog.regclass
+                                   THEN (SELECT co.conname::text FROM pg_catalog.pg_constraint co WHERE co.oid = d.objid)
+                              ELSE (SELECT se.stxname::text FROM pg_catalog.pg_statistic_ext se WHERE se.oid = d.objid) END AS name,
+               CASE d.refclassid WHEN 'pg_catalog.pg_proc'::pg_catalog.regclass
+                                      THEN 'the function ' || d.refobjid::pg_catalog.regprocedure::text
+                                 WHEN 'pg_catalog.pg_operator'::pg_catalog.regclass
+                                      THEN 'the operator ' || d.refobjid::pg_catalog.regoperator::text
+                                 WHEN 'pg_catalog.pg_cast'::pg_catalog.regclass
+                                      THEN 'the cast ' || (SELECT ca.castsource::pg_catalog.regtype::text || ' AS ' || ca.casttarget::pg_catalog.regtype::text
+                                                             FROM pg_catalog.pg_cast ca WHERE ca.oid = d.refobjid)
+                                 ELSE 'the domain ' || d.refobjid::pg_catalog.regtype::text END AS called
+          FROM pg_catalog.pg_depend d
+         WHERE (d.classid = 'pg_catalog.pg_statistic_ext'::pg_catalog.regclass
+                OR (d.classid = 'pg_catalog.pg_class'::pg_catalog.regclass
+                    AND EXISTS (SELECT FROM pg_catalog.pg_class i
+                                 WHERE i.oid = d.objid AND i.relkind IN ('i', 'I')))
+                OR (d.classid = 'pg_catalog.pg_constraint'::pg_catalog.regclass
+                    AND EXISTS (SELECT FROM pg_catalog.pg_constraint co
+                                 WHERE co.oid = d.objid AND co.contype = 'x')))
+           AND ((d.refclassid = 'pg_catalog.pg_proc'::pg_catalog.regclass
+                 AND EXISTS (SELECT FROM pg_catalog.pg_proc p WHERE p.oid = d.refobjid
+                                AND pg_catalog.pg_get_userbyid(p.proowner) = SESSION_USER))
+             OR (d.refclassid = 'pg_catalog.pg_operator'::pg_catalog.regclass
+                 AND EXISTS (SELECT FROM pg_catalog.pg_operator o WHERE o.oid = d.refobjid
+                                AND pg_catalog.pg_get_userbyid(o.oprowner) = SESSION_USER))
+             OR (d.refclassid = 'pg_catalog.pg_cast'::pg_catalog.regclass
+                 AND EXISTS (SELECT FROM pg_catalog.pg_cast ca JOIN pg_catalog.pg_proc p ON p.oid = ca.castfunc
+                              WHERE ca.oid = d.refobjid
+                                AND pg_catalog.pg_get_userbyid(p.proowner) = SESSION_USER))
+             OR (d.refclassid = 'pg_catalog.pg_type'::pg_catalog.regclass
+                 AND EXISTS (SELECT FROM pg_catalog.pg_type t WHERE t.oid = d.refobjid AND t.typtype = 'd'
+                                AND pg_catalog.pg_get_userbyid(t.typowner) = SESSION_USER)))) x
 $f$;
 
 -- The migrations recorded, in order: what the host compares a Version's

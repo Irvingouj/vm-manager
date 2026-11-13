@@ -65,7 +65,7 @@
 //! to this one, its history, keys and rows unchanged; and the migration
 //! role is closed. One that cannot be is not served until it can.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::future::Future;
 use std::ops::Range;
@@ -74,12 +74,14 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock};
 use std::time::Duration;
 
 use sha2::{Digest, Sha256};
+use tokio::task::JoinSet;
 use tokio::time::Instant;
 use tokio_postgres::{CancelToken, Client, Config, GenericClient, NoTls, Row, Transaction};
 
 use crate::executor::{self, IdentityKey, Levels, Password, Source, Target};
 use crate::log;
 use crate::migration_text;
+use crate::oplog::{Entry, OperationLog};
 use crate::platform_db::{
     Connection, DatabaseAddress, DbError, PlatformDatabase, quote_identifier,
 };
@@ -135,6 +137,20 @@ pub const OWN_POOLS_HELD: usize = 64;
 /// Connections of one own database's runtime pool, open or being opened.
 pub const RUNTIME_POOL_SIZE: usize = 4;
 
+/// How often, at most, the structure and the capture of an own database
+/// are compared with what is kept, with a write (blackbox/CONTRACT.md, "What
+/// something else changed").
+const COMPARE_EVERY: Duration = Duration::from_secs(30);
+
+/// Versions being applied at once, across all Applications (one at a time
+/// per Application). Past it a Version is answered unavailable.
+const PREPARING: usize = 64;
+
+/// The longest a Version's sender waits for it to be applied and
+/// recorded: past [`MIGRATION_TIMEOUT`] and [`CLOSE_TIMEOUT`] together, and
+/// below the server's limit on one connection (60 s).
+const ANSWER_TIMEOUT: Duration = Duration::from_secs(58);
+
 /// The longest a role or database name may be: Postgres cuts longer ones.
 const MAX_IDENTIFIER: usize = 63;
 
@@ -147,12 +163,12 @@ const PLATFORM_SCHEMA: &str = include_str!("own_db_schema.sql");
 
 /// What the runtime role `runtime` and the migration role `owner` (both
 /// quoted) may do in `vm`: use the schema, read `vm.history`, call
-/// `vm.identity()` and `vm.transaction_key()`; the migration role also
-/// what the host calls on its session during migrations, and the capture's
-/// trigger functions, which Postgres asks of whoever makes a trigger
-/// calling them (a migration that drops and makes again a capture trigger
-/// is then refused as `capture-changed`, not failed for want of the right;
-/// a trigger function cannot be called but as a trigger). Nothing else.
+/// `vm.identity()` and `vm.transaction_key()`; the runtime role also the
+/// check before a write's commit (`vm.before_commit()`); the migration role
+/// also what the host calls on its session during migrations. Not the
+/// capture's trigger functions: Postgres asks for `EXECUTE` on a trigger's
+/// function of whoever makes the trigger, so a migration cannot make a
+/// trigger of its own that calls one (`42501`). Nothing else.
 fn vm_grants(owner: &str, runtime: &str) -> String {
     format!(
         "REVOKE ALL ON SCHEMA vm FROM {runtime}, {owner};
@@ -164,8 +180,8 @@ fn vm_grants(owner: &str, runtime: &str) -> String {
          GRANT EXECUTE ON FUNCTION vm.identity(), vm.transaction_key() TO {runtime}, {owner};
          GRANT EXECUTE ON FUNCTION vm.capture_new_tables(), vm.capture_state(),
              vm.capture_problems(), vm.applied_migrations(),
-             vm.record_migration(integer, text, text),
-             vm.capture(), vm.capture_truncate() TO {owner};"
+             vm.structure_state(), vm.record_migration(integer, text, text) TO {owner};
+         GRANT EXECUTE ON FUNCTION vm.before_commit() TO {runtime};"
     )
 }
 
@@ -320,6 +336,12 @@ impl Problem {
         Self::Unavailable { step, code: None }
     }
 
+    /// Something that should not happen happened: `step` says what. Not a
+    /// timeout, not Postgres's refusal.
+    fn internal(step: &'static str) -> Self {
+        Self::Unavailable { step, code: None }
+    }
+
     fn refused(migration: &Migration, rule: &'static str, message: String) -> Self {
         Self::Refused {
             migration: migration.name.clone(),
@@ -392,6 +414,14 @@ struct Known {
     /// that closing the migration role never ends another Version's
     /// migrations.
     turn: tokio::sync::Mutex<()>,
+    /// Held while the structure and the capture are compared with what is
+    /// kept (`own_database_states`), and while a Version's migrations are
+    /// committed and what they leave is kept: one at a time, so that a
+    /// comparison never reads the own database and what is kept on either
+    /// side of a commit.
+    comparing: tokio::sync::Mutex<()>,
+    /// When this program last compared, if it has.
+    compared: Mutex<Option<Instant>>,
 }
 
 impl Known {
@@ -403,7 +433,28 @@ impl Known {
             key: OnceLock::new(),
             in_form: AtomicBool::new(false),
             turn: tokio::sync::Mutex::new(()),
+            comparing: tokio::sync::Mutex::new(()),
+            compared: Mutex::new(None),
         }
+    }
+
+    /// Whether a comparison is due: never made in this run, or `every` ago.
+    fn due(&self, every: Duration) -> bool {
+        self.compared
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_none_or(|at| at.elapsed() >= every)
+    }
+
+    fn never_compared(&self) -> bool {
+        self.compared
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_none()
+    }
+
+    fn mark_compared(&self) {
+        *self.compared.lock().unwrap_or_else(PoisonError::into_inner) = Some(Instant::now());
     }
 }
 
@@ -493,6 +544,14 @@ pub struct OwnDatabases {
     known: RwLock<HashMap<Arc<str>, Arc<Known>>>,
     /// Held only to find, make or let go of a pool, never across an await.
     pools: Mutex<Pools>,
+    /// Where a change found outside the host's transactions is said.
+    log: OperationLog,
+    /// The Versions being sent, each a task of its own so that it runs to
+    /// its end whether or not its sender waits for it
+    /// ([`OwnDatabases::to_the_end`]); at most [`PREPARING`]. Each ends by
+    /// itself within its time limits; any still running are ended when
+    /// this is dropped. Held only to spawn or reap, never across an await.
+    preparing: Mutex<JoinSet<()>>,
 }
 
 impl OwnDatabases {
@@ -536,7 +595,6 @@ impl OwnDatabases {
             );
         }
         Ok(Self {
-            platform,
             host: address.host().to_owned(),
             port: address.port(),
             prefix: address.database().to_owned(),
@@ -549,6 +607,9 @@ impl OwnDatabases {
                 held: HashMap::with_capacity(OWN_POOLS_HELD),
                 clock: 0,
             }),
+            log: OperationLog::new(Arc::clone(&platform)),
+            preparing: Mutex::new(JoinSet::new()),
+            platform,
         })
     }
 
@@ -625,6 +686,42 @@ impl OwnDatabases {
         }
     }
 
+    /// Runs `work` to its end as a task of its own, held in
+    /// [`OwnDatabases::preparing`], and answers what it came to, waited for
+    /// up to [`ANSWER_TIMEOUT`]. For sending a Version: it runs to its end
+    /// (the migrations committed and the Version recorded, or neither; the
+    /// migration role closed again) also when its sender goes away before
+    /// the answer (blackbox/CONTRACT.md, "The migration role's password").
+    /// Each such task ends by itself within its own time limits. At most
+    /// [`PREPARING`] at once; past it, refused at once.
+    pub async fn to_the_end<T: Send + 'static>(
+        &self,
+        work: impl Future<Output = T> + Send + 'static,
+    ) -> Result<T, &'static str> {
+        let (done, answer) = tokio::sync::oneshot::channel();
+        {
+            let mut preparing = self
+                .preparing
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            while preparing.try_join_next().is_some() {}
+            if preparing.len() >= PREPARING {
+                return Err("too many Versions are being sent at once");
+            }
+            preparing.spawn(async move {
+                let outcome = work.await;
+                // Nobody may be waiting any more: then the outcome is only
+                // what the databases now hold.
+                done.send(outcome).ok();
+            });
+        }
+        match tokio::time::timeout(ANSWER_TIMEOUT, answer).await {
+            Ok(Ok(outcome)) => Ok(outcome),
+            Ok(Err(_)) => Err("sending the Version: its task ended without an answer"),
+            Err(_) => Err("sending the Version: it did not finish in time"),
+        }
+    }
+
     /// Makes sure the own database of the Application `name`, numbered
     /// `number`, exists, and applies the migrations of `list` it has not
     /// had, all or none, as sent by the Contributor `sender`.
@@ -643,13 +740,16 @@ impl OwnDatabases {
     }
 
     /// The pool of the runtime role's connections to `application`'s own
-    /// database, if it has one in form. Its keys are read first if they
-    /// are not known yet (the first operation after the program starts).
-    pub async fn pool(&self, application: &str) -> Option<Arc<executor::Pool>> {
+    /// database, if it has one in form; `write` when it is for a
+    /// read-write transaction. Before it: the own database brought to form
+    /// and its migration role closed if this program has not yet (or could
+    /// not after a Version); its keys read if they are not known yet (the
+    /// first operation after the program starts); and its structure and
+    /// capture compared with what is kept (blackbox/CONTRACT.md, "What
+    /// something else changed") at its first use in this run, and then
+    /// with a write whenever the last comparison is [`COMPARE_EVERY`] old.
+    pub async fn pool(&self, application: &str, write: bool) -> Option<Arc<executor::Pool>> {
         let (key, known) = self.known(application)?;
-        if let Some(pool) = self.held(application) {
-            return Some(pool);
-        }
         let ready = match self.ensure_form(application, &known).await {
             Ok(()) => self.identity_key(&known).await,
             Err(problem) => Err(problem),
@@ -664,6 +764,16 @@ impl OwnDatabases {
                 return None;
             }
         };
+        if known.never_compared() {
+            self.compare_logged(application, &known, true).await;
+        } else if write && known.due(COMPARE_EVERY) {
+            // A comparison already under way (or a Version being committed)
+            // is not waited for.
+            self.compare_logged(application, &known, false).await;
+        }
+        if let Some(pool) = self.held(application) {
+            return Some(pool);
+        }
         let mut pools = self.pools.lock().unwrap_or_else(PoisonError::into_inner);
         pools.clock = pools.clock.saturating_add(1);
         let now = pools.clock;
@@ -735,6 +845,248 @@ impl OwnDatabases {
         Ok(Arc::clone(known.key.get_or_init(|| Arc::new(read))))
     }
 
+    /// [`OwnDatabases::compare`], its failure logged: a comparison that
+    /// could not be made is made at the next occasion. `wait`: wait for one
+    /// under way (or a Version being committed) to end, up to
+    /// [`SETUP_TIMEOUT`]; else skip.
+    async fn compare_logged(&self, application: &str, known: &Known, wait: bool) {
+        let turn = if wait {
+            tokio::time::timeout(SETUP_TIMEOUT, known.comparing.lock())
+                .await
+                .ok()
+        } else {
+            known.comparing.try_lock().ok()
+        };
+        let Some(_turn) = turn else {
+            return;
+        };
+        let compared = tokio::time::timeout(SETUP_TIMEOUT, self.compare(application, known))
+            .await
+            .unwrap_or_else(|_| {
+                Err(Problem::timed_out(
+                    "comparing the own database's structure: it took too long",
+                ))
+            });
+        if let Err(problem) = compared {
+            log::record(
+                "own-database-not-compared",
+                serde_json::json!({ "application": application, "problem": problem.step() }),
+            );
+        }
+    }
+
+    /// Compares the structure and the capture of `application`'s own
+    /// database with what is kept in the platform database
+    /// (blackbox/CONTRACT.md, "What something else changed"), its
+    /// `comparing` turn held by the caller. What is kept is the state after
+    /// the last Version's migrations, or the pending one if the own
+    /// database's record of migrations shows that their commit was made
+    /// (the program may have been stopped between that commit and keeping
+    /// it). Nothing kept yet: what is found is kept. When tables differ:
+    /// the capture is put back (`vm.restore_capture()`), what is then found
+    /// is kept, and it is said once, in the Operation log and the program's
+    /// log. All of it as the platform's role of the database.
+    async fn compare(&self, application: &str, known: &Known) -> Result<(), Problem> {
+        let names = self.names(known.number)?;
+        let mut connection = self.connect_platform(&names, known).await?;
+        let (record, found) = read_structure(connection.client_mut()).await?;
+        let expected = match self.kept(known.number).await? {
+            None => {
+                self.keep(known.number, &found).await?;
+                known.mark_compared();
+                return Ok(());
+            }
+            Some(Kept {
+                pending: Some((pending, pending_record)),
+                ..
+            }) if pending_record == record => {
+                self.keep(known.number, &pending).await?;
+                pending
+            }
+            Some(kept) => kept.tables,
+        };
+        let tables = differing(&expected, &found);
+        if tables.is_empty() {
+            known.mark_compared();
+            return Ok(());
+        }
+        let uncaptured: Vec<String> = {
+            let transaction = connection
+                .client_mut()
+                .transaction()
+                .await
+                .map_err(|e| Problem::postgres("putting the capture back", &e))?;
+            let rows = transaction
+                .query("SELECT * FROM vm.restore_capture()", &[])
+                .await
+                .map_err(|e| Problem::postgres("putting the capture back", &e))?;
+            transaction
+                .commit()
+                .await
+                .map_err(|e| Problem::postgres("putting the capture back", &e))?;
+            rows.iter()
+                .filter_map(|row| row.try_get::<_, String>(0).ok())
+                .collect()
+        };
+        let (_, now) = read_structure(connection.client_mut()).await?;
+        self.keep(known.number, &now).await?;
+        known.mark_compared();
+        log::record(
+            "capture-changed-outside",
+            serde_json::json!({
+                "application": application,
+                "tables": tables,
+                "uncaptured": uncaptured,
+            }),
+        );
+        let number = known.number;
+        let version = self
+            .platform
+            .pool()
+            .run(async |client: &mut Client| {
+                client
+                    .query_one(
+                        "SELECT coalesce(max(number), 0) FROM versions WHERE application_id = $1",
+                        &[&number],
+                    )
+                    .await
+                    .and_then(|row| row.try_get::<_, i32>(0))
+                    .map_err(DbError::from)
+            })
+            .await
+            .map_err(|e| Problem::unavailable("reading the serving Version's number", &e))?;
+        let entry = Entry {
+            request: None,
+            user: None,
+            application,
+            version: u64::try_from(version).unwrap_or(0),
+            resource: None,
+            actor: "platform",
+            operation: "capture-check",
+            statement: "capture-check",
+            transaction: None,
+        };
+        self.log
+            .whole(&entry, "failed", Some("changed-outside"))
+            .await
+            .map_err(|e| Problem::unavailable("writing the capture-check entry", &e))
+    }
+
+    /// What is kept of `number`'s own database's structure, if anything.
+    async fn kept(&self, number: i64) -> Result<Option<Kept>, Problem> {
+        let row = self
+            .platform
+            .pool()
+            .run(async |client: &mut Client| {
+                client
+                    .query_opt(
+                        "SELECT tables, pending, pending_record FROM own_database_states
+                         WHERE application_id = $1",
+                        &[&number],
+                    )
+                    .await
+                    .map_err(DbError::from)
+            })
+            .await
+            .map_err(|e| Problem::unavailable("reading what is kept of the own database", &e))?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let unreadable =
+            |_| Problem::internal("reading what is kept of the own database: not as written");
+        let tables = structure_of(&row.try_get::<_, serde_json::Value>(0).map_err(unreadable)?);
+        let pending = row
+            .try_get::<_, Option<serde_json::Value>>(1)
+            .map_err(unreadable)?
+            .map(|p| structure_of(&p));
+        let pending_record: Option<String> = row.try_get(2).map_err(unreadable)?;
+        Ok(Some(Kept {
+            tables,
+            pending: pending.zip(pending_record),
+        }))
+    }
+
+    /// Keeps `structure` as what `number`'s own database is; nothing
+    /// pending.
+    async fn keep(&self, number: i64, structure: &Structure) -> Result<(), Problem> {
+        let tables = serde_json::json!(structure);
+        self.platform
+            .pool()
+            .run(async |client: &mut Client| {
+                client
+                    .execute(
+                        "INSERT INTO own_database_states (application_id, tables) VALUES ($1, $2)
+                         ON CONFLICT (application_id) DO UPDATE
+                         SET tables = excluded.tables, pending = NULL, pending_record = NULL",
+                        &[&number, &tables],
+                    )
+                    .await
+                    .map_err(DbError::from)
+            })
+            .await
+            .map(|_| ())
+            .map_err(|e| Problem::unavailable("keeping the own database's structure", &e))
+    }
+
+    /// Keeps `structure` as what `number`'s own database is once the
+    /// migrations being applied are committed, with `record` the digest of
+    /// its record of migrations then.
+    async fn keep_pending(
+        &self,
+        number: i64,
+        structure: &Structure,
+        record: &str,
+    ) -> Result<(), Problem> {
+        let pending = serde_json::json!(structure);
+        self.platform
+            .pool()
+            .run(async |client: &mut Client| {
+                client
+                    .execute(
+                        "INSERT INTO own_database_states (application_id, tables, pending, pending_record)
+                         VALUES ($1, $2, $2, $3)
+                         ON CONFLICT (application_id) DO UPDATE
+                         SET pending = excluded.pending, pending_record = excluded.pending_record",
+                        &[&number, &pending, &record],
+                    )
+                    .await
+                    .map_err(DbError::from)
+            })
+            .await
+            .map(|_| ())
+            .map_err(|e| Problem::unavailable("keeping the own database's structure", &e))
+    }
+
+    /// The migrations whose record is `record` were committed: what was
+    /// pending is what the own database is.
+    async fn settle_pending(&self, number: i64, record: &str) -> Result<(), Problem> {
+        self.platform
+            .pool()
+            .run(async |client: &mut Client| {
+                client
+                    .execute(
+                        "UPDATE own_database_states
+                         SET tables = pending, pending = NULL, pending_record = NULL
+                         WHERE application_id = $1 AND pending_record = $2",
+                        &[&number, &record],
+                    )
+                    .await
+                    .map_err(DbError::from)
+            })
+            .await
+            .map(|_| ())
+            .map_err(|e| Problem::unavailable("keeping the own database's structure", &e))
+    }
+
+    /// Keeps what `number`'s own database's structure is now, read as its
+    /// platform role: after it was made, or brought to form (whose capture
+    /// triggers the platform itself made).
+    async fn keep_found(&self, names: &Names, known: &Known) -> Result<(), Problem> {
+        let mut connection = self.connect_platform(names, known).await?;
+        let (_, found) = read_structure(connection.client_mut()).await?;
+        self.keep(known.number, &found).await
+    }
+
     fn known(&self, application: &str) -> Option<(Arc<str>, Arc<Known>)> {
         self.known
             .read()
@@ -770,6 +1122,7 @@ impl OwnDatabases {
             self.create_database(&names).await?;
             self.give_database(&names).await?;
             self.set_up(&names, name, &known).await?;
+            self.keep_found(&names, &known).await?;
             self.platform
                 .pool()
                 .run(async |client: &mut Client| {
@@ -994,6 +1347,7 @@ impl OwnDatabases {
             let runtime = quote_identifier(&names.runtime);
             let privileges = format!(
                 "COMMENT ON DATABASE {database} IS {comment};
+                 ALTER DATABASE {database} RESET ALL;
                  REVOKE ALL ON DATABASE {database} FROM PUBLIC;
                  GRANT CONNECT, CREATE ON DATABASE {database} TO {owner};
                  GRANT CONNECT ON DATABASE {database} TO {runtime};
@@ -1093,6 +1447,11 @@ impl OwnDatabases {
             self.roles(&names, known).await?;
             self.give_database(&names).await?;
             self.set_up(&names, application, known).await?;
+            // What the earlier form's tables are now, the platform's own
+            // capture made whole on them, is the baseline: nothing was kept
+            // of them before (blackbox/CONTRACT.md, "What something else
+            // changed").
+            self.keep_found(&names, known).await?;
             self.platform
                 .pool()
                 .run(async |client: &mut Client| {
@@ -1125,7 +1484,7 @@ impl OwnDatabases {
 
     /// A connection to the own database, logged in as its platform role.
     async fn connect_platform(&self, names: &Names, known: &Known) -> Result<Connection, Problem> {
-        self.connect(names, &names.platform, &known.platform_password)
+        self.connect(names, &names.platform, &known.platform_password, true)
             .await
             .map_err(|e| {
                 Problem::unavailable("connecting to the own database as its platform role", &e)
@@ -1133,11 +1492,19 @@ impl OwnDatabases {
     }
 
     /// A connection to the own database, logged in as `role`.
+    /// `pinned`: the session's search path is set in the startup packet to
+    /// the catalog alone (`pg_catalog, pg_temp`), which no setting of the
+    /// database's or the role's (`ALTER DATABASE ... SET`, `ALTER ROLE ...
+    /// SET`) overrides, so that nothing of the Application's (a function,
+    /// an operator or a type in `public`) is found by a statement of the
+    /// platform's. Every session as the platform's role is; the migration
+    /// role's is not, since migrations are written for the usual path.
     async fn connect(
         &self,
         names: &Names,
         role: &str,
         password: &Secret,
+        pinned: bool,
     ) -> Result<Connection, DbError> {
         let mut config = Config::new();
         config
@@ -1148,6 +1515,9 @@ impl OwnDatabases {
             .dbname(&names.database)
             .application_name("vm")
             .connect_timeout(CONNECT_TIMEOUT);
+        if pinned {
+            config.options("-c search_path=pg_catalog,pg_temp");
+        }
         Connection::open(&config, CONNECT_TIMEOUT).await
     }
 
@@ -1249,6 +1619,13 @@ impl OwnDatabases {
         tokio::time::timeout_at(deadline, self.ensure_form_in_turn(application, known))
             .await
             .map_err(|_| timed_out())??;
+        // What something else changed is found, said and put right before
+        // the Version's migrations (blackbox/CONTRACT.md, "What something
+        // else changed"); one that cannot be compared now is at the next
+        // occasion.
+        tokio::time::timeout_at(deadline, self.compare_logged(application, known, true))
+            .await
+            .ok();
         let names = self.names(known.number)?;
         let (key, applied) = tokio::time::timeout_at(deadline, async {
             let connection = self.connect_platform(&names, known).await?;
@@ -1297,6 +1674,7 @@ impl OwnDatabases {
             Ok(Ok(password)) => {
                 let work = Work {
                     names: &names,
+                    known,
                     password: &password,
                     key: &key,
                     application,
@@ -1359,7 +1737,7 @@ impl OwnDatabases {
         let unavailable = |e: &tokio_postgres::Error| Problem::postgres("applying migrations", e);
         let mut connection = tokio::time::timeout_at(
             deadline,
-            self.connect(work.names, &work.names.owner, work.password),
+            self.connect(work.names, &work.names.owner, work.password, false),
         )
         .await
         .map_err(|_| timed_out())?
@@ -1454,8 +1832,8 @@ impl OwnDatabases {
                 .map_err(|e| failed(migration, e))?;
             for range in statements {
                 let Some(statement) = migration.sql.get(range.clone()) else {
-                    return Err(Problem::timed_out(
-                        "applying migrations: a statement was lost",
+                    return Err(Problem::internal(
+                        "applying migrations: a statement's place in its migration was lost",
                     ));
                 };
                 within(deadline, &cancel, transaction.execute(statement, &[]))
@@ -1525,8 +1903,10 @@ impl OwnDatabases {
                     "deferrable" => "deferrable",
                     "json-cast" => "json-cast",
                     "in-vm" => "in-vm",
+                    "security-definer" => "security-definer",
+                    "index-code" => "index-code",
                     _ => {
-                        return Err(Problem::timed_out(
+                        return Err(Problem::internal(
                             "applying migrations: a check answered a rule the program does not know",
                         ));
                     }
@@ -1549,7 +1929,7 @@ impl OwnDatabases {
         let last = pending.last();
         for (index, migration) in pending.iter().enumerate() {
             let position = i32::try_from(applied.len().saturating_add(index))
-                .map_err(|_| Problem::timed_out("applying migrations: too many"))?;
+                .map_err(|_| Problem::internal("applying migrations: more than 2^31 of them"))?;
             within(
                 deadline,
                 &cancel,
@@ -1585,21 +1965,188 @@ impl OwnDatabases {
                 code: None,
             });
         }
-        within(deadline, &cancel, transaction.commit())
+        // What the structure and the capture are once this commits, kept
+        // in the platform database before the commit with the record it
+        // goes with: a comparison after a crash between the two knows by
+        // the record whether the commit was made.
+        let structure = within(deadline, &cancel, structure_rows(&transaction))
             .await
             .ok_or_else(timed_out)?
-            .map_err(|e| match last {
-                // Should something still fail at the commit, the last
-                // migration is named, as the one that left it so.
-                Some(last) => failed(last, e),
-                None => unavailable(&e),
-            })
+            .map_err(|e| unavailable(&e))?;
+        let record = record_digest(
+            record
+                .iter()
+                .map(|(_, name, sha256, _)| (name.as_str(), sha256.as_str())),
+        );
+        // No comparison runs from here until what is kept is settled.
+        let _comparing = tokio::time::timeout_at(deadline, work.known.comparing.lock())
+            .await
+            .map_err(|_| timed_out())?;
+        tokio::time::timeout_at(
+            deadline,
+            self.keep_pending(work.known.number, &structure, &record),
+        )
+        .await
+        .map_err(|_| timed_out())??;
+        // The host's last statement before the commit, after everything of
+        // the migrations' can no longer run: no password a migration gave
+        // the role is good from the commit on (blackbox/CONTRACT.md, "The
+        // migration role's password").
+        let committed = match within(
+            deadline,
+            &cancel,
+            transaction.batch_execute("ALTER ROLE CURRENT_USER PASSWORD NULL"),
+        )
+        .await
+        {
+            Some(Ok(())) => within(deadline, &cancel, transaction.commit())
+                .await
+                .ok_or_else(timed_out)
+                .and_then(|ended| {
+                    ended.map_err(|e| match last {
+                        // Should something still fail at the commit, the
+                        // last migration is named, as the one that left it
+                        // so.
+                        Some(last) => failed(last, e),
+                        None => unavailable(&e),
+                    })
+                }),
+            Some(Err(e)) => Err(unavailable(&e)),
+            None => Err(timed_out()),
+        };
+        // Committed: what was pending is what the own database is. Should
+        // that fail, or the commit not be known to have failed, what is
+        // pending stays: the next comparison settles it by the record (a
+        // pending state whose record never comes to be is never used, and
+        // is replaced by the next Version's).
+        if committed.is_ok() {
+            let settled = tokio::time::timeout(
+                CLOSE_TIMEOUT,
+                self.settle_pending(work.known.number, &record),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                Err(Problem::timed_out(
+                    "keeping the own database's structure: it took too long",
+                ))
+            });
+            match settled {
+                Ok(()) => work.known.mark_compared(),
+                Err(problem) => log::record(
+                    "own-database-structure-not-kept",
+                    serde_json::json!({ "application": work.application, "problem": problem.step() }),
+                ),
+            }
+        }
+        committed
     }
+}
+
+/// The structure and the capture of an own database's tables, by
+/// `"<schema>.<table>"`: a digest each (`vm.structure_state()`).
+type Structure = BTreeMap<String, String>;
+
+/// What the platform database keeps of an own database's structure.
+struct Kept {
+    tables: Structure,
+    /// What it is once the migrations being applied are committed, and the
+    /// digest of the record of migrations then.
+    pending: Option<(Structure, String)>,
+}
+
+fn structure_of(value: &serde_json::Value) -> Structure {
+    value
+        .as_object()
+        .map(|tables| {
+            tables
+                .iter()
+                .filter_map(|(table, digest)| Some((table.clone(), digest.as_str()?.to_owned())))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The tables whose digest is not the one expected, or that are on one
+/// side only.
+fn differing(expected: &Structure, found: &Structure) -> Vec<String> {
+    let mut tables: Vec<String> = expected
+        .iter()
+        .filter(|(table, digest)| found.get(*table) != Some(*digest))
+        .map(|(table, _)| table.clone())
+        .chain(
+            found
+                .keys()
+                .filter(|table| !expected.contains_key(*table))
+                .cloned(),
+        )
+        .collect();
+    tables.sort();
+    tables
+}
+
+/// The digest of a record of migrations: of each one's name and sha256,
+/// in order.
+fn record_digest<'a>(record: impl Iterator<Item = (&'a str, &'a str)>) -> String {
+    let mut digest = Sha256::new();
+    for (name, sha256) in record {
+        digest.update(name.as_bytes());
+        digest.update(b"\t");
+        digest.update(sha256.as_bytes());
+        digest.update(b"\n");
+    }
+    crate::registry::hex(&digest.finalize())
+}
+
+/// The own database's record of migrations (its digest) and its structure,
+/// read together in one read-only snapshot.
+async fn read_structure(client: &mut Client) -> Result<(String, Structure), Problem> {
+    let fail =
+        |e: tokio_postgres::Error| Problem::postgres("reading the own database's structure", &e);
+    let transaction = client
+        .build_transaction()
+        .isolation_level(tokio_postgres::IsolationLevel::RepeatableRead)
+        .read_only(true)
+        .start()
+        .await
+        .map_err(fail)?;
+    let record = transaction
+        .query(
+            "SELECT name, sha256 FROM vm.migrations ORDER BY position",
+            &[],
+        )
+        .await
+        .map_err(fail)?;
+    let mut migrations = Vec::with_capacity(record.len());
+    for row in &record {
+        migrations.push((
+            row.try_get::<_, String>(0).map_err(fail)?,
+            row.try_get::<_, String>(1).map_err(fail)?,
+        ));
+    }
+    let structure = structure_rows(&transaction).await.map_err(fail)?;
+    transaction.commit().await.map_err(fail)?;
+    Ok((
+        record_digest(migrations.iter().map(|(n, s)| (n.as_str(), s.as_str()))),
+        structure,
+    ))
+}
+
+/// `vm.structure_state()`, on whichever session.
+async fn structure_rows(client: &impl GenericClient) -> Result<Structure, tokio_postgres::Error> {
+    let rows = client
+        .query("SELECT * FROM vm.structure_state()", &[])
+        .await?;
+    let mut structure = Structure::new();
+    for row in &rows {
+        structure.insert(row.try_get(0)?, row.try_get(1)?);
+    }
+    Ok(structure)
 }
 
 /// What [`OwnDatabases::apply`] works on.
 struct Work<'a> {
     names: &'a Names,
+    known: &'a Known,
     /// The migration role's password for this time.
     password: &'a Secret,
     key: &'a IdentityKey,

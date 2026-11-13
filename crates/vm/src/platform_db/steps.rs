@@ -170,6 +170,33 @@ pub const STEPS: &[Step] = &[
             ALTER COLUMN owner_password DROP NOT NULL;
     ",
     },
+    Step {
+        number: 6,
+        name: "what each own database's structure and capture were",
+        sql: "
+        -- What the structure and the capture of each own database's tables
+        -- were when the last Version's migrations ended, or when the
+        -- platform last compared and put the capture back (crate::own_db;
+        -- blackbox/CONTRACT.md, \"What something else changed\"): a digest
+        -- per table, {\"<schema>.<table>\": \"<hex>\"}. `pending`: what they
+        -- are once the migrations being applied are committed, written just
+        -- before that commit; `pending_record` the digest of the own
+        -- database's record of migrations with them, by which the next
+        -- comparison knows whether the commit was made.
+        CREATE TABLE own_database_states (
+            application_id bigint PRIMARY KEY REFERENCES applications (id),
+            tables jsonb NOT NULL,
+            pending jsonb,
+            pending_record text
+        );
+        -- The platform's own entries: what it found changed outside its
+        -- transactions (`capture-check`).
+        ALTER TABLE operation_log
+            DROP CONSTRAINT operation_log_actor_check,
+            ADD CONSTRAINT operation_log_actor_check
+                CHECK (actor IN ('user', 'application', 'platform'));
+    ",
+    },
 ];
 
 /// The advisory lock every step's transaction takes first: "vm steps".

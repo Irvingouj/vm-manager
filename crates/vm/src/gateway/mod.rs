@@ -1026,7 +1026,13 @@ impl Work {
                 },
             },
             On::Own => {
-                own_pool = self.own.pool(&self.in_flight.application).await;
+                own_pool = self
+                    .own
+                    .pool(
+                        &self.in_flight.application,
+                        matches!(self.kind, Kind::Execute),
+                    )
+                    .await;
                 match &own_pool {
                     Some(pool) => pool,
                     // A serving Version means a ready own database: reached

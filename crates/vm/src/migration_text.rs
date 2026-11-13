@@ -23,6 +23,10 @@
 //!   `COMMIT PREPARED`, `ROLLBACK PREPARED`, `SAVEPOINT`, `RELEASE`,
 //!   `ROLLBACK TO`). The platform's one transaction for the Version must
 //!   not be ended, chained or split behind its back;
+//! - `copy-stream`: `COPY ... FROM STDIN` or `COPY ... TO STDOUT`: there is
+//!   no stream to give or take when a migration is sent statement by
+//!   statement (a `COPY` from or to a file or a program is Postgres's to
+//!   refuse);
 //! - `unparseable`: text the parser cannot read, with its words, and the
 //!   line of the statement it stopped in.
 //!
@@ -84,6 +88,30 @@ pub fn statements(sql: &str) -> Result<Vec<Range<usize>>, Refusal> {
                 });
             };
             let node = raw.stmt.as_ref().and_then(|s| s.node.as_ref());
+            if let Some(NodeEnum::CopyStmt(copy)) = node
+                && copy.filename.is_empty()
+                && !copy.is_program
+            {
+                let here = start
+                    .saturating_add(at.unwrap_or(0))
+                    .saturating_add(leading(text));
+                let (direction, instead) = if copy.is_from {
+                    ("COPY ... FROM STDIN", "put the rows in with INSERT")
+                } else {
+                    (
+                        "COPY ... TO STDOUT",
+                        "remove it: a migration has nobody to give rows to",
+                    )
+                };
+                return Err(Refusal {
+                    rule: "copy-stream",
+                    message: format!(
+                        "the statement on line {} ({}) is {direction}: the platform sends a migration statement by statement and has no stream of rows to give or take; {instead}",
+                        line_of(sql, here),
+                        excerpt(text),
+                    ),
+                });
+            }
             if let Some(NodeEnum::TransactionStmt(control)) = node {
                 let here = start
                     .saturating_add(at.unwrap_or(0))
@@ -245,6 +273,21 @@ mod tests {
         ] {
             assert_eq!(rule(text), Some("transaction-control"), "{text}");
         }
+    }
+
+    #[test]
+    fn copy_from_or_to_the_client_is_found() {
+        for text in [
+            "COPY t FROM STDIN",
+            "copy t (a, b) from stdin with (format csv)",
+            "COPY t TO STDOUT",
+            "COPY (SELECT 1) TO STDOUT",
+            "SELECT 1; COPY t FROM STDIN",
+        ] {
+            assert_eq!(rule(text), Some("copy-stream"), "{text}");
+        }
+        assert_eq!(rule("COPY t FROM '/etc/hostname'"), None);
+        assert_eq!(rule("SELECT 'COPY t FROM STDIN'"), None);
     }
 
     #[test]

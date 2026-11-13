@@ -287,7 +287,10 @@ pub(super) async fn run(
             return;
         }
         On::Own => {
-            own_pool = opened.own.pool(&opened.in_flight.application).await;
+            own_pool = opened
+                .own
+                .pool(&opened.in_flight.application, opened.level == Level::Write)
+                .await;
             if let Some(pool) = &own_pool {
                 pool
             } else {

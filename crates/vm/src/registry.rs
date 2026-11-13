@@ -410,7 +410,28 @@ impl Registry {
     /// made ready and the pending ones applied; then it gets the next number
     /// and becomes the serving Version, in the database and then in memory,
     /// before this returns.
+    ///
+    /// All of it runs as a task of its own ([`OwnDatabases::to_the_end`]):
+    /// a sender that goes away before the answer leaves the migrations
+    /// committed and the Version recorded, or neither.
     pub async fn send_version(
+        self: &Arc<Self>,
+        name: &str,
+        version: NewVersion,
+        sender: &str,
+    ) -> Result<Sent, DbError> {
+        let registry = Arc::clone(self);
+        // Copied: the task owns what it works on; once per Version sent.
+        let name = name.to_owned();
+        let sender = sender.to_owned();
+        self.own
+            .to_the_end(async move { registry.send_version_here(&name, version, &sender).await })
+            .await
+            .unwrap_or_else(|why| Err(DbError::unexpected(why)))
+    }
+
+    /// [`Registry::send_version`]'s work, in its task.
+    async fn send_version_here(
         &self,
         name: &str,
         version: NewVersion,

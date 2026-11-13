@@ -39,6 +39,19 @@ const MAX_MESSAGE: usize = 1024 * 1024;
 /// How much is read from the socket at a time, at most.
 const READ_CHUNK: usize = 64 * 1024;
 
+/// How a read-write transaction on an own database is committed
+/// (blackbox/CONTRACT.md, "What a migration leaves behind: Checked before
+/// every commit that could carry a change"; ADR 0017), in one simple query
+/// so that nothing of the Application's can run between the check and the
+/// commit: deferred constraints made immediate (their triggers run now, not
+/// after the check), every cursor closed (one declared `WITH HOLD` would
+/// run its query at the commit), then `vm.before_commit()`, which raises
+/// `VM004` while the session holds a lock that only a change of structure
+/// or capture takes. A statement that fails skips the rest, `COMMIT`
+/// included: the transaction is left aborted and rolled back.
+const CHECKED_COMMIT: &str =
+    "SET CONSTRAINTS ALL IMMEDIATE; CLOSE ALL; SELECT vm.before_commit(); COMMIT";
+
 /// What went wrong with a connection. A kind only: it carries nothing of
 /// the connection, so it can be logged.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -427,7 +440,10 @@ impl Connection {
             return self.ended(result, Some(sent), false);
         }
         let commit = result.is_ok();
-        let (ending, clean) = self.end_transaction(commit, limits.grace).await;
+        // A write on an own database is committed only after the check
+        // (blackbox/CONTRACT.md, "What a migration leaves behind").
+        let checked = operation.key.is_some() && operation.level == Level::Write;
+        let (ending, clean) = self.end_transaction(commit, checked, limits.grace).await;
         let result = match (result, ending) {
             (Ok(_), Err(failure)) => Err(failure),
             (result, _) => result,
@@ -688,22 +704,33 @@ impl Connection {
     /// `COMMIT` (or `ROLLBACK`) and `DISCARD ALL`, sent together, within
     /// `limit`. Answers how the transaction ended (a `COMMIT` Postgres
     /// refused is its failure; no answer is unavailable), and whether the
-    /// connection is shown clean: both answered, neither with an error, and
-    /// idle outside any transaction after each. `DISCARD ALL` ends what a
-    /// session can hold: settings and the search path, temporary tables,
-    /// prepared statements, cursors (`WITH HOLD` too), session advisory
-    /// locks, `LISTEN`, and any change of role.
+    /// connection is shown clean: everything answered, nothing after the
+    /// ending with an error, and idle outside any transaction at the end.
+    /// `DISCARD ALL` ends what a session can hold: settings and the search
+    /// path, temporary tables, prepared statements, cursors (`WITH HOLD`
+    /// too), session advisory locks, `LISTEN`, and any change of role.
+    ///
+    /// `checked` (a read-write transaction on an own database,
+    /// blackbox/CONTRACT.md, "What a migration leaves behind"): the commit
+    /// is [`CHECKED_COMMIT`] instead, in the same flight, followed by a
+    /// `ROLLBACK` that ends the transaction if the check refused it (and
+    /// is only a warning after a commit).
     pub(super) async fn end_transaction(
         &mut self,
         commit: bool,
+        checked: bool,
         limit: Duration,
     ) -> (Result<(), Failure>, bool) {
         let mut out = BytesMut::new();
-        let end = if commit { "COMMIT" } else { "ROLLBACK" };
-        if frontend::query(end, &mut out).is_err()
-            || frontend::query("DISCARD ALL", &mut out).is_err()
-        {
-            return (Err(Failure::Unavailable), false);
+        let queries: &[&str] = match (commit, checked) {
+            (true, true) => &[CHECKED_COMMIT, "ROLLBACK", "DISCARD ALL"],
+            (true, false) => &["COMMIT", "DISCARD ALL"],
+            (false, _) => &["ROLLBACK", "DISCARD ALL"],
+        };
+        for query in queries {
+            if frontend::query(query, &mut out).is_err() {
+                return (Err(Failure::Unavailable), false);
+            }
         }
         let mut ending: Result<(), Failure> = Err(Failure::Unavailable);
         let mut clean = true;
@@ -711,20 +738,27 @@ impl Connection {
             self.send(&mut out).await?;
             let mut failed: Option<Failure> = None;
             let mut ready = 0;
-            while ready < 2 {
+            while ready < queries.len() {
                 match self.receive(MAX_MESSAGE).await? {
                     Incoming::Message(Message::ReadyForQuery(body)) => {
                         if ready == 0 {
                             ending = failed.take().map_or(Ok(()), Err);
+                            // A checked commit the check refused leaves the
+                            // transaction aborted until the ROLLBACK after
+                            // it; otherwise the first answer must be idle.
+                            clean &= body.status() == b'I' || (checked && ending.is_err());
+                        } else {
+                            clean &= body.status() == b'I';
                         }
                         ready += 1;
-                        clean &= body.status() == b'I';
                     }
                     Incoming::Message(Message::ErrorResponse(body)) => {
                         if ready == 0 {
                             failed = Some(database_error(&body));
+                            clean &= checked;
+                        } else {
+                            clean = false;
                         }
-                        clean = false;
                     }
                     Incoming::Oversized { .. } => clean = false,
                     Incoming::Message(_) => {}

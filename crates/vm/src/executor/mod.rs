@@ -646,8 +646,12 @@ impl Held<'_> {
         let Some(mut connection) = self.connection.take() else {
             return Err(Failure::Unavailable);
         };
+        // A read-write transaction on an own database is committed only
+        // after the check (blackbox/CONTRACT.md, "What a migration leaves
+        // behind").
+        let checked = self.pool.key.is_some() && self.level == Level::Write;
         let (ending, clean) = connection
-            .end_transaction(commit, self.pool.limits.grace)
+            .end_transaction(commit, checked, self.pool.limits.grace)
             .await;
         if clean {
             self.pool.give_back(connection);
