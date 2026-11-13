@@ -528,6 +528,9 @@ DROP FUNCTION IF EXISTS vm.application_code(oid, oid);
 -- non-superuser changes), a function a migration added to an extension
 -- among them. `index-code`: code a role of the Application's owns
 -- (`vm.application_owned`), whatever extension it was added to.
+-- `type-code`: a range type, whoever owns it, whose `subtype_diff` (which
+-- ANALYZE calls for a column of the range or its multirange, as the
+-- table's owner) is such code.
 CREATE OR REPLACE FUNCTION vm.capture_problems()
 RETURNS TABLE (rule text, message text)
 LANGUAGE sql STABLE PARALLEL UNSAFE
@@ -689,6 +692,13 @@ SELECT 'index-code',
                  AND EXISTS (SELECT FROM pg_catalog.pg_type t
                               WHERE t.oid = d.refobjid AND t.typtype = 'd'
                                 AND vm.application_owned(t.typowner))))) x
+UNION ALL
+SELECT 'type-code',
+       pg_catalog.format('the range type %s has the subtype_diff %s, which a role of the Application''s owns: Postgres''s autovacuum would run it with the rights of the role that owns the Application''s tables, on any table with a column of the type, outside any transaction of the platform''s. Leave subtype_diff out, or make it one of Postgres''s own (float8mi, int4range_subdiff)',
+                         r.rngtypid::pg_catalog.regtype, r.rngsubdiff::pg_catalog.regprocedure)
+  FROM pg_catalog.pg_range r
+  JOIN pg_catalog.pg_proc p ON p.oid = r.rngsubdiff
+ WHERE vm.application_owned(p.proowner)
 $f$;
 
 -- The migrations recorded, in order: what the host compares a Version's

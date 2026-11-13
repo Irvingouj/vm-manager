@@ -1966,6 +1966,7 @@ impl OwnDatabases {
                     "in-vm" => "in-vm",
                     "security-definer" => "security-definer",
                     "index-code" => "index-code",
+                    "type-code" => "type-code",
                     _ => {
                         return Err(Problem::internal(
                             "applying migrations: a check answered a rule the program does not know",
