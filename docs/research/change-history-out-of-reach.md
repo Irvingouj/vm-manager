@@ -253,37 +253,37 @@ On a cluster started with `wal_level=logical`, with a superuser's `test_decoding
 
 ## 11. F. Code a migration leaves behind (added 2026-11-13 by the driving session, in review of the first slice)
 
-Provenance of this part: written by the implementation agent of ticket #57's second slice and rerun by it after the third round of review, on Postgres 18 (the black-box harness's, `VM_TEST_PG_VERSION=18`), on a shared 12-CPU VM with nothing else of note running. The figures below are from the rerun; its whole output is `g-cost.log` (exit 0); the first run's log is in this file's history. The script `docs/research/change-history-out-of-reach/g-cost.sh` needs only cargo, this checkout and the harness's cached Postgres binaries (and `.tools/libclang`, which it fills with `scripts/fetch-libclang.sh` where it is missing): it checks out each commit in a git worktree of its own, builds its `vm` with `cargo build --release` into `target/g-cost`, and drives each through the black-box harness (`g_cost.rs`, copied into `blackbox/tests/` for the run and removed after it, as are the worktrees). The builds are **before** (`4d6df80`, the first slice), **middle** (`bc0d37f`, the second slice before a migration's statement and the question of its transaction's key travelled together) and **after** (`5fdf806`, the second slice after the third round). The rerun, with `target/g-cost` absent beforehand, took 103 s, of which 66 s building the three binaries (other build caches of this machine, such as cargo's registry, were warm) [verified, `g-cost.log`]. Each figure below is from that log [verified]; what follows from them is marked.
+Provenance of this part: written by the implementation agent of ticket #57's second slice and rerun by it after the third round of review, on Postgres 18 (the black-box harness's, `VM_TEST_PG_VERSION=18`), on a shared 12-CPU VM with nothing else of note running. The figures below are from the rerun; its whole output is `g-cost.log` (exit 0); the first run's log is in this file's history. The script `docs/research/change-history-out-of-reach/g-cost.sh` needs only cargo, this checkout and the harness's cached Postgres binaries (and `.tools/libclang`, which it fills with `scripts/fetch-libclang.sh` where it is missing): it checks out each commit in a git worktree of its own, builds its `vm` with `cargo build --release` into `target/g-cost`, and drives each through the black-box harness (`g_cost.rs`, copied into `blackbox/tests/` for the run and removed after it, as are the worktrees). The builds are **before** (`4d6df80`, the first slice), **middle** (`bc0d37f`, the second slice before a migration's statement and the question of its transaction's key travelled together) and **after** (`f30046e`, the second slice after the third round of review). Run with `target/g-cost` absent beforehand (for `5fdf806`, one commit earlier), the script took 103 s, 66 s of it building the three binaries, other build caches of this machine such as cargo's registry being warm [verified, that run's output, not kept]; the run in `g-cost.log`, with `target/g-cost` kept from it, took 60 s, 31 s of it building [verified, `g-cost.log`]. Each figure below is from that log [verified]; what follows from them is marked.
 
 **A write** (one `INSERT` through `execute`, from the HTTP request to its answer, 400 in a row after 30 to warm up), median:
 
 | | round 1 | round 2 |
 |---|---|---|
-| before | 6.50 ms | 6.38 ms |
-| middle | 6.62 ms | 6.62 ms |
-| after | 6.53 ms | 6.56 ms |
+| before | 6.38 ms | 6.30 ms |
+| middle | 6.58 ms | 6.62 ms |
+| after | 6.70 ms | 6.67 ms |
 
-The check before the commit (`SET CONSTRAINTS ALL IMMEDIATE; CLOSE ALL; SELECT vm.before_commit(); COMMIT` in one flight) is no extra round trip. Measured alone as the superuser, a transaction with `vm.before_commit()` took 106 us more than one with `SELECT 1` in its place [verified]. The end-to-end difference between before and after (0.03 and 0.18 ms) is no larger than what one build varied between the two rounds of the first run (before: 6.36 and 6.94 ms) [verified, both logs], so the check cannot be told apart from the noise of a whole request here. A write that also makes the 30-second comparison (at most one every 30 s per own database) pays for a connection as the platform's role and the comparison besides, about what a Version with nothing to apply costs below [reasoned, not measured on a write].
+The check before the commit (`SELECT vm.before_commit(); SET CONSTRAINTS ALL IMMEDIATE; CLOSE ALL; SELECT vm.before_commit(); COMMIT` in one flight) is no extra round trip. Measured alone as the superuser, a transaction with one call of `vm.before_commit()` took 107 us more than one with `SELECT 1` in its place [verified]; the commit makes two calls, so about 0.21 ms [reasoned]. After was 0.32 and 0.37 ms slower than before end to end [verified]; the rest of that difference is no larger than what one build varied between the two rounds of the first run (before: 6.36 and 6.94 ms) [verified, both logs], so it cannot be told apart from the noise of a whole request here. A write that also makes the 30-second comparison (at most one every 30 s per own database) pays for a connection as the platform's role and the comparison besides, about what a Version with nothing to apply costs below [reasoned, not measured on a write].
 
 **One statement of a migration**, as sent: the difference between a Version whose last migration is 301 `SELECT 1` and one whose last migration is one, over 300, medians of five:
 
 | | round 1 | round 2 |
 |---|---|---|
-| before | 0.324 ms | 0.327 ms |
-| middle | 0.323 ms | 0.325 ms |
-| after | 0.194 ms | 0.191 ms |
+| before | 0.324 ms | 0.324 ms |
+| middle | 0.320 ms | 0.325 ms |
+| after | 0.193 ms | 0.197 ms |
 
-Before, each statement was prepared and then executed (two round trips) and `vm.transaction_key()` after it likewise (two more). After, the statement and the question each go as one unnamed extended-protocol exchange, both sent before either is answered [from code]; a statement that fails makes the question after it fail, and the statement's own error is the one answered. The question can travel with the statement, and now does. A Version with a migration of one statement became slower (21.9 to 22.5 ms before, 28.3 to 29.1 ms after) [verified]. The comparison before the migrations (a connection as the platform's role and the reads below) and the pending structure kept in the platform database before the commit account for it [reasoned].
+Before, each statement was prepared and then executed (two round trips) and `vm.transaction_key()` after it likewise (two more). After, the statement and the question each go as one unnamed extended-protocol exchange, both sent before either is answered [from code]; a statement that fails makes the question after it fail, and the statement's own error is the one answered. The question can travel with the statement, and now does. A Version with a migration of one statement became slower (21.9 to 22.2 ms before, 28.8 ms after in both rounds) [verified]. The comparison before the migrations (a connection as the platform's role and the reads below) and the pending structure kept in the platform database before the commit account for it [reasoned].
 
-**`vm.capture_guard()`**, which every captured statement that changed rows calls: 126.7 us a call against 92.8 us for a `SELECT 1` round trip, so 34 us more per captured statement, the call itself included [verified]. It was not removed. Inlining it into `vm.capture()` would save only the call's overhead, and the check of `pg_cast` itself is needed while a cast to `json` can be made outside a migration [reasoned].
+**`vm.capture_guard()`**, which every captured statement that changed rows calls: 128.2 us a call against 93.3 us for a `SELECT 1` round trip, so 35 us more per captured statement, the call itself included [verified]. It was not removed. Inlining it into `vm.capture()` would save only the call's overhead, and the check of `pg_cast` itself is needed while a cast to `json` can be made outside a migration [reasoned].
 
 **The checks and the comparison by number of tables** (ten columns each, the capture on each), each statement run 50 times by the harness's superuser after `SET ROLE` to the migration role:
 
 | tables | `capture_state` | `capture_problems` | `structure_state` | a Version with nothing to apply (median of 5) |
 |---|---|---|---|---|
-| 10 | 0.25 ms | 0.97 ms | 0.31 ms | 8.7 ms |
-| 100 | 0.72 ms | 1.32 ms | 1.27 ms | 10.2 ms |
-| 500 | 2.60 ms | 2.97 ms | 5.48 ms | 18.1 ms |
+| 10 | 0.25 ms | 0.95 ms | 0.31 ms | 8.4 ms |
+| 100 | 0.73 ms | 1.30 ms | 1.28 ms | 10.2 ms |
+| 500 | 2.63 ms | 2.89 ms | 5.28 ms | 17.8 ms |
 
 A single SELECT 1 round trip took 0.09 to 0.10 ms [verified]. A Version with nothing to apply includes the whole stored comparison: a connection as the platform's role, `vm.structure_state()` and the record of migrations in one snapshot, and what is kept read from the platform database [from code]. A Version with migrations pays, per migration, `capture_state` twice and `capture_problems` once, and, once per Version, `structure_state` and the pending structure written to the platform database [from code]. At 500 tables that is about 8 ms a migration and 6 ms a Version [reasoned from the table].
 
