@@ -77,11 +77,15 @@ fn rows_a_migration_changed_are_read_as_the_migrations_in_the_present_shape() {
     let (_, changes) = HistoryCall::of("reshaped")
         .key(json!({ "id": 1 }))
         .changes(&sdk, &user, context);
+    // 0002 renamed `before_name`, it did not empty it: just before this
+    // update the row held 0001_seed's `b1` under the new name, and that is
+    // the row a select() gave then.
+    let before = reshaped("k2", None, Some("b1"));
     let mut wants = vec![Want::update(
         &user.id,
         "user",
         &set.request_id(),
-        &k2,
+        &before,
         &now,
         &["added", "afterName"],
     )];
