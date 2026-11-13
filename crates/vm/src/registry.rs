@@ -35,7 +35,7 @@ use tokio_postgres::types::FromSql;
 use tokio_postgres::{Client, Row};
 
 use crate::log;
-use crate::own_db::{Migration, OwnDatabases, Problem, Recorded, continues};
+use crate::own_db::{Migration, NotToTheEnd, OwnDatabases, Problem, Recorded, continues};
 use crate::platform_db::{DbError, PlatformDatabase, rfc3339};
 
 /// Names that are the platform's own and can never be an Application's.
@@ -221,6 +221,9 @@ pub enum Sent {
         rule: &'static str,
         message: String,
     },
+    /// Too many Versions are being sent at once in the program: nothing of
+    /// this one was begun.
+    Busy,
     /// The own database could not be made ready or reached: a fixed
     /// description of the step, and Postgres's SQLSTATE if it gave one.
     OwnDatabaseUnavailable {
@@ -427,7 +430,10 @@ impl Registry {
         self.own
             .to_the_end(async move { registry.send_version_here(&name, version, &sender).await })
             .await
-            .unwrap_or_else(|why| Err(DbError::unexpected(why)))
+            .unwrap_or_else(|why| match why {
+                NotToTheEnd::Busy => Ok(Sent::Busy),
+                NotToTheEnd::Failed(why) => Err(DbError::unexpected(why)),
+            })
     }
 
     /// [`Registry::send_version`]'s work, in its task.

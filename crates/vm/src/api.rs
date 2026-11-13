@@ -655,6 +655,11 @@ impl Api {
                         "migration": migration,
                     } }),
                 ),
+                Sent::Busy => Answer::error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "unavailable",
+                    "too many Versions are being applied at once on the platform: nothing of this one was applied; send it again shortly",
+                ),
                 Sent::OwnDatabaseUnavailable { step, code } => {
                     log::record(
                         "own-database-failed",

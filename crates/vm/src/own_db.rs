@@ -699,7 +699,7 @@ impl OwnDatabases {
     pub async fn to_the_end<T: Send + 'static>(
         &self,
         work: impl Future<Output = T> + Send + 'static,
-    ) -> Result<T, &'static str> {
+    ) -> Result<T, NotToTheEnd> {
         let (done, answer) = tokio::sync::oneshot::channel();
         {
             let mut preparing = self
@@ -708,7 +708,7 @@ impl OwnDatabases {
                 .unwrap_or_else(PoisonError::into_inner);
             while preparing.try_join_next().is_some() {}
             if preparing.len() >= PREPARING {
-                return Err("too many Versions are being sent at once");
+                return Err(NotToTheEnd::Busy);
             }
             preparing.spawn(async move {
                 let outcome = work.await;
@@ -719,8 +719,12 @@ impl OwnDatabases {
         }
         match tokio::time::timeout(ANSWER_TIMEOUT, answer).await {
             Ok(Ok(outcome)) => Ok(outcome),
-            Ok(Err(_)) => Err("sending the Version: its task ended without an answer"),
-            Err(_) => Err("sending the Version: it did not finish in time"),
+            Ok(Err(_)) => Err(NotToTheEnd::Failed(
+                "sending the Version: its task ended without an answer",
+            )),
+            Err(_) => Err(NotToTheEnd::Failed(
+                "sending the Version: it did not finish in time",
+            )),
         }
     }
 
@@ -2097,6 +2101,15 @@ impl OwnDatabases {
         }
         committed
     }
+}
+
+/// Why [`OwnDatabases::to_the_end`] answered nothing of the work's.
+#[derive(Clone, Copy, Debug)]
+pub enum NotToTheEnd {
+    /// [`PREPARING`] are already being sent: nothing of it was begun.
+    Busy,
+    /// Begun, but no answer came: a fixed description.
+    Failed(&'static str),
 }
 
 /// When a comparison is made (blackbox/CONTRACT.md, "What something else
