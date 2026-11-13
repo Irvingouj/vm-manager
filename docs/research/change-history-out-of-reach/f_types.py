@@ -58,6 +58,21 @@ for _ in range(60):
         break
     time.sleep(0.5)
 print(">>> after autovacuum's ANALYZE, subtype_diff ran as:", su.one("SELECT who, count(*) FROM public.seen GROUP BY who").rows)
+print("-- a composite type that comes to hold the range: adding the attribute leaves a strong lock; ANALYZE of a column of the composite, or of its array, does not call subtype_diff")
+for sql in [
+    "CREATE TYPE comp AS (a int)",
+    "CREATE TABLE tc (id int, c comp, arr comp[])",
+    "INSERT INTO tc SELECT g, ROW(g)::comp, ARRAY[ROW(g)::comp] FROM generate_series(1, 300) g",
+    "BEGIN",
+    "ALTER TYPE comp ADD ATTRIBUTE s span",
+    "SELECT l.relation::regclass::text, l.mode FROM pg_locks l WHERE l.locktype = 'relation' AND l.pid = pg_backend_pid() AND l.mode IN ('ShareUpdateExclusiveLock','ShareLock','ShareRowExclusiveLock','ExclusiveLock','AccessExclusiveLock')",
+    "COMMIT",
+    "UPDATE tc SET c = ROW(id, span(id, id + 10))::comp, arr = ARRAY[ROW(id, span(id, id + 10))::comp]",
+]:
+    show(mig, sql)
+show(su, "DELETE FROM public.seen")
+show(su, "ANALYZE public.tc")
+print(">>> after a superuser ANALYZE of the composite's table, subtype_diff ran as:", su.one("SELECT who, count(*) FROM public.seen GROUP BY who").rows)
 print("-- what the platform can see to refuse it: the range's functions and their owners")
 print("user-defined ranges:", su.one(
     "SELECT g.rngtypid::regtype::text, pg_get_userbyid(sd.proowner), sd.proowner IN (SELECT oid FROM pg_roles WHERE rolsuper), "

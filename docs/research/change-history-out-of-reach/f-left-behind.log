@@ -73,8 +73,8 @@ migration tries more: ERROR 42501 permission denied to alter role
 migration tries connection limit: ERROR 42501 permission denied to alter role
 host: password null: ok ALTER ROLE []
 commit: ok COMMIT []
-login with 'known': refused: connection to server at "127.0.0.1", port 38175 failed: FATAL:  password authentication failed for user "a1_mig"
-login with 'a1_mig': refused: connection to server at "127.0.0.1", port 38175 failed: FATAL:  password authentication failed for user "a1_mig"
+login with 'known': refused: connection to server at "127.0.0.1", port 35023 failed: FATAL:  password authentication failed for user "a1_mig"
+login with 'a1_mig': refused: connection to server at "127.0.0.1", port 35023 failed: FATAL:  password authentication failed for user "a1_mig"
 session still alive: ok SELECT 1 [('a1_mig',)]
 == F5: stretching the window between commit and NOLOGIN (the test's technique)
 platform restores a password: ok ALTER ROLE []
@@ -184,13 +184,25 @@ ok []                                                                    <- DELE
 -- leave the table for autovacuum: the runtime role makes many rows, naptime is 1s
 ok []                                                                    <- INSERT INTO t SELECT g, span(g, g + 10) FROM generate_series(1, 5000) g
 >>> after autovacuum's ANALYZE, subtype_diff ran as: [('a1_mig', '5500')]
+-- a composite type that comes to hold the range: adding the attribute leaves a strong lock; ANALYZE of a column of the composite, or of its array, does not call subtype_diff
+ok []                                                                    <- CREATE TYPE comp AS (a int)
+ok []                                                                    <- CREATE TABLE tc (id int, c comp, arr comp[])
+ok []                                                                    <- INSERT INTO tc SELECT g, ROW(g)::comp, ARRAY[ROW(g)::comp] FROM generate_series(1, 300) g
+ok []                                                                    <- BEGIN
+ok []                                                                    <- ALTER TYPE comp ADD ATTRIBUTE s span
+ok [('comp', 'AccessExclusiveLock')]                                     <- SELECT l.relation::regclass::text, l.mode FROM pg_locks l WHERE l.locktype = 'relation' AND l.pid = pg_backend_pid() AND
+ok []                                                                    <- COMMIT
+ok []                                                                    <- UPDATE tc SET c = ROW(id, span(id, id + 10))::comp, arr = ARRAY[ROW(id, span(id, id + 10))::comp]
+ok []                                                                    <- DELETE FROM public.seen
+ok []                                                                    <- ANALYZE public.tc
+>>> after a superuser ANALYZE of the composite's table, subtype_diff ran as: []
 -- what the platform can see to refuse it: the range's functions and their owners
 user-defined ranges: [('span', 'a1_mig', 'f', None)]
 built-in ranges' functions are all a superuser's: [('t',)]
 ######## Postgres 16 (16.15.0), part F, cost
-tables=  10  round trip alone     58 us   digest     768 us more   own strong locks from pg_locks     73 us more
-tables= 100  round trip alone     58 us   digest    1573 us more   own strong locks from pg_locks     74 us more
-tables= 500  round trip alone     58 us   digest    5130 us more   own strong locks from pg_locks     70 us more
+tables=  10  round trip alone     57 us   digest     756 us more   own strong locks from pg_locks     71 us more
+tables= 100  round trip alone     57 us   digest    1545 us more   own strong locks from pg_locks     71 us more
+tables= 500  round trip alone     57 us   digest    5167 us more   own strong locks from pg_locks     71 us more
 ######## Postgres 17 (17.11.0), part F, vectors
 -- at rest, before
 trigger row: 16461 xmin=748 ctid=(0,10) enabled=O
@@ -272,8 +284,8 @@ migration tries more: ERROR 42501 permission denied to alter role
 migration tries connection limit: ERROR 42501 permission denied to alter role
 host: password null: ok ALTER ROLE []
 commit: ok COMMIT []
-login with 'known': refused: connection to server at "127.0.0.1", port 45085 failed: FATAL:  password authentication failed for user "a1_mig"
-login with 'a1_mig': refused: connection to server at "127.0.0.1", port 45085 failed: FATAL:  password authentication failed for user "a1_mig"
+login with 'known': refused: connection to server at "127.0.0.1", port 48155 failed: FATAL:  password authentication failed for user "a1_mig"
+login with 'a1_mig': refused: connection to server at "127.0.0.1", port 48155 failed: FATAL:  password authentication failed for user "a1_mig"
 session still alive: ok SELECT 1 [('a1_mig',)]
 == F5: stretching the window between commit and NOLOGIN (the test's technique)
 platform restores a password: ok ALTER ROLE []
@@ -383,13 +395,25 @@ ok []                                                                    <- DELE
 -- leave the table for autovacuum: the runtime role makes many rows, naptime is 1s
 ok []                                                                    <- INSERT INTO t SELECT g, span(g, g + 10) FROM generate_series(1, 5000) g
 >>> after autovacuum's ANALYZE, subtype_diff ran as: [('a1_mig', '5500')]
+-- a composite type that comes to hold the range: adding the attribute leaves a strong lock; ANALYZE of a column of the composite, or of its array, does not call subtype_diff
+ok []                                                                    <- CREATE TYPE comp AS (a int)
+ok []                                                                    <- CREATE TABLE tc (id int, c comp, arr comp[])
+ok []                                                                    <- INSERT INTO tc SELECT g, ROW(g)::comp, ARRAY[ROW(g)::comp] FROM generate_series(1, 300) g
+ok []                                                                    <- BEGIN
+ok []                                                                    <- ALTER TYPE comp ADD ATTRIBUTE s span
+ok [('comp', 'AccessExclusiveLock')]                                     <- SELECT l.relation::regclass::text, l.mode FROM pg_locks l WHERE l.locktype = 'relation' AND l.pid = pg_backend_pid() AND
+ok []                                                                    <- COMMIT
+ok []                                                                    <- UPDATE tc SET c = ROW(id, span(id, id + 10))::comp, arr = ARRAY[ROW(id, span(id, id + 10))::comp]
+ok []                                                                    <- DELETE FROM public.seen
+ok []                                                                    <- ANALYZE public.tc
+>>> after a superuser ANALYZE of the composite's table, subtype_diff ran as: []
 -- what the platform can see to refuse it: the range's functions and their owners
 user-defined ranges: [('span', 'a1_mig', 'f', None)]
 built-in ranges' functions are all a superuser's: [('t',)]
 ######## Postgres 17 (17.11.0), part F, cost
-tables=  10  round trip alone     57 us   digest     748 us more   own strong locks from pg_locks     70 us more
-tables= 100  round trip alone     57 us   digest    1479 us more   own strong locks from pg_locks     73 us more
-tables= 500  round trip alone     57 us   digest    4914 us more   own strong locks from pg_locks     72 us more
+tables=  10  round trip alone     56 us   digest     763 us more   own strong locks from pg_locks     71 us more
+tables= 100  round trip alone     56 us   digest    1570 us more   own strong locks from pg_locks     71 us more
+tables= 500  round trip alone     56 us   digest    5275 us more   own strong locks from pg_locks     71 us more
 ######## Postgres 18 (18.6.0), part F, vectors
 -- at rest, before
 trigger row: 16467 xmin=762 ctid=(0,10) enabled=O
@@ -421,7 +445,7 @@ captured: 1
 -- V4 the migration role lets the runtime role create; a table made at run time
 loose rows: 1
 -- V5 MAINTAIN: the runtime role refreshes a materialized view
-trigger row: 16467 xmin=796 ctid=(0,20) enabled=O
+trigger row: 16467 xmin=785 ctid=(0,20) enabled=O
 victim: changed unseen via materialized view refresh
 captured: 1
 -- V8 a virtual generated column calling a function of the migration's
@@ -475,8 +499,8 @@ migration tries more: ERROR 42501 permission denied to alter role
 migration tries connection limit: ERROR 42501 permission denied to alter role
 host: password null: ok ALTER ROLE []
 commit: ok COMMIT []
-login with 'known': refused: connection to server at "127.0.0.1", port 58333 failed: FATAL:  password authentication failed for user "a1_mig"
-login with 'a1_mig': refused: connection to server at "127.0.0.1", port 58333 failed: FATAL:  password authentication failed for user "a1_mig"
+login with 'known': refused: connection to server at "127.0.0.1", port 35459 failed: FATAL:  password authentication failed for user "a1_mig"
+login with 'a1_mig': refused: connection to server at "127.0.0.1", port 35459 failed: FATAL:  password authentication failed for user "a1_mig"
 session still alive: ok SELECT 1 [('a1_mig',)]
 == F5: stretching the window between commit and NOLOGIN (the test's technique)
 platform restores a password: ok ALTER ROLE []
@@ -586,10 +610,22 @@ ok []                                                                    <- DELE
 -- leave the table for autovacuum: the runtime role makes many rows, naptime is 1s
 ok []                                                                    <- INSERT INTO t SELECT g, span(g, g + 10) FROM generate_series(1, 5000) g
 >>> after autovacuum's ANALYZE, subtype_diff ran as: [('a1_mig', '5500')]
+-- a composite type that comes to hold the range: adding the attribute leaves a strong lock; ANALYZE of a column of the composite, or of its array, does not call subtype_diff
+ok []                                                                    <- CREATE TYPE comp AS (a int)
+ok []                                                                    <- CREATE TABLE tc (id int, c comp, arr comp[])
+ok []                                                                    <- INSERT INTO tc SELECT g, ROW(g)::comp, ARRAY[ROW(g)::comp] FROM generate_series(1, 300) g
+ok []                                                                    <- BEGIN
+ok []                                                                    <- ALTER TYPE comp ADD ATTRIBUTE s span
+ok [('comp', 'AccessExclusiveLock')]                                     <- SELECT l.relation::regclass::text, l.mode FROM pg_locks l WHERE l.locktype = 'relation' AND l.pid = pg_backend_pid() AND
+ok []                                                                    <- COMMIT
+ok []                                                                    <- UPDATE tc SET c = ROW(id, span(id, id + 10))::comp, arr = ARRAY[ROW(id, span(id, id + 10))::comp]
+ok []                                                                    <- DELETE FROM public.seen
+ok []                                                                    <- ANALYZE public.tc
+>>> after a superuser ANALYZE of the composite's table, subtype_diff ran as: []
 -- what the platform can see to refuse it: the range's functions and their owners
 user-defined ranges: [('span', 'a1_mig', 'f', None)]
 built-in ranges' functions are all a superuser's: [('t',)]
 ######## Postgres 18 (18.6.0), part F, cost
-tables=  10  round trip alone     55 us   digest     742 us more   own strong locks from pg_locks     84 us more
-tables= 100  round trip alone     55 us   digest    1482 us more   own strong locks from pg_locks     84 us more
-tables= 500  round trip alone     55 us   digest    4921 us more   own strong locks from pg_locks     83 us more
+tables=  10  round trip alone     55 us   digest     724 us more   own strong locks from pg_locks     84 us more
+tables= 100  round trip alone     55 us   digest    1461 us more   own strong locks from pg_locks     84 us more
+tables= 500  round trip alone     55 us   digest    5001 us more   own strong locks from pg_locks     85 us more
