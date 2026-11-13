@@ -23,8 +23,10 @@
 //!   is sent.
 //! - [`oplog`]: the Operation log, in the platform database.
 //! - [`own_db`]: the Own-database provisioner and migrator: each
-//!   Application's own database, its two roles, its migrations, and the
+//!   Application's own database, its three roles, its migrations, and the
 //!   runtime role's pool.
+//! - [`migration_text`]: a migration's text split into the single
+//!   statements the migrator sends, and the rules on it.
 //! - [`platform_db`]: the platform database: connecting (and creating it),
 //!   its structure in numbered steps, a bounded pool.
 //! - [`registry`]: the Application registry: Applications, Contributors,
@@ -40,6 +42,7 @@ pub mod executor;
 pub mod gateway;
 pub mod ingress;
 pub mod log;
+pub mod migration_text;
 pub mod oplog;
 pub mod own_db;
 pub mod platform_db;
