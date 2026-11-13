@@ -86,14 +86,20 @@ use crate::platform_db::{
     Connection, DatabaseAddress, DbError, PlatformDatabase, quote_identifier,
 };
 
+mod history;
+mod relay;
+
+pub use history::{HistoryAnswer, HistoryRead};
+
 /// The line `drizzle-kit` puts between the statements of a migration.
 pub const BREAKPOINT: &str = "--> statement-breakpoint";
 
 /// The form of the platform's part of an own database this program brings
-/// every one to: 2 is three roles and `own_db_schema.sql` as it is. Raise
-/// it whenever `own_db_schema.sql` or the roles change, so that every own
+/// every one to: 3 is three roles and `own_db_schema.sql` as it is (the
+/// history shipped from `vm.outbox`; 2 kept it in `vm.history`). Raise it
+/// whenever `own_db_schema.sql` or the roles change, so that every own
 /// database is brought to the new form at the next start.
-pub const FORM: i32 = 2;
+pub const FORM: i32 = 3;
 
 /// The longest opening a connection to an own database may take.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -164,13 +170,14 @@ const MIGRATIONS_LOCK: i64 = 0x766d_6d69_6772_6174;
 const PLATFORM_SCHEMA: &str = include_str!("own_db_schema.sql");
 
 /// What the runtime role `runtime` and the migration role `owner` (both
-/// quoted) may do in `vm`: use the schema, read `vm.history`, call
-/// `vm.identity()` and `vm.transaction_key()`; the runtime role also the
-/// check before a write's commit (`vm.before_commit()`); the migration role
-/// also what the host calls on its session during migrations. Not the
-/// capture's trigger functions: Postgres asks for `EXECUTE` on a trigger's
-/// function of whoever makes the trigger, so a migration cannot make a
-/// trigger of its own that calls one (`42501`). Nothing else.
+/// quoted) may do in `vm`: use the schema, call `vm.identity()` and
+/// `vm.transaction_key()`; the runtime role also the check before a
+/// write's commit (`vm.before_commit()`); the migration role also what the
+/// host calls on its session during migrations. No table: the outbox is
+/// the platform's role's alone (blackbox/CONTRACT.md, "Where it is kept").
+/// Not the capture's trigger functions: Postgres asks for `EXECUTE` on a
+/// trigger's function of whoever makes the trigger, so a migration cannot
+/// make a trigger of its own that calls one (`42501`). Nothing else.
 fn vm_grants(owner: &str, runtime: &str) -> String {
     format!(
         "REVOKE ALL ON SCHEMA vm FROM {runtime}, {owner};
@@ -178,12 +185,12 @@ fn vm_grants(owner: &str, runtime: &str) -> String {
          REVOKE ALL ON ALL TABLES IN SCHEMA vm FROM {runtime}, {owner};
          REVOKE ALL ON ALL SEQUENCES IN SCHEMA vm FROM {runtime}, {owner};
          REVOKE ALL ON ALL FUNCTIONS IN SCHEMA vm FROM {runtime}, {owner};
-         GRANT SELECT ON TABLE vm.history TO {runtime}, {owner};
          GRANT EXECUTE ON FUNCTION vm.identity(), vm.transaction_key() TO {runtime}, {owner};
          GRANT EXECUTE ON FUNCTION vm.capture_new_tables(), vm.capture_state(),
              vm.capture_problems(), vm.applied_migrations(),
              vm.structure_state(), vm.record_migration(integer, text, text),
-             vm.application_owned(oid) TO {owner};
+             vm.application_owned(oid), vm.structure_snapshot(),
+             vm.record_structure(jsonb) TO {owner};
          GRANT EXECUTE ON FUNCTION vm.before_commit() TO {runtime};"
     )
 }
@@ -427,6 +434,8 @@ struct Known {
     /// it has: a comparison that could not be made is not tried again by
     /// every operation that follows, only at the next occasion.
     compared: Mutex<Option<Instant>>,
+    /// Its outbox's shipments ([`relay`]).
+    shipping: relay::Shipping,
 }
 
 impl Known {
@@ -440,6 +449,7 @@ impl Known {
             turn: tokio::sync::Mutex::new(()),
             comparing: tokio::sync::Mutex::new(()),
             compared: Mutex::new(None),
+            shipping: relay::Shipping::default(),
         }
     }
 
@@ -555,6 +565,14 @@ pub struct OwnDatabases {
     /// itself within its time limits; any still running are ended when
     /// this is dropped. Held only to spawn or reap, never across an await.
     preparing: Mutex<JoinSet<()>>,
+    /// What every shipment needs ([`relay`]).
+    courier: Arc<relay::Courier>,
+    /// The shipments running, at most one per own database ([`relay`]):
+    /// owned here, reaped as new ones start, ended when this is dropped.
+    /// Each ends by itself once its outbox is empty or a step failed, every
+    /// step within its time limit. Held only to spawn or reap, never across
+    /// an await.
+    shipments: Mutex<JoinSet<()>>,
 }
 
 impl OwnDatabases {
@@ -611,6 +629,13 @@ impl OwnDatabases {
                 clock: 0,
             }),
             preparing: Mutex::new(JoinSet::new()),
+            courier: Arc::new(relay::Courier {
+                platform: Arc::clone(&platform),
+                host: address.host().to_owned(),
+                port: address.port(),
+                turns: tokio::sync::Semaphore::new(relay::AT_ONCE),
+            }),
+            shipments: Mutex::new(JoinSet::new()),
             platform,
         })
     }
@@ -743,6 +768,74 @@ impl OwnDatabases {
             None => self.provision(number, name).await?,
         };
         self.migrate(&known, name, sender, list).await
+    }
+
+    /// Asks for a shipment of `application`'s outbox ([`relay`]) and does
+    /// not wait for it: after a write, a committed transaction or a Version
+    /// was answered (blackbox/CONTRACT.md, "Shipping: When"). Nothing for an
+    /// Application without an own database.
+    pub fn ship(&self, application: &str) {
+        self.ask_shipment(application);
+    }
+
+    /// Asks for a shipment of `application`'s outbox and waits for it:
+    /// `true` once everything committed before this call is in
+    /// `change_history`, `false` if the shipment failed or there is no own
+    /// database. Before a read of the history; the caller bounds the wait
+    /// (the shipment goes on by itself if it stops waiting).
+    pub async fn ship_and_wait(&self, application: &str) -> bool {
+        match self.ask_shipment(application) {
+            Some((known, ticket)) => known.shipping.wait(ticket).await,
+            None => false,
+        }
+    }
+
+    /// At start, after [`OwnDatabases::bring_to_form`]: a shipment of every
+    /// own database's outbox, asked for and not waited for, so that serving
+    /// is not delayed. Each own database has at most one; [`relay::AT_ONCE`]
+    /// ship at once, the others wait their turn.
+    pub fn ship_all(&self) {
+        let names: Vec<Arc<str>> = self
+            .known
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .keys()
+            .map(Arc::clone)
+            .collect();
+        for name in &names {
+            self.ask_shipment(name);
+        }
+    }
+
+    /// A request for a shipment, its task started unless one runs; the own
+    /// database's state and the request's number, to wait for it.
+    fn ask_shipment(&self, application: &str) -> Option<(Arc<Known>, u64)> {
+        let (name, known) = self.known(application)?;
+        let (ticket, start) = known.shipping.ask();
+        if !start {
+            return Some((known, ticket));
+        }
+        let Ok(names) = self.names(known.number) else {
+            known.shipping.give_up(ticket);
+            return Some((known, ticket));
+        };
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            known.shipping.give_up(ticket);
+            return Some((known, ticket));
+        };
+        let route = relay::Route {
+            application: name,
+            database: names.database,
+            role: names.platform,
+            known: Arc::clone(&known),
+        };
+        let mut shipments = self
+            .shipments
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        while shipments.try_join_next().is_some() {}
+        shipments.spawn_on(relay::run(Arc::clone(&self.courier), route), &runtime);
+        Some((known, ticket))
     }
 
     /// The pool of the runtime role's connections to `application`'s own
@@ -1887,6 +1980,17 @@ impl OwnDatabases {
                 .await
                 .ok_or_else(timed_out)?
                 .map_err(|e| failed(migration, e))?;
+            // What the tables are as the migration begins: what its changes
+            // of structure are found against at its end.
+            let structure_before: serde_json::Value = within(
+                deadline,
+                &cancel,
+                transaction.query_one("SELECT vm.structure_snapshot()", &[]),
+            )
+            .await
+            .ok_or_else(timed_out)?
+            .and_then(|row| row.try_get(0))
+            .map_err(|e| failed(migration, e))?;
             for range in statements {
                 let Some(statement) = migration.sql.get(range.clone()) else {
                     return Err(Problem::internal(
@@ -1975,6 +2079,36 @@ impl OwnDatabases {
                 };
                 return Err(Problem::refused(migration, rule, message));
             }
+            // Its changes of structure that change data, recorded under the
+            // platform's own identity, which no migration can attach, naming
+            // the migration and its sender (blackbox/CONTRACT.md, "Changes of
+            // structure that change data"). Nothing of the migration's runs
+            // while it is attached: the next migration attaches its own
+            // before its first statement.
+            let recording = executor::identity(
+                work.sender,
+                work.application,
+                "platform",
+                None,
+                Some(&migration.name),
+            );
+            let ctx = work.key.attach(&transaction_key, &recording);
+            within(
+                deadline,
+                &cancel,
+                transaction.execute("SELECT pg_catalog.set_config('vm.ctx', $1, true)", &[&ctx]),
+            )
+            .await
+            .ok_or_else(timed_out)?
+            .map_err(|e| unavailable(&e))?;
+            within(
+                deadline,
+                &cancel,
+                transaction.query_one("SELECT vm.record_structure($1)", &[&structure_before]),
+            )
+            .await
+            .ok_or_else(timed_out)?
+            .map_err(|e| failed(migration, e))?;
         }
         // The record, under the platform's own identity, which no migration
         // can attach; then read back.

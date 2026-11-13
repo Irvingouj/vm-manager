@@ -59,8 +59,29 @@ SELECT pg_catalog.sha256(pg_catalog.convert_to(
            || pg_catalog.gen_random_uuid()::text || pg_catalog.gen_random_uuid()::text, 'UTF8'))
 ON CONFLICT (one) DO NOTHING;
 
--- The Change history.
-CREATE TABLE IF NOT EXISTS vm.history (
+-- The outbox (ADR 0017, second slice; blackbox/CONTRACT.md, "The Change
+-- history in the platform database"): every change the capture records, in
+-- the transaction of the change, until the host has shipped it to the
+-- platform database's `change_history` and deleted it here. Only the
+-- platform's role reads or writes it. `id` is the change's id in
+-- `change_history`. `json_nulls`: the `json` and `jsonb` columns of `old`
+-- and `new` whose value was JSON `null`, not SQL null (`to_jsonb` of a row
+-- writes both as `null`), as `{"old": [...], "new": [...]}`; null when
+-- none. `structure`: what a change of structure changed (kind
+-- `structure`, `vm.record_structure`).
+--
+-- An own database of the earlier form had the history itself here, as
+-- `vm.history`: that table becomes the outbox, its rows and its identity
+-- (so later ids are greater) kept, and is shipped like any outbox.
+DO $do$
+BEGIN
+    IF pg_catalog.to_regclass('vm.history') IS NOT NULL
+       AND pg_catalog.to_regclass('vm.outbox') IS NULL THEN
+        ALTER TABLE vm.history RENAME TO outbox;
+    END IF;
+END
+$do$;
+CREATE TABLE IF NOT EXISTS vm.outbox (
     id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     at timestamptz NOT NULL,
     schema_name text NOT NULL,
@@ -74,15 +95,15 @@ CREATE TABLE IF NOT EXISTS vm.history (
     application text NOT NULL,
     actor text NOT NULL,
     request text,
-    migration text
+    migration text,
+    structure jsonb,
+    json_nulls jsonb
 );
-
--- A row's changes, newest first (the SDK's `history(table, key)`, ticket
--- "Read a row's Change history through the SDK"). The key is indexed by its
--- hash, not itself: a btree entry has a size limit, and a long key in it
--- would make the change itself fail. The reader compares the key too.
-CREATE INDEX IF NOT EXISTS history_row ON vm.history
-    (schema_name, table_name, pg_catalog.jsonb_hash_extended(key, 0), id);
+ALTER TABLE vm.outbox ADD COLUMN IF NOT EXISTS structure jsonb,
+                      ADD COLUMN IF NOT EXISTS json_nulls jsonb;
+-- The earlier form's index for reading a row's history here: nothing
+-- reads the outbox by key.
+DROP INDEX IF EXISTS vm.history_row;
 
 -- What makes the transaction it is called in different from every other:
 -- the backend, the virtual transaction id (unique in the backend's slot
@@ -183,8 +204,8 @@ $f$;
 -- The capture: an AFTER ... FOR EACH STATEMENT trigger for each of
 -- insert, update and delete, with the statement's rows as transition
 -- tables (`vm_new`, `vm_old`). The identity is verified once per
--- statement that changed rows; then one history row per changed row is
--- written, in the order the rows were changed. A statement that changed
+-- statement that changed rows; then one row per changed row is written to
+-- the outbox, in the order the rows were changed. A statement that changed
 -- no row records nothing and needs no identity. An update's old and new
 -- rows are paired in the order Postgres put them into its two transition
 -- tables, which is the order it updated them in, one old and one new each.
@@ -193,6 +214,12 @@ $f$;
 -- named like the alias (`t`, `vm_row`, `vm_new`, `vm_old`) cannot stand
 -- for it. The settings that change how values print are pinned, so what
 -- is recorded does not depend on the writer's session.
+--
+-- `to_jsonb` writes a `json` or `jsonb` column holding JSON `null` as it
+-- writes SQL null. For a table with such columns, which of them hold JSON
+-- `null` in each row is found by a second scan of the same transition
+-- table (in the same order: Postgres reads it as it was written), with
+-- Postgres's own `json_typeof`/`jsonb_typeof`, and kept in `json_nulls`.
 CREATE OR REPLACE FUNCTION vm.capture() RETURNS trigger
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER PARALLEL UNSAFE
 SET search_path = pg_catalog, pg_temp
@@ -207,6 +234,9 @@ DECLARE
     v_at timestamptz;
     v_key text[];
     v_columns text[];
+    v_tests text;
+    v_old_nulls jsonb;
+    v_new_nulls jsonb;
 BEGIN
     IF TG_OP = 'INSERT' THEN
         IF NOT EXISTS (SELECT FROM vm_new) THEN
@@ -223,27 +253,55 @@ BEGIN
       FROM pg_catalog.pg_index i
       JOIN pg_catalog.pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY (i.indkey)
      WHERE i.indrelid = TG_RELID AND i.indisprimary;
+    -- One test per json or jsonb column: (its name, whether it is JSON null).
+    SELECT pg_catalog.string_agg(
+               pg_catalog.format('(%L, pg_catalog.%s(vm_row.%I) OPERATOR(pg_catalog.=) %L)',
+                                 a.attname,
+                                 CASE WHEN a.atttypid = 'pg_catalog.json'::pg_catalog.regtype
+                                      THEN 'json_typeof' ELSE 'jsonb_typeof' END,
+                                 a.attname, 'null'),
+               ', ' ORDER BY a.attnum)
+      INTO v_tests
+      FROM pg_catalog.pg_attribute a
+     WHERE a.attrelid = TG_RELID AND a.attnum > 0 AND NOT a.attisdropped
+       AND a.atttypid IN ('pg_catalog.json'::pg_catalog.regtype, 'pg_catalog.jsonb'::pg_catalog.regtype);
+    IF v_tests IS NOT NULL THEN
+        IF TG_OP IN ('INSERT', 'UPDATE') THEN
+            EXECUTE 'SELECT pg_catalog.jsonb_agg(x.z ORDER BY x.i) FROM (SELECT pg_catalog.row_number() OVER () AS i, '
+                    || 'ARRAY(SELECT v.c FROM (VALUES ' || v_tests || ') AS v(c, n) WHERE v.n) AS z '
+                    || 'FROM vm_new vm_row) x'
+               INTO v_new_nulls;
+        END IF;
+        IF TG_OP IN ('DELETE', 'UPDATE') THEN
+            EXECUTE 'SELECT pg_catalog.jsonb_agg(x.z ORDER BY x.i) FROM (SELECT pg_catalog.row_number() OVER () AS i, '
+                    || 'ARRAY(SELECT v.c FROM (VALUES ' || v_tests || ') AS v(c, n) WHERE v.n) AS z '
+                    || 'FROM vm_old vm_row) x'
+               INTO v_old_nulls;
+        END IF;
+    END IF;
     IF TG_OP = 'INSERT' THEN
-        INSERT INTO vm.history (at, schema_name, table_name, kind, key, old, new, changed,
-                                user_id, application, actor, request, migration)
+        INSERT INTO vm.outbox (at, schema_name, table_name, kind, key, old, new, changed,
+                               user_id, application, actor, request, migration, json_nulls)
         SELECT v_at, TG_TABLE_SCHEMA::text, TG_TABLE_NAME::text, 'insert',
                CASE WHEN v_key IS NULL THEN NULL
                     ELSE (SELECT pg_catalog.jsonb_object_agg(c, r.j -> c) FROM pg_catalog.unnest(v_key) c) END,
                NULL, r.j, NULL,
                v_who ->> 'user_id', v_who ->> 'application', v_who ->> 'actor',
-               v_who ->> 'request', v_who ->> 'migration'
+               v_who ->> 'request', v_who ->> 'migration',
+               vm.json_nulls(NULL, v_new_nulls -> (r.i - 1)::integer)
           FROM (SELECT pg_catalog.to_jsonb(vm_row.*) AS j, pg_catalog.row_number() OVER () AS i
                   FROM vm_new vm_row) r
          ORDER BY r.i;
     ELSIF TG_OP = 'DELETE' THEN
-        INSERT INTO vm.history (at, schema_name, table_name, kind, key, old, new, changed,
-                                user_id, application, actor, request, migration)
+        INSERT INTO vm.outbox (at, schema_name, table_name, kind, key, old, new, changed,
+                               user_id, application, actor, request, migration, json_nulls)
         SELECT v_at, TG_TABLE_SCHEMA::text, TG_TABLE_NAME::text, 'delete',
                CASE WHEN v_key IS NULL THEN NULL
                     ELSE (SELECT pg_catalog.jsonb_object_agg(c, r.j -> c) FROM pg_catalog.unnest(v_key) c) END,
                r.j, NULL, NULL,
                v_who ->> 'user_id', v_who ->> 'application', v_who ->> 'actor',
-               v_who ->> 'request', v_who ->> 'migration'
+               v_who ->> 'request', v_who ->> 'migration',
+               vm.json_nulls(v_old_nulls -> (r.i - 1)::integer, NULL)
           FROM (SELECT pg_catalog.to_jsonb(vm_row.*) AS j, pg_catalog.row_number() OVER () AS i
                   FROM vm_old vm_row) r
          ORDER BY r.i;
@@ -252,17 +310,20 @@ BEGIN
           INTO v_columns
           FROM pg_catalog.pg_attribute a
          WHERE a.attrelid = TG_RELID AND a.attnum > 0 AND NOT a.attisdropped;
-        INSERT INTO vm.history (at, schema_name, table_name, kind, key, old, new, changed,
-                                user_id, application, actor, request, migration)
+        INSERT INTO vm.outbox (at, schema_name, table_name, kind, key, old, new, changed,
+                               user_id, application, actor, request, migration, json_nulls)
         SELECT v_at, TG_TABLE_SCHEMA::text, TG_TABLE_NAME::text, 'update',
                CASE WHEN v_key IS NULL THEN NULL
                     ELSE (SELECT pg_catalog.jsonb_object_agg(c, o.j -> c) FROM pg_catalog.unnest(v_key) c) END,
                o.j, n.j,
                (SELECT coalesce(pg_catalog.jsonb_agg(u.c ORDER BY u.p), '[]'::jsonb)
                   FROM pg_catalog.unnest(v_columns) WITH ORDINALITY u(c, p)
-                 WHERE (o.j -> u.c) IS DISTINCT FROM (n.j -> u.c)),
+                 WHERE (o.j -> u.c) IS DISTINCT FROM (n.j -> u.c)
+                    OR (v_old_nulls -> (o.i - 1)::integer ? u.c)
+                       IS DISTINCT FROM (v_new_nulls -> (o.i - 1)::integer ? u.c)),
                v_who ->> 'user_id', v_who ->> 'application', v_who ->> 'actor',
-               v_who ->> 'request', v_who ->> 'migration'
+               v_who ->> 'request', v_who ->> 'migration',
+               vm.json_nulls(v_old_nulls -> (o.i - 1)::integer, v_new_nulls -> (o.i - 1)::integer)
           FROM (SELECT pg_catalog.to_jsonb(vm_row.*) AS j, pg_catalog.row_number() OVER () AS i
                   FROM vm_old vm_row) o
           JOIN (SELECT pg_catalog.to_jsonb(vm_row.*) AS j, pg_catalog.row_number() OVER () AS i
@@ -272,6 +333,21 @@ BEGIN
     END IF;
     RETURN NULL;
 END
+$f$;
+
+-- `json_nulls` of one row of the outbox: from the names of the `json` and
+-- `jsonb` columns holding JSON `null` in its old row and in its new row
+-- (each a jsonb array, or null), `{"old": [...], "new": [...]}` with the
+-- empty ones left out; null when both are.
+CREATE OR REPLACE FUNCTION vm.json_nulls(p_old jsonb, p_new jsonb) RETURNS jsonb
+LANGUAGE sql IMMUTABLE PARALLEL SAFE
+SET search_path = pg_catalog, pg_temp
+AS $f$
+SELECT NULLIF(
+           pg_catalog.jsonb_strip_nulls(pg_catalog.jsonb_build_object(
+               'old', NULLIF(p_old, '[]'::jsonb),
+               'new', NULLIF(p_new, '[]'::jsonb))),
+           '{}'::jsonb)
 $f$;
 
 -- The fourth capture trigger's function: TRUNCATE of a table with history
@@ -733,6 +809,164 @@ BEGIN
     VALUES (p_position, p_name,
             pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(p_sql, 'UTF8')), 'hex'),
             p_sql);
+END
+$f$;
+
+-- What the tables outside `vm` and the enum types are, for the changes of
+-- structure that change data (blackbox/CONTRACT.md, "Changes of structure
+-- that change data"): `tables`, by object id, each with its schema `s`,
+-- name `n`, file node `f` (a new one when Postgres writes the rows anew;
+-- 0 for a partitioned table), columns `c` (number, name, type as
+-- `format_type` prints it under this function's search path, which names
+-- every type that is not Postgres's own with its schema, type's object id;
+-- dropped ones left out) and partitions `p` (object ids); and `enums`, each
+-- value by its object id, which renaming it keeps: [type, label]. Called
+-- by the host on the migration role's session at the start of each
+-- migration, kept in the host's memory, and given back to
+-- `vm.record_structure` at its end. Reads only the catalog.
+CREATE OR REPLACE FUNCTION vm.structure_snapshot() RETURNS jsonb
+LANGUAGE sql STABLE PARALLEL UNSAFE
+SET search_path = pg_catalog, pg_temp
+AS $f$
+SELECT pg_catalog.jsonb_build_object(
+    'tables', coalesce((
+        SELECT pg_catalog.jsonb_object_agg(c.oid::text, pg_catalog.jsonb_build_object(
+                   's', n.nspname::text,
+                   'n', c.relname::text,
+                   'f', c.relfilenode::text,
+                   'c', coalesce((
+                        SELECT pg_catalog.jsonb_agg(pg_catalog.jsonb_build_array(
+                                   a.attnum, a.attname::text,
+                                   pg_catalog.format_type(a.atttypid, a.atttypmod),
+                                   a.atttypid::text) ORDER BY a.attnum)
+                          FROM pg_catalog.pg_attribute a
+                         WHERE a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped), '[]'::jsonb),
+                   'p', coalesce((
+                        SELECT pg_catalog.jsonb_agg(i.inhrelid::text ORDER BY i.inhrelid)
+                          FROM pg_catalog.pg_inherits i
+                          JOIN pg_catalog.pg_class k ON k.oid = i.inhrelid
+                         WHERE i.inhparent = c.oid AND k.relispartition AND k.relkind IN ('r', 'p')), '[]'::jsonb)))
+          FROM pg_catalog.pg_class c
+          JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+         WHERE c.relkind IN ('r', 'p')
+           AND n.nspname <> 'vm' AND n.nspname <> 'information_schema'
+           AND pg_catalog.left(n.nspname, 3) <> 'pg_'), '{}'::jsonb),
+    'enums', coalesce((
+        SELECT pg_catalog.jsonb_object_agg(e.oid::text,
+                   pg_catalog.jsonb_build_array(e.enumtypid::text, e.enumlabel::text))
+          FROM pg_catalog.pg_enum e), '{}'::jsonb))
+$f$;
+
+-- Records, as entries of the outbox of kind `structure`, what the
+-- migration that just ended changed of the structure of the tables there
+-- were when it began (`p_before`, `vm.structure_snapshot()` then), against
+-- what the catalog says now (blackbox/CONTRACT.md, "Changes of structure
+-- that change data"); answers how many. Only with the identity the host
+-- attaches for this at the end of each migration (`actor` `platform`,
+-- with the Contributor and the migration's name), which a migration
+-- cannot make: it does not have the keys. The entries have `actor`
+-- `migration`, that Contributor and that migration. On a table there is
+-- still: `column-dropped`, `column-type`, `table-rewritten` (a new file
+-- node and no `column-type` entry), `enum-value-renamed` (one per value
+-- renamed, on every such table with a column of the type or an array of
+-- it), `partition-attached` (a table that was there, attached) and
+-- `partition-detached`, under the table's name now. On a table that is
+-- gone, or whose name another table has now: `table-dropped` or
+-- `table-replaced`, under the name it had.
+CREATE OR REPLACE FUNCTION vm.record_structure(p_before jsonb) RETURNS integer
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER PARALLEL UNSAFE
+SET search_path = pg_catalog, pg_temp
+AS $f$
+DECLARE
+    v_who jsonb := vm.attached();
+    v_now jsonb;
+    v_at timestamptz := pg_catalog.clock_timestamp();
+    v_made integer;
+BEGIN
+    IF (v_who ->> 'actor') IS DISTINCT FROM 'platform' OR (v_who ->> 'migration') IS NULL THEN
+        RAISE EXCEPTION USING ERRCODE = '42501',
+            MESSAGE = 'only the platform records a change of structure';
+    END IF;
+    v_now := vm.structure_snapshot();
+    WITH b AS (
+        SELECT t.key AS id, t.value ->> 's' AS s, t.value ->> 'n' AS n, t.value AS v
+          FROM pg_catalog.jsonb_each(p_before -> 'tables') t),
+    a AS (
+        SELECT t.key AS id, t.value ->> 's' AS s, t.value ->> 'n' AS n, t.value AS v
+          FROM pg_catalog.jsonb_each(v_now -> 'tables') t),
+    kept AS (
+        SELECT b.id, a.s, a.n, b.v AS bv, a.v AS av FROM b JOIN a ON a.id = b.id),
+    bcols AS (
+        SELECT k.id, (c.value ->> 0)::integer AS attnum, c.value ->> 1 AS name, c.value ->> 2 AS type
+          FROM kept k CROSS JOIN LATERAL pg_catalog.jsonb_array_elements(k.bv -> 'c') c),
+    acols AS (
+        SELECT k.id, (c.value ->> 0)::integer AS attnum, c.value ->> 1 AS name, c.value ->> 2 AS type,
+               (c.value ->> 3)::oid AS typid
+          FROM kept k CROSS JOIN LATERAL pg_catalog.jsonb_array_elements(k.av -> 'c') c),
+    retyped AS (
+        SELECT x.id, y.attnum, y.name, x.type AS from_type, y.type AS to_type
+          FROM bcols x JOIN acols y ON y.id = x.id AND y.attnum = x.attnum
+         WHERE y.type IS DISTINCT FROM x.type),
+    renamed AS (
+        SELECT (o.value ->> 0)::oid AS typid, o.value ->> 1 AS from_label, w.value ->> 1 AS to_label
+          FROM pg_catalog.jsonb_each(p_before -> 'enums') o
+          JOIN pg_catalog.jsonb_each(v_now -> 'enums') w ON w.key = o.key
+         WHERE (w.value ->> 1) IS DISTINCT FROM (o.value ->> 1)),
+    entries (s, n, place, structure) AS (
+        SELECT b.s, b.n, 1,
+               pg_catalog.jsonb_build_object('change',
+                   CASE WHEN EXISTS (SELECT FROM a WHERE a.s = b.s AND a.n = b.n)
+                        THEN 'table-replaced' ELSE 'table-dropped' END)
+          FROM b
+         WHERE NOT EXISTS (SELECT FROM a WHERE a.id = b.id)
+            OR EXISTS (SELECT FROM a WHERE a.s = b.s AND a.n = b.n AND a.id <> b.id)
+        UNION ALL
+        SELECT k.s, k.n, 2, pg_catalog.jsonb_build_object('change', 'column-dropped', 'column', x.name)
+          FROM bcols x JOIN kept k ON k.id = x.id
+         WHERE NOT EXISTS (SELECT FROM acols y WHERE y.id = x.id AND y.attnum = x.attnum)
+        UNION ALL
+        SELECT k.s, k.n, 3, pg_catalog.jsonb_build_object('change', 'column-type', 'column', r.name,
+                                                          'from', r.from_type, 'to', r.to_type)
+          FROM retyped r JOIN kept k ON k.id = r.id
+        UNION ALL
+        SELECT k.s, k.n, 4, pg_catalog.jsonb_build_object('change', 'table-rewritten')
+          FROM kept k
+         WHERE (k.bv ->> 'f') <> '0' AND (k.av ->> 'f') IS DISTINCT FROM (k.bv ->> 'f')
+           AND NOT EXISTS (SELECT FROM retyped r WHERE r.id = k.id)
+        UNION ALL
+        SELECT k.s, k.n, 5, pg_catalog.jsonb_build_object('change', 'enum-value-renamed',
+                   'type', pg_catalog.format_type(e.typid, NULL),
+                   'from', e.from_label, 'to', e.to_label,
+                   'columns', (SELECT pg_catalog.jsonb_agg(y.name ORDER BY y.attnum)
+                                 FROM acols y
+                                WHERE y.id = k.id AND y.typid IN (e.typid, e.typarray)))
+          FROM (SELECT r.*, t.typarray FROM renamed r JOIN pg_catalog.pg_type t ON t.oid = r.typid) e
+          CROSS JOIN kept k
+         WHERE EXISTS (SELECT FROM acols y WHERE y.id = k.id AND y.typid IN (e.typid, e.typarray))
+        UNION ALL
+        SELECT k.s, k.n, 6, pg_catalog.jsonb_build_object('change', 'partition-attached',
+                                                          'partition', p.s || '.' || p.n)
+          FROM kept k
+          CROSS JOIN LATERAL pg_catalog.jsonb_array_elements_text(k.av -> 'p') ch(id)
+          JOIN a p ON p.id = ch.id
+         WHERE NOT (k.bv -> 'p') @> pg_catalog.to_jsonb(ch.id)
+           AND EXISTS (SELECT FROM b WHERE b.id = ch.id)
+        UNION ALL
+        SELECT k.s, k.n, 7, pg_catalog.jsonb_build_object('change', 'partition-detached',
+                   'partition', coalesce((SELECT p.s || '.' || p.n FROM a p WHERE p.id = ch.id),
+                                         (SELECT p.s || '.' || p.n FROM b p WHERE p.id = ch.id)))
+          FROM kept k
+          CROSS JOIN LATERAL pg_catalog.jsonb_array_elements_text(k.bv -> 'p') ch(id)
+         WHERE NOT (k.av -> 'p') @> pg_catalog.to_jsonb(ch.id))
+    INSERT INTO vm.outbox (at, schema_name, table_name, kind, key, old, new, changed,
+                           user_id, application, actor, request, migration, structure)
+    SELECT v_at, e.s, e.n, 'structure', NULL, NULL, NULL, NULL,
+           v_who ->> 'user_id', v_who ->> 'application', 'migration', NULL,
+           v_who ->> 'migration', e.structure
+      FROM entries e
+     ORDER BY e.s, e.n, e.place, e.structure::text;
+    GET DIAGNOSTICS v_made = ROW_COUNT;
+    RETURN v_made;
 END
 $f$;
 
