@@ -34,9 +34,10 @@ The driving session orchestrates; one agent works at a time.
 2. **Red tests.** A test agent writes black-box tests from the contract and the acceptance criteria. It does not read the implementation. The tests are seen failing.
 3. **Implementation.** A different agent makes them pass. It does not edit the tests or the contract; if it believes one is wrong, it says so and the driving session decides.
 4. **Review.** The driving session reads the diff against the Rust rules below and the ticket.
-5. **Green.** The driving session runs the gate itself. If it fails, back to the implementation agent until it is green.
+5. **Fix what the review found.** Everything: a defect, a gap in what the ticket promises, a way round a security claim, a path with no test, a cost nobody measured. Each goes back through the loop (the contract if the outside changes, a red test, the implementation). A ticket is never closed over a list of things left open.
+6. **Green.** The driving session runs the gate itself. If it fails, back to the implementation agent until it is green.
 
-Then the ticket's commits are pushed and the issue is closed with what was run.
+Then the ticket's commits are pushed and the issue is closed with what was run. A finding that cannot be fixed inside the ticket, because only the product owner can decide it, is put to the product owner at once and the ticket stays open until it is answered.
 
 - Black-box tests live in the `blackbox` crate. That crate depends on no product crate, so it cannot reach inside: it starts the real `vm` binary beside a real Postgres, drives it with commands and HTTP as different Users, and asserts on what an outsider can observe (a response, a command's output and exit code, an Operation log entry, a Change history row, a refusal's reason). Fixture Applications, hostile ones included, live there too.
 - Tests below that seam are allowed only where the spec's Testing Decisions name one (the Authorization decision as a pure function, the Request runner with a scripted Application, the SDK's type tests). The test agent still writes them first.
