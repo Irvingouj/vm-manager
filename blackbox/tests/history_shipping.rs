@@ -35,7 +35,8 @@ use std::time::{Duration, Instant};
 use blackbox::User;
 use blackbox::changed_outside::stop;
 use blackbox::history::{
-    APP, SHIPPED_WITHIN, history_standard, history_where, platform_sql, ship, wait_shipped,
+    APP, SHIPPED_WITHIN, history_standard, history_where, outbox_count, platform_sql, ship,
+    wait_shipped, wait_shipped_within,
 };
 use blackbox::history_op::{changes_of, history_call};
 use blackbox::history_shipping::{
@@ -102,16 +103,15 @@ fn execute_long(own: &Own, application: &str, sql: &str) -> Instant {
     answered
 }
 
-/// Fails unless `db`'s Application has exactly `want` rows of
-/// `change_history` satisfying `condition`, waiting up to
-/// [`SHIPPED_WITHIN`] for them and then a while longer for any more.
+/// Fails unless, once `vm.outbox` is empty (everything committed shipped,
+/// within [`SHIPPED_WITHIN`] of the writes' answers), `db`'s Application
+/// has exactly `want` rows of `change_history` satisfying `condition`.
 fn assert_exactly(db: &OwnDatabase, condition: &str, want: i64, context: &str) {
-    let (n, _) = wait_count(db, condition, want, SHIPPED_WITHIN);
-    wait_shipped(db, 0);
+    wait_shipped(db);
     let settled = count_now(db, condition);
     assert!(
-        n >= want && settled == want,
-        "{context}: expected exactly {want} rows of `change_history` where {condition} (CONTRACT.md, \"Shipping: Exactly once\"), got {settled} (at most {SHIPPED_WITHIN:?} after the write: {n}); the rows:\n{}",
+        settled == want,
+        "{context}: expected exactly {want} rows of `change_history` where {condition} once vm.outbox is empty (CONTRACT.md, \"Shipping: Exactly once\"), got {settled}; the rows:\n{}",
         history_where(db, condition)
             .iter()
             .map(Value::to_string)
@@ -197,7 +197,7 @@ fn every_change_of_ordinary_writes_as_both_actors_is_shipped_exactly_once() {
     assert_no_duplicates(&db, "the ordinary writes");
     // A later shipment (forced by a read of the history) adds nothing.
     ship(&own, &alice(), APP, "public", "things");
-    wait_shipped(&db, 0);
+    wait_shipped(&db);
     assert_eq!(
         count_now(&db, "true"),
         total,
@@ -445,7 +445,7 @@ fn a_shipment_has_no_operation_log_entry() {
         "expected a read of the history answered, got {answer}"
     );
     requests.insert(response.request_id());
-    wait_shipped(&db, 0);
+    wait_shipped(&db);
     let after: Vec<Value> = own
         .log()
         .into_iter()
@@ -508,6 +508,11 @@ fn a_write_is_answered_while_change_history_is_locked_and_its_change_is_shipped_
         record["application"], APP,
         "expected the `history-not-shipped` record to name the Application, got {record}"
     );
+    let held = outbox_count(&db);
+    assert_eq!(
+        held, 1,
+        "expected the change held up by the lock to stay in the outbox (CONTRACT.md: \"the changes stay in the outbox\"): vm.outbox has {held} row(s)"
+    );
     let leaked = records_holding(&own.vm, marker);
     assert!(
         leaked.is_empty(),
@@ -522,6 +527,7 @@ fn a_write_is_answered_while_change_history_is_locked_and_its_change_is_shipped_
         1,
         "expected the change held up by the lock in `change_history` once, before a read of the history that began after the lock was released answered"
     );
+    wait_shipped(&db);
     execute_ok(
         &own,
         &alice(),
@@ -553,17 +559,24 @@ fn a_change_not_yet_shipped_when_the_program_is_killed_is_shipped_once_at_the_ne
         "user",
         &format!("insert into things (title) values ('{marker}')"),
     );
-    // The shipment after the write is waiting on the lock.
+    // The shipment after the write is waiting on the lock (half a second
+    // for it to have begun; the test holds without it too).
     std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(
+        outbox_count(&db),
+        1,
+        "the harness's own check: expected the change, not shipped, in vm.outbox when the program is killed"
+    );
     let stopped = stop(own);
     lock.release();
     let own = stopped.start();
-    let (n, took) = wait_count(&db, &inserted_title(marker), 1, SHIPPED_WITHIN);
+    // No request: the shipment at start ships it.
+    let took = wait_shipped_within(&db, SHIPPED_WITHIN);
     assert_eq!(
-        n, 1,
-        "expected the change committed before the program was killed in `change_history` within {SHIPPED_WITHIN:?} of the next start, with no request (CONTRACT.md: shipping runs \"for every own database when the program starts\"); after {took:?} it has {n}"
+        count_now(&db, &inserted_title(marker)),
+        1,
+        "expected the change committed before the program was killed in `change_history` once, vm.outbox empty {took:?} after the next start with no request (CONTRACT.md: shipping runs \"for every own database when the program starts\")"
     );
-    wait_shipped(&db, 0);
     ship(&own, &alice(), APP, "public", "things");
     assert_eq!(
         count_now(&db, &inserted_title(marker)),
@@ -614,12 +627,11 @@ fn a_shipment_killed_in_its_middle_is_finished_once_at_the_next_start() {
         base + ROWS / 2
     );
     let own = stopped.start();
-    let (n, took) = wait_count(&db, &titled_like("mid-"), ROWS, Duration::from_secs(60));
-    assert_eq!(
-        n, ROWS,
-        "expected all {ROWS} changes in `change_history` after the next start (the test waits 60 s, longer than the 10 s of \"How soon\", for so many), {shipped} of them shipped before the kill; after {took:?} there are {n}"
+    // 60 s, longer than the 10 s of "How soon", for so many.
+    let took = wait_shipped_within(&db, Duration::from_secs(60));
+    println!(
+        "the rest of a shipment killed in its middle was shipped {took:?} after the next start"
     );
-    wait_shipped(&db, 0);
     ship(&own, &alice(), APP, "public", "things");
     let wrong = titles_not_once(&db, "mid-", ROWS);
     assert!(
@@ -789,8 +801,9 @@ fn writes_and_reads_at_once_in_two_applications_ship_each_change_once_under_its_
 }
 
 /// How far past 4 MiB the bytes of `old` and `new` of a batch, measured as
-/// `jsonb` prints them, may be: the contract does not say how the platform
-/// measures them, and `jsonb`'s text puts a space after each `:` and `,`.
+/// their text (`jsonb` printed), may be: CONTRACT.md says "4 MiB of `old`
+/// and `new` as text", and a text of the same values made otherwise (no
+/// space after each `:` and `,`) is a little shorter.
 const BYTES_SLACK: i64 = 64 * 1024;
 
 #[test]
@@ -806,13 +819,13 @@ fn batches_hold_at_most_1000_changes_and_4_mib_past_their_first() {
         APP,
         "insert into things (title) select 'big-' || g || '-' || repeat('x', 10000) from generate_series(1, 3000) g",
     );
-    let wait = Duration::from_secs(60);
-    let (n, took) = wait_count(&db, "true", 5500, wait);
+    // 60 s, longer than the 10 s of "How soon", for 30 MB.
+    wait_shipped_within(&db, Duration::from_secs(60));
+    let n = count_now(&db, "true");
     assert_eq!(
         n, 5500,
-        "expected the 5,500 changes of two statements in `change_history` (the test waits {wait:?}); after {took:?} there are {n}"
+        "expected the 5,500 changes of two statements in `change_history` once vm.outbox is empty, got {n}"
     );
-    wait_shipped(&db, 0);
     let found = batches(&db, "true");
     let too_many: Vec<String> = found
         .iter()
@@ -864,24 +877,15 @@ fn a_statement_of_100000_rows_is_shipped_whole_and_the_time_is_written_down() {
     );
     let statement = answered.duration_since(sent);
     // A generous wait: the contract's 10 s is for a change, and this is a
-    // hundred batches or more.
-    let wait = Duration::from_secs(300);
-    let sql = platform_sql(&db);
-    let condition = titled_like("hundred-k-");
-    let mut n;
-    loop {
-        n = blackbox::history_shipping::count_with(&sql, APP, &condition);
-        if n >= ROWS || answered.elapsed() >= wait {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    // hundred batches or more. Shipped whole: vm.outbox empty.
+    wait_shipped_within(&db, Duration::from_secs(300));
     let shipped_in = answered.elapsed();
+    let condition = titled_like("hundred-k-");
+    let n = count_now(&db, &condition);
     assert_eq!(
         n, ROWS,
-        "expected all {ROWS} changes of one statement in `change_history` (the test waits {wait:?} after its answer); after {shipped_in:?} there are {n}"
+        "expected all {ROWS} changes of one statement in `change_history` once vm.outbox is empty ({shipped_in:?} after its answer); there are {n}"
     );
-    wait_shipped(&db, 0);
     let wrong = titles_not_once(&db, "hundred-k-", ROWS);
     assert!(
         wrong.is_empty(),
@@ -972,6 +976,13 @@ fn a_change_is_in_change_history_within_10_seconds_and_before_a_later_read_answe
     );
     assert_ok(&answers[0], "the harness's own check: the insert");
     assert_ok(&answers[1], "the harness's own check: the update");
+    // The read shipped first, and everything committed is of `things`: the
+    // outbox is empty as soon as the read is answered, with no wait.
+    let left = outbox_count(&db);
+    assert_eq!(
+        left, 0,
+        "expected vm.outbox empty once a read of the history that ships first has answered (CONTRACT.md: \"It ships first\"); {left} row(s) left"
+    );
     let changes = changes_of(&answers[2]);
     let kinds: Vec<&str> = changes
         .iter()

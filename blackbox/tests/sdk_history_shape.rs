@@ -9,7 +9,13 @@
 //!   migration's name and no request;
 //! - `0002_reshape` drops `gone`, adds `added`, renames `before_name` to
 //!   `after_name`, and makes `recast.code` an integer (the old value `x1`
-//!   does not cast).
+//!   does not cast). Since the ticket "The Change history lives in the
+//!   platform database, shipped from an outbox", a later migration of the
+//!   same Version leaves `structure` entries ("A table has such entries from
+//!   the end of the migration that made it ... one for each such change a
+//!   later migration makes, of the same Version or of a later one"): the
+//!   drop of `gone` is one on `reshaped`, the change of `code`'s type one on
+//!   `recast`; and each read is one operation `history`.
 //!
 //! Read in the present shape, a dropped column is not shown, an added one is
 //! null, a renamed one is null under its new name; in `changed`, a column
@@ -34,6 +40,9 @@ use blackbox::sdk_history::{
 };
 use serde_json::{Value, json};
 
+/// The migration of `chronicle` that reshapes `reshaped` and `recast`.
+const RESHAPE_MIGRATION: &str = "0002_reshape";
+
 fn reshaped(keep: &str, added: Option<&str>, after: Option<&str>) -> Value {
     let text = |v: Option<&str>| v.map_or_else(d::null, d::string);
     d::object(&[
@@ -51,7 +60,14 @@ fn rows_a_migration_changed_are_read_as_the_migrations_in_the_present_shape() {
     let by_seed = |want: Want<'static>| want.by_migration(INSTALLER, SEED_MIGRATION);
     let k1 = reshaped("k1", None, None);
     let k2 = reshaped("k2", None, None);
+    // 0002_reshape's entry (column-dropped `gone`), newest, then 0001_seed's
+    // three changes.
     let seeded = [
+        Want {
+            kind: "structure",
+            ..Want::insert("", "", "", &blackbox::sdk::d::null())
+                .by_migration(INSTALLER, RESHAPE_MIGRATION)
+        },
         by_seed(Want::update("", "", "", &k2, &k2, &["gone"])),
         by_seed(Want::update("", "", "", &k1, &k2, &["keep"])),
         by_seed(Want::insert("", "", "", &k1)),
@@ -63,7 +79,7 @@ fn rows_a_migration_changed_are_read_as_the_migrations_in_the_present_shape() {
             .as_actor(actor)
             .changes(&sdk, &user, &context);
         assert_changes(&changes, &seeded, &context);
-        assert_one_history_entry(&sdk, &response, &user, actor, 3, &[], &context);
+        assert_one_history_entry(&sdk, &response, &user, actor, 4, &[], &context);
     }
 
     let (set, body) = sdk.get_ok(&user, "/reshaped/set?as=user&id=1&added=a&after=x");
@@ -101,8 +117,8 @@ fn a_value_that_no_longer_casts_fails_the_read_and_changes_nothing_stored() {
     let before = stored();
     assert_eq!(
         before.len(),
-        2,
-        "the harness's own check: 0001_seed's insert and update of recast are recorded:\n{}",
+        3,
+        "the harness's own check: 0001_seed's insert and update of recast, and 0002_reshape's structure entry, are recorded:\n{}",
         lines(&before)
     );
     for actor in ["user", "application"] {
@@ -130,7 +146,7 @@ fn a_value_that_no_longer_casts_fails_the_read_and_changes_nothing_stored() {
             entries[0]
         );
         assert_eq!(
-            entries[0]["operation"], "query",
+            entries[0]["operation"], "history",
             "{context}: {}",
             entries[0]
         );
@@ -142,5 +158,5 @@ fn a_value_that_no_longer_casts_fails_the_read_and_changes_nothing_stored() {
         &user,
         "reshaped, beside recast",
     );
-    assert_eq!(changes.len(), 3, "{}", lines(&changes));
+    assert_eq!(changes.len(), 4, "{}", lines(&changes));
 }

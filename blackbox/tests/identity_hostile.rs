@@ -152,7 +152,7 @@ fn assert_written_truly_or_not_at_all(
 /// what the writes left is shipped (so the outbox is not seen in the middle
 /// of a shipment): to show the runtime role changed nothing there.
 fn vm_rows(db: &OwnDatabase) -> String {
-    blackbox::history::wait_shipped(db, 0);
+    blackbox::history::wait_shipped(db);
     let mut text = String::new();
     for relation in vm_relations(db) {
         if !["r", "p", "m"].contains(&relation.kind.as_str()) {
@@ -766,7 +766,7 @@ fn the_runtime_role_cannot_stop_the_capture() {
         "ALTER TABLE things SET SCHEMA vm".to_owned(),
         "CREATE TABLE things_copy AS SELECT * FROM things".to_owned(),
     ]);
-    // The outbox, whatever its name: every table of vm.
+    // Every table of vm, the outbox (vm.outbox) among them.
     for relation in vm_relations(&db) {
         if ["r", "p"].contains(&relation.kind.as_str()) {
             let name = format!("vm.{}", ident(&relation.name));
@@ -880,10 +880,11 @@ fn ident_path(name: &str) -> String {
 }
 
 /// CONTRACT.md, "The Change history in the platform database": no
-/// `vm.history` (`42P01`), and the outbox, "the platform's own affair":
-/// "For the migration role and the runtime role, reading it, writing it,
-/// locking it or truncating it fails with `42501`". The outbox's name is
-/// the platform's own; every table of `vm` is tried.
+/// `vm.history` (`42P01`), and the outbox, `vm.outbox`: "For the migration
+/// role and the runtime role, reading it, writing it, locking it or
+/// truncating it fails with `42501`". Every table of `vm` is tried, the
+/// outbox among them, with statements that name none of its columns (they
+/// are the platform's own affair).
 #[test]
 fn the_runtime_role_cannot_read_or_change_the_outbox_and_there_is_no_vm_history() {
     let (own, db) = installed();
@@ -916,19 +917,17 @@ fn the_runtime_role_cannot_read_or_change_the_outbox_and_there_is_no_vm_history(
         .filter(|r| ["r", "p"].contains(&r.kind.as_str()))
         .collect();
     assert!(
-        !tables.is_empty(),
-        "the harness's own check: expected tables in vm, the outbox among them"
+        tables.iter().any(|t| t.name == "outbox"),
+        "expected the outbox, vm.outbox, among the tables of vm (CONTRACT.md: \"the outbox, the table `vm.outbox`\"), got {tables:#?}"
     );
     for table in &tables {
         let name = format!("vm.{}", ident(&table.name));
-        let first = table.columns.first().map_or("x".to_owned(), |c| ident(c));
         statements.extend(
             [
                 format!("SELECT * FROM {name}"),
                 format!("SELECT count(*) FROM {name}"),
                 format!("INSERT INTO {name} DEFAULT VALUES"),
                 format!("INSERT INTO {name} SELECT * FROM {name}"),
-                format!("UPDATE {name} SET {first} = {first}"),
                 format!("DELETE FROM {name}"),
                 format!("TRUNCATE {name}"),
                 format!("SELECT * FROM {name} FOR UPDATE"),
@@ -1013,7 +1012,7 @@ fn the_runtime_role_cannot_read_or_change_the_outbox_and_there_is_no_vm_history(
         &own_execute("user", "update things set size = 1"),
     );
     assert_ok(&answer, "an update");
-    blackbox::history::wait_shipped(&db, 4);
+    blackbox::history::wait_shipped(&db);
     assert_eq!(history(&db).len(), 4);
     assert_history_matches_operation_log(&own, &db, "after the attempts on the outbox");
 }

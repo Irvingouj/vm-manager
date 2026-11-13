@@ -19,11 +19,20 @@
 //!   before it; a Version refused or failed leaves none;
 //! - a `history` read answers it among every row's changes, by `id`, newest
 //!   first, with a key, without one, and with `limit`;
-//! - a change of structure that changes no data has none, and neither has
-//!   a table a migration of the same Version made;
+//! - `table-rewritten`: a column's type "changed" to itself with `USING`,
+//!   `CLUSTER`, `SET LOGGED`, a column added with a volatile default; none
+//!   when a `column-type` entry of the same migration explains the rewrite;
+//! - an enum value renamed: `columns` in the table's column order;
+//! - a partition attached or detached: the entry is the parent's, the
+//!   partition's own history has none;
+//! - a change of structure that changes no data has none; a table has
+//!   entries from the end of the migration that made it: none for what that
+//!   migration did, one for what a later migration of the same Version
+//!   does;
 //! - through the SDK (`fixtures/sdk/chronicle`, route `/history/full`) it
-//!   is a change of `kind` `"structure"` with `structure` the object and
-//!   `old`, `new`, `changed` null; a row's change has `structure` null.
+//!   is a change of `kind` `"structure"` with `structure` the object (its
+//!   column names the database's) and `old`, `new`, `changed` null; a row's
+//!   change has `structure` null.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -287,8 +296,28 @@ fn a_table_replaced_under_its_name_either_way_is_an_entry_on_the_name() {
 #[test]
 fn an_enum_value_renamed_is_an_entry_on_every_table_with_a_column_of_it() {
     let mut s = Structure::start();
+    // A table whose enum columns are not in the order of their names, made
+    // by a Version of its own and given history.
+    s.send_ok(&[Migration::new(
+        "0004_backwards_moods",
+        &[r#"CREATE TABLE "backwards_moods" (
+	"id" integer PRIMARY KEY NOT NULL,
+	"z" "mood"[],
+	"m" text,
+	"a" "mood"
+);"#],
+    )]);
+    let (_, answer) = s.own.one(
+        &User::new(WRITER),
+        APP,
+        &own_execute(
+            "user",
+            "insert into backwards_moods (id, z, m, a) values (1, '{sad}', 'm', 'happy')",
+        ),
+    );
+    assert_ok(&answer, "the harness's own check: a row of backwards_moods");
     let last = last_history_id(&s.db);
-    let migration = "0004_rename_mood";
+    let migration = "0005_rename_mood";
     s.send_ok(&[Migration::new(
         migration,
         &[r#"ALTER TYPE "public"."mood" RENAME VALUE 'sad' TO 'blue';"#],
@@ -301,9 +330,10 @@ fn an_enum_value_renamed_is_an_entry_on_every_table_with_a_column_of_it() {
             ("moods", renamed(&["mood"])),
             ("mood_lists", renamed(&["moods"])),
             ("two_moods", renamed(&["a", "b"])),
+            ("backwards_moods", renamed(&["z", "a"])),
         ],
         migration,
-        "an enum's value renamed: one entry on each table with a column of it, also as an array; none on a table without",
+        "an enum's value renamed: one entry on each table with a column of it, also as an array, `columns` in the table's column order; none on a table without",
     );
 }
 
@@ -319,12 +349,9 @@ fn a_partition_attached_or_detached_is_an_entry_on_the_partitioned_table() {
             r#"ALTER TABLE "measures" DETACH PARTITION "measures_2026";"#,
         ],
     )]);
-    // What is recorded on the partitions themselves, if anything, the
-    // contract does not say; the entries of the partitioned table it does.
-    let rows: Vec<Value> = structure_entries(&s.db, last)
-        .into_iter()
-        .filter(|r| r["table_name"] == "measures")
-        .collect();
+    // CONTRACT.md: "The entry is the parent's; the partition's own history
+    // has none": these two, and nothing on measures_2026 or measures_2027.
+    let rows = structure_entries(&s.db, last);
     assert_structure_rows(
         &rows,
         &[
@@ -338,8 +365,18 @@ fn a_partition_attached_or_detached_is_an_entry_on_the_partitioned_table() {
             ),
         ],
         migration,
-        "a partition attached to the table and one detached from it",
+        "a partition attached to the table and one detached from it, and no entry on either partition",
     );
+    for table in ["measures_2026", "measures_2027"] {
+        for actor in ACTORS {
+            let changes = changes_of(&s.read(actor, table, &json!({})));
+            assert!(
+                changes.iter().all(|c| c["kind"] != "structure"),
+                "history of the partition {table} as the {actor}: no structure entry; got\n{}",
+                lines(&changes)
+            );
+        }
+    }
 }
 
 #[test]
@@ -540,39 +577,47 @@ fn changes_of_structure_that_change_no_data_have_no_entry() {
 }
 
 #[test]
-fn a_table_made_in_the_same_version_has_no_structure_entry() {
+fn a_table_has_entries_from_the_end_of_the_migration_that_made_it() {
     let mut s = Structure::start();
     let last = last_history_id(&s.db);
     s.send_ok(&[
         Migration::new(
             "0004_make_fresh",
-            &[r#"CREATE TABLE "fresh" (
+            &[
+                r#"CREATE TABLE "fresh" (
 	"id" integer PRIMARY KEY NOT NULL,
 	"a" integer,
-	"b" text
-);"#],
+	"b" text,
+	"c" text
+);"#,
+                r#"INSERT INTO "fresh" VALUES (1, 1, 'x', 'c'), (2, 2, 'y', 'c');"#,
+                r#"ALTER TABLE "fresh" ALTER COLUMN "a" SET DATA TYPE bigint;"#,
+                r#"ALTER TABLE "fresh" DROP COLUMN "c";"#,
+            ],
         ),
         Migration::new(
             "0005_fill_fresh",
-            &[r#"INSERT INTO "fresh" VALUES (1, 1, 'x'), (2, 2, 'y');"#],
+            &[r#"INSERT INTO "fresh" VALUES (3, 3, 'z');"#],
         ),
         Migration::new(
             "0006_reshape",
             &[
-                r#"ALTER TABLE "fresh" ALTER COLUMN "a" SET DATA TYPE bigint;"#,
+                r#"ALTER TABLE "fresh" ALTER COLUMN "a" SET DATA TYPE numeric(12,2);"#,
                 r#"ALTER TABLE "fresh" DROP COLUMN "b";"#,
                 r#"ALTER TABLE "things" DROP COLUMN "tags";"#,
             ],
         ),
     ]);
     let rows = history_after(&s.db, last);
-    let fresh: Vec<&Value> = rows.iter().filter(|r| r["table_name"] == "fresh").collect();
+    let fresh_rows: Vec<&Value> = rows
+        .iter()
+        .filter(|r| r["table_name"] == "fresh" && r["kind"] != "structure")
+        .collect();
     assert!(
-        fresh.len() == 2
-            && fresh
-                .iter()
-                .all(|r| r["kind"] == "insert" && r["migration"] == "0005_fill_fresh"),
-        "fresh, made by 0004 of the same Version: 0005's two inserts recorded, and no structure entry for 0006's changes; got\n{}",
+        fresh_rows.len() == 1
+            && fresh_rows[0]["kind"] == "insert"
+            && fresh_rows[0]["migration"] == "0005_fill_fresh",
+        "fresh: nothing of what 0004, which made it, did (its inserts, its type change, its drop); 0005's insert recorded; got\n{}",
         lines(&rows)
     );
     let structure: Vec<Value> = rows
@@ -582,10 +627,97 @@ fn a_table_made_in_the_same_version_has_no_structure_entry() {
         .collect();
     assert_structure_rows(
         &structure,
-        &[("things", column_dropped("tags"))],
+        &[
+            ("fresh", column_type("a", "bigint", "numeric(12,2)")),
+            ("fresh", column_dropped("b")),
+            ("things", column_dropped("tags")),
+        ],
         "0006_reshape",
-        "a table that had history before the Version, changed by the same migration",
+        "0006, a later migration of the Version that made fresh, leaves entries on it, as on a table older than the Version; 0004, which made it, none",
     );
+    let insert_id = fresh_rows[0]["id"].as_i64().unwrap();
+    assert!(
+        structure.iter().all(|r| r["id"].as_i64() > Some(insert_id)),
+        "0006's entries come after 0005's insert: {}",
+        lines(&rows)
+    );
+}
+
+/// The file node of `public.<table>`: Postgres gives a table a new one
+/// when it writes its rows anew.
+fn filenode(structure: &Structure, table: &str) -> Option<String> {
+    structure.db.superuser().value(&format!(
+        "SELECT pg_relation_filenode('public.{table}')::text"
+    ))
+}
+
+/// CONTRACT.md: `table-rewritten` when "Postgres wrote the table's rows
+/// anew and no `column-type` entry of the same migration shows why: a
+/// column's type \"changed\" to the type it had, with `USING` ..., and
+/// also ... `CLUSTER`, `SET LOGGED`, a column added with a volatile
+/// default". One table each, in one migration; and a table whose rewrite a
+/// `column-type` entry of the same migration explains has that entry only.
+#[test]
+fn a_table_rewritten_with_no_column_type_entry_to_say_why_is_an_entry() {
+    let mut s = Structure::start();
+    // A table made unlogged by a Version of its own, given history, so that
+    // a later one can set it logged.
+    s.send_ok(&[Migration::new(
+        "0004_unlogged",
+        &[r#"CREATE UNLOGGED TABLE "scratch" (
+	"id" integer PRIMARY KEY NOT NULL,
+	"v" text
+);"#],
+    )]);
+    let (_, answer) = s.own.one(
+        &User::new(WRITER),
+        APP,
+        &own_execute("user", "insert into scratch (id, v) values (1, 's')"),
+    );
+    assert_ok(&answer, "the harness's own check: a row of scratch");
+    let last = last_history_id(&s.db);
+    let tables = ["priced", "plain", "scratch", "no_moods", "swapped"];
+    let before: Vec<Option<String>> = tables.iter().map(|t| filenode(&s, t)).collect();
+    let migration = "0005_rewrites";
+    s.send_ok(&[Migration::new(
+        migration,
+        &[
+            r#"ALTER TABLE "priced" ALTER COLUMN "code" SET DATA TYPE text USING upper("code");"#,
+            r#"CLUSTER "plain" USING "plain_pkey";"#,
+            r#"ALTER TABLE "scratch" SET LOGGED;"#,
+            r#"ALTER TABLE "no_moods" ADD COLUMN "r" double precision DEFAULT random();"#,
+            r#"ALTER TABLE "swapped" ALTER COLUMN "label" SET DATA TYPE integer USING length("label");"#,
+        ],
+    )]);
+    let after: Vec<Option<String>> = tables.iter().map(|t| filenode(&s, t)).collect();
+    for ((table, b), a) in tables.iter().zip(&before).zip(&after) {
+        assert!(
+            b.is_some() && b != a,
+            "the harness's own check: Postgres wrote {table} anew (its file node {b:?} then {a:?})"
+        );
+    }
+    let rewritten = || json!({ "change": "table-rewritten" });
+    assert_structure_rows(
+        &history_after(&s.db, last),
+        &[
+            ("priced", rewritten()),
+            ("plain", rewritten()),
+            ("scratch", rewritten()),
+            ("no_moods", rewritten()),
+            ("swapped", column_type("label", "text", "integer")),
+        ],
+        migration,
+        "a type changed to itself with USING, CLUSTER, SET LOGGED, a column added with a volatile default: table-rewritten; a type changed: column-type and no table-rewritten",
+    );
+    for actor in ACTORS {
+        let context = format!("history of priced {{ id: 1 }} as the {actor}");
+        let changes = changes_of(&s.read(actor, "priced", &json!({ "key": { "id": 1 } })));
+        assert!(
+            !changes.is_empty(),
+            "{context}: expected the entry and the insert, got nothing"
+        );
+        assert_structure_change(&changes[0], migration, &rewritten(), &context);
+    }
 }
 
 #[test]
@@ -613,44 +745,70 @@ fn through_the_sdk_a_structure_entry_is_a_change_of_kind_structure() {
             });
             (response, changes)
         };
-    // The first Version: 0002_reshape changed `reshaped`, which 0000 of the
-    // same Version made: no structure entry; each row's change has
+    // The first Version: 0002_reshape dropped `gone` of `reshaped`, which
+    // 0000 of the same Version made: an entry (a later migration of the
+    // same Version), newest; then 0001_seed's three changes, each with
     // `structure` null.
+    let gone = d::object(&[
+        ("change", d::string("column-dropped")),
+        ("column", d::string("gone")),
+    ]);
+    let entry_of = |migration: &'static str| Want {
+        kind: "structure",
+        ..Want::insert("", "", "", &d::null()).by_migration(INSTALLER, migration)
+    };
     for actor in ACTORS {
+        let context =
+            format!("history(reshaped, {{ id: 1 }}) as the {actor} after the first Version");
         let (_, changes) = full(actor, Some(json!({ "id": 1 })), None);
         assert_eq!(
             changes.len(),
-            3,
-            "history(reshaped, {{ id: 1 }}) as the {actor} after the first Version: 0001_seed's three changes; got:\n{}",
+            4,
+            "{context}: 0002_reshape's entry and 0001_seed's three changes; got:\n{}",
             lines(&changes)
         );
-        for change in &changes {
+        assert_sdk_change(&changes[0], &entry_of("0002_reshape"), &context);
+        assert_eq!(changes[0]["structure"], gone, "{context}: {}", changes[0]);
+        for change in &changes[1..] {
             assert_eq!(
                 change["structure"],
                 d::null(),
-                "a row's change has `structure` null: {change}"
+                "{context}: a row's change has `structure` null: {change}"
             );
+        }
+        for change in &changes {
             assert!(
                 change["properties"]
                     .as_array()
                     .is_some_and(|p| p.contains(&json!("structure"))),
-                "a change has the property `structure`: {change}"
+                "{context}: a change has the property `structure`: {change}"
             );
         }
     }
+    // A later Version retypes `keep` and `after_name` (`afterName` in the
+    // Application's schema): the entries name the database's columns.
     let migration = "0003_recast_keep";
     send_chronicle(
         &sdk,
         &[Migration::new(
             migration,
-            &[r#"ALTER TABLE "reshaped" ALTER COLUMN "keep" SET DATA TYPE varchar(20);"#],
+            &[
+                r#"ALTER TABLE "reshaped" ALTER COLUMN "keep" SET DATA TYPE varchar(20);"#,
+                r#"ALTER TABLE "reshaped" ALTER COLUMN "after_name" SET DATA TYPE varchar(30);"#,
+            ],
         )],
     );
-    let structure = d::object(&[
+    let keep = d::object(&[
         ("change", d::string("column-type")),
         ("column", d::string("keep")),
         ("from", d::string("text")),
         ("to", d::string("character varying(20)")),
+    ]);
+    let after_name = d::object(&[
+        ("change", d::string("column-type")),
+        ("column", d::string("after_name")),
+        ("from", d::string("text")),
+        ("to", d::string("character varying(30)")),
     ]);
     let k1 = d::object(&[
         ("id", d::number("1")),
@@ -670,43 +828,59 @@ fn through_the_sdk_a_structure_entry_is_a_change_of_kind_structure() {
         by_seed(Want::update("", "", "", &k1, &k2, &["keep"])),
         by_seed(Want::insert("", "", "", &k1)),
     ];
-    let structure_want = Want {
-        kind: "structure",
-        ..Want::insert("", "", "", &d::null()).by_migration(INSTALLER, migration)
+    let structure_want = entry_of(migration);
+    // The two entries of 0003, in either order (CONTRACT.md does not order
+    // the entries of one migration).
+    let assert_newest_two = |changes: &[Value], context: &str| {
+        let mut got: Vec<String> = changes[..2]
+            .iter()
+            .map(|c| {
+                assert_sdk_change(c, &structure_want, context);
+                c["structure"].to_string()
+            })
+            .collect();
+        got.sort();
+        let mut want = vec![keep.to_string(), after_name.to_string()];
+        want.sort();
+        assert_eq!(
+            got, want,
+            "{context}: the two entries of {migration}, columns by their names in the database"
+        );
     };
     for actor in ACTORS {
         let context = format!("history(reshaped, {{ id: 1 }}) as the {actor}");
         let (response, changes) = full(actor, Some(json!({ "id": 1 })), None);
         assert_eq!(
             changes.len(),
-            4,
-            "{context}: the structure entry and 0001_seed's three changes; got:\n{}",
+            6,
+            "{context}: {migration}'s two entries, 0002_reshape's entry and 0001_seed's three changes; got:\n{}",
             lines(&changes)
         );
-        assert_sdk_change(&changes[0], &structure_want, &context);
-        assert_eq!(
-            changes[0]["structure"], structure,
-            "{context}: `structure` is the object"
-        );
-        for (change, want) in changes[1..].iter().zip(&seeded) {
+        assert_newest_two(&changes, &context);
+        assert_sdk_change(&changes[2], &entry_of("0002_reshape"), &context);
+        assert_eq!(changes[2]["structure"], gone, "{context}: {}", changes[2]);
+        for (change, want) in changes[3..].iter().zip(&seeded) {
             assert_sdk_change(change, want, &context);
             assert_eq!(change["structure"], d::null(), "{context}: {change}");
         }
         assert_ids_decrease(&changes, &context);
         assert_ids_are_history_rows(&sdk.own, &changes, "public", "reshaped", &context);
-        assert_one_history_entry(&sdk, &response, &user, actor, 4, &[], &context);
+        assert_one_history_entry(&sdk, &response, &user, actor, 6, &[], &context);
 
         let context = format!("history(reshaped, {{ id: 1 }}, {{ limit: 1 }}) as the {actor}");
         let (_, changes) = full(actor, Some(json!({ "id": 1 })), Some(json!({ "limit": 1 })));
         assert_eq!(changes.len(), 1, "{context}: {}", lines(&changes));
         assert_sdk_change(&changes[0], &structure_want, &context);
-        assert_eq!(changes[0]["structure"], structure, "{context}");
+        assert!(
+            changes[0]["structure"] == keep || changes[0]["structure"] == after_name,
+            "{context}: one of {migration}'s entries: {}",
+            changes[0]
+        );
 
         let context = format!("history(reshaped) as the {actor}");
         let (_, changes) = full(actor, None, None);
-        assert_eq!(changes.len(), 4, "{context}: {}", lines(&changes));
-        assert_sdk_change(&changes[0], &structure_want, &context);
-        assert_eq!(changes[0]["structure"], structure, "{context}");
+        assert_eq!(changes.len(), 6, "{context}: {}", lines(&changes));
+        assert_newest_two(&changes, &context);
     }
     // The existing route still answers the entry, by its kind.
     let (_, changes) = HistoryCall::of("reshaped").key(json!({ "id": 1 })).changes(
@@ -714,7 +888,7 @@ fn through_the_sdk_a_structure_entry_is_a_change_of_kind_structure() {
         &user,
         "history(reshaped, { id: 1 }) through /history",
     );
-    assert_eq!(changes.len(), 4, "{}", lines(&changes));
+    assert_eq!(changes.len(), 6, "{}", lines(&changes));
     assert_eq!(changes[0]["kind"], d::string("structure"));
     assert!(id_of(&changes[0]) > id_of(&changes[1]));
 }

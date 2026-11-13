@@ -601,11 +601,7 @@ fn a_bulk_write_records_every_row() {
     );
     let took = began.elapsed();
     assert_eq!(answer["ok"]["rows_affected"], 5000);
-    blackbox::history::wait_for_history(
-        &db,
-        &format!("h.id > {last} AND h.request = '{request}'"),
-        5000,
-    );
+    blackbox::history::wait_shipped(&db);
     let counted = blackbox::history::platform_sql(&db)
         .value(&format!(
             "SELECT count(*)::text || ' ' || count(DISTINCT key)::text FROM change_history

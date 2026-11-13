@@ -6,9 +6,9 @@
 //! - Its arguments: `own` exactly `true`, `as` as for `query`, `table` a
 //!   string, `schema` a string defaulting to `public`, `key` an object of
 //!   scalars, `limit` an integer from 1 to 1000 (default 100), `before` a
-//!   string of digits, `values` as for `query`. Anything else is
-//!   `malformed`, has no Operation log entry and is recorded refused
-//!   `malformed`.
+//!   string of digits, `values` as for `query`. Anything else, `null` for
+//!   any of them included, is `malformed`, has no Operation log entry and is
+//!   recorded refused `malformed`. Arguments it does not have are ignored.
 //! - It is decided as a `query` on the own database: both actors with a
 //!   request in flight, `no-request` without, `log-unavailable` when its
 //!   entry cannot be written.
@@ -17,16 +17,19 @@
 //!   of `columns` with each value as `query` gives it; `limit` and `before`
 //!   page back.
 //! - Which changes: those of the table under the key as the key's columns
-//!   compare values, of the Application in flight only; a key that is not
-//!   exactly the primary key answers none; a column that is not there or a
-//!   value its type refuses is a `database` error.
+//!   compare values (a number or a boolean for a `text` key as its text),
+//!   of the Application in flight only; a key that is not exactly the
+//!   primary key (a column the table does not have included) answers no
+//!   row's changes, the `structure` entries only; a value its column's type
+//!   refuses is a `database` error.
 //! - It ships first, and an uncommitted change is not in it.
 //! - It reads as the runtime role in a read-only transaction, in the
 //!   table's present shape; a table not there is `42P01`; a value that no
 //!   longer fits fails the read whole.
 //! - JSON `null` reads as JSON `null`; `json` reads as `jsonb`.
 //! - The limits: `time` (the administrator holds a lock on
-//!   `change_history`), `bytes`, `unavailable`.
+//!   `change_history`), `bytes`, `unavailable` (the own database out of
+//!   reach; the platform database's is `log-unavailable`, in section 2).
 //! - One Operation log entry per read, written before anything is read.
 #![allow(
     clippy::unwrap_used,
@@ -320,6 +323,31 @@ fn every_form_the_rules_allow_is_read() {
             0,
         ),
     ];
+    // Arguments `history` does not have are ignored, each alone and all
+    // together.
+    let unknown: Vec<(&str, Value)> = vec![
+        ("sql", json!("delete from things")),
+        ("params", json!([7])),
+        ("resource", json!("devops")),
+        ("tx", json!("t-1")),
+        ("application", json!("twin")),
+        ("access", json!("write")),
+        ("whatever", json!({ "x": [1, null] })),
+        ("nothing", Value::Null),
+    ];
+    let mut cases = cases;
+    let mut all = json!({ "own": true, "table": "things" });
+    for (name, value) in &unknown {
+        let mut one = json!({ "own": true, "table": "things" });
+        one[*name] = value.clone();
+        all[*name] = value.clone();
+        cases.push(("an argument `history` does not have: ignored", one, 2));
+    }
+    cases.push((
+        "every argument `history` does not have at once: ignored",
+        all,
+        2,
+    ));
     let mut failures = Vec::new();
     for (what, arguments, want) in cases {
         let (_, answer) = read(&own, APP, &alice(), &history_with(&arguments));
@@ -833,7 +861,7 @@ fn the_key_is_compared_as_the_key_columns_compare_values() {
 }
 
 #[test]
-fn a_key_that_is_not_exactly_the_primary_key_answers_none_and_one_that_cannot_be_compared_is_a_database_error()
+fn a_key_that_is_not_exactly_the_primary_key_answers_no_row_and_a_value_its_type_refuses_is_a_database_error()
  {
     let (own, _db) = reader();
     for sql in [
@@ -846,9 +874,14 @@ fn a_key_that_is_not_exactly_the_primary_key_answers_none_and_one_that_cannot_be
     ] {
         write(&own, APP, &alice(), "user", sql);
     }
-    // Not exactly the primary key's columns: no row's changes (and no
-    // structure entry, as none was recorded).
+    // Not exactly the primary key's columns, a column the table does not
+    // have included: no row's changes (and no structure entry, as none was
+    // recorded for these tables; with them, see the next test). Not a
+    // database error.
     let none: Vec<(&str, &str, Value)> = vec![
+        ("public", "things", json!({ "nope": 7 })),
+        ("public", "things", json!({ "id": 7, "nope": 7 })),
+        ("public", "keyless", json!({ "nope": "a" })),
         ("inventory", "stock", json!({ "sku": "sku-1" })),
         ("inventory", "stock", json!({ "warehouse": "north" })),
         (
@@ -875,21 +908,6 @@ fn a_key_that_is_not_exactly_the_primary_key_answers_none_and_one_that_cannot_be
             ));
         }
     }
-    // A column the table does not have.
-    for key in [json!({ "nope": 7 }), json!({ "id": 7, "nope": 7 })] {
-        let (_, answer) = read(
-            &own,
-            APP,
-            &alice(),
-            &public("user", "things", &json!({ "key": key })),
-        );
-        let code = answer["error"]["code"].as_str().unwrap_or_default();
-        if answer["error"]["kind"] != "database" || code.len() != 5 {
-            failures.push(format!(
-                "  things key {key}: expected {{ error: {{ kind: \"database\", code }} }} for a column the table does not have, got {answer}"
-            ));
-        }
-    }
     // A value the column's type refuses: (table, key, SQLSTATE)
     for (table, key, code) in [
         ("things", json!({ "id": "x" }), "22P02"),
@@ -913,6 +931,68 @@ fn a_key_that_is_not_exactly_the_primary_key_answers_none_and_one_that_cannot_be
     assert!(
         failures.is_empty(),
         "keys answered otherwise than the contract says:\n{}",
+        failures.join("\n")
+    );
+}
+
+/// CONTRACT.md: "A `key` that names something other than exactly the
+/// table's primary key columns (one missing, another column, a name the
+/// table does not have, any key for a table without a primary key) answers
+/// no row's changes (the `structure` entries only)". On `shapes` after
+/// [`RESHAPE`], which has two `structure` entries and two changes of row 1.
+#[test]
+fn a_key_that_is_not_exactly_the_primary_key_answers_the_structure_entries_only() {
+    let (own, _db, _, _) = reshaped();
+    let (_, all, _) = read_ok(&own, APP, &alice(), &public("user", "shapes", &json!({})));
+    let structure_ids: Vec<u128> = all
+        .iter()
+        .filter(|c| c["kind"] == "structure")
+        .map(id_of)
+        .collect();
+    assert_eq!(
+        (all.len(), structure_ids.len()),
+        (4, 2),
+        "the harness's own check: shapes has two structure entries and two changes of row 1, got {all:?}"
+    );
+    let (_, of_row, _) = read_ok(
+        &own,
+        APP,
+        &alice(),
+        &public("user", "shapes", &json!({ "key": { "id": 1 } })),
+    );
+    assert_eq!(
+        of_row.len(),
+        4,
+        "the control: the primary key answers the row's changes and the structure entries, got {of_row:?}"
+    );
+    let mut failures = Vec::new();
+    for key in [
+        json!({}),
+        json!({ "nope": 1 }),
+        json!({ "id": 1, "nope": 1 }),
+        json!({ "c": 6 }),
+        json!({ "id": 1, "c": 6 }),
+        json!({ "a": "x" }),
+        json!({ "b": "y" }),
+    ] {
+        let (_, answer) = read(
+            &own,
+            APP,
+            &alice(),
+            &public("user", "shapes", &json!({ "key": key })),
+        );
+        let ids: Option<Vec<u128>> = answer["ok"]["changes"]
+            .as_array()
+            .map(|cs| cs.iter().map(id_of).collect());
+        if ids.as_ref() != Some(&structure_ids) {
+            failures.push(format!(
+                "  shapes key {key}: expected {{ ok }} with the structure entries only, ids {structure_ids:?}, got {answer}"
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "keys that are not exactly the primary key answered otherwise than the contract says:\n{}",
         failures.join("\n")
     );
 }
@@ -962,8 +1042,8 @@ fn each_application_reads_only_its_own_changes_whatever_is_passed() {
                 }
             }
         }
-        // Naming the other Application changes nothing: the arguments are
-        // either refused as malformed or have no effect.
+        // Naming the other Application changes nothing: `application` is
+        // not an argument of `history`, and is ignored.
         let other = if application == APP { "twin" } else { APP };
         let (_, answer) = read(
             &own,
@@ -975,13 +1055,11 @@ fn each_application_reads_only_its_own_changes_whatever_is_passed() {
                 &json!({ "key": { "id": 7 }, "application": other }),
             ),
         );
-        if answer["error"]["kind"] != "malformed" {
-            let changes = ok_changes(&answer, "a read naming another Application");
-            assert!(
-                changes.len() == 2 && changes.iter().all(|c| c["application"] == application),
-                "{application} naming {other}: expected only its own two changes, got {answer}"
-            );
-        }
+        let changes = ok_changes(&answer, "a read naming another Application");
+        assert!(
+            changes.len() == 2 && changes.iter().all(|c| c["application"] == application),
+            "{application} naming {other}: expected only its own two changes, got {answer}"
+        );
     }
 }
 
@@ -1139,14 +1217,12 @@ fn an_uncommitted_change_is_not_read_and_a_committed_one_is() {
             "{}: a change of an open transaction is not in a read",
             context(2)
         );
-        if answers[3]["error"]["kind"] != "malformed" {
-            assert_eq!(
-                ok_changes(&answers[3], &context(3)).len(),
-                0,
-                "{}: a read never takes a transaction: `tx` is malformed or has no effect",
-                context(3)
-            );
-        }
+        assert_eq!(
+            ok_changes(&answers[3], &context(3)).len(),
+            0,
+            "{}: a read never takes a transaction: `tx` is not an argument of `history`, and is ignored",
+            context(3)
+        );
         let committed = ok_changes(&answers[5], &context(5));
         assert_eq!(committed.len(), 1, "{}: the committed insert", context(5));
         assert_eq!(committed[0]["new"][1], "committed later");

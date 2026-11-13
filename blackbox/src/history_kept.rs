@@ -5,8 +5,9 @@
 //!
 //! - [`roles_of`]: the three roles of an own database, by what they are;
 //! - [`vm_tables`] and [`attacks_on`]: every table of schema `vm` (the
-//!   outbox's name is the platform's own, so every one is tried) and the
-//!   statements that read, write, lock or truncate one;
+//!   outbox, `vm.outbox`, among them) and the statements that read, write,
+//!   lock or truncate one without naming a column (the outbox's columns are
+//!   the platform's own affair);
 //! - [`refusals_as`]: statements run as a role in a session of its own
 //!   (the harness's superuser become the role with `SET ROLE`), each in a
 //!   transaction rolled back, and what Postgres answered that was not the
@@ -40,14 +41,10 @@ pub fn roles_of(db: &OwnDatabase) -> Vec<(&'static str, String)> {
     ]
 }
 
-/// A table of schema `vm`: its name and its first column that is neither
-/// an identity nor generated (for an `UPDATE` that changes nothing: one
-/// that sets an identity column fails with `428C9` before the rights are
-/// checked).
+/// A table of schema `vm`, by name.
 #[derive(Clone, Debug)]
 pub struct VmTable {
     pub name: String,
-    pub first_column: String,
 }
 
 impl VmTable {
@@ -58,29 +55,21 @@ impl VmTable {
 }
 
 /// Every table of schema `vm` (ordinary, partitioned, and partitions),
-/// as the catalog says. Fails unless there is one at least: the outbox is
-/// there (the harness's own check).
+/// as the catalog says. Fails unless `vm.outbox` is among them.
 pub fn vm_tables(db: &OwnDatabase) -> Vec<VmTable> {
     let tables: Vec<VmTable> = db
-        .rows(
-            "SELECT c.relname::text,
-                    coalesce((SELECT a.attname::text FROM pg_attribute a
-                               WHERE a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
-                                 AND a.attidentity = '' AND a.attgenerated = ''
-                               ORDER BY a.attnum LIMIT 1), '')
+        .column(
+            "SELECT c.relname::text
                FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
               WHERE n.nspname = 'vm' AND c.relkind IN ('r', 'p')
               ORDER BY 1",
         )
         .into_iter()
-        .map(|row| VmTable {
-            name: row.first().cloned().flatten().unwrap_or_default(),
-            first_column: row.get(1).cloned().flatten().unwrap_or_default(),
-        })
+        .map(|name| VmTable { name })
         .collect();
     assert!(
-        !tables.is_empty(),
-        "the harness's own check: expected tables in schema vm, the outbox among them"
+        tables.iter().any(|t| t.name == "outbox"),
+        "expected the outbox, vm.outbox, among the tables of vm (CONTRACT.md: \"the outbox, the table `vm.outbox`\"), got {tables:?}"
     );
     tables
 }
@@ -90,15 +79,10 @@ pub fn vm_tables(db: &OwnDatabase) -> Vec<VmTable> {
 /// fails with `42501`"), as (what, statement) on `table`.
 pub fn attacks_on(table: &VmTable) -> Vec<(&'static str, String)> {
     let name = table.qualified();
-    let column = if table.first_column.is_empty() {
-        "x".to_owned()
-    } else {
-        ident(&table.first_column)
-    };
     vec![
         ("read", format!("SELECT * FROM {name}")),
+        ("count", format!("SELECT count(*) FROM {name}")),
         ("insert", format!("INSERT INTO {name} DEFAULT VALUES")),
-        ("update", format!("UPDATE {name} SET {column} = {column}")),
         ("delete", format!("DELETE FROM {name}")),
         ("lock", format!("LOCK TABLE {name} IN ACCESS SHARE MODE")),
         ("lock-rows", format!("SELECT 1 FROM {name} FOR UPDATE")),
@@ -170,9 +154,10 @@ pub fn public_connect(database: &str) -> (Option<String>, bool) {
 /// A platform database as IT would make one: a fresh role that may only
 /// create databases and roles ([`Platform::fresh_with_limited_role`]), and
 /// its database made beforehand by the harness's superuser, owned by the
-/// superuser, with `CONNECT`, `CREATE` and `TEMPORARY` on it and all rights
-/// on its schema `public` granted to the role, and `CONNECT` left to
-/// `PUBLIC` as Postgres gives it.
+/// superuser, with what CONTRACT.md says the tests give the role
+/// (`CONNECT`, `CREATE` and `TEMPORARY` on the database, `USAGE` and
+/// `CREATE` on its schema `public`), and `CONNECT` left to `PUBLIC` as
+/// Postgres gives it.
 pub fn it_made_platform() -> Platform {
     let platform = Platform::fresh_with_limited_role();
     let database = ident(platform.name());
@@ -185,7 +170,7 @@ pub fn it_made_platform() -> Platform {
     ));
     let inside = Sql::connect(&shared().url(platform.name()))
         .unwrap_or_else(|e| panic!("cannot reach {}: {e}", platform.name()));
-    inside.batch(&format!("GRANT ALL ON SCHEMA public TO {role}"));
+    inside.batch(&format!("GRANT USAGE, CREATE ON SCHEMA public TO {role}"));
     let (_, public) = public_connect(platform.name());
     assert!(
         public,

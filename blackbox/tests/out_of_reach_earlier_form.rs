@@ -34,7 +34,7 @@ use blackbox::own_database::{Own, OwnDatabase, assert_ok, ident, own_execute};
 fn data(db: &OwnDatabase) -> String {
     // What the writes left is shipped first, so that the outbox is not
     // seen in the middle of a shipment.
-    blackbox::history::wait_shipped(db, 0);
+    blackbox::history::wait_shipped(db);
     let mut text = String::new();
     for table in db.column(
         "SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace

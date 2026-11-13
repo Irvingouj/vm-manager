@@ -165,9 +165,11 @@ impl Structure {
         sent.push(structure_tables());
         let db = own.install(APP, &sent);
         seed(&own);
+        // SEED's 19 statements change 22 rows; the first Version's
+        // migrations change no table's structure after making it.
         let seeded = history_where(&db, "true");
         assert!(
-            seeded.len() >= 20,
+            seeded.len() == 22,
             "the harness's own check: the seed's changes are in change_history before a later Version; got {}:\n{}",
             seeded.len(),
             lines(&seeded)

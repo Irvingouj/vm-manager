@@ -9,7 +9,8 @@
 //!   statement the statement check sees only as a `SELECT`);
 //! - the Change history read from the platform database's
 //!   `change_history` as the harness's superuser, for one Application,
-//!   once shipped ([`history`], [`wait_shipped`], [`ship`]), and checks of
+//!   once `vm.outbox` is empty ([`history`], [`wait_shipped`],
+//!   [`outbox_count`], [`ship`]), and checks of
 //!   one row of it ([`Change`], [`assert_change`]);
 //! - the global check that every history row of an Application's change
 //!   names a request, User and actor the Operation log has
@@ -180,56 +181,51 @@ fn shipped_so_far(sql: &Sql, application: &str) -> String {
     }
 }
 
-/// Waits for what the writes so far left to be shipped: until
-/// `change_history` holds no fewer rows of `db`'s Application than
-/// `at_least`, and then until it has stopped growing (the same for 400 ms),
-/// at most [`SHIPPED_WITHIN`]. Without a way to see the outbox (the
-/// platform's own affair) a change still on its way after that is taken as
-/// not there; a test that needs it at once forces a shipment instead
-/// ([`ship`]).
-pub fn wait_shipped(db: &OwnDatabase, at_least: usize) {
-    let sql = platform_sql(db);
-    let deadline = Instant::now() + SHIPPED_WITHIN;
-    let mut last = shipped_so_far(&sql, &db.application);
-    let mut since = Instant::now();
-    loop {
-        std::thread::sleep(Duration::from_millis(50));
-        let now = shipped_so_far(&sql, &db.application);
-        let count: usize = now
-            .split('/')
+/// The number of rows in `db`'s outbox, `vm.outbox`, counted by the
+/// harness's superuser (CONTRACT.md, "Where it is kept": "the tests, as the
+/// Postgres administrator, only count its rows: it is empty once everything
+/// committed has been shipped").
+pub fn outbox_count(db: &OwnDatabase) -> i64 {
+    match db
+        .superuser()
+        .try_batch("SELECT count(*)::text FROM vm.outbox")
+    {
+        Ok(rows) => rows
+            .into_iter()
             .next()
-            .and_then(|n| n.parse().ok())
-            .unwrap_or(0);
-        if now != last {
-            last = now;
-            since = Instant::now();
-        } else if count >= at_least && since.elapsed() >= Duration::from_millis(400) {
-            return;
-        }
-        if Instant::now() >= deadline {
-            return;
-        }
+            .and_then(|r| r.into_iter().next().flatten())
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(-1),
+        Err(e) => panic!(
+            "cannot count the rows of vm.outbox in {} (CONTRACT.md: \"the outbox, the table `vm.outbox`\"): {e}",
+            db.name
+        ),
     }
 }
 
-/// Waits up to [`SHIPPED_WITHIN`] for `db`'s Application to have at least
-/// `count` rows of `change_history` satisfying `condition` (on the row
-/// `h`); returns how many it has.
-pub fn wait_for_history(db: &OwnDatabase, condition: &str, count: usize) -> usize {
-    let sql = platform_sql(db);
-    let deadline = Instant::now() + SHIPPED_WITHIN;
+/// Waits until everything committed so far is shipped: `vm.outbox` empty,
+/// at most [`SHIPPED_WITHIN`] (CONTRACT.md: "within 10 seconds of its
+/// write's answer"); fails if it is not.
+pub fn wait_shipped(db: &OwnDatabase) {
+    wait_shipped_within(db, SHIPPED_WITHIN);
+}
+
+/// As [`wait_shipped`], waiting up to `timeout` (for a test that ships
+/// more than the contract's 10 seconds are for, and says so); returns how
+/// long it took.
+pub fn wait_shipped_within(db: &OwnDatabase, timeout: Duration) -> Duration {
+    let start = Instant::now();
     loop {
-        let n: usize = sql
-            .value(&format!(
-                "SELECT count(*)::text FROM change_history h WHERE h.application = {} AND ({condition})",
-                literal(&db.application)
-            ))
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0);
-        if n >= count || Instant::now() >= deadline {
-            return n;
+        let left = outbox_count(db);
+        if left == 0 {
+            return start.elapsed();
         }
-        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            start.elapsed() < timeout,
+            "expected vm.outbox of {} empty (everything committed shipped) within {timeout:?}; {left} row(s) left",
+            db.application
+        );
+        std::thread::sleep(Duration::from_millis(50));
     }
 }
 
@@ -256,7 +252,7 @@ pub fn ship(own: &Own, user: &crate::User, application: &str, schema: &str, tabl
 
 /// Every row of `change_history` of `db`'s Application, oldest first, as
 /// `to_jsonb` of the row (so with every column the table has, by name),
-/// once what was written so far is shipped ([`wait_shipped`]).
+/// once everything committed so far is shipped ([`wait_shipped`]).
 pub fn history(db: &OwnDatabase) -> Vec<Value> {
     history_where(db, "true")
 }
@@ -264,7 +260,7 @@ pub fn history(db: &OwnDatabase) -> Vec<Value> {
 /// The rows of `change_history` of `db`'s Application that satisfy
 /// `condition` (on the row `h`), oldest first, once shipped.
 pub fn history_where(db: &OwnDatabase, condition: &str) -> Vec<Value> {
-    wait_shipped(db, 0);
+    wait_shipped(db);
     history_now(db, condition)
 }
 
@@ -293,7 +289,7 @@ pub fn history_after(db: &OwnDatabase, after: i64) -> Vec<Value> {
 /// The largest `id` of `db`'s Application in `change_history`, 0 when it
 /// has none, once shipped.
 pub fn last_history_id(db: &OwnDatabase) -> i64 {
-    wait_shipped(db, 0);
+    wait_shipped(db);
     shipped_so_far(&platform_sql(db), &db.application)
         .split('/')
         .nth(1)
@@ -304,7 +300,7 @@ pub fn last_history_id(db: &OwnDatabase) -> i64 {
 /// The number of rows of `db`'s Application in `change_history`, once
 /// shipped.
 pub fn history_count(db: &OwnDatabase) -> i64 {
-    wait_shipped(db, 0);
+    wait_shipped(db);
     shipped_so_far(&platform_sql(db), &db.application)
         .split('/')
         .next()

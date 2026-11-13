@@ -132,9 +132,10 @@ fn history_forced_on_a_shared_handle_throws_and_sends_nothing() {
 /// the outbox (declared as a Drizzle table of its own, or through the raw
 /// interface) fails with `OperationFailed` of kind `database`, code
 /// `42501`, and changes nothing"; and "Where it is kept": a statement that
-/// names `vm.history` fails with `42P01`. The outbox's name is the
-/// platform's own: every table of `vm` is tried, with a read and a delete
-/// (a declared column the table does not have would fail first otherwise).
+/// names `vm.history` fails with `42P01`. The outbox is `vm.outbox`; every
+/// table of `vm` is tried, it among them, with a read and a delete (the
+/// outbox's columns are the platform's own affair, so nothing that names
+/// one).
 #[test]
 fn writes_through_a_table_declared_over_vm_history_or_the_outbox_fail_and_change_nothing() {
     let sdk = chronicle();
@@ -157,8 +158,8 @@ fn writes_through_a_table_declared_over_vm_history_or_the_outbox_fail_and_change
         })
         .collect();
     assert!(
-        !tables.is_empty(),
-        "the harness's own check: expected tables in vm, the outbox among them"
+        tables.iter().any(|(t, _)| t == "outbox"),
+        "expected the outbox, vm.outbox, among the tables of vm, got {tables:?}"
     );
     let mut wrong = Vec::new();
     for actor in ACTORS {

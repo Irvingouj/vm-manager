@@ -10,9 +10,9 @@
 //!   fails with `42P01` for every role (the platform's role, the migration
 //!   role, the runtime role; and the superuser). (A migration's text naming
 //!   it is in `out_of_reach_attacks.rs`.)
-//! - The outbox, whatever its name, is out of the migration role's reach:
-//!   reading, writing, locking or truncating any table of `vm` fails with
-//!   `42501`, as the role in a session and from a migration's text, one
+//! - The outbox, `vm.outbox`, is out of the migration role's reach:
+//!   reading, writing (without naming a column), locking or truncating it,
+//!   or any other table of `vm`, fails with `42501`, as the role in a session and from a migration's text, one
 //!   hostile Version per table and attack. (The runtime role's is in
 //!   `identity_hostile.rs`.) A migration cannot install `dblink` or
 //!   `postgres_fdw` to reach another database.
@@ -193,8 +193,17 @@ fn change_history_is_unique_on_application_and_id() {
         );
         assert_ok(&answer, "an insert");
     }
-    wait_shipped(&db, 2);
+    wait_shipped(&db);
     let sql = platform_sql(&db);
+    let shipped = sql.value(&format!(
+        "SELECT count(*)::text FROM change_history WHERE application = {}",
+        literal(APP)
+    ));
+    assert_eq!(
+        shipped.as_deref(),
+        Some("2"),
+        "expected the two inserts in change_history once vm.outbox is empty"
+    );
     let indexes = sql.batch(
         "SELECT i.indexrelid::regclass::text,
                 (SELECT string_agg(a.attname::text, ',' ORDER BY a.attname)
@@ -300,7 +309,9 @@ fn the_program_takes_connect_on_the_platform_database_from_public() {
 /// CONTRACT.md: "When it may not (IT made the database and owns it) and
 /// `PUBLIC` still has it, the program does not start: it exits with a
 /// status other than 0 and a `platform-database-open` record that gives
-/// the statement to run (`REVOKE CONNECT ON DATABASE ... FROM PUBLIC`)."
+/// the statement to run". Since a7cefe1: "a `platform-database-open`
+/// record whose `statement` is what to run (`REVOKE CONNECT ON DATABASE
+/// \"<name>\" FROM PUBLIC`)": the field `statement`, exactly that.
 #[test]
 fn a_platform_database_it_does_not_own_and_public_may_connect_to_stops_the_start() {
     let platform = it_made_platform();
@@ -327,13 +338,16 @@ fn a_platform_database_it_does_not_own_and_public_may_connect_to_stops_the_start
         open.len() == 1,
         "expected one `platform-database-open` record\n{shown}"
     );
-    let text = open[0].to_string();
-    for word in ["REVOKE CONNECT ON DATABASE", "FROM PUBLIC", platform.name()] {
-        assert!(
-            text.contains(word),
-            "expected the `platform-database-open` record to give the statement to run, holding {word:?}, got {text}"
-        );
-    }
+    let expected = format!(
+        "REVOKE CONNECT ON DATABASE {} FROM PUBLIC",
+        ident(platform.name())
+    );
+    assert_eq!(
+        open[0]["statement"].as_str(),
+        Some(expected.as_str()),
+        "expected the `platform-database-open` record's `statement` to be the statement to run, got {}",
+        open[0]
+    );
     let (_, public) = public_connect(platform.name());
     assert!(
         public,

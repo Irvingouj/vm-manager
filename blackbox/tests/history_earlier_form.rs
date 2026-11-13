@@ -1,11 +1,13 @@
 //! An own database from before ticket #62 is brought to the new form when
 //! the program starts (CONTRACT.md, "The Change history in the platform
 //! database: Where it is kept": "An own database from before this ticket is
-//! brought to this form when the program starts, before it serves: what
-//! its `vm.history` held is in `change_history` afterwards (at the latest
-//! when its history is next read), each change once and with the `id` it
-//! had; later changes have greater ids"; and "In the own database there is
-//! no `vm.history`: for every role, a statement that names it fails with
+//! brought to this form when the program starts, before it serves: once the
+//! program listens, `vm.history` is gone. What it held is shipped like
+//! anything in the outbox (by the shipment at start, and at the latest
+//! before the next read of that Application's history) and is then in
+//! `change_history`, each change once and with the `id` it had; later
+//! changes have greater ids"; and "In the own database there is no
+//! `vm.history`: for every role, a statement that names it fails with
 //! `42P01`").
 //!
 //! The own database is made and written by the program as it was when
@@ -16,9 +18,10 @@
 //! `vm.history` then holds, read as the harness's superuser, is the
 //! earlier form's record. That program is stopped and the one under test
 //! started on the same platform database. At once when it says it listens,
-//! no role finds `vm.history`; within 10 seconds, or else once the history
-//! has been read through `history`, `change_history` holds every earlier
-//! change once, with its `id` and its columns. Changes made afterwards
+//! no role finds `vm.history`; the shipment at start empties `vm.outbox`
+//! within 10 seconds, with no request, and `change_history` then holds
+//! every earlier change once, with its `id` and its columns; a read through
+//! `history` changes nothing of that. Changes made afterwards
 //! have greater ids, `history` answers the old changes and the new, and a
 //! second start adds nothing.
 #![allow(
@@ -183,26 +186,41 @@ fn an_own_database_from_before_the_ticket_has_its_history_in_change_history_once
                     found.join("\n  ")
                 ));
             }
+            // "By the shipment at start": vm.outbox empty within 10 s of the
+            // start, with no request.
             let deadline = Instant::now() + SHIPPED_WITHIN;
-            let mut seen = change_history_now(&db);
-            while !matches!(&seen, Ok(after) if differences(APP, &before, after).is_empty())
-                && Instant::now() < deadline
-            {
-                std::thread::sleep(std::time::Duration::from_millis(200));
-                seen = change_history_now(&db);
+            let mut left = outbox_rows(&db);
+            while !matches!(left, Ok(0)) && Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                left = outbox_rows(&db);
             }
-            if !matches!(&seen, Ok(after) if differences(APP, &before, after).is_empty()) {
-                // "At the latest when its history is next read."
-                let (_, answer) = own.one(
-                    &User::new(WRITER),
-                    APP,
-                    &history_call("user", "public", "things", &json!({ "limit": 1 })),
-                );
-                if !answer["ok"].is_object() {
+            if !matches!(left, Ok(0)) {
+                failures.push(format!(
+                    "expected vm.outbox empty within {SHIPPED_WITHIN:?} of the start, what vm.history held shipped by the shipment at start; got {left:?}"
+                ));
+            }
+            let at_start = change_history_now(&db);
+            if let Ok(after) = &at_start {
+                let wrong = differences(APP, &before, after);
+                if !wrong.is_empty() {
                     failures.push(format!(
-                        "expected a read of the history of public.things to be answered after the start, got {answer}"
+                        "expected each of the {} changes vm.history held in change_history once, as it was, after the shipment at start:\n  {}",
+                        before.len(),
+                        wrong.join("\n  ")
                     ));
                 }
+            }
+            // "At the latest before the next read of that Application's
+            // history": a read, which then finds nothing more to ship.
+            let (_, answer) = own.one(
+                &User::new(WRITER),
+                APP,
+                &history_call("user", "public", "things", &json!({ "limit": 1 })),
+            );
+            if !answer["ok"].is_object() {
+                failures.push(format!(
+                    "expected a read of the history of public.things to be answered after the start, got {answer}"
+                ));
             }
             match change_history_now(&db) {
                 Err(e) => failures.push(format!(
@@ -287,6 +305,20 @@ fn an_own_database_from_before_the_ticket_has_its_history_in_change_history_once
             drop(own);
         },
     );
+}
+
+/// The rows of `db`'s `vm.outbox`, counted by the harness's superuser, or
+/// why they could not be.
+fn outbox_rows(db: &OwnDatabase) -> Result<i64, String> {
+    db.superuser()
+        .try_batch("SELECT count(*)::text FROM vm.outbox")
+        .map(|rows| {
+            rows.into_iter()
+                .next()
+                .and_then(|r| r.into_iter().next().flatten())
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(-1)
+        })
 }
 
 fn lines(rows: &[Value]) -> String {
