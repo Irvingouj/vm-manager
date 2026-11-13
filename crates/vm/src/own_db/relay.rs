@@ -12,23 +12,39 @@
 //! deleted by their ids, never by a range: a change committed later with a
 //! lesser id (its transaction began first) is shipped by the next batch.
 //!
-//! Bounds:
+//! Bounds, and who waits for what (blackbox/CONTRACT.md, "Nobody waits for
+//! what is not theirs"):
 //!
-//! - **one shipment per own database at a time** ([`Shipping`]): a request
-//!   while one runs is remembered (`asked`), and the running one goes
-//!   round again; so there is at most one task per own database, and the
-//!   relay's tasks are bounded by the number of own databases;
-//! - **[`AT_ONCE`] shipments at once** in the program, across own
-//!   databases: each holds one connection to its own database and, per
-//!   step, one of the platform database's pool (16): the rest of the pool
-//!   stays for the Operation log. A shipment waits for its turn at most
-//!   [`TURN_WAIT`], then fails (recorded) and leaves its outbox for the
-//!   next one;
+//! - **one shipment task per own database at a time** ([`Shipping`]): a
+//!   request while one runs is remembered (`asked`), and the running task
+//!   makes another pass; so the relay's tasks are at most the own
+//!   databases;
+//! - **a pass ships up to a mark**: the greatest id in the outbox when the
+//!   pass begins. Everything committed before a request was made is
+//!   visible then, so a pass that began after the request ships it; what
+//!   is committed later is the next pass's. A read of the history waits for
+//!   one such pass, never for writes made after it asked;
+//! - **turns of one batch**: [`AT_ONCE`] batches at once in the program,
+//!   across own databases. A shipment takes a turn for each batch and gives
+//!   it back after it, and the turns are handed out first come, first
+//!   served (Tokio's semaphore is fair); so another Application's batch is
+//!   at most the batches already waiting, one per own database, behind. A
+//!   turn is waited for at most [`TURN_WAIT`]: with each turn at most three
+//!   steps of [`STEP_TIMEOUT`], that is reached only when the databases
+//!   stop answering, and a shipment asked at start does not fail for want
+//!   of a turn otherwise;
+//! - **one connection per shipping own database**, as its platform role,
+//!   kept by its task between batches and passes, and for [`IDLE`] after
+//!   the last, then closed; at most [`LINES`] such connections in the
+//!   program. A task that finds none free asks the idle ones to close
+//!   theirs, and waits at most [`TURN_WAIT`];
 //! - **a batch** is at most [`BATCH_ROWS`] changes and, past its first,
 //!   [`BATCH_BYTES`] of `old` and `new` as text, read by the own database
 //!   as one JSON text and sent on as one parameter: what the program holds
 //!   of row data at once per shipment is one batch (a row's size is bounded
-//!   by the host's write limits);
+//!   by the host's write limits). Each batch's write takes one connection
+//!   of the platform database's pool (16) for its length, so the
+//!   Operation log keeps at least 12;
 //! - **each step** (reading the outbox, writing `change_history`, deleting
 //!   from the outbox) is ended after [`STEP_TIMEOUT`], by the server's
 //!   `statement_timeout` and `lock_timeout` and by the host.
@@ -44,11 +60,12 @@
 //! everything it reads by its schema: what it reads from the outbox is
 //! data, passed on as a parameter, never run.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
-use tokio::sync::{Semaphore, watch};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, watch};
 use tokio_postgres::{Client, Config};
 
 use crate::log;
@@ -65,18 +82,36 @@ pub const BATCH_BYTES: i64 = 4 * 1024 * 1024;
 /// The longest each step of a batch may take.
 pub const STEP_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Shipments at once across all own databases.
+/// Batches shipped at once across all own databases.
 pub const AT_ONCE: usize = 4;
 
-/// The longest a shipment waits for one of the [`AT_ONCE`] turns.
-pub const TURN_WAIT: Duration = Duration::from_secs(60);
+/// The longest a shipment waits for a turn, or for a connection.
+pub const TURN_WAIT: Duration = Duration::from_secs(600);
+
+/// Connections the relay keeps to own databases at most.
+pub const LINES: usize = 32;
+
+/// How long a shipment task keeps its connection once nothing more is
+/// asked of it.
+pub const IDLE: Duration = Duration::from_secs(10);
+
+/// Marks a task keeps waiting at most ([`Marks`]).
+const MARKS: usize = 64;
+
+/// How long a task that failed waits before it tries again for a request
+/// made meanwhile.
+const RETRY_AFTER: Duration = Duration::from_secs(1);
 
 /// The longest opening the connection to the own database may take.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// The batch read from the outbox, oldest first: the ids, and the rows as
-/// one JSON array (of `jsonb_build_object` of each), cut at [`BATCH_ROWS`]
-/// and, past the first, [`BATCH_BYTES`]. Both null when it is empty.
+/// The greatest id in the outbox now: the mark a pass ships up to.
+const MARK: &str = "SELECT pg_catalog.max(b.id) FROM vm.outbox b";
+
+/// The batch read from the outbox up to the mark `$3`, oldest first: the
+/// ids, and the rows as one JSON array (of `jsonb_build_object` of each),
+/// cut at [`BATCH_ROWS`] and, past the first, [`BATCH_BYTES`]. Both null
+/// when nothing is left up to the mark.
 const READ_BATCH: &str = "
 SELECT pg_catalog.array_agg(x.id ORDER BY x.id),
        pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object(
@@ -92,6 +127,7 @@ SELECT pg_catalog.array_agg(x.id ORDER BY x.id),
                        coalesce(pg_catalog.octet_length(b.old::pg_catalog.text), 0)
                          + coalesce(pg_catalog.octet_length(b.new::pg_catalog.text), 0) AS size
                   FROM vm.outbox b
+                 WHERE b.id OPERATOR(pg_catalog.<=) $3
                  ORDER BY b.id
                  LIMIT $1) o) x
  WHERE x.past_first <= $2";
@@ -116,6 +152,8 @@ pub struct Shipping {
     /// The greatest request number a finished pass covered, shipped or
     /// failed.
     passes: watch::Sender<Passes>,
+    /// Told of a request while the task keeps its connection, idle.
+    wake: Notify,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -130,6 +168,7 @@ impl Default for Shipping {
             asked: AtomicU64::new(0),
             running: AtomicBool::new(false),
             passes: watch::Sender::new(Passes::default()),
+            wake: Notify::new(),
         }
     }
 }
@@ -140,6 +179,12 @@ impl Shipping {
     pub fn ask(&self) -> (u64, bool) {
         let ticket = self.asked.fetch_add(1, Ordering::AcqRel).saturating_add(1);
         let start = !self.running.swap(true, Ordering::AcqRel);
+        if !start {
+            // The task may be idle, keeping its connection: wake it. A
+            // wake-up it is not waiting for is kept for it, and costs at
+            // most one pass with nothing to ship.
+            self.wake.notify_one();
+        }
         (ticket, start)
     }
 
@@ -166,12 +211,30 @@ impl Shipping {
 }
 
 /// What a shipment needs of the program: where Postgres is, the platform
-/// database, and the turns.
+/// database, the turns and the connections.
 pub struct Courier {
     pub platform: Arc<PlatformDatabase>,
     pub host: String,
     pub port: u16,
+    /// [`AT_ONCE`] batches at once.
     pub turns: Semaphore,
+    /// [`LINES`] connections at once.
+    pub lines: Arc<Semaphore>,
+    /// Told when a task waits for a connection: the idle ones close theirs.
+    pub wanted: Notify,
+}
+
+impl Courier {
+    pub fn new(platform: Arc<PlatformDatabase>, host: String, port: u16) -> Self {
+        Self {
+            platform,
+            host,
+            port,
+            turns: Semaphore::new(AT_ONCE),
+            lines: Arc::new(Semaphore::new(LINES)),
+            wanted: Notify::new(),
+        }
+    }
 }
 
 /// What one shipment ships from: the Application, its own database's name
@@ -184,32 +247,68 @@ pub struct Route {
     pub known: Arc<super::Known>,
 }
 
-/// The shipment task of one own database: passes until nothing more was
-/// asked while one ran. Each pass ships until the outbox is empty or a step
-/// fails; its end is told to whoever waits.
+/// A connection to the own database as its platform role, and its place
+/// among the [`LINES`].
+struct Line {
+    connection: Connection,
+    _permit: OwnedSemaphorePermit,
+}
+
+/// The shipment task of one own database. It ships while anything is
+/// asked of it; then, with its connection kept, waits [`IDLE`] for another
+/// request before it ends.
+///
+/// A request is served by a mark: the greatest id in the outbox when the
+/// task first looks after the request was made (between two batches, so
+/// at most one batch later). Everything committed before the request is
+/// visible then, so has an id at most the mark; batches go in the order
+/// of ids, so once a batch has shipped an id at least the mark, or nothing
+/// is left up to it, the request is served. What is committed later is
+/// shipped after, and nobody who asked before waits for it.
 pub async fn run(courier: Arc<Courier>, route: Route) {
     let shipping = &route.known.shipping;
+    let mut line: Option<Line> = None;
+    let mut marks = Marks::default();
     loop {
-        let ticket = shipping.asked.load(Ordering::Acquire);
-        let shipped = courier.pass(&route).await;
-        match shipped {
-            Ok(_) => shipping
-                .passes
-                .send_modify(|p| p.shipped = p.shipped.max(ticket)),
+        match courier.step(&route, &mut line, &mut marks).await {
+            Ok(true) => continue,
+            Ok(false) => {}
             Err(step) => {
+                line = None;
+                marks.waiting.clear();
                 log::record(
                     "history-not-shipped",
                     serde_json::json!({ "application": &*route.application, "problem": step }),
                 );
+                let seen = marks.seen;
                 shipping
                     .passes
-                    .send_modify(|p| p.failed = p.failed.max(ticket));
+                    .send_modify(|p| p.failed = p.failed.max(seen));
+                if shipping.asked.load(Ordering::Acquire) != seen {
+                    // Asked again meanwhile: try again, not at once.
+                    tokio::time::sleep(RETRY_AFTER).await;
+                    continue;
+                }
             }
+        }
+        if shipping.asked.load(Ordering::Acquire) != marks.seen {
+            continue;
+        }
+        if line.is_some() {
+            let asked = tokio::select! {
+                () = shipping.wake.notified() => true,
+                () = courier.wanted.notified() => false,
+                () = tokio::time::sleep(IDLE) => false,
+            };
+            if asked {
+                continue;
+            }
+            line = None;
         }
         shipping.running.store(false, Ordering::Release);
         // Asked meanwhile, by a caller that saw this task running and so
-        // started none: go round again, unless another task has started.
-        if shipping.asked.load(Ordering::Acquire) == ticket
+        // started none: go on, unless another task has started.
+        if shipping.asked.load(Ordering::Acquire) == marks.seen
             || shipping.running.swap(true, Ordering::AcqRel)
         {
             return;
@@ -217,39 +316,131 @@ pub async fn run(courier: Arc<Courier>, route: Route) {
     }
 }
 
+/// The requests a task has given a mark and not yet served.
+#[derive(Default)]
+struct Marks {
+    /// The greatest request number given a mark.
+    seen: u64,
+    /// `(request number, mark)`, both increasing; at most [`MARKS`].
+    waiting: VecDeque<(u64, i64)>,
+}
+
+impl Marks {
+    /// A mark for every request up to `asked`. When [`MARKS`] wait, the
+    /// last one takes it: its requests are served a little later, never
+    /// sooner than they should be.
+    fn push(&mut self, asked: u64, mark: i64) {
+        let full = self.waiting.len() >= MARKS;
+        match self.waiting.back_mut() {
+            Some(last) if full => *last = (asked, mark),
+            _ => self.waiting.push_back((asked, mark)),
+        }
+    }
+}
+
 impl Courier {
-    /// One pass: batches until the outbox is empty. Answers how many
-    /// changes it shipped, or the step that failed.
-    async fn pass(&self, route: &Route) -> Result<u64, &'static str> {
+    /// One step of a shipment task: a mark for what was asked since the
+    /// last, then one batch up to the last mark, in a turn of its own.
+    /// `true` when there may be more to do, `false` when nothing is left up
+    /// to any mark and nothing new was asked; or the step that failed.
+    async fn step(
+        &self,
+        route: &Route,
+        line: &mut Option<Line>,
+        marks: &mut Marks,
+    ) -> Result<bool, &'static str> {
+        let shipping = &route.known.shipping;
         if !route.known.in_form.load(Ordering::Acquire) {
+            marks.seen = shipping.asked.load(Ordering::Acquire);
             return Err("the own database is not in this program's form");
         }
+        if line
+            .as_ref()
+            .is_some_and(|l| l.connection.client().is_closed())
+        {
+            *line = None;
+        }
+        let client = match line {
+            Some(open) => open.connection.client(),
+            None => {
+                let permit = self.line().await?;
+                let connection = self
+                    .connect(route)
+                    .await
+                    .map_err(|_| "connecting to the own database as its platform role")?;
+                line.insert(Line {
+                    connection,
+                    _permit: permit,
+                })
+                .connection
+                .client()
+            }
+        };
+        let asked = shipping.asked.load(Ordering::Acquire);
+        if asked > marks.seen {
+            let mark = within("reading the outbox", read_mark(client)).await;
+            marks.seen = asked;
+            match mark? {
+                Some(mark) => marks.push(asked, mark),
+                None => {
+                    // Empty: every request so far is served.
+                    marks.waiting.clear();
+                    shipping
+                        .passes
+                        .send_modify(|p| p.shipped = p.shipped.max(asked));
+                    return Ok(false);
+                }
+            }
+        }
+        let Some(&(last, target)) = marks.waiting.back() else {
+            return Ok(false);
+        };
         let _turn = tokio::time::timeout(TURN_WAIT, self.turns.acquire())
             .await
-            .map_err(|_| "waiting for a turn to ship: too many shipments at once")?
+            .map_err(|_| "waiting for a turn to ship: none came")?
             .map_err(|_| "waiting for a turn to ship: the program is stopping")?;
-        let connection = self
-            .connect(route)
-            .await
-            .map_err(|_| "connecting to the own database as its platform role")?;
-        let mut shipped: u64 = 0;
-        loop {
-            let (ids, rows) = within("reading the outbox", read_batch(connection.client())).await?;
-            let (Some(ids), Some(rows)) = (ids, rows) else {
-                return Ok(shipped);
-            };
-            within(
-                "writing change_history",
-                self.write_batch(&route.application, &rows),
-            )
-            .await?;
-            within(
-                "deleting what was shipped from the outbox",
-                delete_batch(connection.client(), &ids),
-            )
-            .await?;
-            shipped = shipped.saturating_add(u64::try_from(ids.len()).unwrap_or(u64::MAX));
+        let (ids, rows) = within("reading the outbox", read_batch(client, target)).await?;
+        let (Some(ids), Some(rows)) = (ids, rows) else {
+            marks.waiting.clear();
+            shipping
+                .passes
+                .send_modify(|p| p.shipped = p.shipped.max(last));
+            return Ok(true);
+        };
+        within(
+            "writing change_history",
+            self.write_batch(&route.application, &rows),
+        )
+        .await?;
+        within(
+            "deleting what was shipped from the outbox",
+            delete_batch(client, &ids),
+        )
+        .await?;
+        let top = ids.last().copied().unwrap_or(i64::MIN);
+        while let Some(&(ticket, mark)) = marks.waiting.front() {
+            if mark > top {
+                break;
+            }
+            marks.waiting.pop_front();
+            shipping
+                .passes
+                .send_modify(|p| p.shipped = p.shipped.max(ticket));
         }
+        Ok(true)
+    }
+
+    /// A place among the [`LINES`]: at once if one is free; else the idle
+    /// tasks are asked to close theirs, and one is waited for.
+    async fn line(&self) -> Result<OwnedSemaphorePermit, &'static str> {
+        if let Ok(permit) = Arc::clone(&self.lines).try_acquire_owned() {
+            return Ok(permit);
+        }
+        self.wanted.notify_waiters();
+        tokio::time::timeout(TURN_WAIT, Arc::clone(&self.lines).acquire_owned())
+            .await
+            .map_err(|_| "waiting for a connection to ship: none came")?
+            .map_err(|_| "waiting for a connection to ship: the program is stopping")
     }
 
     /// A connection to the own database as its platform role: the search
@@ -295,10 +486,22 @@ impl Courier {
     }
 }
 
-/// The next batch of the outbox, oldest first.
-async fn read_batch(client: &Client) -> Result<(Option<Vec<i64>>, Option<String>), DbError> {
+/// The mark: the greatest id in the outbox now; `None` when it is empty.
+async fn read_mark(client: &Client) -> Result<Option<i64>, DbError> {
+    client
+        .query_one(MARK, &[])
+        .await
+        .and_then(|row| row.try_get(0))
+        .map_err(DbError::from)
+}
+
+/// The next batch of the outbox up to `mark`, oldest first.
+async fn read_batch(
+    client: &Client,
+    mark: i64,
+) -> Result<(Option<Vec<i64>>, Option<String>), DbError> {
     let row = client
-        .query_one(READ_BATCH, &[&BATCH_ROWS, &BATCH_BYTES])
+        .query_one(READ_BATCH, &[&BATCH_ROWS, &BATCH_BYTES, &mark])
         .await
         .map_err(DbError::from)?;
     Ok((

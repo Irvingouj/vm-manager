@@ -629,12 +629,11 @@ impl OwnDatabases {
                 clock: 0,
             }),
             preparing: Mutex::new(JoinSet::new()),
-            courier: Arc::new(relay::Courier {
-                platform: Arc::clone(&platform),
-                host: address.host().to_owned(),
-                port: address.port(),
-                turns: tokio::sync::Semaphore::new(relay::AT_ONCE),
-            }),
+            courier: Arc::new(relay::Courier::new(
+                Arc::clone(&platform),
+                address.host().to_owned(),
+                address.port(),
+            )),
             shipments: Mutex::new(JoinSet::new()),
             platform,
         })
@@ -792,8 +791,8 @@ impl OwnDatabases {
 
     /// At start, after [`OwnDatabases::bring_to_form`]: a shipment of every
     /// own database's outbox, asked for and not waited for, so that serving
-    /// is not delayed. Each own database has at most one; [`relay::AT_ONCE`]
-    /// ship at once, the others wait their turn.
+    /// is not delayed. Each own database has at most one task; they take
+    /// turns of one batch ([`relay::AT_ONCE`] at once).
     pub fn ship_all(&self) {
         let names: Vec<Arc<str>> = self
             .known
