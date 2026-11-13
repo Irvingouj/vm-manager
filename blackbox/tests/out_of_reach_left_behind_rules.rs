@@ -11,6 +11,9 @@
 //! exactly as it was (`out_of_reach::untouched`), Version 1 serving and the
 //! owner role unable to log in.
 //!
+//! An index on a function, an operator or a domain the runtime role made
+//! (where an earlier Version let it create) is refused `index-code` too.
+//!
 //! What the contract allows beside them is sent too, each to a fresh
 //! Application: an invoker function, indexes on Postgres's own functions and
 //! operators, and the trusted extensions `pg_trgm`, `citext` and `unaccent`
@@ -31,8 +34,8 @@ use blackbox::User;
 use blackbox::history::{history_after, last_history_id};
 use blackbox::out_of_reach::{
     ANY_CODE, ANY_MIGRATION, Answers, CaptureTrigger, Case, ON_DELETE, ON_INSERT, ON_TRUNCATE,
-    ON_UPDATE, WRITER, base_and, capture_triggers, failed, install_seeded, panic_text, refused,
-    run_cases, start,
+    ON_UPDATE, WRITER, assert_answer, base_and, capture_triggers, failed, install_seeded,
+    panic_text, refused, run_cases, start,
 };
 use blackbox::own_database::{Migration, Own, OwnDatabase, ident, own_execute};
 use blackbox::scenario::lines;
@@ -411,6 +414,156 @@ fn an_index_or_a_statistic_calling_a_function_the_migrations_wrote_is_refused() 
         .mentioning("by_f"),
     ];
     run_cases(&own, "index-code", cases);
+}
+
+/// What the runtime role makes in a schema a migration let it create in,
+/// and the index that uses it.
+struct RuntimeMade {
+    name: &'static str,
+    /// Run as the runtime role (the superuser's `SET ROLE`); `{o}` is the
+    /// owner role.
+    as_runtime: &'static [&'static str],
+    index: &'static str,
+    /// The index or statistic the message must name.
+    names_index: &'static str,
+    /// The function the message must name, when there is one.
+    names_function: Option<&'static str>,
+}
+
+/// CONTRACT.md, `index-code`: "a function that is neither Postgres's own
+/// nor an extension's (one any role of the Application's owns: the
+/// migration role, or the runtime role where a migration let it create)".
+#[test]
+fn an_index_or_a_statistic_calling_a_function_the_runtime_role_made_is_refused() {
+    let own = start();
+    let cases = [
+        RuntimeMade {
+            name: "a-function",
+            as_runtime: &[
+                r#"CREATE FUNCTION "rt"."rt_made_fn"("x" integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $f$ SELECT "x" $f$"#,
+                r#"GRANT EXECUTE ON FUNCTION "rt"."rt_made_fn"(integer) TO {o}"#,
+            ],
+            index: r#"CREATE INDEX "by_rt_fn" ON "things" ("rt"."rt_made_fn"("size"));"#,
+            names_index: "by_rt_fn",
+            names_function: Some("rt_made_fn"),
+        },
+        RuntimeMade {
+            name: "a-function-in-the-where",
+            as_runtime: &[
+                r#"CREATE FUNCTION "rt"."rt_made_fn"("x" integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $f$ SELECT "x" $f$"#,
+                r#"GRANT EXECUTE ON FUNCTION "rt"."rt_made_fn"(integer) TO {o}"#,
+            ],
+            index: r#"CREATE INDEX "partial_rt_fn" ON "things" ("id") WHERE "rt"."rt_made_fn"("size") > 0;"#,
+            names_index: "partial_rt_fn",
+            names_function: Some("rt_made_fn"),
+        },
+        RuntimeMade {
+            name: "an-operator",
+            as_runtime: &[
+                r#"CREATE FUNCTION "rt"."rt_plus"(integer, integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $f$ SELECT $1 + $2 $f$"#,
+                r#"GRANT EXECUTE ON FUNCTION "rt"."rt_plus"(integer, integer) TO {o}"#,
+                r#"CREATE OPERATOR "rt".@+@ (LEFTARG = integer, RIGHTARG = integer, FUNCTION = "rt"."rt_plus")"#,
+            ],
+            index: r#"CREATE INDEX "by_rt_op" ON "things" (("size" OPERATOR("rt".@+@) 1));"#,
+            names_index: "by_rt_op",
+            names_function: Some("rt_plus"),
+        },
+        RuntimeMade {
+            name: "a-domain",
+            as_runtime: &[
+                r#"CREATE DOMAIN "rt"."rt_domain" AS integer"#,
+                r#"GRANT USAGE ON TYPE "rt"."rt_domain" TO {o}"#,
+            ],
+            index: r#"CREATE INDEX "by_rt_domain" ON "things" ((("size")::"rt"."rt_domain"));"#,
+            names_index: "by_rt_domain",
+            names_function: None,
+        },
+        RuntimeMade {
+            name: "an-extended-statistic",
+            as_runtime: &[
+                r#"CREATE FUNCTION "rt"."rt_made_fn"("x" integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $f$ SELECT "x" $f$"#,
+                r#"GRANT EXECUTE ON FUNCTION "rt"."rt_made_fn"(integer) TO {o}"#,
+            ],
+            index: r#"CREATE STATISTICS "st_rt" ON ("rt"."rt_made_fn"("size")), ("id") FROM "things";"#,
+            names_index: "st_rt",
+            names_function: Some("rt_made_fn"),
+        },
+    ];
+    let mut failures = Vec::new();
+    for (i, case) in cases.iter().enumerate() {
+        let application = format!("runtime-made-{i}");
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            let db = install_seeded(&own, &application);
+            // A first Version lets the runtime role create in `rt`.
+            let open = Migration::new(
+                "0004_open",
+                &[
+                    r#"CREATE SCHEMA "rt";"#,
+                    &format!(
+                        r#"GRANT USAGE, CREATE ON SCHEMA "rt" TO {};"#,
+                        ident(&db.runtime)
+                    ),
+                ],
+            );
+            let opened = own.send(&application, &base_and(std::slice::from_ref(&open)));
+            assert_eq!(
+                opened.status,
+                201,
+                "the harness's own check: expected the Version that lets the runtime role create in `rt` applied, got\n{}",
+                opened.describe()
+            );
+            // The runtime role makes its code there.
+            let sql = db.superuser();
+            sql.batch(&format!("SET ROLE {}", ident(&db.runtime)));
+            for statement in case.as_runtime {
+                sql.batch(&statement.replace("{o}", &ident(&db.owner)));
+            }
+            sql.batch("RESET ROLE");
+            drop(sql);
+            let before = blackbox::out_of_reach::untouched(&db);
+            let index = Migration::new("0005_index", &[case.index]);
+            let sent = own.send(&application, &base_and(&[open, index]));
+            assert_answer(&sent, INDEX_CODE, "0005_index", Some(case.names_index));
+            if let Some(function) = case.names_function {
+                let message = sent.json()["error"]["message"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned();
+                assert!(
+                    message.contains(function),
+                    "expected the message to name the function {function:?}, got {message:?}"
+                );
+            }
+            let after = blackbox::out_of_reach::untouched(&db);
+            assert!(
+                after == before,
+                "expected the own database exactly as before the refused Version; it differs:\n{}",
+                blackbox::out_of_reach::differences(&before, &after)
+            );
+            assert_eq!(
+                own.version_numbers(&application),
+                vec![1, 2],
+                "expected no Version recorded for the refused one"
+            );
+        }));
+        if let Err(payload) = outcome {
+            failures.push(format!(
+                "--- case {:?} (Application {application}) ---\n{}",
+                case.name,
+                panic_text(payload.as_ref())
+                    .chars()
+                    .take(3000)
+                    .collect::<String>()
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} of {} indexes on what the runtime role made were not refused `index-code`:\n{}",
+        failures.len(),
+        cases.len(),
+        failures.join("\n")
+    );
 }
 
 #[test]

@@ -36,7 +36,9 @@
 //! - [`sdk_history`] is what the tests of reading the Change history
 //!   through the SDK share;
 //! - [`out_of_reach`] is what the tests of keeping the platform's part of
-//!   an own database out of a migration's reach share.
+//!   an own database out of a migration's reach share, [`left_behind`]
+//!   what those of what a migration leaves behind share, and
+//!   [`changed_outside`] what those of what something else changed share.
 //!
 //! Every wait has a timeout, so a failing test fails within seconds and
 //! never hangs. Each test starts its own program on its own port, so tests
@@ -50,6 +52,7 @@
 )]
 
 pub mod api;
+pub mod changed_outside;
 pub mod expect;
 pub mod history;
 pub mod http;

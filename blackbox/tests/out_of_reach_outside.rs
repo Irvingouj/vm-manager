@@ -39,6 +39,9 @@ use std::cell::Cell;
 use std::time::{Duration, Instant};
 
 use blackbox::User;
+use blackbox::changed_outside::{
+    assert_capture_check_entry, capture_checks, capture_checks_eventually, capture_shape,
+};
 use blackbox::history::{history_after, last_history_id};
 use blackbox::out_of_reach::{
     Answers, ON_DELETE, ON_INSERT, ON_UPDATE, WRITER, assert_answer, base_and, capture_triggers,
@@ -183,50 +186,6 @@ impl Change {
     }
 }
 
-/// The `capture-check` entries of the Operation log for `application`.
-fn capture_checks(own: &Own, application: &str) -> Vec<Value> {
-    own.log()
-        .into_iter()
-        .filter(|e| e["operation"] == "capture-check" && e["application"] == application)
-        .collect()
-}
-
-/// The `capture-check` entries, waiting up to 5 s for there to be one.
-fn capture_checks_eventually(own: &Own, application: &str) -> Vec<Value> {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        let found = capture_checks(own, application);
-        if !found.is_empty() || Instant::now() >= deadline {
-            return found;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-}
-
-fn assert_capture_check_entry(entry: &Value, application: &str) {
-    let want = [
-        ("operation", Value::from("capture-check")),
-        ("statement", Value::from("capture-check")),
-        ("outcome", Value::from("failed")),
-        ("error", Value::from("changed-outside")),
-        ("application", Value::from(application)),
-        ("own_database", Value::from(true)),
-        ("actor", Value::from("platform")),
-        ("user", Value::Null),
-        ("request", Value::Null),
-        ("resource", Value::Null),
-        ("transaction", Value::Null),
-        ("rows", Value::Null),
-    ];
-    for (field, value) in want {
-        assert_eq!(
-            entry.get(field),
-            Some(&value),
-            "expected the capture-check entry's `{field}` to be {value}, the entry is {entry}"
-        );
-    }
-}
-
 /// The `capture-changed-outside` records of `application` in the program's
 /// log so far.
 fn records(own: &Own, application: &str) -> Vec<Value> {
@@ -272,18 +231,6 @@ fn assert_record(own: &Own, application: &str, change: Change) {
         change.uncaptured(),
         "expected the record's `uncaptured`, got {record}"
     );
-}
-
-/// The capture triggers by table, events and function, each enabled
-/// (`O`).
-fn capture_shape(db: &OwnDatabase) -> Vec<String> {
-    db.column(
-        "SELECT t.tgrelid::regclass::text || ' type=' || t.tgtype::text || ' ' || t.tgfoid::regprocedure::text
-                || ' enabled=' || t.tgenabled::text
-           FROM pg_trigger t JOIN pg_proc p ON p.oid = t.tgfoid
-          WHERE NOT t.tgisinternal AND p.pronamespace = 'vm'::regnamespace
-          ORDER BY 1",
-    )
 }
 
 /// Fails unless the capture is whole again: as `shape` was before, and a
