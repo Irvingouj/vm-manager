@@ -33,6 +33,7 @@ use tokio_postgres::Client;
 
 use super::OwnDatabases;
 use crate::executor::{self, Failure, Held, Label, Level, Limit, Param, Rows, Values};
+use crate::log;
 use crate::platform_db::{DbError, quote_identifier, rfc3339};
 
 /// The most bytes of `old` and `new` (as `jsonb` text) a read takes from
@@ -268,10 +269,18 @@ impl OwnDatabases {
         )
         .await?;
         let count = kept.len();
-        Ok(HistoryAnswer::of(
-            answer(application, kept, shaped, read.values),
-            count,
-        ))
+        let answered = answer(application, kept, shaped, read.values).ok_or_else(|| {
+            // Never a row's values left out: the read fails whole.
+            log::record(
+                "history-not-read",
+                serde_json::json!({
+                    "application": application,
+                    "problem": "the own database gave back another number of rows than the changes hold",
+                }),
+            );
+            Failure::Unavailable
+        })?;
+        Ok(HistoryAnswer::of(answered, count))
     }
 
     /// The changes from the platform database, newest first; `None` when
@@ -527,8 +536,9 @@ fn shape_statement(relation: &str, table: &Table) -> String {
 }
 
 /// The answer, from the changes kept and their rows shaped (in the order
-/// of the changes, `old` before `new`).
-fn answer(application: &str, kept: Vec<Kept>, shaped: Rows, values: Values) -> Value {
+/// of the changes, `old` before `new`); `None` unless there is exactly one
+/// shaped row for each `old` and `new` there is.
+fn answer(application: &str, kept: Vec<Kept>, shaped: Rows, values: Values) -> Option<Value> {
     let mut rows = shaped.rows.into_iter();
     let count = kept.len();
     let parse = |text: Option<String>| {
@@ -538,11 +548,11 @@ fn answer(application: &str, kept: Vec<Kept>, shaped: Rows, values: Values) -> V
     let mut changes = Vec::with_capacity(count);
     for k in kept {
         let old = match k.old {
-            Some(_) => rows.next().unwrap_or(Value::Null),
+            Some(_) => rows.next()?,
             None => Value::Null,
         };
         let new = match k.new {
-            Some(_) => rows.next().unwrap_or(Value::Null),
+            Some(_) => rows.next()?,
             None => Value::Null,
         };
         let mut change = Map::with_capacity(13);
@@ -561,13 +571,16 @@ fn answer(application: &str, kept: Vec<Kept>, shaped: Rows, values: Values) -> V
         change.insert("structure".into(), parse(k.structure));
         changes.push(Value::Object(change));
     }
+    if rows.next().is_some() {
+        return None;
+    }
     let mut wire = Map::with_capacity(3);
     wire.insert("columns".into(), shaped.columns.into());
     if values == Values::Text {
         wire.insert("types".into(), shaped.types.into());
     }
     wire.insert("changes".into(), Value::Array(changes));
-    Value::Object(wire)
+    Some(Value::Object(wire))
 }
 
 impl HistoryAnswer {
