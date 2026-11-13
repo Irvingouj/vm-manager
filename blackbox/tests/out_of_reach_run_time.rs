@@ -18,7 +18,10 @@
 //! untouched`, and the capture triggers' very catalog rows); the Operation
 //! log entry of the `execute` or the `commit` is `failed` with `error`
 //! `VM004`; after a failed commit the transaction is over; the next honest
-//! write runs and is in `vm.history`.
+//! write runs and is in `vm.history`. Where a deferred trigger the owner's
+//! code queued is what fails while the host makes deferred constraints
+//! immediate (`deferred-constraint-trigger-queued`), Postgres's own error
+//! for that may stand in for `VM004`, in the answer and in the entry.
 //!
 //! A `query` calling the same code fails with `25006` and changes nothing.
 //! What reading and writing rows brings with it is not refused and is
@@ -84,6 +87,11 @@ struct Attack {
     then_over: bool,
     /// The lowest `server_version_num` it can run on.
     since: u32,
+    /// A deferred trigger the owner's code queued fails while the host
+    /// makes deferred constraints immediate: CONTRACT.md allows
+    /// Postgres's own error for that in place of `VM004` (as on Postgres
+    /// 16 and 17, where it runs without the owner's rights).
+    queued_deferred: bool,
 }
 
 /// Through the `BEFORE DELETE` trigger on `ca`: a row of `ca` whose action
@@ -102,6 +110,7 @@ fn through_a_cascade(name: &str, action: &str) -> Attack {
         entry: "execute",
         then_over: false,
         since: 0,
+        queued_deferred: false,
     }
 }
 
@@ -125,6 +134,7 @@ fn through_a_cascade_in_a_transaction(name: &str, action: &str) -> Attack {
         entry: "commit",
         then_over: true,
         since: 0,
+        queued_deferred: false,
     }
 }
 
@@ -156,7 +166,23 @@ fn run_attacks(own: &Own, prefix: &str, attacks: Vec<Attack>) {
             let catalog = capture_catalog(&db);
             let (response, answers) = steps(own, &application, &attack.attack);
             let answer = answers.get(attack.failing).cloned().unwrap_or(Value::Null);
-            assert_vm004(&answer, "the attack");
+            // The code the answer and the entry carry: `VM004`, or for a
+            // queued deferred trigger Postgres's own SQLSTATE.
+            let code = if attack.queued_deferred && answer["error"]["code"] != "VM004" {
+                let code = answer["error"]["code"].as_str().unwrap_or_default();
+                assert!(
+                    answer["error"]["kind"] == "database"
+                        && code.len() == 5
+                        && code
+                            .chars()
+                            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit()),
+                    "the attack: expected `VM004`, or Postgres's own error for the deferred trigger that failed ({{ error: {{ kind: \"database\", code: <SQLSTATE> }} }}), got {answer}"
+                );
+                code.to_owned()
+            } else {
+                assert_vm004(&answer, "the attack");
+                "VM004".to_owned()
+            };
             if attack.then_over {
                 let last = answers.last().cloned().unwrap_or(Value::Null);
                 assert_eq!(
@@ -183,8 +209,8 @@ fn run_attacks(own: &Own, prefix: &str, attacks: Vec<Attack>) {
             assert!(
                 of_entry.len() == 1
                     && of_entry[0]["outcome"] == "failed"
-                    && of_entry[0]["error"] == "VM004",
-                "expected one Operation log entry of the {} `failed` with `error` `VM004`, got:\n{}",
+                    && of_entry[0]["error"] == code.as_str(),
+                "expected one Operation log entry of the {} `failed` with `error` `{code}`, got:\n{}",
                 attack.entry,
                 lines(&entries)
             );
@@ -244,7 +270,10 @@ fn code_a_migration_left_cannot_change_the_structure_or_the_capture_through_a_ca
         through_a_cascade("drop-a-table", DROP_TABLE),
         through_a_cascade("rename-a-table", RENAME_TABLE),
         through_a_cascade("move-a-table-to-another-schema", MOVE_TABLE),
-        through_a_cascade("deferred-constraint-trigger-queued", DEFERRED_TRIGGER),
+        Attack {
+            queued_deferred: true,
+            ..through_a_cascade("deferred-constraint-trigger-queued", DEFERRED_TRIGGER)
+        },
         through_a_cascade("deferrable-foreign-key", DEFERRABLE_FK),
         through_a_cascade("detach-and-attach-a-partition", DETACH_ATTACH),
         through_a_cascade("detach-a-partition", DETACH),
@@ -292,6 +321,7 @@ fn other_vectors_transactions_and_the_runtime_role_s_functions_are_held_alike() 
             entry: "commit",
             then_over: true,
             since: 0,
+            queued_deferred: false,
         },
         // A CHECK on the child of ON UPDATE CASCADE.
         Attack {
@@ -310,6 +340,7 @@ fn other_vectors_transactions_and_the_runtime_role_s_functions_are_held_alike() 
             entry: "execute",
             then_over: false,
             since: 0,
+            queued_deferred: false,
         },
         // A stored generated column there.
         Attack {
@@ -328,6 +359,7 @@ fn other_vectors_transactions_and_the_runtime_role_s_functions_are_held_alike() 
             entry: "execute",
             then_over: false,
             since: 0,
+            queued_deferred: false,
         },
         // A default under ON DELETE SET DEFAULT, obeying `orders`, in one
         // transaction with the order.
@@ -352,6 +384,7 @@ fn other_vectors_transactions_and_the_runtime_role_s_functions_are_held_alike() 
             entry: "commit",
             then_over: false,
             since: 0,
+            queued_deferred: false,
         },
         // A domain's CHECK on the child's key under ON UPDATE CASCADE,
         // obeying `orders`, in one transaction with the order.
@@ -376,6 +409,7 @@ fn other_vectors_transactions_and_the_runtime_role_s_functions_are_held_alike() 
             entry: "commit",
             then_over: false,
             since: 0,
+            queued_deferred: false,
         },
         // A BEFORE UPDATE trigger on the child under ON DELETE SET NULL.
         Attack {
@@ -390,6 +424,7 @@ fn other_vectors_transactions_and_the_runtime_role_s_functions_are_held_alike() 
             entry: "execute",
             then_over: false,
             since: 0,
+            queued_deferred: false,
         },
         // The same under ON UPDATE SET NULL.
         Attack {
@@ -408,6 +443,7 @@ fn other_vectors_transactions_and_the_runtime_role_s_functions_are_held_alike() 
             entry: "execute",
             then_over: false,
             since: 0,
+            queued_deferred: false,
         },
         // The runtime role's own call of a function of the Application's:
         // a lock stronger than ROW EXCLUSIVE.
@@ -419,6 +455,7 @@ fn other_vectors_transactions_and_the_runtime_role_s_functions_are_held_alike() 
             entry: "execute",
             then_over: false,
             since: 0,
+            queued_deferred: false,
         },
         // A refresh by the runtime role, granted MAINTAIN (17 and later).
         Attack {
@@ -429,6 +466,7 @@ fn other_vectors_transactions_and_the_runtime_role_s_functions_are_held_alike() 
             entry: "execute",
             then_over: false,
             since: 170_000,
+            queued_deferred: false,
         },
         // A table the runtime role itself makes where a migration let it
         // (CONTRACT.md: "whoever comes to own what it made").
@@ -444,6 +482,7 @@ fn other_vectors_transactions_and_the_runtime_role_s_functions_are_held_alike() 
             entry: "execute",
             then_over: false,
             since: 0,
+            queued_deferred: false,
         },
         Attack {
             name: "runtime-made-table-in-a-transaction".to_owned(),
@@ -464,6 +503,7 @@ fn other_vectors_transactions_and_the_runtime_role_s_functions_are_held_alike() 
             entry: "commit",
             then_over: true,
             since: 0,
+            queued_deferred: false,
         },
     ];
     // The isolation levels do not change it.
@@ -484,6 +524,7 @@ fn other_vectors_transactions_and_the_runtime_role_s_functions_are_held_alike() 
             entry: "commit",
             then_over: false,
             since: 0,
+            queued_deferred: false,
         });
     }
     run_attacks(&own, "vectors", attacks);

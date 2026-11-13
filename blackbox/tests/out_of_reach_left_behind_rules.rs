@@ -12,7 +12,11 @@
 //! owner role unable to log in.
 //!
 //! An index on a function, an operator or a domain the runtime role made
-//! (where an earlier Version let it create) is refused `index-code` too.
+//! (where an earlier Version let it create) is refused `index-code` too,
+//! and so is one on a function, an operator or a domain a migration added
+//! to the extension it installed (`ALTER EXTENSION pg_trgm ADD ...`), in
+//! the same Version or an earlier one; a `SECURITY DEFINER` function so
+//! added is refused `security-definer`.
 //!
 //! What the contract allows beside them is sent too, each to a fresh
 //! Application: an invoker function, indexes on Postgres's own functions and
@@ -564,6 +568,171 @@ fn an_index_or_a_statistic_calling_a_function_the_runtime_role_made_is_refused()
         cases.len(),
         failures.join("\n")
     );
+}
+
+/// `CREATE EXTENSION pg_trgm`: the migration role owns the extension it
+/// installs and may add its own objects to it.
+const TRGM: &str = r#"CREATE EXTENSION IF NOT EXISTS "pg_trgm""#;
+const EVIL_FN: &str = r#"CREATE FUNCTION "evil_fn"("x" integer) RETURNS integer LANGUAGE plpgsql IMMUTABLE AS $f$ BEGIN RETURN "x"; END $f$"#;
+const EVIL_FN_IN_TRGM: &str = r#"ALTER EXTENSION "pg_trgm" ADD FUNCTION "evil_fn"(integer)"#;
+
+/// Whether the test Postgres has `pg_trgm` to install.
+fn has_pg_trgm() -> bool {
+    blackbox::sql::Sql::connect(&blackbox::postgres::shared().url("postgres"))
+        .unwrap()
+        .value("SELECT count(*)::text FROM pg_available_extensions WHERE name = 'pg_trgm'")
+        .as_deref()
+        == Some("1")
+}
+
+/// CONTRACT.md, `index-code`: "A function of the Application's that a
+/// migration adds to an extension it installed (`ALTER EXTENSION ... ADD
+/// FUNCTION`) is still the Application's, and refused".
+#[test]
+fn code_of_the_migrations_added_to_an_extension_they_installed_is_still_refused() {
+    if !has_pg_trgm() {
+        eprintln!("SKIPPED: the test Postgres has no pg_trgm");
+        return;
+    }
+    let own = start();
+    let cases = vec![
+        Case::statements("index-on-a-function-added-to-pg-trgm", INDEX_CODE, statements(&[
+            TRGM,
+            EVIL_FN,
+            EVIL_FN_IN_TRGM,
+            r#"CREATE INDEX "by_member_fn" ON "things" (("evil_fn"("id")))"#,
+        ]))
+        .mentioning("by_member_fn"),
+        Case::statements("where-on-a-function-added-to-pg-trgm", INDEX_CODE, statements(&[
+            TRGM,
+            EVIL_FN,
+            EVIL_FN_IN_TRGM,
+            r#"CREATE INDEX "partial_member_fn" ON "things" ("id") WHERE "evil_fn"("size") > 0"#,
+        ]))
+        .mentioning("partial_member_fn"),
+        Case::statements("through-an-operator-added-to-pg-trgm", INDEX_CODE, statements(&[
+            TRGM,
+            r#"CREATE FUNCTION "evil_plus"(integer, integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $f$ SELECT $1 + $2 $f$"#,
+            r#"CREATE OPERATOR @+@ (LEFTARG = integer, RIGHTARG = integer, FUNCTION = "evil_plus")"#,
+            r#"ALTER EXTENSION "pg_trgm" ADD FUNCTION "evil_plus"(integer, integer)"#,
+            r#"ALTER EXTENSION "pg_trgm" ADD OPERATOR @+@ (integer, integer)"#,
+            r#"CREATE INDEX "by_member_op" ON "things" (("size" @+@ 1))"#,
+        ]))
+        .mentioning("by_member_op"),
+        Case::statements("through-a-domain-added-to-pg-trgm", INDEX_CODE, statements(&[
+            TRGM,
+            r#"CREATE DOMAIN "evil_domain" AS integer"#,
+            r#"ALTER EXTENSION "pg_trgm" ADD DOMAIN "evil_domain""#,
+            r#"CREATE INDEX "by_member_domain" ON "things" ((("size")::"evil_domain"))"#,
+        ]))
+        .mentioning("by_member_domain"),
+        Case::statements("a-statistic-on-a-function-added-to-pg-trgm", INDEX_CODE, statements(&[
+            TRGM,
+            EVIL_FN,
+            EVIL_FN_IN_TRGM,
+            r#"CREATE STATISTICS "st_member_fn" ON ("evil_fn"("size")), ("id") FROM "things""#,
+        ]))
+        .mentioning("st_member_fn"),
+        // The function added to the extension by one migration, the index
+        // made by a later one.
+        Case::migrations("function-added-then-index-in-a-later-migration", INDEX_CODE, |_| {
+            vec![
+                Migration::new(
+                    "0004_member",
+                    &[
+                        &format!("{TRGM};"),
+                        &format!("{EVIL_FN};"),
+                        &format!("{EVIL_FN_IN_TRGM};"),
+                    ],
+                ),
+                Migration::new(
+                    "0005_index",
+                    &[r#"CREATE INDEX "by_member_fn" ON "things" (("evil_fn"("id")));"#],
+                ),
+            ]
+        })
+        .naming(ANY_MIGRATION)
+        .mentioning("by_member_fn"),
+    ];
+    run_cases(&own, "member-index-code", cases);
+}
+
+/// CONTRACT.md, `security-definer`: "a function or a procedure of the
+/// migrations' marked `SECURITY DEFINER`, in any schema", one added to an
+/// extension they installed among them.
+#[test]
+fn a_security_definer_function_added_to_an_extension_is_still_refused() {
+    if !has_pg_trgm() {
+        eprintln!("SKIPPED: the test Postgres has no pg_trgm");
+        return;
+    }
+    let own = start();
+    let definer = vec![
+        Case::statements("definer-added-to-pg-trgm", SECURITY_DEFINER, statements(&[
+            TRGM,
+            r#"CREATE FUNCTION "member_powers"() RETURNS integer LANGUAGE sql SECURITY DEFINER AS $f$ SELECT 1 $f$"#,
+            r#"ALTER EXTENSION "pg_trgm" ADD FUNCTION "member_powers"()"#,
+        ]))
+        .mentioning("member_powers"),
+        Case::statements("added-to-pg-trgm-then-made-definer", SECURITY_DEFINER, statements(&[
+            TRGM,
+            r#"CREATE FUNCTION "member_powers"() RETURNS integer LANGUAGE sql AS $f$ SELECT 1 $f$"#,
+            r#"ALTER EXTENSION "pg_trgm" ADD FUNCTION "member_powers"()"#,
+            r#"ALTER FUNCTION "member_powers"() SECURITY DEFINER"#,
+        ]))
+        .mentioning("member_powers"),
+    ];
+    run_cases(&own, "member-definer", definer);
+}
+
+/// The function added to the extension in an earlier Version, the index on
+/// it in a later one.
+#[test]
+fn an_index_on_a_function_an_earlier_version_added_to_an_extension_is_refused() {
+    if !has_pg_trgm() {
+        eprintln!("SKIPPED: the test Postgres has no pg_trgm");
+        return;
+    }
+    let own = start();
+    let application = "member-earlier";
+    let db = install_seeded(&own, application);
+    let member = Migration::new(
+        "0004_member",
+        &[
+            &format!("{TRGM};"),
+            &format!("{EVIL_FN};"),
+            &format!("{EVIL_FN_IN_TRGM};"),
+        ],
+    );
+    let first = own.send(application, &base_and(std::slice::from_ref(&member)));
+    assert_eq!(
+        first.status,
+        201,
+        "the harness's own check: expected the Version that adds a function of its own to pg_trgm applied, got\n{}",
+        first.describe()
+    );
+    let before = blackbox::out_of_reach::untouched(&db);
+    let index = Migration::new(
+        "0005_index",
+        &[r#"CREATE INDEX "by_member_fn" ON "things" (("evil_fn"("id")));"#],
+    );
+    let sent = own.send(application, &base_and(&[member, index]));
+    assert_answer(&sent, INDEX_CODE, "0005_index", Some("by_member_fn"));
+    let message = sent.json()["error"]["message"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    assert!(
+        message.contains("evil_fn"),
+        "expected the message to name the function \"evil_fn\", got {message:?}"
+    );
+    let after = blackbox::out_of_reach::untouched(&db);
+    assert!(
+        after == before,
+        "expected the own database exactly as before the refused Version; it differs:\n{}",
+        blackbox::out_of_reach::differences(&before, &after)
+    );
+    assert_eq!(own.version_numbers(application), vec![1, 2]);
 }
 
 #[test]
