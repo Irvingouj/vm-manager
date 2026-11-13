@@ -715,21 +715,21 @@ for (const change of changes) {
 - `history(table, key?, options?)` is on both handles of the own database: `ctx.user().ownDb()` and `ctx.app().ownDb()`. It resolves to an array of `Change<typeof table>`, **newest first**.
 - `table` is a table of the own database's structure (a Drizzle table, in any schema).
 - `key` names one row by its primary key: an object with exactly the table's primary key columns, by their property names in the Drizzle table (`{ id: 7 }`; for a composite key `{ orderId: 3, line: 2 }`). A key with a property missing, or one that is not of the primary key, or given for a table without a primary key, throws a `TypeError` that names the primary key's properties; nothing is sent to the host. A key the types can check (the wrong property, the wrong type of value, for a primary key declared on its column with `.primaryKey()`) is a compile error.
-- Without `key` (or with `undefined`), the changes of every row of the table. That is the only way to read the history of a table without a primary key.
+- Without `key` (or with `undefined`), the changes of every row of the table. That is the only way to read the history of a table without a primary key. `null` is not a key: it throws the same `TypeError`, so that a value that was meant to be there and is not does not read the whole table.
 - The history is kept under the key the row had **before** each change. A row whose primary key was updated has its earlier changes, and that update, under the old key, and its later ones under the new.
-- `options.limit`: how many changes at most; an integer from 1 to 1000, by default 100. Anything else throws a `TypeError`, nothing sent. `options.before`: a change's `id`; only changes older than it are answered. With both, an Application pages back through a long history.
+- `options.limit`: how many changes at most; an integer from 1 to 1000, by default 100. Anything else (`null` too; `undefined` is the default) throws a `TypeError`, nothing sent. `options.before`: a change's `id`, a string of decimal digits; only changes older than it are answered. Anything else but `undefined` throws a `TypeError`, nothing sent. With both, an Application pages back through a long history.
 - It is not on a shared database's handle (Milestone 1 keeps no Change history there) and not on a transaction's `tx`. Neither has it in its types. Forced past them on a shared handle, it throws an `Error` whose message contains `Change history is kept only in the own database`, and nothing is sent to the host.
 
 ### A change
 
 | Property | Type | What |
 |---|---|---|
-| `id` | `string` | The change's place in the history, as decimal digits. Later changes have greater ids (compare as numbers, or use `before`). |
+| `id` | `string` | The change's place in the history: `vm.history.id`, as decimal digits. Later changes have greater ids (compare as numbers, or use `before`). |
 | `at` | `Date` | When the change was made. |
 | `kind` | `"insert" \| "update" \| "delete"` | |
 | `old` | the table's row, or `null` | The whole row before; `null` for an insert. |
 | `new` | the table's row, or `null` | The whole row after; `null` for a delete. |
-| `changed` | array of the row's property names, or `null` | For an update, the properties whose value differs, in the table's column order; `null` for an insert and a delete. |
+| `changed` | `string[] \| null` | For an update, the properties whose value differs, in the table's column order; `null` for an insert and a delete. |
 | `userId` | `string` | The User in flight when the change was made, whichever the actor; for `migration`, the Contributor who sent the Version. |
 | `application` | `string` | |
 | `actor` | `"user" \| "application" \| "migration"` | |
@@ -737,12 +737,12 @@ for (const change of changes) {
 | `migration` | `string \| null` | The migration's name, for `migration`; `null` otherwise. |
 
 - `old` and `new` are rows exactly as `select()` from that table gives them: the same properties, and each value as "The SDK: Values" promises for its column (a `bigint({ mode: "bigint" })` exact beyond 2^53, a `timestamp` a `Date`, a `numeric` a string with every digit, `jsonb` the value, an array an array). A row read from the history equals the row a `select()` gave at that time.
-- **They are read in the table's present shape.** A column a later migration dropped is not shown; a column added later is `null` in rows from before it; a renamed column is `null` under its new name in rows from before the rename. In `changed`, a column the table no longer has is given by its database name. A value that no longer fits its column's present type (a later migration changed the type and the old value does not cast to it) makes the whole read fail with `OperationFailed` of kind `database`: the Application cannot read that table's history through the SDK until the structure fits again. What is stored is never changed by this; a `query` on `vm.history` through the raw interface still shows it.
+- **They are read in the table's present shape.** A column a later migration dropped is not shown; a column added later is `null` in rows from before it; a renamed column is `null` under its new name in rows from before the rename. In `changed`, a column the table no longer has is given by its database name. A value that no longer fits its column's present type (a later migration changed the type and the old value does not cast to it) makes the whole read fail with `OperationFailed` of kind `database` (its one Operation log entry is `failed`, with the SQLSTATE as `error`): the Application cannot read that table's history through the SDK until the structure fits again. What is stored is never changed by this; a `query` on `vm.history` through the raw interface still shows it.
 
 ### An operation like any other
 
 - Each `history(...)` call is exactly one host operation: a `query` on the own database, as the handle's actor, for the request in flight. It has one Operation log entry (`operation` `query`, `resource` null, the actor, `outcome`, `rows` the number of changes answered) whose `statement` reads from `vm.history` and holds no value: not the key, not the limit.
-- It is decided and limited as any `query`: with no request in flight it is refused `no-request` (rejects with `Refused`); the limits on rows, bytes and time apply (`OperationFailed` of kind `limit`).
+- It is decided and limited as any `query`: with no request in flight it is refused `no-request` (rejects with `Refused`), should such code ever run (through the SDK it does not: once the response is given, neither a timer nor the continuation of an awaited call runs, so no black-box test shows this); the limits on rows, bytes and time apply (`OperationFailed` of kind `limit`).
 - Whoever can use the Application can read all of its history through it, as the Application's code decides (ADR 0005). The history says who changed a row; it does not restrict who may read that.
 
 ### Only its own, and only to read
