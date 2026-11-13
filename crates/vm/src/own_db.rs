@@ -1836,19 +1836,23 @@ impl OwnDatabases {
                         "applying migrations: a statement's place in its migration was lost",
                     ));
                 };
-                within(deadline, &cancel, transaction.execute(statement, &[]))
-                    .await
-                    .ok_or_else(timed_out)?
-                    .map_err(|e| failed(migration, e))?;
-                let key_now: Option<String> = within(
-                    deadline,
-                    &cancel,
-                    transaction.query_one("SELECT vm.transaction_key()", &[]),
-                )
+                // The statement and the question of the transaction's key
+                // after it travel together: each its own extended-protocol
+                // exchange (one statement per Parse, which Postgres refuses
+                // to hold two), sent at once, answered in order. If the
+                // statement fails, the question fails after it.
+                let (ran, key_now) = within(deadline, &cancel, async {
+                    let (ran, key_now) = tokio::join!(
+                        transaction.query_typed(statement, &[]),
+                        transaction.query_typed_one("SELECT vm.transaction_key()", &[]),
+                    );
+                    Ok((ran, key_now))
+                })
                 .await
                 .ok_or_else(timed_out)?
-                .and_then(|row| row.try_get(0))
-                .ok();
+                .map_err(|e| unavailable(&e))?;
+                ran.map_err(|e| failed(migration, e))?;
+                let key_now: Option<String> = key_now.and_then(|row| row.try_get(0)).ok();
                 if key_now.as_deref() != Some(transaction_key.as_str()) {
                     return Err(Problem::refused(
                         migration,
