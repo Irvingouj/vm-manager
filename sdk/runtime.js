@@ -9,7 +9,7 @@
 // asking is decided by the host from the request in flight, on every
 // operation.
 
-import { createTableRelationsHelpers, extractTablesRelationalConfig, TransactionRollbackError } from "drizzle-orm";
+import { createTableRelationsHelpers, extractTablesRelationalConfig } from "drizzle-orm";
 import { PgDialect } from "drizzle-orm/pg-core";
 import { PgProxyTransaction, PgRemoteDatabase, PgRemoteSession } from "drizzle-orm/pg-proxy";
 import { failedOf, OperationFailed, Refused, refusedOf } from "./errors.js";
@@ -78,17 +78,6 @@ const NESTED =
 class HostTransaction extends PgProxyTransaction {
   async transaction() {
     throw new Error(NESTED);
-  }
-
-  /**
-   * Drizzle's: throws its `TransactionRollbackError`, which makes
-   * `transaction` roll back and reject with it. Drizzle 0.45 names that
-   * error `DrizzleError`; here it is named for what it is.
-   */
-  rollback() {
-    const error = new TransactionRollbackError();
-    error.name = "TransactionRollbackError";
-    throw error;
   }
 }
 
