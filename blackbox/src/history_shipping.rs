@@ -278,7 +278,7 @@ pub fn batches(db: &OwnDatabase, condition: &str) -> Vec<Batch> {
             "SELECT h.xmin::text, count(*)::text, sum({size})::text,
                     ((array_agg({size} ORDER BY h.id))[1])::text
                FROM change_history h WHERE h.application = {} AND ({condition})
-              GROUP BY h.xmin ORDER BY min(h.id)",
+              GROUP BY h.xmin::text ORDER BY min(h.id)",
             literal(&db.application)
         ))
         .into_iter()

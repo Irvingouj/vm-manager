@@ -996,3 +996,259 @@ fn a_change_is_in_change_history_within_10_seconds_and_before_a_later_read_answe
     );
     assert_no_duplicates(&db, "changes read soon after");
 }
+
+// ---------------------------------------------------------------------------
+// Nobody waits for what is not theirs.
+// ---------------------------------------------------------------------------
+
+/// Rows of each statement of the writer that does not pause.
+const FLOOD_ROWS: usize = 20_000;
+
+/// How long the writer writes.
+const FLOOD_FOR: Duration = Duration::from_secs(6);
+
+/// The readers, each starting 0.4 s after the one before.
+const READERS: u32 = 8;
+
+/// One reader's read, as the test saw it.
+struct Read {
+    began: Duration,
+    /// The rows of `vm.outbox` (everything committed and not yet shipped)
+    /// just before the read began.
+    backlog: i64,
+    took: Duration,
+    answer: Value,
+}
+
+/// CONTRACT.md, "Nobody waits for what is not theirs": "A read of the
+/// history waits only for the changes committed before it began: writes
+/// made after that, however many and however fast, do not hold it up."
+///
+/// One thread writes statements of 20,000 rows into `things` without pause
+/// for 6 seconds (it writes faster than the relay ships, so the outbox is
+/// never empty meanwhile). Meanwhile eight readers, 0.4 s apart, each count
+/// `vm.outbox` (what was committed before their read and is not shipped:
+/// what the read must ship first), then write a row of their own and read
+/// that row's history in one request. The relay's rate is measured over the
+/// same seconds (changes added to `change_history` while the outbox was
+/// never empty). A read must answer its own row; it may be ended at the
+/// `time` limit only when what was before it would take the relay more
+/// than 8 seconds to ship at that rate. A read that waited for what was
+/// committed after it began would be ended at 10 seconds with little before
+/// it.
+#[test]
+fn reads_of_the_history_do_not_wait_for_writes_made_after_they_began() {
+    let (own, db) = installed();
+    let stop_writing = std::sync::atomic::AtomicBool::new(false);
+    let shipped_at_start = count_now(&db, "true");
+    let start = Instant::now();
+    let (statements, shipped_in_flood, flood_took, mut reads) = std::thread::scope(|scope| {
+        let writer = scope.spawn(|| {
+            let mut n = 0_usize;
+            while start.elapsed() < FLOOD_FOR
+                && !stop_writing.load(std::sync::atomic::Ordering::Relaxed)
+            {
+                let (_, answers) = own.run_body(
+                    &bob(),
+                    APP,
+                    &json!({ "calls": [own_execute(
+                        "application",
+                        &format!("insert into things (title) select 'flood-{n}-' || g from generate_series(1, {FLOOD_ROWS}) g"),
+                    )] }),
+                    LONG_REQUEST,
+                );
+                assert_ok(&answers[0], "the harness's own check: a statement of the writer");
+                n += 1;
+            }
+            let shipped = count_now(&db, "true") - shipped_at_start;
+            (n, shipped, start.elapsed())
+        });
+        let readers: Vec<_> = (0..READERS)
+            .map(|k| {
+                let (own, db, start) = (&own, &db, start);
+                scope.spawn(move || {
+                    let at = Duration::from_millis(300) + Duration::from_millis(400) * k;
+                    if let Some(wait) = at.checked_sub(start.elapsed()) {
+                        std::thread::sleep(wait);
+                    }
+                    let id = 900_000 + i64::from(k);
+                    let backlog = outbox_count(db);
+                    let began = start.elapsed();
+                    let clock = Instant::now();
+                    let (_, answers) = own.run_body(
+                        &alice(),
+                        APP,
+                        &json!({ "calls": [
+                            own_execute("user", &format!("insert into things (id, title) values ({id}, 'reader-{k}')")),
+                            history_call("user", "public", "things", &json!({ "key": { "id": id } })),
+                        ] }),
+                        Duration::from_secs(30),
+                    );
+                    Read {
+                        began,
+                        backlog,
+                        took: clock.elapsed(),
+                        answer: answers[1].clone(),
+                    }
+                })
+            })
+            .collect();
+        let reads: Vec<Read> = readers.into_iter().map(|r| r.join().unwrap()).collect();
+        stop_writing.store(true, std::sync::atomic::Ordering::Relaxed);
+        let (n, shipped, took) = writer.join().unwrap();
+        (n, shipped, took, reads)
+    });
+    reads.sort_by_key(|r| r.began);
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "a rate for a message and a bound, not an exact count"
+    )]
+    let rate = shipped_in_flood as f64 / flood_took.as_secs_f64();
+    println!(
+        "the writer wrote {statements} statements of {FLOOD_ROWS} rows in {flood_took:?}; the relay shipped {shipped_in_flood} changes meanwhile ({rate:.0} a second)"
+    );
+    let mut wrong = Vec::new();
+    for read in &reads {
+        #[expect(clippy::cast_precision_loss, reason = "an estimate in seconds")]
+        let needs = read.backlog as f64 / rate.max(1.0);
+        let holds = read.answer["ok"]["changes"]
+            .as_array()
+            .is_some_and(|c| c.len() == 1 && c[0]["kind"] == "insert");
+        let excused = read.answer["error"]["limit"] == "time" && needs > 8.0;
+        println!(
+            "  read begun at {:.3} s with {} changes before it (about {needs:.1} s of shipping): answered in {:.3} s: {}",
+            read.began.as_secs_f64(),
+            read.backlog,
+            read.took.as_secs_f64(),
+            if holds {
+                "its own row"
+            } else if excused {
+                "ended at the time limit, excused"
+            } else {
+                "WRONG"
+            }
+        );
+        if !holds && !excused {
+            wrong.push(format!(
+                "  the read begun at {:?}, with {} changes before it (about {needs:.1} s of shipping at {rate:.0} a second), answered after {:?}: {}",
+                read.began, read.backlog, read.took, read.answer
+            ));
+        }
+    }
+    assert!(
+        statements >= 2
+            && reads.iter().any(|r| r.answer["ok"].is_object() || {
+                #[expect(clippy::cast_precision_loss, reason = "an estimate in seconds")]
+                let needs = r.backlog as f64 / rate.max(1.0);
+                needs < 8.0
+            }),
+        "the harness's own check: the writer wrote while the reads were made, and some read had little before it"
+    );
+    assert!(
+        wrong.is_empty(),
+        "expected each read made while one writer keeps writing to answer what was committed before it began (CONTRACT.md: \"writes made after that, however many and however fast, do not hold it up\"):\n{}",
+        wrong.join("\n")
+    );
+    wait_shipped_within(&db, Duration::from_secs(300));
+}
+
+/// Rows each of the five Applications writes in one statement.
+const LARGE_OUTBOX: usize = 150_000;
+
+/// CONTRACT.md, "Nobody waits for what is not theirs": "One Application's
+/// shipments do not hold up another's: the relay takes turns of one batch
+/// each, so while several Applications ship large outboxes, a write of
+/// another Application is shipped and a read of its history answered as
+/// soon as their own changes are." Five Applications each write 150,000
+/// rows at once (750,000 changes, some 20 seconds of shipping at the rate
+/// the 100,000-row test measured); as soon as they are answered, a sixth
+/// writes one row, and its change must be in `change_history`, and a read
+/// of its history answered, within 3 seconds (well inside the read's 10),
+/// while the five still have changes in their outboxes. A relay that
+/// shipped one outbox after another would make the sixth wait for them.
+#[test]
+fn one_applications_large_shipments_do_not_hold_up_another_applications() {
+    let own = Own::start();
+    let busy: Vec<String> = (1..=5).map(|i| format!("busy-{i}")).collect();
+    let busy_dbs: Vec<OwnDatabase> = busy
+        .iter()
+        .map(|name| own.install(name, &history_standard()))
+        .collect();
+    let quiet = own.install("quiet", &history_standard());
+    let began = Instant::now();
+    std::thread::scope(|scope| {
+        for name in &busy {
+            let own = &own;
+            scope.spawn(move || {
+                execute_long(
+                    own,
+                    name,
+                    &format!("insert into things (title) select 'large-' || g from generate_series(1, {LARGE_OUTBOX}) g"),
+                )
+            });
+        }
+    });
+    let written = began.elapsed();
+    let left_before: i64 = busy_dbs.iter().map(outbox_count).sum();
+    // A write, then at once a read of its history.
+    let (_, answer) = own.one(
+        &alice(),
+        "quiet",
+        &own_execute(
+            "user",
+            "insert into things (id, title) values (1, 'quiet one')",
+        ),
+    );
+    assert_ok(
+        &answer,
+        "the harness's own check: the sixth Application's write",
+    );
+    let read_began = Instant::now();
+    let (_, read) = own.one(
+        &alice(),
+        "quiet",
+        &history_call("user", "public", "things", &json!({ "key": { "id": 1 } })),
+    );
+    let read_took = read_began.elapsed();
+    let left_at_read: i64 = busy_dbs.iter().map(outbox_count).sum();
+    // Another write, shipped by the relay alone.
+    let (_, answer) = own.one(
+        &alice(),
+        "quiet",
+        &own_execute(
+            "user",
+            "insert into things (id, title) values (2, 'quiet two')",
+        ),
+    );
+    assert_ok(
+        &answer,
+        "the harness's own check: the sixth Application's second write",
+    );
+    let (n, shipped_after) = wait_count(&quiet, &inserted_title("quiet two"), 1, SHIPPED_WITHIN);
+    let left_at_ship: i64 = busy_dbs.iter().map(outbox_count).sum();
+    let all_shipped = Instant::now();
+    for db in &busy_dbs {
+        wait_shipped_within(db, Duration::from_secs(300));
+    }
+    println!(
+        "five statements of {LARGE_OUTBOX} rows answered after {written:?}, {left_before} changes then in their outboxes; the sixth Application's read after its write answered in {read_took:?} ({left_at_read} changes of the five left then); its second write in change_history {shipped_after:?} after it ({left_at_ship} left then); the five shipped whole {:?} later",
+        all_shipped.elapsed()
+    );
+    let changes = read["ok"]["changes"].as_array();
+    assert!(
+        changes.is_some_and(|c| c.len() == 1) && read_took < Duration::from_secs(3),
+        "expected the sixth Application's read answered with its change within 3 s, well inside its 10 s, while five others ship large outboxes (CONTRACT.md: \"a read of its history answered as soon as their own changes are\"); it took {read_took:?} and answered {read}"
+    );
+    assert!(
+        left_at_read > 0,
+        "the harness's own check: the five still had changes to ship when the sixth's read answered; make LARGE_OUTBOX larger"
+    );
+    assert!(
+        n == 1 && shipped_after < Duration::from_secs(3),
+        "expected the sixth Application's write in change_history within 3 s while five others ship large outboxes (CONTRACT.md: \"a write of another Application is shipped ... as soon as their own changes are\"); after {shipped_after:?} it has {n}"
+    );
+    assert!(
+        left_at_ship > 0,
+        "the harness's own check: the five still had changes to ship when the sixth's write was shipped; make LARGE_OUTBOX larger"
+    );
+}

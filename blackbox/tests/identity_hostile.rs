@@ -35,6 +35,9 @@ use blackbox::scenario::lines;
 use blackbox::shared_database::token;
 use serde_json::{Value, json};
 
+/// In place of a SQLSTATE: any failure will do.
+const ANY_FAILURE: &str = "any failure";
+
 /// Makes a statement from a row's title.
 type MakeSql = Box<dyn Fn(&str) -> String>;
 
@@ -982,23 +985,48 @@ fn the_runtime_role_cannot_read_or_change_the_outbox_and_there_is_no_vm_history(
                     ),
                     "42501",
                 ),
+                // ts_stat runs its query read-only: Postgres refuses the
+                // delete with 0A000 before it looks at rights, whoever
+                // asks. It must fail, with any code; the outbox is
+                // checked unchanged below.
                 (
                     own_execute(
                         actor,
                         &format!("select * from ts_stat($q$with d as (delete from {name} returning 1) select to_tsvector('simple', '1') from d$q$)"),
                     ),
-                    "42501",
+                    ANY_FAILURE,
                 ),
             ]);
         }
+        let outbox_before = blackbox::history::outbox_count(&db);
         let only: Vec<Value> = calls.iter().map(|(c, _)| c.clone()).collect();
         let (_, answers) = own.run(&bob(), APP, &only);
+        assert_eq!(
+            answers.len(),
+            calls.len(),
+            "the harness's own check: one answer per call"
+        );
+        let mut wrong = Vec::new();
         for ((call, code), answer) in calls.iter().zip(&answers) {
-            assert!(
-                answer["error"]["code"] == *code,
-                "expected {call} as the {actor} to fail with {code}, got {answer}"
-            );
+            let fine = if *code == ANY_FAILURE {
+                answer["error"].is_object()
+            } else {
+                answer["error"]["code"] == *code
+            };
+            if !fine {
+                wrong.push(format!("  {call}: expected {code}, got {answer}"));
+            }
         }
+        assert!(
+            wrong.is_empty(),
+            "expected each of these as the {actor} to fail as CONTRACT.md says:\n{}",
+            wrong.join("\n")
+        );
+        assert_eq!(
+            blackbox::history::outbox_count(&db),
+            outbox_before,
+            "expected vm.outbox as before the attempts as the {actor}"
+        );
         assert_eq!(
             snapshot(&db),
             before,

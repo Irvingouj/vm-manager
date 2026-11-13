@@ -442,6 +442,25 @@ pub fn assert_one_history_entry(
     values: &[&str],
     context: &str,
 ) -> Value {
+    assert_one_history_entry_under(sdk, response, user, actor, rows, values, 1, context)
+}
+
+/// As [`assert_one_history_entry`], the entry made under Version `version`
+/// of the Application (the Version serving when the read was made).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "what one entry must say, one argument each"
+)]
+pub fn assert_one_history_entry_under(
+    sdk: &Sdk,
+    response: &Response,
+    user: &User,
+    actor: &str,
+    rows: usize,
+    values: &[&str],
+    version: u64,
+    context: &str,
+) -> Value {
     let entries = sdk.entries_of(response);
     assert_eq!(
         entries.len(),
@@ -453,6 +472,7 @@ pub fn assert_one_history_entry(
     let request = response.request_id();
     let expected = Expected {
         rows: Some(u64::try_from(rows).unwrap_or(u64::MAX)),
+        version,
         ..Expected::own(&request, &user.id, CHRONICLE, actor, "history")
     };
     assert_entry(entry, &expected, context);

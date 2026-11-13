@@ -18,7 +18,8 @@
 //! `vm.history` then holds, read as the harness's superuser, is the
 //! earlier form's record. That program is stopped and the one under test
 //! started on the same platform database. At once when it says it listens,
-//! no role finds `vm.history`; the shipment at start empties `vm.outbox`
+//! no role finds `vm.history`, the runtime role and the migration role
+//! cannot read `vm.outbox` (`42501`); the shipment at start empties `vm.outbox`
 //! within 10 seconds, with no request, and `change_history` then holds
 //! every earlier change once, with its `id` and its columns; a read through
 //! `history` changes nothing of that. Changes made afterwards
@@ -185,6 +186,20 @@ fn an_own_database_from_before_the_ticket_has_its_history_in_change_history_once
                     "expected no role to find vm.history in the own database once the program says it listens (42P01 for every role), but:\n  {}",
                     found.join("\n  ")
                 ));
+            }
+            // The roles of the Application cannot read the outbox here
+            // either (the earlier form let them read vm.history).
+            for (what, role) in [
+                ("the runtime role", &db.runtime),
+                ("the migration role", &db.owner),
+            ] {
+                let sql = session_as(&db, Some(role));
+                match sql.try_coded("SELECT count(*) FROM vm.outbox") {
+                    Err(e) if e.code == "42501" => {}
+                    other => failures.push(format!(
+                        "expected {what} {role} refused reading vm.outbox (42501) in the own database of the earlier form, got {other:?}"
+                    )),
+                }
             }
             // "By the shipment at start": vm.outbox empty within 10 s of the
             // start, with no request.

@@ -56,7 +56,8 @@ use blackbox::scenario::lines;
 use blackbox::sdk::{ann, d};
 use blackbox::sdk_history::{
     HistoryCall, SEED_MIGRATION, Want, assert_change as assert_sdk_change,
-    assert_ids_are_history_rows, assert_ids_decrease, assert_one_history_entry, chronicle, id_of,
+    assert_ids_are_history_rows, assert_ids_decrease, assert_one_history_entry_under, chronicle,
+    id_of,
 };
 use blackbox::{INSTALLER, Response, User};
 use serde_json::{Value, json};
@@ -865,7 +866,8 @@ fn through_the_sdk_a_structure_entry_is_a_change_of_kind_structure() {
         }
         assert_ids_decrease(&changes, &context);
         assert_ids_are_history_rows(&sdk.own, &changes, "public", "reshaped", &context);
-        assert_one_history_entry(&sdk, &response, &user, actor, 6, &[], &context);
+        // The entry says the Version serving: the second, sent above.
+        assert_one_history_entry_under(&sdk, &response, &user, actor, 6, &[], 2, &context);
 
         let context = format!("history(reshaped, {{ id: 1 }}, {{ limit: 1 }}) as the {actor}");
         let (_, changes) = full(actor, Some(json!({ "id": 1 })), Some(json!({ "limit": 1 })));
@@ -891,4 +893,155 @@ fn through_the_sdk_a_structure_entry_is_a_change_of_kind_structure() {
     assert_eq!(changes.len(), 6, "{}", lines(&changes));
     assert_eq!(changes[0]["kind"], d::string("structure"));
     assert!(id_of(&changes[0]) > id_of(&changes[1]));
+}
+
+/// CONTRACT.md, `table-rewritten`: "A partitioned table has this entry when
+/// any of its partitions was written anew (its rows' changes are recorded
+/// under its name), and so has that partition"; `partition-detached`: "a
+/// partition was detached from it, or dropped"; `partition-attached`: "one
+/// the migration makes with `CREATE TABLE ... PARTITION OF` brings no rows
+/// and has no entry". One Version, three migrations:
+///
+/// - `0004_cluster_partition`: `CLUSTER measures_2026`: `table-rewritten`
+///   on `measures` and on `measures_2026`;
+/// - `0005_new_partition`: `CREATE TABLE measures_2028 PARTITION OF
+///   measures`: no entry;
+/// - `0006_drop_partition`: `DROP TABLE measures_2026`:
+///   `partition-detached` of `public.measures_2026` on `measures`, and none
+///   in the partition's own history.
+#[test]
+fn partitions_rewritten_made_and_dropped() {
+    let mut s = Structure::start();
+    let last = last_history_id(&s.db);
+    s.send_ok(&[
+        Migration::new(
+            "0004_cluster_partition",
+            &[r#"CLUSTER "measures_2026" USING "measures_2026_pkey";"#],
+        ),
+        Migration::new(
+            "0005_new_partition",
+            &[r#"CREATE TABLE "measures_2028" PARTITION OF "measures" FOR VALUES FROM ('2028-01-01') TO ('2029-01-01');"#],
+        ),
+        Migration::new(
+            "0006_drop_partition",
+            &[r#"DROP TABLE "measures_2026";"#],
+        ),
+    ]);
+    let entries = structure_entries(&s.db, last);
+    let of = |migration: &str| -> Vec<Value> {
+        entries
+            .iter()
+            .filter(|r| r["migration"] == migration)
+            .cloned()
+            .collect()
+    };
+    assert_structure_rows(
+        &of("0004_cluster_partition"),
+        &[
+            ("measures", json!({ "change": "table-rewritten" })),
+            ("measures_2026", json!({ "change": "table-rewritten" })),
+        ],
+        "0004_cluster_partition",
+        "a partition written anew: table-rewritten on the partitioned table and on the partition",
+    );
+    assert_structure_rows(
+        &of("0005_new_partition"),
+        &[],
+        "0005_new_partition",
+        "a partition made with CREATE TABLE ... PARTITION OF: no entry",
+    );
+    assert_structure_rows(
+        &of("0006_drop_partition"),
+        &[(
+            "measures",
+            json!({ "change": "partition-detached", "partition": "public.measures_2026" }),
+        )],
+        "0006_drop_partition",
+        "a partition dropped: partition-detached on the partitioned table, nothing on the partition",
+    );
+    assert_eq!(
+        entries.len(),
+        3,
+        "expected these three entries and no other: {}",
+        lines(&entries)
+    );
+}
+
+/// CONTRACT.md, `enum-value-renamed`: "on every table with a column of that
+/// type, of an array of it, or of a domain over either". A later Version
+/// makes the domains `mood_d` over `mood` and `moods_d` over `mood[]`, and
+/// `dom_moods (id, x mood_d, n text, y moods_d)` with a row; the next one
+/// renames a value of `mood`: `dom_moods` has the entry, `columns` `["x",
+/// "y"]`.
+#[test]
+fn an_enum_value_renamed_is_an_entry_on_a_table_with_a_domain_over_it() {
+    let mut s = Structure::start();
+    s.send_ok(&[Migration::new(
+        "0004_domains",
+        &[
+            r#"CREATE DOMAIN "mood_d" AS "mood";"#,
+            r#"CREATE DOMAIN "moods_d" AS "mood"[];"#,
+            r#"CREATE TABLE "dom_moods" (
+	"id" integer PRIMARY KEY NOT NULL,
+	"x" "mood_d",
+	"n" text,
+	"y" "moods_d"
+);"#,
+        ],
+    )]);
+    let (_, answer) = s.own.one(
+        &User::new(WRITER),
+        APP,
+        &own_execute(
+            "user",
+            "insert into dom_moods (id, x, n, y) values (1, 'sad', 'n', '{sad,happy}')",
+        ),
+    );
+    assert_ok(&answer, "the harness's own check: a row of dom_moods");
+    let last = last_history_id(&s.db);
+    let migration = "0005_rename_mood";
+    s.send_ok(&[Migration::new(
+        migration,
+        &[r#"ALTER TYPE "public"."mood" RENAME VALUE 'sad' TO 'blue';"#],
+    )]);
+    let renamed = |columns: &[&str]| json!({ "change": "enum-value-renamed", "type": "public.mood", "from": "sad", "to": "blue", "columns": columns });
+    assert_structure_rows(
+        &history_after(&s.db, last),
+        &[
+            ("moods", renamed(&["mood"])),
+            ("mood_lists", renamed(&["moods"])),
+            ("two_moods", renamed(&["a", "b"])),
+            ("dom_moods", renamed(&["x", "y"])),
+        ],
+        migration,
+        "an enum's value renamed: also on a table whose columns are of a domain over it and over an array of it",
+    );
+}
+
+/// CONTRACT.md: "A change of structure that changes no data has no entry:
+/// ... a table made to inherit from another (`INHERIT`: each table's rows
+/// stay its own)". `plain (id, a, b)` made to inherit from `renamed_t (id,
+/// a)`: no entry, and each table's history read as before.
+#[test]
+fn a_table_made_to_inherit_from_another_has_no_entry() {
+    let mut s = Structure::start();
+    let last = last_history_id(&s.db);
+    s.send_ok(&[Migration::new(
+        "0004_inherit",
+        &[r#"ALTER TABLE "plain" INHERIT "renamed_t";"#],
+    )]);
+    let rows = history_after(&s.db, last);
+    assert!(
+        rows.is_empty(),
+        "a table made to inherit from another: no entry; got\n{}",
+        lines(&rows)
+    );
+    for (table, count) in [("plain", 2), ("renamed_t", 2)] {
+        let changes = changes_of(&s.read("user", table, &json!({ "key": { "id": 1 } })));
+        assert!(
+            changes.len() == count && changes.iter().all(|c| c["kind"] != "structure"),
+            "history of {table} {{ id: 1 }}: its own two changes, no structure entry; got\n{}",
+            lines(&changes)
+        );
+    }
 }

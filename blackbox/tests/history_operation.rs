@@ -115,6 +115,23 @@ fn every_argument_outside_the_rules_is_malformed_has_no_entry_and_is_recorded_re
         ("arguments null".to_owned(), Value::Null),
         ("`own` missing".to_owned(), without("own")),
         ("`table` missing".to_owned(), without("table")),
+        // CONTRACT.md: "neither is longer than 63 bytes".
+        (
+            "`table` of 64 bytes".to_owned(),
+            with("table", json!("t".repeat(64))),
+        ),
+        (
+            "`schema` of 64 bytes".to_owned(),
+            with("schema", json!("s".repeat(64))),
+        ),
+        (
+            "`table` of 32 two-byte letters (64 bytes)".to_owned(),
+            with("table", json!("é".repeat(32))),
+        ),
+        (
+            "`schema` of 22 three-byte letters (66 bytes)".to_owned(),
+            with("schema", json!("€".repeat(22))),
+        ),
     ];
     let bad: [(&str, Vec<Value>); 8] = [
         (
@@ -229,6 +246,17 @@ fn every_argument_outside_the_rules_is_malformed_has_no_entry_and_is_recorded_re
         "expected each malformed call recorded as a `host-call` refused with reason malformed, got:\n{}",
         blackbox::records::describe(&records.host_calls())
     );
+    // Names of 63 bytes are not malformed: no such table is there.
+    for (what, arguments) in [
+        ("`table` of 63 bytes", with("table", json!("t".repeat(63)))),
+        (
+            "`schema` of 63 bytes",
+            with("schema", json!("s".repeat(63))),
+        ),
+    ] {
+        let (_, answer) = read(&own, APP, &alice(), &history_with(&arguments));
+        assert_database_error(&answer, "42P01", &format!("`history` with {what}"));
+    }
     // A control: the same arguments, well formed, are read.
     let (_, changes, _) = read_ok(&own, APP, &alice(), &history_with(&base));
     assert_eq!(
@@ -1583,6 +1611,166 @@ fn json_null_reads_as_json_null_and_json_reads_as_jsonb() {
     );
 }
 
+/// CONTRACT.md, "Changes of structure that change data": "For a row's
+/// change, `changed` also names a `json` or `jsonb` column that went from
+/// JSON `null` to SQL null or back: the two are different values." On
+/// `docs (id, jb jsonb, js json)`, row 1 goes from JSON null to SQL null and
+/// back in each column, one column at a time; each update's `changed` names
+/// that column, and its `old` and `new` read as written (`values: "text"`).
+#[test]
+fn changed_names_a_json_column_that_went_from_json_null_to_sql_null_and_back() {
+    let (own, _db) = reader();
+    let steps = [
+        (
+            "insert into docs (id, jb, js) values (1, 'null', 'null')",
+            Value::Null,
+        ),
+        ("update docs set jb = NULL where id = 1", json!(["jb"])),
+        ("update docs set jb = 'null' where id = 1", json!(["jb"])),
+        ("update docs set js = NULL where id = 1", json!(["js"])),
+        ("update docs set js = 'null' where id = 1", json!(["js"])),
+    ];
+    for (sql, _) in &steps {
+        write(&own, APP, &alice(), "user", sql);
+    }
+    let (_, changes, _) = read_ok(
+        &own,
+        APP,
+        &alice(),
+        &public(
+            "user",
+            "docs",
+            &json!({ "key": { "id": 1 }, "values": "text" }),
+        ),
+    );
+    let rows = [
+        json!(["1", "null", "null"]),
+        json!(["1", null, "null"]),
+        json!(["1", "null", "null"]),
+        json!(["1", "null", null]),
+        json!(["1", "null", "null"]),
+    ];
+    let mut want = Vec::new();
+    for (i, (_, changed)) in steps.iter().enumerate() {
+        want.push(json!({
+            "kind": if i == 0 { "insert" } else { "update" },
+            "old": if i == 0 { Value::Null } else { rows[i - 1].clone() },
+            "new": rows[i],
+            "changed": changed,
+        }));
+    }
+    want.reverse();
+    let got: Vec<Value> = changes
+        .iter()
+        .map(|c| json!({ "kind": c["kind"], "old": c["old"], "new": c["new"], "changed": c["changed"] }))
+        .collect();
+    assert_eq!(
+        got, want,
+        "expected each update of a json or jsonb column between JSON null and SQL null recorded, `changed` naming the column, newest first"
+    );
+}
+
+/// CONTRACT.md: "a `jsonb` (or `json`) column that held JSON `null` reads
+/// as JSON `null`", here among the 50 rows of one statement: some hold JSON
+/// null in `jb`, some in `js`, some in neither (SQL null or an object).
+/// Read with `values: "text"`, each insert's `new` is the row as written.
+/// Then one statement turns `jb`'s JSON null into SQL null on every row:
+/// each row that held it has `changed` `["jb"]`, `old` and `new` as they
+/// were; no other row's change names `jb`.
+#[test]
+fn json_null_among_the_many_rows_of_one_statement_reads_as_written() {
+    let (own, _db) = reader();
+    write(
+        &own,
+        APP,
+        &alice(),
+        "user",
+        "insert into docs (id, jb, js)
+         select g,
+                case g % 3 when 0 then 'null'::jsonb when 1 then jsonb_build_object('a', g) else NULL end,
+                case g % 3 when 1 then 'null'::json when 0 then json_build_object('b', g) else json_build_object('c', g) end
+           from generate_series(101, 150) g",
+    );
+    let jb = |g: i64| match g % 3 {
+        0 => json!("null"),
+        1 => json!(format!("{{\"a\": {g}}}")),
+        _ => Value::Null,
+    };
+    let js = |g: i64| match g % 3 {
+        1 => json!("null"),
+        0 => json!(format!("{{\"b\": {g}}}")),
+        _ => json!(format!("{{\"c\": {g}}}")),
+    };
+    let (_, changes, _) = read_ok(
+        &own,
+        APP,
+        &alice(),
+        &public("user", "docs", &json!({ "values": "text", "limit": 1000 })),
+    );
+    let mut wrong = Vec::new();
+    for g in 101..=150_i64 {
+        let want = json!([g.to_string(), jb(g), js(g)]);
+        let found: Vec<&Value> = changes
+            .iter()
+            .filter(|c| c["key"] == json!({ "id": g }))
+            .collect();
+        if found.len() != 1 || found[0]["new"] != want {
+            wrong.push(format!(
+                "  row {g}: expected one insert of {want}, got {found:?}"
+            ));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "expected each of the 50 rows of one statement read as written:\n{}",
+        wrong.join("\n")
+    );
+    write(
+        &own,
+        APP,
+        &alice(),
+        "user",
+        "update docs set jb = case when jb = 'null'::jsonb then NULL else jb end where id between 101 and 150",
+    );
+    let (_, changes, _) = read_ok(
+        &own,
+        APP,
+        &alice(),
+        &public("user", "docs", &json!({ "values": "text", "limit": 1000 })),
+    );
+    let mut wrong = Vec::new();
+    for g in 101..=150_i64 {
+        let updates: Vec<&Value> = changes
+            .iter()
+            .filter(|c| c["key"] == json!({ "id": g }) && c["kind"] == "update")
+            .collect();
+        if g % 3 == 0 {
+            let want_old = json!([g.to_string(), "null", js(g)]);
+            let want_new = json!([g.to_string(), null, js(g)]);
+            let fine = updates.len() == 1
+                && updates[0]["changed"] == json!(["jb"])
+                && updates[0]["old"] == want_old
+                && updates[0]["new"] == want_new;
+            if !fine {
+                wrong.push(format!(
+                    "  row {g}: expected one update, `changed` [\"jb\"], from {want_old} to {want_new}; got {updates:?}"
+                ));
+            }
+        } else if updates.iter().any(|u| {
+            u["changed"]
+                .as_array()
+                .is_some_and(|c| c.contains(&json!("jb")))
+        }) {
+            wrong.push(format!("  row {g}: `jb` did not change, yet {updates:?}"));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "expected the statement's change of JSON null to SQL null recorded on exactly the rows that held it:\n{}",
+        wrong.join("\n")
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 10. The limits.
 // ---------------------------------------------------------------------------
@@ -1689,29 +1877,45 @@ fn an_answer_over_8_mib_is_ended_at_the_bytes_limit() {
         "user",
         "insert into big (id, body) select g, repeat('x', 100000) from generate_series(1, 100) g",
     );
+    // 100 changes of 100,000 bytes are 10 MB, over 8 MiB; 70 of them, 7 MB,
+    // are under. The fixture answers a summary of the changes (their count,
+    // ids and the lengths of their values), since the harness reads no
+    // answer over 4 MiB.
     for (extra, fits) in [
         (json!({}), false),
         (json!({ "values": "text" }), false),
-        (json!({ "limit": 50 }), true),
+        (json!({ "limit": 70 }), true),
+        (json!({ "limit": 70, "values": "text" }), true),
     ] {
-        let (response, answers) =
-            run_for(&own, &alice(), APP, &[public("user", "big", &extra)], 60);
+        let (response, answers) = own.run_body(
+            &alice(),
+            APP,
+            &json!({ "calls": [public("user", "big", &extra)], "summary": true }),
+            Duration::from_secs(60),
+        );
         let context = format!("100 changes of 100,000 bytes each, read with {extra}");
         if fits {
-            let changes = ok_changes(&answers[0], &context);
-            assert_eq!(changes.len(), 50, "{context}");
+            let summary = &answers[0]["ok_summary"];
+            assert_eq!(
+                summary["change_count"], 70,
+                "{context}: expected the 70 changes answered (7 MB, under 8 MiB), got {}",
+                answers[0]
+            );
             assert!(
-                changes
-                    .iter()
-                    .all(|c| c["new"][1].as_str().map(str::len) == Some(100_000)),
-                "{context}: every body whole"
+                summary["bytes"].as_u64().is_some_and(|b| b > 7_000_000),
+                "{context}: the harness's own check: the answer's changes are over 7 MB as JSON, got {summary}"
+            );
+            let lengths = summary["lengths"].as_array().cloned().unwrap_or_default();
+            assert!(
+                lengths.len() == 70 && lengths.iter().all(|l| l[1] == 100_000),
+                "{context}: every body whole, got lengths {lengths:?}"
             );
             assert_history_entry(
                 &the_entry(&own, &response),
                 &response.request_id(),
                 "alice",
                 APP,
-                &ReadEntry::allowed("user", "public", "big", 50),
+                &ReadEntry::allowed("user", "public", "big", 70),
                 &context,
             );
         } else {
@@ -1790,6 +1994,66 @@ fn a_read_when_the_own_database_cannot_be_reached_is_unavailable() {
         );
         thread::sleep(Duration::from_millis(250));
     }
+}
+
+/// CONTRACT.md, "Limits": "When ... the shipment before the read fails
+/// otherwise than by taking too long: `{ error: { kind: \"unavailable\" }
+/// }`". Caused from outside: the Postgres administrator adds to
+/// `change_history` a check that no row passes (`NOT VALID`, so the rows
+/// there stay), so that writing a batch fails at once with `23514`. A
+/// change is written, then read: the read is `unavailable`, its entry
+/// failed with `unavailable`. Once the check is gone a read answers the
+/// change.
+#[test]
+fn a_read_whose_shipment_fails_otherwise_than_by_taking_too_long_is_unavailable() {
+    let (own, db) = reader();
+    write(
+        &own,
+        APP,
+        &alice(),
+        "user",
+        "insert into things (id, title) values (7, 'seven')",
+    );
+    let call = public("user", "things", &json!({ "key": { "id": 7 } }));
+    read_ok(&own, APP, &alice(), &call);
+    let platform = blackbox::history::platform_sql(&db);
+    platform.batch(
+        "ALTER TABLE change_history ADD CONSTRAINT vm_blackbox_refuses_all CHECK (false) NOT VALID",
+    );
+    write(
+        &own,
+        APP,
+        &alice(),
+        "user",
+        "update things set title = 'held back' where id = 7",
+    );
+    let began = Instant::now();
+    let (response, answers) = run_for(&own, &alice(), APP, std::slice::from_ref(&call), 40);
+    let took = began.elapsed();
+    platform.batch("ALTER TABLE change_history DROP CONSTRAINT vm_blackbox_refuses_all");
+    assert_eq!(
+        answers[0],
+        json!({ "error": { "kind": "unavailable" } }),
+        "a read whose shipment fails (change_history refuses every row, 23514), answered after {took:?}"
+    );
+    assert!(
+        took < Duration::from_secs(9),
+        "expected the read ended by the failure, not by the 10 s time limit; it took {took:?}"
+    );
+    assert_history_entry(
+        &the_entry(&own, &response),
+        &response.request_id(),
+        "alice",
+        APP,
+        &ReadEntry::failed("user", "public", "things", "unavailable"),
+        "the entry of the read whose shipment failed",
+    );
+    let (_, changes, _) = read_ok(&own, APP, &alice(), &call);
+    assert_eq!(
+        column_values(&changes, 1),
+        vec![json!("held back"), json!("seven")],
+        "once change_history takes rows again, a read answers the change that was held back"
+    );
 }
 
 // ---------------------------------------------------------------------------

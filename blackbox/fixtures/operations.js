@@ -16,7 +16,11 @@
 //   summary     an answer { ok: ... } is replaced by
 //               { ok_summary: { columns, row_count, rows_affected, bytes } },
 //               bytes being the length of its rows as JSON (for results too
-//               large to send back)
+//               large to send back); an answer of `history`, { ok: { columns,
+//               changes } }, by { ok_summary: { columns, change_count, bytes,
+//               ids, lengths } }, bytes the length of its changes as JSON,
+//               ids each change's id, lengths the length of each change's
+//               `new` values that are strings
 //   pauseMs     a pause between calls
 //
 // Answers { answers: [ <what invoke resolved to, or { threw: <message> }> ],
@@ -44,6 +48,19 @@ function call(c) {
 }
 
 function summarize(answer) {
+  if (answer && answer.ok && Array.isArray(answer.ok.changes)) {
+    return {
+      ok_summary: {
+        columns: answer.ok.columns,
+        change_count: answer.ok.changes.length,
+        bytes: JSON.stringify(answer.ok.changes).length,
+        ids: answer.ok.changes.map((c) => c.id),
+        lengths: answer.ok.changes.map((c) =>
+          Array.isArray(c.new) ? c.new.map((v) => (typeof v === "string" ? v.length : null)) : null,
+        ),
+      },
+    };
+  }
   if (answer && answer.ok && Array.isArray(answer.ok.rows)) {
     return {
       ok_summary: {
