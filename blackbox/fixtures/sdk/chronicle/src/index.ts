@@ -31,6 +31,9 @@
 //   /forged?as=&op=insert|update|delete
 //                               a write through ./forged.ts (vm.history
 //                               declared by the Application)
+//   /forged-vm?as=&op=select|delete&table=&column=
+//                               a read or a delete through a table of vm the
+//                               test names, declared by the Application
 //   /exports                    the names @vm/sdk exports, those whose value
 //                               is a Drizzle table, and the properties of
 //                               each own handle that mention history
@@ -42,7 +45,7 @@ import { incidents } from "../resources/devops/schema.ts";
 import { notes as sharedNotes } from "../resources/ops/schema.ts";
 import { archivedNotes, events, orderLines, recast, reshaped, tasks } from "./db/schema.ts";
 import { describe, describeError } from "./describe.ts";
-import { forgedHistory } from "./forged.ts";
+import { forgedHistory, forgedVmTable } from "./forged.ts";
 
 const json = (value: unknown, status = 200) => Response.json(value, { status });
 
@@ -255,6 +258,20 @@ export default defineApp(manifest, {
             await own().update(forgedHistory).set({ userId: "mallory" }).where(eq(forgedHistory.tableName, "tasks"));
           } else {
             await own().delete(forgedHistory).where(eq(forgedHistory.tableName, "tasks"));
+          }
+          return json({ resolved: true });
+        } catch (error) {
+          return json({ caught: describeError(error) });
+        }
+      }
+
+      case "/forged-vm": {
+        const table = forgedVmTable(q("table") ?? "", q("column") ?? "");
+        try {
+          if (q("op") === "select") {
+            await own().select().from(table);
+          } else {
+            await own().delete(table);
           }
           return json({ resolved: true });
         } catch (error) {

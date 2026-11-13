@@ -32,6 +32,9 @@ use blackbox::own_database::{Own, OwnDatabase, assert_ok, ident, own_execute};
 /// digest) and of every table of the Application's, and every sequence of
 /// the Application's.
 fn data(db: &OwnDatabase) -> String {
+    // What the writes left is shipped first, so that the outbox is not
+    // seen in the middle of a shipment.
+    blackbox::history::wait_shipped(db, 0);
     let mut text = String::new();
     for table in db.column(
         "SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -81,8 +84,8 @@ fn earlier_form_brought_to_three_roles(drop_the_role: bool) {
     let db = install_seeded(&own, APP);
     let before = data(&db);
     assert!(
-        before.contains("vm.keys: ") && before.contains("vm.history: "),
-        "the harness's own check: expected vm.keys and vm.history, got\n{before}"
+        before.contains("vm.keys: "),
+        "the harness's own check: expected vm.keys, got\n{before}"
     );
     // The earlier form: everything of the platform's back to the owner
     // role, which may log in.

@@ -4,7 +4,8 @@
 // `Change<typeof table>[]`, `Change` being a type @vm/sdk exports;
 // `changed` is `string[] | null`; a
 // change's `old` and `new` are the table's row as `select()` types it, or
-// null; `kind` and `actor` are their three words.
+// null; `kind` is its four words (`structure` since "The Change history in
+// the platform database") and `actor` its three.
 import { defineApp } from "@vm/sdk";
 import type { Change } from "@vm/sdk";
 import manifest from "../manifest.ts";
@@ -31,7 +32,8 @@ export default defineApp(manifest, {
 
     const shown: string[] = [];
     for (const change of changes) {
-      same<typeof change.kind, "insert" | "update" | "delete">(true);
+      // Since "The Change history in the platform database": `structure` too.
+      same<typeof change.kind, "insert" | "update" | "delete" | "structure">(true);
       same<typeof change.actor, "user" | "application" | "migration">(true);
       same<typeof change.id, string>(true);
       same<typeof change.at, Date>(true);

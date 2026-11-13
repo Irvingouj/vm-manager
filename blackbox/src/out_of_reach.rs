@@ -8,12 +8,13 @@
 //!   made captured tables (a partitioned one among them) and a sequence
 //!   `stash` (a value written into a sequence outlives a rollback, so it is
 //!   where a migration would carry something out of a refused Version), and
-//!   whose tables then got rows, and `vm.history` rows, from operations;
+//!   whose tables then got rows, and Change history rows, from operations;
 //! - [`untouched`]: everything a hostile migration might change, as one
 //!   text: the Application's part of the database ([`OwnDatabase::fingerprint`]:
 //!   its objects, every table's rows, every sequence's state, its roles) and
 //!   the platform's part (a digest of the keys, every row of every other
-//!   table of `vm`, the history and the record of migrations among them;
+//!   table of `vm`, the outbox and the record of migrations among them, and
+//!   the Application's rows of `change_history` once shipped;
 //!   the owner, rights, settings and body of every function of `vm`; every
 //!   relation and type of `vm`; every trigger of every table, by name,
 //!   enabling, function and object id; the platform's role and its
@@ -91,7 +92,7 @@ pub fn base_and(pending: &[Migration]) -> Vec<Migration> {
 }
 
 /// Writes rows through `application` as [`WRITER`], so that its tables and
-/// `vm.history` hold rows a hostile Version must leave alone. Every write
+/// its Change history hold rows a hostile Version must leave alone. Every write
 /// names its key, so that no sequence of the Application's moves.
 pub fn seed(own: &Own, application: &str) {
     let calls = [
@@ -378,11 +379,21 @@ pub fn platform_part_skipping(db: &OwnDatabase, skip: Option<&str>) -> String {
 
 /// Everything a hostile migration might change: the Application's part
 /// ([`OwnDatabase::fingerprint`]) and the platform's ([`platform_part`]).
+///
+/// What the writes so far left is shipped first, so that the outbox (in
+/// `vm`) is not seen in the middle of a shipment, and the Application's
+/// rows of `change_history` are part of it.
 pub fn untouched(db: &OwnDatabase) -> String {
+    let history = crate::history::history(db);
     format!(
-        "{}--- the platform's part ---\n{}",
+        "{}--- the platform's part ---\n{}--- change_history ---\n{}\n",
         db.fingerprint(),
-        platform_part(db)
+        platform_part(db),
+        history
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
     )
 }
 

@@ -18,7 +18,7 @@
 //! untouched`, and the capture triggers' very catalog rows); the Operation
 //! log entry of the `execute` or the `commit` is `failed` with `error`
 //! `VM004`; after a failed commit the transaction is over; the next honest
-//! write runs and is in `vm.history`. Where a deferred trigger the owner's
+//! write runs and is in the Change history. Where a deferred trigger the owner's
 //! code queued is what fails while the host makes deferred constraints
 //! immediate (`deferred-constraint-trigger-queued`), `42501` (Postgres's
 //! own error for that on 16 and 17) may stand in for `VM004`, in the
@@ -238,7 +238,7 @@ fn run_attacks(own: &Own, prefix: &str, attacks: Vec<Attack>) {
             assert!(
                 rows.iter()
                     .any(|r| r["table_name"] == "things" && r["new"]["id"] == 900),
-                "expected the next honest write in vm.history, got:\n{}",
+                "expected the next honest write in the Change history, got:\n{}",
                 lines(&rows)
             );
         }));

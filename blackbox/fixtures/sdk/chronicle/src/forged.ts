@@ -1,7 +1,14 @@
-// `vm.history` declared by the Application as a Drizzle table of its own
+// `vm.history` (there is no such table since "The Change history in the
+// platform database") declared by the Application as a Drizzle table of its own
 // (CONTRACT.md, "Reading the Change history: Only its own, and only to
 // read"). The SDK exports no such table; this one is written by hand.
 import { bigint, jsonb, pgSchema, text, timestamp } from "drizzle-orm/pg-core";
+
+// A table of `vm` the test names (the outbox among them, whatever its name:
+// CONTRACT.md, "The Change history in the platform database"), declared by
+// the Application with one of its columns, read as text.
+export const forgedVmTable = (table: string, column: string) =>
+  pgSchema("vm").table(table, { c: text(column) });
 
 export const forgedHistory = pgSchema("vm").table("history", {
   id: bigint("id", { mode: "bigint" }),

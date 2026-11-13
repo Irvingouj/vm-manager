@@ -42,6 +42,13 @@ const DENIED: Answers = &[failed("42501")];
 const TRUNCATE_REFUSED: Answers = &[failed("VM002")];
 /// CONTRACT.md: "`42501`, or another refusal of Postgres's own".
 const DENIED_ANY: Answers = &[failed(ANY_CODE)];
+/// CONTRACT.md, "The Change history in the platform database: Where it is
+/// kept": "In the own database there is no `vm.history`: for every role, a
+/// statement that names it fails with `42P01`."
+const HISTORY_GONE: Answers = &[failed("42P01")];
+/// Creating in `vm` is refused (`42501`) before the table it copies is
+/// looked up, or the other way round.
+const HISTORY_GONE_OR_DENIED: Answers = &[failed("42P01"), failed("42501")];
 
 #[test]
 fn a_migration_cannot_read_the_keys_or_carry_them_out() {
@@ -104,7 +111,7 @@ fn a_migration_cannot_change_lock_or_hang_anything_on_the_history_or_the_record_
     let mut cases = vec![
         case(
             "insert-history",
-            DENIED,
+            HISTORY_GONE,
             &[
                 r#"INSERT INTO vm.history (at, schema_name, table_name, kind, user_id, application, actor)
 VALUES (now(), 'public', 'things', 'insert', 'mallory', 'board', 'user')"#,
@@ -112,29 +119,29 @@ VALUES (now(), 'public', 'things', 'insert', 'mallory', 'board', 'user')"#,
         ),
         case(
             "update-history",
-            DENIED,
+            HISTORY_GONE,
             &["UPDATE vm.history SET user_id = 'mallory'"],
         ),
-        case("delete-history", DENIED, &["DELETE FROM vm.history"]),
-        case("truncate-history", DENIED, &["TRUNCATE vm.history"]),
+        case("delete-history", HISTORY_GONE, &["DELETE FROM vm.history"]),
+        case("truncate-history", HISTORY_GONE, &["TRUNCATE vm.history"]),
         case(
             "lock-history",
-            DENIED,
+            HISTORY_GONE,
             &["LOCK TABLE vm.history IN ACCESS EXCLUSIVE MODE"],
         ),
         case(
             "history-sequence",
-            DENIED,
+            HISTORY_GONE,
             &["SELECT setval(pg_get_serial_sequence('vm.history', 'id'), 1)"],
         ),
         case(
             "rule-on-history",
-            DENIED,
+            HISTORY_GONE,
             &[r#"CREATE RULE "quiet" AS ON INSERT TO vm.history DO INSTEAD NOTHING"#],
         ),
         case(
             "trigger-on-history",
-            DENIED,
+            HISTORY_GONE,
             &[
                 r#"CREATE FUNCTION "nop"() RETURNS trigger LANGUAGE plpgsql AS $f$ BEGIN RETURN NULL; END $f$"#,
                 r#"CREATE TRIGGER "quiet" BEFORE INSERT ON vm.history FOR EACH ROW EXECUTE FUNCTION "nop"()"#,
@@ -142,27 +149,27 @@ VALUES (now(), 'public', 'things', 'insert', 'mallory', 'board', 'user')"#,
         ),
         case(
             "child-of-history",
-            DENIED,
+            HISTORY_GONE,
             &[r#"CREATE TABLE "kid" () INHERITS (vm.history)"#],
         ),
         case(
             "policy-on-history",
-            DENIED,
+            HISTORY_GONE,
             &["ALTER TABLE vm.history ENABLE ROW LEVEL SECURITY"],
         ),
         case(
             "index-on-history",
-            DENIED,
+            HISTORY_GONE,
             &[r#"CREATE INDEX "mine" ON vm.history (user_id)"#],
         ),
         case(
             "reference-the-history",
-            DENIED,
+            HISTORY_GONE,
             &[r#"CREATE TABLE "pins" ("id" bigint REFERENCES vm.history ("id"))"#],
         ),
         case(
             "delete-history-through-dynamic-sql",
-            DENIED,
+            HISTORY_GONE,
             &[r#"SELECT "run_sql"('DELETE FROM vm.history')"#],
         ),
         case(
@@ -306,7 +313,7 @@ fn a_migration_cannot_create_in_vm_move_into_it_or_change_what_is_there() {
         ),
         case(
             "create-table-like-history-in-vm",
-            DENIED,
+            HISTORY_GONE_OR_DENIED,
             &[r#"CREATE TABLE vm."history_copy" (LIKE vm.history)"#],
         ),
         case(
@@ -337,28 +344,32 @@ fn a_migration_cannot_create_in_vm_move_into_it_or_change_what_is_there() {
         ),
         case(
             "rename-history",
-            DENIED,
+            HISTORY_GONE,
             &[r#"ALTER TABLE vm.history RENAME TO "history_old""#],
         ),
         case(
             "take-over-history",
-            DENIED,
+            HISTORY_GONE,
             &["ALTER TABLE vm.history OWNER TO {o}"],
         ),
-        case("drop-history", DENIED, &["DROP TABLE vm.history CASCADE"]),
+        case(
+            "drop-history",
+            HISTORY_GONE,
+            &["DROP TABLE vm.history CASCADE"],
+        ),
         case(
             "add-a-column-to-history",
-            DENIED,
+            HISTORY_GONE,
             &[r#"ALTER TABLE vm.history ADD COLUMN "x" integer"#],
         ),
         case(
             "disable-the-triggers-of-history",
-            DENIED,
+            HISTORY_GONE,
             &["ALTER TABLE vm.history DISABLE TRIGGER ALL"],
         ),
         case(
             "comment-on-history",
-            DENIED,
+            HISTORY_GONE,
             &["COMMENT ON TABLE vm.history IS 'mine'"],
         ),
         case(
@@ -379,7 +390,7 @@ fn a_migration_cannot_create_in_vm_move_into_it_or_change_what_is_there() {
         ),
         case(
             "restart-the-history-sequence",
-            DENIED,
+            HISTORY_GONE,
             &[
                 "DO $f$ BEGIN EXECUTE format('ALTER SEQUENCE %s RESTART', pg_get_serial_sequence('vm.history', 'id')); END $f$",
             ],
@@ -621,42 +632,45 @@ fn a_migration_cannot_truncate_a_table_that_has_history() {
     run_cases(&own, "truncate", cases);
 }
 
-/// CONTRACT.md: "It can still read `vm.history`, and `vm.identity()`,
-/// which during a migration answers the Contributor who sent the Version
-/// as `user_id`, `actor` `migration` and no request."
+/// CONTRACT.md: a migration can read `vm.identity()`, "which during a
+/// migration answers the Contributor who sent the Version as `user_id`,
+/// `actor` `migration` and no request"; and since "The Change history in
+/// the platform database" ("What the roles of an own database can and
+/// cannot do"): "a migration can no longer read the history at all"
+/// (`vm.history` is not there: `42P01`).
 #[test]
-fn a_migration_can_still_read_the_identity_and_the_history() {
+fn a_migration_can_still_read_the_identity_and_no_longer_the_history() {
     let own = start();
     let db = install_seeded(&own, APP);
     let sent = own.send(
         APP,
         &base_and(&[Migration::new(
             "0004_reads",
-            &[
-                r#"CREATE TABLE "history_seen" AS SELECT count(*) AS "n" FROM vm.history"#,
-                r#"CREATE TABLE "identity_seen" AS SELECT * FROM vm.identity()"#,
-            ],
+            &[r#"CREATE TABLE "history_seen" AS SELECT count(*) AS "n" FROM vm.history"#],
+        )]),
+    );
+    blackbox::out_of_reach::assert_answer(&sent, HISTORY_GONE, "0004_reads", None);
+    let sent = own.send(
+        APP,
+        &base_and(&[Migration::new(
+            "0004_reads",
+            &[r#"CREATE TABLE "identity_seen" AS SELECT * FROM vm.identity()"#],
         )]),
     );
     assert_eq!(
         sent.status,
         201,
-        "expected a migration that reads vm.history and vm.identity() to apply, got\n{}",
+        "expected a migration that reads vm.identity() to apply, got\n{}",
         sent.describe()
     );
-    assert!(db.has_table("history_seen") && db.has_table("identity_seen"));
-    assert_eq!(
-        db.column("SELECT n::text FROM history_seen"),
-        vec![blackbox::history::history_count(&db).to_string()],
-        "expected the migration to have read every row of vm.history"
-    );
+    assert!(db.has_table("identity_seen") && !db.has_table("history_seen"));
     let identity = blackbox::history::row_json(&db, "identity_seen", "true");
     assert_eq!(
         identity,
         json!({ "user_id": blackbox::INSTALLER, "application": APP, "actor": "migration", "request": null }),
         "expected vm.identity() during a migration to answer the Contributor, actor migration, no request"
     );
-    let _ = capture_trigger(&db, "history_seen", blackbox::out_of_reach::ON_INSERT);
+    let _ = capture_trigger(&db, "identity_seen", blackbox::out_of_reach::ON_INSERT);
 }
 
 /// CONTRACT.md: "a few such attempts Postgres answers with a warning and
@@ -916,10 +930,9 @@ fn shadows_of_what_the_capture_calls_do_not_change_what_is_recorded() {
     assert_eq!(row["new"]["title"], "shadowed", "{row}");
     assert_eq!(row["old"]["title"], "first thing", "{row}");
     assert_eq!(row["changed"], json!(["title"]), "{row}");
-    let recent = db
-        .superuser()
+    let recent = blackbox::history::platform_sql(&db)
         .value(&format!(
-            "SELECT (at >= '{before}'::timestamptz AND at <= clock_timestamp())::text FROM vm.history WHERE id = {}",
+            "SELECT (at >= '{before}'::timestamptz AND at <= clock_timestamp())::text FROM change_history WHERE application = '{APP}' AND id = {}",
             row["id"]
         ))
         .unwrap_or_default();

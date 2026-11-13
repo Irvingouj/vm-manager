@@ -428,10 +428,11 @@ pub fn assert_at_within(changes: &[Value], from: i64, to: i64, context: &str) {
 }
 
 /// Fails unless the request `response` answers made exactly one host
-/// operation, logged as one Operation log entry: `query` on the own
+/// operation, logged as one Operation log entry: `history` on the own
 /// database (`resource` null) as `actor`, for `user` in [`CHRONICLE`],
 /// `allowed`, with `rows` the number of changes answered, and a `statement`
-/// that reads from `vm.history` and holds none of `values`.
+/// `history "<schema>"."<table>"` that holds none of `values` (CONTRACT.md,
+/// "The Change history in the platform database: Through the SDK").
 pub fn assert_one_history_entry(
     sdk: &Sdk,
     response: &Response,
@@ -452,14 +453,13 @@ pub fn assert_one_history_entry(
     let request = response.request_id();
     let expected = Expected {
         rows: Some(u64::try_from(rows).unwrap_or(u64::MAX)),
-        ..Expected::own(&request, &user.id, CHRONICLE, actor, "query")
+        ..Expected::own(&request, &user.id, CHRONICLE, actor, "history")
     };
     assert_entry(entry, &expected, context);
     let statement = entry["statement"].as_str().unwrap_or_default();
-    let unquoted = statement.replace('"', "").to_ascii_lowercase();
     assert!(
-        unquoted.contains("vm.history"),
-        "{context}: expected the entry's `statement` to read from vm.history, got {statement:?}"
+        is_history_statement(statement),
+        "{context}: expected the entry's `statement` to be `history \"<schema>\".\"<table>\"`, got {statement:?}"
     );
     for value in values {
         assert!(
@@ -481,11 +481,26 @@ pub fn assert_one_history_entry(
         lines(&calls)
     );
     assert_eq!(
-        calls[0]["operation"], "query",
-        "{context}: the history(...) call is a `query`: {}",
+        calls[0]["operation"], "history",
+        "{context}: the history(...) call is one host operation `history`: {}",
         calls[0]
     );
     entry.clone()
+}
+
+/// Whether `statement` is `history "<schema>"."<table>"`: the two names
+/// quoted, nothing else.
+pub fn is_history_statement(statement: &str) -> bool {
+    let Some(rest) = statement.strip_prefix("history \"") else {
+        return false;
+    };
+    let Some((schema, table)) = rest.split_once("\".\"") else {
+        return false;
+    };
+    let Some(table) = table.strip_suffix('"') else {
+        return false;
+    };
+    !schema.is_empty() && !table.is_empty() && !schema.contains('"') && !table.contains('"')
 }
 
 /// Fails unless the request `response` answers sent nothing to the host:
@@ -548,8 +563,8 @@ pub fn task_key(id: i64) -> Value {
     json!({ "id": id })
 }
 
-/// Fails unless each change's `id` is the `vm.history.id` of its row, read
-/// by the harness's own superuser: the row of that id is of `schema.table`,
+/// Fails unless each change's `id` is the `change_history.id` of its row,
+/// read by the harness's own superuser in the platform database: the row of that id is of `schema.table`,
 /// with the change's kind, User, Application, actor and request.
 pub fn assert_ids_are_history_rows(
     db: &OwnDatabase,
@@ -564,7 +579,7 @@ pub fn assert_ids_are_history_rows(
         assert_eq!(
             rows.len(),
             1,
-            "{context}: expected the change's `id` {id} to be the id of a row of vm.history, found {rows:?}; the change: {change}"
+            "{context}: expected the change's `id` {id} to be the id of a row of change_history, found {rows:?}; the change: {change}"
         );
         let row = &rows[0];
         let text = |property: &str| -> Value {
@@ -583,7 +598,7 @@ pub fn assert_ids_are_history_rows(
         for (column, expected) in pairs {
             assert_eq!(
                 row[column], expected,
-                "{context}: the vm.history row of id {id} has `{column}` {}, the change says {expected}; the change: {change}",
+                "{context}: the change_history row of id {id} has `{column}` {}, the change says {expected}; the change: {change}",
                 row[column]
             );
         }

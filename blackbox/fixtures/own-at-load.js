@@ -1,6 +1,7 @@
 // An Application that calls the host at its top level, while it loads,
 // when no request is in flight: `query` and `execute` on its own database as
-// the User and as the Application, and `query` on the Resource `devops` as
+// the User and as the Application, `history` of its own database as both,
+// and `query` on the Resource `devops` as
 // the Application. CONTRACT.md: each is refused with `no-request`, which is
 // checked before anything else. The handler reports what each call got.
 //
@@ -15,6 +16,10 @@ const tries = {
     { own: true, as: "application", sql: "insert into notes (body) values ('written at load') returning id" },
   ],
   resource_as_application: ["query", { resource: "devops", as: "application", sql: "select 1 as one" }],
+  // CONTRACT.md, "The Change history in the platform database: Reading":
+  // `history` "is decided as a `query` on the own database is".
+  own_history_as_user: ["history", { own: true, as: "user", table: "notes" }],
+  own_history_as_application: ["history", { own: true, as: "application", table: "notes" }],
 };
 
 const message = (e) => String((e && e.message) || e);

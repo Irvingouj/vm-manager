@@ -7,8 +7,10 @@
 //!   (functions an Application's migration may make, `SECURITY INVOKER`,
 //!   which set any setting and then ask `vm.identity()` or write, in one
 //!   statement the statement check sees only as a `SELECT`);
-//! - `vm.history` read from the harness's superuser connection, and checks
-//!   of one row of it ([`Change`], [`assert_change`]);
+//! - the Change history read from the platform database's
+//!   `change_history` as the harness's superuser, for one Application,
+//!   once shipped ([`history`], [`wait_shipped`], [`ship`]), and checks of
+//!   one row of it ([`Change`], [`assert_change`]);
 //! - the global check that every history row of an Application's change
 //!   names a request, User and actor the Operation log has
 //!   ([`assert_history_matches_operation_log`]);
@@ -18,9 +20,12 @@
 //!   with guessed arguments, its relations, the values the runtime role
 //!   cannot read ([`secret_values`]) and their encodings ([`encodings`]).
 
+use std::time::{Duration, Instant};
+
 use serde_json::{Value, json};
 
 use crate::own_database::{Migration, Own, OwnDatabase, helpers, ident, literal};
+use crate::postgres::shared;
 use crate::scenario::op;
 use crate::sql::{DbError, Sql};
 
@@ -143,44 +148,168 @@ pub fn own_call(operation: &str, actor: &str, sql: &str, params: &Value) -> Valu
     )
 }
 
-/// Every row of `vm.history`, oldest first, as `to_jsonb` of the row (so
-/// with every column the table has, by name).
+/// The harness's superuser in the platform database of `db`'s program,
+/// where `change_history` is kept (CONTRACT.md, "The Change history in the
+/// platform database: Where it is kept": "The tests read this table as the
+/// Postgres administrator").
+pub fn platform_sql(db: &OwnDatabase) -> Sql {
+    Sql::connect(&shared().url(&db.platform))
+        .unwrap_or_else(|e| panic!("cannot reach the platform database {}: {e}", db.platform))
+}
+
+/// How long the tests wait for a change to be in `change_history` after
+/// its write was answered (CONTRACT.md, "Shipping: How soon": "within 10
+/// seconds of its write's answer (the tests wait that long)").
+pub const SHIPPED_WITHIN: Duration = Duration::from_secs(10);
+
+/// The number and the greatest id of `db`'s Application's rows of
+/// `change_history`.
+fn shipped_so_far(sql: &Sql, application: &str) -> String {
+    match sql.try_batch(&format!(
+        "SELECT count(*)::text || '/' || coalesce(max(id), 0)::text FROM change_history WHERE application = {}",
+        literal(application)
+    )) {
+        Ok(rows) => rows
+            .into_iter()
+            .next()
+            .and_then(|r| r.into_iter().next().flatten())
+            .unwrap_or_default(),
+        Err(e) => panic!(
+            "cannot read `change_history` in the platform database (CONTRACT.md: \"The history is in the platform database, in the table `change_history`\"): {e}"
+        ),
+    }
+}
+
+/// Waits for what the writes so far left to be shipped: until
+/// `change_history` holds no fewer rows of `db`'s Application than
+/// `at_least`, and then until it has stopped growing (the same for 400 ms),
+/// at most [`SHIPPED_WITHIN`]. Without a way to see the outbox (the
+/// platform's own affair) a change still on its way after that is taken as
+/// not there; a test that needs it at once forces a shipment instead
+/// ([`ship`]).
+pub fn wait_shipped(db: &OwnDatabase, at_least: usize) {
+    let sql = platform_sql(db);
+    let deadline = Instant::now() + SHIPPED_WITHIN;
+    let mut last = shipped_so_far(&sql, &db.application);
+    let mut since = Instant::now();
+    loop {
+        std::thread::sleep(Duration::from_millis(50));
+        let now = shipped_so_far(&sql, &db.application);
+        let count: usize = now
+            .split('/')
+            .next()
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(0);
+        if now != last {
+            last = now;
+            since = Instant::now();
+        } else if count >= at_least && since.elapsed() >= Duration::from_millis(400) {
+            return;
+        }
+        if Instant::now() >= deadline {
+            return;
+        }
+    }
+}
+
+/// Waits up to [`SHIPPED_WITHIN`] for `db`'s Application to have at least
+/// `count` rows of `change_history` satisfying `condition` (on the row
+/// `h`); returns how many it has.
+pub fn wait_for_history(db: &OwnDatabase, condition: &str, count: usize) -> usize {
+    let sql = platform_sql(db);
+    let deadline = Instant::now() + SHIPPED_WITHIN;
+    loop {
+        let n: usize = sql
+            .value(&format!(
+                "SELECT count(*)::text FROM change_history h WHERE h.application = {} AND ({condition})",
+                literal(&db.application)
+            ))
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        if n >= count || Instant::now() >= deadline {
+            return n;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Forces a shipment of `application`'s changes and waits for it: a read
+/// of the history (any table of its own) through a bundle that passes
+/// operations through ([`crate::own_database::FIXTURE`],
+/// `transactions.js`), as `user`. CONTRACT.md: "always before a read of the
+/// history that began after the write was answered gives its answer".
+/// Fails unless the read is answered `ok`.
+pub fn ship(own: &Own, user: &crate::User, application: &str, schema: &str, table: &str) {
+    let (_, answer) = own.one(
+        user,
+        application,
+        &op(
+            "history",
+            &json!({ "own": true, "as": "user", "schema": schema, "table": table, "limit": 1 }),
+        ),
+    );
+    assert!(
+        answer["ok"].is_object(),
+        "expected a read of the history of {schema}.{table} answered, to ship {application:?}'s changes; got {answer}"
+    );
+}
+
+/// Every row of `change_history` of `db`'s Application, oldest first, as
+/// `to_jsonb` of the row (so with every column the table has, by name),
+/// once what was written so far is shipped ([`wait_shipped`]).
 pub fn history(db: &OwnDatabase) -> Vec<Value> {
     history_where(db, "true")
 }
 
-/// The rows of `vm.history` that satisfy `condition`, oldest first.
+/// The rows of `change_history` of `db`'s Application that satisfy
+/// `condition` (on the row `h`), oldest first, once shipped.
 pub fn history_where(db: &OwnDatabase, condition: &str) -> Vec<Value> {
-    db.column(&format!(
-        "SELECT to_jsonb(h)::text FROM vm.history h WHERE {condition} ORDER BY h.id"
-    ))
-    .iter()
-    .map(|text| {
-        serde_json::from_str(text)
-            .unwrap_or_else(|e| panic!("a row of vm.history is not JSON ({e}): {text}"))
-    })
-    .collect()
+    wait_shipped(db, 0);
+    history_now(db, condition)
 }
 
-/// The rows of `vm.history` recorded after the one whose `id` is `after`.
+/// As [`history_where`] without waiting.
+pub fn history_now(db: &OwnDatabase, condition: &str) -> Vec<Value> {
+    platform_sql(db)
+        .batch(&format!(
+            "SELECT to_jsonb(h)::text FROM change_history h WHERE h.application = {} AND ({condition}) ORDER BY h.id",
+            literal(&db.application)
+        ))
+        .into_iter()
+        .map(|row| {
+            let text = row.into_iter().next().flatten().unwrap_or_default();
+            serde_json::from_str(&text)
+                .unwrap_or_else(|e| panic!("a row of change_history is not JSON ({e}): {text}"))
+        })
+        .collect()
+}
+
+/// The rows of `change_history` of `db`'s Application recorded after the
+/// one whose `id` is `after`, once shipped.
 pub fn history_after(db: &OwnDatabase, after: i64) -> Vec<Value> {
     history_where(db, &format!("h.id > {after}"))
 }
 
-/// The largest `id` in `vm.history`, 0 when it is empty.
+/// The largest `id` of `db`'s Application in `change_history`, 0 when it
+/// has none, once shipped.
 pub fn last_history_id(db: &OwnDatabase) -> i64 {
-    db.superuser()
-        .value("SELECT coalesce(max(id), 0)::text FROM vm.history")
+    wait_shipped(db, 0);
+    shipped_so_far(&platform_sql(db), &db.application)
+        .split('/')
+        .nth(1)
         .and_then(|v| v.parse().ok())
-        .unwrap_or_else(|| panic!("cannot read max(id) of vm.history in {}", db.name))
+        .unwrap_or(0)
 }
 
-/// The number of rows in `vm.history`.
+/// The number of rows of `db`'s Application in `change_history`, once
+/// shipped.
 pub fn history_count(db: &OwnDatabase) -> i64 {
-    db.superuser()
-        .value("SELECT count(*)::text FROM vm.history")
+    wait_shipped(db, 0);
+    shipped_so_far(&platform_sql(db), &db.application)
+        .split('/')
+        .next()
         .and_then(|v| v.parse().ok())
-        .unwrap_or_else(|| panic!("cannot count vm.history in {}", db.name))
+        .unwrap_or(0)
 }
 
 /// The time of the test Postgres now, as text it reads back: one end of a
@@ -191,7 +320,7 @@ pub fn db_now(db: &OwnDatabase) -> String {
         .unwrap_or_default()
 }
 
-/// Fails unless every row of `vm.history` with these ids has an `at`
+/// Fails unless every row of `change_history` with these ids has an `at`
 /// between `before` and `after` (both from [`db_now`]).
 pub fn assert_at_within(
     db: &OwnDatabase,
@@ -202,10 +331,11 @@ pub fn assert_at_within(
 ) {
     for row in rows {
         let id = &row["id"];
-        let inside = db.superuser().value(&format!(
-            "SELECT (at >= {}::timestamptz AND at <= {}::timestamptz)::text FROM vm.history WHERE id = {id}",
+        let inside = platform_sql(db).value(&format!(
+            "SELECT (at >= {}::timestamptz AND at <= {}::timestamptz)::text FROM change_history WHERE application = {} AND id = {id}",
             literal(before),
-            literal(after)
+            literal(after),
+            literal(&db.application)
         ));
         assert_eq!(
             inside.as_deref(),
@@ -232,16 +362,18 @@ pub fn table_rows(db: &OwnDatabase, table: &str) -> Vec<String> {
     ))
 }
 
-/// Every row of every captured table and of `vm.history`, as one text.
+/// Every row of every captured table, and the Application's rows of
+/// `change_history` (once shipped), as one text.
 pub fn snapshot(db: &OwnDatabase) -> String {
     let mut text = String::new();
-    for table in CAPTURED.iter().copied().chain(["vm.history"]) {
+    for table in CAPTURED {
         text.push_str(&format!("{table}: {:?}\n", table_rows(db, table)));
     }
+    text.push_str(&format!("change_history: {:?}\n", history(db)));
     text
 }
 
-/// What one row of `vm.history` must say. `at` and `id` are checked
+/// What one row of `change_history` must say. `at` and `id` are checked
 /// elsewhere.
 #[derive(Clone, Debug)]
 pub struct Change<'a> {
@@ -331,7 +463,7 @@ impl<'a> Change<'a> {
     }
 }
 
-/// Fails unless `row` of `vm.history` says what `want` says, column by
+/// Fails unless `row` of `change_history` says what `want` says, column by
 /// column as CONTRACT.md's table gives them.
 pub fn assert_change(row: &Value, want: &Change<'_>, context: &str) {
     let mut wrong = Vec::new();
@@ -356,6 +488,8 @@ pub fn assert_change(row: &Value, want: &Change<'_>, context: &str) {
     check("actor", json!(want.actor));
     check("request", json!(want.request));
     check("migration", json!(want.migration));
+    // CONTRACT.md, "Where it is kept": `structure` is "Null otherwise".
+    check("structure", Value::Null);
     if !row["id"].is_i64() {
         wrong.push(format!("  `id`: expected a number, got {}", row["id"]));
     }
@@ -378,7 +512,7 @@ pub fn assert_ids_increase(rows: &[Value], context: &str) {
     );
 }
 
-/// Fails unless every row of `vm.history` that is not a migration's names
+/// Fails unless every row of `change_history` that is not a migration's names
 /// a request, User, Application and actor that one entry of the Operation
 /// log has (an own-database operation of that request, made by that User
 /// in flight, acting as that actor), and none names anyone else: no change

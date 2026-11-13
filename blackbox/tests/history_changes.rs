@@ -4,15 +4,17 @@
 //! fifth acceptance criteria).
 //!
 //! Each row inserted, updated or deleted through `execute`, as the User or
-//! as the Application, leaves one row in `vm.history` in the same
-//! transaction: the table, the key as it was before (of the new row for an
+//! as the Application, leaves one row of Change history, written in the
+//! same transaction: the table, the key as it was before (of the new row for an
 //! insert; null without a primary key), the kind, the whole row before and
 //! after as `to_jsonb` gives it, the columns that differ in the table's
 //! order, the User in flight, the Application, the actor, the request's id
 //! as in the Operation log, and a time inside the test's window. Many-row
 //! statements leave one row per row; cascades and `ON CONFLICT DO UPDATE`
-//! are recorded like any change; a change rolled back leaves nothing; the
-//! runtime role may read `vm.history` through `query`.
+//! are recorded like any change; a change rolled back leaves nothing.
+//! Since "The Change history in the platform database" the rows are read
+//! from `change_history` (shipped there from the own database), and the
+//! Application reads them through `history`, no longer through `query`.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -494,8 +496,12 @@ fn a_change_that_is_rolled_back_or_fails_leaves_no_history_row() {
     }
 }
 
+/// CONTRACT.md, "The Change history in the platform database": the
+/// history is in `change_history` with the columns "Change history" gives
+/// and `structure`; an Application reads it through `history`, no longer
+/// through `query` (`vm.history` is not there: `42P01`).
 #[test]
-fn the_runtime_role_reads_vm_history_through_query_and_its_columns_have_the_contracts_types() {
+fn change_history_has_the_contracts_columns_and_the_application_reads_it_through_history() {
     let (own, db) = installed();
     execute_ok(
         &own,
@@ -504,15 +510,16 @@ fn the_runtime_role_reads_vm_history_through_query_and_its_columns_have_the_cont
         "insert into things (title) values ('to be read')",
     );
     execute_ok(&own, &bob(), "application", "update things set size = 5");
-    let types = db.rows(
+    let types = blackbox::history::platform_sql(&db).batch(
         "SELECT column_name::text, data_type::text FROM information_schema.columns
-          WHERE table_schema = 'vm' AND table_name = 'history' ORDER BY ordinal_position",
+          WHERE table_schema = 'public' AND table_name = 'change_history' ORDER BY ordinal_position",
     );
     let types: Vec<(String, String)> = types
         .into_iter()
         .map(|r| (r[0].clone().unwrap(), r[1].clone().unwrap()))
         .collect();
     for (column, ty) in [
+        ("application", "text"),
         ("id", "bigint"),
         ("at", "timestamp with time zone"),
         ("schema_name", "text"),
@@ -523,23 +530,22 @@ fn the_runtime_role_reads_vm_history_through_query_and_its_columns_have_the_cont
         ("new", "jsonb"),
         ("changed", "jsonb"),
         ("user_id", "text"),
-        ("application", "text"),
         ("actor", "text"),
         ("request", "text"),
         ("migration", "text"),
+        ("structure", "jsonb"),
     ] {
         assert!(
             types.contains(&(column.to_owned(), ty.to_owned())),
-            "expected vm.history to have a column {column} of type {ty}; its columns are {types:?}"
+            "expected change_history to have a column {column} of type {ty}; its columns are {types:?}"
         );
     }
-    let expected: Vec<Value> = history(&db)
+    let mut expected: Vec<Value> = history(&db)
         .iter()
         .map(|r| {
             json!([
                 r["id"].to_string(),
                 r["kind"],
-                r["table_name"],
                 r["user_id"],
                 r["actor"],
                 r["request"]
@@ -547,19 +553,37 @@ fn the_runtime_role_reads_vm_history_through_query_and_its_columns_have_the_cont
         })
         .collect();
     assert_eq!(expected.len(), 2);
+    expected.reverse();
     for actor in ACTORS {
         let (_, answer) = own.one(
             &alice(),
             APP,
-            &own_query(
-                actor,
-                "select id::text as id, kind, table_name, user_id, actor, request from vm.history order by id",
-            ),
+            &own_query(actor, "select id from vm.history"),
         );
         assert_eq!(
-            answer["ok"]["rows"],
-            Value::Array(expected.clone()),
-            "expected the Application to read its own history through query as the {actor}, got {answer}"
+            answer["error"]["code"], "42P01",
+            "expected `42P01` reading vm.history through query as the {actor}, got {answer}"
+        );
+        let (_, answer) = own.one(
+            &alice(),
+            APP,
+            &blackbox::scenario::op(
+                "history",
+                &json!({ "own": true, "as": actor, "table": "things" }),
+            ),
+        );
+        let got: Vec<Value> = answer["ok"]["changes"]
+            .as_array()
+            .map(|changes| {
+                changes
+                    .iter()
+                    .map(|c| json!([c["id"], c["kind"], c["user_id"], c["actor"], c["request"]]))
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(
+            got, expected,
+            "expected the Application to read its own history through `history` as the {actor}, newest first, got {answer}"
         );
     }
 }
@@ -577,11 +601,15 @@ fn a_bulk_write_records_every_row() {
     );
     let took = began.elapsed();
     assert_eq!(answer["ok"]["rows_affected"], 5000);
-    let counted = db
-        .superuser()
+    blackbox::history::wait_for_history(
+        &db,
+        &format!("h.id > {last} AND h.request = '{request}'"),
+        5000,
+    );
+    let counted = blackbox::history::platform_sql(&db)
         .value(&format!(
-            "SELECT count(*)::text || ' ' || count(DISTINCT key)::text FROM vm.history
-              WHERE id > {last} AND kind = 'insert' AND request = '{request}' AND user_id = 'alice' AND actor = 'user'"
+            "SELECT count(*)::text || ' ' || count(DISTINCT key)::text FROM change_history
+              WHERE application = '{APP}' AND id > {last} AND kind = 'insert' AND request = '{request}' AND user_id = 'alice' AND actor = 'user'"
         ))
         .unwrap();
     assert_eq!(

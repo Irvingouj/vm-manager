@@ -70,13 +70,17 @@ fn the_server_log_holds_no_secret_and_replaying_it_attaches_nothing() {
                 &json!([marker]),
             ),
             own_execute(actor, "update things set size = 1"),
-            own_query(
-                actor,
-                "select id, kind, user_id from vm.history order by id",
+            // CONTRACT.md, "The Change history in the platform database":
+            // the history is read through `history`, no longer `query`.
+            blackbox::scenario::op(
+                "history",
+                &json!({ "own": true, "as": actor, "table": "things" }),
             ),
         ];
         for call in &calls {
-            sent_sql.push(call["arguments"]["sql"].as_str().unwrap().to_owned());
+            if let Some(sql) = call["arguments"]["sql"].as_str() {
+                sent_sql.push(sql.to_owned());
+            }
         }
         let (_, answers) = own.run(&user, APP, &calls);
         for answer in &answers {

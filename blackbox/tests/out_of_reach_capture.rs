@@ -326,19 +326,18 @@ fn a_virtual_generated_column_is_recorded_as_null() {
             "expected the virtual generated column recorded as null, got {row}"
         );
     }
-    // Read back through the Application, as a history read is: a `query`
-    // on vm.history.
+    // Read back through the Application: the operation `history`.
     let (_, answer) = own.one(
         &User::new(WRITER),
         APP,
-        &blackbox::own_database::own_query(
-            "user",
-            "select new from vm.history where table_name = 'gen' order by id",
+        &blackbox::scenario::op(
+            "history",
+            &json!({ "own": true, "as": "user", "table": "gen" }),
         ),
     );
     assert_ok(&answer, "a read of the history of `gen`");
     assert_eq!(
-        answer["ok"]["rows"].as_array().map(Vec::len),
+        answer["ok"]["changes"].as_array().map(Vec::len),
         Some(3),
         "{answer}"
     );

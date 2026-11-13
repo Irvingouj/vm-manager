@@ -11,9 +11,10 @@
 //!   every digit, a timestamp, jsonb, an array), and `changed` by property
 //!   names (`dueAt`, not `due_at`);
 //! - read through `ctx.user().ownDb()` and `ctx.app().ownDb()` alike, each
-//!   call one `query` on the own database as the handle's actor, with one
-//!   Operation log entry whose statement reads `vm.history` and holds no
-//!   value;
+//!   call one host operation `history` on the own database as the handle's
+//!   actor, with one Operation log entry whose statement is `history
+//!   "<schema>"."<table>"` and holds no value (since "The Change history in
+//!   the platform database");
 //! - a composite key, a table in another schema, the history of a whole
 //!   table, the table without a primary key, a key that was updated, and
 //!   paging with `limit` and `before`.

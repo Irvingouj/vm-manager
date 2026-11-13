@@ -148,12 +148,14 @@ fn assert_written_truly_or_not_at_all(
     }
 }
 
-/// The rows of every relation in schema `vm` but `vm.history`, read by
-/// the superuser: to show the runtime role changed nothing there.
+/// The rows of every relation in schema `vm`, read by the superuser once
+/// what the writes left is shipped (so the outbox is not seen in the middle
+/// of a shipment): to show the runtime role changed nothing there.
 fn vm_rows(db: &OwnDatabase) -> String {
+    blackbox::history::wait_shipped(db, 0);
     let mut text = String::new();
     for relation in vm_relations(db) {
-        if relation.name == "history" || !["r", "p", "m"].contains(&relation.kind.as_str()) {
+        if !["r", "p", "m"].contains(&relation.kind.as_str()) {
             continue;
         }
         let rows = db
@@ -592,7 +594,7 @@ fn every_function_in_vm_called_with_guessed_arguments_attaches_nothing_and_shows
 }
 
 #[test]
-fn the_runtime_role_reads_vm_history_identity_and_ctx_and_nothing_else_in_vm() {
+fn the_runtime_role_reads_vm_identity_and_ctx_and_nothing_else_in_vm() {
     let (own, db) = installed();
     let (_, answer) = own.one(
         &alice(),
@@ -609,15 +611,18 @@ fn the_runtime_role_reads_vm_history_identity_and_ctx_and_nothing_else_in_vm() {
     ));
     assert_eq!(usage.as_deref(), Some("true"), "USAGE on schema vm");
     let relations = vm_relations(&db);
+    // CONTRACT.md, "The Change history in the platform database: Where it
+    // is kept": "In the own database there is no `vm.history`: for every
+    // role, a statement that names it fails with `42P01`."
     assert!(
-        relations.iter().any(|r| r.name == "history"),
-        "expected vm.history, got {relations:#?}"
+        !relations.iter().any(|r| r.name == "history"),
+        "expected no vm.history, got {relations:#?}"
     );
     let sql = session_as(&db, Some(&db.runtime));
     let history_read = sql.try_coded("SELECT * FROM vm.history");
     assert!(
-        matches!(&history_read, Ok(rows) if rows.len() == 1),
-        "expected the runtime role to read vm.history, got {history_read:?}"
+        matches!(&history_read, Err(e) if e.code == "42P01"),
+        "expected `42P01` for vm.history as the runtime role, got {history_read:?}"
     );
     let ctx = sql.try_coded("SELECT current_setting('vm.ctx', true)");
     assert!(ctx.is_ok(), "expected vm.ctx readable, got {ctx:?}");
@@ -629,7 +634,7 @@ fn the_runtime_role_reads_vm_history_identity_and_ctx_and_nothing_else_in_vm() {
     let mut readable = Vec::new();
     let mut unreadable_tables = 0;
     for relation in &relations {
-        if relation.name == "history" || relation.kind == "S" {
+        if relation.kind == "S" {
             continue;
         }
         let name = format!("vm.{}", ident(&relation.name));
@@ -663,7 +668,7 @@ fn the_runtime_role_reads_vm_history_identity_and_ctx_and_nothing_else_in_vm() {
     }
     assert!(
         readable.is_empty(),
-        "expected the runtime role to read nothing in vm but vm.history (CONTRACT.md: it can read vm.identity(), vm.ctx, vm.history), but:\n{}",
+        "expected the runtime role to read no relation in vm, the outbox among them (CONTRACT.md, \"What the roles of an own database can and cannot do\": \"the runtime role can read `vm.identity()` and `vm.ctx` only\"), but:\n{}",
         readable.join("\n")
     );
     assert!(
@@ -761,6 +766,18 @@ fn the_runtime_role_cannot_stop_the_capture() {
         "ALTER TABLE things SET SCHEMA vm".to_owned(),
         "CREATE TABLE things_copy AS SELECT * FROM things".to_owned(),
     ]);
+    // The outbox, whatever its name: every table of vm.
+    for relation in vm_relations(&db) {
+        if ["r", "p"].contains(&relation.kind.as_str()) {
+            let name = format!("vm.{}", ident(&relation.name));
+            statements.extend([
+                format!("TRUNCATE {name}"),
+                format!("DROP TABLE {name}"),
+                format!("ALTER TABLE {name} DISABLE TRIGGER ALL"),
+                format!("LOCK TABLE {name} IN ACCESS EXCLUSIVE MODE"),
+            ]);
+        }
+    }
     let vm_before = vm_rows(&db);
     let platform_before = db.platform_schema();
     let fingerprint_before = db.fingerprint();
@@ -862,8 +879,13 @@ fn ident_path(name: &str) -> String {
     name.split('.').map(ident).collect::<Vec<_>>().join(".")
 }
 
+/// CONTRACT.md, "The Change history in the platform database": no
+/// `vm.history` (`42P01`), and the outbox, "the platform's own affair":
+/// "For the migration role and the runtime role, reading it, writing it,
+/// locking it or truncating it fails with `42501`". The outbox's name is
+/// the platform's own; every table of `vm` is tried.
 #[test]
-fn the_runtime_role_cannot_insert_update_or_delete_history_rows() {
+fn the_runtime_role_cannot_read_or_change_the_outbox_and_there_is_no_vm_history() {
     let (own, db) = installed();
     for actor in ACTORS {
         let (_, answer) = own.one(
@@ -876,57 +898,106 @@ fn the_runtime_role_cannot_insert_update_or_delete_history_rows() {
     let rows = history(&db);
     assert_eq!(rows.len(), 2, "{}", lines(&rows));
     let before = snapshot(&db);
-    let forged_row = "INSERT INTO vm.history (at, schema_name, table_name, kind, key, old, new, changed, user_id, application, actor, request, migration)
-                      VALUES (now(), 'public', 'things', 'insert', '{\"id\": 1}', NULL, '{\"id\": 1}', NULL, 'mallory', 'board', 'user', 'forged', NULL)";
-    let statements = [
-        forged_row.to_owned(),
-        "INSERT INTO vm.history SELECT * FROM vm.history".to_owned(),
-        "UPDATE vm.history SET user_id = 'mallory'".to_owned(),
-        "UPDATE vm.history SET new = NULL".to_owned(),
+    let vm_before = vm_rows(&db);
+    let forged = "(now(), 'public', 'things', 'insert', '{\"id\": 1}', NULL, '{\"id\": 1}', NULL, 'mallory', 'board', 'user', 'forged', NULL)";
+    // (statement, the SQLSTATE it must fail with)
+    let mut statements: Vec<(String, &str)> = [
+        format!("INSERT INTO vm.history (at, schema_name, table_name, kind, key, old, new, changed, user_id, application, actor, request, migration) VALUES {forged}"),
+        "SELECT * FROM vm.history".to_owned(),
         "DELETE FROM vm.history".to_owned(),
-        format!("DELETE FROM vm.history WHERE id = {}", rows[0]["id"]),
         "TRUNCATE vm.history".to_owned(),
-        "SELECT * FROM vm.history FOR UPDATE".to_owned(),
-        "COPY vm.history FROM '/dev/null'".to_owned(),
-        "SELECT run_sql('DELETE FROM vm.history')".to_owned(),
-        "SELECT run_sql('UPDATE vm.history SET user_id = ''mallory''')".to_owned(),
-    ];
+        "LOCK TABLE vm.history".to_owned(),
+    ]
+    .into_iter()
+    .map(|s| (s, "42P01"))
+    .collect();
+    let tables: Vec<_> = vm_relations(&db)
+        .into_iter()
+        .filter(|r| ["r", "p"].contains(&r.kind.as_str()))
+        .collect();
+    assert!(
+        !tables.is_empty(),
+        "the harness's own check: expected tables in vm, the outbox among them"
+    );
+    for table in &tables {
+        let name = format!("vm.{}", ident(&table.name));
+        let first = table.columns.first().map_or("x".to_owned(), |c| ident(c));
+        statements.extend(
+            [
+                format!("SELECT * FROM {name}"),
+                format!("SELECT count(*) FROM {name}"),
+                format!("INSERT INTO {name} DEFAULT VALUES"),
+                format!("INSERT INTO {name} SELECT * FROM {name}"),
+                format!("UPDATE {name} SET {first} = {first}"),
+                format!("DELETE FROM {name}"),
+                format!("TRUNCATE {name}"),
+                format!("SELECT * FROM {name} FOR UPDATE"),
+                format!("LOCK TABLE {name} IN ACCESS SHARE MODE"),
+                format!("LOCK TABLE {name} IN ACCESS EXCLUSIVE MODE"),
+            ]
+            .into_iter()
+            .map(|s| (s, "42501")),
+        );
+    }
     let sql = session_as(&db, Some(&db.runtime));
-    let mut allowed = Vec::new();
-    for statement in &statements {
-        if sql.try_coded(statement).is_ok() {
-            allowed.push(format!("  {statement}"));
+    let mut wrong = Vec::new();
+    for (statement, code) in &statements {
+        sql.batch("BEGIN");
+        match sql.try_coded(statement) {
+            Err(e) if e.code == *code => {}
+            other => wrong.push(format!("  {statement}: expected {code}, got {other:?}")),
         }
+        sql.batch("ROLLBACK");
     }
     drop(sql);
     assert!(
-        allowed.is_empty(),
-        "expected Postgres to refuse each of these to the runtime role, but it allowed:\n{}",
-        allowed.join("\n")
+        wrong.is_empty(),
+        "expected Postgres to refuse each of these to the runtime role as CONTRACT.md says, but:\n{}",
+        wrong.join("\n")
     );
     assert_eq!(snapshot(&db), before);
+    assert_eq!(vm_rows(&db), vm_before);
     // Through the program: directly (the statement check allows INSERT,
     // UPDATE and DELETE), through run_sql, and through ts_stat.
     for actor in ACTORS {
-        let mut calls: Vec<Value> = [
-            forged_row.to_owned(),
-            "update vm.history set user_id = 'mallory'".to_owned(),
-            "delete from vm.history".to_owned(),
-            "with d as (delete from vm.history returning id) select id from d".to_owned(),
-            "select run_sql('delete from vm.history') as done".to_owned(),
-            "select run_sql('truncate vm.history') as done".to_owned(),
-            "select run_sql('truncate things') as done".to_owned(),
-            "select * from ts_stat($q$with d as (delete from vm.history returning id) select to_tsvector('simple', id::text) from d$q$)".to_owned(),
-        ]
-        .iter()
-        .map(|s| own_execute(actor, s))
-        .collect();
-        calls.push(own_query(actor, "delete from vm.history"));
-        let (_, answers) = own.run(&bob(), APP, &calls);
-        for (call, answer) in calls.iter().zip(&answers) {
+        let mut calls: Vec<(Value, &str)> = vec![
+            (own_execute(actor, "delete from vm.history"), "42P01"),
+            (own_query(actor, "select * from vm.history"), "42P01"),
+        ];
+        for table in &tables {
+            let name = format!("vm.{}", ident(&table.name));
+            calls.extend([
+                (own_query(actor, &format!("select * from {name}")), "42501"),
+                (own_execute(actor, &format!("delete from {name}")), "42501"),
+                (
+                    own_execute(
+                        actor,
+                        &format!("select run_sql('delete from {name}') as done"),
+                    ),
+                    "42501",
+                ),
+                (
+                    own_execute(
+                        actor,
+                        &format!("select run_sql('truncate {name}') as done"),
+                    ),
+                    "42501",
+                ),
+                (
+                    own_execute(
+                        actor,
+                        &format!("select * from ts_stat($q$with d as (delete from {name} returning 1) select to_tsvector('simple', '1') from d$q$)"),
+                    ),
+                    "42501",
+                ),
+            ]);
+        }
+        let only: Vec<Value> = calls.iter().map(|(c, _)| c.clone()).collect();
+        let (_, answers) = own.run(&bob(), APP, &only);
+        for ((call, code), answer) in calls.iter().zip(&answers) {
             assert!(
-                answer.get("ok").is_none(),
-                "expected {call} as the {actor} to fail, got {answer}"
+                answer["error"]["code"] == *code,
+                "expected {call} as the {actor} to fail with {code}, got {answer}"
             );
         }
         assert_eq!(
@@ -942,8 +1013,9 @@ fn the_runtime_role_cannot_insert_update_or_delete_history_rows() {
         &own_execute("user", "update things set size = 1"),
     );
     assert_ok(&answer, "an update");
+    blackbox::history::wait_shipped(&db, 4);
     assert_eq!(history(&db).len(), 4);
-    assert_history_matches_operation_log(&own, &db, "after the attempts on vm.history");
+    assert_history_matches_operation_log(&own, &db, "after the attempts on the outbox");
 }
 
 #[test]
