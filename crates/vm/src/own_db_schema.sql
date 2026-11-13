@@ -449,9 +449,8 @@ $f$;
 -- one and keeps it until the transaction ends; one made in a
 -- subtransaction that was rolled back was let go with it, and so was what
 -- it changed. The host sends it in the same simple query as the `COMMIT`,
--- before and again after `SET CONSTRAINTS ALL IMMEDIATE` and `CLOSE ALL`,
--- so a raised error turns the commit into a rollback and nothing runs
--- between the last check and the commit. The
+-- after `SET CONSTRAINTS ALL IMMEDIATE` and `CLOSE ALL`, so a raised error
+-- turns the commit into a rollback and nothing runs in between. The
 -- runtime role may call it itself, to no end: it reads the lock manager's
 -- own view of this session, and it cannot be replaced (the platform's
 -- role owns it and `vm`).
@@ -498,31 +497,37 @@ SELECT c.oid, c.oid::pg_catalog.regclass::text,
    AND pg_catalog.left(n.nspname, 3) <> 'pg_'
 $f$;
 
--- Whether the object `p_object` of the catalog `p_catalog` is code of the
--- Application's for `index-code`: neither Postgres's own (made by initdb,
--- so with an object id below 16384, FirstNormalObjectId) nor a member of
--- an extension (a `pg_depend` row of kind 'e' to it; a trusted extension's
--- members belong to the bootstrap superuser, an untrusted one's needed a
--- superuser to make). Whoever owns it: the migration role, or the runtime
--- role where a migration let it create.
-CREATE OR REPLACE FUNCTION vm.application_code(p_catalog oid, p_object oid) RETURNS boolean
+-- Whether what the role `p_owner` owns is code of the Application's for
+-- `index-code`: owned by any role but a superuser and the platform's role
+-- of the database (which owns `vm`). Postgres's own functions, and a
+-- trusted extension's, belong to the bootstrap superuser; nothing of the
+-- platform's can be changed by a role of the Application's. Membership of
+-- an extension says nothing: the migration role owns a trusted extension
+-- it installs and may add its own code to it (`ALTER EXTENSION ... ADD`),
+-- still owning that code (research part F, "An extension's membership is
+-- not a mark of trust"). So every other owner is a role of the
+-- Application's: the migration role, or the runtime role where a migration
+-- let it create.
+CREATE OR REPLACE FUNCTION vm.application_owned(p_owner oid) RETURNS boolean
 LANGUAGE sql STABLE PARALLEL UNSAFE
 SET search_path = pg_catalog, pg_temp
 AS $f$
-SELECT p_object >= 16384::pg_catalog.oid
-   AND NOT EXISTS (SELECT FROM pg_catalog.pg_depend e
-                    WHERE e.classid = p_catalog AND e.objid = p_object
-                      AND e.refclassid = 'pg_catalog.pg_extension'::pg_catalog.regclass
-                      AND e.deptype = 'e')
+SELECT NOT EXISTS (SELECT FROM pg_catalog.pg_roles r WHERE r.oid = p_owner AND r.rolsuper)
+   AND p_owner <> (SELECT n.nspowner FROM pg_catalog.pg_namespace n WHERE n.nspname = 'vm')
 $f$;
+
+-- Earlier forms had `vm.application_code(oid, oid)`, by extension
+-- membership; it is gone.
+DROP FUNCTION IF EXISTS vm.application_code(oid, oid);
 
 -- What the platform refuses at the end of a migration, one row per
 -- finding: the rule (as the answer names it) and what was found, where,
 -- and what to do instead. No row: nothing to refuse. Called on the
--- migration role's own session: "the migrations wrote" is "the session's
--- user owns" (`SESSION_USER`, which no statement of a non-superuser
--- changes), so an extension's functions (owned by the bootstrap
--- superuser) are not counted.
+-- migration role's own session. `security-definer`: "the migrations'" is
+-- "the session's user owns" (`SESSION_USER`, which no statement of a
+-- non-superuser changes), a function a migration added to an extension
+-- among them. `index-code`: code a role of the Application's owns
+-- (`vm.application_owned`), whatever extension it was added to.
 CREATE OR REPLACE FUNCTION vm.capture_problems()
 RETURNS TABLE (rule text, message text)
 LANGUAGE sql STABLE PARALLEL UNSAFE
@@ -637,7 +642,7 @@ SELECT 'security-definer',
  WHERE p.prosecdef AND pg_catalog.pg_get_userbyid(p.proowner) = SESSION_USER
 UNION ALL
 SELECT 'index-code',
-       pg_catalog.format('the %s %s calls %s, which is neither Postgres''s own nor an extension''s: Postgres''s autovacuum would run it with the rights of the role that owns the Application''s tables, outside any transaction of the platform''s. Index or analyze Postgres''s own functions and operators only (or an extension''s), or keep the computed value in a column of its own',
+       pg_catalog.format('the %s %s calls %s, which a role of the Application''s owns: Postgres''s autovacuum would run it with the rights of the role that owns the Application''s tables, outside any transaction of the platform''s. Index or analyze Postgres''s own functions and operators only (or an extension''s), or keep the computed value in a column of its own',
                          x.what, x.name, x.called)
   FROM (SELECT DISTINCT
                CASE d.classid WHEN 'pg_catalog.pg_class'::pg_catalog.regclass THEN 'index'
@@ -668,18 +673,22 @@ SELECT 'index-code',
                     AND EXISTS (SELECT FROM pg_catalog.pg_constraint co
                                  WHERE co.oid = d.objid AND co.contype = 'x')))
            AND ((d.refclassid = 'pg_catalog.pg_proc'::pg_catalog.regclass
-                 AND vm.application_code('pg_catalog.pg_proc'::pg_catalog.regclass, d.refobjid))
+                 AND EXISTS (SELECT FROM pg_catalog.pg_proc p
+                              WHERE p.oid = d.refobjid AND vm.application_owned(p.proowner)))
              OR (d.refclassid = 'pg_catalog.pg_operator'::pg_catalog.regclass
                  AND EXISTS (SELECT FROM pg_catalog.pg_operator o
                               WHERE o.oid = d.refobjid
-                                AND vm.application_code('pg_catalog.pg_proc'::pg_catalog.regclass, o.oprcode)))
+                                AND EXISTS (SELECT FROM pg_catalog.pg_proc p
+                                             WHERE p.oid = o.oprcode AND vm.application_owned(p.proowner))))
              OR (d.refclassid = 'pg_catalog.pg_cast'::pg_catalog.regclass
                  AND EXISTS (SELECT FROM pg_catalog.pg_cast ca
                               WHERE ca.oid = d.refobjid AND ca.castfunc <> 0
-                                AND vm.application_code('pg_catalog.pg_proc'::pg_catalog.regclass, ca.castfunc)))
+                                AND EXISTS (SELECT FROM pg_catalog.pg_proc p
+                                             WHERE p.oid = ca.castfunc AND vm.application_owned(p.proowner))))
              OR (d.refclassid = 'pg_catalog.pg_type'::pg_catalog.regclass
-                 AND EXISTS (SELECT FROM pg_catalog.pg_type t WHERE t.oid = d.refobjid AND t.typtype = 'd')
-                 AND vm.application_code('pg_catalog.pg_type'::pg_catalog.regclass, d.refobjid)))) x
+                 AND EXISTS (SELECT FROM pg_catalog.pg_type t
+                              WHERE t.oid = d.refobjid AND t.typtype = 'd'
+                                AND vm.application_owned(t.typowner))))) x
 $f$;
 
 -- The migrations recorded, in order: what the host compares a Version's

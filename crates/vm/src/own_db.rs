@@ -183,7 +183,7 @@ fn vm_grants(owner: &str, runtime: &str) -> String {
          GRANT EXECUTE ON FUNCTION vm.capture_new_tables(), vm.capture_state(),
              vm.capture_problems(), vm.applied_migrations(),
              vm.structure_state(), vm.record_migration(integer, text, text),
-             vm.application_code(oid, oid) TO {owner};
+             vm.application_owned(oid) TO {owner};
          GRANT EXECUTE ON FUNCTION vm.before_commit() TO {runtime};"
     )
 }
