@@ -304,7 +304,9 @@ fn assert_capture_whole(db: &OwnDatabase, shape: &[String], change: Change) {
     }
     let kept: Vec<&String> = now
         .iter()
-        .filter(|l| !l.starts_with("made_outside "))
+        // `next` is the table the test's own Version makes in (b): its
+        // capture is new, not a difference.
+        .filter(|l| !l.starts_with("made_outside ") && !l.starts_with("next "))
         .collect();
     let before: Vec<&String> = shape.iter().collect();
     assert_eq!(
