@@ -71,7 +71,7 @@ The platform's record of every operation on a Resource: who, through which Appli
 _Avoid_: Audit trail (ambiguous between the two layers), access log
 
 **Change history**:
-The record, kept beside the data, of each row that was changed: old value, new value, who and through which Application. Readable by whoever may read the data.
+The record of each row that was changed in an Application's own database: old value, new value, who and through which Application. The platform keeps it in the platform database, out of reach of the database a Contributor's migrations run in (ADR 0017). Readable, through the Application, by whoever may use the Application.
 _Avoid_: Audit log, versioning, revision table
 
 ### People

@@ -453,6 +453,8 @@ For every operation on the own database the host attaches who the operation is f
 
 ### Change history
 
+(Since the ticket "The Change history lives in the platform database, shipped from an outbox" these rows are kept in the platform database's `change_history`, not in `vm.history`, and are read through the operation `history`: see "The Change history in the platform database". What a change records is as described here.)
+
 Every table an Application's migrations make, in any schema but `vm`, is captured from the end of the migration that made it, with nothing done by the Contributor. Each row inserted, updated or deleted leaves one row in `vm.history`, written in the same transaction as the change:
 
 | Column | Type | What |
@@ -824,9 +826,11 @@ This is the host's doing, on every connection it gives an Application; the runti
 - A materialized view cannot be refreshed at run time: its refresh runs the view's query as the owner and takes a lock that reading and writing rows does not need. It is filled when a migration makes it or refreshes it.
 - **Changes of structure that change data** leave no history row per changed row: a column's type changed with `USING`, a column or a table dropped, a table replaced under its name. The next ticket (the Change history in the platform database) records each as an entry of the table's history with the Contributor and the migration's name; the one after records each row a rewrite changed.
 - The Application's own triggers, which a migration may make on its own tables, change rows under the User in flight and are recorded so. That is the Application's behaviour, as any of its code is.
-- Until the next ticket the history is still in the own database, in `vm.history`, owned by the platform's role: no migration can touch it, but it is not yet outside.
+- (Closed by the next ticket: the history is in the platform database.)
 
 ## Reading the Change history (ticket: Read a row's Change history through the SDK)
+
+(How a read reaches the host, where the history is kept and what a `structure` entry is: see "The Change history in the platform database", which replaces what this section says of `vm.history` and of `query`.)
 
 An Application reads the Change history of its own database through the SDK, to show who changed what. Nothing restores from it.
 
@@ -886,3 +890,103 @@ for (const change of changes) {
 
 - The history an Application reads is its own database's. There is nothing by which Application code can name another Application's own database: `own: true` is always the database of the Application in flight. Two Applications with a table of the same name and a row of the same key each read only their own changes.
 - The SDK has no call that writes, changes or deletes history, and exports no table object for `vm.history`. An Application that declares `vm.history` as a Drizzle table of its own and inserts, updates or deletes through it gets `OperationFailed` of kind `database` with code `42501` (the runtime role may only read it), and the history is unchanged. So is one that does the same through the raw interface.
+
+## The Change history in the platform database (ticket: The Change history lives in the platform database, shipped from an outbox)
+
+ADR 0017, second slice. The Change history is no longer kept in the Application's own database. This section replaces what earlier sections say of the table `vm.history`, of reading it with `query`, and of how `history(...)` reaches the host; what they say of what a change records (its columns, one row per changed row, the identity, rolled-back changes, migrations' changes) holds as before.
+
+### Where it is kept
+
+- **In the own database there is no `vm.history`**: for every role, a statement that names it fails with `42P01`. The capture writes each change, in the same transaction as the change, to an outbox in `vm`. The outbox is the platform's own affair: only the platform's role can read or change it. For the migration role and the runtime role, reading it, writing it, locking it or truncating it fails with `42501`, as for anything else in `vm` they were not given.
+- **The history is in the platform database**, in the table `change_history`, one row per Application and change:
+
+| Column | Type | What |
+|---|---|---|
+| `application` | `text` | The Application's name. |
+| `id` | `bigint` | The change's id: increasing, per Application, in the order the changes were recorded. |
+| `at`, `schema_name`, `table_name`, `kind`, `key`, `old`, `new`, `changed`, `user_id`, `actor`, `request`, `migration` | | As "Change history" gives them. `kind` may also be `structure` (below). |
+| `structure` | `jsonb` | For `structure`: what changed. Null otherwise. |
+
+  `(application, id)` is unique. The tests read this table as the Postgres administrator; the rest of how the platform keeps it is its own affair.
+- **No role of an own database can connect to the platform database** (the platform's role for that database, the migration role, the runtime role: each attempt fails with `42501`), so none can read or change the history where it is kept. The program takes `CONNECT` on the platform database from `PUBLIC` when it starts. When it may not (IT made the database and owns it) and `PUBLIC` still has it, the program does not start: it exits with a status other than 0 and a `platform-database-open` record that gives the statement to run (`REVOKE CONNECT ON DATABASE ... FROM PUBLIC`).
+- **No API for Platform administrators reads the history.** `GET /v1/operation-log` shows that a history was read and of which table, never a row of it; no route under `/v1` answers changes.
+- An own database from before this ticket is brought to this form when the program starts, before it serves: what its `vm.history` held is in `change_history` afterwards (at the latest when its history is next read), each change once and with the `id` it had; later changes have greater ids.
+
+### Shipping
+
+The host ships what the outbox holds to `change_history` and then deletes it from the outbox.
+
+- **When.** After every `execute` and every committed transaction on the own database, **after it was answered** (the answer does not wait for the shipment); after a Version's migrations are committed and the Version answered; before every read of the history; and for every own database when the program starts, without delaying serving.
+- **Exactly once.** Every change that was committed is in `change_history` exactly once, and a change that was rolled back is never there. This holds also when:
+  - the program is stopped (killed) between a change's commit and its shipment, or in the middle of a shipment: after the next start the change is there, once;
+  - a shipment fails or is held up (the tests hold a lock on `change_history`): the write that caused it was answered all the same, the changes stay in the outbox, and the next shipment takes them. The program's log has a `history-not-shipped` record with `application` and nothing of any row;
+  - shipments are asked for at once: many writes and reads of the history at the same time, for one Application and for several.
+- **How soon.** With both databases answering, a change is in `change_history` within 10 seconds of its write's answer (the tests wait that long), and always before a read of the history that began after the write was answered gives its answer.
+- **Bounded.** Changes are shipped in batches: each batch is one transaction in the platform database and holds at most 1,000 changes and, past its first change, at most 4 MiB of `old` and `new`. Each step of a batch (reading the outbox, writing `change_history`, deleting from the outbox) is ended after 10 seconds. One shipment runs per own database at a time. A statement that changes 100,000 rows is shipped whole, in such batches; the time that takes is written down by the test that does it.
+- A shipment has no Operation log entry: it is the platform's own work and no operation of an Application's.
+
+### Reading: the operation `history`
+
+Through the raw host interface:
+
+```js
+env.VM.invoke("history", { own: true, as: "user", schema: "public", table: "tasks",
+                           key: { id: 7 }, limit: 100, before: "1234", values: "text" })
+```
+
+- `own` must be exactly `true` (there is no history of a shared database); `as` is as for `query`. `table` is a string; `schema` is a string and defaults to `public`. `key`, `limit`, `before` and `values` are optional: `key` an object whose values are each `null`, a string, a number or a boolean; `limit` an integer from 1 to 1000, by default 100; `before` a string of decimal digits; `values` as for `query`. Anything else is `{ error: { kind: "malformed", message } }`, and nothing reaches any database.
+- It is decided as a `query` on the own database is: allowed for both actors whenever a request is in flight, refused `no-request` otherwise, refused `log-unavailable` when its Operation log entry cannot be written. It is not an operation of a transaction: it never takes a `transaction`, and what an open transaction has changed and not committed is not in it.
+- Answer: `{ ok: { columns, types?, changes: [ ... ] } }`, **newest first**. `columns` are the table's columns as it is now, in its order (`types` their type OIDs, with `values: "text"`). Each change:
+
+```json
+{ "id": "1234", "at": "<RFC 3339, UTC>", "kind": "insert" | "update" | "delete" | "structure",
+  "key": { "id": 7 } | null, "old": [ ... ] | null, "new": [ ... ] | null, "changed": ["title"] | null,
+  "user_id": "...", "application": "...", "actor": "user" | "application" | "migration",
+  "request": "..." | null, "migration": "..." | null, "structure": { ... } | null }
+```
+
+  `old` and `new` are rows in the order of `columns`, each value as `query` gives a value of that column (so as text with `values: "text"`). `changed` names columns by their names in the database.
+- **Which changes.** Those of the table `schema`.`table` of the Application in flight, and of no other Application, whatever is passed. With `key`: the changes of rows recorded under that key, and every `structure` entry of the table. The key is compared as the table's key columns compare values, not as text: `7` and `"7"` name the same `integer` or `bigint` key, `"1.5"` the `numeric` key `1.50`, a `timestamptz` in any notation the same instant. A `key` that names something other than exactly the table's primary key columns answers no row's changes (the `structure` entries only); one that names a column the table does not have, or a value its column's type refuses, is `{ error: { kind: "database", code } }`. `before`: only changes with a lesser `id`. `limit` counts every change answered, `structure` entries too.
+- **In the table's present shape**, as "Reading the Change history" says: read by the host in the own database, **as the runtime role, in a read-only transaction**. Code of the Application's that this runs (a domain's check, a type's input) runs with the runtime role's rights and can write nothing. A table that is not there now is `{ error: { kind: "database", code: "42P01" } }`; a value that no longer fits its column's type fails the read whole with that SQLSTATE.
+- One correction to "Reading the Change history": **a `jsonb` (or `json`) column that held JSON `null` reads as JSON `null`**, not as SQL null. A `json` column reads as the capture recorded it: as `jsonb` does (key order, white space and duplicate keys are not kept).
+- **It ships first.** The answer holds every change of that table committed, and its write answered, before the read began: in the same request or an earlier one.
+- **Limits.** A read whose shipment and reading together take more than 10 seconds is ended: `{ error: { kind: "limit", limit: "time" } }` (the shipment goes on by itself; a later read finds it done). An answer of more than 8 MiB is `{ error: { kind: "limit", limit: "bytes" } }`. When the own database or the platform database cannot be reached: `{ error: { kind: "unavailable" } }`. A read never answers part of what it was asked for.
+- **In the Operation log**: one entry, written before anything is read and completed at the end: `operation` `history`, `own_database` true, `resource` null, the actor, `transaction` null, `statement` the text `history "<schema>"."<table>"` with the two names as given (no key, no limit, no value), `rows` the number of changes answered, `outcome` and `error` as for a `query`.
+
+### Through the SDK
+
+`history(table, key?, options?)` is as "Reading the Change history" describes it, with these changes:
+
+- Each call is exactly one host operation `history` (no longer a `query`), with one Operation log entry as above.
+- `Change<T>["kind"]` is `"insert" | "update" | "delete" | "structure"`, and a change has one more property, `structure`: `null` for a row's change; for `structure` an object (below), with `old`, `new`, `changed` and (in what the host answers) `key` null.
+- `id` is the change's id in `change_history`.
+- The last paragraphs of "Only its own, and only to read" now read: the SDK has no call that writes, changes or deletes history; there is no table for an Application to declare. `vm.history` does not exist, and whatever an Application sends at the outbox (declared as a Drizzle table of its own, or through the raw interface) fails with `OperationFailed` of kind `database`, code `42501`, and changes nothing.
+
+### Changes of structure that change data
+
+Some changes a migration makes to a table that already has history change or remove data with no row inserted, updated or deleted. The platform sees each from the catalogs at the end of the migration that made it, before the Version's migrations are committed, and records it as an entry of that table's history: `kind` `structure`, `actor` `migration`, `user_id` the Contributor who sent the Version, `migration` the migration's name, `request` null, `key`, `old`, `new` and `changed` null, and `structure`:
+
+| `structure` | When |
+|---|---|
+| `{ "change": "column-type", "column": "<name>", "from": "<type>", "to": "<type>" }` | A column's type was changed (with or without `USING`; the catalogs do not say whether values changed). The types as Postgres names them (`integer`, `numeric(10,2)`). |
+| `{ "change": "column-dropped", "column": "<name>" }` | A column was dropped. |
+| `{ "change": "table-dropped" }` | The table was dropped, and none is there under its name. |
+| `{ "change": "table-replaced" }` | Another table is there under the name (the first dropped, or renamed away, and a new one made). |
+| `{ "change": "enum-value-renamed", "type": "<schema.type>", "from": "<value>", "to": "<value>", "columns": ["<name>", ...] }` | A value of an enum type was renamed; on every table with a column of that type (also as an array of it). |
+| `{ "change": "partition-attached", "partition": "<schema.table>" }`, `{ "change": "partition-detached", "partition": "<schema.table>" }` | A partition was attached to the table or detached from it. |
+
+- Each entry has an `id` like any change, greater than those of the rows the same migration changed before it. It is in the same transaction as the migration: a Version that is refused or fails leaves none.
+- **It is in every row's history of that table**: a read with a `key` answers it among that row's changes, in the order of `id`.
+- A table a migration of the same Version made has no history yet when another migration of that Version changes it; what is recorded for it is as for any table from the end of the migration that made it.
+- A change of structure that changes no data has no entry: a column or a table renamed (history is kept under the table's name at the time of each change, so a renamed table's earlier changes stay under its old name), a column added, a default, a constraint, an index.
+- The rows a rewrite changed are not recorded one by one: that is the next ticket's ("A migration that rewrites values records each changed row").
+
+### What the roles of an own database can and cannot do
+
+"What the runtime role cannot do" and "What a migration cannot do" hold with `vm.history` read as "the outbox", and with these changes: neither role can **read** the outbox (`42501`); the runtime role can read `vm.identity()` and `vm.ctx` only; a migration can no longer read the history at all. An Application's code reads its history through `history`, and only its own.
+
+### What this does not close
+
+- The platform database grows with every change of every Application; nothing bounds an Application's share of it yet.
+- Between a change's commit and its shipment the change is in the own database's outbox, where the platform's role, a superuser and whoever else holds the database's own rights outside the platform can reach it. No role a Contributor's code runs as can.
+- A superuser of the Postgres instance can read and change `change_history`, as it can everything.
