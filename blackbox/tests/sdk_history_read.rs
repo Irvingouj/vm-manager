@@ -27,8 +27,8 @@
 
 use blackbox::sdk::{Sdk, ann, d};
 use blackbox::sdk_history::{
-    HistoryCall, Want, assert_at_within, assert_changes, assert_one_history_entry, bob, carol,
-    chronicle, epoch_ms, id_text, row_of, task_key,
+    HistoryCall, Want, assert_at_within, assert_changes, assert_ids_are_history_rows,
+    assert_one_history_entry, bob, carol, chronicle, epoch_ms, id_text, row_of, task_key,
 };
 use serde_json::{Value, json};
 
@@ -108,6 +108,7 @@ fn two_users_change_a_row_and_its_history_names_each_of_them_newest_first() {
             .as_actor(actor)
             .changes(&sdk, &carol, &context);
         assert_changes(&changes, &wants, &context);
+        assert_ids_are_history_rows(&sdk.own, &changes, "public", "tasks", &context);
         assert_at_within(&changes, from, to, &context);
         assert_one_history_entry(
             &sdk,
@@ -175,6 +176,7 @@ fn a_composite_key_names_one_row_and_without_a_key_every_row_of_the_table() {
     let context = "history(orderLines), every row of the table";
     let (response, changes) = HistoryCall::of("lines").changes(&sdk, &ann, context);
     assert_changes(&changes, &every, context);
+    assert_ids_are_history_rows(&sdk.own, &changes, "public", "order_lines", context);
     assert_one_history_entry(&sdk, &response, &ann, "user", 4, &[], context);
     let context = "history(orderLines, undefined)";
     let (_, changes) = HistoryCall::of("lines")
@@ -216,6 +218,7 @@ fn the_table_without_a_primary_key_is_read_whole() {
             .as_actor(actor)
             .changes(&sdk, &ann, &context);
         assert_changes(&changes, &wants, &context);
+        assert_ids_are_history_rows(&sdk.own, &changes, "public", "events", &context);
         assert_one_history_entry(&sdk, &response, &ann, actor, 3, &[], &context);
     }
 }

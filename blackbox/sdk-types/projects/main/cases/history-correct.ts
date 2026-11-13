@@ -1,7 +1,8 @@
 // Reading the Change history compiles with no diagnostics (CONTRACT.md,
 // "Reading the Change history"): `history` on both handles of the own
 // database, with and without a key and options; it resolves to
-// `Change<typeof table>[]`, `Change` being a type @vm/sdk exports; a
+// `Change<typeof table>[]`, `Change` being a type @vm/sdk exports;
+// `changed` is `string[] | null`; a
 // change's `old` and `new` are the table's row as `select()` types it, or
 // null; `kind` and `actor` are their three words.
 import { defineApp } from "@vm/sdk";
@@ -46,7 +47,8 @@ export default defineApp(manifest, {
       const row: NoteRow | null = null;
       const asNew: typeof change.new = row;
       const asOld: typeof change.old = row;
-      const changed: readonly string[] | null = change.changed;
+      same<typeof change.changed, string[] | null>(true);
+      const changed: string[] | null = change.changed;
       const title: string | undefined = change.new?.body;
       shown.push(`${change.kind} by ${change.userId} at ${change.at.toISOString()}: ${title ?? ""}`);
       void [after, before, asNew, asOld, changed];

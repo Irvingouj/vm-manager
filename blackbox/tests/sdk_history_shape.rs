@@ -118,6 +118,13 @@ fn a_value_that_no_longer_casts_fails_the_read_and_changes_nothing_stored() {
             lines(&entries)
         );
         assert_eq!(entries[0]["outcome"], "failed", "{context}: {}", entries[0]);
+        assert!(
+            entries[0]["error"]
+                .as_str()
+                .is_some_and(|e| e.chars().count() == 5),
+            "{context}: the failed entry's `error` is the SQLSTATE: {}",
+            entries[0]
+        );
         assert_eq!(
             entries[0]["operation"], "query",
             "{context}: {}",

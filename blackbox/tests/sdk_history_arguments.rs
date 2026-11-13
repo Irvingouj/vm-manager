@@ -3,7 +3,9 @@
 //! property missing, a property that is not of the primary key, or given
 //! for a table without one throws a `TypeError` that names the primary
 //! key's properties; a `limit` that is not an integer from 1 to 1000 throws
-//! a `TypeError`. Nothing is sent to the host: no host call, no Operation
+//! a `TypeError`, and so does a key that is null and a `before` that is not
+//! a string of decimal digits (`undefined` is the default for both options).
+//! Nothing is sent to the host: no host call, no Operation
 //! log entry.
 #![allow(
     clippy::unwrap_used,
@@ -49,7 +51,14 @@ fn a_key_that_is_not_the_primary_key_throws_a_type_error_and_sends_nothing() {
             HistoryCall::of("events"),
         ],
     );
-    let cases: [(&str, Value, &[&str], &str); 7] = [
+    let cases: [(&str, Value, &[&str], &str); 9] = [
+        ("tasks", json!(null), &["id"], "a key that is null"),
+        (
+            "lines",
+            json!(null),
+            &["orderId", "line"],
+            "a composite key that is null",
+        ),
         (
             "tasks",
             json!({}),
@@ -115,6 +124,9 @@ fn a_limit_that_is_not_an_integer_from_1_to_1000_throws_a_type_error_and_sends_n
                 .key(json!({ "id": 1 }))
                 .options(json!({ "limit": 1 })),
             HistoryCall::of("events").options(json!({ "limit": 1000 })),
+            HistoryCall::of("tasks")
+                .key(json!({ "id": 1 }))
+                .options(json!({ "limit": "<undefined>" })),
         ],
     );
     let limits = [
@@ -144,6 +156,52 @@ fn a_limit_that_is_not_an_integer_from_1_to_1000_throws_a_type_error_and_sends_n
                     .as_actor(actor),
                 &[],
                 &format!("limit {limit} without a key, as the {actor}"),
+            );
+        }
+    }
+}
+
+#[test]
+fn a_before_that_is_not_a_string_of_decimal_digits_throws_a_type_error_and_sends_nothing() {
+    let sdk = chronicle();
+    sdk.get_ok(&ann(), "/tasks/put?as=user&id=1&v=a");
+    sdk.get_ok(&ann(), "/tasks/set?as=user&id=1&v=b");
+    // The right ones first: `before: undefined`, and a `before` of digits.
+    let (_, changes) = HistoryCall::of("tasks")
+        .key(json!({ "id": 1 }))
+        .options(json!({ "before": "<undefined>" }))
+        .changes(&sdk, &ann(), "before: undefined");
+    assert_eq!(
+        changes.len(),
+        2,
+        "before: undefined answers every change: {changes:?}"
+    );
+    let newest = blackbox::sdk_history::id_text(&changes[0]);
+    let (_, older) = HistoryCall::of("tasks")
+        .key(json!({ "id": 1 }))
+        .options(json!({ "before": newest }))
+        .changes(&sdk, &ann(), "before, a string of digits");
+    assert_eq!(older.len(), 1, "before the newest: the insert: {older:?}");
+    let numeric: u64 = newest.parse().unwrap();
+    let befores = [json!(numeric), json!("12x"), json!(""), json!(null)];
+    for actor in ACTORS {
+        for before in &befores {
+            assert_refused_by_the_sdk(
+                &sdk,
+                &HistoryCall::of("tasks")
+                    .key(json!({ "id": 1 }))
+                    .options(json!({ "before": before }))
+                    .as_actor(actor),
+                &[],
+                &format!("before {before}, as the {actor}"),
+            );
+            assert_refused_by_the_sdk(
+                &sdk,
+                &HistoryCall::of("events")
+                    .options(json!({ "before": before }))
+                    .as_actor(actor),
+                &[],
+                &format!("before {before} without a key, as the {actor}"),
             );
         }
     }

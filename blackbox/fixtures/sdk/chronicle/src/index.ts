@@ -21,7 +21,9 @@
 //   /history?as=&table=&key=&undefinedKey=&options=
 //                               the one host operation of this route:
 //                               history(table, key, options), `key` and
-//                               `options` given as JSON (`undefinedKey=1`
+//                               `options` given as JSON (an option given
+//                               as "<undefined>" is passed as undefined;
+//                               `undefinedKey=1`
 //                               passes `undefined` explicitly). Answers
 //                               `changes`, each described, or `caught`
 //   /shared/history?resource=   `history` forced past the types on a shared
@@ -197,7 +199,13 @@ export default defineApp(manifest, {
         const table = tables[name as keyof typeof tables];
         if (table === undefined) return json({ error: `no table ${name}` }, 404);
         const key = q("undefinedKey") === "1" ? undefined : parsed(q("key"));
+        // JSON has no `undefined`: a property given as "<undefined>" is
+        // passed as present and `undefined`.
         const options = parsed(q("options"));
+        if (typeof options === "object" && options !== null) {
+          const record = options as Record<string, unknown>;
+          for (const [name, value] of Object.entries(record)) if (value === "<undefined>") record[name] = undefined;
+        }
         // The key and the options come from the test, so they are passed
         // past the types: the run-time checks are what is asserted.
         const handle = own() as unknown as {

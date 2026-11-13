@@ -547,3 +547,45 @@ pub fn described_row(entries: &[(&str, Value)]) -> Value {
 pub fn task_key(id: i64) -> Value {
     json!({ "id": id })
 }
+
+/// Fails unless each change's `id` is the `vm.history.id` of its row, read
+/// by the harness's own superuser: the row of that id is of `schema.table`,
+/// with the change's kind, User, Application, actor and request.
+pub fn assert_ids_are_history_rows(
+    db: &OwnDatabase,
+    changes: &[Value],
+    schema: &str,
+    table: &str,
+    context: &str,
+) {
+    for change in changes {
+        let id = id_of(change);
+        let rows = crate::history::history_where(db, &format!("h.id = {id}"));
+        assert_eq!(
+            rows.len(),
+            1,
+            "{context}: expected the change's `id` {id} to be the id of a row of vm.history, found {rows:?}; the change: {change}"
+        );
+        let row = &rows[0];
+        let text = |property: &str| -> Value {
+            described_string(&change[property]).map_or(Value::Null, |s| json!(s))
+        };
+        let pairs = [
+            ("schema_name", json!(schema)),
+            ("table_name", json!(table)),
+            ("kind", text("kind")),
+            ("user_id", text("userId")),
+            ("application", text("application")),
+            ("actor", text("actor")),
+            ("request", text("request")),
+            ("migration", text("migration")),
+        ];
+        for (column, expected) in pairs {
+            assert_eq!(
+                row[column], expected,
+                "{context}: the vm.history row of id {id} has `{column}` {}, the change says {expected}; the change: {change}",
+                row[column]
+            );
+        }
+    }
+}
