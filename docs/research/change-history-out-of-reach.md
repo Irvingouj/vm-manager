@@ -293,3 +293,41 @@ What each costs per write, beyond a round trip of about 0.06 ms [verified, `cost
 3. A function marked `SECURITY DEFINER` is refused when the migration is applied: the runtime role may already read and write every table, so it serves nothing here, and it is the shortest way to the owner's rights.
 4. What was changed by something the host does not run (a way nobody foresaw, or somebody with the database's own rights) cannot be undone. The platform keeps the digest of each own database in the platform database, compares when it first uses the own database, when a Version is sent and every 30 seconds of use, and when they differ says so in the Operation log and puts the capture back.
 5. The host sets the migration role's password to null as its last act in the migration's transaction.
+
+## 12. G. What the second slice costs (added 2026-11-13 by the implementation agent)
+
+Provenance of this part: written by the implementation agent of ticket #57's second slice, which ran `docs/research/change-history-out-of-reach/g-cost.sh` once, on Postgres 18 (the black-box harness's, `VM_TEST_PG_VERSION=18`), on a shared 12-CPU VM with nothing else of note running. The whole output is `g-cost.log` (exit 0). The script drives the real `vm` program through the black-box harness (`g_cost.rs`, copied into `blackbox/tests/` for the run and removed after it) with three release builds: **before** (`4d6df80`, the first slice), **middle** (`bc0d37f`, the second slice) and **after** (`f4d97d9`, the second slice with a migration's statement and the question of its transaction's key sent together). Each figure below is from that log [verified]; what follows from them is marked.
+
+**A write** (one `INSERT` through `execute`, from the HTTP request to its answer, 400 in a row after 30 to warm up), median:
+
+| | round 1 | round 2 |
+|---|---|---|
+| before | 6.36 ms | 6.94 ms |
+| middle | 6.65 ms | 7.20 ms |
+| after | 6.72 ms | 7.05 ms |
+
+The check before the commit (`SET CONSTRAINTS ALL IMMEDIATE; CLOSE ALL; SELECT vm.before_commit(); COMMIT` in one flight) is no extra round trip. Measured alone as the superuser, a transaction with `vm.before_commit()` took 107 us more than one with `SELECT 1` in its place [verified]. The end-to-end difference between the builds (0.1 to 0.35 ms) is within what one build varies between the two rounds (0.3 to 0.6 ms) [verified], so the check cannot be told apart from the noise of a whole request here. A write that also makes the 30-second comparison (at most one every 30 s per own database) pays for a connection as the platform's role and the comparison besides, about what a Version with nothing to apply costs below [reasoned, not measured on a write].
+
+**One statement of a migration**, as sent: the difference between a Version whose last migration is 301 `SELECT 1` and one whose last migration is one, over 300, medians of five:
+
+| | round 1 | round 2 |
+|---|---|---|
+| before | 0.367 ms | 0.347 ms |
+| middle | 0.326 ms | 0.339 ms |
+| after | 0.196 ms | 0.196 ms |
+
+Before, each statement was prepared and then executed (two round trips) and `vm.transaction_key()` after it likewise (two more). After, the statement and the question each go as one unnamed extended-protocol exchange, both sent before either is answered [from code]; a statement that fails makes the question after it fail, and the statement's own error is the one answered. The question can travel with the statement, and now does. A Version with a migration of one statement became slower (22 to 24 ms before, 29 to 32 ms after) [verified]. The comparison before the migrations (a connection as the platform's role and the reads below) and the pending structure kept in the platform database before the commit account for it [reasoned].
+
+**`vm.capture_guard()`**, which every captured statement that changed rows calls: 137.7 us a call against 94.6 us for a `SELECT 1` round trip, so 43 us more per captured statement, the call itself included [verified]. It was not removed. Inlining it into `vm.capture()` would save only the call's overhead, and the check of `pg_cast` itself is needed while a cast to `json` can be made outside a migration [reasoned].
+
+**The checks and the comparison by number of tables** (ten columns each, the capture on each), each statement run 50 times by the harness's superuser after `SET ROLE` to the migration role:
+
+| tables | `capture_state` | `capture_problems` | `structure_state` | a Version with nothing to apply (median of 5) |
+|---|---|---|---|---|
+| 10 | 0.26 ms | 0.93 ms | 0.30 ms | 8.3 ms |
+| 100 | 0.73 ms | 1.30 ms | 1.29 ms | 10.2 ms |
+| 500 | 2.66 ms | 2.92 ms | 5.32 ms | 18.7 ms |
+
+A single SELECT 1 round trip took 0.09 to 0.10 ms [verified]. A Version with nothing to apply includes the whole stored comparison: a connection as the platform's role, `vm.structure_state()` and the record of migrations in one snapshot, and what is kept read from the platform database [from code]. A Version with migrations pays, per migration, `capture_state` twice and `capture_problems` once, and, once per Version, `structure_state` and the pending structure written to the platform database [from code]. At 500 tables that is about 8 ms a migration and 6 ms a Version [reasoned from the table].
+
+[not verified]: the figures on Postgres 16 and 17, and with other sessions writing at the same time; `pg_locks`, which `vm.before_commit()` reads, grows with the instance's sessions (part F).

@@ -1,0 +1,34 @@
+# 2026-11-13T06:58:38Z on Linux 6.8.0-1070-azure x86_64, 12 CPUs
+#### round 1
+######## before: t57-vm-before, parts writes,migrations
+G write (one INSERT through execute, request to answer): n=400 median=6.360 ms p90=6.615 ms mean=6.415 ms
+G migration: a Version with 1 statement n=5 median=21.944 ms p90=25.840 ms mean=22.948 ms ; with 301 statements n=5 median=132.045 ms p90=134.810 ms mean=126.862 ms ; per statement (medians) 0.367 ms
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.12s
+######## middle: t57-vm-unpipelined, parts writes,migrations
+G write (one INSERT through execute, request to answer): n=400 median=6.646 ms p90=6.983 ms mean=6.702 ms
+G migration: a Version with 1 statement n=5 median=29.158 ms p90=29.297 ms mean=29.121 ms ; with 301 statements n=5 median=126.903 ms p90=127.091 ms mean=126.418 ms ; per statement (medians) 0.326 ms
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.30s
+######## after: t57-vm-after, parts writes,migrations
+G write (one INSERT through execute, request to answer): n=400 median=6.721 ms p90=7.320 ms mean=6.847 ms
+G migration: a Version with 1 statement n=5 median=30.670 ms p90=34.489 ms mean=31.186 ms ; with 301 statements n=5 median=89.454 ms p90=91.378 ms mean=89.575 ms ; per statement (medians) 0.196 ms
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.17s
+#### round 2
+######## before: t57-vm-before, parts writes,migrations
+G write (one INSERT through execute, request to answer): n=400 median=6.937 ms p90=7.402 ms mean=7.005 ms
+G migration: a Version with 1 statement n=5 median=24.248 ms p90=28.432 ms mean=24.861 ms ; with 301 statements n=5 median=128.326 ms p90=142.728 ms mean=131.174 ms ; per statement (medians) 0.347 ms
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.42s
+######## middle: t57-vm-unpipelined, parts writes,migrations
+G write (one INSERT through execute, request to answer): n=400 median=7.197 ms p90=7.494 ms mean=7.230 ms
+G migration: a Version with 1 statement n=5 median=31.823 ms p90=34.028 ms mean=31.884 ms ; with 301 statements n=5 median=133.504 ms p90=135.047 ms mean=133.242 ms ; per statement (medians) 0.339 ms
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.58s
+######## after: t57-vm-after, parts writes,migrations
+G write (one INSERT through execute, request to answer): n=400 median=7.051 ms p90=7.271 ms mean=7.046 ms
+G migration: a Version with 1 statement n=5 median=28.951 ms p90=30.692 ms mean=29.366 ms ; with 301 statements n=5 median=87.688 ms p90=90.549 ms mean=88.085 ms ; per statement (medians) 0.196 ms
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.27s
+######## after: t57-vm-after, parts functions
+G capture_guard: 137.7 us a call, round trip alone 94.6 us, so 43.2 us more per captured statement
+G before_commit: 205.5 us a transaction with it, 98.5 us with SELECT 1 instead, so 107.0 us more
+G tables=10: capture_state 0.26 ms, capture_problems 0.93 ms, structure_state 0.30 ms (round trip alone 0.10 ms); a Version with nothing to apply (the stored comparison included) n=5 median=8.343 ms p90=9.077 ms mean=8.466 ms
+G tables=100: capture_state 0.73 ms, capture_problems 1.30 ms, structure_state 1.29 ms (round trip alone 0.09 ms); a Version with nothing to apply (the stored comparison included) n=5 median=10.162 ms p90=11.366 ms mean=10.359 ms
+G tables=500: capture_state 2.66 ms, capture_problems 2.92 ms, structure_state 5.32 ms (round trip alone 0.09 ms); a Version with nothing to apply (the stored comparison included) n=5 median=18.684 ms p90=19.718 ms mean=18.808 ms
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.45s
