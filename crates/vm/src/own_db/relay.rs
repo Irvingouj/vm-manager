@@ -62,7 +62,7 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, watch};
@@ -222,6 +222,9 @@ pub struct Courier {
     pub lines: Arc<Semaphore>,
     /// Told when a task waits for a connection: the idle ones close theirs.
     pub wanted: Notify,
+    /// Tasks waiting for a connection now: a task that would idle with its
+    /// connection closes it instead.
+    pub wanting: AtomicUsize,
 }
 
 impl Courier {
@@ -233,6 +236,7 @@ impl Courier {
             turns: Semaphore::new(AT_ONCE),
             lines: Arc::new(Semaphore::new(LINES)),
             wanted: Notify::new(),
+            wanting: AtomicUsize::new(0),
         }
     }
 }
@@ -245,6 +249,23 @@ pub struct Route {
     pub database: String,
     pub role: String,
     pub known: Arc<super::Known>,
+}
+
+/// One task counted in [`Courier::wanting`] while it lives, even if the
+/// task is ended while it waits.
+struct Wanting<'a>(&'a AtomicUsize);
+
+impl<'a> Wanting<'a> {
+    fn new(count: &'a AtomicUsize) -> Self {
+        count.fetch_add(1, Ordering::AcqRel);
+        Self(count)
+    }
+}
+
+impl Drop for Wanting<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 /// A connection to the own database as its platform role, and its place
@@ -294,7 +315,7 @@ pub async fn run(courier: Arc<Courier>, route: Route) {
         if shipping.asked.load(Ordering::Acquire) != marks.seen {
             continue;
         }
-        if line.is_some() {
+        if line.is_some() && courier.wanting.load(Ordering::Acquire) == 0 {
             let asked = tokio::select! {
                 () = shipping.wake.notified() => true,
                 () = courier.wanted.notified() => false,
@@ -303,8 +324,8 @@ pub async fn run(courier: Arc<Courier>, route: Route) {
             if asked {
                 continue;
             }
-            line = None;
         }
+        line = None;
         shipping.running.store(false, Ordering::Release);
         // Asked meanwhile, by a caller that saw this task running and so
         // started none: go on, unless another task has started.
@@ -436,6 +457,7 @@ impl Courier {
         if let Ok(permit) = Arc::clone(&self.lines).try_acquire_owned() {
             return Ok(permit);
         }
+        let _wanting = Wanting::new(&self.wanting);
         self.wanted.notify_waiters();
         tokio::time::timeout(TURN_WAIT, Arc::clone(&self.lines).acquire_owned())
             .await
