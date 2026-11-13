@@ -81,7 +81,7 @@ use tokio_postgres::{CancelToken, Client, Config, GenericClient, NoTls, Row, Tra
 use crate::executor::{self, IdentityKey, Levels, Password, Source, Target};
 use crate::log;
 use crate::migration_text;
-use crate::oplog::{Entry, OperationLog};
+use crate::oplog::WRITE_TIMEOUT;
 use crate::platform_db::{
     Connection, DatabaseAddress, DbError, PlatformDatabase, quote_identifier,
 };
@@ -142,9 +142,11 @@ pub const RUNTIME_POOL_SIZE: usize = 4;
 /// something else changed").
 const COMPARE_EVERY: Duration = Duration::from_secs(30);
 
-/// Versions being applied at once, across all Applications (one at a time
-/// per Application). Past it a Version is answered unavailable.
-const PREPARING: usize = 64;
+/// Versions being sent at once in the program, across all Applications,
+/// whether or not their senders still wait (blackbox/CONTRACT.md, "The
+/// migration role's password": "At most 8"). Past it a Version is answered
+/// unavailable at once, before anything of it is done.
+const PREPARING: usize = 8;
 
 /// The longest a Version's sender waits for it to be applied and
 /// recorded: past [`MIGRATION_TIMEOUT`] and [`CLOSE_TIMEOUT`] together, and
@@ -180,7 +182,8 @@ fn vm_grants(owner: &str, runtime: &str) -> String {
          GRANT EXECUTE ON FUNCTION vm.identity(), vm.transaction_key() TO {runtime}, {owner};
          GRANT EXECUTE ON FUNCTION vm.capture_new_tables(), vm.capture_state(),
              vm.capture_problems(), vm.applied_migrations(),
-             vm.structure_state(), vm.record_migration(integer, text, text) TO {owner};
+             vm.structure_state(), vm.record_migration(integer, text, text),
+             vm.application_code(oid, oid) TO {owner};
          GRANT EXECUTE ON FUNCTION vm.before_commit() TO {runtime};"
     )
 }
@@ -420,7 +423,9 @@ struct Known {
     /// comparison never reads the own database and what is kept on either
     /// side of a commit.
     comparing: tokio::sync::Mutex<()>,
-    /// When this program last compared, if it has.
+    /// When this program last compared, or last tried to and could not, if
+    /// it has: a comparison that could not be made is not tried again by
+    /// every operation that follows, only at the next occasion.
     compared: Mutex<Option<Instant>>,
 }
 
@@ -544,8 +549,6 @@ pub struct OwnDatabases {
     known: RwLock<HashMap<Arc<str>, Arc<Known>>>,
     /// Held only to find, make or let go of a pool, never across an await.
     pools: Mutex<Pools>,
-    /// Where a change found outside the host's transactions is said.
-    log: OperationLog,
     /// The Versions being sent, each a task of its own so that it runs to
     /// its end whether or not its sender waits for it
     /// ([`OwnDatabases::to_the_end`]); at most [`PREPARING`]. Each ends by
@@ -607,7 +610,6 @@ impl OwnDatabases {
                 held: HashMap::with_capacity(OWN_POOLS_HELD),
                 clock: 0,
             }),
-            log: OperationLog::new(Arc::clone(&platform)),
             preparing: Mutex::new(JoinSet::new()),
             platform,
         })
@@ -765,11 +767,11 @@ impl OwnDatabases {
             }
         };
         if known.never_compared() {
-            self.compare_logged(application, &known, true).await;
+            self.compare_logged(application, &known, Occasion::FirstUse)
+                .await;
         } else if write && known.due(COMPARE_EVERY) {
-            // A comparison already under way (or a Version being committed)
-            // is not waited for.
-            self.compare_logged(application, &known, false).await;
+            self.compare_logged(application, &known, Occasion::Write)
+                .await;
         }
         if let Some(pool) = self.held(application) {
             return Some(pool);
@@ -845,28 +847,48 @@ impl OwnDatabases {
         Ok(Arc::clone(known.key.get_or_init(|| Arc::new(read))))
     }
 
-    /// [`OwnDatabases::compare`], its failure logged: a comparison that
-    /// could not be made is made at the next occasion. `wait`: wait for one
-    /// under way (or a Version being committed) to end, up to
-    /// [`SETUP_TIMEOUT`]; else skip.
-    async fn compare_logged(&self, application: &str, known: &Known, wait: bool) {
-        let turn = if wait {
-            tokio::time::timeout(SETUP_TIMEOUT, known.comparing.lock())
-                .await
-                .ok()
-        } else {
-            known.comparing.try_lock().ok()
-        };
-        let Some(_turn) = turn else {
-            return;
-        };
-        let compared = tokio::time::timeout(SETUP_TIMEOUT, self.compare(application, known))
-            .await
-            .unwrap_or_else(|_| {
-                Err(Problem::timed_out(
-                    "comparing the own database's structure: it took too long",
-                ))
-            });
+    /// [`OwnDatabases::compare`] at `occasion`, its failure logged
+    /// (`own-database-not-compared`): the operation or Version that met it
+    /// goes on as it would have, and it is made again at the next occasion
+    /// (a start, a Version, or a write [`COMPARE_EVERY`] later;
+    /// blackbox/CONTRACT.md, "What something else changed"). Holds its
+    /// caller up for at most [`SETUP_TIMEOUT`], waiting for a comparison
+    /// under way or a Version being committed included. A comparison that
+    /// could not be made, or not begun for that wait, still counts as tried
+    /// (`mark_compared`): the operations that follow within
+    /// [`COMPARE_EVERY`] are not held up again by it.
+    async fn compare_logged(&self, application: &str, known: &Known, occasion: Occasion) {
+        let compared = tokio::time::timeout(SETUP_TIMEOUT, async {
+            let _turn = match occasion {
+                // A write does not wait for a comparison under way (or a
+                // Version being committed).
+                Occasion::Write => match known.comparing.try_lock() {
+                    Ok(turn) => turn,
+                    Err(_) => return Ok(()),
+                },
+                Occasion::FirstUse | Occasion::Version => known.comparing.lock().await,
+            };
+            // Another operation's comparison may have been made while this
+            // one waited for its turn.
+            let made = match occasion {
+                Occasion::FirstUse => !known.never_compared(),
+                Occasion::Write => !known.due(COMPARE_EVERY),
+                Occasion::Version => false,
+            };
+            if made {
+                return Ok(());
+            }
+            let compared = self.compare(application, known).await;
+            known.mark_compared();
+            compared
+        })
+        .await
+        .unwrap_or_else(|_| {
+            known.mark_compared();
+            Err(Problem::timed_out(
+                "comparing the own database's structure: it took too long",
+            ))
+        });
         if let Err(problem) = compared {
             log::record(
                 "own-database-not-compared",
@@ -893,7 +915,6 @@ impl OwnDatabases {
         let expected = match self.kept(known.number).await? {
             None => {
                 self.keep(known.number, &found).await?;
-                known.mark_compared();
                 return Ok(());
             }
             Some(Kept {
@@ -907,7 +928,6 @@ impl OwnDatabases {
         };
         let tables = differing(&expected, &found);
         if tables.is_empty() {
-            known.mark_compared();
             return Ok(());
         }
         let uncaptured: Vec<String> = {
@@ -929,8 +949,12 @@ impl OwnDatabases {
                 .collect()
         };
         let (_, now) = read_structure(connection.client_mut()).await?;
-        self.keep(known.number, &now).await?;
-        known.mark_compared();
+        // The entry and what is kept are written together: when the entry
+        // cannot be written, nothing is kept, and the next comparison finds
+        // the change again against what was kept before it (the capture
+        // already put back has new triggers, so the same tables still
+        // differ) and says it then, once.
+        self.keep_said(known.number, application, &now).await?;
         log::record(
             "capture-changed-outside",
             serde_json::json!({
@@ -939,37 +963,56 @@ impl OwnDatabases {
                 "uncaptured": uncaptured,
             }),
         );
-        let number = known.number;
-        let version = self
-            .platform
-            .pool()
-            .run(async |client: &mut Client| {
+        Ok(())
+    }
+
+    /// Keeps `structure` as what `number`'s own database (of the
+    /// Application `application`) is, nothing pending, in the same
+    /// statement as the Operation log's `capture-check` entry that says it
+    /// was changed outside: both or neither.
+    async fn keep_said(
+        &self,
+        number: i64,
+        application: &str,
+        structure: &Structure,
+    ) -> Result<(), Problem> {
+        let tables = serde_json::json!(structure);
+        let kept = tokio::time::timeout(
+            WRITE_TIMEOUT,
+            self.platform.pool().run(async |client: &mut Client| {
                 client
                     .query_one(
-                        "SELECT coalesce(max(number), 0) FROM versions WHERE application_id = $1",
-                        &[&number],
+                        "WITH entry AS (
+                           INSERT INTO operation_log (application, version, actor, own_database,
+                                                      operation, statement, outcome, error)
+                           SELECT $2, coalesce(max(number), 0), 'platform', true,
+                                  'capture-check', 'capture-check', 'failed', 'changed-outside'
+                             FROM versions WHERE application_id = $1
+                           RETURNING id)
+                         , kept AS (
+                           INSERT INTO own_database_states (application_id, tables)
+                           SELECT $1, $3 FROM entry
+                           ON CONFLICT (application_id) DO UPDATE
+                           SET tables = excluded.tables, pending = NULL, pending_record = NULL
+                           RETURNING application_id)
+                         SELECT count(*) FROM kept",
+                        &[&number, &application, &tables],
                     )
                     .await
-                    .and_then(|row| row.try_get::<_, i32>(0))
+                    .and_then(|row| row.try_get::<_, i64>(0))
                     .map_err(DbError::from)
-            })
-            .await
-            .map_err(|e| Problem::unavailable("reading the serving Version's number", &e))?;
-        let entry = Entry {
-            request: None,
-            user: None,
-            application,
-            version: u64::try_from(version).unwrap_or(0),
-            resource: None,
-            actor: "platform",
-            operation: "capture-check",
-            statement: "capture-check",
-            transaction: None,
-        };
-        self.log
-            .whole(&entry, "failed", Some("changed-outside"))
-            .await
-            .map_err(|e| Problem::unavailable("writing the capture-check entry", &e))
+            }),
+        )
+        .await
+        .map_err(|_| Problem::timed_out("writing the capture-check entry: it took too long"))?
+        .map_err(|e| Problem::unavailable("writing the capture-check entry", &e))?;
+        if kept == 1 {
+            Ok(())
+        } else {
+            Err(Problem::internal(
+                "writing the capture-check entry: what is kept was not written with it",
+            ))
+        }
     }
 
     /// What is kept of `number`'s own database's structure, if anything.
@@ -1414,7 +1457,14 @@ impl OwnDatabases {
         let _turn = tokio::time::timeout(SETUP_TIMEOUT, known.turn.lock())
             .await
             .map_err(|_| Problem::timed_out("waiting for the own database's migrations to end"))?;
-        self.ensure_form_in_turn(application, known).await
+        // Each of its steps has a time limit of its own; the whole of it
+        // too, so that the turn is never held past one.
+        tokio::time::timeout(
+            MIGRATION_TIMEOUT,
+            self.ensure_form_in_turn(application, known),
+        )
+        .await
+        .map_err(|_| Problem::timed_out("bringing the own database to form: it took too long"))?
     }
 
     /// [`Self::ensure_form`], its turn already held.
@@ -1623,9 +1673,12 @@ impl OwnDatabases {
         // the Version's migrations (blackbox/CONTRACT.md, "What something
         // else changed"); one that cannot be compared now is at the next
         // occasion.
-        tokio::time::timeout_at(deadline, self.compare_logged(application, known, true))
-            .await
-            .ok();
+        tokio::time::timeout_at(
+            deadline,
+            self.compare_logged(application, known, Occasion::Version),
+        )
+        .await
+        .ok();
         let names = self.names(known.number)?;
         let (key, applied) = tokio::time::timeout_at(deadline, async {
             let connection = self.connect_platform(&names, known).await?;
@@ -2044,6 +2097,18 @@ impl OwnDatabases {
         }
         committed
     }
+}
+
+/// When a comparison is made (blackbox/CONTRACT.md, "What something else
+/// changed").
+#[derive(Clone, Copy)]
+enum Occasion {
+    /// The first operation on the own database in this run.
+    FirstUse,
+    /// A write, [`COMPARE_EVERY`] after the last comparison.
+    Write,
+    /// A Version sent, before its migrations.
+    Version,
 }
 
 /// The structure and the capture of an own database's tables, by

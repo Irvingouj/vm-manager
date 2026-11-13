@@ -497,6 +497,24 @@ SELECT c.oid, c.oid::pg_catalog.regclass::text,
    AND pg_catalog.left(n.nspname, 3) <> 'pg_'
 $f$;
 
+-- Whether the object `p_object` of the catalog `p_catalog` is code of the
+-- Application's for `index-code`: neither Postgres's own (made by initdb,
+-- so with an object id below 16384, FirstNormalObjectId) nor a member of
+-- an extension (a `pg_depend` row of kind 'e' to it; a trusted extension's
+-- members belong to the bootstrap superuser, an untrusted one's needed a
+-- superuser to make). Whoever owns it: the migration role, or the runtime
+-- role where a migration let it create.
+CREATE OR REPLACE FUNCTION vm.application_code(p_catalog oid, p_object oid) RETURNS boolean
+LANGUAGE sql STABLE PARALLEL UNSAFE
+SET search_path = pg_catalog, pg_temp
+AS $f$
+SELECT p_object >= 16384::pg_catalog.oid
+   AND NOT EXISTS (SELECT FROM pg_catalog.pg_depend e
+                    WHERE e.classid = p_catalog AND e.objid = p_object
+                      AND e.refclassid = 'pg_catalog.pg_extension'::pg_catalog.regclass
+                      AND e.deptype = 'e')
+$f$;
+
 -- What the platform refuses at the end of a migration, one row per
 -- finding: the rule (as the answer names it) and what was found, where,
 -- and what to do instead. No row: nothing to refuse. Called on the
@@ -618,7 +636,7 @@ SELECT 'security-definer',
  WHERE p.prosecdef AND pg_catalog.pg_get_userbyid(p.proowner) = SESSION_USER
 UNION ALL
 SELECT 'index-code',
-       pg_catalog.format('the %s %s calls %s, which the migrations wrote: Postgres''s autovacuum would run it with the rights of the role that owns the Application''s tables, outside any transaction of the platform''s. Index or analyze Postgres''s own functions and operators only (or an extension''s), or keep the computed value in a column of its own',
+       pg_catalog.format('the %s %s calls %s, which is neither Postgres''s own nor an extension''s: Postgres''s autovacuum would run it with the rights of the role that owns the Application''s tables, outside any transaction of the platform''s. Index or analyze Postgres''s own functions and operators only (or an extension''s), or keep the computed value in a column of its own',
                          x.what, x.name, x.called)
   FROM (SELECT DISTINCT
                CASE d.classid WHEN 'pg_catalog.pg_class'::pg_catalog.regclass THEN 'index'
@@ -632,9 +650,12 @@ SELECT 'index-code',
                CASE d.refclassid WHEN 'pg_catalog.pg_proc'::pg_catalog.regclass
                                       THEN 'the function ' || d.refobjid::pg_catalog.regprocedure::text
                                  WHEN 'pg_catalog.pg_operator'::pg_catalog.regclass
-                                      THEN 'the operator ' || d.refobjid::pg_catalog.regoperator::text
+                                      THEN (SELECT 'the operator ' || o.oid::pg_catalog.regoperator::text
+                                                   || ' (its function ' || o.oprcode::pg_catalog.regprocedure::text || ')'
+                                              FROM pg_catalog.pg_operator o WHERE o.oid = d.refobjid)
                                  WHEN 'pg_catalog.pg_cast'::pg_catalog.regclass
                                       THEN 'the cast ' || (SELECT ca.castsource::pg_catalog.regtype::text || ' AS ' || ca.casttarget::pg_catalog.regtype::text
+                                                                  || ' (its function ' || ca.castfunc::pg_catalog.regprocedure::text || ')'
                                                              FROM pg_catalog.pg_cast ca WHERE ca.oid = d.refobjid)
                                  ELSE 'the domain ' || d.refobjid::pg_catalog.regtype::text END AS called
           FROM pg_catalog.pg_depend d
@@ -646,18 +667,18 @@ SELECT 'index-code',
                     AND EXISTS (SELECT FROM pg_catalog.pg_constraint co
                                  WHERE co.oid = d.objid AND co.contype = 'x')))
            AND ((d.refclassid = 'pg_catalog.pg_proc'::pg_catalog.regclass
-                 AND EXISTS (SELECT FROM pg_catalog.pg_proc p WHERE p.oid = d.refobjid
-                                AND pg_catalog.pg_get_userbyid(p.proowner) = SESSION_USER))
+                 AND vm.application_code('pg_catalog.pg_proc'::pg_catalog.regclass, d.refobjid))
              OR (d.refclassid = 'pg_catalog.pg_operator'::pg_catalog.regclass
-                 AND EXISTS (SELECT FROM pg_catalog.pg_operator o WHERE o.oid = d.refobjid
-                                AND pg_catalog.pg_get_userbyid(o.oprowner) = SESSION_USER))
+                 AND EXISTS (SELECT FROM pg_catalog.pg_operator o
+                              WHERE o.oid = d.refobjid
+                                AND vm.application_code('pg_catalog.pg_proc'::pg_catalog.regclass, o.oprcode)))
              OR (d.refclassid = 'pg_catalog.pg_cast'::pg_catalog.regclass
-                 AND EXISTS (SELECT FROM pg_catalog.pg_cast ca JOIN pg_catalog.pg_proc p ON p.oid = ca.castfunc
-                              WHERE ca.oid = d.refobjid
-                                AND pg_catalog.pg_get_userbyid(p.proowner) = SESSION_USER))
+                 AND EXISTS (SELECT FROM pg_catalog.pg_cast ca
+                              WHERE ca.oid = d.refobjid AND ca.castfunc <> 0
+                                AND vm.application_code('pg_catalog.pg_proc'::pg_catalog.regclass, ca.castfunc)))
              OR (d.refclassid = 'pg_catalog.pg_type'::pg_catalog.regclass
-                 AND EXISTS (SELECT FROM pg_catalog.pg_type t WHERE t.oid = d.refobjid AND t.typtype = 'd'
-                                AND pg_catalog.pg_get_userbyid(t.typowner) = SESSION_USER)))) x
+                 AND EXISTS (SELECT FROM pg_catalog.pg_type t WHERE t.oid = d.refobjid AND t.typtype = 'd')
+                 AND vm.application_code('pg_catalog.pg_type'::pg_catalog.regclass, d.refobjid)))) x
 $f$;
 
 -- The migrations recorded, in order: what the host compares a Version's
