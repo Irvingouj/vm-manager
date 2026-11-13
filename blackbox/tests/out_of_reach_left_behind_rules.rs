@@ -364,6 +364,13 @@ fn an_index_or_a_statistic_calling_a_function_the_migrations_wrote_is_refused() 
             r#"CREATE INDEX "by_domain" ON "things" ((("size")::"posint"))"#,
         ]))
         .mentioning("by_domain"),
+        // CONTRACT.md: "or a domain of theirs (a domain's constraint can be
+        // given a function later)".
+        Case::statements("through-a-domain-without-a-constraint", INDEX_CODE, statements(&[
+            r#"CREATE DOMAIN "plainint" AS integer"#,
+            r#"CREATE INDEX "by_plain_domain" ON "things" ((("size")::"plainint"))"#,
+        ]))
+        .mentioning("by_plain_domain"),
         Case::statements("an-extended-statistic", INDEX_CODE, statements(&[
             PLPGSQL_F,
             r#"CREATE STATISTICS "st_f" ON ("f"("size")), ("id") FROM "things""#,

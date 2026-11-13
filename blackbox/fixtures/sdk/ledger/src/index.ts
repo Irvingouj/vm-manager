@@ -27,6 +27,12 @@
 //   /shared/forced-write?marker=
 //                              an insert through a transaction on `devops`
 //                              (declared at read), forced past the types
+//   /cascade/tx?as=&id=        db.transaction deleting `pa` row `id`, whose
+//                              cascade runs code a migration left
+//                              (migrations/0001_cascade.sql); answers
+//                              { done } or { caught }
+//   /cascade/write?as=&id=     the same delete outside a transaction
+//   /cascade/honest?as=&id=    clears the action of `ca` row `id`
 //   /settings?target=own|ops|devops&as=&iso=&mode=
 //                              current_setting('transaction_isolation') and
 //                              ('transaction_read_only') and current_user from
@@ -36,7 +42,7 @@ import { TransactionRollbackError, asc, eq, like, sql } from "drizzle-orm";
 import manifest from "../manifest.ts";
 import { incidents } from "../resources/devops/schema.ts";
 import { notes as sharedNotes } from "../resources/ops/schema.ts";
-import { counters, notes } from "./db/schema.ts";
+import { ca, counters, notes, pa } from "./db/schema.ts";
 
 /** A query Drizzle built, not yet sent. */
 interface Built<T> extends PromiseLike<T> {
@@ -257,6 +263,34 @@ export default defineApp(manifest, {
         } catch (error) {
           return json({ caught: describeError(error), statements: rec.statements });
         }
+      }
+
+      case "/cascade/tx": {
+        const id = Number(url.searchParams.get("id") ?? "1");
+        try {
+          await own().transaction(async (tx) => {
+            await tx.delete(pa).where(eq(pa.id, id));
+          });
+          return json({ done: true });
+        } catch (error) {
+          return json({ caught: describeError(error) });
+        }
+      }
+
+      case "/cascade/write": {
+        const id = Number(url.searchParams.get("id") ?? "2");
+        try {
+          await own().delete(pa).where(eq(pa.id, id));
+          return json({ done: true });
+        } catch (error) {
+          return json({ caught: describeError(error) });
+        }
+      }
+
+      case "/cascade/honest": {
+        const id = Number(url.searchParams.get("id") ?? "3");
+        await own().update(ca).set({ action: null }).where(eq(ca.id, id));
+        return json({ done: true });
       }
 
       case "/settings": {

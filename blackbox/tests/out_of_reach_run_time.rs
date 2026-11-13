@@ -353,6 +353,62 @@ fn other_vectors_transactions_and_the_runtime_role_s_functions_are_held_alike() 
             then_over: false,
             since: 0,
         },
+        // A domain's CHECK on the child's key under ON UPDATE CASCADE,
+        // obeying `orders`, in one transaction with the order.
+        Attack {
+            name: "domain-check-in-an-update-cascade".to_owned(),
+            setup: vec![outside(
+                "execute",
+                "insert into ce (id, p) values (1, 1)",
+                &[],
+            )],
+            attack: vec![
+                begin_write("t", None),
+                inside(
+                    "t",
+                    "insert into orders (id, action) values (2, $1)",
+                    &[OFF_CHANGE_ON],
+                ),
+                inside("t", "update pe set id = 1001 where id = 1", &[]),
+                commit("t"),
+            ],
+            failing: 3,
+            entry: "commit",
+            then_over: false,
+            since: 0,
+        },
+        // A BEFORE UPDATE trigger on the child under ON DELETE SET NULL.
+        Attack {
+            name: "before-update-trigger-under-on-delete-set-null".to_owned(),
+            setup: vec![outside(
+                "execute",
+                "insert into cf (id, p, action) values (1, 1, $1)",
+                &[OFF_CHANGE_ON],
+            )],
+            attack: vec![outside("execute", "delete from pf where id = 1", &[])],
+            failing: 0,
+            entry: "execute",
+            then_over: false,
+            since: 0,
+        },
+        // The same under ON UPDATE SET NULL.
+        Attack {
+            name: "before-update-trigger-under-on-update-set-null".to_owned(),
+            setup: vec![outside(
+                "execute",
+                "insert into cf (id, p, action) values (2, 2, $1)",
+                &[CREATE_TABLE],
+            )],
+            attack: vec![outside(
+                "execute",
+                "update pf set id = 1002 where id = 2",
+                &[],
+            )],
+            failing: 0,
+            entry: "execute",
+            then_over: false,
+            since: 0,
+        },
         // The runtime role's own call of a function of the Application's:
         // a lock stronger than ROW EXCLUSIVE.
         Attack {

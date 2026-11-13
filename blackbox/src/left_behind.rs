@@ -8,7 +8,10 @@
 //!   foreign key (`pa`/`ca`), a `CHECK` on the child of an `ON UPDATE
 //!   CASCADE` one (`pb`/`cb`), a stored generated column there (`pc`/`cc`),
 //!   a default under `ON DELETE SET DEFAULT` (`pd`/`cd`, which obeys the
-//!   rows of `orders`). Each does what the row that sets it off says
+//!   rows of `orders`), a domain's `CHECK` on the child's key under `ON
+//!   UPDATE CASCADE` (`pe`/`ce`, obeying `orders` once the key is 1000 or
+//!   more), a `BEFORE UPDATE` trigger on the child under `ON DELETE SET
+//!   NULL` and `ON UPDATE SET NULL` (`pf`/`cf`). Each does what the row that sets it off says
 //!   (`action`: statements separated by `;;`), so that the same Application
 //!   also works honestly (an empty action does nothing);
 //! - [`install`]: an Application with `fixtures/transactions.js` as the
@@ -102,6 +105,14 @@ END $f$;"#,
             r#"CREATE TABLE "cc" ("id" integer PRIMARY KEY NOT NULL, "p" integer REFERENCES "pc" ("id") ON UPDATE CASCADE, "action" text, "g" text GENERATED ALWAYS AS ("obey_text"("action", "p")) STORED);"#,
             r#"CREATE TABLE "pd" ("id" integer PRIMARY KEY NOT NULL);"#,
             r#"CREATE TABLE "cd" ("id" integer PRIMARY KEY NOT NULL, "p" integer DEFAULT "obey_orders"() REFERENCES "pd" ("id") ON DELETE SET DEFAULT);"#,
+            r#"CREATE FUNCTION "obey_key"("v" integer) RETURNS boolean LANGUAGE plpgsql IMMUTABLE AS $f$ BEGIN IF "v" >= 1000 THEN PERFORM public.obey_orders(); END IF; RETURN true; END $f$;"#,
+            r#"CREATE DOMAIN "obeying_key" AS integer CONSTRAINT "obeying_key_obeys" CHECK ("obey_key"(VALUE));"#,
+            r#"CREATE TABLE "pe" ("id" integer PRIMARY KEY NOT NULL);"#,
+            r#"CREATE TABLE "ce" ("id" integer PRIMARY KEY NOT NULL, "p" "obeying_key" REFERENCES "pe" ("id") ON UPDATE CASCADE);"#,
+            r#"CREATE TABLE "pf" ("id" integer PRIMARY KEY NOT NULL);"#,
+            r#"CREATE TABLE "cf" ("id" integer PRIMARY KEY NOT NULL, "p" integer REFERENCES "pf" ("id") ON DELETE SET NULL ON UPDATE SET NULL, "action" text);"#,
+            r#"CREATE FUNCTION "cf_before"() RETURNS trigger LANGUAGE plpgsql AS $f$ BEGIN IF NEW."p" IS NULL AND OLD."p" IS NOT NULL THEN PERFORM public.obey(OLD."action"); END IF; RETURN NEW; END $f$;"#,
+            r#"CREATE TRIGGER "cf_before" BEFORE UPDATE ON "cf" FOR EACH ROW EXECUTE FUNCTION "cf_before"();"#,
             r#"CREATE FUNCTION "late_fn"() RETURNS trigger LANGUAGE plpgsql AS $f$
 BEGIN
   PERFORM public.each_capture('public.counters', 'ALTER TABLE public.counters DISABLE TRIGGER %I');
@@ -117,6 +128,8 @@ END $f$;"#,
             r#"INSERT INTO "pb" SELECT g FROM generate_series(1, 20) g;"#,
             r#"INSERT INTO "pc" SELECT g FROM generate_series(1, 20) g;"#,
             r#"INSERT INTO "pd" SELECT g FROM generate_series(1, 20) g;"#,
+            r#"INSERT INTO "pe" SELECT g FROM generate_series(1, 20) g;"#,
+            r#"INSERT INTO "pf" SELECT g FROM generate_series(1, 20) g;"#,
             "INSERT INTO \"ca\" VALUES (9, 9, 'SELECT public.each_capture(''public.parents'', ''ALTER TABLE public.parents DISABLE TRIGGER %I'');;UPDATE public.parents SET name = ''changed by a held cursor'' WHERE id = 1;;SELECT public.each_capture(''public.parents'', ''ALTER TABLE public.parents ENABLE TRIGGER %I'')');",
         ],
     )

@@ -508,6 +508,14 @@ fn a_change_found_when_a_version_is_sent_is_said_and_the_version_applies_as_it_w
             let _ = writes.write(&own, &application);
             writes.recorded(&own, &db, &application, "a write after the Version");
             if change == Change::SuperuserTable {
+                // CONTRACT.md: "a Version with none to apply is accepted".
+                let none_new = own.send(&application, &blackbox::out_of_reach::base());
+                assert_eq!(
+                    none_new.status,
+                    201,
+                    "expected a Version with no migrations to apply accepted while the superuser's table is there, got\n{}",
+                    none_new.describe()
+                );
                 db.superuser().batch("DROP TABLE public.superuser_made");
                 let sent = own.send(&application, &list);
                 assert_eq!(

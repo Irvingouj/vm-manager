@@ -246,7 +246,10 @@ fn no_login_with_a_migration_s_password_while_closing_the_role_is_held_up() {
         !has_password(&db),
         "expected the owner role without a password from the commit on, also while closing it is held up"
     );
-    let answered = answered_rx.recv_timeout(Duration::from_secs(15));
+    // CONTRACT.md: answered "at most 15 seconds after their commit"; the
+    // lock is granted to the harness at the commit.
+    let answered =
+        answered_rx.recv_timeout(Duration::from_secs(15).saturating_sub(held_at.elapsed()));
     let waited = held_at.elapsed();
     assert_no_login(
         &db,
@@ -259,7 +262,7 @@ fn no_login_with_a_migration_s_password_while_closing_the_role_is_held_up() {
         Ok(sent) => sent,
         Err(_) => {
             panic!(
-                "expected the Version answered while closing the role was held up (CONTRACT.md: \"the Version is still answered as its migrations ended\"); after {waited:?} of holding it was not"
+                "expected the Version answered within 15 s of its migrations' commit while closing the role was held up (CONTRACT.md: \"at most 15 seconds after their commit\"); {waited:?} after the commit it was not"
             );
         }
     };
