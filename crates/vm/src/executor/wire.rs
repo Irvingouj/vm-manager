@@ -43,14 +43,19 @@ const READ_CHUNK: usize = 64 * 1024;
 /// (blackbox/CONTRACT.md, "What a migration leaves behind: Checked before
 /// every commit that could carry a change"; ADR 0017), in one simple query
 /// so that nothing of the Application's can run between the check and the
-/// commit: deferred constraints made immediate (their triggers run now, not
-/// after the check), every cursor closed (one declared `WITH HOLD` would
-/// run its query at the commit), then `vm.before_commit()`, which raises
-/// `VM004` while the session holds a lock that only a change of structure
-/// or capture takes. A statement that fails skips the rest, `COMMIT`
-/// included: the transaction is left aborted and rolled back.
-const CHECKED_COMMIT: &str =
-    "SET CONSTRAINTS ALL IMMEDIATE; CLOSE ALL; SELECT vm.before_commit(); COMMIT";
+/// commit: `vm.before_commit()`, which raises `VM004` while the session
+/// holds a lock that only a change of structure or capture takes; then
+/// deferred constraints made immediate (their triggers run now, not after
+/// the check), every cursor closed (one declared `WITH HOLD` would run its
+/// query at the commit), and `vm.before_commit()` again, for what those
+/// ran. The first check answers `VM004` for a change already made before
+/// a deferred trigger can fail otherwise (before Postgres 18 a deferred
+/// trigger runs as the role that commits, not the one that queued it, so
+/// a trigger queued by the owner's code fails for lack of rights). A
+/// statement that fails skips the rest, `COMMIT` included: the transaction
+/// is left aborted and rolled back.
+const CHECKED_COMMIT: &str = "SELECT vm.before_commit(); SET CONSTRAINTS ALL IMMEDIATE; CLOSE ALL; \
+     SELECT vm.before_commit(); COMMIT";
 
 /// What went wrong with a connection. A kind only: it carries nothing of
 /// the connection, so it can be logged.

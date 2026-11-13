@@ -449,8 +449,9 @@ $f$;
 -- one and keeps it until the transaction ends; one made in a
 -- subtransaction that was rolled back was let go with it, and so was what
 -- it changed. The host sends it in the same simple query as the `COMMIT`,
--- after `SET CONSTRAINTS ALL IMMEDIATE` and `CLOSE ALL`, so a raised error
--- turns the commit into a rollback and nothing runs in between. The
+-- before and again after `SET CONSTRAINTS ALL IMMEDIATE` and `CLOSE ALL`,
+-- so a raised error turns the commit into a rollback and nothing runs
+-- between the last check and the commit. The
 -- runtime role may call it itself, to no end: it reads the lock manager's
 -- own view of this session, and it cannot be replaced (the platform's
 -- role owns it and `vm`).
