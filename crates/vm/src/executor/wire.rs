@@ -28,7 +28,8 @@ use tokio::net::TcpStream;
 use tokio::time::{Instant, timeout, timeout_at};
 
 use super::{
-    Failure, IdentityKey, Label, Level, Limit, Limits, Param, Rows, Target, Values, identity,
+    Failure, IdentityKey, Isolation, Label, Level, Limit, Limits, Param, Rows, Target, Values,
+    identity,
 };
 
 /// The largest message other than a row that is read. A larger one is a
@@ -99,13 +100,38 @@ pub(super) struct Operation<'a> {
     pub(super) key: Option<&'a IdentityKey>,
 }
 
-/// Why the transaction's key could not be had.
-enum Exchange {
+/// The begin of a transaction that stays open for statements sent one at a
+/// time (blackbox/CONTRACT.md, "Transactions"): its level and isolation, its
+/// label, and on an own database the keys its identity is attached with.
+pub(super) struct Begin<'a> {
+    pub(super) level: Level,
+    pub(super) isolation: Option<Isolation>,
+    pub(super) label: Label<'a>,
+    pub(super) key: Option<&'a IdentityKey>,
+}
+
+/// One statement in a transaction already begun.
+pub(super) struct Statement<'a> {
+    pub(super) sql: &'a str,
+    pub(super) params: &'a [Param],
+    pub(super) values: Values,
+}
+
+/// Why the transaction's key, or a transaction's begin, could not be had.
+pub(super) enum Exchange {
     /// The connection failed before the server answered anything: probably
     /// closed while idle.
     Stale,
     /// Anything else: the connection is not to be used again.
     Failed,
+}
+
+/// How reading an answer ended.
+enum Answered {
+    /// The server is ready again, with this transaction status.
+    Ready(u8),
+    /// The statement was stopped or the connection failed: the whole run.
+    Over(Run),
 }
 
 /// How one operation went on the connection.
@@ -125,6 +151,9 @@ pub(super) struct Run {
     /// probably closed while idle, and the statement may be tried on a new
     /// one.
     pub(super) stale: bool,
+    /// In a transaction left open ([`Connection::statement`]): Postgres has
+    /// it aborted, after a statement it refused.
+    pub(super) aborted: bool,
 }
 
 pub(super) struct Connection {
@@ -327,19 +356,23 @@ impl Connection {
         let mut out = BytesMut::new();
         let host_left = match (operation.key, operation.label.actor) {
             (Some(key), Some(actor)) => {
-                let transaction_key =
-                    match timeout(limits.statement, self.transaction_key(operation)).await {
-                        Ok(Ok(transaction_key)) => transaction_key,
-                        Ok(Err(Exchange::Stale)) => {
-                            return Run {
-                                stale: true,
-                                ..self.ended(Err(Failure::Unavailable), None, false)
-                            };
-                        }
-                        Ok(Err(Exchange::Failed)) | Err(_) => {
-                            return self.ended(Err(Failure::Unavailable), None, false);
-                        }
-                    };
+                let transaction_key = match timeout(
+                    limits.statement,
+                    self.transaction_key(operation.level, None, operation.label),
+                )
+                .await
+                {
+                    Ok(Ok(transaction_key)) => transaction_key,
+                    Ok(Err(Exchange::Stale)) => {
+                        return Run {
+                            stale: true,
+                            ..self.ended(Err(Failure::Unavailable), None, false)
+                        };
+                    }
+                    Ok(Err(Exchange::Failed)) | Err(_) => {
+                        return self.ended(Err(Failure::Unavailable), None, false);
+                    }
+                };
                 let label = operation.label;
                 let who = identity(
                     label.user,
@@ -375,34 +408,13 @@ impl Connection {
         let deadline = sent + limits.statement;
         let mut result = Reading::new(limits, host_left, operation.values);
         // After the key's round trip, the server has answered already.
-        let mut answered = host_left < 2;
-        let status = loop {
-            let row_limit = result.bytes_left();
-            let incoming = match timeout_at(deadline, self.receive(row_limit)).await {
-                Ok(Ok(incoming)) => incoming,
-                Ok(Err(_)) => {
-                    let failure = Err(Failure::Unavailable);
-                    return Run {
-                        stale: !answered,
-                        ..self.ended(failure, if answered { Some(sent) } else { None }, false)
-                    };
-                }
-                Err(_) => return self.stop(Limit::Time, sent, limits).await,
-            };
-            answered = true;
-            match result.take(incoming, &mut out) {
-                Step::Go => {}
-                Step::Reply => {
-                    if self.send(&mut out).await.is_err() {
-                        return self.ended(Err(Failure::Unavailable), Some(sent), false);
-                    }
-                }
-                Step::Ready(status) => break status,
-                Step::Limit(limit) => return self.stop(limit, sent, limits).await,
-                Step::Broken => {
-                    return self.ended(Err(Failure::Unavailable), Some(sent), false);
-                }
-            }
+        let answered = host_left < 2;
+        let status = match self
+            .read_answer(&mut result, &mut out, sent, deadline, answered, limits)
+            .await
+        {
+            Answered::Ready(status) => status,
+            Answered::Over(run) => return run,
         };
         let statement_ended = Instant::now();
         let result = result.finish();
@@ -426,12 +438,204 @@ impl Connection {
         }
     }
 
+    /// Reads the answer to what was sent at `sent`, until the server is
+    /// ready again: its transaction status ([`Answered::Ready`]). Past `deadline`, or past the row
+    /// or byte limit, the statement is stopped ([`Connection::stop`]); a
+    /// connection that fails is given up. Either way the run is answered
+    /// whole, as [`Answered::Over`]. `answered`: the server has answered something
+    /// already (so a failure now is not a stale connection's).
+    async fn read_answer(
+        &mut self,
+        result: &mut Reading,
+        out: &mut BytesMut,
+        sent: Instant,
+        deadline: Instant,
+        mut answered: bool,
+        limits: &Limits,
+    ) -> Answered {
+        loop {
+            let row_limit = result.bytes_left();
+            let incoming = match timeout_at(deadline, self.receive(row_limit)).await {
+                Ok(Ok(incoming)) => incoming,
+                Ok(Err(_)) => {
+                    let failure = Err(Failure::Unavailable);
+                    return Answered::Over(Run {
+                        stale: !answered,
+                        ..self.ended(failure, if answered { Some(sent) } else { None }, false)
+                    });
+                }
+                Err(_) => return Answered::Over(self.stop(Limit::Time, sent, limits.grace).await),
+            };
+            answered = true;
+            match result.take(incoming, out) {
+                Step::Go => {}
+                Step::Reply => {
+                    if self.send(out).await.is_err() {
+                        return Answered::Over(self.ended(
+                            Err(Failure::Unavailable),
+                            Some(sent),
+                            false,
+                        ));
+                    }
+                }
+                Step::Ready(status) => return Answered::Ready(status),
+                Step::Limit(limit) => {
+                    return Answered::Over(self.stop(limit, sent, limits.grace).await);
+                }
+                Step::Broken => {
+                    return Answered::Over(self.ended(
+                        Err(Failure::Unavailable),
+                        Some(sent),
+                        false,
+                    ));
+                }
+            }
+        }
+    }
+
+    /// Begins a transaction that stays open (blackbox/CONTRACT.md,
+    /// "Transactions"), within `limit`: `BEGIN` with its level and
+    /// isolation, and the host's first statement, which sets the label. On
+    /// an own database (a key, and a label with an actor) the identity is
+    /// attached too, as in [`Connection::operate`]: it is transaction-local,
+    /// so it holds until the transaction ends. Succeeds only when everything
+    /// was answered without an error and the server is in the transaction.
+    pub(super) async fn begin_transaction(
+        &mut self,
+        begin: &Begin<'_>,
+        limit: Duration,
+    ) -> Result<(), Exchange> {
+        let exchange = async {
+            let mut out = BytesMut::new();
+            let answered = match (begin.key, begin.label.actor) {
+                (Some(key), Some(actor)) => {
+                    let transaction_key = self
+                        .transaction_key(begin.level, begin.isolation, begin.label)
+                        .await?;
+                    let label = begin.label;
+                    let who = identity(
+                        label.user,
+                        label.application,
+                        actor,
+                        Some(label.request),
+                        None,
+                    );
+                    let ctx = key.attach(&transaction_key, &who);
+                    encode_host(HOST_ATTACH, &[ctx.as_str()], &mut out)
+                        .map_err(|_| Exchange::Failed)?;
+                    true
+                }
+                _ => {
+                    encode_labelled_begin(begin.level, begin.isolation, begin.label, &mut out)
+                        .map_err(|_| Exchange::Failed)?;
+                    false
+                }
+            };
+            frontend::sync(&mut out);
+            self.send(&mut out).await.map_err(|_| {
+                if answered {
+                    Exchange::Failed
+                } else {
+                    Exchange::Stale
+                }
+            })?;
+            match self.host_answer(answered).await? {
+                b'T' => Ok(()),
+                _ => Err(Exchange::Failed),
+            }
+        };
+        timeout(limit, exchange)
+            .await
+            .map_err(|_| Exchange::Failed)?
+    }
+
+    /// Reads the answer to statements of the host's own, up to the Sync:
+    /// the transaction status, or `Failed` if any of them failed.
+    async fn host_answer(&mut self, mut answered: bool) -> Result<u8, Exchange> {
+        let mut failed = false;
+        loop {
+            let incoming = match self.receive(MAX_MESSAGE).await {
+                Ok(incoming) => incoming,
+                Err(_) if !answered => return Err(Exchange::Stale),
+                Err(_) => return Err(Exchange::Failed),
+            };
+            answered = true;
+            match incoming {
+                Incoming::Message(Message::ReadyForQuery(body)) if !failed => {
+                    return Ok(body.status());
+                }
+                Incoming::Message(Message::ReadyForQuery(_)) => return Err(Exchange::Failed),
+                Incoming::Message(Message::ErrorResponse(_)) | Incoming::Oversized { .. } => {
+                    failed = true;
+                }
+                Incoming::Message(_) => {}
+            }
+        }
+    }
+
+    /// Runs one statement in the transaction begun on this connection
+    /// ([`Connection::begin_transaction`]), under the limits of `limits`,
+    /// its time cut at `cap` if that comes first. `reusable` in the answer
+    /// means the transaction is still open and the connection usable for
+    /// its next statement, `aborted` that Postgres has it aborted. Past a
+    /// limit the statement is stopped as in [`Connection::operate`] (its
+    /// transaction rolled back), and the connection is not to be used
+    /// again.
+    pub(super) async fn statement(
+        &mut self,
+        statement: &Statement<'_>,
+        limits: &Limits,
+        cap: Instant,
+    ) -> Run {
+        let mut out = BytesMut::new();
+        if encode_statement(statement.sql, statement.params, &mut out).is_err() {
+            return self.ended(Err(Failure::Unavailable), None, false);
+        }
+        if self.send(&mut out).await.is_err() {
+            return self.ended(Err(Failure::Unavailable), None, false);
+        }
+        let sent = Instant::now();
+        let deadline = (sent + limits.statement).min(cap);
+        let mut result = Reading::new(limits, 0, statement.values);
+        let status = match self
+            .read_answer(&mut result, &mut out, sent, deadline, true, limits)
+            .await
+        {
+            Answered::Ready(status) => status,
+            Answered::Over(run) => return run,
+        };
+        let result = result.finish();
+        // Still in the transaction, and the statement ran or Postgres
+        // refused it. Anything else (no longer in a transaction, a message
+        // the host cannot read) and the transaction is given up.
+        let ran_or_refused = matches!(result, Ok(_) | Err(Failure::Database { .. }));
+        let open = matches!(status, b'T' | b'E') && ran_or_refused;
+        Run {
+            aborted: status == b'E',
+            ..self.ended(result, Some(sent), open)
+        }
+    }
+
+    /// Stops what the connection is doing, as [`Connection::stop`] does,
+    /// whatever state it was left in: cancels, waits up to `grace` for it to
+    /// come back, and rolls back. Answers the backend to end from another
+    /// connection if it did not come back; the connection is not to be used
+    /// again either way.
+    pub(super) async fn halt(&mut self, grace: Duration) -> Option<i32> {
+        self.stop(Limit::Time, Instant::now(), grace).await.stuck
+    }
+
     /// Begins the operation's transaction, sets the label, and answers the
     /// transaction's key: `BEGIN` and the host's first statement, flushed
     /// without a Sync, so that the transaction stays open for the rest.
-    async fn transaction_key(&mut self, operation: &Operation<'_>) -> Result<String, Exchange> {
+    async fn transaction_key(
+        &mut self,
+        level: Level,
+        isolation: Option<Isolation>,
+        label: Label<'_>,
+    ) -> Result<String, Exchange> {
         let mut out = BytesMut::new();
-        encode_keyed_begin(operation, &mut out).map_err(|_| Exchange::Failed)?;
+        encode_keyed_begin(level, isolation, label, &mut out).map_err(|_| Exchange::Failed)?;
         frontend::flush(&mut out);
         self.send(&mut out).await.map_err(|_| Exchange::Stale)?;
         let mut answered = false;
@@ -477,6 +681,7 @@ impl Connection {
             reusable,
             stuck: None,
             stale: false,
+            aborted: false,
         }
     }
 
@@ -488,7 +693,7 @@ impl Connection {
     /// session can hold: settings and the search path, temporary tables,
     /// prepared statements, cursors (`WITH HOLD` too), session advisory
     /// locks, `LISTEN`, and any change of role.
-    async fn end_transaction(
+    pub(super) async fn end_transaction(
         &mut self,
         commit: bool,
         limit: Duration,
@@ -531,11 +736,11 @@ impl Connection {
         (ending, answered && clean)
     }
 
-    /// Past a limit: cancels the statement and waits up to `limits.grace`
-    /// for the connection to come back, discarding what arrives.
-    async fn stop(&mut self, limit: Limit, sent: Instant, limits: &Limits) -> Run {
+    /// Past a limit: cancels the statement and waits up to `grace` for the
+    /// connection to come back, discarding what arrives.
+    async fn stop(&mut self, limit: Limit, sent: Instant, grace: Duration) -> Run {
         let ended = Instant::now();
-        let grace = ended + limits.grace;
+        let grace = ended + grace;
         let cancelled = match self.process_id {
             Some(process_id) => timeout_at(grace, cancel(self.peer, process_id, self.secret_key))
                 .await
@@ -559,6 +764,7 @@ impl Connection {
                     reusable: false,
                     stuck: self.process_id,
                     stale: false,
+                    aborted: false,
                 };
             }
         }
@@ -569,6 +775,7 @@ impl Connection {
             reusable: false,
             stuck: if back { None } else { self.process_id },
             stale: false,
+            aborted: false,
         }
     }
 
@@ -613,7 +820,17 @@ async fn cancel(peer: SocketAddr, process_id: i32, secret_key: i32) -> Result<()
 /// The messages of one operation, ending in one Sync: `BEGIN`, the label,
 /// the Application's statement.
 fn encode_operation(operation: &Operation<'_>, out: &mut BytesMut) -> Result<(), WireError> {
-    let label = operation.label;
+    encode_labelled_begin(operation.level, None, operation.label, out)?;
+    encode_statement(operation.sql, operation.params, out)
+}
+
+/// `BEGIN` and the host's first statement, which sets the label. No Sync.
+fn encode_labelled_begin(
+    level: Level,
+    isolation: Option<Isolation>,
+    label: Label<'_>,
+    out: &mut BytesMut,
+) -> Result<(), WireError> {
     let shared = [label.user, label.application, label.request];
     let own;
     let (first, values): (&str, &[&str]) = match label.actor {
@@ -623,18 +840,21 @@ fn encode_operation(operation: &Operation<'_>, out: &mut BytesMut) -> Result<(),
             (HOST_FIRST_STATEMENT_OWN, &own)
         }
     };
-    encode_host(begin_of(operation.level), &[], out)?;
-    encode_host(first, values, out)?;
-    encode_statement(operation, out)
+    encode_host(begin_of(level, isolation), &[], out)?;
+    encode_host(first, values, out)
 }
 
 /// `BEGIN` and the host's first statement on an own database, which sets
 /// the label and answers the transaction's key. No Sync.
-fn encode_keyed_begin(operation: &Operation<'_>, out: &mut BytesMut) -> Result<(), WireError> {
-    let label = operation.label;
+fn encode_keyed_begin(
+    level: Level,
+    isolation: Option<Isolation>,
+    label: Label<'_>,
+    out: &mut BytesMut,
+) -> Result<(), WireError> {
     let actor = label.actor.unwrap_or_default();
     let values = [label.user, label.application, label.request, actor];
-    encode_host(begin_of(operation.level), &[], out)?;
+    encode_host(begin_of(level, isolation), &[], out)?;
     encode_host(HOST_FIRST_STATEMENT_KEYED, &values, out)
 }
 
@@ -646,13 +866,33 @@ fn encode_attached(
     out: &mut BytesMut,
 ) -> Result<(), WireError> {
     encode_host(HOST_ATTACH, &[ctx], out)?;
-    encode_statement(operation, out)
+    encode_statement(operation.sql, operation.params, out)
 }
 
-fn begin_of(level: Level) -> &'static str {
-    match level {
-        Level::Read => "BEGIN READ ONLY",
-        Level::Write => "BEGIN READ WRITE",
+/// The `BEGIN` of a transaction at `level`: read-only or read-write, at
+/// `isolation` or the database's default. Fixed words only.
+fn begin_of(level: Level, isolation: Option<Isolation>) -> &'static str {
+    match (level, isolation) {
+        (Level::Read, None) => "BEGIN READ ONLY",
+        (Level::Write, None) => "BEGIN READ WRITE",
+        (Level::Read, Some(Isolation::ReadCommitted)) => {
+            "BEGIN ISOLATION LEVEL READ COMMITTED READ ONLY"
+        }
+        (Level::Write, Some(Isolation::ReadCommitted)) => {
+            "BEGIN ISOLATION LEVEL READ COMMITTED READ WRITE"
+        }
+        (Level::Read, Some(Isolation::RepeatableRead)) => {
+            "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY"
+        }
+        (Level::Write, Some(Isolation::RepeatableRead)) => {
+            "BEGIN ISOLATION LEVEL REPEATABLE READ READ WRITE"
+        }
+        (Level::Read, Some(Isolation::Serializable)) => {
+            "BEGIN ISOLATION LEVEL SERIALIZABLE READ ONLY"
+        }
+        (Level::Write, Some(Isolation::Serializable)) => {
+            "BEGIN ISOLATION LEVEL SERIALIZABLE READ WRITE"
+        }
     }
 }
 
@@ -677,16 +917,15 @@ fn encode_host(sql: &str, values: &[&str], out: &mut BytesMut) -> Result<(), Wir
 }
 
 /// The Application's statement over the extended protocol, then Sync.
-fn encode_statement(operation: &Operation<'_>, out: &mut BytesMut) -> Result<(), WireError> {
+fn encode_statement(sql: &str, params: &[Param], out: &mut BytesMut) -> Result<(), WireError> {
     // Types left for the server to infer (0), every parameter and every
     // result column in text (no format codes means text).
-    frontend::parse("", operation.sql, operation.params.iter().map(|_| 0), out)
-        .map_err(protocol)?;
+    frontend::parse("", sql, params.iter().map(|_| 0), out).map_err(protocol)?;
     frontend::bind(
         "",
         "",
         std::iter::empty(),
-        operation.params,
+        params,
         |param, buf| match param {
             Param::Null => Ok(IsNull::Yes),
             Param::Text(text) => {

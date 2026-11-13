@@ -23,6 +23,14 @@
 //! is closed. The program never sends `SET ROLE` or `SET SESSION
 //! AUTHORIZATION`.
 //!
+//! A transaction that stays open between operations (blackbox/CONTRACT.md,
+//! "Transactions") takes a connection with [`Pool::checkout`] and holds it
+//! as a [`Held`] until it ends: begun once ([`Held::begin`]: its label, and
+//! on an own database its signed identity, set for all of it), then one
+//! statement at a time ([`Held::run`]), each under the same limits, its time
+//! also cut at the transaction's cap. The same rule holds at its end: back
+//! to the pool only shown clean.
+//!
 //! A pool opens no connection until it is used (registering a Resource
 //! does not connect). The statement check (crate::check) is not here: it
 //! is hygiene, decided before an operation reaches the executor, and
@@ -36,11 +44,12 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use serde_json::{Map, Value};
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, SemaphorePermit};
+use tokio::time::Instant;
 
 use crate::log;
 pub use identity::{IdentityKey, identity};
-use wire::{Connection, WireError};
+use wire::{Connection, Exchange, WireError};
 
 /// A password for a shared database. No `Display`; its `Debug` shows
 /// nothing of it.
@@ -160,6 +169,28 @@ pub struct Label<'a> {
     pub request: &'a str,
     /// `user` or `application`, on an own database; `None` on a shared one.
     pub actor: Option<&'a str>,
+}
+
+/// The isolation level a transaction is begun at (blackbox/CONTRACT.md,
+/// "Transactions: Through the raw interface"). Without one, the database's
+/// default.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Isolation {
+    ReadCommitted,
+    RepeatableRead,
+    Serializable,
+}
+
+impl Isolation {
+    /// The level of one of the three names the contract gives, exactly.
+    pub fn of(name: &str) -> Option<Self> {
+        match name {
+            "read committed" => Some(Self::ReadCommitted),
+            "repeatable read" => Some(Self::RepeatableRead),
+            "serializable" => Some(Self::Serializable),
+            _ => None,
+        }
+    }
 }
 
 /// Which transactions a pool's login runs.
@@ -399,6 +430,34 @@ impl Pool {
         }
     }
 
+    /// Takes a connection for a transaction that stays open until it is
+    /// ended ([`Held`]), within the checkout wait, as [`Pool::run`] does. It
+    /// holds one of the pool's permits until then. Nothing is sent yet.
+    pub async fn checkout(&self, level: Level) -> Result<Held<'_>, Failure> {
+        if !self.levels.permit(level) {
+            self.report("a transaction of a level this login is not for");
+            return Err(Failure::Unavailable);
+        }
+        let checkout = self.limits.checkout;
+        let Ok(Ok(permit)) = tokio::time::timeout(checkout, self.permits.acquire()).await else {
+            self.report("no connection was free in time");
+            return Err(Failure::Unavailable);
+        };
+        let (connection, reused) = match self.take_idle() {
+            Some(connection) => (connection, true),
+            None => (self.open().await.map_err(|()| Failure::Unavailable)?, false),
+        };
+        Ok(Held {
+            pool: self,
+            _permit: permit,
+            level,
+            connection: Some(connection),
+            reused,
+            begun: false,
+            aborted: false,
+        })
+    }
+
     async fn open(&self) -> Result<Connection, ()> {
         Connection::open(&self.target, self.limits.connect)
             .await
@@ -449,6 +508,175 @@ impl Pool {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .push(connection);
+    }
+}
+
+/// A connection held by one transaction, from its begin to its end
+/// (blackbox/CONTRACT.md, "Transactions"), with one of its pool's permits:
+/// between them it runs nothing but that transaction's statements, one at a
+/// time (each takes `&mut self`). Whoever holds it ends it: [`Held::end`]
+/// (the connection goes back to its pool only shown clean, as after any
+/// operation), [`Held::halt`] when it was left in the middle of a
+/// statement, or [`Held::release`] before it was begun. Dropped otherwise,
+/// the connection is closed, which rolls its transaction back.
+pub struct Held<'p> {
+    pool: &'p Pool,
+    _permit: SemaphorePermit<'p>,
+    level: Level,
+    /// `None` once given up: the transaction is over.
+    connection: Option<Connection>,
+    /// Taken from the idle ones: the server may have closed it meanwhile.
+    reused: bool,
+    begun: bool,
+    /// A statement Postgres refused left the transaction aborted.
+    aborted: bool,
+}
+
+impl fmt::Debug for Held<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Held")
+            .field("pool", &self.pool)
+            .field("level", &self.level)
+            .field("open", &self.connection.is_some())
+            .field("aborted", &self.aborted)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Held<'_> {
+    /// Begins the transaction, read-only or read-write as the checkout's
+    /// level says, at `isolation`, labelled `label` (and on an own database
+    /// with the signed identity attached, once, for all of it). A reused
+    /// connection the server had closed is replaced once by a new one.
+    /// Answers how long it took; on a failure the connection is given up.
+    pub async fn begin(
+        &mut self,
+        isolation: Option<Isolation>,
+        label: Label<'_>,
+    ) -> Result<Duration, Failure> {
+        let begin = wire::Begin {
+            level: self.level,
+            isolation,
+            label,
+            key: self.pool.key.as_deref(),
+        };
+        let limit = self.pool.limits.statement;
+        let started = Instant::now();
+        let Some(connection) = self.connection.as_mut() else {
+            return Err(Failure::Unavailable);
+        };
+        self.begun = true;
+        let mut began = connection.begin_transaction(&begin, limit).await;
+        if matches!(began, Err(Exchange::Stale)) && self.reused {
+            self.connection = None;
+            let mut fresh = self.pool.open().await.map_err(|()| Failure::Unavailable)?;
+            began = fresh.begin_transaction(&begin, limit).await;
+            self.connection = Some(fresh);
+        }
+        self.reused = false;
+        match began {
+            Ok(()) => Ok(started.elapsed()),
+            Err(_) => {
+                self.connection = None;
+                self.pool.report("a transaction could not be begun");
+                Err(Failure::Unavailable)
+            }
+        }
+    }
+
+    /// Whether the transaction is still open on its connection.
+    pub fn is_open(&self) -> bool {
+        self.connection.is_some()
+    }
+
+    /// Whether Postgres has the transaction aborted: a statement failed.
+    pub fn aborted(&self) -> bool {
+        self.aborted
+    }
+
+    /// Runs `sql` in the transaction, under the pool's limits, its time cut
+    /// at `cap` if that comes first. A statement Postgres refuses leaves the
+    /// transaction open and aborted. A statement a limit ended, or a
+    /// connection that failed, ends the transaction: rolled back, and the
+    /// connection given up (its backend ended from another connection if
+    /// it does not come back from the cancel).
+    pub async fn run(
+        &mut self,
+        sql: &str,
+        params: &[Param],
+        values: Values,
+        cap: Instant,
+    ) -> Outcome {
+        let Some(connection) = self.connection.as_mut() else {
+            return unavailable();
+        };
+        let statement = wire::Statement {
+            sql,
+            params,
+            values,
+        };
+        let run = connection
+            .statement(&statement, &self.pool.limits, cap)
+            .await;
+        if matches!(run.result, Err(Failure::Unavailable)) {
+            self.pool
+                .report("the connection failed during a statement in a transaction");
+        }
+        if run.reusable {
+            self.aborted = run.aborted;
+        } else {
+            self.connection = None;
+            if let Some(process_id) = run.stuck {
+                self.pool.terminate(process_id).await;
+            }
+        }
+        Outcome {
+            duration: run
+                .sent
+                .map(|sent| run.ended.saturating_duration_since(sent)),
+            result: run.result,
+        }
+    }
+
+    /// Ends the transaction: `COMMIT` when `commit`, else `ROLLBACK`, with
+    /// `DISCARD ALL`, within the grace period. The connection goes back to
+    /// its pool only if both were answered without error and it is idle;
+    /// otherwise it is closed. A `COMMIT` Postgres refused is its failure.
+    pub async fn end(mut self, commit: bool) -> Result<(), Failure> {
+        let Some(mut connection) = self.connection.take() else {
+            return Err(Failure::Unavailable);
+        };
+        let (ending, clean) = connection
+            .end_transaction(commit, self.pool.limits.grace)
+            .await;
+        if clean {
+            self.pool.give_back(connection);
+        }
+        ending
+    }
+
+    /// Ends a transaction whose connection was left in an unknown state (a
+    /// statement given up halfway): cancels what runs, waits up to the
+    /// grace period for it, rolls back, and closes the connection; if it
+    /// did not come back, its backend is ended from another connection.
+    pub async fn halt(mut self) {
+        let Some(mut connection) = self.connection.take() else {
+            return;
+        };
+        let stuck = connection.halt(self.pool.limits.grace).await;
+        drop(connection);
+        if let Some(process_id) = stuck {
+            self.pool.terminate(process_id).await;
+        }
+    }
+
+    /// Lets go of a connection on which nothing was begun: back to its pool.
+    pub fn release(mut self) {
+        if let Some(connection) = self.connection.take()
+            && !self.begun
+        {
+            self.pool.give_back(connection);
+        }
     }
 }
 
