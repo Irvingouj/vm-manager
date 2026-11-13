@@ -403,6 +403,13 @@ fn the_isolation_level_and_the_access_mode_reach_postgres() {
                     "off"
                 };
                 assert_eq!(row["ro"], read_only, "{context}");
+                if target == "ops" && read_only == "on" {
+                    assert_eq!(
+                        row["login"],
+                        sdk.scenario.db.reader.role.as_str(),
+                        "accessMode read only on a handle declared at write begins at read, as the read login: {context}"
+                    );
+                }
                 if target == "ops" && read_only == "off" {
                     assert_eq!(
                         row["login"],
@@ -413,6 +420,46 @@ fn the_isolation_level_and_the_access_mode_reach_postgres() {
             }
         }
     }
+}
+
+#[test]
+fn read_only_on_a_handle_declared_at_write_needs_only_read() {
+    let sdk = ledger();
+    sdk.scenario.grant(OPS, "ops-readers", "read");
+    let olga = blackbox::User::new("olga").in_groups(&["ops-readers"]);
+    let (response, body) = sdk.get_ok(&olga, "/settings?target=ops&mode=read%20only");
+    assert_eq!(
+        body["rows"][0]["login"],
+        sdk.scenario.db.reader.role.as_str(),
+        "a read-only transaction on ops runs as the read login: {body}"
+    );
+    assert_eq!(body["rows"][0]["ro"], "on", "{body}");
+    let entries = sdk.entries_of(&response);
+    assert_eq!(
+        operations(&entries).first(),
+        Some(&"begin"),
+        "{}",
+        lines(&entries)
+    );
+    assert_eq!(
+        entries[0]["outcome"], "allowed",
+        "the begin needs read only, which olga holds: {}",
+        entries[0]
+    );
+    // Read-write needs write, which she does not hold.
+    let refused = sdk.get(&olga, "/settings?target=ops&mode=read%20write");
+    assert_eq!(
+        refused.status,
+        403,
+        "a read-write transaction on ops by a User holding read is refused: {}",
+        refused.describe()
+    );
+    assert_eq!(
+        refused.json()["refusal"]["reason"],
+        "no-grant",
+        "{}",
+        refused.describe()
+    );
 }
 
 #[test]

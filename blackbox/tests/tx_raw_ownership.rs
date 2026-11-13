@@ -94,7 +94,7 @@ fn an_id_never_begun_or_already_ended_answers_no_transaction_for_every_use() {
     steps.push(begin(own, "write", "rolled"));
     steps.push(rollback("rolled"));
     steps.extend(every_use_of("rolled", own, &marker));
-    let (_, body) = t.run_body(&user, APP, &steps);
+    let (response, body) = t.run_body(&user, APP, &steps);
     let answers = body["answers"].as_array().unwrap();
     let mut ids: Vec<String> = made_up.iter().map(|s| (*s).to_owned()).collect();
     for name in ["committed", "rolled"] {
@@ -131,6 +131,16 @@ fn an_id_never_begun_or_already_ended_answers_no_transaction_for_every_use() {
         said.len(),
         USES.len(),
         "the answer does not say why an id is not an open transaction of the request: each use must answer the same whatever the reason, but these differ:\n{said:#?}"
+    );
+    let entries = t.entries_of(&response);
+    assert_eq!(
+        entries
+            .iter()
+            .map(|e| e["operation"].as_str().unwrap_or_default())
+            .collect::<Vec<_>>(),
+        vec!["begin", "commit", "begin", "rollback"],
+        "a use answered `no-transaction` has no Operation log entry:\n{}",
+        blackbox::scenario::lines(&entries)
     );
     assert_eq!(
         t.rows_with(shared, &marker),
@@ -183,8 +193,9 @@ fn an_id_begun_by_another_request_answers_no_transaction_while_it_runs_and_after
                 (User::new("mallory").in_groups(&["writers", "readers"]), APP),
                 (user.clone(), VIEWER),
             ] {
-                let (_, answers) = t.run(&who, application, &every_use(&id, target, &stolen));
-                during.push((who.id.clone(), application, answers));
+                let (response, answers) =
+                    t.run(&who, application, &every_use(&id, target, &stolen));
+                during.push((who.id.clone(), application, answers, response));
             }
             assert!(
                 !first_done.load(Ordering::SeqCst),
@@ -192,7 +203,13 @@ fn an_id_begun_by_another_request_answers_no_transaction_while_it_runs_and_after
             );
             (first.join().unwrap(), during, id)
         });
-        for (who, application, answers) in &during {
+        for (who, application, answers, response) in &during {
+            let entries = t.entries_of(response);
+            assert!(
+                entries.is_empty(),
+                "{context}: uses answered `no-transaction` have no Operation log entry, got:\n{}",
+                blackbox::scenario::lines(&entries)
+            );
             for (use_, answer) in USES.iter().zip(answers) {
                 assert_no_transaction(
                     answer,
@@ -227,7 +244,11 @@ fn an_id_begun_by_another_request_answers_no_transaction_while_it_runs_and_after
             t.db().assert_not_received(&stolen, &context);
         }
         // After the first request ended.
-        let (_, answers) = t.run(&user, APP, &every_use(&id, target, &stolen));
+        let (after, answers) = t.run(&user, APP, &every_use(&id, target, &stolen));
+        assert!(
+            t.entries_of(&after).is_empty(),
+            "{context}: uses answered `no-transaction` have no Operation log entry"
+        );
         for (use_, answer) in USES.iter().zip(&answers) {
             assert_no_transaction(
                 answer,

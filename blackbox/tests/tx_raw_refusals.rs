@@ -3,8 +3,9 @@
 //!
 //! - malformed arguments: no `access`, an unknown `access` or `isolation`,
 //!   no target or two, a bad `own` or `as`; `tx` beside `resource`, `own`
-//!   or `as`. Nothing reaches the database, and there is no Operation log
-//!   entry;
+//!   or `as`; `tx` missing or not a string on `tx.commit`, `tx.rollback`,
+//!   `query` and `execute`. Nothing reaches the database, and there is no
+//!   Operation log entry;
 //! - the refusals of `tx.begin`, in the order of "Who is allowed"
 //!   (`not-own-database`, `not-declared`, `not-registered`,
 //!   `declared-lower`, `no-grant`), each logged as a refused `begin` with
@@ -40,6 +41,10 @@ fn malformed_begins_are_answered_malformed_and_reach_nothing() {
         (
             "an unknown access",
             json!({ "resource": RESOURCE, "access": "admin" }),
+        ),
+        (
+            "access structure, which is not one of the two",
+            json!({ "resource": RESOURCE, "access": "structure" }),
         ),
         (
             "an access that is not a string",
@@ -136,13 +141,34 @@ fn tx_beside_resource_own_or_as_is_malformed_and_runs_nothing() {
             steps.push(step(operation, args));
         }
     }
+    // `tx` missing or not a string.
+    for args in [
+        json!({}),
+        json!({ "tx": 1 }),
+        json!({ "tx": null }),
+        json!({ "tx": ["x"] }),
+    ] {
+        steps.push(step("tx.commit", args.clone()));
+        steps.push(step("tx.rollback", args));
+    }
+    for bad in [json!(7), json!(null), json!({ "id": "x" })] {
+        steps.push(step(
+            "query",
+            json!({ "tx": bad, "sql": "select 1 as one" }),
+        ));
+        steps.push(step("execute", json!({ "tx": bad, "sql": insert })));
+    }
     steps.push(commit("t"));
     let (response, answers) = t.run(&user, APP, &steps);
     let id = assert_began(&answers[0], "begin");
     for (i, answer) in answers[1..answers.len() - 1].iter().enumerate() {
         assert_malformed(
             answer,
-            &format!("call {i}: `tx` beside {:?}", steps[i + 1]["args"]),
+            &format!(
+                "call {i}: {} with {:?}",
+                steps[i + 1]["op"],
+                steps[i + 1]["args"]
+            ),
         );
     }
     assert_ended(

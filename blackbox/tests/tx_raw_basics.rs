@@ -405,6 +405,52 @@ fn the_isolation_level_and_the_access_reach_postgres() {
 }
 
 #[test]
+fn without_isolation_the_transaction_has_the_databases_default() {
+    let t = Txs::start();
+    let user = wanda();
+    let ask = "select current_setting('transaction_isolation') as iso";
+    // A database left at its default.
+    for target in TARGETS {
+        let (_, answers) = t.run(
+            &user,
+            APP,
+            &[begin(target, "write", "t"), query_in("t", ask), commit("t")],
+        );
+        assert_began(&answers[0], &target.describe());
+        assert_eq!(
+            answers[1]["ok"]["rows"],
+            json!([["read committed"]]),
+            "{}: without `isolation`, the database's default",
+            target.describe()
+        );
+    }
+    // The viewer's own database, set to repeatable read before any
+    // request opened a connection to it.
+    let viewer = blackbox::own_database::OwnDatabase::find(t.vm().platform(), VIEWER).unwrap();
+    viewer.instance().batch(&format!(
+        "ALTER DATABASE {} SET default_transaction_isolation = 'repeatable read'",
+        blackbox::own_database::ident(&viewer.name)
+    ));
+    for access in ["write", "read"] {
+        let (_, answers) = t.run(
+            &user,
+            VIEWER,
+            &[
+                begin(Target::Own("user"), access, "t"),
+                query_in("t", ask),
+                commit("t"),
+            ],
+        );
+        assert_began(&answers[0], access);
+        assert_eq!(
+            answers[1]["ok"]["rows"],
+            json!([["repeatable read"]]),
+            "at {access}, without `isolation`, on a database whose default_transaction_isolation is repeatable read"
+        );
+    }
+}
+
+#[test]
 fn a_statement_postgres_refuses_aborts_the_transaction_and_the_commit_says_so() {
     let t = Txs::start();
     let user = wanda();
@@ -456,6 +502,15 @@ fn a_statement_postgres_refuses_aborts_the_transaction_and_the_commit_says_so() 
             "{context}: everything was rolled back"
         );
         let entries = t.entries_of(&response);
+        assert_eq!(
+            entries
+                .iter()
+                .map(|e| e["operation"].as_str().unwrap_or_default())
+                .collect::<Vec<_>>(),
+            vec!["begin", "execute", "query", "query", "commit"],
+            "{context}: one entry per operation; the use after the end, answered `no-transaction`, has none:\n{}",
+            lines(&entries)
+        );
         let commits: Vec<&Value> = entries
             .iter()
             .filter(|e| e["operation"] == "commit")
@@ -484,13 +539,7 @@ fn a_statement_postgres_refuses_aborts_the_transaction_and_the_commit_says_so() 
         );
         let failed: Vec<&Value> = entries
             .iter()
-            // (Not the use after the end: what the log records for a
-            // `no-transaction` answer is not said.)
-            .filter(|e| {
-                e["operation"] == "query"
-                    && e["outcome"] == "failed"
-                    && e["error"] != "no-transaction"
-            })
+            .filter(|e| e["operation"] == "query" && e["outcome"] == "failed")
             .collect();
         assert_eq!(
             failed

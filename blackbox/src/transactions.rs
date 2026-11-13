@@ -643,14 +643,21 @@ pub fn of_operations<'v>(entries: &'v [Value], operations: &[&str]) -> Vec<&'v V
 }
 
 /// Fails unless exactly one of `entries` is a `rollback` of transaction
-/// `id`; returns it.
+/// `id`, and it is `allowed` (CONTRACT.md: the host's own rollback is
+/// `allowed`, its `error` saying why); returns it.
 pub fn the_rollback<'v>(entries: &'v [Value], id: &str, context: &str) -> &'v Value {
     let found: Vec<&Value> = entries
         .iter()
         .filter(|e| e["operation"] == "rollback" && e["transaction"].as_str() == Some(id))
         .collect();
     match found.as_slice() {
-        [one] => one,
+        [one] => {
+            assert_eq!(
+                one["outcome"], "allowed",
+                "{context}: the host's own rollback entry has `outcome` `allowed`: {one}"
+            );
+            one
+        }
         _ => panic!(
             "{context}: expected exactly one `rollback` entry of the transaction {id:?} in the Operation log, got {}:\n{}",
             found.len(),
