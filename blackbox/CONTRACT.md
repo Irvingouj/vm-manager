@@ -776,8 +776,8 @@ Code a migration leaves in the database can run later with the migration role's 
 
 **Refused when the migration is applied** (`migration-refused`, checked before the commit with the other rules):
 
-- `security-definer`: a function or a procedure marked `SECURITY DEFINER`, in any schema. The message names it and says the runtime role may already read and write every table the migrations make.
-- `index-code`: an index (in an expression or in its `WHERE`) or an extended statistic that calls a function the migrations wrote, directly or through an operator, a cast or a domain's constraint of theirs. Postgres's autovacuum would run it as the owner. The message names the index or statistic and the function. Indexes on Postgres's own functions and operators (`lower(name)`, `(a + b)`, `WHERE deleted_at IS NULL`) are allowed.
+- `security-definer`: a function or a procedure of the migrations' marked `SECURITY DEFINER`, in any schema. The message names it and says the runtime role may already read and write every table the migrations make.
+- `index-code`: an index (in an expression or in its `WHERE`) or an extended statistic that calls a function the migrations wrote (one the migration role owns; an extension's functions are not), directly or through an operator, a cast or a domain's constraint of theirs. Postgres's autovacuum would run it as the owner. The message names the index or statistic and the function. Indexes on Postgres's own functions and operators (`lower(name)`, `(a + b)`, `WHERE deleted_at IS NULL`) are allowed.
 
 **Checked before every commit that could carry a change.** On the own database, an `execute` outside a transaction, and the commit of a transaction begun with `access: "write"`, end like this: the host makes deferred constraints immediate, closes every cursor (one declared `WITH HOLD` never runs its query), and checks that the structure of the Application's tables and the capture on them are **the very same as when the last Version's migrations ended**. If they are not:
 
@@ -785,7 +785,7 @@ Code a migration leaves in the database can run later with the migration role's 
 - the answer is `{ error: { kind: "database", code: "VM004", message } }`, from `execute` or from `tx.commit` (through the SDK: `OperationFailed` of kind `database` with that code); the message says that an Application's structure changes in migrations only;
 - the Operation log entry (of the `execute`, or of the `commit`) is `failed` with `error` `VM004`; the transaction is over, as after any commit.
 
-At the least these are such a change, whoever's rights the statement that made them ran with and however it came to run:
+At the least these are such a change, whoever's rights the statement that made them ran with, whoever comes to own what it made, and however it came to run:
 
 - a capture trigger disabled, dropped or renamed, **also when it was put back** in the same transaction;
 - a table (outside `vm`) made, dropped, renamed or moved to another schema;
@@ -804,7 +804,7 @@ This is the host's doing, on every connection it gives an Application; the runti
 - The platform keeps, in the platform database, what the structure and the capture of each own database were when the last Version's migrations ended. When it finds them otherwise (at the latest at the next write to that own database, or when the next Version is sent; also when the change was made while the program was not running, and then at the first use after it starts), it
   - writes an Operation log entry: `operation` and `statement` `capture-check`, `outcome` `failed`, `error` `changed-outside`, `application`, `own_database` true, `actor` `platform`, and null `user`, `request`, `resource`, `transaction`, `rows`;
   - writes a `capture-changed-outside` record to the program's log, with `application` and `tables`: the tables, as `"<schema>.<table>"`, whose structure or capture is not what it was (one that was dropped or made is named too);
-  - puts the capture back whole on every table: a capture trigger found disabled is enabled, one missing is made, a table found without capture is given it;
+  - puts the capture back whole on every table: a capture trigger found disabled is enabled, one missing is made, a table found without capture is given it. A table the platform may not put the capture on, because it belongs to a role that is not the Application's migration role (a superuser made it there), is left as it is and named in the record's `uncaptured` (an array like `tables`, empty otherwise); while it is there, a Version with migrations to apply is refused `capture-missing`, naming it;
   - and goes on from what it now finds.
 - The write that finds it may itself be answered `VM004` and rolled back. The next write is not, and is recorded in the history.
 - One change is said once: not again at the next write, nor after a restart.
