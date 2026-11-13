@@ -281,3 +281,65 @@ fn the_runtime_role_s_own_settings_do_not_change_what_is_recorded() {
     let rows = recorded(&db, last, 2, "the two inserts");
     assert_recorded_alike(&rows[1], &rows[0], "the runtime role with its own settings");
 }
+
+/// CONTRACT.md, "The capture itself": "A virtual generated column
+/// (Postgres 18) is recorded as null: it holds no data of its own, and the
+/// capture computes nothing." Skipped before Postgres 18, which has no
+/// virtual generated columns.
+#[test]
+fn a_virtual_generated_column_is_recorded_as_null() {
+    let own = start();
+    let mut list = history_standard();
+    list.push(Migration::new(
+        "0003_virtual",
+        &[r#"CREATE TABLE "gen" (
+	"id" integer PRIMARY KEY NOT NULL,
+	"n" integer NOT NULL,
+	"doubled" integer GENERATED ALWAYS AS ("n" * 2) VIRTUAL
+);"#],
+    ));
+    let major = blackbox::out_of_reach::server_version_num();
+    if major < 180_000 {
+        eprintln!(
+            "SKIPPED: Postgres {major} has no virtual generated columns (CONTRACT.md: Postgres 18)"
+        );
+        return;
+    }
+    let db = own.install(APP, &list);
+    let last = last_history_id(&db);
+    write(&own, "user", "insert into gen (id, n) values (1, 21)");
+    write(&own, "application", "update gen set n = 5 where id = 1");
+    write(&own, "user", "delete from gen where id = 1");
+    let rows = recorded(&db, last, 3, "an insert, an update and a delete of `gen`");
+    let expected = [
+        (Value::Null, json!({ "id": 1, "n": 21, "doubled": null })),
+        (
+            json!({ "id": 1, "n": 21, "doubled": null }),
+            json!({ "id": 1, "n": 5, "doubled": null }),
+        ),
+        (json!({ "id": 1, "n": 5, "doubled": null }), Value::Null),
+    ];
+    for (row, (old, new)) in rows.iter().zip(expected) {
+        assert_eq!(
+            (&row["old"], &row["new"]),
+            (&old, &new),
+            "expected the virtual generated column recorded as null, got {row}"
+        );
+    }
+    // Read back through the Application, as a history read is: a `query`
+    // on vm.history.
+    let (_, answer) = own.one(
+        &User::new(WRITER),
+        APP,
+        &blackbox::own_database::own_query(
+            "user",
+            "select new from vm.history where table_name = 'gen' order by id",
+        ),
+    );
+    assert_ok(&answer, "a read of the history of `gen`");
+    assert_eq!(
+        answer["ok"]["rows"].as_array().map(Vec::len),
+        Some(3),
+        "{answer}"
+    );
+}

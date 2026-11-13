@@ -859,3 +859,12 @@ pub fn run_lenient_cases(own: &Own, prefix: &str, cases: Vec<Case>, keys_after: 
         failures.join("\n")
     );
 }
+
+/// The test Postgres's `server_version_num` (180006 for 18.6).
+pub fn server_version_num() -> u32 {
+    crate::sql::Sql::connect(&crate::postgres::shared().url("postgres"))
+        .unwrap_or_else(|e| panic!("cannot reach the test Postgres: {e}"))
+        .value("SELECT current_setting('server_version_num')")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
+}

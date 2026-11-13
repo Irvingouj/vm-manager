@@ -35,12 +35,9 @@ const CHANGED_OR_MISSING: Answers = &[refused("capture-changed"), refused("captu
 const DEFERRABLE: Answers = &[refused("deferrable")];
 const JSON_CAST: Answers = &[refused("json-cast")];
 const IN_VM: Answers = &[refused("in-vm")];
-const DENIED_OR_MISSING: Answers = &[failed("42501"), refused("capture-missing")];
-const DENIED_CHANGED_OR_MISSING: Answers = &[
-    failed("42501"),
-    refused("capture-changed"),
-    refused("capture-missing"),
-];
+// CONTRACT.md: a migration may not "make a trigger of its own that calls a
+// function of `vm` (`42501`)".
+const DENIED: Answers = &[failed("42501")];
 const DEFERRABLE_OR_CHANGED: Answers = &[refused("deferrable"), refused("capture-changed")];
 const FOREIGN_KEY_FAILED: Answers = &[failed("23503")];
 const VM003_OR_JSON_CAST: Answers = &[failed("VM003"), refused("json-cast")];
@@ -144,15 +141,16 @@ fn a_capture_trigger_switched_off_dropped_renamed_or_replaced_is_refused_also_wh
             ]
         })
         .mentioning("things"),
-        Case::statements("drop-change-recreate-the-same", CAPTURE_CHANGED, |db| {
+        // CONTRACT.md: "A migration that drops one and tries to make it
+        // again fails at that statement with `42501`."
+        Case::statements("drop-change-recreate-the-same", DENIED, |db| {
             let trigger = capture_trigger(db, "things", ON_UPDATE);
             vec![
                 format!(r#"DROP TRIGGER {} ON "things""#, ident(&trigger.name)),
                 r#"UPDATE "things" SET "title" = 'changed while dropped'"#.to_owned(),
                 trigger.definition,
             ]
-        })
-        .mentioning("things"),
+        }),
         Case::statements("rename-change-rename-back", CAPTURE_CHANGED, |db| {
             let u = things_update(db);
             vec![
@@ -272,57 +270,50 @@ END $f$;"],
         )
         .naming(ANY_MIGRATION)
         .mentioning("fresh"),
-        // a-attacks.sql A58: a trigger of its own on a vm function.
-        Case::statements(
-            "own-trigger-calling-a-vm-function",
-            DENIED_OR_MISSING,
-            |db| {
-                let trigger = capture_trigger(db, "things", ON_INSERT);
-                vec![moved(
-                    &trigger.definition,
-                    &trigger.name,
-                    "mine",
-                    "things",
-                    "keyless",
-                )]
-            },
-        ),
+        // a-attacks.sql A58: a trigger of its own on a vm function
+        // (CONTRACT.md: `42501`, at the statement).
+        Case::statements("own-trigger-calling-a-vm-function", DENIED, |db| {
+            let trigger = capture_trigger(db, "things", ON_INSERT);
+            vec![moved(
+                &trigger.definition,
+                &trigger.name,
+                "mine",
+                "things",
+                "keyless",
+            )]
+        }),
         // a-attacks.sql A59: the capture trigger replaced with its old and
         // new rows swapped.
-        Case::statements(
-            "capture-replaced-with-old-and-new-swapped",
-            DENIED_CHANGED_OR_MISSING,
-            |db| {
-                let trigger = capture_trigger(db, "things", ON_UPDATE);
-                let tables = db.rows(&format!(
-                    "SELECT tgoldtable::text, tgnewtable::text FROM pg_trigger
+        Case::statements("capture-replaced-with-old-and-new-swapped", DENIED, |db| {
+            let trigger = capture_trigger(db, "things", ON_UPDATE);
+            let tables = db.rows(&format!(
+                "SELECT tgoldtable::text, tgnewtable::text FROM pg_trigger
                       WHERE tgrelid = 'things'::regclass AND tgname = {}",
-                    blackbox::own_database::literal(&trigger.name)
-                ));
-                let (old, new) = match tables.first() {
-                    Some(row) => (
-                        row.first().cloned().flatten(),
-                        row.get(1).cloned().flatten(),
-                    ),
-                    None => (None, None),
-                };
-                let referencing = match (old, new) {
-                    (Some(old), Some(new)) => {
-                        format!(
-                            "REFERENCING OLD TABLE AS {} NEW TABLE AS {} ",
-                            ident(&new),
-                            ident(&old)
-                        )
-                    }
-                    _ => String::new(),
-                };
-                vec![format!(
-                    "CREATE OR REPLACE TRIGGER {} AFTER UPDATE ON public.things {referencing}FOR EACH STATEMENT EXECUTE FUNCTION {}",
-                    ident(&trigger.name),
-                    trigger.function
-                )]
-            },
-        ),
+                blackbox::own_database::literal(&trigger.name)
+            ));
+            let (old, new) = match tables.first() {
+                Some(row) => (
+                    row.first().cloned().flatten(),
+                    row.get(1).cloned().flatten(),
+                ),
+                None => (None, None),
+            };
+            let referencing = match (old, new) {
+                (Some(old), Some(new)) => {
+                    format!(
+                        "REFERENCING OLD TABLE AS {} NEW TABLE AS {} ",
+                        ident(&new),
+                        ident(&old)
+                    )
+                }
+                _ => String::new(),
+            };
+            vec![format!(
+                "CREATE OR REPLACE TRIGGER {} AFTER UPDATE ON public.things {referencing}FOR EACH STATEMENT EXECUTE FUNCTION {}",
+                ident(&trigger.name),
+                trigger.function
+            )]
+        }),
     ];
     run_cases(&own, "missing", cases);
 }
