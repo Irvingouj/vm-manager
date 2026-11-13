@@ -713,7 +713,7 @@ for (const change of changes) {
 ### The call
 
 - `history(table, key?, options?)` is on both handles of the own database: `ctx.user().ownDb()` and `ctx.app().ownDb()`. It resolves to an array of `Change<typeof table>`, **newest first**.
-- `table` is a table of the own database's structure (a Drizzle table, in any schema).
+- `table` is a table of the own database's structure (a Drizzle table, in any schema; one declared without a schema is read in `public`, where its migrations make it). Anything else throws a `TypeError`.
 - `key` names one row by its primary key: an object with exactly the table's primary key columns, by their property names in the Drizzle table (`{ id: 7 }`; for a composite key `{ orderId: 3, line: 2 }`). A key with a property missing, or one that is not of the primary key, or given for a table without a primary key, throws a `TypeError` that names the primary key's properties; nothing is sent to the host. A key the types can check (the wrong property, the wrong type of value, for a primary key declared on its column with `.primaryKey()`) is a compile error.
 - Without `key` (or with `undefined`), the changes of every row of the table. That is the only way to read the history of a table without a primary key. `null` is not a key: it throws the same `TypeError`, so that a value that was meant to be there and is not does not read the whole table.
 - The history is kept under the key the row had **before** each change. A row whose primary key was updated has its earlier changes, and that update, under the old key, and its later ones under the new.
@@ -729,7 +729,7 @@ for (const change of changes) {
 | `kind` | `"insert" \| "update" \| "delete"` | |
 | `old` | the table's row, or `null` | The whole row before; `null` for an insert. |
 | `new` | the table's row, or `null` | The whole row after; `null` for a delete. |
-| `changed` | `string[] \| null` | For an update, the properties whose value differs, in the table's column order; `null` for an insert and a delete. |
+| `changed` | `string[] \| null` | For an update, the properties whose value differs, in the order the Drizzle table declares them; `null` for an insert and a delete. |
 | `userId` | `string` | The User in flight when the change was made, whichever the actor; for `migration`, the Contributor who sent the Version. |
 | `application` | `string` | |
 | `actor` | `"user" \| "application" \| "migration"` | |
@@ -737,7 +737,7 @@ for (const change of changes) {
 | `migration` | `string \| null` | The migration's name, for `migration`; `null` otherwise. |
 
 - `old` and `new` are rows exactly as `select()` from that table gives them: the same properties, and each value as "The SDK: Values" promises for its column (a `bigint({ mode: "bigint" })` exact beyond 2^53, a `timestamp` a `Date`, a `numeric` a string with every digit, `jsonb` the value, an array an array). A row read from the history equals the row a `select()` gave at that time.
-- **They are read in the table's present shape.** A column a later migration dropped is not shown; a column added later is `null` in rows from before it; a renamed column is `null` under its new name in rows from before the rename. In `changed`, a column the table no longer has is given by its database name. A value that no longer fits its column's present type (a later migration changed the type and the old value does not cast to it) makes the whole read fail with `OperationFailed` of kind `database` (its one Operation log entry is `failed`, with the SQLSTATE as `error`): the Application cannot read that table's history through the SDK until the structure fits again. What is stored is never changed by this; a `query` on `vm.history` through the raw interface still shows it.
+- **They are read in the table's present shape.** A column a later migration dropped is not shown; a column added later is `null` in rows from before it; a renamed column is `null` under its new name in rows from before the rename. In `changed`, a column the Drizzle table does not declare (one the table no longer has) is given by its database name, after the others. A value that no longer fits its column's present type (a later migration changed the type and the old value does not cast to it) makes a read whose answer would hold it fail whole with `OperationFailed` of kind `database` (its one Operation log entry is `failed`, with the SQLSTATE as `error`): the Application cannot read that part of the table's history through the SDK until the structure fits again (a read whose `limit` and `before` keep such a change out of the answer is not touched by it). What is stored is never changed by this; a `query` on `vm.history` through the raw interface still shows it.
 
 ### An operation like any other
 
