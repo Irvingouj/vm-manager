@@ -1,0 +1,720 @@
+//! Changes of structure that change data (CONTRACT.md, "The Change history
+//! in the platform database: Changes of structure that change data" and
+//! "Through the SDK"; ticket "The Change history lives in the platform
+//! database, shipped from an outbox", fifth acceptance criterion: "A
+//! migration that changes a column's type with `USING`, drops a column or a
+//! table, or replaces a table under its name, leaves a `structure` entry
+//! that a reader of any row's history of that table sees").
+//!
+//! Every test installs `board` with tables a User then writes, so that each
+//! has history, and sends a later Version whose migration changes their
+//! structure:
+//!
+//! - each row of the contract's table is one entry of the table's history
+//!   in `change_history`: `kind` `structure`, `actor` `migration`, the
+//!   Contributor who sent the Version, the migration's name, no request,
+//!   `key`, `old`, `new` and `changed` null, and `structure` as the table
+//!   gives it, the types as Postgres names them;
+//! - its `id` is greater than those of the rows the same migration changed
+//!   before it; a Version refused or failed leaves none;
+//! - a `history` read answers it among every row's changes, by `id`, newest
+//!   first, with a key, without one, and with `limit`;
+//! - a change of structure that changes no data has none, and neither has
+//!   a table a migration of the same Version made;
+//! - through the SDK (`fixtures/sdk/chronicle`, route `/history/full`) it
+//!   is a change of `kind` `"structure"` with `structure` the object and
+//!   `old`, `new`, `changed` null; a row's change has `structure` null.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    reason = "test code: a failed expectation is a failing test"
+)]
+
+use blackbox::api::assert_api_error;
+use blackbox::history::{
+    APP, Change, assert_at_within, assert_change, db_now, history_after, history_where,
+    last_history_id,
+};
+use blackbox::history_op::changes_of;
+use blackbox::history_structure::{
+    Structure, WRITER, answered_ids, assert_structure_change, assert_structure_row,
+    assert_structure_rows, newest_first, send_chronicle, structure_entries,
+};
+use blackbox::own_database::{Migration, assert_ok, own_execute};
+use blackbox::scenario::lines;
+use blackbox::sdk::{ann, d};
+use blackbox::sdk_history::{
+    HistoryCall, SEED_MIGRATION, Want, assert_change as assert_sdk_change,
+    assert_ids_are_history_rows, assert_ids_decrease, assert_one_history_entry, chronicle, id_of,
+};
+use blackbox::{INSTALLER, Response, User};
+use serde_json::{Value, json};
+
+const ACTORS: [&str; 2] = ["user", "application"];
+
+fn column_type(column: &str, from: &str, to: &str) -> Value {
+    json!({ "change": "column-type", "column": column, "from": from, "to": to })
+}
+
+fn column_dropped(column: &str) -> Value {
+    json!({ "change": "column-dropped", "column": column })
+}
+
+/// The type of a column of `public.<table>` as Postgres names it.
+fn type_of(structure: &Structure, table: &str, column: &str) -> Option<String> {
+    structure.db.superuser().value(&format!(
+        "SELECT format_type(atttypid, atttypmod) FROM pg_attribute
+          WHERE attrelid = 'public.{table}'::regclass AND attname = '{column}' AND NOT attisdropped"
+    ))
+}
+
+#[test]
+fn a_column_type_changed_with_or_without_using_is_an_entry_after_the_rows_changed_before_it() {
+    let mut s = Structure::start();
+    let last = last_history_id(&s.db);
+    let before = db_now(&s.db);
+    let migration = "0004_column_types";
+    s.send_ok(&[Migration::new(
+        migration,
+        &[
+            r#"UPDATE "things" SET "size" = "size" + 100 WHERE "id" = 1;"#,
+            r#"ALTER TABLE "things" ALTER COLUMN "size" SET DATA TYPE bigint;"#,
+            r#"ALTER TABLE "priced" ALTER COLUMN "price" SET DATA TYPE numeric(12, 3);"#,
+            r#"ALTER TABLE "priced" ALTER COLUMN "code" SET DATA TYPE integer USING "code"::integer;"#,
+        ],
+    )]);
+    let after = db_now(&s.db);
+    assert_eq!(
+        type_of(&s, "priced", "code").as_deref(),
+        Some("integer"),
+        "the harness's own check: the Version changed the type"
+    );
+    let rows = history_after(&s.db, last);
+    assert_eq!(
+        rows.len(),
+        4,
+        "expected the migration's update of things and one structure entry per column whose type it changed, got:\n{}",
+        lines(&rows)
+    );
+    assert_change(
+        &rows[0],
+        &Change::by_migration(INSTALLER, migration)
+            .on("public", "things")
+            .update(
+                json!({ "id": 1 }),
+                json!({ "id": 1, "title": "one", "size": 1, "tags": ["a"] }),
+                json!({ "id": 1, "title": "one", "size": 101, "tags": ["a"] }),
+                json!(["size"]),
+            ),
+        "the update the migration made before changing the type, recorded first",
+    );
+    let update_id = rows[0]["id"].as_i64().unwrap();
+    let structure: Vec<Value> = rows[1..].to_vec();
+    for row in &structure {
+        assert!(
+            row["id"].as_i64().is_some_and(|id| id > update_id),
+            "a structure entry's id is greater than those of the rows the same migration changed before it ({update_id}): {row}"
+        );
+    }
+    assert_structure_rows(
+        &structure,
+        &[
+            ("things", column_type("size", "integer", "bigint")),
+            (
+                "priced",
+                column_type("price", "numeric(10,2)", "numeric(12,3)"),
+            ),
+            ("priced", column_type("code", "text", "integer")),
+        ],
+        migration,
+        "a column's type changed, without USING and with it",
+    );
+    assert_at_within(
+        &s.db,
+        &structure,
+        &before,
+        &after,
+        "the structure entries of the Version",
+    );
+}
+
+#[test]
+fn a_column_dropped_is_an_entry() {
+    let mut s = Structure::start();
+    let last = last_history_id(&s.db);
+    let migration = "0004_drop_columns";
+    s.send_ok(&[Migration::new(
+        migration,
+        &[
+            r#"ALTER TABLE "things" DROP COLUMN "tags";"#,
+            r#"ALTER TABLE "priced" DROP COLUMN "code";"#,
+        ],
+    )]);
+    let rows = history_after(&s.db, last);
+    assert_structure_rows(
+        &rows,
+        &[
+            ("things", column_dropped("tags")),
+            ("priced", column_dropped("code")),
+        ],
+        migration,
+        "two columns dropped, and nothing else recorded",
+    );
+}
+
+#[test]
+fn a_table_dropped_is_an_entry_after_the_rows_deleted_before_it_and_its_history_stays() {
+    let mut s = Structure::start();
+    let earlier = history_where(&s.db, "h.table_name = 'gone_table'");
+    assert_eq!(earlier.len(), 2, "the harness's own check: {earlier:?}");
+    let last = last_history_id(&s.db);
+    let migration = "0004_drop_table";
+    s.send_ok(&[Migration::new(
+        migration,
+        &[
+            r#"DELETE FROM "gone_table" WHERE "id" = 1;"#,
+            r#"DROP TABLE "gone_table";"#,
+        ],
+    )]);
+    let rows = history_after(&s.db, last);
+    assert_eq!(
+        rows.len(),
+        2,
+        "expected the delete and then one entry table-dropped, got:\n{}",
+        lines(&rows)
+    );
+    assert_change(
+        &rows[0],
+        &Change::by_migration(INSTALLER, migration)
+            .on("public", "gone_table")
+            .delete(json!({ "id": 1 }), json!({ "id": 1, "note": "a" })),
+        "the delete the migration made before dropping the table",
+    );
+    assert_structure_row(
+        &rows[1],
+        "gone_table",
+        migration,
+        &json!({ "change": "table-dropped" }),
+        "a table dropped, with none under its name",
+    );
+    assert!(
+        rows[1]["id"].as_i64() > rows[0]["id"].as_i64(),
+        "the entry's id is greater than the delete's: {}",
+        lines(&rows)
+    );
+    let still: Vec<Value> = history_where(&s.db, &format!("h.id <= {last}"))
+        .into_iter()
+        .filter(|r| r["table_name"] == "gone_table")
+        .collect();
+    assert_eq!(
+        still, earlier,
+        "the dropped table's earlier history stays as it was"
+    );
+    for actor in ACTORS {
+        let answer = s.read(actor, "gone_table", &json!({}));
+        assert_eq!(
+            answer["error"]["kind"], "database",
+            "a table that is not there now: {answer}"
+        );
+        assert_eq!(
+            answer["error"]["code"], "42P01",
+            "a table that is not there now: {answer}"
+        );
+    }
+}
+
+#[test]
+fn a_table_replaced_under_its_name_either_way_is_an_entry_on_the_name() {
+    let mut s = Structure::start();
+    let last = last_history_id(&s.db);
+    let migration = "0004_replace_tables";
+    s.send_ok(&[Migration::new(
+        migration,
+        &[
+            r#"DROP TABLE "swapped";"#,
+            r#"CREATE TABLE "swapped" (
+	"id" integer PRIMARY KEY NOT NULL,
+	"other" text
+);"#,
+            r#"ALTER TABLE "swapped_away" RENAME TO "swapped_aside";"#,
+            r#"CREATE TABLE "swapped_away" (
+	"id" integer PRIMARY KEY NOT NULL,
+	"label" text
+);"#,
+        ],
+    )]);
+    let rows = history_after(&s.db, last);
+    assert_structure_rows(
+        &rows,
+        &[
+            ("swapped", json!({ "change": "table-replaced" })),
+            ("swapped_away", json!({ "change": "table-replaced" })),
+        ],
+        migration,
+        "a table dropped and another made under its name; a table renamed away and another made under its name (the rename itself no entry)",
+    );
+    for table in ["swapped", "swapped_away"] {
+        let entry = rows.iter().find(|r| r["table_name"] == table).unwrap();
+        for actor in ACTORS {
+            let context = format!("history of {table} {{ id: 1 }} as the {actor}");
+            let answer = s.read(actor, table, &json!({ "key": { "id": 1 } }));
+            let changes = changes_of(&answer);
+            assert_eq!(
+                changes.len(),
+                2,
+                "{context}: the entry and the earlier insert under the name, got:\n{}",
+                lines(&changes)
+            );
+            assert_structure_change(
+                &changes[0],
+                migration,
+                &json!({ "change": "table-replaced" }),
+                &context,
+            );
+            assert_eq!(
+                answered_ids(&changes)[0],
+                entry["id"].as_i64().unwrap(),
+                "{context}"
+            );
+            assert_eq!(changes[1]["kind"], "insert", "{context}: {}", changes[1]);
+            assert_eq!(changes[1]["user_id"], WRITER, "{context}: {}", changes[1]);
+        }
+    }
+}
+
+#[test]
+fn an_enum_value_renamed_is_an_entry_on_every_table_with_a_column_of_it() {
+    let mut s = Structure::start();
+    let last = last_history_id(&s.db);
+    let migration = "0004_rename_mood";
+    s.send_ok(&[Migration::new(
+        migration,
+        &[r#"ALTER TYPE "public"."mood" RENAME VALUE 'sad' TO 'blue';"#],
+    )]);
+    let renamed = |columns: &[&str]| json!({ "change": "enum-value-renamed", "type": "public.mood", "from": "sad", "to": "blue", "columns": columns });
+    let rows = history_after(&s.db, last);
+    assert_structure_rows(
+        &rows,
+        &[
+            ("moods", renamed(&["mood"])),
+            ("mood_lists", renamed(&["moods"])),
+            ("two_moods", renamed(&["a", "b"])),
+        ],
+        migration,
+        "an enum's value renamed: one entry on each table with a column of it, also as an array; none on a table without",
+    );
+}
+
+#[test]
+fn a_partition_attached_or_detached_is_an_entry_on_the_partitioned_table() {
+    let mut s = Structure::start();
+    let last = last_history_id(&s.db);
+    let migration = "0004_partitions";
+    s.send_ok(&[Migration::new(
+        migration,
+        &[
+            r#"ALTER TABLE "measures" ATTACH PARTITION "measures_2027" FOR VALUES FROM ('2027-01-01') TO ('2028-01-01');"#,
+            r#"ALTER TABLE "measures" DETACH PARTITION "measures_2026";"#,
+        ],
+    )]);
+    // What is recorded on the partitions themselves, if anything, the
+    // contract does not say; the entries of the partitioned table it does.
+    let rows: Vec<Value> = structure_entries(&s.db, last)
+        .into_iter()
+        .filter(|r| r["table_name"] == "measures")
+        .collect();
+    assert_structure_rows(
+        &rows,
+        &[
+            (
+                "measures",
+                json!({ "change": "partition-attached", "partition": "public.measures_2027" }),
+            ),
+            (
+                "measures",
+                json!({ "change": "partition-detached", "partition": "public.measures_2026" }),
+            ),
+        ],
+        migration,
+        "a partition attached to the table and one detached from it",
+    );
+}
+
+#[test]
+fn a_structure_entry_is_in_every_rows_history_in_the_order_of_id() {
+    let mut s = Structure::start();
+    let last = last_history_id(&s.db);
+    let migration = "0004_drop_tags";
+    s.send_ok(&[Migration::new(
+        migration,
+        &[r#"ALTER TABLE "things" DROP COLUMN "tags";"#],
+    )]);
+    let dropped = column_dropped("tags");
+    let entries = structure_entries(&s.db, last);
+    assert_structure_rows(
+        &entries,
+        &[("things", dropped.clone())],
+        migration,
+        "the column dropped",
+    );
+    let entry_id = entries[0]["id"].as_i64().unwrap();
+    // A change after the entry, to row 2.
+    let (_, answer) = s.own.one(
+        &User::new(WRITER),
+        APP,
+        &own_execute("user", "update things set size = 200 where id = 2"),
+    );
+    assert_ok(
+        &answer,
+        "the harness's own check: an update after the Version",
+    );
+    let all = history_where(&s.db, "h.table_name = 'things'");
+    assert!(
+        all.iter()
+            .any(|r| r["kind"] == "update" && r["id"].as_i64() > Some(entry_id)),
+        "the harness's own check: the update after the Version is recorded: {}",
+        lines(&all)
+    );
+    for actor in ACTORS {
+        for id in [1, 2, 3] {
+            let context = format!("history of things {{ id: {id} }} as the {actor}");
+            let answer = s.read(actor, "things", &json!({ "key": { "id": id } }));
+            let changes = changes_of(&answer);
+            let expected: Vec<Value> = all
+                .iter()
+                .filter(|r| r["key"] == json!({ "id": id }) || r["kind"] == "structure")
+                .cloned()
+                .collect();
+            assert_eq!(
+                answered_ids(&changes),
+                newest_first(&expected),
+                "{context}: expected the row's changes and the structure entry, by id, newest first; got:\n{}",
+                lines(&changes)
+            );
+            let found: Vec<&Value> = changes
+                .iter()
+                .filter(|c| c["kind"] == "structure")
+                .collect();
+            assert_eq!(found.len(), 1, "{context}: {}", lines(&changes));
+            assert_structure_change(found[0], migration, &dropped, &context);
+        }
+        let context = format!("history of things as the {actor}, every row");
+        let changes = changes_of(&s.read(actor, "things", &json!({})));
+        assert_eq!(
+            answered_ids(&changes),
+            newest_first(&all),
+            "{context}: {}",
+            lines(&changes)
+        );
+        let context = format!("history of things {{ id: 1 }}, limit 1, as the {actor}");
+        let changes =
+            changes_of(&s.read(actor, "things", &json!({ "key": { "id": 1 }, "limit": 1 })));
+        assert_eq!(
+            changes.len(),
+            1,
+            "{context}: limit counts the structure entry too: {}",
+            lines(&changes)
+        );
+        assert_structure_change(&changes[0], migration, &dropped, &context);
+        for key in [json!({ "id": 99 }), json!({ "title": "one" })] {
+            let context = format!("history of things {key} as the {actor}");
+            let changes = changes_of(&s.read(actor, "things", &json!({ "key": key })));
+            assert_eq!(
+                changes.len(),
+                1,
+                "{context}: a key of no row, or not the primary key, answers the structure entries only: {}",
+                lines(&changes)
+            );
+            assert_structure_change(&changes[0], migration, &dropped, &context);
+        }
+    }
+}
+
+#[test]
+fn a_version_refused_or_failed_leaves_no_structure_entry() {
+    let mut s = Structure::start();
+    let last = last_history_id(&s.db);
+    let refused = s.send(&[Migration::new(
+        "0004_refused",
+        &[
+            r#"UPDATE "things" SET "size" = "size" + 1 WHERE "id" = 1;"#,
+            r#"ALTER TABLE "things" ALTER COLUMN "size" SET DATA TYPE bigint;"#,
+            r#"ALTER TABLE "priced" ADD CONSTRAINT "priced_code_unique" UNIQUE("code") DEFERRABLE;"#,
+        ],
+    )]);
+    assert_api_error(&refused, 422, "migration-refused");
+    let failed = s.send(&[Migration::new(
+        "0004_fails",
+        &[
+            r#"ALTER TABLE "things" DROP COLUMN "tags";"#,
+            r#"DROP TABLE "gone_table";"#,
+            r#"SELECT 1 / 0;"#,
+        ],
+    )]);
+    assert_api_error(&failed, 422, "migration-failed");
+    assert_eq!(
+        type_of(&s, "things", "size").as_deref(),
+        Some("integer"),
+        "the harness's own check: nothing of the refused Version is kept"
+    );
+    assert!(
+        type_of(&s, "things", "tags").is_some(),
+        "the harness's own check: nothing of the failed Version is kept"
+    );
+    let rows = history_after(&s.db, last);
+    assert!(
+        rows.is_empty(),
+        "a Version refused or failed leaves no entry, structure or row: got\n{}",
+        lines(&rows)
+    );
+    // The same change in a Version that is accepted: one entry, its own.
+    let migration = "0004_drop_tags";
+    s.send_ok(&[Migration::new(
+        migration,
+        &[r#"ALTER TABLE "things" DROP COLUMN "tags";"#],
+    )]);
+    assert_structure_rows(
+        &history_after(&s.db, last),
+        &[("things", column_dropped("tags"))],
+        migration,
+        "the accepted Version after the refused and the failed one",
+    );
+}
+
+#[test]
+fn changes_of_structure_that_change_no_data_have_no_entry() {
+    let mut s = Structure::start();
+    let last = last_history_id(&s.db);
+    let renamed_before = history_where(&s.db, "h.table_name = 'renamed_t'");
+    assert_eq!(
+        renamed_before.len(),
+        2,
+        "the harness's own check: {renamed_before:?}"
+    );
+    s.send_ok(&[Migration::new(
+        "0004_no_data_changed",
+        &[
+            r#"ALTER TABLE "plain" RENAME COLUMN "a" TO "a2";"#,
+            r#"ALTER TABLE "plain" ADD COLUMN "c" text;"#,
+            r#"ALTER TABLE "plain" ALTER COLUMN "b" SET DEFAULT 5;"#,
+            r#"ALTER TABLE "plain" ALTER COLUMN "b" SET NOT NULL;"#,
+            r#"ALTER TABLE "plain" ADD CONSTRAINT "plain_b_check" CHECK ("b" >= 0);"#,
+            r#"ALTER TABLE "plain" ADD CONSTRAINT "plain_a2_unique" UNIQUE("a2");"#,
+            r#"CREATE INDEX "plain_b_idx" ON "plain" USING btree ("b");"#,
+            r#"ALTER TABLE "renamed_t" RENAME TO "renamed_t2";"#,
+        ],
+    )]);
+    let rows = history_after(&s.db, last);
+    assert!(
+        rows.is_empty(),
+        "a column or a table renamed, a column added, a default, a constraint, an index: no entry; got\n{}",
+        lines(&rows)
+    );
+    assert_eq!(
+        history_where(&s.db, "h.table_name = 'renamed_t'"),
+        renamed_before,
+        "a renamed table's earlier changes stay under its old name"
+    );
+    for actor in ACTORS {
+        let answer = s.read(actor, "renamed_t2", &json!({}));
+        assert_eq!(
+            changes_of(&answer),
+            Vec::<Value>::new(),
+            "history of the table under its new name, as the {actor}: its earlier changes are under the old name"
+        );
+        let answer = s.read(actor, "renamed_t", &json!({}));
+        assert_eq!(
+            answer["error"]["code"], "42P01",
+            "history under the old name, which no table has now, as the {actor}: {answer}"
+        );
+        let answer = s.read(actor, "plain", &json!({ "key": { "id": 1 } }));
+        let changes = changes_of(&answer);
+        assert!(
+            changes.len() == 2 && changes.iter().all(|c| c["kind"] != "structure"),
+            "history of plain {{ id: 1 }} as the {actor}: the insert and the update, no structure entry; got\n{}",
+            lines(&changes)
+        );
+    }
+}
+
+#[test]
+fn a_table_made_in_the_same_version_has_no_structure_entry() {
+    let mut s = Structure::start();
+    let last = last_history_id(&s.db);
+    s.send_ok(&[
+        Migration::new(
+            "0004_make_fresh",
+            &[r#"CREATE TABLE "fresh" (
+	"id" integer PRIMARY KEY NOT NULL,
+	"a" integer,
+	"b" text
+);"#],
+        ),
+        Migration::new(
+            "0005_fill_fresh",
+            &[r#"INSERT INTO "fresh" VALUES (1, 1, 'x'), (2, 2, 'y');"#],
+        ),
+        Migration::new(
+            "0006_reshape",
+            &[
+                r#"ALTER TABLE "fresh" ALTER COLUMN "a" SET DATA TYPE bigint;"#,
+                r#"ALTER TABLE "fresh" DROP COLUMN "b";"#,
+                r#"ALTER TABLE "things" DROP COLUMN "tags";"#,
+            ],
+        ),
+    ]);
+    let rows = history_after(&s.db, last);
+    let fresh: Vec<&Value> = rows.iter().filter(|r| r["table_name"] == "fresh").collect();
+    assert!(
+        fresh.len() == 2
+            && fresh
+                .iter()
+                .all(|r| r["kind"] == "insert" && r["migration"] == "0005_fill_fresh"),
+        "fresh, made by 0004 of the same Version: 0005's two inserts recorded, and no structure entry for 0006's changes; got\n{}",
+        lines(&rows)
+    );
+    let structure: Vec<Value> = rows
+        .iter()
+        .filter(|r| r["kind"] == "structure")
+        .cloned()
+        .collect();
+    assert_structure_rows(
+        &structure,
+        &[("things", column_dropped("tags"))],
+        "0006_reshape",
+        "a table that had history before the Version, changed by the same migration",
+    );
+}
+
+#[test]
+fn through_the_sdk_a_structure_entry_is_a_change_of_kind_structure() {
+    let sdk = chronicle();
+    let user = ann();
+    let full =
+        |actor: &str, key: Option<Value>, options: Option<Value>| -> (Response, Vec<Value>) {
+            let mut path = format!("/history/full?as={actor}&table=reshaped");
+            if let Some(key) = key {
+                path.push_str(&format!(
+                    "&key={}",
+                    blackbox::sdk_history::encode(&key.to_string())
+                ));
+            }
+            if let Some(options) = options {
+                path.push_str(&format!(
+                    "&options={}",
+                    blackbox::sdk_history::encode(&options.to_string())
+                ));
+            }
+            let (response, body) = sdk.get_ok(&user, &path);
+            let changes = body["changes"].as_array().cloned().unwrap_or_else(|| {
+                panic!("expected history(...) to resolve to changes, got {body}")
+            });
+            (response, changes)
+        };
+    // The first Version: 0002_reshape changed `reshaped`, which 0000 of the
+    // same Version made: no structure entry; each row's change has
+    // `structure` null.
+    for actor in ACTORS {
+        let (_, changes) = full(actor, Some(json!({ "id": 1 })), None);
+        assert_eq!(
+            changes.len(),
+            3,
+            "history(reshaped, {{ id: 1 }}) as the {actor} after the first Version: 0001_seed's three changes; got:\n{}",
+            lines(&changes)
+        );
+        for change in &changes {
+            assert_eq!(
+                change["structure"],
+                d::null(),
+                "a row's change has `structure` null: {change}"
+            );
+            assert!(
+                change["properties"]
+                    .as_array()
+                    .is_some_and(|p| p.contains(&json!("structure"))),
+                "a change has the property `structure`: {change}"
+            );
+        }
+    }
+    let migration = "0003_recast_keep";
+    send_chronicle(
+        &sdk,
+        &[Migration::new(
+            migration,
+            &[r#"ALTER TABLE "reshaped" ALTER COLUMN "keep" SET DATA TYPE varchar(20);"#],
+        )],
+    );
+    let structure = d::object(&[
+        ("change", d::string("column-type")),
+        ("column", d::string("keep")),
+        ("from", d::string("text")),
+        ("to", d::string("character varying(20)")),
+    ]);
+    let k1 = d::object(&[
+        ("id", d::number("1")),
+        ("keep", d::string("k1")),
+        ("added", d::null()),
+        ("afterName", d::null()),
+    ]);
+    let k2 = d::object(&[
+        ("id", d::number("1")),
+        ("keep", d::string("k2")),
+        ("added", d::null()),
+        ("afterName", d::null()),
+    ]);
+    let by_seed = |want: Want<'static>| want.by_migration(INSTALLER, SEED_MIGRATION);
+    let seeded = [
+        by_seed(Want::update("", "", "", &k2, &k2, &["gone"])),
+        by_seed(Want::update("", "", "", &k1, &k2, &["keep"])),
+        by_seed(Want::insert("", "", "", &k1)),
+    ];
+    let structure_want = Want {
+        kind: "structure",
+        ..Want::insert("", "", "", &d::null()).by_migration(INSTALLER, migration)
+    };
+    for actor in ACTORS {
+        let context = format!("history(reshaped, {{ id: 1 }}) as the {actor}");
+        let (response, changes) = full(actor, Some(json!({ "id": 1 })), None);
+        assert_eq!(
+            changes.len(),
+            4,
+            "{context}: the structure entry and 0001_seed's three changes; got:\n{}",
+            lines(&changes)
+        );
+        assert_sdk_change(&changes[0], &structure_want, &context);
+        assert_eq!(
+            changes[0]["structure"], structure,
+            "{context}: `structure` is the object"
+        );
+        for (change, want) in changes[1..].iter().zip(&seeded) {
+            assert_sdk_change(change, want, &context);
+            assert_eq!(change["structure"], d::null(), "{context}: {change}");
+        }
+        assert_ids_decrease(&changes, &context);
+        assert_ids_are_history_rows(&sdk.own, &changes, "public", "reshaped", &context);
+        assert_one_history_entry(&sdk, &response, &user, actor, 4, &[], &context);
+
+        let context = format!("history(reshaped, {{ id: 1 }}, {{ limit: 1 }}) as the {actor}");
+        let (_, changes) = full(actor, Some(json!({ "id": 1 })), Some(json!({ "limit": 1 })));
+        assert_eq!(changes.len(), 1, "{context}: {}", lines(&changes));
+        assert_sdk_change(&changes[0], &structure_want, &context);
+        assert_eq!(changes[0]["structure"], structure, "{context}");
+
+        let context = format!("history(reshaped) as the {actor}");
+        let (_, changes) = full(actor, None, None);
+        assert_eq!(changes.len(), 4, "{context}: {}", lines(&changes));
+        assert_sdk_change(&changes[0], &structure_want, &context);
+        assert_eq!(changes[0]["structure"], structure, "{context}");
+    }
+    // The existing route still answers the entry, by its kind.
+    let (_, changes) = HistoryCall::of("reshaped").key(json!({ "id": 1 })).changes(
+        &sdk,
+        &user,
+        "history(reshaped, { id: 1 }) through /history",
+    );
+    assert_eq!(changes.len(), 4, "{}", lines(&changes));
+    assert_eq!(changes[0]["kind"], d::string("structure"));
+    assert!(id_of(&changes[0]) > id_of(&changes[1]));
+}

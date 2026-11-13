@@ -26,6 +26,12 @@
 //                               `undefinedKey=1`
 //                               passes `undefined` explicitly). Answers
 //                               `changes`, each described, or `caught`
+//   /history/full?as=&table=&key=&options=
+//                               as /history, and each change also has
+//                               `structure` described and `properties`,
+//                               the names of the change's own properties
+//                               (CONTRACT.md, "The Change history in the
+//                               platform database: Through the SDK")
 //   /shared/history?resource=   `history` forced past the types on a shared
 //                               database's handle
 //   /forged?as=&op=insert|update|delete
@@ -220,6 +226,35 @@ export default defineApp(manifest, {
           else if (q("undefinedKey") === "1" || key !== undefined) changes = await handle.history(table, key);
           else changes = await handle.history(table);
           return json({ changes: changes.map(describeChange), isArray: Array.isArray(changes) });
+        } catch (error) {
+          return json({ caught: describeError(error) });
+        }
+      }
+
+      case "/history/full": {
+        const name = q("table") ?? "tasks";
+        const table = tables[name as keyof typeof tables];
+        if (table === undefined) return json({ error: `no table ${name}` }, 404);
+        const key = parsed(q("key"));
+        const options = parsed(q("options"));
+        // Passed past the types, as on /history; `structure` is read off
+        // the change as a property like any other.
+        const handle = own() as unknown as {
+          history(table: unknown, key?: unknown, options?: unknown): Promise<Record<string, unknown>[]>;
+        };
+        try {
+          let changes: Record<string, unknown>[];
+          if (options !== undefined) changes = await handle.history(table, key, options);
+          else if (key !== undefined) changes = await handle.history(table, key);
+          else changes = await handle.history(table);
+          return json({
+            changes: changes.map((change) => ({
+              ...describeChange(change),
+              structure: describe(change.structure),
+              properties: Object.keys(change).sort(),
+            })),
+            isArray: Array.isArray(changes),
+          });
         } catch (error) {
           return json({ caught: describeError(error) });
         }
