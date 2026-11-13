@@ -32,7 +32,9 @@
 //! - [`sdk`] is what the tests of the SDK share: its tooling, the fixture
 //!   projects under `fixtures/sdk/` built with it, and the Applications
 //!   installed from them;
-//! - [`transactions`] is what the raw tests of transactions share.
+//! - [`transactions`] is what the raw tests of transactions share;
+//! - [`sdk_history`] is what the tests of reading the Change history
+//!   through the SDK share.
 //!
 //! Every wait has a timeout, so a failing test fails within seconds and
 //! never hangs. Each test starts its own program on its own port, so tests
@@ -56,6 +58,7 @@ pub mod program;
 pub mod records;
 pub mod scenario;
 pub mod sdk;
+pub mod sdk_history;
 pub mod server_log;
 pub mod shared_database;
 pub mod sql;
