@@ -688,3 +688,64 @@ Three operations and one argument. A transaction belongs to the request that beg
 - The label, and on the own database the attached identity, are set once when the transaction begins and hold for all of it: `vm.identity()` answers the same in every statement, and every change is in the Change history with the User, the Application, the actor and the request, as outside a transaction.
 - Every Operation log entry gains `"transaction": "<id>" | null`. Each statement in a transaction has its own entry, as before. `tx.begin`, `tx.commit` and `tx.rollback` have entries too, with `operation` `begin`, `commit` and `rollback`, `statement` the same word, and `rows` null; a refused `tx.begin` is logged like any refusal, with `transaction` null. A rollback the host makes on its own has a `rollback` entry with `outcome` `allowed` whose `error` says why: `request-ended`, `time` or the limit's name. A commit of an aborted transaction is `failed` with `error` `transaction-aborted`. A `tx.begin` that could not begin is `failed` with `transaction` null and `error` `transactions` (the fifth at once) or `unavailable` (no connection to give). A use of `tx` with no request in flight is refused `no-request` and has no entry, since no target is known.
 - The id in the Operation log is the id Application code holds. Knowing an id gives nothing: it works only inside the request that began it.
+
+## Reading the Change history (ticket: Read a row's Change history through the SDK)
+
+An Application reads the Change history of its own database through the SDK, to show who changed what. Nothing restores from it.
+
+```ts
+import type { Change } from "@vm/sdk";
+import { tasks } from "./db/schema.ts";
+
+const changes: Change<typeof tasks>[] = await ctx.user().ownDb().history(tasks, { id: 7 });
+for (const change of changes) {
+  change.kind;        // "insert" | "update" | "delete"
+  change.old?.title;  // the row before, typed as `select()` types a row of `tasks`; null for an insert
+  change.new?.title;  // the row after; null for a delete
+  change.changed;     // for an update: the properties whose value differs; null otherwise
+  change.userId;      // the User the change was made for
+  change.application;
+  change.actor;       // "user" | "application" | "migration"
+  change.at;          // Date
+}
+```
+
+### The call
+
+- `history(table, key?, options?)` is on both handles of the own database: `ctx.user().ownDb()` and `ctx.app().ownDb()`. It resolves to an array of `Change<typeof table>`, **newest first**.
+- `table` is a table of the own database's structure (a Drizzle table, in any schema).
+- `key` names one row by its primary key: an object with exactly the table's primary key columns, by their property names in the Drizzle table (`{ id: 7 }`; for a composite key `{ orderId: 3, line: 2 }`). A key with a property missing, or one that is not of the primary key, or given for a table without a primary key, throws a `TypeError` that names the primary key's properties; nothing is sent to the host. A key the types can check (the wrong property, the wrong type of value, for a primary key declared on its column with `.primaryKey()`) is a compile error.
+- Without `key` (or with `undefined`), the changes of every row of the table. That is the only way to read the history of a table without a primary key.
+- The history is kept under the key the row had **before** each change. A row whose primary key was updated has its earlier changes, and that update, under the old key, and its later ones under the new.
+- `options.limit`: how many changes at most; an integer from 1 to 1000, by default 100. Anything else throws a `TypeError`, nothing sent. `options.before`: a change's `id`; only changes older than it are answered. With both, an Application pages back through a long history.
+- It is not on a shared database's handle (Milestone 1 keeps no Change history there) and not on a transaction's `tx`. Neither has it in its types. Forced past them on a shared handle, it throws an `Error` whose message contains `Change history is kept only in the own database`, and nothing is sent to the host.
+
+### A change
+
+| Property | Type | What |
+|---|---|---|
+| `id` | `string` | The change's place in the history, as decimal digits. Later changes have greater ids (compare as numbers, or use `before`). |
+| `at` | `Date` | When the change was made. |
+| `kind` | `"insert" \| "update" \| "delete"` | |
+| `old` | the table's row, or `null` | The whole row before; `null` for an insert. |
+| `new` | the table's row, or `null` | The whole row after; `null` for a delete. |
+| `changed` | array of the row's property names, or `null` | For an update, the properties whose value differs, in the table's column order; `null` for an insert and a delete. |
+| `userId` | `string` | The User in flight when the change was made, whichever the actor; for `migration`, the Contributor who sent the Version. |
+| `application` | `string` | |
+| `actor` | `"user" \| "application" \| "migration"` | |
+| `request` | `string \| null` | The request's id, as in the Operation log; `null` for `migration`. |
+| `migration` | `string \| null` | The migration's name, for `migration`; `null` otherwise. |
+
+- `old` and `new` are rows exactly as `select()` from that table gives them: the same properties, and each value as "The SDK: Values" promises for its column (a `bigint({ mode: "bigint" })` exact beyond 2^53, a `timestamp` a `Date`, a `numeric` a string with every digit, `jsonb` the value, an array an array). A row read from the history equals the row a `select()` gave at that time.
+- **They are read in the table's present shape.** A column a later migration dropped is not shown; a column added later is `null` in rows from before it; a renamed column is `null` under its new name in rows from before the rename. In `changed`, a column the table no longer has is given by its database name. A value that no longer fits its column's present type (a later migration changed the type and the old value does not cast to it) makes the whole read fail with `OperationFailed` of kind `database`: the Application cannot read that table's history through the SDK until the structure fits again. What is stored is never changed by this; a `query` on `vm.history` through the raw interface still shows it.
+
+### An operation like any other
+
+- Each `history(...)` call is exactly one host operation: a `query` on the own database, as the handle's actor, for the request in flight. It has one Operation log entry (`operation` `query`, `resource` null, the actor, `outcome`, `rows` the number of changes answered) whose `statement` reads from `vm.history` and holds no value: not the key, not the limit.
+- It is decided and limited as any `query`: with no request in flight it is refused `no-request` (rejects with `Refused`); the limits on rows, bytes and time apply (`OperationFailed` of kind `limit`).
+- Whoever can use the Application can read all of its history through it, as the Application's code decides (ADR 0005). The history says who changed a row; it does not restrict who may read that.
+
+### Only its own, and only to read
+
+- The history an Application reads is its own database's. There is nothing by which Application code can name another Application's own database: `own: true` is always the database of the Application in flight. Two Applications with a table of the same name and a row of the same key each read only their own changes.
+- The SDK has no call that writes, changes or deletes history, and exports no table object for `vm.history`. An Application that declares `vm.history` as a Drizzle table of its own and inserts, updates or deletes through it gets `OperationFailed` of kind `database` with code `42501` (the runtime role may only read it), and the history is unchanged. So is one that does the same through the raw interface.
