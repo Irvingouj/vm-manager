@@ -253,80 +253,37 @@ On a cluster started with `wal_level=logical`, with a superuser's `test_decoding
 
 ## 11. F. Code a migration leaves behind (added 2026-11-13 by the driving session, in review of the first slice)
 
-Provenance of this part: written by the driving session, which ran `docs/research/change-history-out-of-reach/f-left-behind.sh` on Postgres 16.15, 17.11 and 18.6; its whole output is `f-left-behind.log` (exit 0). The roles are the same as above; the capture is a stand-in (one statement trigger `vm_capture_update` on `victim`, owned by `a1_vm`).
-
-Parts A and B asked what a migration can do while it runs. They did not ask what the code it leaves in the database can do afterwards. The migration role cannot log in between migrations, but **Postgres runs code with that role's rights without any login** [verified, `vectors`, same on each version unless said]:
-
-| Way | Who starts it | Ran as | Capture switched off, row changed, switched on, no history |
-|---|---|---|---|
-| A function marked `SECURITY DEFINER`, called in a statement | the runtime role | `a1_mig` | yes |
-| A `BEFORE` row trigger on the referencing table of a foreign key `ON DELETE CASCADE`, when a referenced row is deleted | the runtime role | `a1_mig` | yes |
-| A `CHECK` constraint on the referencing table of a foreign key `ON UPDATE CASCADE`, when a referenced key is updated | the runtime role | `a1_mig` | yes |
-| An index expression, when autovacuum analyzes the table (the runtime role only inserted rows) | autovacuum | `a1_mig` | yes |
-| A materialized view's query, refreshed by a role granted `MAINTAIN` (17 and 18; the privilege does not exist on 16) | the runtime role | `a1_mig` | yes |
-
-Postgres carries out a foreign key's action, analyzes a table and refreshes a materialized view as the table's owner, and runs whatever user code is attached with those rights. None of these is refused by a privilege, because the code is the owner's and the owner may disable a trigger on its own table. Also [verified]: a migration can let the runtime role create tables (`GRANT CREATE ON SCHEMA`), which then have no capture.
-
-In every case the trigger's catalog row was a new row afterwards (another `xmin`), as B1 found for a migration.
-
-What a fix can rest on [verified, `checks`, 16/17/18]:
-
-- **A read-only transaction refuses it**: `ALTER TABLE` inside a `SECURITY DEFINER` function called in `BEGIN READ ONLY` fails with `25006`. Reads are safe as they are.
-- **Inside the transaction that did it, the change shows before the commit**: the digest of the capture triggers' rows (`oid`, `xmin`, `tgenabled`) differs from the one taken before, and a rollback undoes the change of the row and of the trigger alike.
-- **A cursor `WITH HOLD` runs its query at `COMMIT`**, after any check: declared over a function that deletes a referenced row, it switched the capture off and on at the commit (digest equal before the commit, different after). `CLOSE ALL` before the check prevents it.
-- **The migration role's password**: the role may set its own password in a migration; it may not set its own `VALID UNTIL` or `CONNECTION LIMIT` (`42501`). `ALTER ROLE CURRENT_USER PASSWORD NULL` sent on the same session as the last act before `COMMIT` leaves no password: a login with the migration's password is refused after the commit. Without it, the password is good from the commit until the platform's `ALTER ROLE ... NOLOGIN` commits; that window can be held open (the run holds the role's row with `SELECT ... FOR UPDATE` as a superuser, standing for a program stopped at that moment), and **a login with the migration's password succeeded in it**.
-- **The catalogs say what an index or an extended statistic calls**: `pg_depend` has a row from the index to the function (expression and `WHERE` alike), to the operator, or to the domain; from the statistic to the function.
-- **Postgres 18's virtual generated columns** cannot call a user-defined function (`0A000`, "generation expression uses user-defined function") nor have a domain type, and in a transition table read by a trigger their value is null (`to_jsonb` gave `{"g": null, "id": 5}` for `g int GENERATED ALWAYS AS (id * 2) VIRTUAL`). So the capture runs no code for them and records null. This answers the item of section 10.
-
-What ordinary maintenance does to the rows such a digest reads [verified, `maintenance`, 16/17/18]: `VACUUM (FREEZE, ANALYZE)`, `VACUUM FULL` of a table, `REINDEX`, `CLUSTER`, `VACUUM FULL` of `pg_trigger` and of `pg_attribute`, `ANALYZE` leave the `xmin` of the table's `pg_trigger` and `pg_attribute` rows unchanged. `VACUUM FULL` of a catalog moves its rows (`ctid`); `VACUUM FULL` and `CLUSTER` of a table give its `pg_class` row a new `xmin` and `relfilenode`. So a digest that is to hold between transactions may use `oid` and `xmin` of `pg_trigger` and `pg_attribute` rows and the values of `pg_class` columns, and must not use `ctid`, nor `xmin` or `relfilenode` of `pg_class`.
-
-**A lock tells, for a tenth of the price** [verified, `locks`, 16/17/18: 42 cases each, every one as expected]. Every statement tried that changes a table's structure or the capture leaves, until its transaction ends, a lock of a mode that reading and writing rows never takes (`SHARE UPDATE EXCLUSIVE` or stronger, on a relation, in `pg_locks` under the session's own process): disabling, enabling, dropping or renaming a trigger; a deferrable constraint trigger; a foreign key made deferrable; a column added, dropped, renamed or retyped; a table made (also made and dropped again), dropped, renamed, moved, set unlogged; a partition attached or detached; inheritance; row security; a rule; an index; a view replaced; `TRUNCATE`; and also `LOCK TABLE ... IN SHARE MODE`, `ANALYZE`, a materialized view's refresh and `ALTER SEQUENCE`. A change made in a block whose exception is caught leaves none (it was undone with its subtransaction). Reading and writing rows leaves none: insert, update, delete, a captured update, cascades with the Application's triggers and checks, `FOR UPDATE` and `FOR KEY SHARE`, `ON CONFLICT`, `nextval`, views, `SERIALIZABLE`, `LOCK TABLE ... IN ROW EXCLUSIVE MODE`, advisory locks, a partitioned insert.
-
-What each costs per write, beyond a round trip of about 0.06 ms [verified, `cost`, 16/17/18 within 7% of each other; one shared VM, nothing else running]: a digest of structure and capture over all tables (the `pg_class` columns, `pg_attribute` and `pg_trigger` rows by `oid` and `xmin`, `pg_inherits`; ten columns and four triggers a table) costs about 0.8 ms at 10 tables, 1.5 ms at 100 and 5 ms at 500; counting the session's own strong locks costs 0.06 to 0.09 ms and does not grow with them. (`pg_locks` reads the whole lock table of the instance, so it grows with the instance's sessions instead; the identity's `vm.transaction_key()` already reads it once per transaction.)
-
-[not verified]: that these five are all the ways. Others reasoned, not run: a stored generated column, a default (`ON ... SET DEFAULT`), an index expression or a partition key on the referencing table of a cascading foreign key; an extended statistic's expression under autovacuum; `REINDEX`, `CLUSTER` and `ANALYZE` by a role with `MAINTAIN`. The fix below does not depend on the list being complete.
-
-### What follows for the design
-
-1. A check must be made **before every commit that could carry such a change, not only a migration's**: every read-write transaction the host runs for an Application ends with `SET CONSTRAINTS ALL IMMEDIATE`, `CLOSE ALL`, the check, `COMMIT`; a transaction that changed the structure of a table or the capture is rolled back. The check is of the session's own locks, which is cheap enough for every write; the whole digest is compared now and then (item 4). This covers every way that starts from the Application's own statements, known or not.
-2. Autovacuum is not a transaction of the host's. An index or an extended statistic that calls code of the Application's is refused when the migration is applied.
-3. A function marked `SECURITY DEFINER` is refused when the migration is applied: the runtime role may already read and write every table, so it serves nothing here, and it is the shortest way to the owner's rights.
-4. What was changed by something the host does not run (a way nobody foresaw, or somebody with the database's own rights) cannot be undone. The platform keeps the digest of each own database in the platform database, compares when it first uses the own database, when a Version is sent and every 30 seconds of use, and when they differ says so in the Operation log and puts the capture back.
-5. The host sets the migration role's password to null as its last act in the migration's transaction.
-
-## 12. G. What the second slice costs (added 2026-11-13 by the implementation agent)
-
-Provenance of this part: written by the implementation agent of ticket #57's second slice, which ran `docs/research/change-history-out-of-reach/g-cost.sh` once, on Postgres 18 (the black-box harness's, `VM_TEST_PG_VERSION=18`), on a shared 12-CPU VM with nothing else of note running. The whole output is `g-cost.log` (exit 0). The script drives the real `vm` program through the black-box harness (`g_cost.rs`, copied into `blackbox/tests/` for the run and removed after it) with three release builds: **before** (`4d6df80`, the first slice), **middle** (`bc0d37f`, the second slice) and **after** (`f4d97d9`, the second slice with a migration's statement and the question of its transaction's key sent together). Each figure below is from that log [verified]; what follows from them is marked.
+Provenance of this part: written by the implementation agent of ticket #57's second slice and rerun by it after the third round of review, on Postgres 18 (the black-box harness's, `VM_TEST_PG_VERSION=18`), on a shared 12-CPU VM with nothing else of note running. The figures below are from the rerun; its whole output is `g-cost.log` (exit 0); the first run's log is in this file's history. The script `docs/research/change-history-out-of-reach/g-cost.sh` needs only cargo, this checkout and the harness's cached Postgres binaries (and `.tools/libclang`, which it fills with `scripts/fetch-libclang.sh` where it is missing): it checks out each commit in a git worktree of its own, builds its `vm` with `cargo build --release` into `target/g-cost`, and drives each through the black-box harness (`g_cost.rs`, copied into `blackbox/tests/` for the run and removed after it, as are the worktrees). The builds are **before** (`4d6df80`, the first slice), **middle** (`bc0d37f`, the second slice before a migration's statement and the question of its transaction's key travelled together) and **after** (`5fdf806`, the second slice after the third round). The rerun, with `target/g-cost` absent beforehand, took 103 s, of which 66 s building the three binaries (other build caches of this machine, such as cargo's registry, were warm) [verified, `g-cost.log`]. Each figure below is from that log [verified]; what follows from them is marked.
 
 **A write** (one `INSERT` through `execute`, from the HTTP request to its answer, 400 in a row after 30 to warm up), median:
 
 | | round 1 | round 2 |
 |---|---|---|
-| before | 6.36 ms | 6.94 ms |
-| middle | 6.65 ms | 7.20 ms |
-| after | 6.72 ms | 7.05 ms |
+| before | 6.50 ms | 6.38 ms |
+| middle | 6.62 ms | 6.62 ms |
+| after | 6.53 ms | 6.56 ms |
 
-The check before the commit (`SET CONSTRAINTS ALL IMMEDIATE; CLOSE ALL; SELECT vm.before_commit(); COMMIT` in one flight) is no extra round trip. Measured alone as the superuser, a transaction with `vm.before_commit()` took 107 us more than one with `SELECT 1` in its place [verified]. The end-to-end difference between the builds (0.1 to 0.35 ms) is within what one build varies between the two rounds (0.3 to 0.6 ms) [verified], so the check cannot be told apart from the noise of a whole request here. A write that also makes the 30-second comparison (at most one every 30 s per own database) pays for a connection as the platform's role and the comparison besides, about what a Version with nothing to apply costs below [reasoned, not measured on a write].
+The check before the commit (`SET CONSTRAINTS ALL IMMEDIATE; CLOSE ALL; SELECT vm.before_commit(); COMMIT` in one flight) is no extra round trip. Measured alone as the superuser, a transaction with `vm.before_commit()` took 106 us more than one with `SELECT 1` in its place [verified]. The end-to-end difference between before and after (0.03 and 0.18 ms) is no larger than what one build varied between the two rounds of the first run (before: 6.36 and 6.94 ms) [verified, both logs], so the check cannot be told apart from the noise of a whole request here. A write that also makes the 30-second comparison (at most one every 30 s per own database) pays for a connection as the platform's role and the comparison besides, about what a Version with nothing to apply costs below [reasoned, not measured on a write].
 
 **One statement of a migration**, as sent: the difference between a Version whose last migration is 301 `SELECT 1` and one whose last migration is one, over 300, medians of five:
 
 | | round 1 | round 2 |
 |---|---|---|
-| before | 0.367 ms | 0.347 ms |
-| middle | 0.326 ms | 0.339 ms |
-| after | 0.196 ms | 0.196 ms |
+| before | 0.324 ms | 0.327 ms |
+| middle | 0.323 ms | 0.325 ms |
+| after | 0.194 ms | 0.191 ms |
 
-Before, each statement was prepared and then executed (two round trips) and `vm.transaction_key()` after it likewise (two more). After, the statement and the question each go as one unnamed extended-protocol exchange, both sent before either is answered [from code]; a statement that fails makes the question after it fail, and the statement's own error is the one answered. The question can travel with the statement, and now does. A Version with a migration of one statement became slower (22 to 24 ms before, 29 to 32 ms after) [verified]. The comparison before the migrations (a connection as the platform's role and the reads below) and the pending structure kept in the platform database before the commit account for it [reasoned].
+Before, each statement was prepared and then executed (two round trips) and `vm.transaction_key()` after it likewise (two more). After, the statement and the question each go as one unnamed extended-protocol exchange, both sent before either is answered [from code]; a statement that fails makes the question after it fail, and the statement's own error is the one answered. The question can travel with the statement, and now does. A Version with a migration of one statement became slower (21.9 to 22.5 ms before, 28.3 to 29.1 ms after) [verified]. The comparison before the migrations (a connection as the platform's role and the reads below) and the pending structure kept in the platform database before the commit account for it [reasoned].
 
-**`vm.capture_guard()`**, which every captured statement that changed rows calls: 137.7 us a call against 94.6 us for a `SELECT 1` round trip, so 43 us more per captured statement, the call itself included [verified]. It was not removed. Inlining it into `vm.capture()` would save only the call's overhead, and the check of `pg_cast` itself is needed while a cast to `json` can be made outside a migration [reasoned].
+**`vm.capture_guard()`**, which every captured statement that changed rows calls: 126.7 us a call against 92.8 us for a `SELECT 1` round trip, so 34 us more per captured statement, the call itself included [verified]. It was not removed. Inlining it into `vm.capture()` would save only the call's overhead, and the check of `pg_cast` itself is needed while a cast to `json` can be made outside a migration [reasoned].
 
 **The checks and the comparison by number of tables** (ten columns each, the capture on each), each statement run 50 times by the harness's superuser after `SET ROLE` to the migration role:
 
 | tables | `capture_state` | `capture_problems` | `structure_state` | a Version with nothing to apply (median of 5) |
 |---|---|---|---|---|
-| 10 | 0.26 ms | 0.93 ms | 0.30 ms | 8.3 ms |
-| 100 | 0.73 ms | 1.30 ms | 1.29 ms | 10.2 ms |
-| 500 | 2.66 ms | 2.92 ms | 5.32 ms | 18.7 ms |
+| 10 | 0.25 ms | 0.97 ms | 0.31 ms | 8.7 ms |
+| 100 | 0.72 ms | 1.32 ms | 1.27 ms | 10.2 ms |
+| 500 | 2.60 ms | 2.97 ms | 5.48 ms | 18.1 ms |
 
 A single SELECT 1 round trip took 0.09 to 0.10 ms [verified]. A Version with nothing to apply includes the whole stored comparison: a connection as the platform's role, `vm.structure_state()` and the record of migrations in one snapshot, and what is kept read from the platform database [from code]. A Version with migrations pays, per migration, `capture_state` twice and `capture_problems` once, and, once per Version, `structure_state` and the pending structure written to the platform database [from code]. At 500 tables that is about 8 ms a migration and 6 ms a Version [reasoned from the table].
 
