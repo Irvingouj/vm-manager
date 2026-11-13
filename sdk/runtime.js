@@ -9,9 +9,9 @@
 // asking is decided by the host from the request in flight, on every
 // operation.
 
-import { createTableRelationsHelpers, extractTablesRelationalConfig } from "drizzle-orm";
+import { createTableRelationsHelpers, extractTablesRelationalConfig, TransactionRollbackError } from "drizzle-orm";
 import { PgDialect } from "drizzle-orm/pg-core";
-import { PgRemoteDatabase, PgRemoteSession } from "drizzle-orm/pg-proxy";
+import { PgProxyTransaction, PgRemoteDatabase, PgRemoteSession } from "drizzle-orm/pg-proxy";
 import { failedOf, OperationFailed, Refused, refusedOf } from "./errors.js";
 import { decodeRows, encodeParam, operationOf, rowsAsObjects } from "./values.js";
 
@@ -66,7 +66,47 @@ function ownError(error) {
   return error;
 }
 
+/** What `tx.transaction(...)` rejects with: the host has no nesting. */
+const NESTED =
+  "Transactions cannot be nested: run these statements in the transaction you are in, through its `tx`";
+
+/**
+ * The `tx` a transaction's callback is given: a Drizzle database whose
+ * statements carry the transaction's id. It refuses nesting without asking
+ * the host.
+ */
+class HostTransaction extends PgProxyTransaction {
+  async transaction() {
+    throw new Error(NESTED);
+  }
+
+  /**
+   * Drizzle's: throws its `TransactionRollbackError`, which makes
+   * `transaction` roll back and reject with it. Drizzle 0.45 names that
+   * error `DrizzleError`; here it is named for what it is.
+   */
+  rollback() {
+    const error = new TransactionRollbackError();
+    error.name = "TransactionRollbackError";
+    throw error;
+  }
+}
+
 class HostSession extends PgRemoteSession {
+  /**
+   * `target` is the handle's (`{ resource, as }` or `{ own: true, as }`);
+   * `declared` its Access level as manifest.ts declares it (`write` on the
+   * own database); `tx` the transaction's id, for a session inside one.
+   */
+  constructor(target, declared, tx, dialect, relational) {
+    super(callback(tx === undefined ? target : freeze({ tx })), dialect, relational);
+    this.hostTarget = target;
+    this.hostDeclared = declared;
+    this.hostTx = tx;
+    this.hostDialect = dialect;
+    this.hostRelational = relational;
+  }
+
   prepareQuery(...args) {
     const prepared = super.prepareQuery(...args);
     for (const name of ["execute", "all", "values"]) {
@@ -82,54 +122,104 @@ class HostSession extends PgRemoteSession {
     }
     return prepared;
   }
+
+  /**
+   * Drizzle's `db.transaction(callback, config)` (blackbox/CONTRACT.md,
+   * "Transactions: Through the SDK"): `tx.begin` on the handle's target,
+   * at `read` when the handle is declared at read or `accessMode` is
+   * `read only`, else at `write`; the callback with a `tx` bound to the
+   * transaction; then `tx.commit`, or `tx.rollback` when the callback threw
+   * or rejected, and then that same error again. The host rolls back on its
+   * own whatever a request leaves open.
+   */
+  async transaction(run, config) {
+    if (this.hostTx !== undefined) throw new Error(NESTED);
+    const readOnly = this.hostDeclared === "read" || config?.accessMode === "read only";
+    const args = { ...this.hostTarget, access: readOnly ? "read" : "write" };
+    if (config?.isolationLevel !== undefined) args.isolation = config.isolationLevel;
+    const { tx: id } = settle(await invoke("tx.begin", args));
+    const session = new HostSession(this.hostTarget, this.hostDeclared, id, this.hostDialect, this.hostRelational);
+    const tx = new HostTransaction(this.hostDialect, session, this.hostRelational);
+    withoutRawSql(tx);
+    let result;
+    try {
+      result = await run(tx);
+    } catch (error) {
+      try {
+        // Whatever the host says, the callback's error is what rejects.
+        await invoke("tx.rollback", { tx: id });
+      } catch {
+        // The host rolls back what the request leaves open.
+      }
+      throw error;
+    }
+    settle(await invoke("tx.commit", { tx: id }));
+    return result;
+  }
 }
 
-/** A Drizzle database on `target`, typed (at compile time) and related by `schema`. */
-function database(target, schema) {
+/** The handles offer no raw SQL (blackbox/CONTRACT.md, "What Application
+ * code is given"); the database role is the boundary, this is guidance. */
+function withoutRawSql(db) {
+  Object.defineProperty(db, "execute", { value: undefined });
+}
+
+/**
+ * A Drizzle database on `target`, typed (at compile time) and related by
+ * `schema`; `declared` is its Access level (`read` or `write`).
+ */
+function database(target, declared, schema) {
   const dialect = new PgDialect();
   let relational;
   if (schema !== undefined && Object.keys(schema).length > 0) {
     const tables = extractTablesRelationalConfig(schema, createTableRelationsHelpers);
     relational = { fullSchema: schema, schema: tables.tables, tableNamesMap: tables.tableNamesMap };
   }
-  const session = new HostSession(callback(freeze(target)), dialect, relational);
+  const session = new HostSession(freeze(target), declared, undefined, dialect, relational);
   const db = new PgRemoteDatabase(dialect, session, relational);
-  // The handles offer no raw SQL (blackbox/CONTRACT.md, "What Application
-  // code is given"); the database role is the boundary, this is guidance.
-  Object.defineProperty(db, "execute", { value: undefined });
+  withoutRawSql(db);
   return db;
 }
 
 /** The Trusted context of one request, over the platform's `raw` one. */
-function context(raw, structures) {
+function context(raw, structures, declared) {
   const own = structures.own;
   const shared = structures.shared;
   const handles = new Map();
-  const handle = (key, target, schema) => {
+  const handle = (key, target, schema, access) => {
     let db = handles.get(key);
     if (db === undefined) {
-      db = database(target, schema);
+      db = database(target, access, schema);
       handles.set(key, db);
     }
     return db;
   };
   const structureOf = (name) => (hasOwn(shared, name) ? shared[name] : undefined);
+  // A Resource not declared is `write` here: the host refuses it anyway.
+  const accessOf = (name) => (hasOwn(declared, name) && declared[name]?.access === "read" ? "read" : "write");
   return freeze({
     user() {
       const who = raw.user();
       return freeze({
         id: who.id,
         groups: who.groups,
-        db: (name) => handle(`user resource ${name}`, { resource: name, as: "user" }, structureOf(name)),
-        ownDb: () => handle("user own", { own: true, as: "user" }, own),
+        db: (name) =>
+          handle(`user resource ${name}`, { resource: name, as: "user" }, structureOf(name), accessOf(name)),
+        ownDb: () => handle("user own", { own: true, as: "user" }, own, "write"),
       });
     },
     app() {
       return freeze({
-        ownDb: () => handle("application own", { own: true, as: "application" }, own),
+        ownDb: () => handle("application own", { own: true, as: "application" }, own, "write"),
         // Not in the types: code forced past them gets the host's
         // `not-own-database`, not a TypeError.
-        db: (name) => handle(`application resource ${name}`, { resource: name, as: "application" }, structureOf(name)),
+        db: (name) =>
+          handle(
+            `application resource ${name}`,
+            { resource: name, as: "application" },
+            structureOf(name),
+            accessOf(name),
+          ),
       });
     },
   });
@@ -150,13 +240,17 @@ function refusedResponse(error) {
  */
 export function serve(app, structures) {
   const all = freeze({ own: structures?.own ?? {}, shared: structures?.shared ?? {} });
+  // What manifest.ts declares, read once: a transaction through a handle
+  // declared at `read` is begun read-only.
+  const resources = app?.manifest?.resources;
+  const declared = freeze(resources !== null && typeof resources === "object" ? { ...resources } : {});
   return freeze({
     async fetch(request, raw) {
       if (app === null || typeof app !== "object" || typeof app.fetch !== "function") {
         throw new Error("src/index.ts must export default defineApp(manifest, { fetch(request, ctx) { ... } })");
       }
       try {
-        return await app.fetch(request, context(raw, all));
+        return await app.fetch(request, context(raw, all, declared));
       } catch (error) {
         if (error instanceof Refused) return refusedResponse(error);
         throw error;

@@ -13,6 +13,7 @@
 // The types guide; the platform decides. Every operation is decided by the
 // host from the request in flight, and the database role is the boundary.
 
+import type { PgTransactionConfig } from "drizzle-orm/pg-core";
 import type { PgRemoteDatabase } from "drizzle-orm/pg-proxy";
 import type * as OwnStructureModule from "@vm/own-structure";
 
@@ -116,19 +117,46 @@ export type OwnStructure = typeof OwnStructureModule;
 
 type Structure = Record<string, unknown>;
 
-/** What no handle offers: raw SQL, and transactions (their own ticket). */
+/** What no handle offers: raw SQL. `transaction` is the SDK's own, below. */
 type NotOffered = "execute" | "transaction";
 
-/** A Drizzle database on a database the Application may change. */
-export type Database<S extends Structure> = Omit<PgRemoteDatabase<S>, NotOffered>;
+/** Drizzle's `tx` on a database of structure `S`. */
+type DrizzleTransaction<S extends Structure> = Parameters<Parameters<PgRemoteDatabase<S>["transaction"]>[0]>[0];
+
+/**
+ * The second argument of `transaction`, Drizzle's: `isolationLevel`
+ * (`read committed`, `repeatable read`, `serializable`) and `accessMode`
+ * (`read write`, `read only`).
+ */
+export type TransactionConfig = Pick<PgTransactionConfig, "isolationLevel" | "accessMode">;
+
+/**
+ * The `tx` a transaction's callback is given: the same database, inside the
+ * transaction. Transactions cannot be nested, so it has no `transaction`;
+ * `tx.rollback()` rolls back and makes `transaction` reject with Drizzle's
+ * `TransactionRollbackError`. Its isolation level and access mode are the
+ * second argument of `transaction`: Drizzle's `setTransaction` sends a `SET`
+ * statement, which the platform refuses, so it is not offered either.
+ */
+export type Transaction<S extends Structure> = Omit<DrizzleTransaction<S>, NotOffered | "setTransaction">;
+
+/**
+ * A Drizzle database on a database the Application may change.
+ * `transaction(callback, config?)` commits when the callback returns (and
+ * resolves to what it returned), and rolls everything back when it throws
+ * (and rejects with that same error).
+ */
+export type Database<S extends Structure> = Omit<PgRemoteDatabase<S>, NotOffered> & {
+  transaction<T>(callback: (tx: Transaction<S>) => Promise<T>, config?: TransactionConfig): Promise<T>;
+};
 
 type Reading = "select" | "selectDistinct" | "selectDistinctOn" | "$count" | "query" | "$with";
 
 type DeclaredAtRead<N extends string> =
   `'${N}' is declared at 'read' in manifest.ts. Declare it at 'write' to change rows.`;
 
-/** A Drizzle database that only reads: the Resource is declared at `read`. */
-export type ReadOnlyDatabase<N extends string, S extends Structure> = Pick<PgRemoteDatabase<S>, Reading> & {
+/** What a database declared at `read` offers besides its reads: no change of rows. */
+type OnlyReads<N extends string, S extends Structure> = {
   with(
     ...queries: Parameters<PgRemoteDatabase<S>["with"]>
   ): Pick<ReturnType<PgRemoteDatabase<S>["with"]>, "select" | "selectDistinct" | "selectDistinctOn">;
@@ -136,6 +164,25 @@ export type ReadOnlyDatabase<N extends string, S extends Structure> = Pick<PgRem
   update(this: DeclaredAtRead<N>, ...args: unknown[]): never;
   delete(this: DeclaredAtRead<N>, ...args: unknown[]): never;
 };
+
+/** The `tx` of a transaction through a handle declared at `read`: reads only, always read-only. */
+export type ReadOnlyTransaction<N extends string, S extends Structure> = Pick<
+  DrizzleTransaction<S>,
+  Reading | "rollback"
+> &
+  OnlyReads<N, S>;
+
+/**
+ * A Drizzle database that only reads: the Resource is declared at `read`.
+ * Its transactions are read-only whatever `accessMode` says.
+ */
+export type ReadOnlyDatabase<N extends string, S extends Structure> = Pick<PgRemoteDatabase<S>, Reading> &
+  OnlyReads<N, S> & {
+    transaction<T>(
+      callback: (tx: ReadOnlyTransaction<N, S>) => Promise<T>,
+      config?: TransactionConfig,
+    ): Promise<T>;
+  };
 
 /** What `db(name)` is when the Resource has no generated link. */
 type NotPulled<N extends string> =
