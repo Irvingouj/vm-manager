@@ -31,7 +31,8 @@
 //!   server log as the statements each role sent;
 //! - [`sdk`] is what the tests of the SDK share: its tooling, the fixture
 //!   projects under `fixtures/sdk/` built with it, and the Applications
-//!   installed from them.
+//!   installed from them;
+//! - [`transactions`] is what the raw tests of transactions share.
 //!
 //! Every wait has a timeout, so a failing test fails within seconds and
 //! never hangs. Each test starts its own program on its own port, so tests
@@ -58,6 +59,7 @@ pub mod sdk;
 pub mod server_log;
 pub mod shared_database;
 pub mod sql;
+pub mod transactions;
 pub mod vm;
 
 pub use api::{Api, assert_api_error};
