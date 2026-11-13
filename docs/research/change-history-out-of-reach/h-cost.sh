@@ -3,10 +3,12 @@
 # (the Change history in the platform database, shipped from an outbox)
 # costs, measured with the real program on Postgres 18.
 #
-#   docs/research/change-history-out-of-reach/h-cost.sh [BEFORE [AFTER]]
+#   docs/research/change-history-out-of-reach/h-cost.sh [BEFORE [AFTER [MIDDLE]]]
 #
-# BEFORE, AFTER: the commits to compare (by default 9255bea, the last
-# commit before the ticket's program, and HEAD). Each is checked out in a
+# BEFORE, AFTER, MIDDLE: the commits to compare (by default 9255bea, the
+# last commit before the ticket's program; HEAD; and 1d4b9f6, the ticket's
+# program with a connection opened for each shipment; MIDDLE may be given
+# as "" to leave it out). Each is checked out in a
 # git worktree of its own in a temporary directory and its `vm` built there
 # with `cargo build --release -p vm --bin vm`, into one target directory
 # kept between runs (target/h-cost). The statement parser's build needs
@@ -17,6 +19,8 @@
 # blackbox/tests/ for the run and removed after it, as are the worktrees.
 # Run it on a quiet machine and not beside a gate.
 #   writes      one INSERT through `execute`, request to answer, 400 times
+#   where       writes back to back and 100 ms apart, on a table with a
+#               `jsonb` column and on one without; sessions opened meanwhile
 #   migrations  a Version with one migration (`SELECT 1`, or a column
 #               retyped) at 10, 100 and 500 tables
 #   snapshot    (AFTER only) vm.structure_snapshot() at 10, 100, 500 tables
@@ -31,6 +35,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(git -C "$HERE" rev-parse --show-toplevel)"
 BEFORE_COMMIT="${1:-9255bea}"
 AFTER_COMMIT="${2:-HEAD}"
+MIDDLE_COMMIT="${3-1d4b9f6}"
 TEST="$ROOT/blackbox/tests/h_cost.rs"
 WORK="$(mktemp -d)"
 export CARGO_TARGET_DIR="$ROOT/target/h-cost"
@@ -53,9 +58,13 @@ build() { # build LABEL COMMIT: echoes the binary's path
   cp "$CARGO_TARGET_DIR/release/vm" "$WORK/vm-$1"
   echo "$WORK/vm-$1"
 }
-echo "# building: before $(git -C "$ROOT" rev-parse --short "$BEFORE_COMMIT"), after $(git -C "$ROOT" rev-parse --short "$AFTER_COMMIT")"
+echo "# building: before $(git -C "$ROOT" rev-parse --short "$BEFORE_COMMIT"), after $(git -C "$ROOT" rev-parse --short "$AFTER_COMMIT")${MIDDLE_COMMIT:+, middle $(git -C "$ROOT" rev-parse --short "$MIDDLE_COMMIT")}"
 BEFORE="$(build before "$BEFORE_COMMIT")"
 AFTER="$(build after "$AFTER_COMMIT")"
+MIDDLE=""
+if [ -n "$MIDDLE_COMMIT" ]; then
+  MIDDLE="$(build middle "$MIDDLE_COMMIT")"
+fi
 echo "# built in ${SECONDS} s"
 cp "$HERE/h_cost.rs" "$TEST"
 run() { # run LABEL BINARY PARTS
@@ -66,8 +75,11 @@ run() { # run LABEL BINARY PARTS
 echo "# $(date -u +%FT%TZ) on $(uname -srm), $(nproc) CPUs"
 for round in 1 2; do
   echo "#### round $round"
-  run before "$BEFORE" writes,migrations
-  run after "$AFTER" writes,migrations,snapshot
+  run before "$BEFORE" writes,where,migrations
+  if [ -n "$MIDDLE" ]; then
+    run middle "$MIDDLE" writes,where
+  fi
+  run after "$AFTER" writes,where,migrations,snapshot
 done
 run after "$AFTER" after
 run after "$AFTER" ship

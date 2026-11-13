@@ -1,38 +1,68 @@
-# building: before 9255bea, after 9d7361e
-# built in 57 s
-# 2026-11-13T20:12:27Z on Linux 6.8.0-1070-azure x86_64, 12 CPUs
+# building: before 9255bea, after ef61013, middle 1d4b9f6
+# built in 32 s
+# 2026-11-13T22:09:24Z on Linux 6.8.0-1070-azure x86_64, 12 CPUs
 #### round 1
-######## before: vm at before, parts writes,migrations
-H write (one INSERT through execute, request to answer): n=400 median=6.676 ms p90=7.002 ms mean=6.742 ms
-H tables=10: a Version with one migration of `SELECT 1` n=5 median=29.542 ms p90=32.433 ms mean=30.091 ms ; with one migration retyping a column n=5 median=30.957 ms p90=31.115 ms mean=30.956 ms
-H tables=100: a Version with one migration of `SELECT 1` n=5 median=35.203 ms p90=37.215 ms mean=35.294 ms ; with one migration retyping a column n=5 median=36.083 ms p90=36.743 ms mean=35.927 ms
-H tables=500: a Version with one migration of `SELECT 1` n=5 median=57.238 ms p90=59.485 ms mean=57.363 ms ; with one migration retyping a column n=5 median=58.374 ms p90=58.784 ms mean=57.968 ms
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.70s
-######## after: vm at after, parts writes,migrations,snapshot
-H write (one INSERT through execute, request to answer): n=400 median=7.052 ms p90=7.583 ms mean=7.164 ms
-H tables=10: a Version with one migration of `SELECT 1` n=5 median=35.079 ms p90=37.551 ms mean=35.576 ms ; with one migration retyping a column n=5 median=36.058 ms p90=36.717 ms mean=36.102 ms
-H tables=10: vm.structure_snapshot() 0.57 ms a call (4909 bytes as text), a round trip alone 0.09 ms
-H tables=100: a Version with one migration of `SELECT 1` n=5 median=48.305 ms p90=50.168 ms mean=48.792 ms ; with one migration retyping a column n=5 median=49.726 ms p90=49.957 ms mean=49.515 ms
-H tables=100: vm.structure_snapshot() 3.21 ms a call (36680 bytes as text), a round trip alone 0.09 ms
-H tables=500: a Version with one migration of `SELECT 1` n=5 median=127.257 ms p90=129.814 ms mean=127.737 ms ; with one migration retyping a column n=5 median=128.586 ms p90=129.594 ms mean=128.471 ms
-H tables=500: vm.structure_snapshot() 14.77 ms a call (178280 bytes as text), a round trip alone 0.10 ms
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.92s
+######## before: vm at before, parts writes,where,migrations
+H write (one INSERT through execute, request to answer): n=400 median=6.589 ms p90=6.793 ms mean=6.616 ms
+H where, things: back to back n=300 median=6.570 ms p90=6.724 ms mean=6.601 ms ; sessions opened in the own database during them 0
+H where, things: 100 ms apart n=100 median=7.686 ms p90=7.934 ms mean=7.651 ms
+H where, parents: back to back n=300 median=6.570 ms p90=6.731 ms mean=6.599 ms ; sessions opened in the own database during them 0
+H where, parents: 100 ms apart n=100 median=7.690 ms p90=7.984 ms mean=7.723 ms
+H tables=10: a Version with one migration of `SELECT 1` n=5 median=29.736 ms p90=31.324 ms mean=30.125 ms ; with one migration retyping a column n=5 median=30.884 ms p90=31.050 ms mean=30.814 ms
+H tables=100: a Version with one migration of `SELECT 1` n=5 median=34.706 ms p90=36.668 ms mean=35.103 ms ; with one migration retyping a column n=5 median=35.858 ms p90=36.480 ms mean=35.796 ms
+H tables=500: a Version with one migration of `SELECT 1` n=5 median=57.215 ms p90=60.219 ms mean=57.677 ms ; with one migration retyping a column n=5 median=58.026 ms p90=58.469 ms mean=58.098 ms
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 33.78s
+######## middle: vm at middle, parts writes,where
+H write (one INSERT through execute, request to answer): n=400 median=7.032 ms p90=7.586 ms mean=7.159 ms
+H where, things: back to back n=300 median=7.043 ms p90=7.549 ms mean=7.140 ms ; sessions opened in the own database during them 300
+H where, things: 100 ms apart n=100 median=7.934 ms p90=8.246 ms mean=7.936 ms
+H where, parents: back to back n=300 median=7.019 ms p90=7.551 ms mean=7.131 ms ; sessions opened in the own database during them 300
+H where, parents: 100 ms apart n=100 median=7.901 ms p90=8.188 ms mean=7.938 ms
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 32.17s
+######## after: vm at after, parts writes,where,migrations,snapshot
+H write (one INSERT through execute, request to answer): n=400 median=6.845 ms p90=7.037 ms mean=6.871 ms
+H where, things: back to back n=300 median=6.841 ms p90=7.021 ms mean=6.861 ms ; sessions opened in the own database during them 0
+H where, things: 100 ms apart n=100 median=7.821 ms p90=8.176 ms mean=7.816 ms
+H where, parents: back to back n=300 median=6.780 ms p90=6.981 ms mean=6.823 ms ; sessions opened in the own database during them 0
+H where, parents: 100 ms apart n=100 median=7.833 ms p90=8.100 ms mean=7.842 ms
+H tables=10: a Version with one migration of `SELECT 1` n=5 median=34.788 ms p90=36.055 ms mean=35.140 ms ; with one migration retyping a column n=5 median=35.857 ms p90=36.331 ms mean=35.917 ms
+H tables=10: vm.structure_snapshot() 0.56 ms a call (4909 bytes as text), a round trip alone 0.10 ms
+H tables=100: a Version with one migration of `SELECT 1` n=5 median=48.961 ms p90=50.489 ms mean=49.126 ms ; with one migration retyping a column n=5 median=48.707 ms p90=49.908 ms mean=48.879 ms
+H tables=100: vm.structure_snapshot() 3.16 ms a call (36680 bytes as text), a round trip alone 0.10 ms
+H tables=500: a Version with one migration of `SELECT 1` n=5 median=125.904 ms p90=128.253 ms mean=125.846 ms ; with one migration retyping a column n=5 median=127.163 ms p90=128.861 ms mean=127.043 ms
+H tables=500: vm.structure_snapshot() 14.63 ms a call (178280 bytes as text), a round trip alone 0.10 ms
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 36.04s
 #### round 2
-######## before: vm at before, parts writes,migrations
-H write (one INSERT through execute, request to answer): n=400 median=6.631 ms p90=6.780 ms mean=6.645 ms
-H tables=10: a Version with one migration of `SELECT 1` n=5 median=29.724 ms p90=30.600 ms mean=29.774 ms ; with one migration retyping a column n=5 median=30.600 ms p90=31.271 ms mean=30.754 ms
-H tables=100: a Version with one migration of `SELECT 1` n=5 median=34.693 ms p90=37.289 ms mean=35.129 ms ; with one migration retyping a column n=5 median=35.744 ms p90=36.373 ms mean=35.753 ms
-H tables=500: a Version with one migration of `SELECT 1` n=5 median=57.879 ms p90=59.344 ms mean=57.967 ms ; with one migration retyping a column n=5 median=57.924 ms p90=58.536 ms mean=57.918 ms
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.65s
-######## after: vm at after, parts writes,migrations,snapshot
-H write (one INSERT through execute, request to answer): n=400 median=7.143 ms p90=7.684 ms mean=7.267 ms
-H tables=10: a Version with one migration of `SELECT 1` n=5 median=34.338 ms p90=36.344 ms mean=34.746 ms ; with one migration retyping a column n=5 median=35.555 ms p90=36.776 ms mean=35.706 ms
-H tables=10: vm.structure_snapshot() 0.57 ms a call (4909 bytes as text), a round trip alone 0.09 ms
-H tables=100: a Version with one migration of `SELECT 1` n=5 median=48.359 ms p90=50.048 ms mean=48.611 ms ; with one migration retyping a column n=5 median=49.035 ms p90=49.874 ms mean=49.144 ms
-H tables=100: vm.structure_snapshot() 3.13 ms a call (36680 bytes as text), a round trip alone 0.10 ms
-H tables=500: a Version with one migration of `SELECT 1` n=5 median=126.012 ms p90=129.598 ms mean=126.314 ms ; with one migration retyping a column n=5 median=126.760 ms p90=127.676 ms mean=126.663 ms
-H tables=500: vm.structure_snapshot() 14.45 ms a call (178280 bytes as text), a round trip alone 0.10 ms
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.94s
+######## before: vm at before, parts writes,where,migrations
+H write (one INSERT through execute, request to answer): n=400 median=6.583 ms p90=6.705 ms mean=6.594 ms
+H where, things: back to back n=300 median=6.623 ms p90=6.852 ms mean=6.666 ms ; sessions opened in the own database during them 0
+H where, things: 100 ms apart n=100 median=7.529 ms p90=7.836 ms mean=7.517 ms
+H where, parents: back to back n=300 median=6.570 ms p90=6.775 ms mean=6.604 ms ; sessions opened in the own database during them 0
+H where, parents: 100 ms apart n=100 median=7.684 ms p90=7.909 ms mean=7.721 ms
+H tables=10: a Version with one migration of `SELECT 1` n=5 median=29.406 ms p90=31.733 ms mean=29.862 ms ; with one migration retyping a column n=5 median=30.820 ms p90=31.212 ms mean=30.680 ms
+H tables=100: a Version with one migration of `SELECT 1` n=5 median=33.821 ms p90=37.095 ms mean=34.566 ms ; with one migration retyping a column n=5 median=34.984 ms p90=35.582 ms mean=34.980 ms
+H tables=500: a Version with one migration of `SELECT 1` n=5 median=56.569 ms p90=59.625 ms mean=56.984 ms ; with one migration retyping a column n=5 median=57.307 ms p90=57.811 ms mean=57.193 ms
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 33.71s
+######## middle: vm at middle, parts writes,where
+H write (one INSERT through execute, request to answer): n=400 median=7.134 ms p90=7.694 ms mean=7.268 ms
+H where, things: back to back n=300 median=7.140 ms p90=7.624 ms mean=7.247 ms ; sessions opened in the own database during them 300
+H where, things: 100 ms apart n=100 median=7.943 ms p90=8.279 ms mean=7.948 ms
+H where, parents: back to back n=300 median=7.094 ms p90=7.652 ms mean=7.246 ms ; sessions opened in the own database during them 300
+H where, parents: 100 ms apart n=100 median=7.902 ms p90=8.103 ms mean=7.937 ms
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 32.29s
+######## after: vm at after, parts writes,where,migrations,snapshot
+H write (one INSERT through execute, request to answer): n=400 median=6.810 ms p90=7.003 ms mean=6.839 ms
+H where, things: back to back n=300 median=6.877 ms p90=7.120 ms mean=6.921 ms ; sessions opened in the own database during them 0
+H where, things: 100 ms apart n=100 median=7.828 ms p90=8.085 ms mean=7.797 ms
+H where, parents: back to back n=300 median=6.842 ms p90=7.138 ms mean=6.889 ms ; sessions opened in the own database during them 0
+H where, parents: 100 ms apart n=100 median=7.823 ms p90=8.096 ms mean=7.838 ms
+H tables=10: a Version with one migration of `SELECT 1` n=5 median=34.050 ms p90=36.609 ms mean=34.759 ms ; with one migration retyping a column n=5 median=35.301 ms p90=35.602 ms mean=35.318 ms
+H tables=10: vm.structure_snapshot() 0.56 ms a call (4909 bytes as text), a round trip alone 0.09 ms
+H tables=100: a Version with one migration of `SELECT 1` n=5 median=48.995 ms p90=50.657 ms mean=48.975 ms ; with one migration retyping a column n=5 median=49.093 ms p90=49.821 ms mean=49.090 ms
+H tables=100: vm.structure_snapshot() 3.09 ms a call (36680 bytes as text), a round trip alone 0.10 ms
+H tables=500: a Version with one migration of `SELECT 1` n=5 median=125.153 ms p90=128.643 ms mean=125.689 ms ; with one migration retyping a column n=5 median=126.948 ms p90=131.516 ms mean=127.709 ms
+H tables=500: vm.structure_snapshot() 14.44 ms a call (178280 bytes as text), a round trip alone 0.09 ms
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 36.04s
 ######## after: vm at after, parts after
 H next-write round 0: outbox held 9000 rows when the next write was sent
 H next-write round 1: outbox held 9000 rows when the next write was sent
@@ -44,20 +74,20 @@ H next-write round 6: outbox held 9000 rows when the next write was sent
 H next-write round 7: outbox held 9000 rows when the next write was sent
 H next-write round 8: outbox held 9000 rows when the next write was sent
 H next-write round 9: outbox held 9000 rows when the next write was sent
-H a write of 10,000 rows: n=10 median=81.373 ms p90=82.054 ms mean=81.073 ms
-H a write of one row with the outbox empty: n=10 median=7.807 ms p90=8.139 ms mean=8.548 ms
-H a write of one row sent at once after the write of 10,000 was answered (its shipment under way): n=10 median=7.902 ms p90=8.785 ms mean=8.284 ms
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.69s
+H a write of 10,000 rows: n=10 median=79.980 ms p90=81.694 ms mean=80.133 ms
+H a write of one row with the outbox empty: n=10 median=7.636 ms p90=8.111 ms mean=8.480 ms
+H a write of one row sent at once after the write of 10,000 was answered (its shipment under way): n=10 median=7.921 ms p90=8.133 ms mean=8.214 ms
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.70s
 ######## after: vm at after, parts ship
-H 100,000 rows in one execute: answered after 0.812 s; outbox empty 2.664 s after the answer; 100000 changes in change_history, in 100 transactions
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.22s
+H 100,000 rows in one execute: answered after 0.791 s; outbox empty 2.596 s after the answer; 100000 changes in change_history, in 100 transactions
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.13s
 ######## after: vm at after, parts reads
-H read with 1000 changes of the Application kept, no key: 100 changes answered; n=50 median=12.374 ms p90=12.687 ms mean=12.410 ms
-H read with 1000 changes of the Application kept, key {id: 7}: 100 changes answered; n=50 median=12.987 ms p90=13.323 ms mean=13.017 ms
-H read with 1000 changes of the Application kept, key {id: "7"}: 100 changes answered; n=50 median=12.883 ms p90=13.051 ms mean=12.859 ms
-H read with 1000000 changes of the Application kept, no key: 100 changes answered; n=50 median=12.639 ms p90=13.010 ms mean=12.635 ms
-H read with 1000000 changes of the Application kept, key {id: 7}: 100 changes answered; n=50 median=13.039 ms p90=13.268 ms mean=13.073 ms
-H read with 1000000 changes of the Application kept, key {id: "7"}: 100 changes answered; n=50 median=13.058 ms p90=13.438 ms mean=13.117 ms
+H read with 1000 changes of the Application kept, no key: 100 changes answered; n=50 median=9.101 ms p90=9.193 ms mean=9.110 ms
+H read with 1000 changes of the Application kept, key {id: 7}: 100 changes answered; n=50 median=9.558 ms p90=9.746 ms mean=9.633 ms
+H read with 1000 changes of the Application kept, key {id: "7"}: 100 changes answered; n=50 median=9.689 ms p90=9.952 ms mean=9.713 ms
+H read with 1000000 changes of the Application kept, no key: 100 changes answered; n=50 median=9.178 ms p90=9.353 ms mean=9.186 ms
+H read with 1000000 changes of the Application kept, key {id: 7}: 100 changes answered; n=50 median=9.580 ms p90=9.767 ms mean=9.611 ms
+H read with 1000000 changes of the Application kept, key {id: "7"}: 100 changes answered; n=50 median=9.616 ms p90=9.900 ms mean=9.666 ms
 H the keyed read's plan with 1000000 changes kept:
 H   Subquery Scan on y (actual rows=100.00 loops=1)
 H     Filter: ((y.running - y.size) <= 8388608)
@@ -94,11 +124,11 @@ H                                                     Index Searches: 1
 H                                                     Buffers: shared hit=2
 H   Planning:
 H     Buffers: shared hit=42 read=5
-H   Planning Time: 0.261 ms
-H   Execution Time: 0.240 ms
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 18.14s
+H   Planning Time: 0.257 ms
+H   Execution Time: 0.252 ms
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 16.98s
 ######## after: vm at after, parts start
-H start with 50 own databases, 50000 changes in their outboxes: listening after 0.014 s; a write sent then answered in 31.077 ms, a read of another Application's history in 380.814 ms; every outbox empty 2.615 s after the start; 50000 of them in change_history; 0 history-not-shipped records after the restart
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 13.55s
-# whole run: 133 s
+H start with 50 own databases, 50000 changes in their outboxes: listening after 0.023 s; a write sent then answered in 35.699 ms, a read of another Application's history in 325.646 ms; every outbox empty 2.777 s after the start; 50000 of them in change_history; 0 history-not-shipped records after the restart
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 14.06s
+# whole run: 277 s
 DONE exit 0

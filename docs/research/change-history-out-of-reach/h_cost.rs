@@ -7,7 +7,7 @@
 //! it drives the real `vm` binary (`VM_BIN`) beside the harness's Postgres
 //! through the harness, as the black-box tests do. `H_PARTS` says which
 //! parts run: `writes` and `migrations` work with a program from before the
-//! ticket; `snapshot`, `after`, `ship`, `reads` and `start` need the ticket's program.
+//! ticket; `where` works with both; `snapshot`, `after`, `ship`, `reads` and `start` need the ticket's program.
 //!
 //! It prints lines beginning with `H ` and asserts only that what it times
 //! succeeded.
@@ -133,6 +133,46 @@ fn h_cost() {
         }
         let times: Vec<Duration> = (0..400).map(|i| write(&own, app, 200_000 + i)).collect();
         println!("H write (one INSERT through execute, request to answer): {}", summary(&times));
+    }
+
+    if parts.contains("where") {
+        // Where a write's time goes. Back to back on `things` (it has a
+        // `jsonb` column, so the capture's JSON-null scan runs) and on
+        // `parents` (no `json` or `jsonb` column); then the same with 100 ms
+        // between writes, so that no shipment of the write before is under
+        // way; and the sessions the own database saw meanwhile.
+        let sessions = || -> i64 {
+            value(
+                &db.instance(),
+                &format!(
+                    "SELECT sessions::text FROM pg_stat_database WHERE datname = {}",
+                    literal(&db.name)
+                ),
+            )
+            .parse()
+            .unwrap_or(-1)
+        };
+        for (table, base_id) in [("things", 500_000_i64), ("parents", 600_000)] {
+            let one = |id: i64| {
+                execute(&own, app, &format!("insert into {table} (id, {}) values ({id}, 'a write')", if table == "things" { "title" } else { "name" }))
+            };
+            for i in 0..30 {
+                one(base_id + i);
+            }
+            std::thread::sleep(Duration::from_millis(500));
+            let before = sessions();
+            let back: Vec<Duration> = (0..300).map(|i| one(base_id + 100 + i)).collect();
+            std::thread::sleep(Duration::from_millis(500));
+            let opened = sessions() - before;
+            let spaced: Vec<Duration> = (0..100)
+                .map(|i| {
+                    std::thread::sleep(Duration::from_millis(100));
+                    one(base_id + 1000 + i)
+                })
+                .collect();
+            println!("H where, {table}: back to back {} ; sessions opened in the own database during them {opened}", summary(&back));
+            println!("H where, {table}: 100 ms apart {}", summary(&spaced));
+        }
     }
 
     if parts.contains("migrations") {
