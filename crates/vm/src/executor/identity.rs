@@ -4,9 +4,9 @@
 //! schema `vm` (crate::own_db, `own_db_schema.sql`) verify.
 //!
 //! Each own database has its own two keys, made inside it and kept in a
-//! table of `vm` the runtime role cannot read; the host reads them once
-//! over the owner role's connection (a result, which Postgres does not
-//! log) and holds them in an [`IdentityKey`], which never prints. The keys
+//! table of `vm` that only the platform's role of the database can read;
+//! the host reads them once over that role's connection (a result, which
+//! Postgres does not log) and holds them in an [`IdentityKey`], which never prints. The keys
 //! never travel to Postgres in a statement or a parameter.
 //!
 //! Per transaction the host asks the database for the transaction's key

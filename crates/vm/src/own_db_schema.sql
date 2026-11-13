@@ -1,21 +1,36 @@
 -- The platform's schema `vm` in an Application's own database
 -- (blackbox/CONTRACT.md, "Identity and Change history in the own
--- database"). Run by the owner role, in a transaction, whenever the own
--- database is made and whenever a Version is sent: every statement is
--- idempotent, so an own database made before any of this gets it whole,
--- and one that has it is left as it is. The runtime role's grants follow
--- it (crate::own_db), since they name the role.
+-- database", and "The platform's part of an own database is out of a
+-- migration's reach"; ADR 0017). Run by the platform's own role for the
+-- database (`<p>_app_<n>_platform`), which owns the schema and everything
+-- in it, in a transaction, whenever the own database is made or brought to
+-- the present form (crate::own_db): every statement is idempotent, so an
+-- own database made before any of this gets it whole, and one that has it
+-- is left as it is. The grants to the runtime role and to the migration
+-- role follow it (crate::own_db), since they name the roles.
 --
--- Every function that runs with its owner's rights pins its search path to
--- the catalog (then nothing: the runtime role can make no temporary
--- object), and names the platform's own objects with `vm.`, so that no
--- name Application SQL could make is found first.
+-- Every function pins its search path to the catalog (then nothing: no
+-- role of the Application can make a temporary object), and names the
+-- platform's own objects with `vm.`, so that no name a migration or
+-- Application SQL could make is found first. No function here reads a
+-- table of the Application's, and none calls a function of the
+-- Application's: the capture reads only its transition tables and the
+-- catalog, and refuses to convert rows while a user-made cast to json
+-- exists (Postgres would call it inside `to_jsonb`).
+--
+-- What the migration role may call is called by the host on the migration
+-- role's own session, inside the migrations' transaction (only that
+-- session sees its uncommitted catalog). A migration may call them as
+-- well; it gains nothing by it: they report on the catalog, put the
+-- platform's own capture on its tables, or read the names of migrations
+-- already recorded, and recording one needs an identity only the host can
+-- attach.
 
 CREATE SCHEMA IF NOT EXISTS vm;
 REVOKE ALL ON SCHEMA vm FROM PUBLIC;
 
 -- Which migrations have been applied (ticket "An Application's own
--- database").
+-- database"). Written only by vm.record_migration().
 CREATE TABLE IF NOT EXISTS vm.migrations (
     position integer PRIMARY KEY,
     name text NOT NULL UNIQUE,
@@ -27,8 +42,9 @@ CREATE TABLE IF NOT EXISTS vm.migrations (
 -- The platform's secret: two keys of 32 bytes, made here from the
 -- server's strong random source (four version 4 UUIDs, 488 random bits,
 -- through sha256), so that neither ever travels in a statement. One row,
--- made once. Only the owner role reads it: the host, once per own database
--- (a result, which Postgres does not log), and the functions below.
+-- made once. Only the platform's role reads it: the host, once per own
+-- database and program run (a result, which Postgres does not log), and
+-- the functions below.
 CREATE TABLE IF NOT EXISTS vm.keys (
     one boolean PRIMARY KEY DEFAULT true CHECK (one),
     k1 bytea NOT NULL CHECK (length(k1) = 32),
@@ -72,7 +88,9 @@ CREATE INDEX IF NOT EXISTS history_row ON vm.history
 -- the backend, the virtual transaction id (unique in the backend's slot
 -- until the server restarts) and the transaction's start, in
 -- microseconds since the epoch (so not printed by the session's time
--- zone). An attached identity is signed over it.
+-- zone). An attached identity is signed over it; the host also asks it
+-- after every statement of a migration, so that a transaction ended and
+-- begun again behind its back is seen.
 CREATE OR REPLACE FUNCTION vm.transaction_key() RETURNS text
 LANGUAGE sql VOLATILE PARALLEL UNSAFE
 SET search_path = pg_catalog, pg_temp
@@ -140,6 +158,28 @@ BEGIN
 END
 $f$;
 
+-- Refuses (VM003) while a cast from a type of the Application's to json
+-- or jsonb exists whose function is not written in C or internal (only a
+-- superuser, or a trusted extension's script, makes those): `to_jsonb`
+-- would call it inside the capture, with the platform's rights.
+CREATE OR REPLACE FUNCTION vm.capture_guard() RETURNS void
+LANGUAGE plpgsql STABLE PARALLEL UNSAFE
+SET search_path = pg_catalog, pg_temp
+AS $f$
+BEGIN
+    IF EXISTS (SELECT FROM pg_catalog.pg_cast c
+                 JOIN pg_catalog.pg_proc p ON p.oid = c.castfunc
+                 JOIN pg_catalog.pg_language l ON l.oid = p.prolang
+                WHERE c.casttarget IN ('pg_catalog.json'::pg_catalog.regtype,
+                                       'pg_catalog.jsonb'::pg_catalog.regtype)
+                  AND c.castsource >= 16384
+                  AND l.lanname NOT IN ('c', 'internal')) THEN
+        RAISE EXCEPTION USING ERRCODE = 'VM003',
+            MESSAGE = 'a cast to json or jsonb from a type of the Application''s exists: the Change history capture refuses to run it, so no captured table can be changed until the cast is dropped';
+    END IF;
+END
+$f$;
+
 -- The capture: an AFTER ... FOR EACH STATEMENT trigger for each of
 -- insert, update and delete, with the statement's rows as transition
 -- tables (`vm_new`, `vm_old`). The identity is verified once per
@@ -148,9 +188,19 @@ $f$;
 -- no row records nothing and needs no identity. An update's old and new
 -- rows are paired in the order Postgres put them into its two transition
 -- tables, which is the order it updated them in, one old and one new each.
+--
+-- A row is turned into JSON whole, as `to_jsonb(vm_row.*)`: a column
+-- named like the alias (`t`, `vm_row`, `vm_new`, `vm_old`) cannot stand
+-- for it. The settings that change how values print are pinned, so what
+-- is recorded does not depend on the writer's session.
 CREATE OR REPLACE FUNCTION vm.capture() RETURNS trigger
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER PARALLEL UNSAFE
 SET search_path = pg_catalog, pg_temp
+SET TimeZone = 'UTC'
+SET extra_float_digits = 1
+SET IntervalStyle = 'postgres'
+SET DateStyle = 'ISO, YMD'
+SET bytea_output = 'hex'
 AS $f$
 DECLARE
     v_who jsonb;
@@ -166,6 +216,7 @@ BEGIN
         RETURN NULL;
     END IF;
     v_who := vm.attached();
+    PERFORM vm.capture_guard();
     v_at := pg_catalog.clock_timestamp();
     SELECT pg_catalog.array_agg(a.attname::text ORDER BY pg_catalog.array_position(i.indkey::int2[], a.attnum))
       INTO v_key
@@ -181,7 +232,8 @@ BEGIN
                NULL, r.j, NULL,
                v_who ->> 'user_id', v_who ->> 'application', v_who ->> 'actor',
                v_who ->> 'request', v_who ->> 'migration'
-          FROM (SELECT pg_catalog.to_jsonb(t) AS j, pg_catalog.row_number() OVER () AS i FROM vm_new t) r
+          FROM (SELECT pg_catalog.to_jsonb(vm_row.*) AS j, pg_catalog.row_number() OVER () AS i
+                  FROM vm_new vm_row) r
          ORDER BY r.i;
     ELSIF TG_OP = 'DELETE' THEN
         INSERT INTO vm.history (at, schema_name, table_name, kind, key, old, new, changed,
@@ -192,7 +244,8 @@ BEGIN
                r.j, NULL, NULL,
                v_who ->> 'user_id', v_who ->> 'application', v_who ->> 'actor',
                v_who ->> 'request', v_who ->> 'migration'
-          FROM (SELECT pg_catalog.to_jsonb(t) AS j, pg_catalog.row_number() OVER () AS i FROM vm_old t) r
+          FROM (SELECT pg_catalog.to_jsonb(vm_row.*) AS j, pg_catalog.row_number() OVER () AS i
+                  FROM vm_old vm_row) r
          ORDER BY r.i;
     ELSE
         SELECT pg_catalog.array_agg(a.attname::text ORDER BY a.attnum)
@@ -210,8 +263,10 @@ BEGIN
                  WHERE (o.j -> u.c) IS DISTINCT FROM (n.j -> u.c)),
                v_who ->> 'user_id', v_who ->> 'application', v_who ->> 'actor',
                v_who ->> 'request', v_who ->> 'migration'
-          FROM (SELECT pg_catalog.to_jsonb(t) AS j, pg_catalog.row_number() OVER () AS i FROM vm_old t) o
-          JOIN (SELECT pg_catalog.to_jsonb(t) AS j, pg_catalog.row_number() OVER () AS i FROM vm_new t) n
+          FROM (SELECT pg_catalog.to_jsonb(vm_row.*) AS j, pg_catalog.row_number() OVER () AS i
+                  FROM vm_old vm_row) o
+          JOIN (SELECT pg_catalog.to_jsonb(vm_row.*) AS j, pg_catalog.row_number() OVER () AS i
+                  FROM vm_new vm_row) n
             ON n.i = o.i
          ORDER BY o.i;
     END IF;
@@ -219,14 +274,30 @@ BEGIN
 END
 $f$;
 
--- Puts the three capture triggers on every table, in any schema but the
+-- The fourth capture trigger's function: TRUNCATE of a table with history
+-- is refused, whoever runs it, also through CASCADE and through a
+-- partition (each truncated table fires its own).
+CREATE OR REPLACE FUNCTION vm.capture_truncate() RETURNS trigger
+LANGUAGE plpgsql VOLATILE PARALLEL UNSAFE
+SET search_path = pg_catalog, pg_temp
+AS $f$
+BEGIN
+    RAISE EXCEPTION USING ERRCODE = 'VM002',
+        MESSAGE = pg_catalog.format(
+            'TRUNCATE of %I.%I is refused: the rows it removes would leave no Change history. Use DELETE FROM %I.%I instead, which is recorded',
+            TG_TABLE_SCHEMA, TG_TABLE_NAME, TG_TABLE_SCHEMA, TG_TABLE_NAME);
+END
+$f$;
+
+-- Puts the four capture triggers on every table, in any schema but the
 -- platform's and the catalog's, that does not have them yet: partitioned
 -- tables and partitions both, since a statement fires the statement
--- triggers of the table it names only. Run by the host after each
--- migration, inside the migrations' transaction; answers how many
--- triggers it made.
+-- triggers of the table it names only. Runs with the platform's role's
+-- rights, which may make triggers on the migration role's tables through
+-- its inheriting membership. Called by the host after each migration,
+-- inside the migrations' transaction; answers how many triggers it made.
 CREATE OR REPLACE FUNCTION vm.capture_new_tables() RETURNS integer
-LANGUAGE plpgsql VOLATILE PARALLEL UNSAFE
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER PARALLEL UNSAFE
 SET search_path = pg_catalog, pg_temp
 AS $f$
 DECLARE
@@ -234,12 +305,14 @@ DECLARE
     v_made integer := 0;
 BEGIN
     FOR v_table IN
-        SELECT c.oid::regclass AS relation, e.event, e.referencing
+        SELECT c.oid::pg_catalog.regclass AS relation, e.event, e.timing, e.referencing, e.fn
           FROM pg_catalog.pg_class c
           JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-         CROSS JOIN (VALUES ('insert', 'NEW TABLE AS vm_new'),
-                            ('update', 'OLD TABLE AS vm_old NEW TABLE AS vm_new'),
-                            ('delete', 'OLD TABLE AS vm_old')) AS e(event, referencing)
+         CROSS JOIN (VALUES ('insert', 'AFTER', 'REFERENCING NEW TABLE AS vm_new', 'vm.capture()'),
+                            ('update', 'AFTER', 'REFERENCING OLD TABLE AS vm_old NEW TABLE AS vm_new', 'vm.capture()'),
+                            ('delete', 'AFTER', 'REFERENCING OLD TABLE AS vm_old', 'vm.capture()'),
+                            ('truncate', 'BEFORE', '', 'vm.capture_truncate()'))
+               AS e(event, timing, referencing, fn)
          WHERE c.relkind IN ('r', 'p')
            AND n.nspname <> 'vm' AND n.nspname <> 'information_schema'
            AND pg_catalog.left(n.nspname, 3) <> 'pg_'
@@ -248,19 +321,191 @@ BEGIN
          ORDER BY c.oid, e.event
     LOOP
         EXECUTE pg_catalog.format(
-            'CREATE TRIGGER %I AFTER %s ON %s REFERENCING %s FOR EACH STATEMENT EXECUTE FUNCTION vm.capture()',
-            'vm_capture_' || v_table.event, pg_catalog.upper(v_table.event),
-            v_table.relation, v_table.referencing);
+            'CREATE TRIGGER %I %s %s ON %s %s FOR EACH STATEMENT EXECUTE FUNCTION %s',
+            'vm_capture_' || v_table.event, v_table.timing, pg_catalog.upper(v_table.event),
+            v_table.relation, v_table.referencing, v_table.fn);
         v_made := v_made + 1;
     END LOOP;
     RETURN v_made;
 END
 $f$;
 
+-- Which catalog rows the capture triggers of every table are: one row per
+-- table outside `vm`, with its capture triggers (those named like the
+-- platform's; another trigger calling a function of `vm` is
+-- `capture-missing`, below) as their names and the
+-- identity of their `pg_trigger` tuples (object id, `xmin`, `ctid`).
+-- Disabling, enabling, renaming, replacing or dropping one gives another
+-- tuple, also when it is put back, so the host compares what this answers
+-- before and after each migration (kept in the host's memory, not here).
+CREATE OR REPLACE FUNCTION vm.capture_state()
+RETURNS TABLE (table_oid oid, table_name text, triggers text)
+LANGUAGE sql STABLE PARALLEL UNSAFE
+SET search_path = pg_catalog, pg_temp
+AS $f$
+SELECT c.oid, c.oid::pg_catalog.regclass::text,
+       coalesce((SELECT pg_catalog.string_agg(
+                            pg_catalog.format('%s|%s|%s|%s|%s', g.tgname, g.oid, g.xmin, g.ctid, g.tgenabled),
+                            ';' ORDER BY g.oid)
+                   FROM pg_catalog.pg_trigger g
+                  WHERE g.tgrelid = c.oid
+                    AND g.tgname LIKE 'vm\_capture\_%'), '')
+  FROM pg_catalog.pg_class c
+  JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+ WHERE c.relkind IN ('r', 'p')
+   AND n.nspname <> 'vm' AND n.nspname <> 'information_schema'
+   AND pg_catalog.left(n.nspname, 3) <> 'pg_'
+$f$;
+
+-- What the platform refuses at the end of a migration, one row per
+-- finding: the rule (as the answer names it) and what was found, where,
+-- and what to do instead. No row: nothing to refuse.
+CREATE OR REPLACE FUNCTION vm.capture_problems()
+RETURNS TABLE (rule text, message text)
+LANGUAGE sql STABLE PARALLEL UNSAFE
+SET search_path = pg_catalog, pg_temp
+AS $f$
+WITH tabs AS (
+    SELECT c.oid FROM pg_catalog.pg_class c
+      JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+     WHERE c.relkind IN ('r', 'p')
+       AND n.nspname <> 'vm' AND n.nspname <> 'information_schema'
+       AND pg_catalog.left(n.nspname, 3) <> 'pg_'),
+want(name, tgtype, fn, oldt, newt) AS (VALUES
+    ('vm_capture_insert', 4, 'vm.capture()'::pg_catalog.regprocedure, NULL, 'vm_new'),
+    ('vm_capture_update', 16, 'vm.capture()'::pg_catalog.regprocedure, 'vm_old', 'vm_new'),
+    ('vm_capture_delete', 8, 'vm.capture()'::pg_catalog.regprocedure, 'vm_old', NULL),
+    ('vm_capture_truncate', 34, 'vm.capture_truncate()'::pg_catalog.regprocedure, NULL, NULL)),
+vm_functions AS (
+    SELECT p.oid FROM pg_catalog.pg_proc p WHERE p.pronamespace = 'vm'::pg_catalog.regnamespace)
+SELECT 'capture-missing',
+       pg_catalog.format('the table %s is without its whole Change history capture: its trigger %s is missing, disabled or altered. The platform puts its capture triggers (named vm_capture_...) on every table; leave them as they are: do not drop, disable, rename or replace them', t.oid::pg_catalog.regclass, w.name)
+  FROM tabs t CROSS JOIN want w
+ WHERE NOT EXISTS (
+    SELECT FROM pg_catalog.pg_trigger g
+     WHERE g.tgrelid = t.oid AND g.tgname = w.name
+       AND g.tgtype = w.tgtype AND g.tgfoid = w.fn
+       AND g.tgenabled IN ('O', 'A') AND g.tgqual IS NULL
+       AND g.tgnargs = 0 AND coalesce(pg_catalog.array_length(g.tgattr::int2[], 1), 0) = 0
+       AND NOT g.tgdeferrable AND g.tgconstraint = 0
+       AND g.tgoldtable IS NOT DISTINCT FROM w.oldt
+       AND g.tgnewtable IS NOT DISTINCT FROM w.newt)
+UNION ALL
+SELECT 'capture-missing',
+       pg_catalog.format('the trigger %s on %s calls the platform''s function %s and is not one of its capture triggers: drop it; a trigger of the Application''s calls a function of the Application''s',
+                         g.tgname, g.tgrelid::pg_catalog.regclass, g.tgfoid::pg_catalog.regprocedure)
+  FROM pg_catalog.pg_trigger g
+ WHERE g.tgfoid IN (SELECT oid FROM vm_functions)
+   AND (g.tgname NOT LIKE 'vm\_capture\_%' OR g.tgrelid NOT IN (SELECT oid FROM tabs))
+UNION ALL
+SELECT 'deferrable',
+       pg_catalog.format('the constraint %s on %s is DEFERRABLE: its work would run at the commit, after the platform''s checks. Declare it NOT DEFERRABLE (the default)',
+                         co.conname, co.conrelid::pg_catalog.regclass)
+  FROM pg_catalog.pg_constraint co
+  JOIN pg_catalog.pg_namespace n ON n.oid = co.connamespace
+ WHERE co.condeferrable AND co.conrelid <> 0
+   AND n.nspname <> 'vm' AND n.nspname <> 'information_schema'
+   AND pg_catalog.left(n.nspname, 3) <> 'pg_'
+UNION ALL
+SELECT 'deferrable',
+       pg_catalog.format('the trigger %s on %s is DEFERRABLE: its work would run at the commit, after the platform''s checks. Make it an ordinary trigger, or a constraint trigger NOT DEFERRABLE',
+                         g.tgname, g.tgrelid::pg_catalog.regclass)
+  FROM pg_catalog.pg_trigger g
+ WHERE g.tgdeferrable AND NOT g.tgisinternal AND g.tgconstraint = 0
+UNION ALL
+SELECT 'json-cast',
+       pg_catalog.format('the cast from %s to %s runs the function %s, which Postgres would call inside the Change history capture with the platform''s rights: drop the cast (DROP CAST (%s AS %s)) and call the function where the conversion is wanted',
+                         c.castsource::pg_catalog.regtype, c.casttarget::pg_catalog.regtype,
+                         c.castfunc::pg_catalog.regprocedure,
+                         c.castsource::pg_catalog.regtype, c.casttarget::pg_catalog.regtype)
+  FROM pg_catalog.pg_cast c
+  JOIN pg_catalog.pg_proc p ON p.oid = c.castfunc
+  JOIN pg_catalog.pg_language l ON l.oid = p.prolang
+ WHERE c.casttarget IN ('pg_catalog.json'::pg_catalog.regtype, 'pg_catalog.jsonb'::pg_catalog.regtype)
+   AND c.castsource >= 16384 AND l.lanname NOT IN ('c', 'internal')
+UNION ALL
+SELECT 'in-vm',
+       pg_catalog.format('the extension %s is in the platform''s schema vm, which holds only the platform''s: create it in a schema of the Application''s (CREATE EXTENSION %s SCHEMA public)',
+                         e.extname, e.extname)
+  FROM pg_catalog.pg_extension e
+ WHERE e.extnamespace = 'vm'::pg_catalog.regnamespace
+UNION ALL
+SELECT 'in-vm',
+       pg_catalog.format('the %s %s in the platform''s schema vm is not the platform''s: the schema vm holds only the platform''s; make it in a schema of the Application''s', o.kind, o.name)
+  FROM (SELECT 'function' AS kind, p.oid::pg_catalog.regprocedure::text AS name, p.proowner AS owner
+          FROM pg_catalog.pg_proc p WHERE p.pronamespace = 'vm'::pg_catalog.regnamespace
+        UNION ALL
+        SELECT 'relation', c.oid::pg_catalog.regclass::text, c.relowner
+          FROM pg_catalog.pg_class c WHERE c.relnamespace = 'vm'::pg_catalog.regnamespace
+        UNION ALL
+        SELECT 'type', t.oid::pg_catalog.regtype::text, t.typowner
+          FROM pg_catalog.pg_type t WHERE t.typnamespace = 'vm'::pg_catalog.regnamespace
+        UNION ALL
+        SELECT 'operator', o.oid::pg_catalog.regoperator::text, o.oprowner
+          FROM pg_catalog.pg_operator o WHERE o.oprnamespace = 'vm'::pg_catalog.regnamespace
+        UNION ALL
+        SELECT 'operator class', oc.opcname::text, oc.opcowner
+          FROM pg_catalog.pg_opclass oc WHERE oc.opcnamespace = 'vm'::pg_catalog.regnamespace
+        UNION ALL
+        SELECT 'operator family', of.opfname::text, of.opfowner
+          FROM pg_catalog.pg_opfamily of WHERE of.opfnamespace = 'vm'::pg_catalog.regnamespace
+        UNION ALL
+        SELECT 'collation', co.collname::text, co.collowner
+          FROM pg_catalog.pg_collation co WHERE co.collnamespace = 'vm'::pg_catalog.regnamespace
+        UNION ALL
+        SELECT 'conversion', cv.conname::text, cv.conowner
+          FROM pg_catalog.pg_conversion cv WHERE cv.connamespace = 'vm'::pg_catalog.regnamespace
+        UNION ALL
+        SELECT 'text search configuration', ts.cfgname::text, ts.cfgowner
+          FROM pg_catalog.pg_ts_config ts WHERE ts.cfgnamespace = 'vm'::pg_catalog.regnamespace
+        UNION ALL
+        SELECT 'text search dictionary', td.dictname::text, td.dictowner
+          FROM pg_catalog.pg_ts_dict td WHERE td.dictnamespace = 'vm'::pg_catalog.regnamespace
+        UNION ALL
+        SELECT 'statistics object', se.stxname::text, se.stxowner
+          FROM pg_catalog.pg_statistic_ext se WHERE se.stxnamespace = 'vm'::pg_catalog.regnamespace) o
+ WHERE o.owner <> (SELECT n.nspowner FROM pg_catalog.pg_namespace n WHERE n.nspname = 'vm')
+$f$;
+
+-- The migrations recorded, in order: what the host compares a Version's
+-- list with, and reads back after recording. `sql_sha256` is computed
+-- from the text kept, not taken from the record.
+CREATE OR REPLACE FUNCTION vm.applied_migrations()
+RETURNS TABLE (place integer, name text, sha256 text, sql_sha256 text)
+LANGUAGE sql STABLE SECURITY DEFINER PARALLEL UNSAFE
+SET search_path = pg_catalog, pg_temp
+AS $f$
+SELECT m.position, m.name, m.sha256,
+       pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(m.sql, 'UTF8')), 'hex')
+  FROM vm.migrations m
+ ORDER BY m.position
+$f$;
+
+-- Records one migration as applied. Only with the identity the host
+-- attaches for this, after the Version's last migration and its checks
+-- (`actor` `platform`), which a migration cannot make: it does not have
+-- the keys.
+CREATE OR REPLACE FUNCTION vm.record_migration(p_position integer, p_name text, p_sql text)
+RETURNS void
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER PARALLEL UNSAFE
+SET search_path = pg_catalog, pg_temp
+AS $f$
+BEGIN
+    IF (vm.attached() ->> 'actor') IS DISTINCT FROM 'platform' THEN
+        RAISE EXCEPTION USING ERRCODE = '42501',
+            MESSAGE = 'only the platform records a migration';
+    END IF;
+    INSERT INTO vm.migrations (position, name, sha256, sql)
+    VALUES (p_position, p_name,
+            pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(p_sql, 'UTF8')), 'hex'),
+            p_sql);
+END
+$f$;
+
 SELECT vm.capture_new_tables();
 
--- New functions are executable by PUBLIC: only these two are by anyone but
--- the owner, and only for the runtime role (granted with its name).
+-- New functions are executable by PUBLIC: none is by anyone but the
+-- platform's role, except as granted by name (crate::own_db).
 REVOKE ALL ON ALL FUNCTIONS IN SCHEMA vm FROM PUBLIC;
 REVOKE ALL ON ALL TABLES IN SCHEMA vm FROM PUBLIC;
 REVOKE ALL ON ALL SEQUENCES IN SCHEMA vm FROM PUBLIC;

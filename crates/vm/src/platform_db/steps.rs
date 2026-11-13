@@ -154,6 +154,22 @@ pub const STEPS: &[Step] = &[
         ALTER TABLE operation_log ADD COLUMN transaction_id text;
     ",
     },
+    Step {
+        number: 5,
+        name: "the platform's own role of each own database",
+        sql: "
+        -- Three roles per own database (ADR 0017): the platform's own role
+        -- for it, whose password is kept here; the migration role, which
+        -- has no password kept anywhere (a fresh one each time it is let in
+        -- to apply migrations); the runtime role as before. `form`: the
+        -- form of the platform's part of the own database the program last
+        -- brought it to (crate::own_db); 1 is the form before this step.
+        ALTER TABLE own_databases
+            ADD COLUMN platform_password text,
+            ADD COLUMN form integer NOT NULL DEFAULT 1,
+            ALTER COLUMN owner_password DROP NOT NULL;
+    ",
+    },
 ];
 
 /// The advisory lock every step's transaction takes first: "vm steps".

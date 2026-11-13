@@ -642,6 +642,19 @@ impl Api {
                         "database_message": message,
                     } }),
                 ),
+                Sent::MigrationRefused {
+                    migration,
+                    rule,
+                    message,
+                } => Answer::json(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    &json!({ "error": {
+                        "reason": "migration-refused",
+                        "rule": rule,
+                        "message": format!("the migration {migration:?} breaks the platform's rule {rule}: {message}. Nothing was applied and the previous Version still serves"),
+                        "migration": migration,
+                    } }),
+                ),
                 Sent::OwnDatabaseUnavailable { step, code } => {
                     log::record(
                         "own-database-failed",

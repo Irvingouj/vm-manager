@@ -214,6 +214,13 @@ pub enum Sent {
         code: String,
         message: String,
     },
+    /// A migration broke a rule of the platform's; nothing was applied or
+    /// recorded.
+    MigrationRefused {
+        migration: String,
+        rule: &'static str,
+        message: String,
+    },
     /// The own database could not be made ready or reached: a fixed
     /// description of the step, and Postgres's SQLSTATE if it gave one.
     OwnDatabaseUnavailable {
@@ -452,6 +459,17 @@ impl Registry {
                 return Ok(Sent::MigrationFailed {
                     migration,
                     code,
+                    message,
+                });
+            }
+            Err(Problem::Refused {
+                migration,
+                rule,
+                message,
+            }) => {
+                return Ok(Sent::MigrationRefused {
+                    migration,
+                    rule,
                     message,
                 });
             }
