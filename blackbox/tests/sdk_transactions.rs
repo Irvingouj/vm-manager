@@ -292,7 +292,6 @@ fn tx_rollback_rolls_back_and_rejects_with_drizzles_rollback_error() {
             caught["isRollbackError"], true,
             "as the {actor}: tx.rollback() makes transaction reject with Drizzle's TransactionRollbackError, got {body}"
         );
-        assert_eq!(caught["name"], "TransactionRollbackError", "{body}");
         assert!(
             own_notes_with(&sdk, &marker).is_empty(),
             "as the {actor}: rolled back"

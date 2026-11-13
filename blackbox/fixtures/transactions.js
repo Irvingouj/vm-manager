@@ -16,6 +16,8 @@
 //                             every inner step made before any is awaited;
 //                             its answer is the array of theirs
 //   { "throw": "<message>" }  throw an Error, not caught: the request fails
+//   { "fire": <step> }        make the inner step and do not await it;
+//                             answers { fired: true }
 //   { "later": { "delayMs": <n>, "steps": [ <step>, ... ] } }
 //                             arms a timer that runs these steps after the
 //                             request has ended, with the names kept so far,
@@ -70,6 +72,10 @@ async function run(step, kept) {
   }
   if (step.together !== undefined) {
     return await Promise.all(step.together.map((inner) => run(inner, kept)));
+  }
+  if (step.fire !== undefined) {
+    run(step.fire, kept).catch(() => {});
+    return { fired: true };
   }
   if (step.throw !== undefined) {
     throw new Error(String(step.throw));

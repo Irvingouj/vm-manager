@@ -504,6 +504,33 @@ pub fn wait_for_none(timeout: Duration, look: impl Fn() -> Vec<String>) -> Vec<S
     }
 }
 
+/// Fails if the server log of `db` shows `text` in anything a login other
+/// than the harness's own superuser sent: the program's statements, not
+/// the harness's own counts and checks (which carry the same markers).
+pub fn assert_program_never_sent(db: &SharedDatabase, text: &str, context: &str) {
+    let found: Vec<String> = db
+        .server_log()
+        .into_iter()
+        .filter(|e| {
+            e.contains(text)
+                && crate::shared_database::login_of_entry(e).as_deref()
+                    != Some(crate::postgres::SUPERUSER)
+        })
+        .collect();
+    assert!(
+        found.is_empty(),
+        "{context}: expected nothing containing {text:?} sent to the shared database {} by the program, but its server log shows:\n{}",
+        db.name(),
+        found.join("\n")
+    );
+}
+
+/// A step that makes `inner` without awaiting it: the operation may still
+/// run when the request ends.
+pub fn fire(inner: &Value) -> Value {
+    json!({ "fire": inner })
+}
+
 /// Fails unless `answer` is `{ ok: { tx: "<id>" } }` and nothing else;
 /// returns the id.
 pub fn assert_began(answer: &Value, context: &str) -> String {
@@ -640,6 +667,29 @@ pub fn of_operations<'v>(entries: &'v [Value], operations: &[&str]) -> Vec<&'v V
                 .is_some_and(|o| operations.contains(&o))
         })
         .collect()
+}
+
+/// Fails unless exactly one of `entries` is a `begin` with `transaction`
+/// null, and it is `failed` with this `error` (CONTRACT.md: a `tx.begin`
+/// that opened nothing has an entry with no id).
+pub fn assert_refused_begin_entry(entries: &[Value], error: &str, context: &str) {
+    let found: Vec<&Value> = entries
+        .iter()
+        .filter(|e| e["operation"] == "begin" && e["transaction"].is_null())
+        .collect();
+    let [one] = found.as_slice() else {
+        panic!(
+            "{context}: expected exactly one `begin` entry with `transaction` null, got {}:\n{}",
+            found.len(),
+            lines(entries)
+        )
+    };
+    assert_eq!(one["outcome"], "failed", "{context}: {one}");
+    assert_eq!(one["error"], error, "{context}: {one}");
+    assert!(
+        one.get("transaction").is_some(),
+        "{context}: the field `transaction` is there, null: {one}"
+    );
 }
 
 /// Fails unless exactly one of `entries` is a `rollback` of transaction

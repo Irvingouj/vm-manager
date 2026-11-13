@@ -30,9 +30,9 @@ use blackbox::records::{event, request_of};
 use blackbox::scenario::RESOURCE;
 use blackbox::shared_database::token;
 use blackbox::transactions::{
-    APP, Target, Txs, VIEWER, assert_began, assert_ended, assert_no_transaction, begin, commit,
-    count_marker, counted, execute_in, insert_marker, later, query_in, rollback, stash_value, step,
-    tx, wanda,
+    APP, Target, Txs, VIEWER, assert_began, assert_ended, assert_no_transaction,
+    assert_program_never_sent, begin, commit, count_marker, counted, execute_in, insert_marker,
+    later, query_in, rollback, stash_value, step, tx, wanda,
 };
 use serde_json::{Value, json};
 
@@ -60,6 +60,13 @@ fn every_use_of(name: &str, target: Target<'_>, marker: &str) -> Vec<Value> {
         commit(name),
         rollback(name),
     ]
+}
+
+/// `marker` as an SQL concatenation of two literals (`a' || 'b`), for use
+/// inside a quoted literal: the statement's text does not hold it whole.
+fn split(marker: &str) -> String {
+    let (a, b) = marker.split_at(marker.len() / 2);
+    format!("{a}' || '{b}")
 }
 
 const USES: [&str; 4] = ["query", "execute", "tx.commit", "tx.rollback"];
@@ -152,8 +159,11 @@ fn an_id_never_begun_or_already_ended_answers_no_transaction_for_every_use() {
         0,
         "nothing ran on the own database"
     );
-    t.db()
-        .assert_not_received(&marker, "uses of ids that are not open transactions");
+    assert_program_never_sent(
+        t.db(),
+        &marker,
+        "uses of ids that are not open transactions",
+    );
 }
 
 #[test]
@@ -177,7 +187,13 @@ fn an_id_begun_by_another_request_answers_no_transaction_while_it_runs_and_after
                         stash_value(&key, &tx("t")),
                         query_in("t", "select pg_sleep(3) is null as slept"),
                         execute_in("t", &insert_marker(target, &mine)),
-                        query_in("t", &count_marker(target, &stolen)),
+                        // Counts the thieves' rows without sending their
+                        // marker whole, so that the server log shows it
+                        // only if a thief's statement reached the database.
+                        query_in(
+                            "t",
+                            &count_marker(target, &stolen).replace(&stolen, &split(&stolen)),
+                        ),
                         commit("t"),
                     ],
                 );
@@ -241,7 +257,7 @@ fn an_id_begun_by_another_request_answers_no_transaction_while_it_runs_and_after
             "{context}: nothing stolen ran"
         );
         if let Target::Shared(_) = target {
-            t.db().assert_not_received(&stolen, &context);
+            assert_program_never_sent(t.db(), &stolen, &context);
         }
         // After the first request ended.
         let (after, answers) = t.run(&user, APP, &every_use(&id, target, &stolen));
@@ -339,7 +355,7 @@ fn a_transaction_kept_past_its_request_is_unusable_and_was_rolled_back() {
             "{context}: nothing the leftover code sent ran"
         );
         if let Target::Shared(_) = target {
-            t.db().assert_not_received(&after, &context);
+            assert_program_never_sent(t.db(), &after, &context);
         }
         let entries = t.entries_eventually(&response, 3);
         let late: Vec<Value> = t

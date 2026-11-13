@@ -26,8 +26,9 @@ use blackbox::scenario::{
 };
 use blackbox::shared_database::token;
 use blackbox::transactions::{
-    APP, GHOST, Target, TxEntry, Txs, VIEWER, assert_began, assert_ended, assert_tx_entry, begin,
-    begin_with, commit, insert_marker, install, nobody, query_in, rita, step, tx, wanda,
+    APP, GHOST, Target, TxEntry, Txs, VIEWER, assert_began, assert_ended,
+    assert_refused_begin_entry, assert_tx_entry, begin, begin_with, commit, insert_marker, install,
+    nobody, query_in, rita, step, tx, wanda,
 };
 use serde_json::{Value, json};
 
@@ -397,7 +398,7 @@ fn a_pool_with_no_connection_to_give_answers_unavailable() {
     s.grant("tight", READERS, "read");
     install(t.vm(), "tightly", &[("tight", "read")]);
     let target = Target::Shared("tight");
-    let (_, answers) = t.run(
+    let (response, answers) = t.run(
         &rita(),
         "tightly",
         &[
@@ -419,6 +420,11 @@ fn a_pool_with_no_connection_to_give_answers_unavailable() {
         &answers[2],
         "unavailable",
         "a second tx.begin while the only connection is held by the first",
+    );
+    assert_refused_begin_entry(
+        &t.entries_of(&response),
+        "unavailable",
+        "a tx.begin with no connection to give",
     );
     let text = answers[2].to_string();
     for (what, value) in [

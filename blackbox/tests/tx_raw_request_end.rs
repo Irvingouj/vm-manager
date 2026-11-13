@@ -19,6 +19,10 @@
 //!   pool's connections, find nothing left on their sessions, and on the
 //!   own database `vm.identity()` names the new request.
 //!
+//! A request may also end while a statement of its transaction is still
+//! running (CONTRACT.md: the statement is stopped, its entry `failed` with
+//! `error` `request-ended`, then the rollback): see the second test.
+//!
 //! Not tested: a request that ends because "its time is up". CONTRACT.md
 //! gives no time after which a request is ended.
 #![allow(
@@ -34,8 +38,8 @@ use std::time::Duration;
 use blackbox::scenario::{RESOURCE, lines};
 use blackbox::shared_database::{OBSERVE_SESSION, Session, token};
 use blackbox::transactions::{
-    APP, Target, Txs, assert_began, begin, execute_in, insert_marker, query_in, step, the_rollback,
-    throw, together, wanda,
+    APP, Target, Txs, assert_began, begin, execute_in, fire, insert_marker, query_in, sleep, step,
+    the_rollback, throw, together, wanda,
 };
 use serde_json::{Value, json};
 
@@ -213,5 +217,106 @@ fn a_request_that_ends_with_a_transaction_open_has_it_rolled_back_and_its_connec
                 );
             }
         }
+    }
+}
+
+/// The next request's operations on `target`, made together, find nothing
+/// left on their sessions and carry their own request's label.
+fn next_operations_are_clean(t: &Txs, target: Target<'_>, context: &str) {
+    let (next, answers) = t.run(
+        &wanda(),
+        APP,
+        &[together(&vec![observe_execute(target, 300); 6])],
+    );
+    for answer in answers[0].as_array().unwrap() {
+        let session = Session::from_answer(answer).unwrap_or_else(|| {
+            panic!("{context}: expected an observation of the session, got {answer}")
+        });
+        assert!(
+            session.leftovers().is_empty(),
+            "{context}: a later operation found what the ended transaction left: {:?} in {session:?}",
+            session.leftovers()
+        );
+        assert_eq!(
+            session.vm_request.as_deref(),
+            Some(next.request_id().as_str()),
+            "{context}: a later operation's label is its own request's: {session:?}"
+        );
+    }
+}
+
+#[test]
+fn a_request_that_ends_while_a_statement_of_its_transaction_runs_has_it_stopped_and_rolled_back() {
+    let t = Txs::start();
+    let user = wanda();
+    for target in [Target::Shared(RESOURCE), Target::Own("user")] {
+        let context = format!(
+            "{}: the request answers while `select pg_sleep(30)` runs in its transaction",
+            target.describe()
+        );
+        let marker = format!("mid-statement-{}", token());
+        let steps = [
+            begin(target, "write", "t"),
+            execute_in("t", &insert_marker(target, &marker)),
+            fire(&query_in("t", "select pg_sleep(30) as slept")),
+            // Long enough for the statement to reach Postgres; the request
+            // then answers with it still running.
+            sleep(500),
+        ];
+        let started = std::time::Instant::now();
+        let response = t.send(&user, APP, &steps);
+        assert_eq!(response.status, 200, "{context}: {}", response.describe());
+        let answers = response.json()["answers"].as_array().cloned().unwrap();
+        let id = assert_began(&answers[0], &context);
+        assert_eq!(answers[2], json!({ "fired": true }), "{context}");
+
+        let still = t.sessions_in_transaction(target, Duration::from_secs(5));
+        assert!(
+            still.is_empty(),
+            "{context}: expected no session of the transaction's login in a transaction or running the sleep a few seconds after the request ended, but Postgres shows:\n{still:#?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "{context}: the sleep was stopped, not waited out ({:?})",
+            started.elapsed()
+        );
+        assert_eq!(
+            t.rows_with(target, &marker),
+            0,
+            "{context}: the insert made in the transaction is gone"
+        );
+
+        // begin, execute, the sleep's query, the host's rollback.
+        let entries = t.entries_eventually(&response, 4);
+        let slept: Vec<&Value> = entries
+            .iter()
+            .filter(|e| {
+                e["operation"] == "query"
+                    && e["statement"]
+                        .as_str()
+                        .is_some_and(|s| s.contains("pg_sleep("))
+            })
+            .collect();
+        let [slept] = slept.as_slice() else {
+            panic!(
+                "{context}: expected one entry of the sleep, got {}:\n{}",
+                slept.len(),
+                lines(&entries)
+            )
+        };
+        assert_eq!(slept["outcome"], "failed", "{context}: {slept}");
+        assert_eq!(slept["error"], "request-ended", "{context}: {slept}");
+        assert_eq!(
+            slept["transaction"].as_str(),
+            Some(id.as_str()),
+            "{context}: {slept}"
+        );
+        let rollback = the_rollback(&entries, &id, &context);
+        assert_eq!(
+            rollback["error"], "request-ended",
+            "{context}: the host's rollback says why: {rollback}"
+        );
+
+        next_operations_are_clean(&t, target, &context);
     }
 }
