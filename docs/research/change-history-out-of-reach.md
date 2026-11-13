@@ -337,3 +337,45 @@ Before, each statement was prepared and then executed (two round trips) and `vm.
 A single SELECT 1 round trip took 0.09 to 0.10 ms [verified]. A Version with nothing to apply includes the whole stored comparison: a connection as the platform's role, `vm.structure_state()` and the record of migrations in one snapshot, and what is kept read from the platform database [from code]. A Version with migrations pays, per migration, `capture_state` twice and `capture_problems` once, and, once per Version, `structure_state` and the pending structure written to the platform database [from code]. At 500 tables that is about 8 ms a migration and 6 ms a Version [reasoned from the table].
 
 [not verified]: the figures on Postgres 16 and 17, and with other sessions writing at the same time; `pg_locks`, which `vm.before_commit()` reads, grows with the instance's sessions (part F).
+
+## 13. H. What ticket #62 costs: the history in the platform database, shipped from an outbox (added 2026-11-13 by the implementation agent)
+
+Provenance of this part: written by the implementation agent of ticket #62. Every figure is from one run of `docs/research/change-history-out-of-reach/h-cost.sh`, whose whole output is `h-cost.log` beside it (exit 0, 133 s in all, 57 s of it building) [verified]. The script follows `g-cost.sh`: it builds `vm` with `cargo build --release` at **before** (`9255bea`, the last commit before the ticket's program) and **after** (`9d7361e`, the ticket's program), each in a git worktree of its own, and drives each through the black-box harness on Postgres 18 (`h_cost.rs`, copied into `blackbox/tests/` for the run and removed after it), on a shared 12-CPU VM. A program from before the ticket only runs the parts `writes` and `migrations`. What follows from the figures is marked.
+
+**A write** (one `INSERT` through `execute`, from the HTTP request to its answer, 400 in a row after 30 to warm up), median:
+
+| | round 1 | round 2 |
+|---|---|---|
+| before | 6.68 ms | 6.63 ms |
+| after | 7.05 ms | 7.14 ms |
+
+After is 0.4 to 0.5 ms slower [verified]. The answer does not wait for the shipment: the shipment is asked for after the answer is given and runs as a task of its own [from code]. Each shipment opens a new connection to the own database as its platform role (password authentication included) and makes three statements per batch there and one transaction in the platform database; with writes one after another, that work competes with the next write for the same Postgres and CPUs, which is the likeliest cause of the difference [reasoned, not measured apart].
+
+**Does the next write wait for the shipment?** Ten times: a write of 10,000 rows (median 81.4 ms to its answer), then at once a write of one row, while the outbox still held 9,000 of the 10,000 changes (counted by the harness when the second write was sent, every round) [verified]. The one-row write took 7.90 ms (median) against 7.81 ms with the outbox empty [verified]: it does not wait for the shipment.
+
+**Shipping 100,000 changes** (one `execute` inserting 100,000 rows of `things`): answered after 0.812 s; the outbox was empty 2.664 s after the answer; the 100,000 changes were in `change_history` in 100 transactions (distinct `xmin`), so in batches of 1,000 [verified]. The black-box test that is to write this down (`target/t62-100k-shipment.txt`) does not get that far: its harness query fails first (see the hand-back of ticket #62).
+
+**Reading 100 changes** with `history` (from the HTTP request to its answer, 50 reads after 5 to warm up), median; the 1,000 changes are 10 rows of `things` inserted and updated 99 times each through the program; the 1,000,000 are those and 999,000 more written into `change_history` by the harness's superuser, copies of them under 9,990 other keys with greater ids [verified]:
+
+| changes kept for the Application | no key | key `{ id: 7 }` | key `{ id: "7" }` |
+|---|---|---|---|
+| 1,000 | 12.37 ms | 12.99 ms | 12.88 ms |
+| 1,000,000 | 12.64 ms | 13.04 ms | 13.06 ms |
+
+The time does not grow with what is kept [verified]. The keyed read's plan (the program's statement for a row's changes, copied into `h_cost.rs` with its parameters written in, run with `EXPLAIN (ANALYZE, BUFFERS)` at 1,000,000 kept) reads the row's changes with a backward scan of the index `change_history_row` (`application, schema_name, table_name, jsonb_hash_extended(key, 0), id`), 43 buffers, and the `structure` entries with a backward scan of the partial index `change_history_structure`, 2 buffers, merged and cut at 100; execution 0.24 ms [verified, `h-cost.log`]. Most of the 12 to 13 ms is therefore elsewhere: the shipment the read asks for and waits for first (a connection to the own database), the read-only transaction as the runtime role in the own database, and the request itself [reasoned, not measured apart].
+
+**A Version's migrations and the structure comparison** (a Version adding one migration to those already applied, median of 5, by number of tables of ten columns each):
+
+| tables | before, `SELECT 1` | after, `SELECT 1` | before, a column retyped | after, a column retyped | `vm.structure_snapshot()` alone (after) |
+|---|---|---|---|---|---|
+| 10 | 29.5 / 29.7 ms | 35.1 / 34.3 ms | 31.0 / 30.6 ms | 36.1 / 35.6 ms | 0.57 ms (4.9 kB) |
+| 100 | 35.2 / 34.7 ms | 48.3 / 48.4 ms | 36.1 / 35.7 ms | 49.7 / 49.0 ms | 3.2 ms (36.7 kB) |
+| 500 | 57.2 / 57.9 ms | 127.3 / 126.0 ms | 58.4 / 57.9 ms | 128.6 / 126.8 ms | 14.6 ms (178 kB) |
+
+(Two figures: rounds 1 and 2.) [verified]. The comparison costs about 5 ms a migration at 10 tables, 14 ms at 100 and 69 ms at 500 [reasoned from the table]. Per migration the program takes `vm.structure_snapshot()` before it, and `vm.record_structure()` after it takes the snapshot again and compares the two in SQL; the snapshot is sent to the server and back as a parameter in between [from code]. Two snapshots at 500 tables are about 29 ms of the 69; the rest is the comparison and the snapshot's travel [reasoned]. It grows with the tables of the own database, whether or not the migration touched them [from code]. Taking the snapshot only of tables that have history, or comparing only when the catalogs' versions moved, would cut it; neither was tried [not verified].
+
+**A start with 50 own databases, each with an outbox of 1,000 changes** (written while the harness held a lock on `change_history`, so that no shipment got through; the program then killed, the lock released, and the program started on the same platform database): `listening` 0.014 s after the start was begun; a write to the first Application, sent at once, answered in 31.1 ms; a `history` read of the fiftieth Application's history in 381 ms; every outbox empty 2.615 s after the start; the 50,000 changes in `change_history`; no `history-not-shipped` record after the restart [verified]. Serving is not delayed: the shipments at start are tasks asked for after the own databases are in form and before the program listens, and nothing waits for them [from code].
+
+What bounds it [from code]: one shipment task per own database at most (a request while one runs is remembered and served by that one going round again), so at most as many tasks as own databases; of them at most 4 ship at once (a semaphore), each holding one connection to its own database and, for the length of one batch's write, one connection of the platform database's pool of 16, so the Operation log keeps at least 12; a batch in memory per shipment of at most 1,000 changes and, past the first, 4 MiB of `old` and `new`; each step 10 s. A shipment that waits more than 60 s for a turn gives up, records `history-not-shipped`, and leaves its outbox for the next shipment, which the next write, Version or read of that Application asks for [from code]. In this run the 46 that waited all got their turn [verified, no record]; with outboxes large enough that 4 at a time take more than 60 s to clear, the rest would give up and be shipped only when their Application is next used [reasoned, not measured]. A read that arrives meanwhile waits for its turn too, within its own 10 s (the 381 ms above) [verified for this case].
+
+[not verified]: the figures on Postgres 16 and 17; with other sessions writing at the same time; with an outbox that keeps filling while a shipment runs (a pass ships until the outbox is empty, so a busy Application holds its turn for as long as it keeps writing); the cost of a new connection per shipment measured apart.

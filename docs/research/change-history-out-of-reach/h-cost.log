@@ -1,0 +1,104 @@
+# building: before 9255bea, after 9d7361e
+# built in 57 s
+# 2026-11-13T20:12:27Z on Linux 6.8.0-1070-azure x86_64, 12 CPUs
+#### round 1
+######## before: vm at before, parts writes,migrations
+H write (one INSERT through execute, request to answer): n=400 median=6.676 ms p90=7.002 ms mean=6.742 ms
+H tables=10: a Version with one migration of `SELECT 1` n=5 median=29.542 ms p90=32.433 ms mean=30.091 ms ; with one migration retyping a column n=5 median=30.957 ms p90=31.115 ms mean=30.956 ms
+H tables=100: a Version with one migration of `SELECT 1` n=5 median=35.203 ms p90=37.215 ms mean=35.294 ms ; with one migration retyping a column n=5 median=36.083 ms p90=36.743 ms mean=35.927 ms
+H tables=500: a Version with one migration of `SELECT 1` n=5 median=57.238 ms p90=59.485 ms mean=57.363 ms ; with one migration retyping a column n=5 median=58.374 ms p90=58.784 ms mean=57.968 ms
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.70s
+######## after: vm at after, parts writes,migrations,snapshot
+H write (one INSERT through execute, request to answer): n=400 median=7.052 ms p90=7.583 ms mean=7.164 ms
+H tables=10: a Version with one migration of `SELECT 1` n=5 median=35.079 ms p90=37.551 ms mean=35.576 ms ; with one migration retyping a column n=5 median=36.058 ms p90=36.717 ms mean=36.102 ms
+H tables=10: vm.structure_snapshot() 0.57 ms a call (4909 bytes as text), a round trip alone 0.09 ms
+H tables=100: a Version with one migration of `SELECT 1` n=5 median=48.305 ms p90=50.168 ms mean=48.792 ms ; with one migration retyping a column n=5 median=49.726 ms p90=49.957 ms mean=49.515 ms
+H tables=100: vm.structure_snapshot() 3.21 ms a call (36680 bytes as text), a round trip alone 0.09 ms
+H tables=500: a Version with one migration of `SELECT 1` n=5 median=127.257 ms p90=129.814 ms mean=127.737 ms ; with one migration retyping a column n=5 median=128.586 ms p90=129.594 ms mean=128.471 ms
+H tables=500: vm.structure_snapshot() 14.77 ms a call (178280 bytes as text), a round trip alone 0.10 ms
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.92s
+#### round 2
+######## before: vm at before, parts writes,migrations
+H write (one INSERT through execute, request to answer): n=400 median=6.631 ms p90=6.780 ms mean=6.645 ms
+H tables=10: a Version with one migration of `SELECT 1` n=5 median=29.724 ms p90=30.600 ms mean=29.774 ms ; with one migration retyping a column n=5 median=30.600 ms p90=31.271 ms mean=30.754 ms
+H tables=100: a Version with one migration of `SELECT 1` n=5 median=34.693 ms p90=37.289 ms mean=35.129 ms ; with one migration retyping a column n=5 median=35.744 ms p90=36.373 ms mean=35.753 ms
+H tables=500: a Version with one migration of `SELECT 1` n=5 median=57.879 ms p90=59.344 ms mean=57.967 ms ; with one migration retyping a column n=5 median=57.924 ms p90=58.536 ms mean=57.918 ms
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.65s
+######## after: vm at after, parts writes,migrations,snapshot
+H write (one INSERT through execute, request to answer): n=400 median=7.143 ms p90=7.684 ms mean=7.267 ms
+H tables=10: a Version with one migration of `SELECT 1` n=5 median=34.338 ms p90=36.344 ms mean=34.746 ms ; with one migration retyping a column n=5 median=35.555 ms p90=36.776 ms mean=35.706 ms
+H tables=10: vm.structure_snapshot() 0.57 ms a call (4909 bytes as text), a round trip alone 0.09 ms
+H tables=100: a Version with one migration of `SELECT 1` n=5 median=48.359 ms p90=50.048 ms mean=48.611 ms ; with one migration retyping a column n=5 median=49.035 ms p90=49.874 ms mean=49.144 ms
+H tables=100: vm.structure_snapshot() 3.13 ms a call (36680 bytes as text), a round trip alone 0.10 ms
+H tables=500: a Version with one migration of `SELECT 1` n=5 median=126.012 ms p90=129.598 ms mean=126.314 ms ; with one migration retyping a column n=5 median=126.760 ms p90=127.676 ms mean=126.663 ms
+H tables=500: vm.structure_snapshot() 14.45 ms a call (178280 bytes as text), a round trip alone 0.10 ms
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.94s
+######## after: vm at after, parts after
+H next-write round 0: outbox held 9000 rows when the next write was sent
+H next-write round 1: outbox held 9000 rows when the next write was sent
+H next-write round 2: outbox held 9000 rows when the next write was sent
+H next-write round 3: outbox held 9000 rows when the next write was sent
+H next-write round 4: outbox held 9000 rows when the next write was sent
+H next-write round 5: outbox held 9000 rows when the next write was sent
+H next-write round 6: outbox held 9000 rows when the next write was sent
+H next-write round 7: outbox held 9000 rows when the next write was sent
+H next-write round 8: outbox held 9000 rows when the next write was sent
+H next-write round 9: outbox held 9000 rows when the next write was sent
+H a write of 10,000 rows: n=10 median=81.373 ms p90=82.054 ms mean=81.073 ms
+H a write of one row with the outbox empty: n=10 median=7.807 ms p90=8.139 ms mean=8.548 ms
+H a write of one row sent at once after the write of 10,000 was answered (its shipment under way): n=10 median=7.902 ms p90=8.785 ms mean=8.284 ms
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.69s
+######## after: vm at after, parts ship
+H 100,000 rows in one execute: answered after 0.812 s; outbox empty 2.664 s after the answer; 100000 changes in change_history, in 100 transactions
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.22s
+######## after: vm at after, parts reads
+H read with 1000 changes of the Application kept, no key: 100 changes answered; n=50 median=12.374 ms p90=12.687 ms mean=12.410 ms
+H read with 1000 changes of the Application kept, key {id: 7}: 100 changes answered; n=50 median=12.987 ms p90=13.323 ms mean=13.017 ms
+H read with 1000 changes of the Application kept, key {id: "7"}: 100 changes answered; n=50 median=12.883 ms p90=13.051 ms mean=12.859 ms
+H read with 1000000 changes of the Application kept, no key: 100 changes answered; n=50 median=12.639 ms p90=13.010 ms mean=12.635 ms
+H read with 1000000 changes of the Application kept, key {id: 7}: 100 changes answered; n=50 median=13.039 ms p90=13.268 ms mean=13.073 ms
+H read with 1000000 changes of the Application kept, key {id: "7"}: 100 changes answered; n=50 median=13.058 ms p90=13.438 ms mean=13.117 ms
+H the keyed read's plan with 1000000 changes kept:
+H   Subquery Scan on y (actual rows=100.00 loops=1)
+H     Filter: ((y.running - y.size) <= 8388608)
+H     Buffers: shared hit=45
+H     ->  WindowAgg (actual rows=100.00 loops=1)
+H           Window: w1 AS (ORDER BY h.id)
+H           Storage: Memory  Maximum Storage: 17kB
+H           Buffers: shared hit=45
+H           ->  Subquery Scan on h (actual rows=100.00 loops=1)
+H                 Buffers: shared hit=45
+H                 ->  Limit (actual rows=100.00 loops=1)
+H                       Buffers: shared hit=45
+H                       ->  Result (actual rows=100.00 loops=1)
+H                             Buffers: shared hit=45
+H                             ->  Merge Append (actual rows=100.00 loops=1)
+H                                   Sort Key: "*SELECT* 1".id DESC
+H                                   Buffers: shared hit=45
+H                                   ->  Subquery Scan on "*SELECT* 1" (actual rows=100.00 loops=1)
+H                                         Buffers: shared hit=43
+H                                         ->  Limit (actual rows=100.00 loops=1)
+H                                               Buffers: shared hit=43
+H                                               ->  Index Scan Backward using change_history_row on change_history (actual rows=100.00 loops=1)
+H                                                     Index Cond: ((application = 'reads'::text) AND (schema_name = 'public'::text) AND (table_name = 'things'::text) AND (jsonb_hash_extended(key, '0'::bigint) = '-4288738339839719787'::bigint) AND (id < '9223372036854775807'::bigint))
+H                                                     Filter: (key = '{"id": 7}'::jsonb)
+H                                                     Index Searches: 1
+H                                                     Buffers: shared hit=43
+H                                   ->  Subquery Scan on "*SELECT* 2" (actual rows=0.00 loops=1)
+H                                         Buffers: shared hit=2
+H                                         ->  Limit (actual rows=0.00 loops=1)
+H                                               Buffers: shared hit=2
+H                                               ->  Index Scan Backward using change_history_structure on change_history change_history_1 (actual rows=0.00 loops=1)
+H                                                     Index Cond: ((application = 'reads'::text) AND (schema_name = 'public'::text) AND (table_name = 'things'::text) AND (id < '9223372036854775807'::bigint))
+H                                                     Index Searches: 1
+H                                                     Buffers: shared hit=2
+H   Planning:
+H     Buffers: shared hit=42 read=5
+H   Planning Time: 0.261 ms
+H   Execution Time: 0.240 ms
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 18.14s
+######## after: vm at after, parts start
+H start with 50 own databases, 50000 changes in their outboxes: listening after 0.014 s; a write sent then answered in 31.077 ms, a read of another Application's history in 380.814 ms; every outbox empty 2.615 s after the start; 50000 of them in change_history; 0 history-not-shipped records after the restart
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 13.55s
+# whole run: 133 s
+DONE exit 0
