@@ -13,7 +13,7 @@
 // The types guide; the platform decides. Every operation is decided by the
 // host from the request in flight, and the database role is the boundary.
 
-import type { PgTransactionConfig } from "drizzle-orm/pg-core";
+import type { PgTable, PgTransactionConfig } from "drizzle-orm/pg-core";
 import type { PgRemoteDatabase } from "drizzle-orm/pg-proxy";
 import type * as OwnStructureModule from "@vm/own-structure";
 
@@ -198,6 +198,83 @@ type SharedDatabase<R extends Declarations, N extends keyof R & string> = N exte
     : never
   : NotPulled<N>;
 
+// ---------------------------------------------------------------- Change history
+
+/**
+ * One change of a row, as the own database's Change history recorded it.
+ * `old` and `new` are rows of the table as `select()` gives them, read in
+ * the table's present shape: a column dropped since is not there, a column
+ * added or renamed since is null in rows from before that.
+ */
+export interface Change<T extends PgTable> {
+  /**
+   * The change's place in the history, as decimal digits; later changes
+   * have greater ids. Pass it as `before` to page back.
+   */
+  readonly id: string;
+  /** When the change was made. */
+  readonly at: Date;
+  readonly kind: "insert" | "update" | "delete";
+  /** The whole row before; null for an insert. */
+  readonly old: T["$inferSelect"] | null;
+  /** The whole row after; null for a delete. */
+  readonly new: T["$inferSelect"] | null;
+  /**
+   * For an update, the properties whose value differs, in the order the
+   * Drizzle table declares them; then any column it does not declare (one
+   * the table no longer has, say) by its database name. Null for an insert
+   * and a delete.
+   */
+  readonly changed: string[] | null;
+  /** The User in flight when the change was made; for a migration, the Contributor who sent the Version. */
+  readonly userId: string;
+  readonly application: string;
+  readonly actor: "user" | "application" | "migration";
+  /** The request's id, as in the Operation log; null for a migration. */
+  readonly request: string | null;
+  /** The migration's name, for a migration; null otherwise. */
+  readonly migration: string | null;
+}
+
+type ColumnsOf<T extends PgTable> = T["_"]["columns"];
+
+/** The properties of the columns declared with `.primaryKey()`, with their values' types. */
+type DeclaredKey<T extends PgTable> = {
+  [K in keyof ColumnsOf<T> as ColumnsOf<T>[K]["_"]["isPrimaryKey"] extends true
+    ? K
+    : never]: ColumnsOf<T>[K]["_"]["data"];
+};
+
+/**
+ * The key of one row: its primary key's properties. Checked here for a
+ * primary key declared on its column with `.primaryKey()`; for one declared
+ * on the table, at run time.
+ */
+export type HistoryKey<T extends PgTable> = keyof DeclaredKey<T> extends never
+  ? { readonly [property: string]: unknown }
+  : { readonly [K in keyof DeclaredKey<T>]: DeclaredKey<T>[K] };
+
+export interface HistoryOptions {
+  /** How many changes at most: an integer from 1 to 1000; 100 when left out. */
+  readonly limit?: number;
+  /** A change's `id`: only changes older than it are answered. */
+  readonly before?: string;
+}
+
+/** What the own database's handles have besides Drizzle's. */
+interface ReadsHistory {
+  /**
+   * The Change history of `table`, newest first: of the row whose primary
+   * key is `key`, or, without `key`, of every row. The history is kept
+   * under the key a row had before each change. One `query` of the own
+   * database, as this handle's actor.
+   */
+  history<T extends PgTable>(table: T, key?: HistoryKey<T>, options?: HistoryOptions): Promise<Change<T>[]>;
+}
+
+/** A handle of the own database: a Drizzle database, and its Change history. */
+export type OwnDatabase = Database<OwnStructure> & ReadsHistory;
+
 // ---------------------------------------------------------------- context
 
 /** Acting as the User of the request: the shared databases declared in manifest.ts, and the own database. */
@@ -207,13 +284,13 @@ export interface ActingAsUser<R extends Declarations> {
   /** A shared database declared in manifest.ts, with this User's Access. */
   db<N extends keyof R & string>(name: N): SharedDatabase<R, N>;
   /** The Application's own database, as this User. */
-  ownDb(): Database<OwnStructure>;
+  ownDb(): OwnDatabase;
 }
 
 /** Acting as the Application itself: its own database only. */
 export interface ActingAsApplication {
   /** The Application's own database, as the Application. */
-  ownDb(): Database<OwnStructure>;
+  ownDb(): OwnDatabase;
 }
 
 /** Made by the platform for each request; Application code cannot make one. */

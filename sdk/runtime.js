@@ -13,6 +13,7 @@ import { createTableRelationsHelpers, extractTablesRelationalConfig } from "driz
 import { PgDialect } from "drizzle-orm/pg-core";
 import { PgProxyTransaction, PgRemoteDatabase, PgRemoteSession } from "drizzle-orm/pg-proxy";
 import { failedOf, OperationFailed, Refused, refusedOf } from "./errors.js";
+import { NOT_SHARED, readHistory } from "./history.js";
 import { decodeRows, encodeParam, operationOf, rowsAsObjects } from "./values.js";
 
 const freeze = Object.freeze;
@@ -154,6 +155,25 @@ function withoutRawSql(db) {
 }
 
 /**
+ * A handle: Drizzle's database, and `history` (blackbox/CONTRACT.md,
+ * "Reading the Change history"). `history` is in the types of the own
+ * database's handles only; on a shared database's it throws without asking
+ * the host. A transaction's `tx` is not one of these, so it has none.
+ */
+class HostDatabase extends PgRemoteDatabase {
+  constructor(target, dialect, session, relational) {
+    super(dialect, session, relational);
+    Object.defineProperty(this, "hostTarget", { value: target });
+  }
+
+  async history(table, key, options) {
+    if (this.hostTarget.own !== true) throw new Error(NOT_SHARED);
+    const run = async (operation, args) => settle(await invoke(operation, args));
+    return readHistory(run, this.hostTarget, table, key, options);
+  }
+}
+
+/**
  * A Drizzle database on `target`, typed (at compile time) and related by
  * `schema`; `declared` is its Access level (`read` or `write`).
  */
@@ -164,8 +184,9 @@ function database(target, declared, schema) {
     const tables = extractTablesRelationalConfig(schema, createTableRelationsHelpers);
     relational = { fullSchema: schema, schema: tables.tables, tableNamesMap: tables.tableNamesMap };
   }
-  const session = new HostSession(freeze(target), declared, undefined, dialect, relational);
-  const db = new PgRemoteDatabase(dialect, session, relational);
+  const frozen = freeze(target);
+  const session = new HostSession(frozen, declared, undefined, dialect, relational);
+  const db = new HostDatabase(frozen, dialect, session, relational);
   withoutRawSql(db);
   return db;
 }
