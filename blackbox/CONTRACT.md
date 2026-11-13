@@ -988,6 +988,8 @@ Some changes a migration makes to a table that already has history change or rem
 
 "What the runtime role cannot do" and "What a migration cannot do" hold with `vm.history` read as "the outbox", and with these changes: neither role can **read** the outbox (`42501`); the runtime role can read `vm.identity()` and `vm.ctx` only; a migration can no longer read the history at all. An Application's code reads its history through `history`, and only its own.
 
+**Neither role can make an entry of the history other than by changing a row.** Whatever a migration or the runtime role calls in `vm`, with whatever arguments (the functions the platform itself calls to record a migration's changes of structure among them), `change_history` afterwards holds for that Application only the changes of rows that were made, under the identity they were made with, and the `structure` entries of changes of structure that were made, with the migration that made them. A Version whose migration tries is refused or fails, or applies with nothing forged; none leaves an entry for a change that did not happen, or under another User, migration or table.
+
 ### What this does not close
 
 - The platform database grows with every change of every Application; nothing bounds an Application's share of it yet.
