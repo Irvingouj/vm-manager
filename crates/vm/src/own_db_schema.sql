@@ -873,11 +873,13 @@ $f$;
 -- cannot make: it does not have the keys. The entries have `actor`
 -- `migration`, that Contributor and that migration. On a table there is
 -- still: `column-dropped`, `column-type`, `table-rewritten` (a new file
--- node and no `column-type` entry), `enum-value-renamed` (one per value
--- renamed, on every such table with a column of the type or an array of
--- it), `partition-attached` (a table that was there, attached) and
--- `partition-detached`, under the table's name now. On a table that is
--- gone, or whose name another table has now: `table-dropped` or
+-- node and no `column-type` entry; on a partitioned table, when a table
+-- under it was), `enum-value-renamed` (one per value renamed, on every
+-- such table with a column of the type, of a domain over it or an array of
+-- it, at any depth), `partition-attached` (a table that was there,
+-- attached) and `partition-detached` (detached or dropped), under the
+-- table's name now. On a table that is gone, or whose name another table
+-- has now, and that was not a partition: `table-dropped` or
 -- `table-replaced`, under the name it had.
 CREATE OR REPLACE FUNCTION vm.record_structure(p_before jsonb) RETURNS integer
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER PARALLEL UNSAFE
@@ -894,7 +896,7 @@ BEGIN
             MESSAGE = 'only the platform records a change of structure';
     END IF;
     v_now := vm.structure_snapshot();
-    WITH b AS (
+    WITH RECURSIVE b AS (
         SELECT t.key AS id, t.value ->> 's' AS s, t.value ->> 'n' AS n, t.value AS v
           FROM pg_catalog.jsonb_each(p_before -> 'tables') t),
     a AS (
@@ -918,14 +920,42 @@ BEGIN
           FROM pg_catalog.jsonb_each(p_before -> 'enums') o
           JOIN pg_catalog.jsonb_each(v_now -> 'enums') w ON w.key = o.key
          WHERE (w.value ->> 1) IS DISTINCT FROM (o.value ->> 1)),
+    -- The types whose values hold a renamed enum's: the enum, and every
+    -- domain over one of these and array of one of these, to any depth.
+    holding (enum, typid) AS (
+        SELECT DISTINCT r.typid, r.typid FROM renamed r
+        UNION
+        SELECT h.enum, t.oid
+          FROM holding h
+          JOIN pg_catalog.pg_type u ON u.oid = h.typid
+          JOIN pg_catalog.pg_type t
+            ON (t.typtype = 'd' AND t.typbasetype = h.typid) OR t.oid = u.typarray),
+    -- A partitioned table and every table under it, at any depth, now.
+    under (top, id) AS (
+        SELECT a.id, ch.id
+          FROM a CROSS JOIN LATERAL pg_catalog.jsonb_array_elements_text(a.v -> 'p') ch(id)
+        UNION
+        SELECT u.top, ch.id
+          FROM under u JOIN a ON a.id = u.id
+         CROSS JOIN LATERAL pg_catalog.jsonb_array_elements_text(a.v -> 'p') ch(id)),
+    -- Written anew, and no type change says why.
+    rewritten AS (
+        SELECT k.id FROM kept k
+         WHERE (k.bv ->> 'f') <> '0' AND (k.av ->> 'f') IS DISTINCT FROM (k.bv ->> 'f')
+           AND NOT EXISTS (SELECT FROM retyped r WHERE r.id = k.id)),
+    -- What was a partition when the migration began: its own history has
+    -- no entry of a change of structure; its parent's has.
+    was_partition AS (
+        SELECT ch.id FROM b CROSS JOIN LATERAL pg_catalog.jsonb_array_elements_text(b.v -> 'p') ch(id)),
     entries (s, n, place, structure) AS (
         SELECT b.s, b.n, 1,
                pg_catalog.jsonb_build_object('change',
                    CASE WHEN EXISTS (SELECT FROM a WHERE a.s = b.s AND a.n = b.n)
                         THEN 'table-replaced' ELSE 'table-dropped' END)
           FROM b
-         WHERE NOT EXISTS (SELECT FROM a WHERE a.id = b.id)
-            OR EXISTS (SELECT FROM a WHERE a.s = b.s AND a.n = b.n AND a.id <> b.id)
+         WHERE (NOT EXISTS (SELECT FROM a WHERE a.id = b.id)
+                OR EXISTS (SELECT FROM a WHERE a.s = b.s AND a.n = b.n AND a.id <> b.id))
+           AND NOT EXISTS (SELECT FROM was_partition w WHERE w.id = b.id)
         UNION ALL
         SELECT k.s, k.n, 2, pg_catalog.jsonb_build_object('change', 'column-dropped', 'column', x.name)
           FROM bcols x JOIN kept k ON k.id = x.id
@@ -937,18 +967,23 @@ BEGIN
         UNION ALL
         SELECT k.s, k.n, 4, pg_catalog.jsonb_build_object('change', 'table-rewritten')
           FROM kept k
-         WHERE (k.bv ->> 'f') <> '0' AND (k.av ->> 'f') IS DISTINCT FROM (k.bv ->> 'f')
-           AND NOT EXISTS (SELECT FROM retyped r WHERE r.id = k.id)
+         WHERE EXISTS (SELECT FROM rewritten w WHERE w.id = k.id)
+            OR ((k.av ->> 'f') = '0'
+                AND NOT EXISTS (SELECT FROM retyped r WHERE r.id = k.id)
+                AND EXISTS (SELECT FROM under u JOIN rewritten w ON w.id = u.id WHERE u.top = k.id))
         UNION ALL
         SELECT k.s, k.n, 5, pg_catalog.jsonb_build_object('change', 'enum-value-renamed',
                    'type', pg_catalog.format_type(e.typid, NULL),
                    'from', e.from_label, 'to', e.to_label,
                    'columns', (SELECT pg_catalog.jsonb_agg(y.name ORDER BY y.attnum)
                                  FROM acols y
-                                WHERE y.id = k.id AND y.typid IN (e.typid, e.typarray)))
-          FROM (SELECT r.*, t.typarray FROM renamed r JOIN pg_catalog.pg_type t ON t.oid = r.typid) e
+                                WHERE y.id = k.id
+                                  AND y.typid IN (SELECT h.typid FROM holding h WHERE h.enum = e.typid)))
+          FROM renamed e
           CROSS JOIN kept k
-         WHERE EXISTS (SELECT FROM acols y WHERE y.id = k.id AND y.typid IN (e.typid, e.typarray))
+         WHERE EXISTS (SELECT FROM acols y
+                        WHERE y.id = k.id
+                          AND y.typid IN (SELECT h.typid FROM holding h WHERE h.enum = e.typid))
         UNION ALL
         SELECT k.s, k.n, 6, pg_catalog.jsonb_build_object('change', 'partition-attached',
                                                           'partition', p.s || '.' || p.n)
