@@ -236,7 +236,7 @@ Decided by the host from the request in flight, the serving Version's Declared a
 
 - `fix` is a sentence a Coding agent can act on. For `no-grant` it names the Resource's contact.
 - A User holds the highest level any of their Groups is granted. `structure` < `read` < `write`.
-- A Grant written or changed applies from the next request.
+- A Grant written or changed applies to every operation decided after it: from the next request at the latest, and also to the later operations of a request already in flight.
 - The program decides from what it holds in memory (Applications, Versions, Resources, Grants), which it keeps exactly in step with the platform database it alone writes. So while the platform database cannot be reached, Applications are still routed and operations are still decided; what cannot be logged is refused.
 - A refused or malformed operation sends nothing to the shared database.
 
@@ -656,7 +656,7 @@ const moved = await ctx.user().ownDb().transaction(async (tx) => {
 
 - Every handle has `transaction`: a shared database, the own database as the User, the own database as the Application. `tx` is a Drizzle database on the same target, with the same types (through a handle declared at `read`, `tx` offers reads only).
 - When the callback returns, the transaction is committed and `transaction` resolves to what the callback returned. When it throws or rejects, everything is rolled back and `transaction` rejects with that same error. `tx.rollback()` is Drizzle's: it rolls back and `transaction` rejects with Drizzle's `TransactionRollbackError`.
-- The second argument is Drizzle's: `isolationLevel` (`read committed`, `repeatable read`, `serializable`) and `accessMode` (`read write`, `read only`). Through a handle declared at `read` the transaction is always read-only.
+- The second argument is Drizzle's: `isolationLevel` (`read committed`, `repeatable read`, `serializable`) and `accessMode` (`read write`, `read only`). Through a handle declared at `read` the transaction is always read-only. The SDK begins the transaction with `access: "read"` when the handle is declared at `read` or `accessMode` is `read only`, and with `access: "write"` otherwise.
 - **Nesting is refused.** `tx.transaction(...)` rejects with an `Error` whose message contains `Transactions cannot be nested`, and nothing is sent to the host. It is not in the types of `tx`.
 - A commit that cannot be made (a statement in the transaction had failed and the Application went on) rejects with `OperationFailed` of kind `transaction-aborted`; everything was rolled back.
 - Statements go one at a time on the transaction's connection, in the order Application code awaited them.
@@ -665,18 +665,18 @@ const moved = await ctx.user().ownDb().transaction(async (tx) => {
 
 Three operations and one argument. A transaction belongs to the request that began it.
 
-- `env.VM.invoke("tx.begin", { resource: "devops" | own: true, as, access: "read" | "write", isolation })` answers `{ ok: { tx: "<id>" } }`. `access` is required. `isolation` is optional: `"read committed"`, `"repeatable read"` or `"serializable"`; anything else is `malformed`.
+- `env.VM.invoke("tx.begin", { resource: "devops" | own: true, as, access: "read" | "write", isolation })` answers `{ ok: { tx: "<id>" } }`. `access` is required and is `"read"` or `"write"`; anything else, `"structure"` included, is `malformed`. `isolation` is optional: `"read committed"`, `"repeatable read"` or `"serializable"`; anything else is `malformed`. Without it the transaction has the database's default isolation.
   - It is decided like an operation that needs `access` on that target: the same refusals in the same order (`no-request`, `not-own-database`, `not-declared`, `not-registered`, `declared-lower`, `no-grant`). On the own database both are allowed.
   - `read` begins a read-only transaction: on a shared database as the read login, on the own database as the runtime role. `write` begins a read-write one: the write login (a Resource registered without one answers `read-only-resource` as `execute` does), or the runtime role.
   - It takes one connection from that pool and keeps it until the transaction ends. A pool with none to give within the usual wait answers `unavailable`.
 - `query` and `execute` take `tx: "<id>"` **instead of** `resource`, `own` and `as` (any of those beside `tx` is `malformed`): the statement runs in that transaction, as its target and actor. Each is still one operation: decided again (a Grant taken away meanwhile refuses it), checked by the statement check, limited, and logged. `execute` in a transaction begun with `access: "read"` is refused as it would be outside (`declared-lower`, `no-grant`), or fails in the database, which refuses the write.
-- `env.VM.invoke("tx.commit", { tx })` and `env.VM.invoke("tx.rollback", { tx })` answer `{ ok: {} }` and end the transaction. Committing a transaction in which a statement had failed rolls it back and answers `{ error: { kind: "transaction-aborted", message } }`.
-- An id that is not an open transaction **of the request in flight** answers `{ error: { kind: "no-transaction", message } }`, for every one of `query`, `execute`, `tx.commit` and `tx.rollback`: never begun, already ended, ended by the host, or begun by another request. The answer does not say which. An id is opaque and cannot be guessed.
+- `env.VM.invoke("tx.commit", { tx })` and `env.VM.invoke("tx.rollback", { tx })` answer `{ ok: {} }` and end the transaction. A `tx` that is missing or not a string is `malformed`, here and on `query` and `execute`. Committing a transaction in which a statement had failed rolls it back and answers `{ error: { kind: "transaction-aborted", message } }`.
+- An id that is not an open transaction **of the request in flight** answers `{ error: { kind: "no-transaction", message } }`, for every one of `query`, `execute`, `tx.commit` and `tx.rollback`: never begun, already ended, ended by the host, or begun by another request. The answer does not say which. An id is opaque and cannot be guessed. Such a use has no Operation log entry: nothing was touched (the program's log has its `host-call` record).
 - A statement that Postgres refuses leaves the transaction open and aborted, as Postgres does: later statements fail with SQLSTATE `25P02` until it is rolled back.
 
 ### What the host does on its own
 
-- **The request ends** (its response is sent, it fails, or its time is up): every transaction it left open is rolled back. Nothing it did is kept.
+- **The request ends** (its response is sent, or it fails): every transaction it left open is rolled back. Nothing it did is kept. (The ticket on limits per request adds the request's own time limit to this.)
 - **The cap.** A transaction may be open for 10 seconds. Past that the host ends it: the statement running is cancelled, everything is rolled back, and every later use of the id answers `no-transaction`. A statement in a transaction is also cut at the transaction's remaining time (`{ error: { kind: "limit", limit: "time" } }`).
 - **A statement the host ends** for a limit (rows, bytes, time) ends its transaction too: rolled back, then `no-transaction`.
 - **At most 4 transactions open at once per request.** A fifth `tx.begin` answers `{ error: { kind: "limit", limit: "transactions" } }`.
@@ -685,5 +685,5 @@ Three operations and one argument. A transaction belongs to the request that beg
 ### Identity, the Operation log and the Change history
 
 - The label, and on the own database the attached identity, are set once when the transaction begins and hold for all of it: `vm.identity()` answers the same in every statement, and every change is in the Change history with the User, the Application, the actor and the request, as outside a transaction.
-- Every Operation log entry gains `"transaction": "<id>" | null`. Each statement in a transaction has its own entry, as before. `tx.begin`, `tx.commit` and `tx.rollback` have entries too, with `operation` `begin`, `commit` and `rollback`, `statement` the same word, and `rows` null; a refused `tx.begin` is logged like any refusal, with `transaction` null. A rollback the host makes on its own has a `rollback` entry whose `error` says why: `request-ended`, `time` or the limit's name. A commit of an aborted transaction is `failed` with `error` `transaction-aborted`.
+- Every Operation log entry gains `"transaction": "<id>" | null`. Each statement in a transaction has its own entry, as before. `tx.begin`, `tx.commit` and `tx.rollback` have entries too, with `operation` `begin`, `commit` and `rollback`, `statement` the same word, and `rows` null; a refused `tx.begin` is logged like any refusal, with `transaction` null. A rollback the host makes on its own has a `rollback` entry with `outcome` `allowed` whose `error` says why: `request-ended`, `time` or the limit's name. A commit of an aborted transaction is `failed` with `error` `transaction-aborted`.
 - The id in the Operation log is the id Application code holds. Knowing an id gives nothing: it works only inside the request that began it.
