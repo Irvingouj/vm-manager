@@ -930,14 +930,6 @@ BEGIN
           JOIN pg_catalog.pg_type u ON u.oid = h.typid
           JOIN pg_catalog.pg_type t
             ON (t.typtype = 'd' AND t.typbasetype = h.typid) OR t.oid = u.typarray),
-    -- A partitioned table and every table under it, at any depth, now.
-    under (top, id) AS (
-        SELECT a.id, ch.id
-          FROM a CROSS JOIN LATERAL pg_catalog.jsonb_array_elements_text(a.v -> 'p') ch(id)
-        UNION
-        SELECT u.top, ch.id
-          FROM under u JOIN a ON a.id = u.id
-         CROSS JOIN LATERAL pg_catalog.jsonb_array_elements_text(a.v -> 'p') ch(id)),
     -- Written anew, and no type change says why.
     rewritten AS (
         SELECT k.id FROM kept k
@@ -970,7 +962,9 @@ BEGIN
          WHERE EXISTS (SELECT FROM rewritten w WHERE w.id = k.id)
             OR ((k.av ->> 'f') = '0'
                 AND NOT EXISTS (SELECT FROM retyped r WHERE r.id = k.id)
-                AND EXISTS (SELECT FROM under u JOIN rewritten w ON w.id = u.id WHERE u.top = k.id))
+                AND EXISTS (SELECT FROM pg_catalog.pg_partition_tree(k.id::oid) u
+                            JOIN rewritten w ON w.id = u.relid::oid::text
+                           WHERE u.relid::oid OPERATOR(pg_catalog.<>) k.id::oid))
         UNION ALL
         SELECT k.s, k.n, 5, pg_catalog.jsonb_build_object('change', 'enum-value-renamed',
                    'type', pg_catalog.format_type(e.typid, NULL),
