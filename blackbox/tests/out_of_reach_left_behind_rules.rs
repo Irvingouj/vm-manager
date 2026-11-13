@@ -16,7 +16,11 @@
 //! and so is one on a function, an operator or a domain a migration added
 //! to the extension it installed (`ALTER EXTENSION pg_trgm ADD ...`), in
 //! the same Version or an earlier one; a `SECURITY DEFINER` function so
-//! added is refused `security-definer`.
+//! added is refused `security-definer`. A range type whose
+//! `subtype_diff` is a function of the Application's is refused
+//! `type-code`, with or without a column of it, the function made earlier
+//! or added to an extension; one with no `subtype_diff`, with `float8mi`,
+//! and Postgres's own range types are allowed.
 //!
 //! What the contract allows beside them is sent too, each to a fresh
 //! Application: an invoker function, indexes on Postgres's own functions and
@@ -38,10 +42,10 @@ use blackbox::User;
 use blackbox::history::{history_after, last_history_id};
 use blackbox::out_of_reach::{
     ANY_CODE, ANY_MIGRATION, Answers, CaptureTrigger, Case, ON_DELETE, ON_INSERT, ON_TRUNCATE,
-    ON_UPDATE, WRITER, assert_answer, base_and, capture_triggers, failed, install_seeded,
-    panic_text, refused, run_cases, start,
+    ON_UPDATE, WRITER, assert_answer, base_and, can_log_in, capture_triggers, failed,
+    install_seeded, panic_text, refused, run_cases, start,
 };
-use blackbox::own_database::{Migration, Own, OwnDatabase, ident, own_execute};
+use blackbox::own_database::{Migration, Own, OwnDatabase, ident, own_execute, own_query};
 use blackbox::scenario::lines;
 
 /// CONTRACT.md: "Make a trigger of its own that calls a function of `vm`
@@ -735,6 +739,208 @@ fn an_index_on_a_function_an_earlier_version_added_to_an_extension_is_refused() 
     assert_eq!(own.version_numbers(application), vec![1, 2]);
 }
 
+const TYPE_CODE: Answers = &[refused("type-code")];
+/// A function of the migrations', fit to be a range's `subtype_diff`.
+const SPAN_DIFF: &str = r#"CREATE FUNCTION "span_diff_fn"("a" integer, "b" integer) RETURNS float8 LANGUAGE plpgsql IMMUTABLE AS $f$ BEGIN RETURN "a" - "b"; END $f$"#;
+/// A range type over it.
+const EVIL_SPAN: &str = r#"CREATE TYPE "evil_span" AS RANGE (subtype = integer, subtype_diff = "span_diff_fn", multirange_type_name = "evil_spans")"#;
+/// What the message must name: the type and the function.
+const NAMES_TYPE_AND_FUNCTION: &[&str] = &["evil_span", "span_diff_fn"];
+
+/// CONTRACT.md, `type-code`: "a range type whose `subtype_diff` is a
+/// function a role of the Application's owns, whether or not a table has a
+/// column of it yet ... The function may come from an earlier migration or
+/// an earlier Version than the type."
+#[test]
+fn a_range_type_whose_subtype_diff_is_the_application_s_is_refused() {
+    let own = start();
+    let mut cases = vec![
+        Case::statements("type-and-function-no-table", TYPE_CODE, statements(&[
+            SPAN_DIFF, EVIL_SPAN,
+        ]))
+        .mentioning_also(NAMES_TYPE_AND_FUNCTION),
+        Case::statements("a-column-of-the-type", TYPE_CODE, statements(&[
+            SPAN_DIFF,
+            EVIL_SPAN,
+            r#"CREATE TABLE "spans" ("id" integer PRIMARY KEY NOT NULL, "s" "evil_span")"#,
+        ]))
+        .mentioning_also(NAMES_TYPE_AND_FUNCTION),
+        Case::statements("a-multirange-column", TYPE_CODE, statements(&[
+            SPAN_DIFF,
+            EVIL_SPAN,
+            r#"CREATE TABLE "spans" ("id" integer PRIMARY KEY NOT NULL, "s" "evil_spans")"#,
+        ]))
+        .mentioning_also(NAMES_TYPE_AND_FUNCTION),
+        Case::statements("a-domain-over-the-range", TYPE_CODE, statements(&[
+            SPAN_DIFF,
+            EVIL_SPAN,
+            r#"CREATE DOMAIN "span_domain" AS "evil_span""#,
+            r#"CREATE TABLE "spans" ("id" integer PRIMARY KEY NOT NULL, "s" "span_domain")"#,
+        ]))
+        .mentioning_also(NAMES_TYPE_AND_FUNCTION),
+        Case::statements("a-column-added-to-a-table-of-the-first-version", TYPE_CODE, statements(&[
+            SPAN_DIFF,
+            EVIL_SPAN,
+            r#"ALTER TABLE "things" ADD COLUMN "s" "evil_span""#,
+        ]))
+        .mentioning_also(NAMES_TYPE_AND_FUNCTION),
+        // The function in an earlier migration of the same Version.
+        Case::migrations("function-in-an-earlier-migration", TYPE_CODE, |_| {
+            vec![
+                Migration::new("0004_diff", &[&format!("{SPAN_DIFF};")]),
+                Migration::new(
+                    "0005_span",
+                    &[
+                        &format!("{EVIL_SPAN};"),
+                        r#"CREATE TABLE "spans" ("id" integer PRIMARY KEY NOT NULL, "s" "evil_span");"#,
+                    ],
+                ),
+            ]
+        })
+        .naming(ANY_MIGRATION)
+        .mentioning_also(NAMES_TYPE_AND_FUNCTION),
+    ];
+    if has_pg_trgm() {
+        // The function added to an extension the migration installed.
+        cases.push(
+            Case::statements(
+                "function-added-to-pg-trgm",
+                TYPE_CODE,
+                statements(&[
+                    TRGM,
+                    SPAN_DIFF,
+                    r#"ALTER EXTENSION "pg_trgm" ADD FUNCTION "span_diff_fn"(integer, integer)"#,
+                    EVIL_SPAN,
+                ]),
+            )
+            .mentioning_also(NAMES_TYPE_AND_FUNCTION),
+        );
+    } else {
+        eprintln!("SKIPPED function-added-to-pg-trgm: the test Postgres has no pg_trgm");
+    }
+    run_cases(&own, "type-code", cases);
+}
+
+/// The function in an earlier Version (accepted then), the type in the
+/// next; after the refusal the Application still works and a later Version
+/// without the type is accepted.
+#[test]
+fn a_range_type_over_a_function_an_earlier_version_made_is_refused_and_the_application_goes_on() {
+    let own = start();
+    let application = "type-code-earlier";
+    let db = install_seeded(&own, application);
+    let diff = Migration::new("0004_diff", &[&format!("{SPAN_DIFF};")]);
+    let first = own.send(application, &base_and(std::slice::from_ref(&diff)));
+    assert_eq!(
+        first.status,
+        201,
+        "expected a Version with the function alone accepted (CONTRACT.md refuses the type, not the function), got\n{}",
+        first.describe()
+    );
+    let before = blackbox::out_of_reach::untouched(&db);
+    let span = Migration::new(
+        "0005_span",
+        &[
+            &format!("{EVIL_SPAN};"),
+            r#"CREATE TABLE "spans" ("id" integer PRIMARY KEY NOT NULL, "s" "evil_span");"#,
+        ],
+    );
+    let sent = own.send(application, &base_and(&[diff.clone(), span]));
+    assert_answer(&sent, TYPE_CODE, "0005_span", Some("evil_span"));
+    let message = sent.json()["error"]["message"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    assert!(
+        message.contains("span_diff_fn"),
+        "expected the message to name the function \"span_diff_fn\", got {message:?}"
+    );
+    let after = blackbox::out_of_reach::untouched(&db);
+    assert!(
+        after == before,
+        "expected nothing of the refused Version kept; the own database differs:\n{}",
+        blackbox::out_of_reach::differences(&before, &after)
+    );
+    assert_eq!(own.version_numbers(application), vec![1, 2]);
+    assert!(
+        !can_log_in(&db, &db.owner),
+        "expected the owner role unable to log in once the Version was answered"
+    );
+    // The Application still works: a write runs and is recorded.
+    let last = last_history_id(&db);
+    let (_, answer) = own.one(
+        &User::new(WRITER),
+        application,
+        &own_execute(
+            "user",
+            "insert into things (id, title) values (1201, 'after type-code')",
+        ),
+    );
+    assert!(
+        answer["ok"].is_object(),
+        "expected a write after the refusal to run, got {answer}"
+    );
+    assert!(
+        history_after(&db, last)
+            .iter()
+            .any(|r| r["table_name"] == "things" && r["new"]["id"] == 1201),
+        "expected the write after the refusal recorded"
+    );
+    // A later Version without the type is accepted.
+    let later = Migration::new(
+        "0005_plain",
+        &[r#"CREATE TABLE "plain_after" ("id" integer PRIMARY KEY NOT NULL);"#],
+    );
+    let sent = own.send(application, &base_and(&[diff, later]));
+    assert_eq!(
+        sent.status,
+        201,
+        "expected a later Version without the type accepted, got\n{}",
+        sent.describe()
+    );
+}
+
+/// CONTRACT.md, `type-code`: "A range type with no `subtype_diff`, or with
+/// one that belongs to a superuser, is allowed, and so are Postgres's own
+/// range types."
+#[test]
+fn range_types_with_no_subtype_diff_or_postgres_s_own_are_allowed() {
+    let own = start();
+    let mut no_diff = allowed(
+        "range-with-no-subtype-diff",
+        &[
+            r#"CREATE TYPE "plain_span" AS RANGE (subtype = integer);"#,
+            r#"CREATE TABLE "plain_spans" ("id" integer PRIMARY KEY NOT NULL, "s" "plain_span" NOT NULL);"#,
+        ],
+        "insert into plain_spans (id, s) values (1, '[1,5)')",
+        "plain_spans",
+    );
+    no_diff.read = Some("select s::text as s from plain_spans where id = 1");
+    let mut float8mi = allowed(
+        "range-with-float8mi",
+        &[
+            r#"CREATE TYPE "float_span" AS RANGE (subtype = float8, subtype_diff = float8mi);"#,
+            r#"CREATE TABLE "float_spans" ("id" integer PRIMARY KEY NOT NULL, "s" "float_span" NOT NULL);"#,
+            r#"CREATE INDEX "float_spans_s" ON "float_spans" USING gist ("s");"#,
+        ],
+        "insert into float_spans (id, s) values (1, '[1.5,2.5)')",
+        "float_spans",
+    );
+    float8mi.read = Some("select s::text as s from float_spans where s @> 2.0::float8");
+    let mut built_in = allowed(
+        "built-in-ranges-with-gist-indexes",
+        &[
+            r#"CREATE TABLE "bookings" ("id" integer PRIMARY KEY NOT NULL, "during" tstzrange NOT NULL, "seats" int4range NOT NULL);"#,
+            r#"CREATE INDEX "bookings_during" ON "bookings" USING gist ("during");"#,
+            r#"CREATE INDEX "bookings_seats" ON "bookings" USING gist ("seats");"#,
+        ],
+        "insert into bookings (id, during, seats) values (1, '[2026-01-01 00:00+00,2026-01-02 00:00+00)', '[1,3)')",
+        "bookings",
+    );
+    built_in.read = Some("select id from bookings where seats @> 2");
+    run_allowed(&own, "type-allowed", vec![no_diff, float8mi, built_in]);
+}
+
 #[test]
 fn copy_to_or_from_the_client_is_refused_before_anything_is_sent() {
     let own = start();
@@ -807,6 +1013,8 @@ struct Allowed {
     table: &'static str,
     /// The extensions it needs; skipped when the test Postgres lacks one.
     needs: &'static [&'static str],
+    /// A `query` that must read back at least one row after the write.
+    read: Option<&'static str>,
 }
 
 fn allowed(
@@ -821,6 +1029,7 @@ fn allowed(
         write,
         table,
         needs: &[],
+        read: None,
     }
 }
 
@@ -876,6 +1085,16 @@ fn run_allowed(own: &Own, prefix: &str, cases: Vec<Allowed>) {
                 case.table,
                 lines(&rows)
             );
+            if let Some(read) = case.read {
+                let (_, answer) =
+                    own.one(&User::new(WRITER), &application, &own_query("user", read));
+                assert!(
+                    answer["ok"]["rows"]
+                        .as_array()
+                        .is_some_and(|rows| !rows.is_empty()),
+                    "expected {read:?} to read the row back, got {answer}"
+                );
+            }
         }));
         if let Err(payload) = outcome {
             let why: String = panic_text(payload.as_ref()).chars().take(3000).collect();

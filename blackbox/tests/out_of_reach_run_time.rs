@@ -20,8 +20,9 @@
 //! `VM004`; after a failed commit the transaction is over; the next honest
 //! write runs and is in `vm.history`. Where a deferred trigger the owner's
 //! code queued is what fails while the host makes deferred constraints
-//! immediate (`deferred-constraint-trigger-queued`), Postgres's own error
-//! for that may stand in for `VM004`, in the answer and in the entry.
+//! immediate (`deferred-constraint-trigger-queued`), `42501` (Postgres's
+//! own error for that on 16 and 17) may stand in for `VM004`, in the
+//! answer and in the entry.
 //!
 //! A `query` calling the same code fails with `25006` and changes nothing.
 //! What reading and writing rows brings with it is not refused and is
@@ -88,9 +89,9 @@ struct Attack {
     /// The lowest `server_version_num` it can run on.
     since: u32,
     /// A deferred trigger the owner's code queued fails while the host
-    /// makes deferred constraints immediate: CONTRACT.md allows
-    /// Postgres's own error for that in place of `VM004` (as on Postgres
-    /// 16 and 17, where it runs without the owner's rights).
+    /// makes deferred constraints immediate: CONTRACT.md allows `42501`
+    /// in place of `VM004` (on Postgres 16 and 17, where it runs without
+    /// the owner's rights).
     queued_deferred: bool,
 }
 
@@ -167,22 +168,26 @@ fn run_attacks(own: &Own, prefix: &str, attacks: Vec<Attack>) {
             let (response, answers) = steps(own, &application, &attack.attack);
             let answer = answers.get(attack.failing).cloned().unwrap_or(Value::Null);
             // The code the answer and the entry carry: `VM004`, or for a
-            // queued deferred trigger Postgres's own SQLSTATE.
-            let code = if attack.queued_deferred && answer["error"]["code"] != "VM004" {
-                let code = answer["error"]["code"].as_str().unwrap_or_default();
+            // queued deferred trigger `42501` on Postgres 16 and 17.
+            let code = if attack.queued_deferred
+                && version < 180_000
+                && answer["error"]["code"] != "VM004"
+            {
                 assert!(
-                    answer["error"]["kind"] == "database"
-                        && code.len() == 5
-                        && code
-                            .chars()
-                            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit()),
-                    "the attack: expected `VM004`, or Postgres's own error for the deferred trigger that failed ({{ error: {{ kind: \"database\", code: <SQLSTATE> }} }}), got {answer}"
+                    answer["error"]["kind"] == "database" && answer["error"]["code"] == "42501",
+                    "the attack: expected `VM004`, or `42501` for the deferred trigger that failed (CONTRACT.md: \"`42501` on Postgres 16 and 17\"), got {answer}"
                 );
-                code.to_owned()
+                "42501".to_owned()
             } else {
                 assert_vm004(&answer, "the attack");
                 "VM004".to_owned()
             };
+            if attack.queued_deferred {
+                eprintln!(
+                    "{}: answered {code} on server_version_num {version}",
+                    attack.name
+                );
+            }
             if attack.then_over {
                 let last = answers.last().cloned().unwrap_or(Value::Null);
                 assert_eq!(

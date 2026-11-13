@@ -530,6 +530,8 @@ pub struct Case {
     pub names: Option<&'static str>,
     /// A word the answer's message must hold (the table, for `capture-changed`).
     pub mentions: Option<&'static str>,
+    /// More words the answer's `message` must hold.
+    pub mentions_also: &'static [&'static str],
 }
 
 impl Case {
@@ -550,6 +552,7 @@ impl Case {
             answers,
             names: None,
             mentions: None,
+            mentions_also: &[],
         }
     }
 
@@ -565,6 +568,7 @@ impl Case {
             answers,
             names: None,
             mentions: None,
+            mentions_also: &[],
         }
     }
 
@@ -589,6 +593,13 @@ impl Case {
     #[must_use]
     pub fn mentioning(mut self, word: &'static str) -> Self {
         self.mentions = Some(word);
+        self
+    }
+
+    /// The answer's `message` must hold these words too.
+    #[must_use]
+    pub fn mentioning_also(mut self, words: &'static [&'static str]) -> Self {
+        self.mentions_also = words;
         self
     }
 }
@@ -624,6 +635,16 @@ pub fn run_cases(own: &Own, prefix: &str, cases: Vec<Case>) {
                 .unwrap_or_default();
             let sent = own.send(&application, &base_and(&pending));
             assert_answer(&sent, case.answers, &migration, case.mentions);
+            let message = sent.json()["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned();
+            for word in case.mentions_also {
+                assert!(
+                    message.contains(word),
+                    "expected the error's message to mention {word:?}, got {message:?}"
+                );
+            }
             assert_untouched(own, &db, &application, &before, "after the refused Version");
             assert!(
                 !can_log_in(&db, &db.owner),
