@@ -73,8 +73,8 @@ migration tries more: ERROR 42501 permission denied to alter role
 migration tries connection limit: ERROR 42501 permission denied to alter role
 host: password null: ok ALTER ROLE []
 commit: ok COMMIT []
-login with 'known': refused: connection to server at "127.0.0.1", port 47095 failed: FATAL:  password authentication failed for user "a1_mig"
-login with 'a1_mig': refused: connection to server at "127.0.0.1", port 47095 failed: FATAL:  password authentication failed for user "a1_mig"
+login with 'known': refused: connection to server at "127.0.0.1", port 46705 failed: FATAL:  password authentication failed for user "a1_mig"
+login with 'a1_mig': refused: connection to server at "127.0.0.1", port 46705 failed: FATAL:  password authentication failed for user "a1_mig"
 session still alive: ok SELECT 1 [('a1_mig',)]
 == F5: stretching the window between commit and NOLOGIN (the test's technique)
 platform restores a password: ok ALTER ROLE []
@@ -100,6 +100,55 @@ VACUUM FULL pg_catalog.pg_trigger  ok [('16461', '740', '(0,10)', 'O')] [('1', '
 VACUUM FULL pg_catalog.pg_attribut ok [('16461', '740', '(0,10)', 'O')] [('1', '739', '(57,10)'), ('2', '739', '(57,11)')] [('793', '(1,47)', '16478')]
 VACUUM (FREEZE) pg_catalog.pg_trig ok [('16461', '740', '(0,10)', 'O')] [('1', '739', '(57,10)'), ('2', '739', '(57,11)')] [('793', '(1,47)', '16478')]
 ANALYZE                            ok [('16461', '740', '(0,10)', 'O')] [('1', '739', '(57,10)'), ('2', '739', '(57,11)')] [('793', '(1,47)', '16478')]
+######## Postgres 16 (16.15.0), part F, locks
+== changes of structure or capture (as the migration role: the rights such code runs with)
+as-expected  strong= 1 ShareRowExclusiveLock                         disable a capture trigger
+as-expected  strong= 1 ShareRowExclusiveLock                         disable and enable
+as-expected  strong= 1 ShareRowExclusiveLock                         disable all triggers
+as-expected  strong= 1 AccessExclusiveLock                           drop a capture trigger
+as-expected  strong= 1 AccessExclusiveLock                           rename a capture trigger
+as-expected  strong= 1 ShareRowExclusiveLock                         a deferrable constraint trigger
+as-expected  strong= 1 AccessExclusiveLock                           a foreign key made deferrable
+as-expected  strong= 9 AccessExclusiveLock,ShareLock,ShareUpdateExclusiveLock a column's type
+as-expected  strong= 1 AccessExclusiveLock                           add a column
+as-expected  strong= 1 AccessExclusiveLock                           drop a column
+as-expected  strong= 1 AccessExclusiveLock                           rename a column
+as-expected  strong= 1 AccessExclusiveLock                           create a table
+as-expected  strong= 4 AccessExclusiveLock,ShareLock                 create a table as
+as-expected  strong= 1 AccessExclusiveLock                           create and drop a table
+as-expected  strong= 6 AccessExclusiveLock                           drop a table
+as-expected  strong= 1 AccessExclusiveLock                           rename a table
+as-expected  strong= 1 AccessExclusiveLock                           move a table
+as-expected  strong= 2 AccessExclusiveLock,ShareUpdateExclusiveLock  attach a partition
+as-expected  strong= 2 AccessExclusiveLock                           detach a partition
+as-expected  strong= 2 AccessExclusiveLock,ShareUpdateExclusiveLock  inherit
+as-expected  strong=10 AccessExclusiveLock,ShareLock,ShareUpdateExclusiveLock unlogged
+as-expected  strong= 1 AccessExclusiveLock                           row security
+as-expected  strong= 1 AccessExclusiveLock                           a rule
+as-expected  strong= 2 AccessExclusiveLock,ShareLock                 an index
+as-expected  strong= 1 AccessExclusiveLock                           replace a view
+as-expected  strong= 6 AccessExclusiveLock,ShareLock                 truncate
+as-expected  strong= 1 ShareLock                                     lock table share
+as-expected  strong= 1 ShareUpdateExclusiveLock                      analyze
+as-expected  strong= 4 AccessExclusiveLock,ExclusiveLock,ShareLock   refresh a materialized view
+as-expected  strong= 1 ShareRowExclusiveLock                         alter a sequence
+as-expected  strong= 0                                               in a block that fails and is caught, then nothing
+== reading and writing rows (as the runtime role)
+as-expected  strong= 0                                               insert, update, delete
+as-expected  strong= 0                                               update of a captured table (the capture fires)
+as-expected  strong= 0                                               cascading delete, update with trigger and check
+as-expected  strong= 0                                               select for update, for share
+as-expected  strong= 0                                               on conflict
+as-expected  strong= 0                                               nextval
+as-expected  strong= 0                                               a view, a materialized view read
+as-expected  strong= 0                                               serializable
+as-expected  strong= 0                                               lock table row exclusive
+as-expected  strong= 0                                               advisory lock
+as-expected  strong= 0                                               partitioned insert
+######## Postgres 16 (16.15.0), part F, cost
+tables=  10  round trip alone     61 us   digest     800 us more   own strong locks from pg_locks     81 us more
+tables= 100  round trip alone     61 us   digest    1562 us more   own strong locks from pg_locks     68 us more
+tables= 500  round trip alone     61 us   digest    5212 us more   own strong locks from pg_locks     66 us more
 ######## Postgres 17 (17.11.0), part F, vectors
 -- at rest, before
 trigger row: 16461 xmin=748 ctid=(0,10) enabled=O
@@ -181,8 +230,8 @@ migration tries more: ERROR 42501 permission denied to alter role
 migration tries connection limit: ERROR 42501 permission denied to alter role
 host: password null: ok ALTER ROLE []
 commit: ok COMMIT []
-login with 'known': refused: connection to server at "127.0.0.1", port 33547 failed: FATAL:  password authentication failed for user "a1_mig"
-login with 'a1_mig': refused: connection to server at "127.0.0.1", port 33547 failed: FATAL:  password authentication failed for user "a1_mig"
+login with 'known': refused: connection to server at "127.0.0.1", port 41919 failed: FATAL:  password authentication failed for user "a1_mig"
+login with 'a1_mig': refused: connection to server at "127.0.0.1", port 41919 failed: FATAL:  password authentication failed for user "a1_mig"
 session still alive: ok SELECT 1 [('a1_mig',)]
 == F5: stretching the window between commit and NOLOGIN (the test's technique)
 platform restores a password: ok ALTER ROLE []
@@ -208,6 +257,55 @@ VACUUM FULL pg_catalog.pg_trigger  ok [('16461', '748', '(0,10)', 'O')] [('1', '
 VACUUM FULL pg_catalog.pg_attribut ok [('16461', '748', '(0,10)', 'O')] [('1', '747', '(54,31)'), ('2', '747', '(54,32)')] [('801', '(1,47)', '16478')]
 VACUUM (FREEZE) pg_catalog.pg_trig ok [('16461', '748', '(0,10)', 'O')] [('1', '747', '(54,31)'), ('2', '747', '(54,32)')] [('801', '(1,47)', '16478')]
 ANALYZE                            ok [('16461', '748', '(0,10)', 'O')] [('1', '747', '(54,31)'), ('2', '747', '(54,32)')] [('801', '(1,47)', '16478')]
+######## Postgres 17 (17.11.0), part F, locks
+== changes of structure or capture (as the migration role: the rights such code runs with)
+as-expected  strong= 1 ShareRowExclusiveLock                         disable a capture trigger
+as-expected  strong= 1 ShareRowExclusiveLock                         disable and enable
+as-expected  strong= 1 ShareRowExclusiveLock                         disable all triggers
+as-expected  strong= 1 AccessExclusiveLock                           drop a capture trigger
+as-expected  strong= 1 AccessExclusiveLock                           rename a capture trigger
+as-expected  strong= 1 ShareRowExclusiveLock                         a deferrable constraint trigger
+as-expected  strong= 1 AccessExclusiveLock                           a foreign key made deferrable
+as-expected  strong= 9 AccessExclusiveLock,ShareLock,ShareUpdateExclusiveLock a column's type
+as-expected  strong= 1 AccessExclusiveLock                           add a column
+as-expected  strong= 1 AccessExclusiveLock                           drop a column
+as-expected  strong= 1 AccessExclusiveLock                           rename a column
+as-expected  strong= 1 AccessExclusiveLock                           create a table
+as-expected  strong= 4 AccessExclusiveLock,ShareLock                 create a table as
+as-expected  strong= 1 AccessExclusiveLock                           create and drop a table
+as-expected  strong= 6 AccessExclusiveLock                           drop a table
+as-expected  strong= 1 AccessExclusiveLock                           rename a table
+as-expected  strong= 1 AccessExclusiveLock                           move a table
+as-expected  strong= 2 AccessExclusiveLock,ShareUpdateExclusiveLock  attach a partition
+as-expected  strong= 2 AccessExclusiveLock                           detach a partition
+as-expected  strong= 2 AccessExclusiveLock,ShareUpdateExclusiveLock  inherit
+as-expected  strong=10 AccessExclusiveLock,ShareLock,ShareUpdateExclusiveLock unlogged
+as-expected  strong= 1 AccessExclusiveLock                           row security
+as-expected  strong= 1 AccessExclusiveLock                           a rule
+as-expected  strong= 2 AccessExclusiveLock,ShareLock                 an index
+as-expected  strong= 1 AccessExclusiveLock                           replace a view
+as-expected  strong= 6 AccessExclusiveLock,ShareLock                 truncate
+as-expected  strong= 1 ShareLock                                     lock table share
+as-expected  strong= 1 ShareUpdateExclusiveLock                      analyze
+as-expected  strong= 4 AccessExclusiveLock,ExclusiveLock,ShareLock   refresh a materialized view
+as-expected  strong= 1 ShareRowExclusiveLock                         alter a sequence
+as-expected  strong= 0                                               in a block that fails and is caught, then nothing
+== reading and writing rows (as the runtime role)
+as-expected  strong= 0                                               insert, update, delete
+as-expected  strong= 0                                               update of a captured table (the capture fires)
+as-expected  strong= 0                                               cascading delete, update with trigger and check
+as-expected  strong= 0                                               select for update, for share
+as-expected  strong= 0                                               on conflict
+as-expected  strong= 0                                               nextval
+as-expected  strong= 0                                               a view, a materialized view read
+as-expected  strong= 0                                               serializable
+as-expected  strong= 0                                               lock table row exclusive
+as-expected  strong= 0                                               advisory lock
+as-expected  strong= 0                                               partitioned insert
+######## Postgres 17 (17.11.0), part F, cost
+tables=  10  round trip alone     64 us   digest     779 us more   own strong locks from pg_locks     84 us more
+tables= 100  round trip alone     64 us   digest    1486 us more   own strong locks from pg_locks     64 us more
+tables= 500  round trip alone     64 us   digest    4940 us more   own strong locks from pg_locks     63 us more
 ######## Postgres 18 (18.6.0), part F, vectors
 -- at rest, before
 trigger row: 16467 xmin=762 ctid=(0,10) enabled=O
@@ -293,8 +391,8 @@ migration tries more: ERROR 42501 permission denied to alter role
 migration tries connection limit: ERROR 42501 permission denied to alter role
 host: password null: ok ALTER ROLE []
 commit: ok COMMIT []
-login with 'known': refused: connection to server at "127.0.0.1", port 48023 failed: FATAL:  password authentication failed for user "a1_mig"
-login with 'a1_mig': refused: connection to server at "127.0.0.1", port 48023 failed: FATAL:  password authentication failed for user "a1_mig"
+login with 'known': refused: connection to server at "127.0.0.1", port 49933 failed: FATAL:  password authentication failed for user "a1_mig"
+login with 'a1_mig': refused: connection to server at "127.0.0.1", port 49933 failed: FATAL:  password authentication failed for user "a1_mig"
 session still alive: ok SELECT 1 [('a1_mig',)]
 == F5: stretching the window between commit and NOLOGIN (the test's technique)
 platform restores a password: ok ALTER ROLE []
@@ -320,3 +418,52 @@ VACUUM FULL pg_catalog.pg_trigger  ok [('16467', '762', '(0,10)', 'O')] [('1', '
 VACUUM FULL pg_catalog.pg_attribut ok [('16467', '762', '(0,10)', 'O')] [('1', '761', '(55,8)'), ('2', '761', '(55,9)')] [('815', '(1,47)', '16484')]
 VACUUM (FREEZE) pg_catalog.pg_trig ok [('16467', '762', '(0,10)', 'O')] [('1', '761', '(55,8)'), ('2', '761', '(55,9)')] [('815', '(1,47)', '16484')]
 ANALYZE                            ok [('16467', '762', '(0,10)', 'O')] [('1', '761', '(55,8)'), ('2', '761', '(55,9)')] [('815', '(1,47)', '16484')]
+######## Postgres 18 (18.6.0), part F, locks
+== changes of structure or capture (as the migration role: the rights such code runs with)
+as-expected  strong= 1 ShareRowExclusiveLock                         disable a capture trigger
+as-expected  strong= 1 ShareRowExclusiveLock                         disable and enable
+as-expected  strong= 1 ShareRowExclusiveLock                         disable all triggers
+as-expected  strong= 1 AccessExclusiveLock                           drop a capture trigger
+as-expected  strong= 1 AccessExclusiveLock                           rename a capture trigger
+as-expected  strong= 1 ShareRowExclusiveLock                         a deferrable constraint trigger
+as-expected  strong= 1 AccessExclusiveLock                           a foreign key made deferrable
+as-expected  strong= 9 AccessExclusiveLock,ShareLock,ShareUpdateExclusiveLock a column's type
+as-expected  strong= 1 AccessExclusiveLock                           add a column
+as-expected  strong= 1 AccessExclusiveLock                           drop a column
+as-expected  strong= 1 AccessExclusiveLock                           rename a column
+as-expected  strong= 1 AccessExclusiveLock                           create a table
+as-expected  strong= 4 AccessExclusiveLock,ShareLock                 create a table as
+as-expected  strong= 1 AccessExclusiveLock                           create and drop a table
+as-expected  strong= 6 AccessExclusiveLock                           drop a table
+as-expected  strong= 1 AccessExclusiveLock                           rename a table
+as-expected  strong= 1 AccessExclusiveLock                           move a table
+as-expected  strong= 2 AccessExclusiveLock,ShareUpdateExclusiveLock  attach a partition
+as-expected  strong= 2 AccessExclusiveLock                           detach a partition
+as-expected  strong= 2 AccessExclusiveLock,ShareUpdateExclusiveLock  inherit
+as-expected  strong=10 AccessExclusiveLock,ShareLock,ShareUpdateExclusiveLock unlogged
+as-expected  strong= 1 AccessExclusiveLock                           row security
+as-expected  strong= 1 AccessExclusiveLock                           a rule
+as-expected  strong= 2 AccessExclusiveLock,ShareLock                 an index
+as-expected  strong= 1 AccessExclusiveLock                           replace a view
+as-expected  strong= 6 AccessExclusiveLock,ShareLock                 truncate
+as-expected  strong= 1 ShareLock                                     lock table share
+as-expected  strong= 1 ShareUpdateExclusiveLock                      analyze
+as-expected  strong= 4 AccessExclusiveLock,ExclusiveLock,ShareLock   refresh a materialized view
+as-expected  strong= 1 ShareRowExclusiveLock                         alter a sequence
+as-expected  strong= 0                                               in a block that fails and is caught, then nothing
+== reading and writing rows (as the runtime role)
+as-expected  strong= 0                                               insert, update, delete
+as-expected  strong= 0                                               update of a captured table (the capture fires)
+as-expected  strong= 0                                               cascading delete, update with trigger and check
+as-expected  strong= 0                                               select for update, for share
+as-expected  strong= 0                                               on conflict
+as-expected  strong= 0                                               nextval
+as-expected  strong= 0                                               a view, a materialized view read
+as-expected  strong= 0                                               serializable
+as-expected  strong= 0                                               lock table row exclusive
+as-expected  strong= 0                                               advisory lock
+as-expected  strong= 0                                               partitioned insert
+######## Postgres 18 (18.6.0), part F, cost
+tables=  10  round trip alone     65 us   digest     783 us more   own strong locks from pg_locks     86 us more
+tables= 100  round trip alone     65 us   digest    1493 us more   own strong locks from pg_locks     73 us more
+tables= 500  round trip alone     65 us   digest    5040 us more   own strong locks from pg_locks     73 us more

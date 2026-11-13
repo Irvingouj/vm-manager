@@ -10,6 +10,8 @@
 #   vectors      each way such code runs, and what it did to the capture
 #   checks       what the fix rests on (f_checks.py)
 #   maintenance  what ordinary maintenance does to the catalog rows (f_maintenance.py)
+#   locks        which statements leave a lock that reading and writing rows never takes (f_locks.py)
+#   cost         what a whole digest and a look at the session's own locks cost per write (f_cost.py)
 # Passwords are the roles' names: scratch clusters on 127.0.0.1 only.
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -179,4 +181,6 @@ for v in $VERSIONS; do
   start "$v" vectors; vectors; cleanup
   start "$v" checks; more; python3 -I -B "$HERE/f_checks.py" "$PORT" 2>&1; cleanup
   start "$v" maintenance; python3 -I -B "$HERE/f_maintenance.py" "$PORT" 2>&1; cleanup
+  start "$v" locks; python3 -I -B "$HERE/f_locks.py" "$PORT" 2>&1; cleanup
+  start "$v" cost; python3 -I -B "$HERE/f_cost.py" "$PORT" 2>&1; cleanup
 done
