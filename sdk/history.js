@@ -1,16 +1,16 @@
 // Reading the Change history of the own database (blackbox/CONTRACT.md,
-// "Reading the Change history"): `history(table, key?, options?)` on the
-// own database's handles. One call is one host `query`, as the handle's
-// actor, of `vm.history`.
+// "Reading the Change history" and "The Change history in the platform
+// database: Through the SDK"): `history(table, key?, options?)` on the own
+// database's handles. One call is one host operation `history`, as the
+// handle's actor.
 //
-// Postgres reads each stored row (`old`, `new`: jsonb, as `to_jsonb` gave
-// it) back into the table's present row type, `jsonb_populate_record(null::
-// <table>, ...)`, in that same statement: a dropped column is not there, an
-// added or renamed one is null, and a value that no longer casts fails the
-// statement. The columns come back as a `select()` of the table brings them
-// (text by type, values.js), and each is read by its Drizzle column's
-// `mapFromDriverValue`, as Drizzle's own `mapResultRow` does; so a row of the
-// history is read by the same code as a row of the table.
+// The host reads each stored row (`old`, `new`) back into the table's
+// present row type and answers it as `query` answers a row of the table
+// (with `values: "text"`: text by type, values.js); each column is read by
+// its Drizzle column's `mapFromDriverValue`, as Drizzle's own
+// `mapResultRow` does, so a row of the history is read by the same code as
+// a row of the table. The host compares the key as the key columns compare
+// values.
 //
 // Drizzle API used: `is`, `getTableColumns`, `getTableConfig` (its
 // `columns`, `primaryKeys`, `name`, `schema`), a column's `name`, `primary`,
@@ -26,18 +26,6 @@ export const NOT_SHARED =
 
 const DEFAULT_LIMIT = 100;
 const MAX_LIMIT = 1000;
-/** The greatest `bigint`: `vm.history.id` is one. */
-const MAX_ID = 9223372036854775807n;
-
-/** A column's name as a string constant: a name, not a value. */
-function literal(name) {
-  return `'${String(name).replace(/'/g, "''")}'`;
-}
-
-/** A name as a quoted SQL identifier. */
-function ident(name) {
-  return `"${String(name).replace(/"/g, '""')}"`;
-}
 
 /**
  * What is known of `table` for reading its history: its schema and name in
@@ -64,10 +52,10 @@ function describeTable(table) {
   // A table declared without a schema is in `public`, where the
   // migrations Drizzle writes for it make it.
   const schema = config.schema ?? "public";
-  return { schema, name: config.name, columns, key, relation: `${ident(schema)}.${ident(config.name)}` };
+  return { schema, name: config.name, columns, key };
 }
 
-/** The key's values in the order of `table.key`, checked: `undefined` for no key. */
+/** The key as the host takes it, by database column, checked: `undefined` for no key. */
 function keyValues(table, key) {
   if (key === undefined) return undefined;
   const names = table.key.map(({ property }) => property);
@@ -98,10 +86,14 @@ function keyValues(table, key) {
     throw new TypeError(`${label}: the key must be ${wanted} (${what})`);
   }
   // Each value as a `where` on its column would send it.
-  return table.key.map(({ property, column }) => encodeParam(column.mapToDriverValue(key[property])));
+  const out = {};
+  for (const { property, column } of table.key) {
+    out[column.name] = encodeParam(column.mapToDriverValue(key[property]));
+  }
+  return out;
 }
 
-/** `options`, checked: the limit, and `before` as a bigint or undefined. */
+/** `options`, checked: the limit, and `before` or undefined. */
 function optionsOf(options) {
   if (options === undefined) return { limit: DEFAULT_LIMIT, before: undefined };
   if (options === null || typeof options !== "object") {
@@ -119,60 +111,8 @@ function optionsOf(options) {
       "history(table, key, options): `before` must be a change's `id`: a string of decimal digits",
     );
   }
-  return { limit, before: before === undefined ? undefined : BigInt(before) };
+  return { limit, before };
 }
-
-/**
- * The one statement, and its parameters: the changes of `table` (of the row
- * whose stored key equals `key`, when given), newest first, at most `limit`,
- * older than `before`; each with its `old` and `new` read into the table's
- * present row type. No value is written into the statement.
- *
- * The key is compared as stored: the given values are read into the key
- * columns' present types by the same `jsonb_populate_record`, and turned
- * back into jsonb as the capture did (`to_jsonb` of each column), so the
- * comparison is exact whatever the columns' types. The hash of the key
- * finds the rows through the index `vm.history_row` (own_db_schema.sql).
- */
-function statementOf(table, values, options) {
-  const params = [table.schema, table.name];
-  const param = (value) => {
-    params.push(value);
-    return `$${params.length}`;
-  };
-  let keyed = "";
-  let filter = "";
-  if (values !== undefined) {
-    const given = table.key.map(({ column }, i) => `${literal(column.name)}, ${param(values[i])}::text`).join(", ");
-    const built = table.key.map(({ column }) => `${literal(column.name)}, k.${ident(column.name)}`).join(", ");
-    keyed =
-      `with wanted as (select pg_catalog.jsonb_build_object(${built}) as key ` +
-      `from pg_catalog.jsonb_populate_record(null::${table.relation}, pg_catalog.jsonb_build_object(${given})) k) `;
-    filter =
-      " and pg_catalog.jsonb_hash_extended(h.key, 0)" +
-      " = (select pg_catalog.jsonb_hash_extended(w.key, 0) from wanted w)" +
-      " and h.key = (select w.key from wanted w)";
-  }
-  // Older than every change there is: nothing to leave out.
-  if (options.before !== undefined && options.before <= MAX_ID) {
-    filter += ` and h.id < ${param(options.before.toString())}::bigint`;
-  }
-  const limit = param(String(options.limit));
-  const row = (alias) => table.columns.map(({ column }) => `${alias}.${ident(column.name)}`).join(", ");
-  const sql =
-    `${keyed}select h.id::text, h.at, h.kind, h.changed, h.user_id, h.application, h.actor, h.request, h.migration, ` +
-    `h.old is not null, ${row("o")}, h.new is not null, ${row("n")} ` +
-    "from (select h.* from vm.history h " +
-    `where h.schema_name = $1 and h.table_name = $2${filter} ` +
-    `order by h.id desc limit ${limit}::integer) h ` +
-    `cross join lateral pg_catalog.jsonb_populate_record(null::${table.relation}, h.old) o ` +
-    `cross join lateral pg_catalog.jsonb_populate_record(null::${table.relation}, h.new) n ` +
-    "order by h.id desc";
-  return { sql, params };
-}
-
-/** The leading columns of a result row, before `old`. */
-const LEADING = 9;
 
 /**
  * An update's `changed` (database names, in the database's column order) as
@@ -187,33 +127,34 @@ function changedOf(table, properties, names) {
   return [...declared, ...others];
 }
 
-/** One result row as a `Change`. */
-function changeOf(table, properties, row) {
-  const width = table.columns.length;
-  const rowAt = (start) => {
-    if (row[start] !== true) return null;
+/** One change as the host answered it, as a `Change`. */
+function changeOf(table, properties, at, types, change) {
+  const rowOf = (values) => {
+    if (!Array.isArray(values)) return null;
+    const [decoded] = decodeRows(types, [values]);
     const out = {};
-    table.columns.forEach(({ property, column }, i) => {
-      const value = row[start + 1 + i];
+    for (const { property, column } of table.columns) {
+      const i = at.get(column.name);
+      const value = i === undefined ? null : decoded[i];
       // As Drizzle's mapResultRow reads a column.
       out[property] = value === null || value === undefined ? null : column.mapFromDriverValue(value);
-    });
+    }
     return out;
   };
-  const changed = row[3] === null ? null : JSON.parse(row[3]);
+  const structure = change.kind === "structure";
   return {
-    id: row[0],
-    // As Drizzle's timestamp({ withTimezone: true }) reads its text.
-    at: new Date(row[1]),
-    kind: row[2],
-    old: rowAt(LEADING),
-    new: rowAt(LEADING + 1 + width),
-    changed: Array.isArray(changed) ? changedOf(table, properties, changed) : null,
-    userId: row[4],
-    application: row[5],
-    actor: row[6],
-    request: row[7],
-    migration: row[8],
+    id: change.id,
+    at: new Date(change.at),
+    kind: change.kind,
+    old: structure ? null : rowOf(change.old),
+    new: structure ? null : rowOf(change.new),
+    changed: Array.isArray(change.changed) ? changedOf(table, properties, change.changed) : null,
+    userId: change.user_id,
+    application: change.application,
+    actor: change.actor,
+    request: change.request,
+    migration: change.migration,
+    structure: structure ? change.structure : null,
   };
 }
 
@@ -225,11 +166,15 @@ function changeOf(table, properties, row) {
  */
 export async function readHistory(run, target, table, key, options) {
   const described = describeTable(table);
-  const values = keyValues(described, key);
+  const keyed = keyValues(described, key);
   const checked = optionsOf(options);
-  const { sql, params } = statementOf(described, values, checked);
-  const result = await run("query", { ...target, sql, params, values: "text" });
-  const rows = decodeRows(result.types, Array.isArray(result.rows) ? result.rows : []);
+  const args = { ...target, schema: described.schema, table: described.name, limit: checked.limit, values: "text" };
+  if (keyed !== undefined) args.key = keyed;
+  if (checked.before !== undefined) args.before = checked.before;
+  const result = await run("history", args);
+  const columns = Array.isArray(result.columns) ? result.columns : [];
+  const at = new Map(columns.map((name, i) => [name, i]));
   const properties = new Map(described.columns.map(({ property, column }) => [column.name, property]));
-  return rows.map((row) => changeOf(described, properties, row));
+  const changes = Array.isArray(result.changes) ? result.changes : [];
+  return changes.map((change) => changeOf(described, properties, at, result.types, change));
 }

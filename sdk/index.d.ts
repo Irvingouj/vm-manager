@@ -201,12 +201,31 @@ type SharedDatabase<R extends Declarations, N extends keyof R & string> = N exte
 // ---------------------------------------------------------------- Change history
 
 /**
- * One change of a row, as the own database's Change history recorded it.
- * `old` and `new` are rows of the table as `select()` gives them, read in
- * the table's present shape: a column dropped since is not there, a column
- * added or renamed since is null in rows from before that.
+ * What a change of structure that changed data was (blackbox/CONTRACT.md,
+ * "Changes of structure that change data"): one member per `change`. Names
+ * of columns are the database's; types as Postgres's `format_type` prints
+ * them, a type that is not Postgres's own with its schema.
  */
-export interface Change<T extends PgTable> {
+export type StructureChange =
+  /** A column's type was changed (with or without `USING`). */
+  | { change: "column-type"; column: string; from: string; to: string }
+  /** A column was dropped. */
+  | { change: "column-dropped"; column: string }
+  /** The table was dropped, and none is there under its name. */
+  | { change: "table-dropped" }
+  /** Another table is there under the name. */
+  | { change: "table-replaced" }
+  /** Postgres wrote the table's rows anew, and no `column-type` entry shows why. */
+  | { change: "table-rewritten" }
+  /** A value of the enum `type` was renamed; `columns` of this table have that type. */
+  | { change: "enum-value-renamed"; type: string; from: string; to: string; columns: string[] }
+  /** A partition (`schema.table`) was attached to the table. */
+  | { change: "partition-attached"; partition: string }
+  /** A partition (`schema.table`) was detached from the table. */
+  | { change: "partition-detached"; partition: string };
+
+/** What every change has, of a row or of the structure. */
+interface ChangeCommon {
   /**
    * The change's place in the history, as decimal digits; later changes
    * have greater ids. Pass it as `before` to page back.
@@ -214,6 +233,23 @@ export interface Change<T extends PgTable> {
   readonly id: string;
   /** When the change was made. */
   readonly at: Date;
+  /** The User in flight when the change was made; for a migration, the Contributor who sent the Version. */
+  readonly userId: string;
+  readonly application: string;
+  readonly actor: "user" | "application" | "migration";
+  /** The request's id, as in the Operation log; null for a migration. */
+  readonly request: string | null;
+  /** The migration's name, for a migration; null otherwise. */
+  readonly migration: string | null;
+}
+
+/**
+ * One change of a row, as the Change history recorded it. `old` and `new`
+ * are rows of the table as `select()` gives them, read in the table's
+ * present shape: a column dropped since is not there, a column added or
+ * renamed since is null in rows from before that.
+ */
+export interface RowChange<T extends PgTable> extends ChangeCommon {
   readonly kind: "insert" | "update" | "delete";
   /** The whole row before; null for an insert. */
   readonly old: T["$inferSelect"] | null;
@@ -226,15 +262,21 @@ export interface Change<T extends PgTable> {
    * and a delete.
    */
   readonly changed: string[] | null;
-  /** The User in flight when the change was made; for a migration, the Contributor who sent the Version. */
-  readonly userId: string;
-  readonly application: string;
-  readonly actor: "user" | "application" | "migration";
-  /** The request's id, as in the Operation log; null for a migration. */
-  readonly request: string | null;
-  /** The migration's name, for a migration; null otherwise. */
-  readonly migration: string | null;
+  readonly structure: null;
 }
+
+/** A change of the table's structure that changed data, made by a migration. */
+export interface StructureEntry extends ChangeCommon {
+  readonly kind: "structure";
+  readonly old: null;
+  readonly new: null;
+  readonly changed: null;
+  /** What changed. */
+  readonly structure: StructureChange;
+}
+
+/** One change of the table's history, narrowed by `kind`. */
+export type Change<T extends PgTable> = RowChange<T> | StructureEntry;
 
 type ColumnsOf<T extends PgTable> = T["_"]["columns"];
 
@@ -266,8 +308,9 @@ interface ReadsHistory {
   /**
    * The Change history of `table`, newest first: of the row whose primary
    * key is `key`, or, without `key`, of every row. The history is kept
-   * under the key a row had before each change. One `query` of the own
-   * database, as this handle's actor.
+   * under the key a row had before each change; a change of the table's
+   * structure is in every row's history. One host operation `history`, as
+   * this handle's actor.
    */
   history<T extends PgTable>(table: T, key?: HistoryKey<T>, options?: HistoryOptions): Promise<Change<T>[]>;
 }
