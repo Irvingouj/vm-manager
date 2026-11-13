@@ -711,12 +711,15 @@ For an Application the platform numbers `n`, with `<p>` the platform database's 
 Each of these, in a migration's text, fails in the database: the answer is `422 migration-failed` with the SQLSTATE given, nothing the Version's migrations did is kept, and the keys, the history, the record of migrations and the capture are as before.
 
 - Read `vm.keys` (`42501`).
-- Insert, update, delete or truncate `vm.history` or the platform's record of migrations; lock them; put a rule, a trigger or a child table on them (`42501`).
+- Insert, update, delete or truncate `vm.history` or the platform's record of migrations (`vm.migrations`); lock them; put a rule, a trigger or a child table on them (`42501`).
 - Create, replace, alter, rename, take over or drop anything in `vm`, or `vm` itself; move a table into it (`42501`).
-- Become the platform's role or the runtime role, give itself their rights or theirs to another, change the database's settings or owner (`42501`).
+- Become the platform's role or the runtime role, give itself their rights or theirs to another, change the database's settings or owner (`42501`, or another refusal of Postgres's own; a few such attempts Postgres answers with a warning and does nothing, and then the Version applies and the platform's part is as before).
+- A migration may change the migration role's own password or settings (Postgres lets any role); it is not refused and is of no use: the role cannot log in, and the platform sets what it needs each time.
 - `TRUNCATE` a table that has history, directly, through `CASCADE` or through a partition (`VM002`; the message says to `DELETE`, which is recorded).
 
-It can still read `vm.identity()` and call what the runtime role may call.
+It can still read `vm.history`, and `vm.identity()`, which during a migration answers the Contributor who sent the Version as `user_id`, `actor` `migration` and no request.
+
+Whatever else a migration tries that Postgres refuses to a role without superuser (temporary objects, untrusted languages and extensions, event triggers, publications of all tables, the server's files, other sessions, the statistics), the Version fails or applies as Postgres decides, and either way the platform's part is as before.
 
 ### How migrations are sent, and what is refused before anything is sent
 
@@ -727,7 +730,7 @@ It can still read `vm.identity()` and call what the runtime role may call.
   { "error": { "reason": "migration-refused", "rule": "<kebab-case>", "message": "<what was found, where, and what to do instead>", "migration": "<name>" } }
   ```
 
-  when a rule of the platform's is broken. Nothing is kept, no Version is recorded, the previous Version goes on serving, exactly as for `migration-failed`. In the order of "The platform's API", `migration-refused` stands where `migration-failed` does.
+  when a rule of the platform's is broken. When several are broken the answer names one of them. `migration` is the migration whose text broke the rule, or after which the check failed. Nothing is kept, no Version is recorded, the previous Version goes on serving, exactly as for `migration-failed`. In the order of "The platform's API", `migration-refused` stands where `migration-failed` does.
 - Rules checked on the text, before any statement of any migration is sent:
   - `transaction-control`: a statement that begins, ends, chains, prepares or savepoints a transaction (`BEGIN`, `START TRANSACTION`, `COMMIT`, `END`, `ROLLBACK`, `ABORT`, `COMMIT AND CHAIN`, `ROLLBACK AND CHAIN`, `PREPARE TRANSACTION`, `COMMIT PREPARED`, `ROLLBACK PREPARED`, `SAVEPOINT`, `RELEASE`, `ROLLBACK TO`). The word inside a string, a comment, a dollar-quoted body or an identifier is not one.
   - `unparseable`: text the parser cannot read. The message gives Postgres's own words and position.
@@ -737,13 +740,15 @@ It can still read `vm.identity()` and call what the runtime role may call.
 
 After the last migration's last statement, and before the commit, the platform makes sure nothing of the migration's can still run, then checks. A broken rule is `migration-refused`:
 
-- `capture-changed`: a capture trigger that existed before the Version's migrations was disabled, dropped, renamed or replaced during them, **also when it was put back** (disable, change rows, enable). The message names the table.
+- `capture-changed`: a capture trigger that existed before one of the Version's migrations (the capture of a table is made at the end of the migration that makes the table) was disabled, dropped, renamed or replaced during a later one, **also when it was put back** (disable, change rows, enable). The message names the table.
 - `capture-missing`: a table outside `vm` is without its whole capture at the end, or carries another trigger that calls a function of `vm`.
 - `deferrable`: a trigger or a constraint that is `DEFERRABLE`. Their work would run at the commit, after the checks. (A constraint that failed when made immediate is `migration-failed` with its own SQLSTATE.)
 - `json-cast`: a cast from one of the Application's types to `json` or `jsonb` whose function is not Postgres's own. Postgres would call it inside the capture, with the platform's rights.
 - `in-vm`: an extension, or any object the platform did not make, in schema `vm` (`CREATE EXTENSION hstore SCHEMA vm` is allowed by Postgres to this role).
 
-A cursor left open `WITH HOLD` is closed by the platform before the checks; its query never runs.
+A cursor left open `WITH HOLD` is closed by the platform before the checks; its query never runs, and the Version applies.
+
+A cast of the `json-cast` kind followed by a change of a captured table in the same Version may also end as `migration-failed` with `VM003` (below): whichever comes first.
 
 ### The capture itself
 
