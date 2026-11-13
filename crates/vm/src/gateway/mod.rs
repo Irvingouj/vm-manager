@@ -992,6 +992,9 @@ const HISTORY_DEFAULT_LIMIT: i64 = 100;
 /// a boolean; `limit` an integer from 1 to 1000; `before` a string of
 /// decimal digits; `values` as for `query`. Arguments it does not have are
 /// ignored (`resource`, `tx`, `sql`, ...).
+/// The longest name of a schema or table `history` takes, in bytes.
+const HISTORY_NAME_BYTES: usize = 63;
+
 fn read_history(args: &Value) -> Result<(authz::Actor, HistoryRead), &'static str> {
     let Some(args) = args.as_object() else {
         return Err(
@@ -1019,6 +1022,11 @@ fn read_history(args: &Value) -> Result<(authz::Actor, HistoryRead), &'static st
             return Err("`schema` must be the schema's name, as a string (public when not given)");
         }
     };
+    // No name in Postgres is longer (NAMEDATALEN - 1); this also bounds
+    // what of the caller's goes into the entry's `statement`.
+    if table.len() > HISTORY_NAME_BYTES || schema.len() > HISTORY_NAME_BYTES {
+        return Err("`schema` and `table` are names of at most 63 bytes");
+    }
     let key = match args.get("key") {
         None => None,
         Some(Value::Object(key))
