@@ -38,6 +38,7 @@ use std::fmt;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
+use authz::AccessLevel;
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
@@ -103,6 +104,8 @@ struct Handle {
     /// The Resource; `None` for the own database.
     resource: Option<Arc<str>>,
     actor: authz::Actor,
+    /// The `access` it was begun at.
+    access: AccessLevel,
     commands: mpsc::Sender<Command>,
     /// Dropped when the request ends (or the handle is taken away): the
     /// task then rolls back.
@@ -114,6 +117,10 @@ pub(super) struct Found {
     pub(super) id: Arc<str>,
     pub(super) resource: Option<Arc<str>>,
     pub(super) actor: authz::Actor,
+    /// The `access` it was begun at: in a `write` transaction every
+    /// statement needs `write`, `query` included (blackbox/CONTRACT.md,
+    /// "Transactions: Through the raw interface").
+    pub(super) access: AccessLevel,
     pub(super) commands: mpsc::Sender<Command>,
 }
 
@@ -156,6 +163,7 @@ impl Transactions {
             id: Arc::clone(&handle.id),
             resource: handle.resource.as_ref().map(Arc::clone),
             actor: handle.actor,
+            access: handle.access,
             commands: handle.commands.clone(),
         })
     }
@@ -164,7 +172,12 @@ impl Transactions {
     /// as `actor`, unless [`PER_REQUEST`] are open. Its id is made here:
     /// 64 hex digits from the operating system's random source (two version
     /// 4 UUIDs, 244 random bits), which cannot be guessed.
-    pub(super) fn reserve(&self, resource: Option<&str>, actor: authz::Actor) -> Reserved {
+    pub(super) fn reserve(
+        &self,
+        resource: Option<&str>,
+        actor: authz::Actor,
+        access: AccessLevel,
+    ) -> Reserved {
         let mut open = self.open.lock().unwrap_or_else(PoisonError::into_inner);
         if open.ended {
             return Reserved::Ended;
@@ -184,6 +197,7 @@ impl Transactions {
             id: Arc::clone(&id),
             resource: resource.map(Arc::from),
             actor,
+            access,
             commands,
             _alive: alive,
         });

@@ -445,7 +445,10 @@ impl PlatformGateway {
             None => Target::Own,
             Some(name) => Target::Resource(name),
         };
-        let (on, refusal) = self.decide(kind.needed(), found.actor, target, in_flight, active);
+        // In a `write` transaction a `query` runs as the write login in a
+        // read-write transaction, where it could write: it needs `write`.
+        let needed = kind.needed().max(found.access);
+        let (on, refusal) = self.decide(needed, found.actor, target, in_flight, active);
         let work = Work {
             transaction: Some(Arc::clone(&found.id)),
             ..self.work(kind, in_flight, active, found.actor, on, call, refusal)
@@ -492,9 +495,10 @@ impl PlatformGateway {
             let refused = Some(refusal.reason);
             return self.dispatch(work, refused, Work::run);
         }
-        let reserved = in_flight
-            .transactions
-            .reserve(work.resource_name(), begin.actor);
+        let reserved =
+            in_flight
+                .transactions
+                .reserve(work.resource_name(), begin.actor, begin.access);
         let made = match reserved {
             transaction::Reserved::Made(made) => made,
             // The request ended meanwhile.
