@@ -14,6 +14,8 @@
 #   extension    whether the migration role can make its own function a member of an extension (f_extension.py)
 #   types        with whose rights a user-defined type's own code runs later (f_types.py)
 #   cost         what a whole digest and a look at the session's own locks cost per write (f_cost.py)
+#   sessions     what that look costs on a busy instance (f_sessions.py); not among the default
+#                parts: `f-left-behind.sh "18 16" sessions > f-sessions.log`, on a quiet machine
 # Passwords are the roles' names: scratch clusters on 127.0.0.1 only.
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -44,7 +46,7 @@ start() { # start VERSION PART: a cluster, the roles, the stand-in capture, a fi
   "$BIN/initdb" -D "$DIR/data" -U postgres --pwfile="$DIR/pw" --auth=scram-sha-256 -E UTF8 --locale=C >"$DIR/initdb.log" 2>&1
   PORT=$(python3 -I -B -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')
   export PORT
-  "$BIN/pg_ctl" -D "$DIR/data" -l "$DIR/server.log" -w -o "-p $PORT -k $DIR -c listen_addresses=127.0.0.1 -c autovacuum_naptime=1s" start >/dev/null
+  "$BIN/pg_ctl" -D "$DIR/data" -l "$DIR/server.log" -w -o "-p $PORT -k $DIR -c listen_addresses=127.0.0.1 -c autovacuum_naptime=1s ${PG_OPTS:-}" start >/dev/null
   echo "######## Postgres $V (${FULL[$V]}), part F, $2"
   q postgres postgres -c "CREATE ROLE plat LOGIN CREATEDB CREATEROLE PASSWORD 'plat'"
   q plat postgres -c "CREATE ROLE a1_vm LOGIN PASSWORD 'a1_vm'" -c "CREATE ROLE a1_mig LOGIN PASSWORD 'a1_mig'" -c "CREATE ROLE a1_rt LOGIN PASSWORD 'a1_rt'" \
@@ -189,4 +191,9 @@ for v in $VERSIONS; do
   if want extension; then start "$v" extension; python3 -I -B "$HERE/f_extension.py" "$PORT" 2>&1; cleanup; fi
   if want types; then start "$v" types; python3 -I -B "$HERE/f_types.py" "$PORT" 2>&1; cleanup; fi
   if want cost; then start "$v" cost; python3 -I -B "$HERE/f_cost.py" "$PORT" 2>&1; cleanup; fi
+  if want sessions; then
+    PG_OPTS="-c max_connections=100"; start "$v" "sessions, max_connections=100"; python3 -I -B "$HERE/f_sessions.py" "$PORT" throughput 2>&1; cleanup
+    PG_OPTS="-c max_connections=500"; start "$v" "sessions, max_connections=500"; python3 -I -B "$HERE/f_sessions.py" "$PORT" scaling 2>&1; python3 -I -B "$HERE/f_sessions.py" "$PORT" throughput 2>&1; cleanup
+    PG_OPTS=""
+  fi
 done

@@ -1,0 +1,28 @@
+######## Postgres 18 (18.6.0), part F, sessions, max_connections=100
+client processes   1: without the look    16127 and    15836 tx/s; with it     6764 and     6744 tx/s; ratio 0.42
+client processes   8: without the look    74961 and    76048 tx/s; with it    30953 and    30996 tx/s; ratio 0.41
+client processes  32: without the look   222102 and   218054 tx/s; with it    42290 and    42222 tx/s; ratio 0.19
+client processes  64: without the look   206784 and   207938 tx/s; with it    40328 and    40215 tx/s; ratio 0.19
+######## Postgres 18 (18.6.0), part F, sessions, max_connections=500
+other sessions in a transaction:    0  rows in pg_locks:      2  round trip alone    70 us  own strong locks    148 us more
+other sessions in a transaction:   50  rows in pg_locks:   1052  round trip alone    64 us  own strong locks    434 us more
+other sessions in a transaction:  200  rows in pg_locks:   4202  round trip alone    57 us  own strong locks   1363 us more
+other sessions in a transaction:  400  rows in pg_locks:   8402  round trip alone    57 us  own strong locks   2592 us more
+client processes   1: without the look    16209 and    15992 tx/s; with it     4760 and     4795 tx/s; ratio 0.30
+client processes   8: without the look    74158 and    74514 tx/s; with it    22945 and    22892 tx/s; ratio 0.31
+client processes  32: without the look   222618 and   215600 tx/s; with it    27656 and    27888 tx/s; ratio 0.13
+client processes  64: without the look   204790 and   201067 tx/s; with it    26590 and    26534 tx/s; ratio 0.13
+######## Postgres 16 (16.15.0), part F, sessions, max_connections=100
+client processes   1: without the look    13830 and    13492 tx/s; with it     6646 and     6678 tx/s; ratio 0.49
+client processes   8: without the look    64308 and    64026 tx/s; with it    32893 and    32868 tx/s; ratio 0.51
+client processes  32: without the look   194503 and   185373 tx/s; with it    54735 and    53926 tx/s; ratio 0.29
+client processes  64: without the look   197444 and   195731 tx/s; with it    48459 and    48352 tx/s; ratio 0.25
+######## Postgres 16 (16.15.0), part F, sessions, max_connections=500
+other sessions in a transaction:    0  rows in pg_locks:      2  round trip alone    71 us  own strong locks    158 us more
+other sessions in a transaction:   50  rows in pg_locks:   1052  round trip alone    65 us  own strong locks    464 us more
+other sessions in a transaction:  200  rows in pg_locks:   4202  round trip alone    56 us  own strong locks   1385 us more
+other sessions in a transaction:  400  rows in pg_locks:   8402  round trip alone    56 us  own strong locks   2628 us more
+client processes   1: without the look    13561 and    13480 tx/s; with it     4405 and     4434 tx/s; ratio 0.33
+client processes   8: without the look    64973 and    64725 tx/s; with it    20556 and    20687 tx/s; ratio 0.32
+client processes  32: without the look   194513 and   184610 tx/s; with it    26727 and    26770 tx/s; ratio 0.14
+client processes  64: without the look   195178 and   195064 tx/s; with it    25650 and    25779 tx/s; ratio 0.13
