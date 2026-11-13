@@ -1,0 +1,14 @@
+# What the host's own parser (pg_query, the version crates/vm uses) makes of
+# migration texts that try to end the platform's transaction. A workspace of
+# its own: not part of the product. Run by ../run.sh part b.
+[package]
+name = "chr-parse"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+pg_query = "=18.1.0"
+serde_json = "1"

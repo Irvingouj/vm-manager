@@ -1,0 +1,967 @@
+######## Postgres 16 (16.15.0), part a
+[pg16] ==== setup.sql
+[pg16] steps not as expected: 0
+[pg16] ==== a-attacks.sql
+[pg16] F0     as-expected [vm] ok SELECT 1 [('9c85cc29df4098b348815710b1d5888f', '4:730fa7ca36d99762342e9329634aa6a4', 'e1fd518b2cc7f7af8f588d299f08bbf9', 'keys:a1_vm:{a1_vm=arwdDxt/a1_vm},keys_pkey:a1_vm:,migrations:a1_vm:{a1_vm=arwdDxt/a1_vm},migratio...  -- fingerprint of vm before (expect ok)
+[pg16] A01    as-expected [mig] ERROR 42501 permission denied for table keys  -- read the keys (expect err:42501)
+[pg16] A02    as-expected [mig] ERROR 42501 permission denied for table outbox  -- read the outbox (expect err:42501)
+[pg16] A03    as-expected [mig] ERROR 42501 permission denied for table outbox  -- write the outbox (expect err:42501)
+[pg16] A04    as-expected [mig] ERROR 42501 permission denied for table outbox  -- update the outbox (expect err:42501)
+[pg16] A05    as-expected [mig] ERROR 42501 permission denied for table outbox  -- delete from the outbox (expect err:42501)
+[pg16] A06    as-expected [mig] ERROR 42501 permission denied for table outbox  -- truncate the outbox (expect err:42501)
+[pg16] A07    as-expected [mig] ERROR 42501 permission denied for sequence outbox_id_seq  -- the outbox's sequence (expect err:42501)
+[pg16] A08    as-expected [mig] ERROR 42501 permission denied for table outbox (rolled back)  -- lock the outbox (expect err:42501)
+[pg16] A09    as-expected [mig] ERROR 42501 permission denied for table migrations  -- read the record of migrations (expect err:42501)
+[pg16] A10    as-expected [mig] ERROR 42501 permission denied for schema vm  -- replace a vm function (expect err:42501)
+[pg16] A11    as-expected [mig] ERROR 42501 must be owner of function vm.capture  -- drop a vm function (expect err:42501)
+[pg16] A12    as-expected [mig] ERROR 42501 must be owner of function capture  -- take a vm function over (expect err:42501)
+[pg16] A13    as-expected [mig] ERROR 42501 must be owner of function vm.capture  -- change a vm function's settings (expect err:42501)
+[pg16] A14    as-expected [mig] ERROR 42501 permission denied for function attached  -- call the identity check directly (expect err:42501)
+[pg16] A15    as-expected [mig] ERROR 42501 permission denied for schema vm  -- create a table in vm (expect err:42501)
+[pg16] A16    as-expected [mig] ERROR 42501 permission denied for schema vm  -- create a function in vm (expect err:42501)
+[pg16] A17    as-expected [mig] ERROR 42501 permission denied for schema vm  -- move an own table into vm (expect err:42501)
+[pg16] A18    as-expected [mig] ERROR 42501 must be owner of table outbox  -- a view or rule on the outbox (expect err:42501)
+[pg16] A19    as-expected [mig] ERROR 42501 permission denied for table outbox  -- a trigger on the outbox (expect err:42501)
+[pg16] A20    as-expected [mig] ERROR 42501 must be owner of table outbox  -- a child table of the outbox (expect err:42501)
+[pg16] A21    as-expected [mig] ERROR 42501 must be owner of schema vm  -- rename schema vm (expect err:42501)
+[pg16] A22    as-expected [mig] ERROR 42501 must be owner of schema vm  -- take schema vm over (expect err:42501)
+[pg16] A23    as-expected [mig] ERROR 42501 must be owner of schema vm  -- drop schema vm (expect err:42501)
+[pg16] A24    as-expected [mig] ERROR 42501 must be owner of schema vm  -- comment on schema vm (expect err:42501)
+[pg16] A25    as-expected [mig] ERROR 42501 permission denied to reassign objects  -- reassign what a1_vm owns (expect err:42501)
+[pg16] A26    as-expected [mig] ERROR 42501 permission denied to drop objects  -- drop what a1_vm owns (expect err:42501)
+[pg16] A27    as-expected [mig] ERROR 42501 permission denied to set role "a1_vm"  -- become a1_vm (expect err:42501)
+[pg16] A28    as-expected [mig] ERROR 42501 permission denied to set session authorization "a1_vm"  -- become a1_vm by session (expect err:42501)
+[pg16] A29    as-expected [mig] ERROR 42501 permission denied to set role "a1_vm"  -- become a1_vm by setting (expect err:42501)
+[pg16] A30    as-expected [mig] ERROR 42501 permission denied to change default privileges  -- default privileges of a1_vm (expect err:42501)
+[pg16] A31    as-expected [mig] ERROR 42501 permission denied for table keys  -- grant itself the keys (expect err:42501)
+[pg16] A32    as-expected [mig] ERROR 42501 permission denied to grant role "a1_vm"  -- grant itself a1_vm (expect err:42501)
+[pg16] A33    as-expected [mig] ERROR 42501 permission denied to grant role "a1_mig"  -- grant itself to the runtime role (expect err:42501)
+[pg16] A34    as-expected [mig] ERROR 42501 permission denied to revoke role "a1_mig"  -- take a1_vm's membership in a1_mig away (expect err:42501)
+[pg16] A35    as-expected [mig] ERROR 42501 must be owner of database a1  -- settings of the database (expect err:42501)
+[pg16] A36    as-expected [mig] ERROR 42501 must be owner of database a1  -- take the database over (expect err:42501)
+[pg16] A37    as-expected [mig] ERROR 42501 must be owner of database a1  -- rename the database (expect err:42501)
+[pg16] A38    as-expected [mig] ERROR 42501 permission denied to alter role  -- another role's attributes (expect err:42501)
+[pg16] A39    as-expected [mig] ERROR 42501 permission denied to alter role  -- its own attributes: CREATEROLE (expect err:42501)
+[pg16] A40    as-expected [mig] ERROR 42501 permission denied to alter role  -- its own attributes: VALID UNTIL (expect err:42501)
+[pg16] A41    as-expected [mig] ERROR 42501 permission denied to create role  -- create a role (expect err:42501)
+[pg16] A42    as-expected [mig] ok ROLLBACK []  -- its own settings (session defaults of its own logins) (expect ok)
+[pg16] A43    as-expected [mig] ok ALTER ROLE []  -- its own password (committed; see L1) (expect ok)
+[pg16] L1     as-expected logged in  -- log in as a1_mig (expect ok)
+[pg16] A44    as-expected [plat] ok ALTER ROLE []  -- the platform's role sets it back (expect ok)
+[pg16] A44a   as-expected [plat] ok ALTER ROLE []  -- the platform's role can take the login away between migrations (expect ok)
+[pg16] A44b   as-expected [mig] ok ALTER ROLE []  -- a1_mig's open session may still change its password (expect ok)
+[pg16] L2     as-expected refused: connection to server at "127.0.0.1", port 35475 failed: FATAL:  role "a1_mig" is not permitted to log in  -- log in as a1_mig (expect err)
+[pg16] A44c   as-expected [mig] ERROR 42501 permission denied to alter role  -- nor give itself the login back (expect err:42501)
+[pg16] A44d   as-expected [rt] ok ROLLBACK []  -- the runtime role can change its own password too (expect ok)
+[pg16] A44e   as-expected [plat] ok ALTER ROLE []  -- back to the scenario's login (expect ok)
+[pg16] A45    as-expected [mig] ERROR 42501 permission denied to set parameter "session_replication_role"  -- session_replication_role (expect err:42501)
+[pg16] A46    as-expected [mig] ERROR 42501 permission denied to create temporary tables in database "a1"  -- temporary objects (expect err:42501)
+[pg16] A47    as-expected [mig] ERROR 42501 permission denied to create extension "dblink"  -- extension not trusted (expect err:42501)
+[pg16] A48    as-expected [mig] ok CREATE EXTENSION []  -- a trusted extension into vm: allowed (its script runs as the bootstrap superuser) (expect ok)
+[pg16] A48a   as-expected [mig] ok SELECT 1 [('a1_mig', '60', 'postgres')]  -- what it put there is the superuser's, the extension a1_mig's (expect has:postgres)
+[pg16] A48b   as-expected [mig] ERROR 42501 must be owner of function vm.capture (rolled back)  -- add vm.capture() to its extension (to drop it with the extension) (expect err:42501)
+[pg16] A48c   as-expected [mig] ERROR 42501 permission denied for schema vm (rolled back)  -- replace a function the extension put in vm (expect err:42501)
+[pg16] A48d   as-expected [mig] ok SELECT 85 [('extension hstore is in schema vm',), ("function vm.hstore_in(cstring) in schema vm is not the platform's",), ("function vm.hstore_out(vm.hstore) in schema vm is not the platform's",)]  -- the check names it (expect has:extension)
+[pg16] A48e   as-expected [mig] ok ROLLBACK []  --  (expect ok)
+[pg16] A49    as-expected [mig] ok ROLLBACK []  -- a trusted extension into public (expect ok)
+[pg16] A50    as-expected [mig] ERROR 42501 permission denied to create extension "plpython3u"  -- an untrusted language (expect err:42501)
+[pg16] A51    as-expected [mig] ERROR 42501 permission denied to create event trigger "et"  -- an event trigger (expect err:42501)
+[pg16] A52    as-expected [mig] ERROR 42501 must be superuser to create FOR ALL TABLES publication  -- a publication of every table (expect err:42501)
+[pg16] A53    as-expected [mig] ERROR 42501 permission denied to terminate process  -- end a1_vm's sessions (expect err:42501)
+[pg16] A54    as-expected [mig] ERROR 42501 permission denied for function pg_stat_reset  -- reset the statistics counters (expect err:42501)
+[pg16] A55    as-expected [mig] ERROR 42501 permission denied for function pg_stat_reset_single_table_counters  -- reset one table's counters (expect err:42501)
+[pg16] A56    as-expected [mig] ERROR 42501 permission denied for function pg_read_file  -- server files (expect err:42501)
+[pg16] A57    as-expected [mig] ERROR 42501 must be able to SET ROLE "a1_vm"  -- give its table to a1_vm (expect err:42501)
+[pg16] A58    as-expected [mig] ERROR 42501 permission denied for function vm.capture  -- a capture trigger of its own (no EXECUTE on vm.capture) (expect err:42501)
+[pg16] A59    as-expected [mig] ERROR 42501 permission denied for function vm.capture  -- replace the capture trigger with old and new swapped (expect err:42501)
+[pg16] A60    as-expected [mig] ok ROLLBACK []  -- disable a capture trigger on its own table (owner's right) (expect ok)
+[pg16] A61    as-expected [mig] ok ROLLBACK []  -- drop a capture trigger on its own table (owner's right) (expect ok)
+[pg16] A62    as-expected [mig] ok ROLLBACK []  -- make a capture trigger fire only on replicas (owner's right) (expect ok)
+[pg16] A63    as-expected [mig] ok ROLLBACK []  -- rename a capture trigger (owner's right) (expect ok)
+[pg16] A64    as-expected [mig] ERROR VM002 TRUNCATE of public.notes is refused: its Change history would lose rows  -- truncate a captured table (expect err:VM002)
+[pg16] A65    as-expected [mig] ok ROLLBACK []  -- its table unlogged (owner's right; the capture still fires) (expect ok)
+[pg16] A66    as-expected [mig] ok ROLLBACK [] NOTICES WARNING:  no privileges could be revoked for "a1" | WARNING:  no privileges could be revoked for "public" | WARNING:  no privileges could be revoked for "vm" | WARNING:  no privileges could be revok...  -- drop all it owns (owner's right; drops every table, unrecorded) (expect ok)
+[pg16] A67    as-expected [mig] ERROR 42P06 schema "vm" already exists  -- a schema named like vm (expect err:42P06)
+[pg16] A68    as-expected [mig] ERROR 42939 unacceptable schema name "pg_vm"  -- a schema in the reserved pg_ names (expect err:42939)
+[pg16] A70    as-expected [mig] ok SET []  -- shadows of what the capture calls, then a captured write (expect ok)
+[pg16] A71    as-expected [mig] ok SELECT 0 []  --  (expect ok)
+[pg16] A72    as-expected [vm] ok SELECT 0 []  -- the outbox is unaffected by the shadows (row not committed: none seen; see A73) (expect lacks:forged)
+[pg16] A73    as-expected [mig] ok COMMIT []  -- commit the shadow test (expect ok)
+[pg16] A74    as-expected [vm] ok SELECT 1 [('update', '{"id": 2, "title": "shadowed", "amount": 20}', 't')]  -- the update was captured with the real functions (expect has:shadowed)
+[pg16] A75    as-expected [mig] ok DROP FUNCTION []  -- drop the shadows again (expect ok)
+[pg16] F1     as-expected [vm] ok SELECT 1 [('9c85cc29df4098b348815710b1d5888f', '5:639ae9a3d672900690c847be9135e877', 'e1fd518b2cc7f7af8f588d299f08bbf9', 'keys:a1_vm:{a1_vm=arwdDxt/a1_vm},keys_pkey:a1_vm:,migrations:a1_vm:{a1_vm=arwdDxt/a1_vm},migratio...  -- fingerprint after the one committed write of A71 (expect ok)
+[pg16] A80    as-expected [mig] ok SELECT 1 [('8',)]  -- a cast to json for an enum of its own (expect ok)
+[pg16] A81    as-expected [mig] ok SELECT 2 [('a1_vm', 'keys 128 hex digits'), ('a1_vm', 'deleted 6 outbox rows')]  -- a captured write runs a1_mig's cast function as a1_vm (expect has:a1_vm)
+[pg16] A82    as-expected [mig] ok SELECT 1 [('cast public.mood -> json runs user code where to_jsonb looks',)]  -- the check names the cast (expect has:cast)
+[pg16] A83    as-expected [mig] ok ROLLBACK []  -- roll it back (expect ok)
+[pg16] A84    as-expected [mig] ok SELECT 1 [('8',)]  -- the same with a cast to jsonb (expect ok)
+[pg16] A85    as-expected [mig] ok SELECT 0 []  -- a captured write with a cast to jsonb only (expect any)
+[pg16] A86    as-expected [mig] ok ROLLBACK []  -- roll it back (expect ok)
+[pg16] A86h   as-expected [vm] ok ALTER FUNCTION []  -- file hardening.sql (expect ok)
+[pg16] A86i   as-expected [mig] ok SELECT 1 [('8',)]  -- the trojan again (expect ok)
+[pg16] A86j   as-expected [mig] ERROR VM003 a cast to json of a type of the Application exists: the capture refuses to run it (rolled back)  -- hardened: the capture refuses before converting (expect err:VM003)
+[pg16] A86k   as-expected [mig] ok CREATE CAST []  -- a write to a table without the enum: refused too (the guard is global) (expect ok)
+[pg16] A86l   as-expected [mig] ERROR VM003 a cast to json of a type of the Application exists: the capture refuses to run it (rolled back)  --  (expect err:VM003)
+[pg16] A86m   as-expected [mig] ok CREATE EXTENSION []  -- an extension's C cast (hstore in public) does not trip the guard (expect ok)
+[pg16] A86n   as-expected [mig] ok ROLLBACK []  --  (expect ok)
+[pg16] F2     as-expected [vm] ok SELECT 1 [('9c85cc29df4098b348815710b1d5888f', '5:639ae9a3d672900690c847be9135e877', '6539c45e36f5e0231aec1dd4fcc587fa', 'keys:a1_vm:{a1_vm=arwdDxt/a1_vm},keys_pkey:a1_vm:,migrations:a1_vm:{a1_vm=arwdDxt/a1_vm},migratio...  -- fingerprint after hardening (expect ok)
+[pg16] A87    as-expected [mig] ok CREATE SEQUENCE []  -- a sequence keeps what a rolled-back transaction wrote into it (expect ok)
+[pg16] A87a   as-expected [mig] ok ROLLBACK []  --  (expect ok)
+[pg16] A88    as-expected [mig] ok SELECT 1 [('424242',)]  -- the value outlived the rollback (expect has:424242)
+[pg16] A90    as-expected [mig] ok SELECT 1 [('4',)]  -- a table full of a1_mig's code (expect ok)
+[pg16] A91    as-expected [mig] ok DELETE 1 [] NOTICES NOTICE:  spy ran as a1_mig | NOTICE:  spy ran as a1_mig | NOTICE:  policy ran as a1_mig | NOTICE:  spy ran as a1_mig | NOTICE:  spy ran as a1_mig | NOTICE:  trigger ran as a1_mig | NOTICE:  policy r...  -- a write: none of it runs as a1_vm (expect nonotice:a1_vm)
+[pg16] A92    as-expected [mig] ok ROLLBACK []  -- roll it back (expect ok)
+[pg16] F9     as-expected [vm] ok SELECT 1 [('9c85cc29df4098b348815710b1d5888f', '5:639ae9a3d672900690c847be9135e877', '6539c45e36f5e0231aec1dd4fcc587fa', 'keys:a1_vm:{a1_vm=arwdDxt/a1_vm},keys_pkey:a1_vm:,migrations:a1_vm:{a1_vm=arwdDxt/a1_vm},migratio...  -- fingerprint of vm after: unchanged since F2 (F1 differs from F0 in the outbox only, F2 from F1 in the functions only) (expect same:F2)
+[pg16] steps not as expected: 0
+######## Postgres 16 (16.15.0), part b
+[pg16] ==== setup.sql
+[pg16] steps not as expected: 0
+[pg16] ==== b-checks.sql
+[pg16] B00    as-expected [vm] ok ALTER FUNCTION []  -- file hardening.sql (expect ok)
+[pg16] B00a   as-expected [vm] ok GRANT []  -- a digest of every table's structure (for B5) (expect ok)
+[pg16] B10    as-expected [mig] ok BEGIN []  -- begin (expect ok)
+[pg16] B11    as-expected [mig] ok SELECT 1 [('e7499110c0e7e8549070ddfab20b5ef9',)]  -- the digest before the migration's statements (expect ok)
+[pg16] B12    as-expected [mig] ok SELECT 0 []  -- disable, update, enable: the final catalog looks whole (expect rows:0)
+[pg16] B13    as-expected [mig] ok SELECT 1 [('31c41a1cda5b7b858d0b5b4066e135a8',)]  -- the digest is not the same (expect differs:B11)
+[pg16] B14    as-expected [mig] ok ROLLBACK []  --  (expect ok)
+[pg16] B15    as-expected [mig] ok BEGIN []  -- the same inside a released savepoint (expect ok)
+[pg16] B15a   as-expected [mig] ok SELECT 1 [('e7499110c0e7e8549070ddfab20b5ef9',)]  --  (expect ok)
+[pg16] B15b   as-expected [mig] ok RELEASE []  --  (expect ok)
+[pg16] B15c   as-expected [mig] ok SELECT 1 [('457b5b0ea6cc1556dee3f6a9a5da3979',)]  -- digest differs (expect differs:B15a)
+[pg16] B15d   as-expected [mig] ok ROLLBACK []  --  (expect ok)
+[pg16] B16    as-expected [mig] ok BEGIN []  -- inside a savepoint rolled back: nothing changed, digest equal (expect ok)
+[pg16] B16a   as-expected [mig] ok SELECT 1 [('e7499110c0e7e8549070ddfab20b5ef9',)]  --  (expect ok)
+[pg16] B16b   as-expected [mig] ok ROLLBACK []  --  (expect ok)
+[pg16] B16c   as-expected [mig] ok SELECT 1 [('e7499110c0e7e8549070ddfab20b5ef9',)]  -- digest equal (expect same:B16a)
+[pg16] B16d   as-expected [mig] ok SELECT 1 [('11',)]  -- and the update did not happen (expect has:11)
+[pg16] B16e   as-expected [mig] ok ROLLBACK []  --  (expect ok)
+[pg16] B17    as-expected [mig] ok CREATE TRIGGER []  -- a trigger of the same name calling its own function (expect ok)
+[pg16] B17a   as-expected [mig] ok SELECT 1 [('public.items: vm_capture_update missing, disabled or altered',)]  -- the catalog check names it (expect has:vm_capture_update)
+[pg16] B17b   as-expected [mig] ok ROLLBACK []  --  (expect ok)
+[pg16] B18    as-expected [mig] ok BEGIN []  -- rename the trigger away and back (expect ok)
+[pg16] B18a   as-expected [mig] ok SELECT 1 [('e7499110c0e7e8549070ddfab20b5ef9',)]  --  (expect ok)
+[pg16] B18b   as-expected [mig] ok SELECT 1 [('c5f28d954b758190064625a71ba76c9d',)]  --  (expect differs:B18a)
+[pg16] B18c   as-expected [mig] ok ROLLBACK []  --  (expect ok)
+[pg16] B19    as-expected [mig] ok BEGIN []  -- ordinary migrations leave the digest alone (expect ok)
+[pg16] B19a   as-expected [mig] ok SELECT 1 [('e7499110c0e7e8549070ddfab20b5ef9',)]  --  (expect ok)
+[pg16] B19b   as-expected [mig] ok SELECT 1 [('e7499110c0e7e8549070ddfab20b5ef9',)]  -- add, retype, rename, constrain, index, drop a column; rename and move the table (expect same:B19a)
+[pg16] B19c   as-expected [mig] ok ROLLBACK []  --  (expect ok)
+[pg16] B20    as-expected [mig] ok DROP TRIGGER []  --  (expect ok)
+[pg16] B20a   as-expected [mig] ok SELECT 1 [('public.items: vm_capture_delete missing, disabled or altered',)]  -- the check still sees it (expect has:vm_capture_delete)
+[pg16] B20b   as-expected [mig] ok ROLLBACK []  --  (expect ok)
+[pg16] B30    as-expected [mig] ok BEGIN []  -- a deferred constraint trigger that switches the capture off at commit (expect ok)
+[pg16] B30a   as-expected [mig] ok UPDATE 1 []  --  (expect ok)
+[pg16] B30b   as-expected [mig] ok SELECT 1 [('public.items: deferrable trigger sneak',)]  -- the catalog check names the deferrable trigger (expect has:deferrable)
+[pg16] B30c   as-expected [mig] ok SELECT 1 [('e7499110c0e7e8549070ddfab20b5ef9',)]  -- the digest before COMMIT (expect ok)
+[pg16] B30d   as-expected [mig] ok DROP TRIGGER []  -- drop the trigger, its event still queued (expect ok)
+[pg16] B30e   as-expected [mig] ok SELECT 0 []  -- now the catalog check sees nothing wrong (expect rows:0)
+[pg16] B30f   as-expected [mig] ok SELECT 1 [('e7499110c0e7e8549070ddfab20b5ef9',)]  -- and the digest is unchanged (expect same:B30c)
+[pg16] B30g   as-expected [mig] ok COMMIT []  -- COMMIT: does the dropped trigger's event still run? (expect any)
+[pg16] B30h   as-expected [vm] ok SELECT 1 [('note', '0')]  -- the notes after that commit, and their outbox rows (expect any)
+[pg16] B31    as-expected [mig] ok BEGIN []  -- the same, the trigger kept: it runs at COMMIT, after the check (expect ok)
+[pg16] B31a   as-expected [mig] ok UPDATE 1 []  --  (expect ok)
+[pg16] B31b   as-expected [mig] ok COMMIT []  -- COMMIT (expect any)
+[pg16] B31c   as-expected [vm] ok SELECT 1 [('changed at commit', '0')]  -- the notes after that commit, and their outbox rows (expect any)
+[pg16] B31d   as-expected [mig] ok BEGIN []  -- put the note back, recorded (expect ok)
+[pg16] B31e   as-expected [mig] ok COMMIT []  --  (expect ok)
+[pg16] B32    as-expected [mig] ok BEGIN []  -- with SET CONSTRAINTS ALL IMMEDIATE before the check, it runs before the check (expect ok)
+[pg16] B32a   as-expected [mig] ok SELECT 1 [('f2a781b09232df4452e3ea5b7da7afe8',)]  --  (expect ok)
+[pg16] B32b   as-expected [mig] ok SET CONSTRAINTS []  --  (expect ok)
+[pg16] B32c   as-expected [mig] ok SELECT 1 [('e9980aa2ef847f400cad6ae2f88780cc',)]  -- the digest shows it (expect differs:B32a)
+[pg16] B32d   as-expected [mig] ok ROLLBACK []  --  (expect ok)
+[pg16] B33    as-expected [mig] ok BEGIN []  -- a cursor WITH HOLD whose query runs at COMMIT (expect ok)
+[pg16] B33a   as-expected [mig] ok DECLARE CURSOR []  --  (expect ok)
+[pg16] B33b   as-expected [mig] ok SELECT 1 [('f2a781b09232df4452e3ea5b7da7afe8',)]  -- the digest before COMMIT (expect ok)
+[pg16] B33c   as-expected [mig] ok SELECT 0 []  -- the check sees nothing (expect rows:0)
+[pg16] B33d   as-expected [mig] ok COMMIT []  -- COMMIT (expect any)
+[pg16] B33e   as-expected [vm] ok SELECT 1 [('changed by a cursor at commit', '0')]  -- the notes after that commit, and their outbox rows (expect any)
+[pg16] B33f   as-expected [mig] ok BEGIN []  --  (expect ok)
+[pg16] B33g   as-expected [mig] ok COMMIT []  --  (expect ok)
+[pg16] B34    as-expected [mig] ok BEGIN []  -- with CLOSE ALL before the check, the cursor's query never runs (expect ok)
+[pg16] B34a   as-expected [mig] ok COMMIT []  --  (expect ok)
+[pg16] B34b   as-expected [vm] ok SELECT 1 [('note',)]  -- the note is unchanged (expect has:note)
+[pg16] B40    as-expected [mig] ERROR VM002 TRUNCATE of public.items is refused: its Change history would lose rows NOTICES NOTICE:  truncate cascades to table "notes"  -- TRUNCATE ... CASCADE through a captured table (expect err:VM002)
+[pg16] B41    as-expected [mig] ok BEGIN []  -- partitions: captured parent and partition (expect ok)
+[pg16] B41a   as-expected [mig] ok INSERT 0 2 []  --  (expect ok)
+[pg16] B41b   as-expected [mig] ERROR VM002 TRUNCATE of public.p is refused: its Change history would lose rows (rolled back)  -- TRUNCATE of the parent (expect err:VM002)
+[pg16] B41c   as-expected [mig] ok BEGIN [] NOTICES WARNING:  there is no transaction in progress  --  (expect ok)
+[pg16] B41d   as-expected [mig] ok DROP TRIGGER []  --  (expect ok)
+[pg16] B41e   as-expected [mig] ERROR VM002 TRUNCATE of public.p1 is refused: its Change history would lose rows (rolled back)  -- TRUNCATE of the parent without its own trigger: the partition's fires (expect err:VM002)
+[pg16] B41f   as-expected [mig] ok ROLLBACK [] NOTICES WARNING:  there is no transaction in progress  --  (expect ok)
+[pg16] B50    as-expected [mig] ok BEGIN []  --  (expect ok)
+[pg16] B50a   as-expected [mig] ok SELECT 1 [('b145f721bc9d6501dca25df504a7551a',)]  --  (expect ok)
+[pg16] B50b   as-expected [mig] ok SELECT 2 [('16447', 'public.items', '16447', '1:id:23:false,2:title:25:false,3:amount:1700:false', None), ('16454', 'public.notes', '16454', '1:id:23:false,2:item:23:false,3:body:25:false', None)]  --  (expect ok)
+[pg16] B50c   as-expected [mig] ok ALTER TABLE []  -- every amount set to 0 by a rewrite (expect ok)
+[pg16] B50d   as-expected [mig] ok SELECT 1 [('0,0',)]  -- the values changed (expect has:0)
+[pg16] B50e   as-expected [mig] ok SELECT 1 [('b145f721bc9d6501dca25df504a7551a',)]  -- the capture digest is unchanged (expect same:B50a)
+[pg16] B50f   as-expected [mig] ok SELECT 0 []  -- the catalog check sees nothing (expect rows:0)
+[pg16] B50g   as-expected [mig] ok SELECT 0 []  -- the outbox has nothing of it (expect rows:0)
+[pg16] B50h   as-expected [mig] ok SELECT 2 [('16447', 'public.items', '16543', '1:id:23:false,2:title:25:false,3:amount:1700:false', None), ('16454', 'public.notes', '16454', '1:id:23:false,2:item:23:false,3:body:25:false', None)]  -- the structure digest shows the rewrite (a new filenode) (expect differs:B50b)
+[pg16] B50i   as-expected [mig] ok ROLLBACK []  --  (expect ok)
+[pg16] B51    as-expected [mig] ok BEGIN []  -- a table replaced under its own name (expect ok)
+[pg16] B51a   as-expected [mig] ok SELECT 2 [('16447', 'public.items', '16447', '1:id:23:false,2:title:25:false,3:amount:1700:false', None), ('16454', 'public.notes', '16454', '1:id:23:false,2:item:23:false,3:body:25:false', None)]  --  (expect ok)
+[pg16] B51b   as-expected [mig] ok SELECT 1 [('4',)]  --  (expect ok)
+[pg16] B51c   as-expected [mig] ok SELECT 0 []  -- the catalog check sees nothing (expect rows:0)
+[pg16] B51d   as-expected [mig] ok SELECT 2 [('16447', 'public.items', '16447', '1:id:23:false,2:title:25:false,3:amount:1700:false', None), ('16549', 'public.notes', '16549', '1:id:23:false,2:item:23:false,3:body:25:false', None)]  -- the structure digest shows a new table under the old name (expect differs:B51a)
+[pg16] B51e   as-expected [mig] ok ROLLBACK []  --  (expect ok)
+[pg16] steps not as expected: 0
+[pg16] counters at the start of a new transaction, before it did anything (left from earlier ones): public.c 10/0/0, public.cc 3/0/0, public.cp 2/0/0, public.ip 1/0/0, public.pt1 2/0/0, public.pt2 1/0/0
+[pg16] counters: change of n_tup_ins/upd/del (hot) in pg_stat_xact_user_tables during the case vs outbox insert/update/delete of the case
+[pg16]   plain insert, update 2, delete: public.c 1/2/1(0) vs 1/2/1 =
+[pg16]   insert in a savepoint rolled back: public.c 1/0/0(0) vs 0/0/0 MISMATCH
+[pg16]   insert in an EXCEPTION block that catches: public.c 1/0/0(0) vs 0/0/0 MISMATCH
+[pg16]   ON CONFLICT DO UPDATE on an existing key: public.c 0/1/0(1) vs 0/1/0 =
+[pg16]   ON CONFLICT DO NOTHING on an existing key: nothing counted, nothing captured
+[pg16]   delete with a cascade: public.cc 0/0/2(0) vs 0/0/2 =; public.cp 0/0/1(0) vs 0/0/1 =
+[pg16]   COPY of 3 rows: public.c 3/0/0(0) vs 3/0/0 =
+[pg16]   HOT update of an unindexed column: public.c 0/1/0(1) vs 0/1/0 =
+[pg16]   MERGE: update 1, insert 1, delete 1: public.c 1/1/1(1) vs 1/1/1 =
+[pg16]   update through the partitioned parent, within a partition: public.pt 0/0/0(0) vs 0/1/0 MISMATCH; public.pt1 0/1/0(1) vs 0/0/0 MISMATCH
+[pg16]   update moving a row to another partition: public.pt 0/0/0(0) vs 0/1/0 MISMATCH; public.pt1 0/0/1(0) vs 0/0/0 MISMATCH; public.pt2 1/0/0(0) vs 0/0/0 MISMATCH
+[pg16]   TRUNCATE (its refusing trigger dropped first): nothing counted, nothing captured
+[pg16]   ALTER COLUMN TYPE ... USING (a rewrite): nothing counted, nothing captured
+[pg16]   capture disabled, update 3 rows, enabled: public.c 0/3/0(0) vs 0/0/0 MISMATCH
+[pg16]   inheritance: a new child balances an uncaptured update of its parent: public.ic 1/1/0(1) vs 0/0/0 MISMATCH(new table); public.ip 0/1/0(1) vs 0/1/0 =
+[pg16]   counters after pg_stat_clear_snapshot() and pg_stat_force_next_flush(): public.c 0/1/0(0) vs 0/1/0 =
+[pg16] protocol | text | answer | status after | the earlier INSERT committed?
+[pg16]   simple | COMMIT; BEGIN | ok | intrans | YES
+[pg16]   simple | COMMIT AND CHAIN | ok | intrans | YES
+[pg16]   simple | END; START TRANSACTION | ok | intrans | YES
+[pg16]   simple | ROLLBACK AND CHAIN | ok | intrans | no
+[pg16]   simple | ABORT; BEGIN | ok | intrans | no
+[pg16]   simple | PREPARE TRANSACTION 'x'; BEGIN | 55000 prepared transactions are disabled | idle | no
+[pg16]   simple | SAVEPOINT a; RELEASE SAVEPOINT a | ok | intrans | no
+[pg16]   simple | DO $$ BEGIN COMMIT; END $$ | 2D000 invalid transaction termination | inerror | no
+[pg16]   simple | CREATE PROCEDURE public.p() LANGUAGE plpgsql AS $$ BEGIN COMMIT; END $$; CALL public.p() | 2D000 invalid transaction termination | inerror | no
+[pg16]   simple | SELECT query_to_xml('ALTER TABLE public.items DISABLE TRIGGER USER', true, true, '') | 0A000 ALTER TABLE is not allowed in a non-volatile function | inerror | no
+[pg16]   simple | SELECT query_to_xml('COMMIT', true, true, '') | 22000 invalid query | inerror | no
+[pg16]   extended | COMMIT | ok | idle | YES
+[pg16]   extended | COMMIT AND CHAIN | ok | intrans | YES
+[pg16]   extended | SELECT 1; COMMIT | 42601 cannot insert multiple commands into a prepared statement | inerror | no
+######## Postgres 16 (16.15.0), part c
+[pg16] ==== setup.sql
+[pg16] steps not as expected: 0
+[pg16] start: outbox 4, history 0; relay: 4 shipped; outbox 0, history 4
+[pg16] C1 outbox rows: before 0; seen by another session while the write is open 0; after ROLLBACK 0; after COMMIT 1
+[pg16] C2 relay while A is open shipped 1 (history now has change ids 8); after A commits shipped 1; history change_id:row = 7:501,8:502
+[pg16] C3 the same batch inserted twice: 'INSERT 0 1' then 'INSERT 0 0'; rows in history: 1
+[pg16] C4 relay said 'SHIPPED' and was killed (SIGKILL): history 3, outbox 3; relay again shipped 3: history 3, outbox 0
+[pg16] C5 platform database unreachable: connection refused; outbox keeps 1; reachable again: shipped 1, rows of it in history 1
+[pg16] C7 two relays read the same batch, insert ('INSERT 0 2', 'INSERT 0 0'), delete ('DELETE 2', 'DELETE 0'): rows in history 2, outbox 0
+[pg16] C6 a1_mig connects to platdb: refused (permission denied for database "platdb")
+[pg16] C6 a1_rt connects to platdb: refused (permission denied for database "platdb")
+[pg16] C6 a1_vm connects to platdb: refused (permission denied for database "platdb")
+[pg16] M1 UPDATE of 100,000 rows, median of 3: no capture 332.81 ms; today's vm.history capture 1444.05 ms (11.11 us/row over none); outbox capture (hardened) 1307.68 ms (9.75 us/row over none)
+[pg16] M1 INSERT of 100,000 rows, median of 3: no capture 356.82 ms; today's vm.history capture 1730.58 ms (13.74 us/row over none); outbox capture (hardened) 1364.46 ms (10.08 us/row over none)
+[pg16] M2 shipping 100000 changes (9115 kB of old+new jsonb text; 37901 KiB of batches sent), batches of at most 1000 rows / 8192 KiB: 100 batches, 5689.54 ms, 17,576 rows/s (read 1926.04 ms, insert+commit 2529.38 ms, delete+commit 1227.38 ms)
+[pg16] M2 shipping 100000 changes (9115 kB of old+new jsonb text; 37999 KiB of batches sent), batches of at most 10000 rows / 8192 KiB: 10 batches, 10648.63 ms, 9,391 rows/s (read 1592.72 ms, insert+commit 6456.00 ms, delete+commit 2594.25 ms)
+[pg16] M2 shipping 100000 changes (9115 kB of old+new jsonb text; 37971 KiB of batches sent), batches of at most 10000 rows / 256 KiB: 36 batches, 5156.20 ms, 19,394 rows/s (read 1957.17 ms, insert+commit 2121.36 ms, delete+commit 1077.51 ms)
+[pg16] M3 single-row write (BEGIN, attach, UPDATE, COMMIT): median 4.03 ms, p95 4.57 ms; then shipping it (read, insert+commit in platdb, delete+commit in a1): median 15.49 ms, p95 18.38 ms; 200 runs, fsync on, data directory on disk
+######## Postgres 16 (16.15.0), part d
+[pg16] ==== setup.sql
+[pg16] steps not as expected: 0
+[pg16] D1 4 rows x 22 columns shaped from history as a1_rt, read-only; values that differ from select(): 2
+[pg16]     row 1 js: select() '{"b": 1,  "a": [1, "x"], "a": 2}' / history '{"a": 2, "b": 1}'
+[pg16]     row 2 jb: select() 'null' / history None
+[pg16] D2 after ADD added, RENAME tx TO tx2, DROP vc: ok=True; columns 22 ('vc' present: False); row 1 added=None tx2=None
+[pg16] D2 after u uuid -> integer: a read holding an old uuid fails whole: ERROR 22P02 invalid input syntax for type integer: "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"
+[pg16] D2 the same read without those rows: ok=True, 3 rows
+[pg16] D3 1000 rows (572 KiB of jsonb[] text): fetch from platdb median 5.8 ms, shape in a1 (BEGIN READ ONLY, SET LOCAL, query, COMMIT) median 31.7 ms; 20 runs
+[pg16] D4 k_int: stored {"id": 7}; given {"id": 7}: matches as given 1; shaped in a1 under Tokyo time {"id": 7} matches 1; under UTC {"id": 7} matches 1
+[pg16] D4 k_big: stored {"id": 9007199254740993}; given {"id": "9007199254740993"}: matches as given 0; shaped in a1 under Tokyo time {"id": 9007199254740993} matches 1; under UTC {"id": 9007199254740993} matches 1
+[pg16] D4 k_num: stored {"id": 1.50}; given {"id": "1.5"}: matches as given 0; shaped in a1 under Tokyo time {"id": 1.5} matches 1; under UTC {"id": 1.5} matches 1
+[pg16] D4 k_tz: stored {"id": "2026-11-12T10:00:00+00:00"}; given {"id": "2026-11-12T10:00:00.000Z"}: matches as given 0; shaped in a1 under Tokyo time {"id": "2026-11-12T19:00:00+09:00"} matches 0; under UTC {"id": "2026-11-12T10:00:00+00:00"} matches 1
+[pg16] D4 k_uuid: stored {"id": "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"}; given {"id": "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"}: matches as given 1; shaped in a1 under Tokyo time {"id": "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"} matches 1; under UTC {"id": "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"} matches 1
+[pg16] D5 a row (1, 'just t', 5) of a table with a column named t is recorded as: outbox design "just t"; today's crates/vm/src/own_db_schema.sql "just t"
+[pg16] D5 today's capture, writer with extra_float_digits -15, TimeZone Pacific/Chatham, IntervalStyle sql_standard, row (1, 0.1234567890123, 2026-11-12 10:00:00+00, 1 year 2 mons -3 days 04:05:06) recorded as {"d": 0.1, "z": "2026-11-12T23:45:00+13:45", "id": 1, "iv": "+1-2 -3 +4:05:06"}
+[pg16] D5 with to_jsonb(vm_row.*) over FROM vm_new vm_row: columns t and vm_row text: {"t": "just t", "id": 1, "vm_row": "just vm_row"}; a composite column named vm_row: {"id": 1, "vm_row": {"a": 1, "b": 2}}
+######## Postgres 16 (16.15.0), part e
+[pg16] ==== setup.sql
+[pg16] steps not as expected: 0
+[pg16] ==== e-alternatives.sql
+[pg16] E01    as-expected [plat] ok SELECT 1 [('replica', '10', '10', '0')]  -- defaults that matter (expect has:replica)
+[pg16] E02    as-expected [plat] ERROR 42501 permission denied to create role  -- a CREATEROLE role creates a role with REPLICATION (expect err:42501)
+[pg16] E03    as-expected [plat] ERROR 42501 permission denied to alter role  -- or gives it to a role it made (expect err:42501)
+[pg16] E04    as-expected [plat] ERROR 42501 permission denied to create role  -- BYPASSRLS likewise (expect err:42501)
+[pg16] E05    as-expected [plat] ERROR 42501 permission denied to set parameter "wal_level"  -- nor can it change wal_level (expect err:42501)
+[pg16] E06    as-expected [plat] ERROR 42501 permission denied to use replication slots  -- a logical slot without REPLICATION (expect err:42501)
+[pg16] E07    as-expected [vm] ERROR 42501 must be superuser to create FOR ALL TABLES publication  -- the database's owner: a publication of all tables (expect err:42501)
+[pg16] E08    as-expected [vm] ERROR 42501 must be superuser to create FOR TABLES IN SCHEMA publication  -- or of every table in a schema (expect err:42501)
+[pg16] E09    as-expected [mig] ok ROLLBACK [] NOTICES WARNING:  wal_level is insufficient to publish logical changes HINT:  Set wal_level to "logical" before creating subscriptions.  -- a table's owner: a publication of its table (with a warning about wal_level) (expect ok)
+[pg16] E10    as-expected [mig] ok ROLLBACK []  -- a table's owner sets its replica identity (expect ok)
+[pg16] E11    as-expected [mig] ok SELECT 1 [('t',)]  -- anyone may write a message into the WAL (expect ok)
+[pg16] E12    as-expected [rt] ok SELECT 1 [('t',)]  -- the runtime role too (expect ok)
+[pg16] E13    as-expected [su] ERROR 55000 prepared transactions are disabled  -- two-phase commit, even for the superuser, under the defaults (expect err:55000)
+[pg16] steps not as expected: 0
+[pg16] ==== setup.sql
+[pg16] steps not as expected: 0
+[pg16] ==== e-logical.sql
+[pg16] L01    as-expected [su] ok SELECT 1 [('t',)]  -- a logical slot in the own database (superuser) (expect ok)
+[pg16] L02    as-expected [mig] ok BEGIN []  -- a migration with the capture switched off, a table unlogged, a replica identity of nothing (expect ok)
+[pg16] L03    as-expected [mig] ok COMMIT []  --  (expect ok)
+[pg16] L04    as-expected [su] ok SELECT 1 [('BEGIN 741 || table public.items: UPDATE: id[integer]:2 title[text]:\'triggers off\' amount[numeric]:20 || table public.items: DELETE: (no-tuple-data) || message: transactional: 1 prefix: vm, sz: 21 content:{...  -- what the slot saw (the vm.outbox rows of the capture left out) (expect any)
+[pg16] L05    as-expected [su] ok SELECT 1 [('f',)]  --  (expect ok)
+[pg16] L06    as-expected [mig] ok BEGIN []  -- with max_prepared_transactions set, a migration can detach its transaction (expect ok)
+[pg16] L06a   as-expected [mig] ok PREPARE TRANSACTION []  --  (expect ok)
+[pg16] L06b   as-expected [mig] status idle  -- transaction status (expect idle)
+[pg16] L07    as-expected [mig] ok COMMIT PREPARED []  -- and commit it later itself (expect ok)
+[pg16] steps not as expected: 0
+######## Postgres 17 (17.11.0), part a
+[pg17] ==== setup.sql
+[pg17] steps not as expected: 0
+[pg17] ==== a-attacks.sql
+[pg17] F0     as-expected [vm] ok SELECT 1 [('70753ef4bde75cde2f904e828d59f0a2', '4:730fa7ca36d99762342e9329634aa6a4', 'e1fd518b2cc7f7af8f588d299f08bbf9', 'keys:a1_vm:{a1_vm=arwdDxtm/a1_vm},keys_pkey:a1_vm:,migrations:a1_vm:{a1_vm=arwdDxtm/a1_vm},migrat...  -- fingerprint of vm before (expect ok)
+[pg17] A01    as-expected [mig] ERROR 42501 permission denied for table keys  -- read the keys (expect err:42501)
+[pg17] A02    as-expected [mig] ERROR 42501 permission denied for table outbox  -- read the outbox (expect err:42501)
+[pg17] A03    as-expected [mig] ERROR 42501 permission denied for table outbox  -- write the outbox (expect err:42501)
+[pg17] A04    as-expected [mig] ERROR 42501 permission denied for table outbox  -- update the outbox (expect err:42501)
+[pg17] A05    as-expected [mig] ERROR 42501 permission denied for table outbox  -- delete from the outbox (expect err:42501)
+[pg17] A06    as-expected [mig] ERROR 42501 permission denied for table outbox  -- truncate the outbox (expect err:42501)
+[pg17] A07    as-expected [mig] ERROR 42501 permission denied for sequence outbox_id_seq  -- the outbox's sequence (expect err:42501)
+[pg17] A08    as-expected [mig] ERROR 42501 permission denied for table outbox (rolled back)  -- lock the outbox (expect err:42501)
+[pg17] A09    as-expected [mig] ERROR 42501 permission denied for table migrations  -- read the record of migrations (expect err:42501)
+[pg17] A10    as-expected [mig] ERROR 42501 permission denied for schema vm  -- replace a vm function (expect err:42501)
+[pg17] A11    as-expected [mig] ERROR 42501 must be owner of function vm.capture  -- drop a vm function (expect err:42501)
+[pg17] A12    as-expected [mig] ERROR 42501 must be owner of function capture  -- take a vm function over (expect err:42501)
+[pg17] A13    as-expected [mig] ERROR 42501 must be owner of function vm.capture  -- change a vm function's settings (expect err:42501)
+[pg17] A14    as-expected [mig] ERROR 42501 permission denied for function attached  -- call the identity check directly (expect err:42501)
+[pg17] A15    as-expected [mig] ERROR 42501 permission denied for schema vm  -- create a table in vm (expect err:42501)
+[pg17] A16    as-expected [mig] ERROR 42501 permission denied for schema vm  -- create a function in vm (expect err:42501)
+[pg17] A17    as-expected [mig] ERROR 42501 permission denied for schema vm  -- move an own table into vm (expect err:42501)
+[pg17] A18    as-expected [mig] ERROR 42501 must be owner of table outbox  -- a view or rule on the outbox (expect err:42501)
+[pg17] A19    as-expected [mig] ERROR 42501 permission denied for table outbox  -- a trigger on the outbox (expect err:42501)
+[pg17] A20    as-expected [mig] ERROR 42501 must be owner of table outbox  -- a child table of the outbox (expect err:42501)
+[pg17] A21    as-expected [mig] ERROR 42501 must be owner of schema vm  -- rename schema vm (expect err:42501)
+[pg17] A22    as-expected [mig] ERROR 42501 must be owner of schema vm  -- take schema vm over (expect err:42501)
+[pg17] A23    as-expected [mig] ERROR 42501 must be owner of schema vm  -- drop schema vm (expect err:42501)
+[pg17] A24    as-expected [mig] ERROR 42501 must be owner of schema vm  -- comment on schema vm (expect err:42501)
+[pg17] A25    as-expected [mig] ERROR 42501 permission denied to reassign objects  -- reassign what a1_vm owns (expect err:42501)
+[pg17] A26    as-expected [mig] ERROR 42501 permission denied to drop objects  -- drop what a1_vm owns (expect err:42501)
+[pg17] A27    as-expected [mig] ERROR 42501 permission denied to set role "a1_vm"  -- become a1_vm (expect err:42501)
+[pg17] A28    as-expected [mig] ERROR 42501 permission denied to set session authorization "a1_vm"  -- become a1_vm by session (expect err:42501)
+[pg17] A29    as-expected [mig] ERROR 42501 permission denied to set role "a1_vm"  -- become a1_vm by setting (expect err:42501)
+[pg17] A30    as-expected [mig] ERROR 42501 permission denied to change default privileges  -- default privileges of a1_vm (expect err:42501)
+[pg17] A31    as-expected [mig] ERROR 42501 permission denied for table keys  -- grant itself the keys (expect err:42501)
+[pg17] A32    as-expected [mig] ERROR 42501 permission denied to grant role "a1_vm"  -- grant itself a1_vm (expect err:42501)
+[pg17] A33    as-expected [mig] ERROR 42501 permission denied to grant role "a1_mig"  -- grant itself to the runtime role (expect err:42501)
+[pg17] A34    as-expected [mig] ERROR 42501 permission denied to revoke role "a1_mig"  -- take a1_vm's membership in a1_mig away (expect err:42501)
+[pg17] A35    as-expected [mig] ERROR 42501 must be owner of database a1  -- settings of the database (expect err:42501)
+[pg17] A36    as-expected [mig] ERROR 42501 must be owner of database a1  -- take the database over (expect err:42501)
+[pg17] A37    as-expected [mig] ERROR 42501 must be owner of database a1  -- rename the database (expect err:42501)
+[pg17] A38    as-expected [mig] ERROR 42501 permission denied to alter role  -- another role's attributes (expect err:42501)
+[pg17] A39    as-expected [mig] ERROR 42501 permission denied to alter role  -- its own attributes: CREATEROLE (expect err:42501)
+[pg17] A40    as-expected [mig] ERROR 42501 permission denied to alter role  -- its own attributes: VALID UNTIL (expect err:42501)
+[pg17] A41    as-expected [mig] ERROR 42501 permission denied to create role  -- create a role (expect err:42501)
+[pg17] A42    as-expected [mig] ok ROLLBACK []  -- its own settings (session defaults of its own logins) (expect ok)
+[pg17] A43    as-expected [mig] ok ALTER ROLE []  -- its own password (committed; see L1) (expect ok)
+[pg17] L1     as-expected logged in  -- log in as a1_mig (expect ok)
+[pg17] A44    as-expected [plat] ok ALTER ROLE []  -- the platform's role sets it back (expect ok)
+[pg17] A44a   as-expected [plat] ok ALTER ROLE []  -- the platform's role can take the login away between migrations (expect ok)
+[pg17] A44b   as-expected [mig] ok ALTER ROLE []  -- a1_mig's open session may still change its password (expect ok)
+[pg17] L2     as-expected refused: connection to server at "127.0.0.1", port 40629 failed: FATAL:  role "a1_mig" is not permitted to log in  -- log in as a1_mig (expect err)
+[pg17] A44c   as-expected [mig] ERROR 42501 permission denied to alter role  -- nor give itself the login back (expect err:42501)
+[pg17] A44d   as-expected [rt] ok ROLLBACK []  -- the runtime role can change its own password too (expect ok)
+[pg17] A44e   as-expected [plat] ok ALTER ROLE []  -- back to the scenario's login (expect ok)
+[pg17] A45    as-expected [mig] ERROR 42501 permission denied to set parameter "session_replication_role"  -- session_replication_role (expect err:42501)
+[pg17] A46    as-expected [mig] ERROR 42501 permission denied to create temporary tables in database "a1"  -- temporary objects (expect err:42501)
+[pg17] A47    as-expected [mig] ERROR 42501 permission denied to create extension "dblink"  -- extension not trusted (expect err:42501)
+[pg17] A48    as-expected [mig] ok CREATE EXTENSION []  -- a trusted extension into vm: allowed (its script runs as the bootstrap superuser) (expect ok)
+[pg17] A48a   as-expected [mig] ok SELECT 1 [('a1_mig', '60', 'postgres')]  -- what it put there is the superuser's, the extension a1_mig's (expect has:postgres)
+[pg17] A48b   as-expected [mig] ERROR 42501 must be owner of function vm.capture (rolled back)  -- add vm.capture() to its extension (to drop it with the extension) (expect err:42501)
+[pg17] A48c   as-expected [mig] ERROR 42501 permission denied for schema vm (rolled back)  -- replace a function the extension put in vm (expect err:42501)
+[pg17] A48d   as-expected [mig] ok SELECT 85 [('extension hstore is in schema vm',), ("function vm.hstore_in(cstring) in schema vm is not the platform's",), ("function vm.hstore_out(vm.hstore) in schema vm is not the platform's",)]  -- the check names it (expect has:extension)
+[pg17] A48e   as-expected [mig] ok ROLLBACK []  --  (expect ok)
+[pg17] A49    as-expected [mig] ok ROLLBACK []  -- a trusted extension into public (expect ok)
+[pg17] A50    as-expected [mig] ERROR 42501 permission denied to create extension "plpython3u"  -- an untrusted language (expect err:42501)
+[pg17] A51    as-expected [mig] ERROR 42501 permission denied to create event trigger "et"  -- an event trigger (expect err:42501)
+[pg17] A52    as-expected [mig] ERROR 42501 must be superuser to create FOR ALL TABLES publication  -- a publication of every table (expect err:42501)
+[pg17] A53    as-expected [mig] ERROR 42501 permission denied to terminate process  -- end a1_vm's sessions (expect err:42501)
+[pg17] A54    as-expected [mig] ERROR 42501 permission denied for function pg_stat_reset  -- reset the statistics counters (expect err:42501)
+[pg17] A55    as-expected [mig] ERROR 42501 permission denied for function pg_stat_reset_single_table_counters  -- reset one table's counters (expect err:42501)
+[pg17] A56    as-expected [mig] ERROR 42501 permission denied for function pg_read_file  -- server files (expect err:42501)
+[pg17] A57    as-expected [mig] ERROR 42501 must be able to SET ROLE "a1_vm"  -- give its table to a1_vm (expect err:42501)
+[pg17] A58    as-expected [mig] ERROR 42501 permission denied for function vm.capture  -- a capture trigger of its own (no EXECUTE on vm.capture) (expect err:42501)
+[pg17] A59    as-expected [mig] ERROR 42501 permission denied for function vm.capture  -- replace the capture trigger with old and new swapped (expect err:42501)
+[pg17] A60    as-expected [mig] ok ROLLBACK []  -- disable a capture trigger on its own table (owner's right) (expect ok)
+[pg17] A61    as-expected [mig] ok ROLLBACK []  -- drop a capture trigger on its own table (owner's right) (expect ok)
+[pg17] A62    as-expected [mig] ok ROLLBACK []  -- make a capture trigger fire only on replicas (owner's right) (expect ok)
+[pg17] A63    as-expected [mig] ok ROLLBACK []  -- rename a capture trigger (owner's right) (expect ok)
+[pg17] A64    as-expected [mig] ERROR VM002 TRUNCATE of public.notes is refused: its Change history would lose rows  -- truncate a captured table (expect err:VM002)
+[pg17] A65    as-expected [mig] ok ROLLBACK []  -- its table unlogged (owner's right; the capture still fires) (expect ok)
+[pg17] A66    as-expected [mig] ok ROLLBACK [] NOTICES WARNING:  no privileges could be revoked for "a1" | WARNING:  no privileges could be revoked for "public" | WARNING:  no privileges could be revoked for "vm" | WARNING:  no privileges could be revok...  -- drop all it owns (owner's right; drops every table, unrecorded) (expect ok)
+[pg17] A67    as-expected [mig] ERROR 42P06 schema "vm" already exists  -- a schema named like vm (expect err:42P06)
+[pg17] A68    as-expected [mig] ERROR 42939 unacceptable schema name "pg_vm"  -- a schema in the reserved pg_ names (expect err:42939)
+[pg17] A70    as-expected [mig] ok SET []  -- shadows of what the capture calls, then a captured write (expect ok)
+[pg17] A71    as-expected [mig] ok SELECT 0 []  --  (expect ok)
+[pg17] A72    as-expected [vm] ok SELECT 0 []  -- the outbox is unaffected by the shadows (row not committed: none seen; see A73) (expect lacks:forged)
+[pg17] A73    as-expected [mig] ok COMMIT []  -- commit the shadow test (expect ok)
+[pg17] A74    as-expected [vm] ok SELECT 1 [('update', '{"id": 2, "title": "shadowed", "amount": 20}', 't')]  -- the update was captured with the real functions (expect has:shadowed)
+[pg17] A75    as-expected [mig] ok DROP FUNCTION []  -- drop the shadows again (expect ok)
+[pg17] F1     as-expected [vm] ok SELECT 1 [('70753ef4bde75cde2f904e828d59f0a2', '5:639ae9a3d672900690c847be9135e877', 'e1fd518b2cc7f7af8f588d299f08bbf9', 'keys:a1_vm:{a1_vm=arwdDxtm/a1_vm},keys_pkey:a1_vm:,migrations:a1_vm:{a1_vm=arwdDxtm/a1_vm},migrat...  -- fingerprint after the one committed write of A71 (expect ok)
+[pg17] A80    as-expected [mig] ok SELECT 1 [('8',)]  -- a cast to json for an enum of its own (expect ok)
+[pg17] A81    as-expected [mig] ok SELECT 2 [('a1_vm', 'keys 128 hex digits'), ('a1_vm', 'deleted 6 outbox rows')]  -- a captured write runs a1_mig's cast function as a1_vm (expect has:a1_vm)
+[pg17] A82    as-expected [mig] ok SELECT 1 [('cast public.mood -> json runs user code where to_jsonb looks',)]  -- the check names the cast (expect has:cast)
+[pg17] A83    as-expected [mig] ok ROLLBACK []  -- roll it back (expect ok)
+[pg17] A84    as-expected [mig] ok SELECT 1 [('8',)]  -- the same with a cast to jsonb (expect ok)
+[pg17] A85    as-expected [mig] ok SELECT 0 []  -- a captured write with a cast to jsonb only (expect any)
+[pg17] A86    as-expected [mig] ok ROLLBACK []  -- roll it back (expect ok)
+[pg17] A86h   as-expected [vm] ok ALTER FUNCTION []  -- file hardening.sql (expect ok)
+[pg17] A86i   as-expected [mig] ok SELECT 1 [('8',)]  -- the trojan again (expect ok)
+[pg17] A86j   as-expected [mig] ERROR VM003 a cast to json of a type of the Application exists: the capture refuses to run it (rolled back)  -- hardened: the capture refuses before converting (expect err:VM003)
+[pg17] A86k   as-expected [mig] ok CREATE CAST []  -- a write to a table without the enum: refused too (the guard is global) (expect ok)
+[pg17] A86l   as-expected [mig] ERROR VM003 a cast to json of a type of the Application exists: the capture refuses to run it (rolled back)  --  (expect err:VM003)
+[pg17] A86m   as-expected [mig] ok CREATE EXTENSION []  -- an extension's C cast (hstore in public) does not trip the guard (expect ok)
+[pg17] A86n   as-expected [mig] ok ROLLBACK []  --  (expect ok)
+[pg17] F2     as-expected [vm] ok SELECT 1 [('70753ef4bde75cde2f904e828d59f0a2', '5:639ae9a3d672900690c847be9135e877', '6539c45e36f5e0231aec1dd4fcc587fa', 'keys:a1_vm:{a1_vm=arwdDxtm/a1_vm},keys_pkey:a1_vm:,migrations:a1_vm:{a1_vm=arwdDxtm/a1_vm},migrat...  -- fingerprint after hardening (expect ok)
+[pg17] A87    as-expected [mig] ok CREATE SEQUENCE []  -- a sequence keeps what a rolled-back transaction wrote into it (expect ok)
+[pg17] A87a   as-expected [mig] ok ROLLBACK []  --  (expect ok)
+[pg17] A88    as-expected [mig] ok SELECT 1 [('424242',)]  -- the value outlived the rollback (expect has:424242)
+[pg17] A90    as-expected [mig] ok SELECT 1 [('4',)]  -- a table full of a1_mig's code (expect ok)
+[pg17] A91    as-expected [mig] ok DELETE 1 [] NOTICES NOTICE:  spy ran as a1_mig | NOTICE:  spy ran as a1_mig | NOTICE:  policy ran as a1_mig | NOTICE:  spy ran as a1_mig | NOTICE:  spy ran as a1_mig | NOTICE:  trigger ran as a1_mig | NOTICE:  policy r...  -- a write: none of it runs as a1_vm (expect nonotice:a1_vm)
+[pg17] A92    as-expected [mig] ok ROLLBACK []  -- roll it back (expect ok)
+[pg17] F9     as-expected [vm] ok SELECT 1 [('70753ef4bde75cde2f904e828d59f0a2', '5:639ae9a3d672900690c847be9135e877', '6539c45e36f5e0231aec1dd4fcc587fa', 'keys:a1_vm:{a1_vm=arwdDxtm/a1_vm},keys_pkey:a1_vm:,migrations:a1_vm:{a1_vm=arwdDxtm/a1_vm},migrat...  -- fingerprint of vm after: unchanged since F2 (F1 differs from F0 in the outbox only, F2 from F1 in the functions only) (expect same:F2)
+[pg17] steps not as expected: 0
+######## Postgres 17 (17.11.0), part b
+[pg17] ==== setup.sql
+[pg17] steps not as expected: 0
+[pg17] ==== b-checks.sql
+[pg17] B00    as-expected [vm] ok ALTER FUNCTION []  -- file hardening.sql (expect ok)
+[pg17] B00a   as-expected [vm] ok GRANT []  -- a digest of every table's structure (for B5) (expect ok)
+[pg17] B10    as-expected [mig] ok BEGIN []  -- begin (expect ok)
+[pg17] B11    as-expected [mig] ok SELECT 1 [('6cc608db39062d99a0c001a64935a84c',)]  -- the digest before the migration's statements (expect ok)
+[pg17] B12    as-expected [mig] ok SELECT 0 []  -- disable, update, enable: the final catalog looks whole (expect rows:0)
+[pg17] B13    as-expected [mig] ok SELECT 1 [('a3652c3816f959d619737f2b37bb6b9c',)]  -- the digest is not the same (expect differs:B11)
+[pg17] B14    as-expected [mig] ok ROLLBACK []  --  (expect ok)
+[pg17] B15    as-expected [mig] ok BEGIN []  -- the same inside a released savepoint (expect ok)
+[pg17] B15a   as-expected [mig] ok SELECT 1 [('6cc608db39062d99a0c001a64935a84c',)]  --  (expect ok)
+[pg17] B15b   as-expected [mig] ok RELEASE []  --  (expect ok)
+[pg17] B15c   as-expected [mig] ok SELECT 1 [('13ffc57e4646dc20cd6898c9ace86a34',)]  -- digest differs (expect differs:B15a)
+[pg17] B15d   as-expected [mig] ok ROLLBACK []  --  (expect ok)
+[pg17] B16    as-expected [mig] ok BEGIN []  -- inside a savepoint rolled back: nothing changed, digest equal (expect ok)
+[pg17] B16a   as-expected [mig] ok SELECT 1 [('6cc608db39062d99a0c001a64935a84c',)]  --  (expect ok)
+[pg17] B16b   as-expected [mig] ok ROLLBACK []  --  (expect ok)
+[pg17] B16c   as-expected [mig] ok SELECT 1 [('6cc608db39062d99a0c001a64935a84c',)]  -- digest equal (expect same:B16a)
+[pg17] B16d   as-expected [mig] ok SELECT 1 [('11',)]  -- and the update did not happen (expect has:11)
+[pg17] B16e   as-expected [mig] ok ROLLBACK []  --  (expect ok)
+[pg17] B17    as-expected [mig] ok CREATE TRIGGER []  -- a trigger of the same name calling its own function (expect ok)
+[pg17] B17a   as-expected [mig] ok SELECT 1 [('public.items: vm_capture_update missing, disabled or altered',)]  -- the catalog check names it (expect has:vm_capture_update)
+[pg17] B17b   as-expected [mig] ok ROLLBACK []  --  (expect ok)
+[pg17] B18    as-expected [mig] ok BEGIN []  -- rename the trigger away and back (expect ok)
+[pg17] B18a   as-expected [mig] ok SELECT 1 [('6cc608db39062d99a0c001a64935a84c',)]  --  (expect ok)
+[pg17] B18b   as-expected [mig] ok SELECT 1 [('97920e0d47b1eadfd0d76662269c81ab',)]  --  (expect differs:B18a)
+[pg17] B18c   as-expected [mig] ok ROLLBACK []  --  (expect ok)
+[pg17] B19    as-expected [mig] ok BEGIN []  -- ordinary migrations leave the digest alone (expect ok)
+[pg17] B19a   as-expected [mig] ok SELECT 1 [('6cc608db39062d99a0c001a64935a84c',)]  --  (expect ok)
+[pg17] B19b   as-expected [mig] ok SELECT 1 [('6cc608db39062d99a0c001a64935a84c',)]  -- add, retype, rename, constrain, index, drop a column; rename and move the table (expect same:B19a)
+[pg17] B19c   as-expected [mig] ok ROLLBACK []  --  (expect ok)
+[pg17] B20    as-expected [mig] ok DROP TRIGGER []  --  (expect ok)
+[pg17] B20a   as-expected [mig] ok SELECT 1 [('public.items: vm_capture_delete missing, disabled or altered',)]  -- the check still sees it (expect has:vm_capture_delete)
+[pg17] B20b   as-expected [mig] ok ROLLBACK []  --  (expect ok)
+[pg17] B30    as-expected [mig] ok BEGIN []  -- a deferred constraint trigger that switches the capture off at commit (expect ok)
+[pg17] B30a   as-expected [mig] ok UPDATE 1 []  --  (expect ok)
+[pg17] B30b   as-expected [mig] ok SELECT 1 [('public.items: deferrable trigger sneak',)]  -- the catalog check names the deferrable trigger (expect has:deferrable)
+[pg17] B30c   as-expected [mig] ok SELECT 1 [('6cc608db39062d99a0c001a64935a84c',)]  -- the digest before COMMIT (expect ok)
+[pg17] B30d   as-expected [mig] ok DROP TRIGGER []  -- drop the trigger, its event still queued (expect ok)
+[pg17] B30e   as-expected [mig] ok SELECT 0 []  -- now the catalog check sees nothing wrong (expect rows:0)
+[pg17] B30f   as-expected [mig] ok SELECT 1 [('6cc608db39062d99a0c001a64935a84c',)]  -- and the digest is unchanged (expect same:B30c)
+[pg17] B30g   as-expected [mig] ok COMMIT []  -- COMMIT: does the dropped trigger's event still run? (expect any)
+[pg17] B30h   as-expected [vm] ok SELECT 1 [('note', '0')]  -- the notes after that commit, and their outbox rows (expect any)
+[pg17] B31    as-expected [mig] ok BEGIN []  -- the same, the trigger kept: it runs at COMMIT, after the check (expect ok)
+[pg17] B31a   as-expected [mig] ok UPDATE 1 []  --  (expect ok)
+[pg17] B31b   as-expected [mig] ok COMMIT []  -- COMMIT (expect any)
+[pg17] B31c   as-expected [vm] ok SELECT 1 [('changed at commit', '0')]  -- the notes after that commit, and their outbox rows (expect any)
+[pg17] B31d   as-expected [mig] ok BEGIN []  -- put the note back, recorded (expect ok)
+[pg17] B31e   as-expected [mig] ok COMMIT []  --  (expect ok)
+[pg17] B32    as-expected [mig] ok BEGIN []  -- with SET CONSTRAINTS ALL IMMEDIATE before the check, it runs before the check (expect ok)
+[pg17] B32a   as-expected [mig] ok SELECT 1 [('81a49ae00e63257e383f6f5a124cff23',)]  --  (expect ok)
+[pg17] B32b   as-expected [mig] ok SET CONSTRAINTS []  --  (expect ok)
+[pg17] B32c   as-expected [mig] ok SELECT 1 [('b2562fcda6190e47cbaf53362f1f3468',)]  -- the digest shows it (expect differs:B32a)
+[pg17] B32d   as-expected [mig] ok ROLLBACK []  --  (expect ok)
+[pg17] B33    as-expected [mig] ok BEGIN []  -- a cursor WITH HOLD whose query runs at COMMIT (expect ok)
+[pg17] B33a   as-expected [mig] ok DECLARE CURSOR []  --  (expect ok)
+[pg17] B33b   as-expected [mig] ok SELECT 1 [('81a49ae00e63257e383f6f5a124cff23',)]  -- the digest before COMMIT (expect ok)
+[pg17] B33c   as-expected [mig] ok SELECT 0 []  -- the check sees nothing (expect rows:0)
+[pg17] B33d   as-expected [mig] ok COMMIT []  -- COMMIT (expect any)
+[pg17] B33e   as-expected [vm] ok SELECT 1 [('changed by a cursor at commit', '0')]  -- the notes after that commit, and their outbox rows (expect any)
+[pg17] B33f   as-expected [mig] ok BEGIN []  --  (expect ok)
+[pg17] B33g   as-expected [mig] ok COMMIT []  --  (expect ok)
+[pg17] B34    as-expected [mig] ok BEGIN []  -- with CLOSE ALL before the check, the cursor's query never runs (expect ok)
+[pg17] B34a   as-expected [mig] ok COMMIT []  --  (expect ok)
+[pg17] B34b   as-expected [vm] ok SELECT 1 [('note',)]  -- the note is unchanged (expect has:note)
+[pg17] B40    as-expected [mig] ERROR VM002 TRUNCATE of public.items is refused: its Change history would lose rows NOTICES NOTICE:  truncate cascades to table "notes"  -- TRUNCATE ... CASCADE through a captured table (expect err:VM002)
+[pg17] B41    as-expected [mig] ok BEGIN []  -- partitions: captured parent and partition (expect ok)
+[pg17] B41a   as-expected [mig] ok INSERT 0 2 []  --  (expect ok)
+[pg17] B41b   as-expected [mig] ERROR VM002 TRUNCATE of public.p is refused: its Change history would lose rows (rolled back)  -- TRUNCATE of the parent (expect err:VM002)
+[pg17] B41c   as-expected [mig] ok BEGIN [] NOTICES WARNING:  there is no transaction in progress  --  (expect ok)
+[pg17] B41d   as-expected [mig] ok DROP TRIGGER []  --  (expect ok)
+[pg17] B41e   as-expected [mig] ERROR VM002 TRUNCATE of public.p1 is refused: its Change history would lose rows (rolled back)  -- TRUNCATE of the parent without its own trigger: the partition's fires (expect err:VM002)
+[pg17] B41f   as-expected [mig] ok ROLLBACK [] NOTICES WARNING:  there is no transaction in progress  --  (expect ok)
+[pg17] B50    as-expected [mig] ok BEGIN []  --  (expect ok)
+[pg17] B50a   as-expected [mig] ok SELECT 1 [('5b241f16013c5b75c4ee710f412404ea',)]  --  (expect ok)
+[pg17] B50b   as-expected [mig] ok SELECT 2 [('16447', 'public.items', '16447', '1:id:23:false,2:title:25:false,3:amount:1700:false', None), ('16454', 'public.notes', '16454', '1:id:23:false,2:item:23:false,3:body:25:false', None)]  --  (expect ok)
+[pg17] B50c   as-expected [mig] ok ALTER TABLE []  -- every amount set to 0 by a rewrite (expect ok)
+[pg17] B50d   as-expected [mig] ok SELECT 1 [('0,0',)]  -- the values changed (expect has:0)
+[pg17] B50e   as-expected [mig] ok SELECT 1 [('5b241f16013c5b75c4ee710f412404ea',)]  -- the capture digest is unchanged (expect same:B50a)
+[pg17] B50f   as-expected [mig] ok SELECT 0 []  -- the catalog check sees nothing (expect rows:0)
+[pg17] B50g   as-expected [mig] ok SELECT 0 []  -- the outbox has nothing of it (expect rows:0)
+[pg17] B50h   as-expected [mig] ok SELECT 2 [('16447', 'public.items', '16543', '1:id:23:false,2:title:25:false,3:amount:1700:false', None), ('16454', 'public.notes', '16454', '1:id:23:false,2:item:23:false,3:body:25:false', None)]  -- the structure digest shows the rewrite (a new filenode) (expect differs:B50b)
+[pg17] B50i   as-expected [mig] ok ROLLBACK []  --  (expect ok)
+[pg17] B51    as-expected [mig] ok BEGIN []  -- a table replaced under its own name (expect ok)
+[pg17] B51a   as-expected [mig] ok SELECT 2 [('16447', 'public.items', '16447', '1:id:23:false,2:title:25:false,3:amount:1700:false', None), ('16454', 'public.notes', '16454', '1:id:23:false,2:item:23:false,3:body:25:false', None)]  --  (expect ok)
+[pg17] B51b   as-expected [mig] ok SELECT 1 [('4',)]  --  (expect ok)
+[pg17] B51c   as-expected [mig] ok SELECT 0 []  -- the catalog check sees nothing (expect rows:0)
+[pg17] B51d   as-expected [mig] ok SELECT 2 [('16447', 'public.items', '16447', '1:id:23:false,2:title:25:false,3:amount:1700:false', None), ('16549', 'public.notes', '16549', '1:id:23:false,2:item:23:false,3:body:25:false', None)]  -- the structure digest shows a new table under the old name (expect differs:B51a)
+[pg17] B51e   as-expected [mig] ok ROLLBACK []  --  (expect ok)
+[pg17] steps not as expected: 0
+[pg17] counters at the start of a new transaction, before it did anything (left from earlier ones): public.c 10/0/0, public.cc 3/0/0, public.cp 2/0/0, public.ip 1/0/0, public.pt1 2/0/0, public.pt2 1/0/0
+[pg17] counters: change of n_tup_ins/upd/del (hot) in pg_stat_xact_user_tables during the case vs outbox insert/update/delete of the case
+[pg17]   plain insert, update 2, delete: public.c 1/2/1(0) vs 1/2/1 =
+[pg17]   insert in a savepoint rolled back: public.c 1/0/0(0) vs 0/0/0 MISMATCH
+[pg17]   insert in an EXCEPTION block that catches: public.c 1/0/0(0) vs 0/0/0 MISMATCH
+[pg17]   ON CONFLICT DO UPDATE on an existing key: public.c 0/1/0(1) vs 0/1/0 =
+[pg17]   ON CONFLICT DO NOTHING on an existing key: nothing counted, nothing captured
+[pg17]   delete with a cascade: public.cc 0/0/2(0) vs 0/0/2 =; public.cp 0/0/1(0) vs 0/0/1 =
+[pg17]   COPY of 3 rows: public.c 3/0/0(0) vs 3/0/0 =
+[pg17]   HOT update of an unindexed column: public.c 0/1/0(1) vs 0/1/0 =
+[pg17]   MERGE: update 1, insert 1, delete 1: public.c 1/1/1(1) vs 1/1/1 =
+[pg17]   update through the partitioned parent, within a partition: public.pt 0/0/0(0) vs 0/1/0 MISMATCH; public.pt1 0/1/0(1) vs 0/0/0 MISMATCH
+[pg17]   update moving a row to another partition: public.pt 0/0/0(0) vs 0/1/0 MISMATCH; public.pt1 0/0/1(0) vs 0/0/0 MISMATCH; public.pt2 1/0/0(0) vs 0/0/0 MISMATCH
+[pg17]   TRUNCATE (its refusing trigger dropped first): nothing counted, nothing captured
+[pg17]   ALTER COLUMN TYPE ... USING (a rewrite): nothing counted, nothing captured
+[pg17]   capture disabled, update 3 rows, enabled: public.c 0/3/0(0) vs 0/0/0 MISMATCH
+[pg17]   inheritance: a new child balances an uncaptured update of its parent: public.ic 1/1/0(1) vs 0/0/0 MISMATCH(new table); public.ip 0/1/0(1) vs 0/1/0 =
+[pg17]   counters after pg_stat_clear_snapshot() and pg_stat_force_next_flush(): public.c 0/1/0(0) vs 0/1/0 =
+[pg17] protocol | text | answer | status after | the earlier INSERT committed?
+[pg17]   simple | COMMIT; BEGIN | ok | intrans | YES
+[pg17]   simple | COMMIT AND CHAIN | ok | intrans | YES
+[pg17]   simple | END; START TRANSACTION | ok | intrans | YES
+[pg17]   simple | ROLLBACK AND CHAIN | ok | intrans | no
+[pg17]   simple | ABORT; BEGIN | ok | intrans | no
+[pg17]   simple | PREPARE TRANSACTION 'x'; BEGIN | 55000 prepared transactions are disabled | idle | no
+[pg17]   simple | SAVEPOINT a; RELEASE SAVEPOINT a | ok | intrans | no
+[pg17]   simple | DO $$ BEGIN COMMIT; END $$ | 2D000 invalid transaction termination | inerror | no
+[pg17]   simple | CREATE PROCEDURE public.p() LANGUAGE plpgsql AS $$ BEGIN COMMIT; END $$; CALL public.p() | 2D000 invalid transaction termination | inerror | no
+[pg17]   simple | SELECT query_to_xml('ALTER TABLE public.items DISABLE TRIGGER USER', true, true, '') | 0A000 ALTER TABLE is not allowed in a non-volatile function | inerror | no
+[pg17]   simple | SELECT query_to_xml('COMMIT', true, true, '') | 22000 invalid query | inerror | no
+[pg17]   extended | COMMIT | ok | idle | YES
+[pg17]   extended | COMMIT AND CHAIN | ok | intrans | YES
+[pg17]   extended | SELECT 1; COMMIT | 42601 cannot insert multiple commands into a prepared statement | inerror | no
+######## Postgres 17 (17.11.0), part c
+[pg17] ==== setup.sql
+[pg17] steps not as expected: 0
+[pg17] start: outbox 4, history 0; relay: 4 shipped; outbox 0, history 4
+[pg17] C1 outbox rows: before 0; seen by another session while the write is open 0; after ROLLBACK 0; after COMMIT 1
+[pg17] C2 relay while A is open shipped 1 (history now has change ids 8); after A commits shipped 1; history change_id:row = 7:501,8:502
+[pg17] C3 the same batch inserted twice: 'INSERT 0 1' then 'INSERT 0 0'; rows in history: 1
+[pg17] C4 relay said 'SHIPPED' and was killed (SIGKILL): history 3, outbox 3; relay again shipped 3: history 3, outbox 0
+[pg17] C5 platform database unreachable: connection refused; outbox keeps 1; reachable again: shipped 1, rows of it in history 1
+[pg17] C7 two relays read the same batch, insert ('INSERT 0 2', 'INSERT 0 0'), delete ('DELETE 2', 'DELETE 0'): rows in history 2, outbox 0
+[pg17] C6 a1_mig connects to platdb: refused (permission denied for database "platdb")
+[pg17] C6 a1_rt connects to platdb: refused (permission denied for database "platdb")
+[pg17] C6 a1_vm connects to platdb: refused (permission denied for database "platdb")
+[pg17] M1 UPDATE of 100,000 rows, median of 3: no capture 662.67 ms; today's vm.history capture 2591.30 ms (19.29 us/row over none); outbox capture (hardened) 2153.23 ms (14.91 us/row over none)
+[pg17] M1 INSERT of 100,000 rows, median of 3: no capture 439.75 ms; today's vm.history capture 1640.31 ms (12.01 us/row over none); outbox capture (hardened) 1499.38 ms (10.60 us/row over none)
+[pg17] M2 shipping 100000 changes (9115 kB of old+new jsonb text; 37901 KiB of batches sent), batches of at most 1000 rows / 8192 KiB: 100 batches, 10016.50 ms, 9,984 rows/s (read 1716.95 ms, insert+commit 5350.12 ms, delete+commit 2942.94 ms)
+[pg17] M2 shipping 100000 changes (9115 kB of old+new jsonb text; 37999 KiB of batches sent), batches of at most 10000 rows / 8192 KiB: 10 batches, 4900.22 ms, 20,407 rows/s (read 1550.23 ms, insert+commit 2027.08 ms, delete+commit 1317.73 ms)
+[pg17] M2 shipping 100000 changes (9115 kB of old+new jsonb text; 37971 KiB of batches sent), batches of at most 10000 rows / 256 KiB: 36 batches, 4996.90 ms, 20,012 rows/s (read 1861.63 ms, insert+commit 2055.23 ms, delete+commit 1079.88 ms)
+[pg17] M3 single-row write (BEGIN, attach, UPDATE, COMMIT): median 4.01 ms, p95 6.46 ms; then shipping it (read, insert+commit in platdb, delete+commit in a1): median 9.46 ms, p95 13.89 ms; 200 runs, fsync on, data directory on disk
+######## Postgres 17 (17.11.0), part d
+[pg17] ==== setup.sql
+[pg17] steps not as expected: 0
+[pg17] D1 4 rows x 22 columns shaped from history as a1_rt, read-only; values that differ from select(): 2
+[pg17]     row 1 js: select() '{"b": 1,  "a": [1, "x"], "a": 2}' / history '{"a": 2, "b": 1}'
+[pg17]     row 2 jb: select() 'null' / history None
+[pg17] D2 after ADD added, RENAME tx TO tx2, DROP vc: ok=True; columns 22 ('vc' present: False); row 1 added=None tx2=None
+[pg17] D2 after u uuid -> integer: a read holding an old uuid fails whole: ERROR 22P02 invalid input syntax for type integer: "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"
+[pg17] D2 the same read without those rows: ok=True, 3 rows
+[pg17] D3 1000 rows (572 KiB of jsonb[] text): fetch from platdb median 5.6 ms, shape in a1 (BEGIN READ ONLY, SET LOCAL, query, COMMIT) median 30.2 ms; 20 runs
+[pg17] D4 k_int: stored {"id": 7}; given {"id": 7}: matches as given 1; shaped in a1 under Tokyo time {"id": 7} matches 1; under UTC {"id": 7} matches 1
+[pg17] D4 k_big: stored {"id": 9007199254740993}; given {"id": "9007199254740993"}: matches as given 0; shaped in a1 under Tokyo time {"id": 9007199254740993} matches 1; under UTC {"id": 9007199254740993} matches 1
+[pg17] D4 k_num: stored {"id": 1.50}; given {"id": "1.5"}: matches as given 0; shaped in a1 under Tokyo time {"id": 1.5} matches 1; under UTC {"id": 1.5} matches 1
+[pg17] D4 k_tz: stored {"id": "2026-11-12T10:00:00+00:00"}; given {"id": "2026-11-12T10:00:00.000Z"}: matches as given 0; shaped in a1 under Tokyo time {"id": "2026-11-12T19:00:00+09:00"} matches 0; under UTC {"id": "2026-11-12T10:00:00+00:00"} matches 1
+[pg17] D4 k_uuid: stored {"id": "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"}; given {"id": "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"}: matches as given 1; shaped in a1 under Tokyo time {"id": "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"} matches 1; under UTC {"id": "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"} matches 1
+[pg17] D5 a row (1, 'just t', 5) of a table with a column named t is recorded as: outbox design "just t"; today's crates/vm/src/own_db_schema.sql "just t"
+[pg17] D5 today's capture, writer with extra_float_digits -15, TimeZone Pacific/Chatham, IntervalStyle sql_standard, row (1, 0.1234567890123, 2026-11-12 10:00:00+00, 1 year 2 mons -3 days 04:05:06) recorded as {"d": 0.1, "z": "2026-11-12T23:45:00+13:45", "id": 1, "iv": "+1-2 -3 +4:05:06"}
+[pg17] D5 with to_jsonb(vm_row.*) over FROM vm_new vm_row: columns t and vm_row text: {"t": "just t", "id": 1, "vm_row": "just vm_row"}; a composite column named vm_row: {"id": 1, "vm_row": {"a": 1, "b": 2}}
+######## Postgres 17 (17.11.0), part e
+[pg17] ==== setup.sql
+[pg17] steps not as expected: 0
+[pg17] ==== e-alternatives.sql
+[pg17] E01    as-expected [plat] ok SELECT 1 [('replica', '10', '10', '0')]  -- defaults that matter (expect has:replica)
+[pg17] E02    as-expected [plat] ERROR 42501 permission denied to create role  -- a CREATEROLE role creates a role with REPLICATION (expect err:42501)
+[pg17] E03    as-expected [plat] ERROR 42501 permission denied to alter role  -- or gives it to a role it made (expect err:42501)
+[pg17] E04    as-expected [plat] ERROR 42501 permission denied to create role  -- BYPASSRLS likewise (expect err:42501)
+[pg17] E05    as-expected [plat] ERROR 42501 permission denied to set parameter "wal_level"  -- nor can it change wal_level (expect err:42501)
+[pg17] E06    as-expected [plat] ERROR 42501 permission denied to use replication slots  -- a logical slot without REPLICATION (expect err:42501)
+[pg17] E07    as-expected [vm] ERROR 42501 must be superuser to create FOR ALL TABLES publication  -- the database's owner: a publication of all tables (expect err:42501)
+[pg17] E08    as-expected [vm] ERROR 42501 must be superuser to create FOR TABLES IN SCHEMA publication  -- or of every table in a schema (expect err:42501)
+[pg17] E09    as-expected [mig] ok ROLLBACK [] NOTICES WARNING:  "wal_level" is insufficient to publish logical changes HINT:  Set "wal_level" to "logical" before creating subscriptions.  -- a table's owner: a publication of its table (with a warning about wal_level) (expect ok)
+[pg17] E10    as-expected [mig] ok ROLLBACK []  -- a table's owner sets its replica identity (expect ok)
+[pg17] E11    as-expected [mig] ok SELECT 1 [('t',)]  -- anyone may write a message into the WAL (expect ok)
+[pg17] E12    as-expected [rt] ok SELECT 1 [('t',)]  -- the runtime role too (expect ok)
+[pg17] E13    as-expected [su] ERROR 55000 prepared transactions are disabled  -- two-phase commit, even for the superuser, under the defaults (expect err:55000)
+[pg17] steps not as expected: 0
+[pg17] ==== setup.sql
+[pg17] steps not as expected: 0
+[pg17] ==== e-logical.sql
+[pg17] L01    as-expected [su] ok SELECT 1 [('t',)]  -- a logical slot in the own database (superuser) (expect ok)
+[pg17] L02    as-expected [mig] ok BEGIN []  -- a migration with the capture switched off, a table unlogged, a replica identity of nothing (expect ok)
+[pg17] L03    as-expected [mig] ok COMMIT []  --  (expect ok)
+[pg17] L04    as-expected [su] ok SELECT 1 [('BEGIN 749 || table public.items: UPDATE: id[integer]:2 title[text]:\'triggers off\' amount[numeric]:20 || table public.items: DELETE: (no-tuple-data) || message: transactional: 1 prefix: vm, sz: 21 content:{...  -- what the slot saw (the vm.outbox rows of the capture left out) (expect any)
+[pg17] L05    as-expected [su] ok SELECT 1 [('f',)]  --  (expect ok)
+[pg17] L06    as-expected [mig] ok BEGIN []  -- with max_prepared_transactions set, a migration can detach its transaction (expect ok)
+[pg17] L06a   as-expected [mig] ok PREPARE TRANSACTION []  --  (expect ok)
+[pg17] L06b   as-expected [mig] status idle  -- transaction status (expect idle)
+[pg17] L07    as-expected [mig] ok COMMIT PREPARED []  -- and commit it later itself (expect ok)
+[pg17] steps not as expected: 0
+######## Postgres 18 (18.6.0), part a
+[pg18] ==== setup.sql
+[pg18] steps not as expected: 0
+[pg18] ==== a-attacks.sql
+[pg18] F0     as-expected [vm] ok SELECT 1 [('494a9bb2bfcbf17e54aa014a79c6689f', '4:730fa7ca36d99762342e9329634aa6a4', 'e1fd518b2cc7f7af8f588d299f08bbf9', 'keys:a1_vm:{a1_vm=arwdDxtm/a1_vm},keys_pkey:a1_vm:,migrations:a1_vm:{a1_vm=arwdDxtm/a1_vm},migrat...  -- fingerprint of vm before (expect ok)
+[pg18] A01    as-expected [mig] ERROR 42501 permission denied for table keys  -- read the keys (expect err:42501)
+[pg18] A02    as-expected [mig] ERROR 42501 permission denied for table outbox  -- read the outbox (expect err:42501)
+[pg18] A03    as-expected [mig] ERROR 42501 permission denied for table outbox  -- write the outbox (expect err:42501)
+[pg18] A04    as-expected [mig] ERROR 42501 permission denied for table outbox  -- update the outbox (expect err:42501)
+[pg18] A05    as-expected [mig] ERROR 42501 permission denied for table outbox  -- delete from the outbox (expect err:42501)
+[pg18] A06    as-expected [mig] ERROR 42501 permission denied for table outbox  -- truncate the outbox (expect err:42501)
+[pg18] A07    as-expected [mig] ERROR 42501 permission denied for sequence outbox_id_seq  -- the outbox's sequence (expect err:42501)
+[pg18] A08    as-expected [mig] ERROR 42501 permission denied for table outbox (rolled back)  -- lock the outbox (expect err:42501)
+[pg18] A09    as-expected [mig] ERROR 42501 permission denied for table migrations  -- read the record of migrations (expect err:42501)
+[pg18] A10    as-expected [mig] ERROR 42501 permission denied for schema vm  -- replace a vm function (expect err:42501)
+[pg18] A11    as-expected [mig] ERROR 42501 must be owner of function vm.capture  -- drop a vm function (expect err:42501)
+[pg18] A12    as-expected [mig] ERROR 42501 must be owner of function capture  -- take a vm function over (expect err:42501)
+[pg18] A13    as-expected [mig] ERROR 42501 must be owner of function vm.capture  -- change a vm function's settings (expect err:42501)
+[pg18] A14    as-expected [mig] ERROR 42501 permission denied for function attached  -- call the identity check directly (expect err:42501)
+[pg18] A15    as-expected [mig] ERROR 42501 permission denied for schema vm  -- create a table in vm (expect err:42501)
+[pg18] A16    as-expected [mig] ERROR 42501 permission denied for schema vm  -- create a function in vm (expect err:42501)
+[pg18] A17    as-expected [mig] ERROR 42501 permission denied for schema vm  -- move an own table into vm (expect err:42501)
+[pg18] A18    as-expected [mig] ERROR 42501 must be owner of table outbox  -- a view or rule on the outbox (expect err:42501)
+[pg18] A19    as-expected [mig] ERROR 42501 permission denied for table outbox  -- a trigger on the outbox (expect err:42501)
+[pg18] A20    as-expected [mig] ERROR 42501 must be owner of table outbox  -- a child table of the outbox (expect err:42501)
+[pg18] A21    as-expected [mig] ERROR 42501 must be owner of schema vm  -- rename schema vm (expect err:42501)
+[pg18] A22    as-expected [mig] ERROR 42501 must be owner of schema vm  -- take schema vm over (expect err:42501)
+[pg18] A23    as-expected [mig] ERROR 42501 must be owner of schema vm  -- drop schema vm (expect err:42501)
+[pg18] A24    as-expected [mig] ERROR 42501 must be owner of schema vm  -- comment on schema vm (expect err:42501)
+[pg18] A25    as-expected [mig] ERROR 42501 permission denied to reassign objects  -- reassign what a1_vm owns (expect err:42501)
+[pg18] A26    as-expected [mig] ERROR 42501 permission denied to drop objects  -- drop what a1_vm owns (expect err:42501)
+[pg18] A27    as-expected [mig] ERROR 42501 permission denied to set role "a1_vm"  -- become a1_vm (expect err:42501)
+[pg18] A28    as-expected [mig] ERROR 42501 permission denied to set session authorization "a1_vm"  -- become a1_vm by session (expect err:42501)
+[pg18] A29    as-expected [mig] ERROR 42501 permission denied to set role "a1_vm"  -- become a1_vm by setting (expect err:42501)
+[pg18] A30    as-expected [mig] ERROR 42501 permission denied to change default privileges  -- default privileges of a1_vm (expect err:42501)
+[pg18] A31    as-expected [mig] ERROR 42501 permission denied for table keys  -- grant itself the keys (expect err:42501)
+[pg18] A32    as-expected [mig] ERROR 42501 permission denied to grant role "a1_vm"  -- grant itself a1_vm (expect err:42501)
+[pg18] A33    as-expected [mig] ERROR 42501 permission denied to grant role "a1_mig"  -- grant itself to the runtime role (expect err:42501)
+[pg18] A34    as-expected [mig] ERROR 42501 permission denied to revoke role "a1_mig"  -- take a1_vm's membership in a1_mig away (expect err:42501)
+[pg18] A35    as-expected [mig] ERROR 42501 must be owner of database a1  -- settings of the database (expect err:42501)
+[pg18] A36    as-expected [mig] ERROR 42501 must be owner of database a1  -- take the database over (expect err:42501)
+[pg18] A37    as-expected [mig] ERROR 42501 must be owner of database a1  -- rename the database (expect err:42501)
+[pg18] A38    as-expected [mig] ERROR 42501 permission denied to alter role  -- another role's attributes (expect err:42501)
+[pg18] A39    as-expected [mig] ERROR 42501 permission denied to alter role  -- its own attributes: CREATEROLE (expect err:42501)
+[pg18] A40    as-expected [mig] ERROR 42501 permission denied to alter role  -- its own attributes: VALID UNTIL (expect err:42501)
+[pg18] A41    as-expected [mig] ERROR 42501 permission denied to create role  -- create a role (expect err:42501)
+[pg18] A42    as-expected [mig] ok ROLLBACK []  -- its own settings (session defaults of its own logins) (expect ok)
+[pg18] A43    as-expected [mig] ok ALTER ROLE []  -- its own password (committed; see L1) (expect ok)
+[pg18] L1     as-expected logged in  -- log in as a1_mig (expect ok)
+[pg18] A44    as-expected [plat] ok ALTER ROLE []  -- the platform's role sets it back (expect ok)
+[pg18] A44a   as-expected [plat] ok ALTER ROLE []  -- the platform's role can take the login away between migrations (expect ok)
+[pg18] A44b   as-expected [mig] ok ALTER ROLE []  -- a1_mig's open session may still change its password (expect ok)
+[pg18] L2     as-expected refused: connection to server at "127.0.0.1", port 46187 failed: FATAL:  role "a1_mig" is not permitted to log in  -- log in as a1_mig (expect err)
+[pg18] A44c   as-expected [mig] ERROR 42501 permission denied to alter role  -- nor give itself the login back (expect err:42501)
+[pg18] A44d   as-expected [rt] ok ROLLBACK []  -- the runtime role can change its own password too (expect ok)
+[pg18] A44e   as-expected [plat] ok ALTER ROLE []  -- back to the scenario's login (expect ok)
+[pg18] A45    as-expected [mig] ERROR 42501 permission denied to set parameter "session_replication_role"  -- session_replication_role (expect err:42501)
+[pg18] A46    as-expected [mig] ERROR 42501 permission denied to create temporary tables in database "a1"  -- temporary objects (expect err:42501)
+[pg18] A47    as-expected [mig] ERROR 42501 permission denied to create extension "dblink"  -- extension not trusted (expect err:42501)
+[pg18] A48    as-expected [mig] ok CREATE EXTENSION []  -- a trusted extension into vm: allowed (its script runs as the bootstrap superuser) (expect ok)
+[pg18] A48a   as-expected [mig] ok SELECT 1 [('a1_mig', '60', 'postgres')]  -- what it put there is the superuser's, the extension a1_mig's (expect has:postgres)
+[pg18] A48b   as-expected [mig] ERROR 42501 must be owner of function vm.capture (rolled back)  -- add vm.capture() to its extension (to drop it with the extension) (expect err:42501)
+[pg18] A48c   as-expected [mig] ERROR 42501 permission denied for schema vm (rolled back)  -- replace a function the extension put in vm (expect err:42501)
+[pg18] A48d   as-expected [mig] ok SELECT 85 [('extension hstore is in schema vm',), ("function vm.hstore_in(cstring) in schema vm is not the platform's",), ("function vm.hstore_out(vm.hstore) in schema vm is not the platform's",)]  -- the check names it (expect has:extension)
+[pg18] A48e   as-expected [mig] ok ROLLBACK []  --  (expect ok)
+[pg18] A49    as-expected [mig] ok ROLLBACK []  -- a trusted extension into public (expect ok)
+[pg18] A50    as-expected [mig] ERROR 42501 permission denied to create extension "plpython3u"  -- an untrusted language (expect err:42501)
+[pg18] A51    as-expected [mig] ERROR 42501 permission denied to create event trigger "et"  -- an event trigger (expect err:42501)
+[pg18] A52    as-expected [mig] ERROR 42501 must be superuser to create FOR ALL TABLES publication  -- a publication of every table (expect err:42501)
+[pg18] A53    as-expected [mig] ERROR 42501 permission denied to terminate process  -- end a1_vm's sessions (expect err:42501)
+[pg18] A54    as-expected [mig] ERROR 42501 permission denied for function pg_stat_reset  -- reset the statistics counters (expect err:42501)
+[pg18] A55    as-expected [mig] ERROR 42501 permission denied for function pg_stat_reset_single_table_counters  -- reset one table's counters (expect err:42501)
+[pg18] A56    as-expected [mig] ERROR 42501 permission denied for function pg_read_file  -- server files (expect err:42501)
+[pg18] A57    as-expected [mig] ERROR 42501 must be able to SET ROLE "a1_vm"  -- give its table to a1_vm (expect err:42501)
+[pg18] A58    as-expected [mig] ERROR 42501 permission denied for function vm.capture  -- a capture trigger of its own (no EXECUTE on vm.capture) (expect err:42501)
+[pg18] A59    as-expected [mig] ERROR 42501 permission denied for function vm.capture  -- replace the capture trigger with old and new swapped (expect err:42501)
+[pg18] A60    as-expected [mig] ok ROLLBACK []  -- disable a capture trigger on its own table (owner's right) (expect ok)
+[pg18] A61    as-expected [mig] ok ROLLBACK []  -- drop a capture trigger on its own table (owner's right) (expect ok)
+[pg18] A62    as-expected [mig] ok ROLLBACK []  -- make a capture trigger fire only on replicas (owner's right) (expect ok)
+[pg18] A63    as-expected [mig] ok ROLLBACK []  -- rename a capture trigger (owner's right) (expect ok)
+[pg18] A64    as-expected [mig] ERROR VM002 TRUNCATE of public.notes is refused: its Change history would lose rows  -- truncate a captured table (expect err:VM002)
+[pg18] A65    as-expected [mig] ok ROLLBACK []  -- its table unlogged (owner's right; the capture still fires) (expect ok)
+[pg18] A66    as-expected [mig] ok ROLLBACK [] NOTICES WARNING:  no privileges could be revoked for "a1" | WARNING:  no privileges could be revoked for "public" | WARNING:  no privileges could be revoked for "vm" | WARNING:  no privileges could be revok...  -- drop all it owns (owner's right; drops every table, unrecorded) (expect ok)
+[pg18] A67    as-expected [mig] ERROR 42P06 schema "vm" already exists  -- a schema named like vm (expect err:42P06)
+[pg18] A68    as-expected [mig] ERROR 42939 unacceptable schema name "pg_vm"  -- a schema in the reserved pg_ names (expect err:42939)
+[pg18] A70    as-expected [mig] ok SET []  -- shadows of what the capture calls, then a captured write (expect ok)
+[pg18] A71    as-expected [mig] ok SELECT 0 []  --  (expect ok)
+[pg18] A72    as-expected [vm] ok SELECT 0 []  -- the outbox is unaffected by the shadows (row not committed: none seen; see A73) (expect lacks:forged)
+[pg18] A73    as-expected [mig] ok COMMIT []  -- commit the shadow test (expect ok)
+[pg18] A74    as-expected [vm] ok SELECT 1 [('update', '{"id": 2, "title": "shadowed", "amount": 20}', 't')]  -- the update was captured with the real functions (expect has:shadowed)
+[pg18] A75    as-expected [mig] ok DROP FUNCTION []  -- drop the shadows again (expect ok)
+[pg18] F1     as-expected [vm] ok SELECT 1 [('494a9bb2bfcbf17e54aa014a79c6689f', '5:639ae9a3d672900690c847be9135e877', 'e1fd518b2cc7f7af8f588d299f08bbf9', 'keys:a1_vm:{a1_vm=arwdDxtm/a1_vm},keys_pkey:a1_vm:,migrations:a1_vm:{a1_vm=arwdDxtm/a1_vm},migrat...  -- fingerprint after the one committed write of A71 (expect ok)
+[pg18] A80    as-expected [mig] ok SELECT 1 [('8',)]  -- a cast to json for an enum of its own (expect ok)
+[pg18] A81    as-expected [mig] ok SELECT 2 [('a1_vm', 'keys 128 hex digits'), ('a1_vm', 'deleted 6 outbox rows')]  -- a captured write runs a1_mig's cast function as a1_vm (expect has:a1_vm)
+[pg18] A82    as-expected [mig] ok SELECT 1 [('cast public.mood -> json runs user code where to_jsonb looks',)]  -- the check names the cast (expect has:cast)
+[pg18] A83    as-expected [mig] ok ROLLBACK []  -- roll it back (expect ok)
+[pg18] A84    as-expected [mig] ok SELECT 1 [('8',)]  -- the same with a cast to jsonb (expect ok)
+[pg18] A85    as-expected [mig] ok SELECT 0 []  -- a captured write with a cast to jsonb only (expect any)
+[pg18] A86    as-expected [mig] ok ROLLBACK []  -- roll it back (expect ok)
+[pg18] A86h   as-expected [vm] ok ALTER FUNCTION []  -- file hardening.sql (expect ok)
+[pg18] A86i   as-expected [mig] ok SELECT 1 [('8',)]  -- the trojan again (expect ok)
+[pg18] A86j   as-expected [mig] ERROR VM003 a cast to json of a type of the Application exists: the capture refuses to run it (rolled back)  -- hardened: the capture refuses before converting (expect err:VM003)
+[pg18] A86k   as-expected [mig] ok CREATE CAST []  -- a write to a table without the enum: refused too (the guard is global) (expect ok)
+[pg18] A86l   as-expected [mig] ERROR VM003 a cast to json of a type of the Application exists: the capture refuses to run it (rolled back)  --  (expect err:VM003)
+[pg18] A86m   as-expected [mig] ok CREATE EXTENSION []  -- an extension's C cast (hstore in public) does not trip the guard (expect ok)
+[pg18] A86n   as-expected [mig] ok ROLLBACK []  --  (expect ok)
+[pg18] F2     as-expected [vm] ok SELECT 1 [('494a9bb2bfcbf17e54aa014a79c6689f', '5:639ae9a3d672900690c847be9135e877', '6539c45e36f5e0231aec1dd4fcc587fa', 'keys:a1_vm:{a1_vm=arwdDxtm/a1_vm},keys_pkey:a1_vm:,migrations:a1_vm:{a1_vm=arwdDxtm/a1_vm},migrat...  -- fingerprint after hardening (expect ok)
+[pg18] A87    as-expected [mig] ok CREATE SEQUENCE []  -- a sequence keeps what a rolled-back transaction wrote into it (expect ok)
+[pg18] A87a   as-expected [mig] ok ROLLBACK []  --  (expect ok)
+[pg18] A88    as-expected [mig] ok SELECT 1 [('424242',)]  -- the value outlived the rollback (expect has:424242)
+[pg18] A90    as-expected [mig] ok SELECT 1 [('4',)]  -- a table full of a1_mig's code (expect ok)
+[pg18] A91    as-expected [mig] ok DELETE 1 [] NOTICES NOTICE:  spy ran as a1_mig | NOTICE:  spy ran as a1_mig | NOTICE:  policy ran as a1_mig | NOTICE:  spy ran as a1_mig | NOTICE:  spy ran as a1_mig | NOTICE:  trigger ran as a1_mig | NOTICE:  policy r...  -- a write: none of it runs as a1_vm (expect nonotice:a1_vm)
+[pg18] A92    as-expected [mig] ok ROLLBACK []  -- roll it back (expect ok)
+[pg18] F9     as-expected [vm] ok SELECT 1 [('494a9bb2bfcbf17e54aa014a79c6689f', '5:639ae9a3d672900690c847be9135e877', '6539c45e36f5e0231aec1dd4fcc587fa', 'keys:a1_vm:{a1_vm=arwdDxtm/a1_vm},keys_pkey:a1_vm:,migrations:a1_vm:{a1_vm=arwdDxtm/a1_vm},migrat...  -- fingerprint of vm after: unchanged since F2 (F1 differs from F0 in the outbox only, F2 from F1 in the functions only) (expect same:F2)
+[pg18] steps not as expected: 0
+######## Postgres 18 (18.6.0), part b
+[pg18] ==== setup.sql
+[pg18] steps not as expected: 0
+[pg18] ==== b-checks.sql
+[pg18] B00    as-expected [vm] ok ALTER FUNCTION []  -- file hardening.sql (expect ok)
+[pg18] B00a   as-expected [vm] ok GRANT []  -- a digest of every table's structure (for B5) (expect ok)
+[pg18] B10    as-expected [mig] ok BEGIN []  -- begin (expect ok)
+[pg18] B11    as-expected [mig] ok SELECT 1 [('82c99d51d9ff36cc1415b63c8ffcb550',)]  -- the digest before the migration's statements (expect ok)
+[pg18] B12    as-expected [mig] ok SELECT 0 []  -- disable, update, enable: the final catalog looks whole (expect rows:0)
+[pg18] B13    as-expected [mig] ok SELECT 1 [('78ec7e8622c87d3be9727fcd3967fe85',)]  -- the digest is not the same (expect differs:B11)
+[pg18] B14    as-expected [mig] ok ROLLBACK []  --  (expect ok)
+[pg18] B15    as-expected [mig] ok BEGIN []  -- the same inside a released savepoint (expect ok)
+[pg18] B15a   as-expected [mig] ok SELECT 1 [('82c99d51d9ff36cc1415b63c8ffcb550',)]  --  (expect ok)
+[pg18] B15b   as-expected [mig] ok RELEASE []  --  (expect ok)
+[pg18] B15c   as-expected [mig] ok SELECT 1 [('55b359bb8a9b31262cb161f0622d091b',)]  -- digest differs (expect differs:B15a)
+[pg18] B15d   as-expected [mig] ok ROLLBACK []  --  (expect ok)
+[pg18] B16    as-expected [mig] ok BEGIN []  -- inside a savepoint rolled back: nothing changed, digest equal (expect ok)
+[pg18] B16a   as-expected [mig] ok SELECT 1 [('82c99d51d9ff36cc1415b63c8ffcb550',)]  --  (expect ok)
+[pg18] B16b   as-expected [mig] ok ROLLBACK []  --  (expect ok)
+[pg18] B16c   as-expected [mig] ok SELECT 1 [('82c99d51d9ff36cc1415b63c8ffcb550',)]  -- digest equal (expect same:B16a)
+[pg18] B16d   as-expected [mig] ok SELECT 1 [('11',)]  -- and the update did not happen (expect has:11)
+[pg18] B16e   as-expected [mig] ok ROLLBACK []  --  (expect ok)
+[pg18] B17    as-expected [mig] ok CREATE TRIGGER []  -- a trigger of the same name calling its own function (expect ok)
+[pg18] B17a   as-expected [mig] ok SELECT 1 [('public.items: vm_capture_update missing, disabled or altered',)]  -- the catalog check names it (expect has:vm_capture_update)
+[pg18] B17b   as-expected [mig] ok ROLLBACK []  --  (expect ok)
+[pg18] B18    as-expected [mig] ok BEGIN []  -- rename the trigger away and back (expect ok)
+[pg18] B18a   as-expected [mig] ok SELECT 1 [('82c99d51d9ff36cc1415b63c8ffcb550',)]  --  (expect ok)
+[pg18] B18b   as-expected [mig] ok SELECT 1 [('0ef50fd40e362f3715f2a780157d85fd',)]  --  (expect differs:B18a)
+[pg18] B18c   as-expected [mig] ok ROLLBACK []  --  (expect ok)
+[pg18] B19    as-expected [mig] ok BEGIN []  -- ordinary migrations leave the digest alone (expect ok)
+[pg18] B19a   as-expected [mig] ok SELECT 1 [('82c99d51d9ff36cc1415b63c8ffcb550',)]  --  (expect ok)
+[pg18] B19b   as-expected [mig] ok SELECT 1 [('82c99d51d9ff36cc1415b63c8ffcb550',)]  -- add, retype, rename, constrain, index, drop a column; rename and move the table (expect same:B19a)
+[pg18] B19c   as-expected [mig] ok ROLLBACK []  --  (expect ok)
+[pg18] B20    as-expected [mig] ok DROP TRIGGER []  --  (expect ok)
+[pg18] B20a   as-expected [mig] ok SELECT 1 [('public.items: vm_capture_delete missing, disabled or altered',)]  -- the check still sees it (expect has:vm_capture_delete)
+[pg18] B20b   as-expected [mig] ok ROLLBACK []  --  (expect ok)
+[pg18] B30    as-expected [mig] ok BEGIN []  -- a deferred constraint trigger that switches the capture off at commit (expect ok)
+[pg18] B30a   as-expected [mig] ok UPDATE 1 []  --  (expect ok)
+[pg18] B30b   as-expected [mig] ok SELECT 1 [('public.items: deferrable trigger sneak',)]  -- the catalog check names the deferrable trigger (expect has:deferrable)
+[pg18] B30c   as-expected [mig] ok SELECT 1 [('82c99d51d9ff36cc1415b63c8ffcb550',)]  -- the digest before COMMIT (expect ok)
+[pg18] B30d   as-expected [mig] ok DROP TRIGGER []  -- drop the trigger, its event still queued (expect ok)
+[pg18] B30e   as-expected [mig] ok SELECT 0 []  -- now the catalog check sees nothing wrong (expect rows:0)
+[pg18] B30f   as-expected [mig] ok SELECT 1 [('82c99d51d9ff36cc1415b63c8ffcb550',)]  -- and the digest is unchanged (expect same:B30c)
+[pg18] B30g   as-expected [mig] ok COMMIT []  -- COMMIT: does the dropped trigger's event still run? (expect any)
+[pg18] B30h   as-expected [vm] ok SELECT 1 [('note', '0')]  -- the notes after that commit, and their outbox rows (expect any)
+[pg18] B31    as-expected [mig] ok BEGIN []  -- the same, the trigger kept: it runs at COMMIT, after the check (expect ok)
+[pg18] B31a   as-expected [mig] ok UPDATE 1 []  --  (expect ok)
+[pg18] B31b   as-expected [mig] ok COMMIT []  -- COMMIT (expect any)
+[pg18] B31c   as-expected [vm] ok SELECT 1 [('changed at commit', '0')]  -- the notes after that commit, and their outbox rows (expect any)
+[pg18] B31d   as-expected [mig] ok BEGIN []  -- put the note back, recorded (expect ok)
+[pg18] B31e   as-expected [mig] ok COMMIT []  --  (expect ok)
+[pg18] B32    as-expected [mig] ok BEGIN []  -- with SET CONSTRAINTS ALL IMMEDIATE before the check, it runs before the check (expect ok)
+[pg18] B32a   as-expected [mig] ok SELECT 1 [('480bd88f5a8ab36ff9e5836246a08c3f',)]  --  (expect ok)
+[pg18] B32b   as-expected [mig] ok SET CONSTRAINTS []  --  (expect ok)
+[pg18] B32c   as-expected [mig] ok SELECT 1 [('7d64e74ab7312c100725141fcd174978',)]  -- the digest shows it (expect differs:B32a)
+[pg18] B32d   as-expected [mig] ok ROLLBACK []  --  (expect ok)
+[pg18] B33    as-expected [mig] ok BEGIN []  -- a cursor WITH HOLD whose query runs at COMMIT (expect ok)
+[pg18] B33a   as-expected [mig] ok DECLARE CURSOR []  --  (expect ok)
+[pg18] B33b   as-expected [mig] ok SELECT 1 [('480bd88f5a8ab36ff9e5836246a08c3f',)]  -- the digest before COMMIT (expect ok)
+[pg18] B33c   as-expected [mig] ok SELECT 0 []  -- the check sees nothing (expect rows:0)
+[pg18] B33d   as-expected [mig] ok COMMIT []  -- COMMIT (expect any)
+[pg18] B33e   as-expected [vm] ok SELECT 1 [('changed by a cursor at commit', '0')]  -- the notes after that commit, and their outbox rows (expect any)
+[pg18] B33f   as-expected [mig] ok BEGIN []  --  (expect ok)
+[pg18] B33g   as-expected [mig] ok COMMIT []  --  (expect ok)
+[pg18] B34    as-expected [mig] ok BEGIN []  -- with CLOSE ALL before the check, the cursor's query never runs (expect ok)
+[pg18] B34a   as-expected [mig] ok COMMIT []  --  (expect ok)
+[pg18] B34b   as-expected [vm] ok SELECT 1 [('note',)]  -- the note is unchanged (expect has:note)
+[pg18] B40    as-expected [mig] ERROR VM002 TRUNCATE of public.items is refused: its Change history would lose rows NOTICES NOTICE:  truncate cascades to table "notes"  -- TRUNCATE ... CASCADE through a captured table (expect err:VM002)
+[pg18] B41    as-expected [mig] ok BEGIN []  -- partitions: captured parent and partition (expect ok)
+[pg18] B41a   as-expected [mig] ok INSERT 0 2 []  --  (expect ok)
+[pg18] B41b   as-expected [mig] ERROR VM002 TRUNCATE of public.p is refused: its Change history would lose rows (rolled back)  -- TRUNCATE of the parent (expect err:VM002)
+[pg18] B41c   as-expected [mig] ok BEGIN [] NOTICES WARNING:  there is no transaction in progress  --  (expect ok)
+[pg18] B41d   as-expected [mig] ok DROP TRIGGER []  --  (expect ok)
+[pg18] B41e   as-expected [mig] ERROR VM002 TRUNCATE of public.p1 is refused: its Change history would lose rows (rolled back)  -- TRUNCATE of the parent without its own trigger: the partition's fires (expect err:VM002)
+[pg18] B41f   as-expected [mig] ok ROLLBACK [] NOTICES WARNING:  there is no transaction in progress  --  (expect ok)
+[pg18] B50    as-expected [mig] ok BEGIN []  --  (expect ok)
+[pg18] B50a   as-expected [mig] ok SELECT 1 [('89980fcf0567c2fdcef6a68323e44d77',)]  --  (expect ok)
+[pg18] B50b   as-expected [mig] ok SELECT 2 [('16473', 'public.items', '16473', '1:id:23:false,2:title:25:false,3:amount:1700:false', None), ('16481', 'public.notes', '16481', '1:id:23:false,2:item:23:false,3:body:25:false', None)]  --  (expect ok)
+[pg18] B50c   as-expected [mig] ok ALTER TABLE []  -- every amount set to 0 by a rewrite (expect ok)
+[pg18] B50d   as-expected [mig] ok SELECT 1 [('0,0',)]  -- the values changed (expect has:0)
+[pg18] B50e   as-expected [mig] ok SELECT 1 [('89980fcf0567c2fdcef6a68323e44d77',)]  -- the capture digest is unchanged (expect same:B50a)
+[pg18] B50f   as-expected [mig] ok SELECT 0 []  -- the catalog check sees nothing (expect rows:0)
+[pg18] B50g   as-expected [mig] ok SELECT 0 []  -- the outbox has nothing of it (expect rows:0)
+[pg18] B50h   as-expected [mig] ok SELECT 2 [('16473', 'public.items', '16573', '1:id:23:false,2:title:25:false,3:amount:1700:false', None), ('16481', 'public.notes', '16481', '1:id:23:false,2:item:23:false,3:body:25:false', None)]  -- the structure digest shows the rewrite (a new filenode) (expect differs:B50b)
+[pg18] B50i   as-expected [mig] ok ROLLBACK []  --  (expect ok)
+[pg18] B51    as-expected [mig] ok BEGIN []  -- a table replaced under its own name (expect ok)
+[pg18] B51a   as-expected [mig] ok SELECT 2 [('16473', 'public.items', '16473', '1:id:23:false,2:title:25:false,3:amount:1700:false', None), ('16481', 'public.notes', '16481', '1:id:23:false,2:item:23:false,3:body:25:false', None)]  --  (expect ok)
+[pg18] B51b   as-expected [mig] ok SELECT 1 [('4',)]  --  (expect ok)
+[pg18] B51c   as-expected [mig] ok SELECT 0 []  -- the catalog check sees nothing (expect rows:0)
+[pg18] B51d   as-expected [mig] ok SELECT 2 [('16473', 'public.items', '16473', '1:id:23:false,2:title:25:false,3:amount:1700:false', None), ('16579', 'public.notes', '16579', '1:id:23:false,2:item:23:false,3:body:25:false', None)]  -- the structure digest shows a new table under the old name (expect differs:B51a)
+[pg18] B51e   as-expected [mig] ok ROLLBACK []  --  (expect ok)
+[pg18] steps not as expected: 0
+[pg18] counters at the start of a new transaction, before it did anything (left from earlier ones): public.c 10/0/0, public.cc 3/0/0, public.cp 2/0/0, public.ip 1/0/0, public.pt1 2/0/0, public.pt2 1/0/0
+[pg18] counters: change of n_tup_ins/upd/del (hot) in pg_stat_xact_user_tables during the case vs outbox insert/update/delete of the case
+[pg18]   plain insert, update 2, delete: public.c 1/2/1(0) vs 1/2/1 =
+[pg18]   insert in a savepoint rolled back: public.c 1/0/0(0) vs 0/0/0 MISMATCH
+[pg18]   insert in an EXCEPTION block that catches: public.c 1/0/0(0) vs 0/0/0 MISMATCH
+[pg18]   ON CONFLICT DO UPDATE on an existing key: public.c 0/1/0(1) vs 0/1/0 =
+[pg18]   ON CONFLICT DO NOTHING on an existing key: nothing counted, nothing captured
+[pg18]   delete with a cascade: public.cc 0/0/2(0) vs 0/0/2 =; public.cp 0/0/1(0) vs 0/0/1 =
+[pg18]   COPY of 3 rows: public.c 3/0/0(0) vs 3/0/0 =
+[pg18]   HOT update of an unindexed column: public.c 0/1/0(1) vs 0/1/0 =
+[pg18]   MERGE: update 1, insert 1, delete 1: public.c 1/1/1(1) vs 1/1/1 =
+[pg18]   update through the partitioned parent, within a partition: public.pt 0/0/0(0) vs 0/1/0 MISMATCH; public.pt1 0/1/0(1) vs 0/0/0 MISMATCH
+[pg18]   update moving a row to another partition: public.pt 0/0/0(0) vs 0/1/0 MISMATCH; public.pt1 0/0/1(0) vs 0/0/0 MISMATCH; public.pt2 1/0/0(0) vs 0/0/0 MISMATCH
+[pg18]   TRUNCATE (its refusing trigger dropped first): nothing counted, nothing captured
+[pg18]   ALTER COLUMN TYPE ... USING (a rewrite): nothing counted, nothing captured
+[pg18]   capture disabled, update 3 rows, enabled: public.c 0/3/0(0) vs 0/0/0 MISMATCH
+[pg18]   inheritance: a new child balances an uncaptured update of its parent: public.ic 1/1/0(1) vs 0/0/0 MISMATCH(new table); public.ip 0/1/0(1) vs 0/1/0 =
+[pg18]   counters after pg_stat_clear_snapshot() and pg_stat_force_next_flush(): public.c 0/1/0(0) vs 0/1/0 =
+[pg18] protocol | text | answer | status after | the earlier INSERT committed?
+[pg18]   simple | COMMIT; BEGIN | ok | intrans | YES
+[pg18]   simple | COMMIT AND CHAIN | ok | intrans | YES
+[pg18]   simple | END; START TRANSACTION | ok | intrans | YES
+[pg18]   simple | ROLLBACK AND CHAIN | ok | intrans | no
+[pg18]   simple | ABORT; BEGIN | ok | intrans | no
+[pg18]   simple | PREPARE TRANSACTION 'x'; BEGIN | 55000 prepared transactions are disabled | idle | no
+[pg18]   simple | SAVEPOINT a; RELEASE SAVEPOINT a | ok | intrans | no
+[pg18]   simple | DO $$ BEGIN COMMIT; END $$ | 2D000 invalid transaction termination | inerror | no
+[pg18]   simple | CREATE PROCEDURE public.p() LANGUAGE plpgsql AS $$ BEGIN COMMIT; END $$; CALL public.p() | 2D000 invalid transaction termination | inerror | no
+[pg18]   simple | SELECT query_to_xml('ALTER TABLE public.items DISABLE TRIGGER USER', true, true, '') | 0A000 ALTER TABLE is not allowed in a non-volatile function | inerror | no
+[pg18]   simple | SELECT query_to_xml('COMMIT', true, true, '') | 22000 invalid query | inerror | no
+[pg18]   extended | COMMIT | ok | idle | YES
+[pg18]   extended | COMMIT AND CHAIN | ok | intrans | YES
+[pg18]   extended | SELECT 1; COMMIT | 42601 cannot insert multiple commands into a prepared statement | inerror | no
+INSERT INTO t VALUES (1); COMMIT; BEGIN; INSERT INTO t VALUES (2)
+    [INSERT INTO t VALUES (1)] InsertStmt
+    [COMMIT] TransactionStmt(TransStmtCommit)
+    [BEGIN] TransactionStmt(TransStmtBegin)
+    [INSERT INTO t VALUES (2)] InsertStmt
+-- COMMIT;\nSELECT 'COMMIT; ROLLBACK'; /* END; */ SELECT $x$ ; COMMIT; $x$; SELECT "commit" FROM t
+    [SELECT 'COMMIT; ROLLBACK'] SelectStmt
+    [SELECT $x$ ; COMMIT; $x$] SelectStmt
+    [SELECT "commit" FROM t] SelectStmt
+COMMIT AND CHAIN
+    [COMMIT AND CHAIN] TransactionStmt(TransStmtCommit)
+END
+    [END] TransactionStmt(TransStmtCommit)
+ABORT
+    [ABORT] TransactionStmt(TransStmtRollback)
+ROLLBACK AND CHAIN
+    [ROLLBACK AND CHAIN] TransactionStmt(TransStmtRollback)
+START TRANSACTION
+    [START TRANSACTION] TransactionStmt(TransStmtStart)
+PREPARE TRANSACTION 'x'
+    [PREPARE TRANSACTION 'x'] TransactionStmt(TransStmtPrepare)
+COMMIT PREPARED 'x'
+    [COMMIT PREPARED 'x'] TransactionStmt(TransStmtCommitPrepared)
+SAVEPOINT a; RELEASE SAVEPOINT a; ROLLBACK TO SAVEPOINT a
+    [SAVEPOINT a] TransactionStmt(TransStmtSavepoint)
+    [RELEASE SAVEPOINT a] TransactionStmt(TransStmtRelease)
+    [ROLLBACK TO SAVEPOINT a] TransactionStmt(TransStmtRollbackTo)
+DO $$ BEGIN COMMIT; END $$
+    [DO $$ BEGIN COMMIT; END $$] DoStmt
+CALL p()
+    [CALL p()] CallStmt
+CREATE PROCEDURE p() LANGUAGE plpgsql AS $$ BEGIN COMMIT; END $$
+    [CREATE PROCEDURE p() LANGUAGE plpgsql AS $$ BEGIN COMMIT; END $$] CreateFunctionStmt
+SELECT query_to_xml('ALTER TABLE t DISABLE TRIGGER USER', true, true, '')
+    [SELECT query_to_xml('ALTER TABLE t DISABLE TRIGGER USER', true, true, '')] SelectStmt
+CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql AS $$ BEGIN EXECUTE convert_from(decode('QUxURVIgVEFCTEU=', 'base64'), 'UTF8') || ' t DISABLE TRIGGER USER'; END $$
+    [CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql AS $$ BEGIN EXECUTE convert_from(decode('QUxURVIgVEFCTEU=', 'base64'), 'UTF8') || ' t DISABLE TRIGGER USER'; END $$] CreateFunctionStmt
+ALTER TABLE t DISABLE TRIGGER vm_capture_update
+    [ALTER TABLE t DISABLE TRIGGER vm_capture_update] AlterTableStmt
+INSERT INTO t VALUES (1);\n--> statement-breakpoint\nCOMMIT;
+    [INSERT INTO t VALUES (1)] InsertStmt
+    [COMMIT] TransactionStmt(TransStmtCommit)
+plpgsql: PLpgSQL_stmt_dynexecute":{"lineno":1,"query":{"PLpgSQL_expr":{"parseMode":2,"query":"convert_from(decode('QUxURVIgVEFCTEU=', 'base64'), 'UTF8') || ' t DISABLE T
+######## Postgres 18 (18.6.0), part c
+[pg18] ==== setup.sql
+[pg18] steps not as expected: 0
+[pg18] start: outbox 4, history 0; relay: 4 shipped; outbox 0, history 4
+[pg18] C1 outbox rows: before 0; seen by another session while the write is open 0; after ROLLBACK 0; after COMMIT 1
+[pg18] C2 relay while A is open shipped 1 (history now has change ids 8); after A commits shipped 1; history change_id:row = 7:501,8:502
+[pg18] C3 the same batch inserted twice: 'INSERT 0 1' then 'INSERT 0 0'; rows in history: 1
+[pg18] C4 relay said 'SHIPPED' and was killed (SIGKILL): history 3, outbox 3; relay again shipped 3: history 3, outbox 0
+[pg18] C5 platform database unreachable: connection refused; outbox keeps 1; reachable again: shipped 1, rows of it in history 1
+[pg18] C7 two relays read the same batch, insert ('INSERT 0 2', 'INSERT 0 0'), delete ('DELETE 2', 'DELETE 0'): rows in history 2, outbox 0
+[pg18] C6 a1_mig connects to platdb: refused (permission denied for database "platdb")
+[pg18] C6 a1_rt connects to platdb: refused (permission denied for database "platdb")
+[pg18] C6 a1_vm connects to platdb: refused (permission denied for database "platdb")
+[pg18] M1 UPDATE of 100,000 rows, median of 3: no capture 374.16 ms; today's vm.history capture 1463.31 ms (10.89 us/row over none); outbox capture (hardened) 1158.63 ms (7.84 us/row over none)
+[pg18] M1 INSERT of 100,000 rows, median of 3: no capture 220.30 ms; today's vm.history capture 1017.57 ms (7.97 us/row over none); outbox capture (hardened) 743.46 ms (5.23 us/row over none)
+[pg18] M2 shipping 100000 changes (9115 kB of old+new jsonb text; 37901 KiB of batches sent), batches of at most 1000 rows / 8192 KiB: 100 batches, 9420.54 ms, 10,615 rows/s (read 1509.52 ms, insert+commit 6009.53 ms, delete+commit 1893.91 ms)
+[pg18] M2 shipping 100000 changes (9115 kB of old+new jsonb text; 37999 KiB of batches sent), batches of at most 10000 rows / 8192 KiB: 10 batches, 5890.83 ms, 16,976 rows/s (read 1452.43 ms, insert+commit 3135.93 ms, delete+commit 1295.49 ms)
+[pg18] M2 shipping 100000 changes (9115 kB of old+new jsonb text; 37971 KiB of batches sent), batches of at most 10000 rows / 256 KiB: 36 batches, 4925.95 ms, 20,301 rows/s (read 1738.67 ms, insert+commit 2130.86 ms, delete+commit 1056.25 ms)
+[pg18] M3 single-row write (BEGIN, attach, UPDATE, COMMIT): median 3.89 ms, p95 6.84 ms; then shipping it (read, insert+commit in platdb, delete+commit in a1): median 9.60 ms, p95 12.86 ms; 200 runs, fsync on, data directory on disk
+######## Postgres 18 (18.6.0), part d
+[pg18] ==== setup.sql
+[pg18] steps not as expected: 0
+[pg18] D1 4 rows x 22 columns shaped from history as a1_rt, read-only; values that differ from select(): 2
+[pg18]     row 1 js: select() '{"b": 1,  "a": [1, "x"], "a": 2}' / history '{"a": 2, "b": 1}'
+[pg18]     row 2 jb: select() 'null' / history None
+[pg18] D2 after ADD added, RENAME tx TO tx2, DROP vc: ok=True; columns 22 ('vc' present: False); row 1 added=None tx2=None
+[pg18] D2 after u uuid -> integer: a read holding an old uuid fails whole: ERROR 22P02 invalid input syntax for type integer: "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"
+[pg18] D2 the same read without those rows: ok=True, 3 rows
+[pg18] D3 1000 rows (572 KiB of jsonb[] text): fetch from platdb median 5.6 ms, shape in a1 (BEGIN READ ONLY, SET LOCAL, query, COMMIT) median 30.0 ms; 20 runs
+[pg18] D4 k_int: stored {"id": 7}; given {"id": 7}: matches as given 1; shaped in a1 under Tokyo time {"id": 7} matches 1; under UTC {"id": 7} matches 1
+[pg18] D4 k_big: stored {"id": 9007199254740993}; given {"id": "9007199254740993"}: matches as given 0; shaped in a1 under Tokyo time {"id": 9007199254740993} matches 1; under UTC {"id": 9007199254740993} matches 1
+[pg18] D4 k_num: stored {"id": 1.50}; given {"id": "1.5"}: matches as given 0; shaped in a1 under Tokyo time {"id": 1.5} matches 1; under UTC {"id": 1.5} matches 1
+[pg18] D4 k_tz: stored {"id": "2026-11-12T10:00:00+00:00"}; given {"id": "2026-11-12T10:00:00.000Z"}: matches as given 0; shaped in a1 under Tokyo time {"id": "2026-11-12T19:00:00+09:00"} matches 0; under UTC {"id": "2026-11-12T10:00:00+00:00"} matches 1
+[pg18] D4 k_uuid: stored {"id": "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"}; given {"id": "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"}: matches as given 1; shaped in a1 under Tokyo time {"id": "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"} matches 1; under UTC {"id": "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"} matches 1
+[pg18] D5 a row (1, 'just t', 5) of a table with a column named t is recorded as: outbox design "just t"; today's crates/vm/src/own_db_schema.sql "just t"
+[pg18] D5 today's capture, writer with extra_float_digits -15, TimeZone Pacific/Chatham, IntervalStyle sql_standard, row (1, 0.1234567890123, 2026-11-12 10:00:00+00, 1 year 2 mons -3 days 04:05:06) recorded as {"d": 0.1, "z": "2026-11-12T23:45:00+13:45", "id": 1, "iv": "+1-2 -3 +4:05:06"}
+[pg18] D5 with to_jsonb(vm_row.*) over FROM vm_new vm_row: columns t and vm_row text: {"t": "just t", "id": 1, "vm_row": "just vm_row"}; a composite column named vm_row: {"id": 1, "vm_row": {"a": 1, "b": 2}}
+######## Postgres 18 (18.6.0), part e
+[pg18] ==== setup.sql
+[pg18] steps not as expected: 0
+[pg18] ==== e-alternatives.sql
+[pg18] E01    as-expected [plat] ok SELECT 1 [('replica', '10', '10', '0')]  -- defaults that matter (expect has:replica)
+[pg18] E02    as-expected [plat] ERROR 42501 permission denied to create role  -- a CREATEROLE role creates a role with REPLICATION (expect err:42501)
+[pg18] E03    as-expected [plat] ERROR 42501 permission denied to alter role  -- or gives it to a role it made (expect err:42501)
+[pg18] E04    as-expected [plat] ERROR 42501 permission denied to create role  -- BYPASSRLS likewise (expect err:42501)
+[pg18] E05    as-expected [plat] ERROR 42501 permission denied to set parameter "wal_level"  -- nor can it change wal_level (expect err:42501)
+[pg18] E06    as-expected [plat] ERROR 42501 permission denied to use replication slots  -- a logical slot without REPLICATION (expect err:42501)
+[pg18] E07    as-expected [vm] ERROR 42501 must be superuser to create FOR ALL TABLES publication  -- the database's owner: a publication of all tables (expect err:42501)
+[pg18] E08    as-expected [vm] ERROR 42501 must be superuser to create FOR TABLES IN SCHEMA publication  -- or of every table in a schema (expect err:42501)
+[pg18] E09    as-expected [mig] ok ROLLBACK [] NOTICES WARNING:  "wal_level" is insufficient to publish logical changes HINT:  Set "wal_level" to "logical" before creating subscriptions.  -- a table's owner: a publication of its table (with a warning about wal_level) (expect ok)
+[pg18] E10    as-expected [mig] ok ROLLBACK []  -- a table's owner sets its replica identity (expect ok)
+[pg18] E11    as-expected [mig] ok SELECT 1 [('t',)]  -- anyone may write a message into the WAL (expect ok)
+[pg18] E12    as-expected [rt] ok SELECT 1 [('t',)]  -- the runtime role too (expect ok)
+[pg18] E13    as-expected [su] ERROR 55000 prepared transactions are disabled  -- two-phase commit, even for the superuser, under the defaults (expect err:55000)
+[pg18] steps not as expected: 0
+[pg18] ==== setup.sql
+[pg18] steps not as expected: 0
+[pg18] ==== e-logical.sql
+[pg18] L01    as-expected [su] ok SELECT 1 [('t',)]  -- a logical slot in the own database (superuser) (expect ok)
+[pg18] L02    as-expected [mig] ok BEGIN []  -- a migration with the capture switched off, a table unlogged, a replica identity of nothing (expect ok)
+[pg18] L03    as-expected [mig] ok COMMIT []  --  (expect ok)
+[pg18] L04    as-expected [su] ok SELECT 1 [('BEGIN 763 || table public.items: UPDATE: id[integer]:2 title[text]:\'triggers off\' amount[numeric]:20 || table public.items: DELETE: (no-tuple-data) || message: transactional: 1 prefix: vm, sz: 21 content:{...  -- what the slot saw (the vm.outbox rows of the capture left out) (expect any)
+[pg18] L05    as-expected [su] ok SELECT 1 [('f',)]  --  (expect ok)
+[pg18] L06    as-expected [mig] ok BEGIN []  -- with max_prepared_transactions set, a migration can detach its transaction (expect ok)
+[pg18] L06a   as-expected [mig] ok PREPARE TRANSACTION []  --  (expect ok)
+[pg18] L06b   as-expected [mig] status idle  -- transaction status (expect idle)
+[pg18] L07    as-expected [mig] ok COMMIT PREPARED []  -- and commit it later itself (expect ok)
+[pg18] steps not as expected: 0
