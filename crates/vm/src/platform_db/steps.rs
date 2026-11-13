@@ -197,6 +197,51 @@ pub const STEPS: &[Step] = &[
                 CHECK (actor IN ('user', 'application', 'platform'));
     ",
     },
+    Step {
+        number: 7,
+        name: "the Change history",
+        sql: "
+        -- The Change history of every Application's own database (ADR 0017,
+        -- second slice; blackbox/CONTRACT.md, \"The Change history in the
+        -- platform database\"), shipped from each own database's outbox
+        -- (crate::own_db::relay). `id` is the change's id in the outbox,
+        -- which increases per own database; a change shipped twice is kept
+        -- once. `json_nulls`: which `json` and `jsonb` columns of `old` and
+        -- `new` held JSON null rather than SQL null, as the capture saw it.
+        CREATE TABLE change_history (
+            application text NOT NULL,
+            id bigint NOT NULL,
+            at timestamptz NOT NULL,
+            schema_name text NOT NULL,
+            table_name text NOT NULL,
+            kind text NOT NULL,
+            key jsonb,
+            old jsonb,
+            new jsonb,
+            changed jsonb,
+            user_id text NOT NULL,
+            actor text NOT NULL,
+            request text,
+            migration text,
+            structure jsonb,
+            json_nulls jsonb,
+            CONSTRAINT change_history_application_id UNIQUE (application, id)
+        );
+        -- A table's changes, newest first.
+        CREATE INDEX change_history_table
+            ON change_history (application, schema_name, table_name, id);
+        -- One row's changes, newest first: by the hash of its key, since a
+        -- key may be longer than a btree entry may be. The reader compares
+        -- the key itself too.
+        CREATE INDEX change_history_row
+            ON change_history (application, schema_name, table_name,
+                               jsonb_hash_extended(key, 0), id);
+        -- A table's changes of structure, which are in every row's history.
+        CREATE INDEX change_history_structure
+            ON change_history (application, schema_name, table_name, id)
+            WHERE kind = 'structure';
+    ",
+    },
 ];
 
 /// The advisory lock every step's transaction takes first: "vm steps".

@@ -20,6 +20,7 @@ pub mod steps;
 use std::fmt;
 use std::time::Duration;
 
+use tokio_postgres::Client;
 use tokio_postgres::error::SqlState;
 
 pub use address::{DatabaseAddress, FORM, Password, VARIABLE};
@@ -129,6 +130,7 @@ impl PlatformDatabase {
         let applied = steps::bring_up_to_date(&database.pool, steps::STEPS)
             .await
             .map_err(|e| format!("the platform database \"{}\": {e}", address.database()))?;
+        database.close_to_public(address).await?;
         log::record(
             "platform-database",
             serde_json::json!({
@@ -163,6 +165,75 @@ impl PlatformDatabase {
     pub fn pool(&self) -> &Pool {
         &self.pool
     }
+
+    /// Takes `CONNECT` on the platform database from `PUBLIC`, so that no
+    /// role of an own database (which the platform's role creates, and
+    /// which have it from `PUBLIC` alone) can connect to it and reach the
+    /// Change history (blackbox/CONTRACT.md, "Where it is kept"). When the
+    /// platform's role may not (IT made the database and owns it) and
+    /// `PUBLIC` still has it, the program does not start: the
+    /// `platform-database-open` record and the message say what to run.
+    async fn close_to_public(&self, address: &DatabaseAddress) -> Result<(), String> {
+        let failed = |e: DbError| {
+            format!(
+                "the platform database \"{}\": cannot take CONNECT from PUBLIC: {e}",
+                address.database()
+            )
+        };
+        let still_open = self
+            .pool
+            .run(async |client: &mut Client| {
+                if !public_may_connect(client).await? {
+                    return Ok(false);
+                }
+                // Only a warning when the platform's role does not own the
+                // database: then nothing is taken, and the second look says so.
+                client
+                    .batch_execute(
+                        "DO $$ BEGIN
+                             EXECUTE pg_catalog.format('REVOKE CONNECT ON DATABASE %I FROM PUBLIC',
+                                                       pg_catalog.current_database());
+                         END $$",
+                    )
+                    .await
+                    .map_err(DbError::from)?;
+                public_may_connect(client).await
+            })
+            .await
+            .map_err(failed)?;
+        if !still_open {
+            return Ok(());
+        }
+        let statement = format!(
+            "REVOKE CONNECT ON DATABASE {} FROM PUBLIC",
+            quote_identifier(address.database())
+        );
+        log::record(
+            "platform-database-open",
+            serde_json::json!({
+                "database": address.database(),
+                "server": address.server(),
+                "statement": statement,
+            }),
+        );
+        Err(format!(
+            "the platform database \"{}\" lets every role connect (PUBLIC has CONNECT on it), and the role \"{}\" may not take that away: the roles of Applications' own databases could read the Change history there. Have its owner run: {statement}",
+            address.database(),
+            address.role()
+        ))
+    }
+}
+
+/// Whether `PUBLIC` has `CONNECT` on the database `client` is connected to.
+async fn public_may_connect(client: &Client) -> Result<bool, DbError> {
+    client
+        .query_one(
+            "SELECT pg_catalog.has_database_privilege('public', pg_catalog.current_database(), 'CONNECT')",
+            &[],
+        )
+        .await
+        .and_then(|row| row.try_get::<_, bool>(0))
+        .map_err(DbError::from)
 }
 
 fn config(address: &DatabaseAddress, limits: &PoolLimits) -> tokio_postgres::Config {
