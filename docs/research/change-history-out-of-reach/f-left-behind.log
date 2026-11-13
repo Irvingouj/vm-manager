@@ -73,8 +73,8 @@ migration tries more: ERROR 42501 permission denied to alter role
 migration tries connection limit: ERROR 42501 permission denied to alter role
 host: password null: ok ALTER ROLE []
 commit: ok COMMIT []
-login with 'known': refused: connection to server at "127.0.0.1", port 57377 failed: FATAL:  password authentication failed for user "a1_mig"
-login with 'a1_mig': refused: connection to server at "127.0.0.1", port 57377 failed: FATAL:  password authentication failed for user "a1_mig"
+login with 'known': refused: connection to server at "127.0.0.1", port 38175 failed: FATAL:  password authentication failed for user "a1_mig"
+login with 'a1_mig': refused: connection to server at "127.0.0.1", port 38175 failed: FATAL:  password authentication failed for user "a1_mig"
 session still alive: ok SELECT 1 [('a1_mig',)]
 == F5: stretching the window between commit and NOLOGIN (the test's technique)
 platform restores a password: ok ALTER ROLE []
@@ -156,10 +156,41 @@ ok CREATE TABLE []                                                              
 ok CREATE INDEX []                                                                                               <- CREATE INDEX te_evil ON te (evil(id))
 [('plpgsql', 'postgres'), ('pg_trgm', 'a1_mig')]
 [('similarity', 'postgres', 't', 't'), ('evil', 'a1_mig', 'f', 't')]
+######## Postgres 16 (16.15.0), part F, types
+-- operator classes and families are a superuser's to make or alter, as the migration role
+ok []                                                                    <- CREATE FUNCTION cmp(int, int) RETURNS int LANGUAGE plpgsql IMMUTABLE AS $f$ BEGIN RETURN btint4cmp($1, $2); END $f$
+ERROR 42501 must be superuser to create an operator family               <- CREATE OPERATOR FAMILY fam USING btree
+ERROR 42501 must be superuser to create an operator class                <- CREATE OPERATOR CLASS opc FOR TYPE int USING btree AS OPERATOR 1 <, FUNCTION 1 cmp(int, int)
+ERROR 42501 must be superuser to alter an operator family                <- ALTER OPERATOR FAMILY integer_ops USING btree ADD FUNCTION 1 (int, int) cmp(int, int)
+-- a canonical function needs a shell type first, and a shell type is a superuser's to make
+ERROR 42501 must be superuser to create a base type                      <- CREATE TYPE cr
+ERROR 42704 type cr does not exist                                       <- CREATE FUNCTION canon(cr) RETURNS cr LANGUAGE plpgsql IMMUTABLE AS $f$ BEGIN RETURN $1; END $f$
+ERROR 42P17 cannot specify a canonical function without a pre-created    <- CREATE TYPE cr AS RANGE (subtype = int, canonical = canon)
+-- a range type whose subtype_diff the migration role owns; the runtime role adds rows; the superuser's ANALYZE stands in for autovacuum
+ok []                                                                    <- CREATE TABLE seen (who text)
+ok []                                                                    <- GRANT INSERT ON seen TO a1_rt
+ok []                                                                    <- CREATE FUNCTION note() RETURNS void LANGUAGE plpgsql AS $f$ BEGIN INSERT INTO public.seen VALUES (current_user); END $f$
+ok []                                                                    <- CREATE FUNCTION diff_fn(int, int) RETURNS float8 LANGUAGE plpgsql IMMUTABLE AS $f$ BEGIN PERFORM public.note(); RETURN (
+ok []                                                                    <- CREATE TYPE span AS RANGE (subtype = int, subtype_diff = diff_fn)
+ok []                                                                    <- CREATE TABLE t (id int, s span)
+ok []                                                                    <- GRANT INSERT ON t TO a1_rt
+ok []                                                                    <- INSERT INTO t SELECT g, span(g, g + 10) FROM generate_series(1, 500) g
+rows recorded by the owner's code at insert time, as the runtime role: [('0', None)]
+ok []                                                                    <- DELETE FROM public.seen
+ok [('a1_mig',)]                                                         <- SELECT pg_get_userbyid(relowner) FROM pg_class WHERE oid='public.t'::regclass
+ok []                                                                    <- ANALYZE public.t
+>>> after a superuser ANALYZE, subtype_diff ran as: [('a1_mig', '500')]
+ok []                                                                    <- DELETE FROM public.seen
+-- leave the table for autovacuum: the runtime role makes many rows, naptime is 1s
+ok []                                                                    <- INSERT INTO t SELECT g, span(g, g + 10) FROM generate_series(1, 5000) g
+>>> after autovacuum's ANALYZE, subtype_diff ran as: [('a1_mig', '5500')]
+-- what the platform can see to refuse it: the range's functions and their owners
+user-defined ranges: [('span', 'a1_mig', 'f', None)]
+built-in ranges' functions are all a superuser's: [('t',)]
 ######## Postgres 16 (16.15.0), part F, cost
-tables=  10  round trip alone     64 us   digest     790 us more   own strong locks from pg_locks     77 us more
-tables= 100  round trip alone     64 us   digest    1541 us more   own strong locks from pg_locks     66 us more
-tables= 500  round trip alone     64 us   digest    5159 us more   own strong locks from pg_locks     63 us more
+tables=  10  round trip alone     58 us   digest     768 us more   own strong locks from pg_locks     73 us more
+tables= 100  round trip alone     58 us   digest    1573 us more   own strong locks from pg_locks     74 us more
+tables= 500  round trip alone     58 us   digest    5130 us more   own strong locks from pg_locks     70 us more
 ######## Postgres 17 (17.11.0), part F, vectors
 -- at rest, before
 trigger row: 16461 xmin=748 ctid=(0,10) enabled=O
@@ -241,8 +272,8 @@ migration tries more: ERROR 42501 permission denied to alter role
 migration tries connection limit: ERROR 42501 permission denied to alter role
 host: password null: ok ALTER ROLE []
 commit: ok COMMIT []
-login with 'known': refused: connection to server at "127.0.0.1", port 46251 failed: FATAL:  password authentication failed for user "a1_mig"
-login with 'a1_mig': refused: connection to server at "127.0.0.1", port 46251 failed: FATAL:  password authentication failed for user "a1_mig"
+login with 'known': refused: connection to server at "127.0.0.1", port 45085 failed: FATAL:  password authentication failed for user "a1_mig"
+login with 'a1_mig': refused: connection to server at "127.0.0.1", port 45085 failed: FATAL:  password authentication failed for user "a1_mig"
 session still alive: ok SELECT 1 [('a1_mig',)]
 == F5: stretching the window between commit and NOLOGIN (the test's technique)
 platform restores a password: ok ALTER ROLE []
@@ -324,10 +355,41 @@ ok CREATE TABLE []                                                              
 ok CREATE INDEX []                                                                                               <- CREATE INDEX te_evil ON te (evil(id))
 [('plpgsql', 'postgres'), ('pg_trgm', 'a1_mig')]
 [('similarity', 'postgres', 't', 't'), ('evil', 'a1_mig', 'f', 't')]
+######## Postgres 17 (17.11.0), part F, types
+-- operator classes and families are a superuser's to make or alter, as the migration role
+ok []                                                                    <- CREATE FUNCTION cmp(int, int) RETURNS int LANGUAGE plpgsql IMMUTABLE AS $f$ BEGIN RETURN btint4cmp($1, $2); END $f$
+ERROR 42501 must be superuser to create an operator family               <- CREATE OPERATOR FAMILY fam USING btree
+ERROR 42501 must be superuser to create an operator class                <- CREATE OPERATOR CLASS opc FOR TYPE int USING btree AS OPERATOR 1 <, FUNCTION 1 cmp(int, int)
+ERROR 42501 must be superuser to alter an operator family                <- ALTER OPERATOR FAMILY integer_ops USING btree ADD FUNCTION 1 (int, int) cmp(int, int)
+-- a canonical function needs a shell type first, and a shell type is a superuser's to make
+ERROR 42501 must be superuser to create a base type                      <- CREATE TYPE cr
+ERROR 42704 type cr does not exist                                       <- CREATE FUNCTION canon(cr) RETURNS cr LANGUAGE plpgsql IMMUTABLE AS $f$ BEGIN RETURN $1; END $f$
+ERROR 42P17 cannot specify a canonical function without a pre-created    <- CREATE TYPE cr AS RANGE (subtype = int, canonical = canon)
+-- a range type whose subtype_diff the migration role owns; the runtime role adds rows; the superuser's ANALYZE stands in for autovacuum
+ok []                                                                    <- CREATE TABLE seen (who text)
+ok []                                                                    <- GRANT INSERT ON seen TO a1_rt
+ok []                                                                    <- CREATE FUNCTION note() RETURNS void LANGUAGE plpgsql AS $f$ BEGIN INSERT INTO public.seen VALUES (current_user); END $f$
+ok []                                                                    <- CREATE FUNCTION diff_fn(int, int) RETURNS float8 LANGUAGE plpgsql IMMUTABLE AS $f$ BEGIN PERFORM public.note(); RETURN (
+ok []                                                                    <- CREATE TYPE span AS RANGE (subtype = int, subtype_diff = diff_fn)
+ok []                                                                    <- CREATE TABLE t (id int, s span)
+ok []                                                                    <- GRANT INSERT ON t TO a1_rt
+ok []                                                                    <- INSERT INTO t SELECT g, span(g, g + 10) FROM generate_series(1, 500) g
+rows recorded by the owner's code at insert time, as the runtime role: [('0', None)]
+ok []                                                                    <- DELETE FROM public.seen
+ok [('a1_mig',)]                                                         <- SELECT pg_get_userbyid(relowner) FROM pg_class WHERE oid='public.t'::regclass
+ok []                                                                    <- ANALYZE public.t
+>>> after a superuser ANALYZE, subtype_diff ran as: [('a1_mig', '500')]
+ok []                                                                    <- DELETE FROM public.seen
+-- leave the table for autovacuum: the runtime role makes many rows, naptime is 1s
+ok []                                                                    <- INSERT INTO t SELECT g, span(g, g + 10) FROM generate_series(1, 5000) g
+>>> after autovacuum's ANALYZE, subtype_diff ran as: [('a1_mig', '5500')]
+-- what the platform can see to refuse it: the range's functions and their owners
+user-defined ranges: [('span', 'a1_mig', 'f', None)]
+built-in ranges' functions are all a superuser's: [('t',)]
 ######## Postgres 17 (17.11.0), part F, cost
-tables=  10  round trip alone     65 us   digest     763 us more   own strong locks from pg_locks     75 us more
-tables= 100  round trip alone     65 us   digest    1507 us more   own strong locks from pg_locks     64 us more
-tables= 500  round trip alone     65 us   digest    4986 us more   own strong locks from pg_locks     63 us more
+tables=  10  round trip alone     57 us   digest     748 us more   own strong locks from pg_locks     70 us more
+tables= 100  round trip alone     57 us   digest    1479 us more   own strong locks from pg_locks     73 us more
+tables= 500  round trip alone     57 us   digest    4914 us more   own strong locks from pg_locks     72 us more
 ######## Postgres 18 (18.6.0), part F, vectors
 -- at rest, before
 trigger row: 16467 xmin=762 ctid=(0,10) enabled=O
@@ -413,8 +475,8 @@ migration tries more: ERROR 42501 permission denied to alter role
 migration tries connection limit: ERROR 42501 permission denied to alter role
 host: password null: ok ALTER ROLE []
 commit: ok COMMIT []
-login with 'known': refused: connection to server at "127.0.0.1", port 35857 failed: FATAL:  password authentication failed for user "a1_mig"
-login with 'a1_mig': refused: connection to server at "127.0.0.1", port 35857 failed: FATAL:  password authentication failed for user "a1_mig"
+login with 'known': refused: connection to server at "127.0.0.1", port 58333 failed: FATAL:  password authentication failed for user "a1_mig"
+login with 'a1_mig': refused: connection to server at "127.0.0.1", port 58333 failed: FATAL:  password authentication failed for user "a1_mig"
 session still alive: ok SELECT 1 [('a1_mig',)]
 == F5: stretching the window between commit and NOLOGIN (the test's technique)
 platform restores a password: ok ALTER ROLE []
@@ -496,7 +558,38 @@ ok CREATE TABLE []                                                              
 ok CREATE INDEX []                                                                                               <- CREATE INDEX te_evil ON te (evil(id))
 [('plpgsql', 'postgres'), ('pg_trgm', 'a1_mig')]
 [('similarity', 'postgres', 't', 't'), ('evil', 'a1_mig', 'f', 't')]
+######## Postgres 18 (18.6.0), part F, types
+-- operator classes and families are a superuser's to make or alter, as the migration role
+ok []                                                                    <- CREATE FUNCTION cmp(int, int) RETURNS int LANGUAGE plpgsql IMMUTABLE AS $f$ BEGIN RETURN btint4cmp($1, $2); END $f$
+ERROR 42501 must be superuser to create an operator family               <- CREATE OPERATOR FAMILY fam USING btree
+ERROR 42501 must be superuser to create an operator class                <- CREATE OPERATOR CLASS opc FOR TYPE int USING btree AS OPERATOR 1 <, FUNCTION 1 cmp(int, int)
+ERROR 42501 must be superuser to alter an operator family                <- ALTER OPERATOR FAMILY integer_ops USING btree ADD FUNCTION 1 (int, int) cmp(int, int)
+-- a canonical function needs a shell type first, and a shell type is a superuser's to make
+ERROR 42501 must be superuser to create a base type                      <- CREATE TYPE cr
+ERROR 42704 type cr does not exist                                       <- CREATE FUNCTION canon(cr) RETURNS cr LANGUAGE plpgsql IMMUTABLE AS $f$ BEGIN RETURN $1; END $f$
+ERROR 42P17 cannot specify a canonical function without a pre-created    <- CREATE TYPE cr AS RANGE (subtype = int, canonical = canon)
+-- a range type whose subtype_diff the migration role owns; the runtime role adds rows; the superuser's ANALYZE stands in for autovacuum
+ok []                                                                    <- CREATE TABLE seen (who text)
+ok []                                                                    <- GRANT INSERT ON seen TO a1_rt
+ok []                                                                    <- CREATE FUNCTION note() RETURNS void LANGUAGE plpgsql AS $f$ BEGIN INSERT INTO public.seen VALUES (current_user); END $f$
+ok []                                                                    <- CREATE FUNCTION diff_fn(int, int) RETURNS float8 LANGUAGE plpgsql IMMUTABLE AS $f$ BEGIN PERFORM public.note(); RETURN (
+ok []                                                                    <- CREATE TYPE span AS RANGE (subtype = int, subtype_diff = diff_fn)
+ok []                                                                    <- CREATE TABLE t (id int, s span)
+ok []                                                                    <- GRANT INSERT ON t TO a1_rt
+ok []                                                                    <- INSERT INTO t SELECT g, span(g, g + 10) FROM generate_series(1, 500) g
+rows recorded by the owner's code at insert time, as the runtime role: [('0', None)]
+ok []                                                                    <- DELETE FROM public.seen
+ok [('a1_mig',)]                                                         <- SELECT pg_get_userbyid(relowner) FROM pg_class WHERE oid='public.t'::regclass
+ok []                                                                    <- ANALYZE public.t
+>>> after a superuser ANALYZE, subtype_diff ran as: [('a1_mig', '500')]
+ok []                                                                    <- DELETE FROM public.seen
+-- leave the table for autovacuum: the runtime role makes many rows, naptime is 1s
+ok []                                                                    <- INSERT INTO t SELECT g, span(g, g + 10) FROM generate_series(1, 5000) g
+>>> after autovacuum's ANALYZE, subtype_diff ran as: [('a1_mig', '5500')]
+-- what the platform can see to refuse it: the range's functions and their owners
+user-defined ranges: [('span', 'a1_mig', 'f', None)]
+built-in ranges' functions are all a superuser's: [('t',)]
 ######## Postgres 18 (18.6.0), part F, cost
-tables=  10  round trip alone     67 us   digest     755 us more   own strong locks from pg_locks    103 us more
-tables= 100  round trip alone     67 us   digest    1485 us more   own strong locks from pg_locks     69 us more
-tables= 500  round trip alone     67 us   digest    4935 us more   own strong locks from pg_locks     70 us more
+tables=  10  round trip alone     55 us   digest     742 us more   own strong locks from pg_locks     84 us more
+tables= 100  round trip alone     55 us   digest    1482 us more   own strong locks from pg_locks     84 us more
+tables= 500  round trip alone     55 us   digest    4921 us more   own strong locks from pg_locks     83 us more

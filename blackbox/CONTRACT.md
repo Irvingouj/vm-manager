@@ -747,7 +747,7 @@ After the last migration's last statement, and before the commit, the platform m
 - `deferrable`: a trigger or a constraint that is `DEFERRABLE`. Their work would run at the commit, after the checks. (A constraint that failed when made immediate is `migration-failed` with its own SQLSTATE.)
 - `json-cast`: a cast from one of the Application's types to `json` or `jsonb` whose function is not Postgres's own. Postgres would call it inside the capture, with the platform's rights.
 - `in-vm`: an extension, or any object the platform did not make, in schema `vm` (`CREATE EXTENSION hstore SCHEMA vm` is allowed by Postgres to this role).
-- `security-definer`, `index-code`: see "What a migration leaves behind" below.
+- `security-definer`, `index-code`, `type-code`: see "What a migration leaves behind" below.
 
 A cursor left open `WITH HOLD` is closed by the platform before the checks; its query never runs, and the Version applies.
 
@@ -779,6 +779,7 @@ Code a migration leaves in the database can run later with the migration role's 
 
 - `security-definer`: a function or a procedure of the migrations' marked `SECURITY DEFINER`, in any schema. The message names it and says the runtime role may already read and write every table the migrations make.
 - `index-code`: an index (in an expression or in its `WHERE`) or an extended statistic that calls a function a role of the Application's owns (the migration role, or the runtime role where a migration let it create), directly or through an operator, a cast or a domain of theirs (a domain's constraint can be given a function later). Postgres's autovacuum would run it as the owner. The message names the index or statistic and the function. Indexes on Postgres's own functions and operators (`lower(name)`, `(a + b)`, `WHERE deleted_at IS NULL`) are allowed, and on a trusted extension's (`pg_trgm`, `citext`): those belong to a superuser, and no role of the Application's can change them. A function of the Application's that a migration adds to an extension it installed (`ALTER EXTENSION ... ADD FUNCTION`) is still the Application's, and refused.
+- `type-code`: a range type whose `subtype_diff` is a function a role of the Application's owns, whether or not a table has a column of it yet. Postgres's autovacuum would run that function as the owner of any table with such a column, with no index on it. The message names the type and the function, and says that `subtype_diff` may be left out or be one of Postgres's own (`float8mi`, `int4range_subdiff`). A range type with no `subtype_diff`, or with one that belongs to a superuser, is allowed, and so are Postgres's own range types. The function may come from an earlier migration or an earlier Version than the type.
 
 **Checked before every commit that could carry a change.** On the own database, an `execute` outside a transaction, and the commit of a transaction begun with `access: "write"`, end like this: the host makes deferred constraints immediate, closes every cursor (one declared `WITH HOLD` never runs its query), and checks that **the statement or the transaction changed neither the structure of a table nor the capture on one**. If it did:
 

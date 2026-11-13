@@ -12,11 +12,14 @@
 #   maintenance  what ordinary maintenance does to the catalog rows (f_maintenance.py)
 #   locks        which statements leave a lock that reading and writing rows never takes (f_locks.py)
 #   extension    whether the migration role can make its own function a member of an extension (f_extension.py)
+#   types        with whose rights a user-defined type's own code runs later (f_types.py)
 #   cost         what a whole digest and a look at the session's own locks cost per write (f_cost.py)
 # Passwords are the roles' names: scratch clusters on 127.0.0.1 only.
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 VERSIONS="${1:-16 17 18}"
+PARTS=" ${2:-vectors checks maintenance locks extension types cost} "
+want(){ [[ "$PARTS" == *" $1 "* ]]; }
 declare -A FULL=([16]=16.15.0 [17]=17.11.0 [18]=18.6.0)
 DIR=""
 BIN=""
@@ -179,10 +182,11 @@ SQL
 
 }
 for v in $VERSIONS; do
-  start "$v" vectors; vectors; cleanup
-  start "$v" checks; more; python3 -I -B "$HERE/f_checks.py" "$PORT" 2>&1; cleanup
-  start "$v" maintenance; python3 -I -B "$HERE/f_maintenance.py" "$PORT" 2>&1; cleanup
-  start "$v" locks; python3 -I -B "$HERE/f_locks.py" "$PORT" 2>&1; cleanup
-  start "$v" extension; python3 -I -B "$HERE/f_extension.py" "$PORT" 2>&1; cleanup
-  start "$v" cost; python3 -I -B "$HERE/f_cost.py" "$PORT" 2>&1; cleanup
+  if want vectors; then start "$v" vectors; vectors; cleanup; fi
+  if want checks; then start "$v" checks; more; python3 -I -B "$HERE/f_checks.py" "$PORT" 2>&1; cleanup; fi
+  if want maintenance; then start "$v" maintenance; python3 -I -B "$HERE/f_maintenance.py" "$PORT" 2>&1; cleanup; fi
+  if want locks; then start "$v" locks; python3 -I -B "$HERE/f_locks.py" "$PORT" 2>&1; cleanup; fi
+  if want extension; then start "$v" extension; python3 -I -B "$HERE/f_extension.py" "$PORT" 2>&1; cleanup; fi
+  if want types; then start "$v" types; python3 -I -B "$HERE/f_types.py" "$PORT" 2>&1; cleanup; fi
+  if want cost; then start "$v" cost; python3 -I -B "$HERE/f_cost.py" "$PORT" 2>&1; cleanup; fi
 done
