@@ -779,7 +779,7 @@ Code a migration leaves in the database can run later with the migration role's 
 - `security-definer`: a function or a procedure of the migrations' marked `SECURITY DEFINER`, in any schema. The message names it and says the runtime role may already read and write every table the migrations make.
 - `index-code`: an index (in an expression or in its `WHERE`) or an extended statistic that calls a function the migrations wrote (one the migration role owns; an extension's functions are not), directly or through an operator, a cast or a domain's constraint of theirs. Postgres's autovacuum would run it as the owner. The message names the index or statistic and the function. Indexes on Postgres's own functions and operators (`lower(name)`, `(a + b)`, `WHERE deleted_at IS NULL`) are allowed.
 
-**Checked before every commit that could carry a change.** On the own database, an `execute` outside a transaction, and the commit of a transaction begun with `access: "write"`, end like this: the host makes deferred constraints immediate, closes every cursor (one declared `WITH HOLD` never runs its query), and checks that the structure of the Application's tables and the capture on them are **the very same as when the last Version's migrations ended**. If they are not:
+**Checked before every commit that could carry a change.** On the own database, an `execute` outside a transaction, and the commit of a transaction begun with `access: "write"`, end like this: the host makes deferred constraints immediate, closes every cursor (one declared `WITH HOLD` never runs its query), and checks that **the statement or the transaction changed neither the structure of a table nor the capture on one**. If it did:
 
 - everything the statement or the transaction did is rolled back, what it did to the structure and the capture included;
 - the answer is `{ error: { kind: "database", code: "VM004", message } }`, from `execute` or from `tx.commit` (through the SDK: `OperationFailed` of kind `database` with that code); the message says that an Application's structure changes in migrations only;
@@ -793,7 +793,7 @@ At the least these are such a change, whoever's rights the statement that made t
 - a trigger or a constraint made that is `DEFERRABLE`;
 - a partition attached or detached.
 
-The platform may refuse other changes of definitions at run time too. What an Application does at run time otherwise is as before: a foreign key's cascade with the Application's own triggers and constraints, a function that only reads and writes rows, a materialized view refreshed by the runtime role where a migration granted it `MAINTAIN` (Postgres 17 and later).
+The platform refuses more than these: whatever takes a lock on a table, an index, a view or a sequence that reading and writing rows does not need is answered the same way. That is every change of a definition, and also `LOCK TABLE` in a mode stronger than `ROW EXCLUSIVE`, `ANALYZE`, and the refresh of a materialized view, when a function of the Application's does them. At run time an Application reads and writes rows; everything else is a migration's. What reading and writing rows brings with it is as before: a foreign key's cascade with the Application's own triggers and constraints, functions that read and write rows, `SELECT ... FOR UPDATE`, sequences, `ON CONFLICT`, any isolation level.
 
 A `query` outside such a transaction is in a read-only transaction, where Postgres itself refuses such a change (`25006`).
 
@@ -801,12 +801,12 @@ This is the host's doing, on every connection it gives an Application; the runti
 
 **What something else changed.** A change made by something that is not a transaction of the host's (a way nobody foresaw; a superuser or somebody else with the database's own rights) cannot be rolled back by the platform. It is found and said:
 
-- The platform keeps, in the platform database, what the structure and the capture of each own database were when the last Version's migrations ended. When it finds them otherwise (at the latest at the next write to that own database, or when the next Version is sent; also when the change was made while the program was not running, and then at the first use after it starts), it
+- The platform keeps, in the platform database, what the structure and the capture of each own database were when the last Version's migrations ended, and compares: when it first uses the own database after the program starts (so also a change made while the program was not running is found); when a Version is sent, before its migrations are applied; and with a write, whenever the last comparison is 30 seconds old or older. When it finds them otherwise, it
   - writes an Operation log entry: `operation` and `statement` `capture-check`, `outcome` `failed`, `error` `changed-outside`, `application`, `own_database` true, `actor` `platform`, and null `user`, `request`, `resource`, `transaction`, `rows`;
   - writes a `capture-changed-outside` record to the program's log, with `application` and `tables`: the tables, as `"<schema>.<table>"`, whose structure or capture is not what it was (one that was dropped or made is named too);
   - puts the capture back whole on every table: a capture trigger found disabled is enabled, one missing is made, a table found without capture is given it. A table the platform may not put the capture on, because it belongs to a role that is not the Application's migration role (a superuser made it there), is left as it is and named in the record's `uncaptured` (an array like `tables`, empty otherwise); while it is there, a Version with migrations to apply is refused `capture-missing`, naming it;
   - and goes on from what it now finds.
-- The write that finds it may itself be answered `VM004` and rolled back. The next write is not, and is recorded in the history.
+- The write that finds it may itself be answered `VM004` and rolled back. The next write is not, and is recorded in the history. A Version that finds it is applied as it would have been.
 - One change is said once: not again at the next write, nor after a restart.
 - Ordinary maintenance is not a change: after `VACUUM (FREEZE, ANALYZE)`, `VACUUM FULL` (of a table, of the catalogs), `REINDEX`, `CLUSTER` and `ANALYZE` by a superuser, no such entry is written and writes go on.
 - After the Postgres under the platform is replaced (a restore of a dump, `pg_upgrade`), each own database is found changed once.
@@ -817,7 +817,7 @@ This is the host's doing, on every connection it gives an Application; the runti
 ### What this does not close
 
 - A superuser, and whoever else holds the database's own rights outside the platform, can still switch the capture off. The platform says so when it finds it ("What something else changed"); it cannot say which rows were changed meanwhile.
-- On Postgres 16 the runtime role cannot refresh a materialized view (only its owner can, and `SECURITY DEFINER` is refused); on 17 and later a migration grants `MAINTAIN`.
+- A materialized view cannot be refreshed at run time: its refresh runs the view's query as the owner and takes a lock that reading and writing rows does not need. It is filled when a migration makes it or refreshes it.
 - **Changes of structure that change data** leave no history row per changed row: a column's type changed with `USING`, a column or a table dropped, a table replaced under its name. The next ticket (the Change history in the platform database) records each as an entry of the table's history with the Contributor and the migration's name; the one after records each row a rewrite changed.
 - The Application's own triggers, which a migration may make on its own tables, change rows under the User in flight and are recorded so. That is the Application's behaviour, as any of its code is.
 - Until the next ticket the history is still in the own database, in `vm.history`, owned by the platform's role: no migration can touch it, but it is not yet outside.
