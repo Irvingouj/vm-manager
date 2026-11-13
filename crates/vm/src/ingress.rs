@@ -22,6 +22,7 @@ use openworkers_core::{HttpMethod, HttpRequest, RequestBody};
 use serde_json::json;
 
 use crate::api::Api;
+use crate::gateway::Transactions;
 use crate::log;
 use crate::registry::Registry;
 use crate::runner::{InFlight, Outcome, RequestRunner};
@@ -139,6 +140,7 @@ impl Ingress {
             application: Arc::clone(&serving.application),
             version: serving.version,
             declared: Arc::clone(&serving.declared),
+            transactions: Transactions::default(),
         });
         let known = Known {
             user: Some(&in_flight.user.id),

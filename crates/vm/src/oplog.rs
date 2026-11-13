@@ -5,7 +5,8 @@
 //!
 //! Interface: [`OperationLog::refused`] writes a refused operation's entry
 //! whole, and [`OperationLog::failed`] the whole entry of an allowed one
-//! that failed before its statement was sent; [`OperationLog::begin`] writes an allowed one's as `unfinished`
+//! that failed before its statement was sent ([`OperationLog::whole`] any
+//! whole entry, such as the host's own `rollback`); [`OperationLog::begin`] writes an allowed one's as `unfinished`
 //! before its statement is sent, and [`OperationLog::finish`] completes it.
 //! Each write has [`WRITE_TIMEOUT`]. [`OperationLog::newest`] reads.
 //!
@@ -40,8 +41,11 @@ pub struct Entry<'a> {
     /// `user` or `application`.
     pub actor: &'a str,
     pub operation: &'a str,
-    /// Without its values.
+    /// Without its values. For `begin`, `commit` and `rollback`, that word.
     pub statement: &'a str,
+    /// The transaction's id, for a statement in a transaction and for its
+    /// `begin`, `commit` and `rollback`; `None` otherwise.
+    pub transaction: Option<&'a str>,
 }
 
 /// How an allowed operation ended.
@@ -55,6 +59,8 @@ pub struct Ending<'a> {
     pub rows: Option<u64>,
     /// When the statement was sent.
     pub duration_ms: Option<u64>,
+    /// A `begin` that began nothing: its entry's `transaction` becomes null.
+    pub began_nothing: bool,
 }
 
 pub struct OperationLog {
@@ -74,8 +80,8 @@ impl OperationLog {
                 .execute(
                     "INSERT INTO operation_log (request, user_id, application, version, resource,
                                                 actor, own_database, operation, statement,
-                                                outcome, reason)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'refused', $10)",
+                                                transaction_id, outcome, reason)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'refused', $11)",
                     &[
                         &entry.request,
                         &entry.user,
@@ -86,6 +92,7 @@ impl OperationLog {
                         &entry.resource.is_none(),
                         &entry.operation,
                         &entry.statement,
+                        &entry.transaction,
                         &reason,
                     ],
                 )
@@ -100,14 +107,26 @@ impl OperationLog {
     /// its statement was sent (the statement check refused it, the Resource
     /// has no login for it): `failed`, with `error` saying why.
     pub async fn failed(&self, entry: &Entry<'_>, error: &str) -> Result<(), DbError> {
+        self.whole(entry, "failed", Some(error)).await
+    }
+
+    /// Writes the whole entry of an operation with this `outcome` and
+    /// `error`, and no rows: what [`OperationLog::failed`] writes, and the
+    /// `rollback` the host makes on its own (`allowed`, `error` saying why).
+    pub async fn whole(
+        &self,
+        entry: &Entry<'_>,
+        outcome: &str,
+        error: Option<&str>,
+    ) -> Result<(), DbError> {
         let version = version_of(entry.version)?;
         self.write(async |client: &mut Client| {
             client
                 .execute(
                     "INSERT INTO operation_log (request, user_id, application, version, resource,
                                                 actor, own_database, operation, statement,
-                                                outcome, error)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'failed', $10)",
+                                                transaction_id, outcome, error)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
                     &[
                         &entry.request,
                         &entry.user,
@@ -118,6 +137,8 @@ impl OperationLog {
                         &entry.resource.is_none(),
                         &entry.operation,
                         &entry.statement,
+                        &entry.transaction,
+                        &outcome,
                         &error,
                     ],
                 )
@@ -137,8 +158,8 @@ impl OperationLog {
                 .query_one(
                     "INSERT INTO operation_log (request, user_id, application, version, resource,
                                                 actor, own_database, operation, statement,
-                                                outcome)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'unfinished')
+                                                transaction_id, outcome)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'unfinished')
                      RETURNING id",
                     &[
                         &entry.request,
@@ -150,6 +171,7 @@ impl OperationLog {
                         &entry.resource.is_none(),
                         &entry.operation,
                         &entry.statement,
+                        &entry.transaction,
                     ],
                 )
                 .await
@@ -175,9 +197,17 @@ impl OperationLog {
             client
                 .execute(
                     "UPDATE operation_log
-                     SET outcome = $2, error = $3, rows = $4, duration_ms = $5
+                     SET outcome = $2, error = $3, rows = $4, duration_ms = $5,
+                         transaction_id = CASE WHEN $6 THEN NULL ELSE transaction_id END
                      WHERE id = $1",
-                    &[&id, &ending.outcome, &ending.error, &rows, &duration],
+                    &[
+                        &id,
+                        &ending.outcome,
+                        &ending.error,
+                        &rows,
+                        &duration,
+                        &ending.began_nothing,
+                    ],
                 )
                 .await
                 .map_err(DbError::from)?;
@@ -209,7 +239,7 @@ impl OperationLog {
                             rfc3339!("time"),
                             ", request, user_id, application, version, resource, operation,
                                statement, outcome, reason, error, rows, duration_ms,
-                               actor, own_database
+                               actor, own_database, transaction_id
                              FROM (SELECT * FROM operation_log ORDER BY id DESC LIMIT $1) newest
                              ORDER BY id"
                         ),
@@ -221,7 +251,7 @@ impl OperationLog {
             .await?;
         let mut entries = Vec::with_capacity(rows.len());
         for row in &rows {
-            let mut entry = Map::with_capacity(16);
+            let mut entry = Map::with_capacity(17);
             entry.insert("id".into(), get::<i64>(row, 0)?.into());
             entry.insert("time".into(), get::<String>(row, 1)?.into());
             entry.insert("request".into(), get::<Option<String>>(row, 2)?.into());
@@ -238,6 +268,7 @@ impl OperationLog {
             entry.insert("error".into(), get::<Option<String>>(row, 11)?.into());
             entry.insert("rows".into(), get::<Option<i64>>(row, 12)?.into());
             entry.insert("duration_ms".into(), get::<Option<i64>>(row, 13)?.into());
+            entry.insert("transaction".into(), get::<Option<String>>(row, 16)?.into());
             entries.push(Value::Object(entry));
         }
         Ok(entries)

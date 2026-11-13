@@ -59,9 +59,11 @@ impl HostOps {
         self.active.store(true, Ordering::SeqCst);
     }
 
-    /// The request is over: from now on this context speaks for no one.
+    /// The request is over: from now on this context speaks for no one,
+    /// and every transaction it left open is rolled back.
     pub fn end(&self) {
         self.active.store(false, Ordering::SeqCst);
+        self.in_flight.transactions.end();
     }
 
     pub fn failed(&self) -> bool {

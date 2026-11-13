@@ -144,6 +144,16 @@ pub const STEPS: &[Step] = &[
         END $$;
     ",
     },
+    Step {
+        number: 4,
+        name: "transactions in the operation log",
+        sql: "
+        -- The id of the transaction a statement ran in, or that a `begin`,
+        -- `commit` or `rollback` was of; null otherwise. The id Application
+        -- code holds, which works only inside the request that began it.
+        ALTER TABLE operation_log ADD COLUMN transaction_id text;
+    ",
+    },
 ];
 
 /// The advisory lock every step's transaction takes first: "vm steps".

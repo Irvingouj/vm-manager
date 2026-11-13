@@ -37,7 +37,7 @@ use openworkers_runtime_v8::Worker;
 use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio::task::JoinSet;
 
-use crate::gateway::Gateway;
+use crate::gateway::{Gateway, Transactions};
 use crate::registry::{Declared, Serving};
 use crate::user::User;
 use host::{APPLICATION_BINDING, HostOps};
@@ -54,6 +54,9 @@ pub struct InFlight {
     pub version: u64,
     /// That Version's Declared access.
     pub declared: Arc<Declared>,
+    /// The transactions it holds open (blackbox/CONTRACT.md,
+    /// "Transactions"): they belong to it, and are rolled back when it ends.
+    pub transactions: Transactions,
 }
 
 /// What the Application answered.

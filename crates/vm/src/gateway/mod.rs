@@ -38,6 +38,18 @@
 //! are bounded ([`OPERATIONS_AT_ONCE`]); past the bound an operation waits
 //! up to [`PERMIT_WAIT`] to start, within the Application's call.
 //!
+//! Transactions (blackbox/CONTRACT.md, "Transactions"; [`transaction`]):
+//! `tx.begin` is decided like an operation needing the `access` it asks for
+//! on its target, then, within the request's bound ([`PER_REQUEST`]), a task
+//! of its own takes a connection, logs the `begin` and begins. `query` and
+//! `execute` with `tx` are looked up among the request's own open
+//! transactions (`no-transaction` otherwise, with no entry), decided again
+//! as the transaction's target and actor, and handed to its task in the
+//! order they are made; the task checks, logs, limits and runs them one at
+//! a time on its connection. `tx.commit` and `tx.rollback` are handed over
+//! the same way. The request's end, the cap ([`CAP`]) and a limit end a
+//! transaction from the host's side.
+//!
 //! Later tickets add outbound calls here.
 
 use std::future::Future;
@@ -48,11 +60,15 @@ use std::time::Duration;
 use authz::{AccessLevel, Question};
 use serde_json::{Map, Value, json};
 use tokio::runtime::Handle;
-use tokio::sync::{Semaphore, oneshot};
+use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio::task::JoinSet;
 
+mod transaction;
+
+pub use transaction::{CAP, PER_REQUEST, Transactions};
+
 use crate::check;
-use crate::executor::{Failure, Label, Level, Param, Pool, Values};
+use crate::executor::{Failure, Held, Isolation, Label, Level, Outcome, Param, Pool, Values};
 use crate::log;
 use crate::oplog::{Ending, Entry, OperationLog};
 use crate::own_db::OwnDatabases;
@@ -219,6 +235,62 @@ fn error_to_wire(error: Value) -> Value {
     Value::Object(wire)
 }
 
+/// Arguments that cannot be read: `{ error: { kind: "malformed", message } }`,
+/// nothing logged or sent; the `host-call` record says `malformed`.
+fn malformed(problem: &str) -> Decision {
+    Decision {
+        refused: Some(MALFORMED),
+        answer: Box::pin(std::future::ready(error_to_wire(
+            json!({ "kind": "malformed", "message": problem }),
+        ))),
+    }
+}
+
+/// An id that is not an open transaction of the request in flight: the same
+/// answer whatever the reason, and no Operation log entry. The `host-call`
+/// record says `no-transaction`.
+fn no_transaction() -> Decision {
+    Decision {
+        refused: Some(transaction::NO_TRANSACTION),
+        answer: Box::pin(std::future::ready(transaction::no_transaction_wire())),
+    }
+}
+
+/// Hands a command to a transaction's task, at once, so that commands run
+/// in the order they were made; answers what the task answers. A task that
+/// has ended (or ends before it gets to the command) is `no-transaction`. A
+/// transaction whose queue is full ([`transaction::QUEUE`] commands waiting)
+/// answers `unavailable`.
+fn hand_over(
+    commands: &mpsc::Sender<transaction::Command>,
+    command: impl FnOnce(oneshot::Sender<Value>) -> transaction::Command,
+) -> Decision {
+    let (reply, answer) = oneshot::channel();
+    match commands.try_send(command(reply)) {
+        Ok(()) => {}
+        Err(mpsc::error::TrySendError::Closed(_)) => return no_transaction(),
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            log::record(
+                "operations-busy",
+                json!({ "problem": "too many operations waiting in one transaction" }),
+            );
+            return Decision::allowed(error_to_wire(json!({ "kind": "unavailable" })));
+        }
+    }
+    let answer = async move {
+        match tokio::time::timeout(ANSWER_WAIT, answer).await {
+            Ok(Ok(answer)) => answer,
+            // The task ended without getting to it.
+            Ok(Err(_)) => transaction::no_transaction_wire(),
+            Err(_) => error_to_wire(json!({ "kind": "unavailable" })),
+        }
+    };
+    Decision {
+        refused: None,
+        answer: Box::pin(answer),
+    }
+}
+
 /// What Application code will receive.
 pub type Answer = Pin<Box<dyn Future<Output = Value> + Send>>;
 
@@ -328,27 +400,184 @@ impl PlatformGateway {
             Ok(call) => call,
             // With no request in flight nothing is answered but that.
             Err(_) if !active => return Decision::refused(&Refusal::no_request()),
-            Err(problem) => {
-                return Decision {
-                    refused: Some(MALFORMED),
-                    answer: Box::pin(std::future::ready(error_to_wire(
-                        json!({ "kind": "malformed", "message": problem }),
-                    ))),
-                };
+            Err(problem) => return malformed(problem),
+        };
+        let target = match call.target {
+            Target::Tx(id) => return self.in_transaction(kind, in_flight, active, id, call),
+            target => target,
+        };
+        let actor = call.actor;
+        let (on, refusal) = self.decide(kind.needed(), actor, target, in_flight, active);
+        let work = self.work(kind, in_flight, active, actor, on, call, refusal);
+        if !active {
+            // Refused (`no-request` comes first). Answered at once: the
+            // runtime may not settle a call made while no event runs, as
+            // at the script's top level. Its entry is written meanwhile.
+            return self.refused_unawaited(work);
+        }
+        let refused = work.refusal.as_ref().map(|r| r.reason);
+        self.dispatch(work, refused, Work::run)
+    }
+
+    /// `query` or `execute` with `tx`: in the transaction `id` of the
+    /// request in flight, as its target and actor, decided again. An id
+    /// that is not one of its open transactions answers `no-transaction`,
+    /// with no Operation log entry. An allowed statement is handed to the
+    /// transaction's task at once, so statements run in the order they were
+    /// made.
+    fn in_transaction(
+        &self,
+        kind: Kind,
+        in_flight: &Arc<InFlight>,
+        active: bool,
+        id: &str,
+        call: Call<'_>,
+    ) -> Decision {
+        // A transaction belongs to the request in flight; with none, there
+        // is nothing to look it up in.
+        if !active {
+            return Decision::refused(&Refusal::no_request());
+        }
+        let Some(found) = in_flight.transactions.find(id) else {
+            return no_transaction();
+        };
+        let target = match &found.resource {
+            None => Target::Own,
+            Some(name) => Target::Resource(name),
+        };
+        let (on, refusal) = self.decide(kind.needed(), found.actor, target, in_flight, active);
+        let work = Work {
+            transaction: Some(Arc::clone(&found.id)),
+            ..self.work(kind, in_flight, active, found.actor, on, call, refusal)
+        };
+        if let Some(refusal) = &work.refusal {
+            let refused = Some(refusal.reason);
+            return self.dispatch(work, refused, Work::run);
+        }
+        hand_over(&found.commands, |reply| transaction::Command::Statement {
+            work: Box::new(work),
+            reply,
+        })
+    }
+
+    /// `tx.begin`: decided like an operation needing its `access` on its
+    /// target; then, within the request's bound on open transactions, a
+    /// task of its own takes a connection and begins it.
+    fn begin(&self, in_flight: &Arc<InFlight>, active: bool, args: &Value) -> Decision {
+        let begin = match Begin::read(args) {
+            Ok(begin) => begin,
+            Err(_) if !active => return Decision::refused(&Refusal::no_request()),
+            Err(problem) => return malformed(problem),
+        };
+        let (on, refusal) = self.decide(begin.access, begin.actor, begin.target, in_flight, active);
+        let work = Work {
+            kind: Kind::Begin(begin.access),
+            in_flight: Arc::clone(in_flight),
+            active,
+            actor: begin.actor,
+            target: on,
+            sql: String::new(),
+            params: Vec::new(),
+            values: Values::Typed,
+            statement: "begin".to_owned(),
+            refusal,
+            transaction: None,
+            log: Arc::clone(&self.log),
+            own: Arc::clone(&self.own),
+        };
+        if !active {
+            return self.refused_unawaited(work);
+        }
+        if let Some(refusal) = &work.refusal {
+            let refused = Some(refusal.reason);
+            return self.dispatch(work, refused, Work::run);
+        }
+        let reserved = in_flight
+            .transactions
+            .reserve(work.resource_name(), begin.actor);
+        let made = match reserved {
+            transaction::Reserved::Made(made) => made,
+            // The request ended meanwhile.
+            transaction::Reserved::Ended => return Decision::refused(&Refusal::no_request()),
+            transaction::Reserved::Full => {
+                return self.dispatch(work, None, |work: Work| async move {
+                    let answer = error_to_wire(json!({ "kind": "limit", "limit": "transactions" }));
+                    work.failed_unsent("transactions", answer).await
+                });
             }
         };
+        let level = match begin.access {
+            AccessLevel::Write => Level::Write,
+            AccessLevel::Read | AccessLevel::Structure => Level::Read,
+        };
+        let opened = transaction::Opened {
+            id: made.id,
+            in_flight: work.in_flight,
+            actor: begin.actor,
+            target: work.target,
+            level,
+            isolation: begin.isolation,
+            log: work.log,
+            own: work.own,
+        };
+        let (began, answer) = oneshot::channel();
+        self.operations
+            .spawn(transaction::run(opened, made.commands, made.alive, began));
+        let answer = async move {
+            match tokio::time::timeout(ANSWER_WAIT, answer).await {
+                Ok(Ok(answer)) => answer,
+                Ok(Err(_)) | Err(_) => error_to_wire(json!({ "kind": "unavailable" })),
+            }
+        };
+        Decision {
+            refused: None,
+            answer: Box::pin(answer),
+        }
+    }
+
+    /// `tx.commit` (`commit`) or `tx.rollback`: handed to the transaction's
+    /// task, after the statements made before it.
+    fn end(&self, in_flight: &Arc<InFlight>, active: bool, args: &Value, commit: bool) -> Decision {
+        let id = match args.as_object().and_then(|args| args.get("tx")) {
+            Some(Value::String(id)) => id,
+            _ if !active => return Decision::refused(&Refusal::no_request()),
+            _ => return malformed("`tx` must be the id of a transaction, as a string"),
+        };
+        if !active {
+            return Decision::refused(&Refusal::no_request());
+        }
+        let Some(found) = in_flight.transactions.find(id) else {
+            return no_transaction();
+        };
+        hand_over(&found.commands, |reply| transaction::Command::End {
+            commit,
+            reply,
+        })
+    }
+
+    /// The Authorization decision for an operation needing `needed` on
+    /// `target`, acting as `actor`, for the request in flight: what it is
+    /// on, and the refusal if refused.
+    fn decide(
+        &self,
+        needed: AccessLevel,
+        actor: authz::Actor,
+        target: Target<'_>,
+        in_flight: &InFlight,
+        active: bool,
+    ) -> (On, Option<Refusal>) {
         let groups: Vec<&str> = in_flight.user.groups.iter().map(String::as_str).collect();
-        let (target, refusal) = match call.target {
-            Target::Own => {
+        match target {
+            Target::Own | Target::Tx(_) => {
                 let decision = authz::decide(&Question {
                     request_in_flight: active,
-                    actor: call.actor,
+                    actor,
                     own_database: true,
                     groups: &groups,
                     declared: None,
                     registered: false,
                     grants: &[],
-                    needed: kind.needed(),
+                    needed,
                 });
                 let refusal = match decision {
                     authz::Decision::Allow => None,
@@ -362,13 +591,13 @@ impl PlatformGateway {
                 let decide = |grants: &[authz::Grant<'_>]| {
                     authz::decide(&Question {
                         request_in_flight: active,
-                        actor: call.actor,
+                        actor,
                         own_database: false,
                         groups: &groups,
                         declared: in_flight.declared.get(name).copied(),
                         registered: resource.is_some(),
                         grants,
-                        needed: kind.needed(),
+                        needed,
                     })
                 };
                 let decision = match &resource {
@@ -379,7 +608,7 @@ impl PlatformGateway {
                     authz::Decision::Allow => None,
                     authz::Decision::Refuse(reason) => Some(Refusal::of(
                         reason,
-                        kind.needed(),
+                        needed,
                         name,
                         &in_flight.user.id,
                         resource.as_deref(),
@@ -393,33 +622,55 @@ impl PlatformGateway {
                 };
                 (on, refusal)
             }
-        };
-        let refused = refusal.as_ref().map(|r| r.reason);
-        // What is sent is kept only for an operation that will be sent.
+        }
+    }
+
+    /// The operation `call` asks for, decided: what is sent is kept only
+    /// for an operation that will be sent.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the parts of one decided operation, each named"
+    )]
+    fn work(
+        &self,
+        kind: Kind,
+        in_flight: &Arc<InFlight>,
+        active: bool,
+        actor: authz::Actor,
+        target: On,
+        call: Call<'_>,
+        refusal: Option<Refusal>,
+    ) -> Work {
         let (sql, params) = match refusal {
+            // Copied: sent from another thread, after the call.
             None => (call.sql.to_owned(), call.params),
             Some(_) => (String::new(), Vec::new()),
         };
-        let work = Work {
+        Work {
             kind,
             in_flight: Arc::clone(in_flight),
             active,
-            actor: call.actor,
+            actor,
             target,
             sql,
             params,
             values: call.values,
             statement: statement::without_values(call.sql),
             refusal,
+            transaction: None,
             log: Arc::clone(&self.log),
             own: Arc::clone(&self.own),
-        };
-        if !active {
-            // Refused (`no-request` comes first). Answered at once: the
-            // runtime may not settle a call made while no event runs, as
-            // at the script's top level. Its entry is written meanwhile.
-            return self.refused_unawaited(work);
         }
+    }
+
+    /// Runs `task` on `work` in a task of its own, owned here, once one of
+    /// [`OPERATIONS_AT_ONCE`] is free (waiting up to [`PERMIT_WAIT`]), and
+    /// answers what it answers.
+    fn dispatch<F, Fut>(&self, work: Work, refused: Option<&'static str>, task: F) -> Decision
+    where
+        F: FnOnce(Work) -> Fut + Send + 'static,
+        Fut: Future<Output = Value> + Send + 'static,
+    {
         let operations = Arc::clone(&self.operations);
         let answer = async move {
             let permits = Arc::clone(&operations.permits);
@@ -431,7 +682,7 @@ impl PlatformGateway {
             operations.spawn(async move {
                 // The Application may have stopped waiting; the entry is
                 // complete either way.
-                reply.send(work.run().await).ok();
+                reply.send(task(work).await).ok();
                 drop(permit);
             });
             match tokio::time::timeout(ANSWER_WAIT, answer).await {
@@ -479,6 +730,9 @@ impl Gateway for PlatformGateway {
         match operation {
             "query" => self.on_database(Kind::Query, in_flight, active, args),
             "execute" => self.on_database(Kind::Execute, in_flight, active, args),
+            "tx.begin" => self.begin(in_flight, active, args),
+            "tx.commit" => self.end(in_flight, active, args, true),
+            "tx.rollback" => self.end(in_flight, active, args, false),
             _ if !active => Decision::refused(&Refusal::no_request()),
             // Nothing the Application passes is read: who is asking is the
             // request in flight.
@@ -502,6 +756,10 @@ enum Kind {
     /// `execute`: needs `write`; a read-write transaction, as the write
     /// login or the runtime role.
     Execute,
+    /// `tx.begin`: needs the `access` it asks for. Only its refusals and
+    /// failures before anything is sent run as a [`Work`]; the rest is the
+    /// transaction's own task.
+    Begin(AccessLevel),
 }
 
 impl Kind {
@@ -509,6 +767,7 @@ impl Kind {
         match self {
             Self::Query => "query",
             Self::Execute => "execute",
+            Self::Begin(_) => "begin",
         }
     }
 
@@ -516,6 +775,7 @@ impl Kind {
         match self {
             Self::Query => AccessLevel::Read,
             Self::Execute => AccessLevel::Write,
+            Self::Begin(access) => access,
         }
     }
 }
@@ -527,13 +787,82 @@ enum Target<'a> {
     Own,
     /// A Resource, by name.
     Resource(&'a str),
+    /// A transaction of the request in flight, by its id: its target and
+    /// actor are the transaction's.
+    Tx(&'a str),
 }
+
+/// What a call's arguments name: `own: true` or `resource`, and `as`.
+fn read_target(args: &Map<String, Value>) -> Result<(Target<'_>, authz::Actor), &'static str> {
+    const TARGET: &str = "name exactly one target: `own: true` for the Application's own database, or `resource` with the name of a Resource";
+    let own = match args.get("own") {
+        None => false,
+        Some(Value::Bool(true)) => true,
+        Some(_) => return Err("`own` must be exactly true, and then no `resource` is given"),
+    };
+    let target = match (own, args.get("resource")) {
+        (true, None) => Target::Own,
+        (false, Some(Value::String(name))) => Target::Resource(name),
+        (false, Some(_)) => {
+            return Err("`resource` must be the name of a Resource, as a string");
+        }
+        (true, Some(_)) | (false, None) => return Err(TARGET),
+    };
+    let actor = match args.get("as") {
+        None => authz::Actor::User,
+        Some(Value::String(actor)) if actor == "user" => authz::Actor::User,
+        Some(Value::String(actor)) if actor == "application" => authz::Actor::Application,
+        Some(_) => return Err("`as` must be \"user\" (the default) or \"application\""),
+    };
+    Ok((target, actor))
+}
+
+/// The arguments of `tx.begin` (blackbox/CONTRACT.md, "Transactions: Through
+/// the raw interface"): a target and actor as for `query`, `access`
+/// (`"read"` or `"write"`) and, optionally, `isolation`.
+struct Begin<'a> {
+    target: Target<'a>,
+    actor: authz::Actor,
+    access: AccessLevel,
+    isolation: Option<Isolation>,
+}
+
+impl<'a> Begin<'a> {
+    fn read(args: &'a Value) -> Result<Self, &'static str> {
+        let Some(args) = args.as_object() else {
+            return Err(
+                "the arguments must be an object: { own: true, as, access, isolation } or { resource, as, access, isolation }",
+            );
+        };
+        let (target, actor) = read_target(args)?;
+        let access = match args.get("access") {
+            Some(Value::String(access)) if access == "read" => AccessLevel::Read,
+            Some(Value::String(access)) if access == "write" => AccessLevel::Write,
+            _ => return Err("`access` must be \"read\" or \"write\""),
+        };
+        let isolation = match args.get("isolation") {
+            None => None,
+            Some(Value::String(name)) => Some(Isolation::of(name).ok_or(ISOLATION)?),
+            Some(_) => return Err(ISOLATION),
+        };
+        Ok(Self {
+            target,
+            actor,
+            access,
+            isolation,
+        })
+    }
+}
+
+const ISOLATION: &str =
+    "`isolation` must be \"read committed\", \"repeatable read\" or \"serializable\", or not given";
 
 /// The arguments of `query` and `execute`, read strictly (blackbox/CONTRACT.md,
 /// "Operations on a shared database" and "Operations on the own database"):
 /// exactly one of `own: true` and `resource`; `as` absent, `"user"` or
-/// `"application"`; `values` absent or `"text"` ("The SDK: Values"). Fields
-/// it does not have are ignored.
+/// `"application"`; or instead of all three `tx`, a transaction's id
+/// ("Transactions"); `values` absent or `"text"` ("The SDK: Values").
+/// Fields it does not have are ignored.
 struct Call<'a> {
     target: Target<'a>,
     actor: authz::Actor,
@@ -544,30 +873,26 @@ struct Call<'a> {
 
 impl<'a> Call<'a> {
     fn read(args: &'a Value) -> Result<Self, &'static str> {
-        const TARGET: &str = "name exactly one target: `own: true` for the Application's own database, or `resource` with the name of a Resource";
         let Some(args) = args.as_object() else {
             return Err(
-                "the arguments must be an object: { own: true, as, sql, params } or { resource, as, sql, params }",
+                "the arguments must be an object: { own: true, as, sql, params }, { resource, as, sql, params } or { tx, sql, params }",
             );
         };
-        let own = match args.get("own") {
-            None => false,
-            Some(Value::Bool(true)) => true,
-            Some(_) => return Err("`own` must be exactly true, and then no `resource` is given"),
-        };
-        let target = match (own, args.get("resource")) {
-            (true, None) => Target::Own,
-            (false, Some(Value::String(name))) => Target::Resource(name),
-            (false, Some(_)) => {
-                return Err("`resource` must be the name of a Resource, as a string");
+        let (target, actor) = match args.get("tx") {
+            Some(Value::String(id)) => {
+                if ["resource", "own", "as"]
+                    .iter()
+                    .any(|key| args.contains_key(*key))
+                {
+                    return Err(
+                        "`tx` names the transaction, and with it the target and the actor: give no `resource`, `own` or `as` beside it",
+                    );
+                }
+                // The transaction's own actor is used, not this.
+                (Target::Tx(id), authz::Actor::User)
             }
-            (true, Some(_)) | (false, None) => return Err(TARGET),
-        };
-        let actor = match args.get("as") {
-            None => authz::Actor::User,
-            Some(Value::String(actor)) if actor == "user" => authz::Actor::User,
-            Some(Value::String(actor)) if actor == "application" => authz::Actor::Application,
-            Some(_) => return Err("`as` must be \"user\" (the default) or \"application\""),
+            Some(_) => return Err("`tx` must be the id of a transaction, as a string"),
+            None => read_target(args)?,
         };
         let values = match args.get("values") {
             None => Values::Typed,
@@ -637,6 +962,9 @@ struct Work {
     values: Values,
     statement: String,
     refusal: Option<Refusal>,
+    /// The transaction it runs in (blackbox/CONTRACT.md, "Transactions"),
+    /// by its id; `None` outside one.
+    transaction: Option<Arc<str>>,
     log: Arc<OperationLog>,
     own: Arc<OwnDatabases>,
 }
@@ -660,6 +988,7 @@ impl Work {
             actor: actor_name(self.actor),
             operation: self.kind.name(),
             statement: &self.statement,
+            transaction: self.transaction.as_deref(),
         }
     }
 
@@ -680,7 +1009,7 @@ impl Work {
                 resource: Some(resource),
                 ..
             } => match self.kind {
-                Kind::Query => resource.read_pool(),
+                Kind::Query | Kind::Begin(_) => resource.read_pool(),
                 Kind::Execute => match resource.write_pool() {
                     Some(pool) => pool,
                     None => {
@@ -730,16 +1059,100 @@ impl Work {
             },
         };
         let level = match self.kind {
-            Kind::Query => Level::Read,
+            Kind::Query | Kind::Begin(_) => Level::Read,
             Kind::Execute => Level::Write,
         };
         let outcome = pool
             .run(level, &self.sql, &self.params, self.values, label)
             .await;
+        let ending = self.ending_of(&outcome);
+        if let Err(error) = self.log.finish(id, &ending).await {
+            self.unlogged(&error);
+        }
+        self.answer_of(outcome)
+    }
+
+    /// A statement in its transaction, on the transaction's connection
+    /// `held`: checked, logged and run as any statement is, its time cut at
+    /// the transaction's `cap`. If the request ends (`alive` answers) before
+    /// or while it runs, it is given up. Answers what Application code
+    /// receives, and what became of the transaction.
+    async fn run_in_transaction(
+        self,
+        held: &mut Held<'_>,
+        cap: tokio::time::Instant,
+        alive: &mut oneshot::Receiver<()>,
+    ) -> (Value, transaction::After) {
+        if let Err(refused) = check::check(&self.sql) {
+            let answer = error_to_wire(json!({
+                "kind": "statement",
+                "reason": refused.reason.name(),
+                "message": refused.message,
+            }));
+            let answer = self.failed_unsent("statement", answer).await;
+            return (answer, transaction::After::Open);
+        }
+        let id = match self.log.begin(&self.entry()).await {
+            Ok(id) => id,
+            Err(error) => {
+                self.unlogged(&error);
+                let answer = Refusal::log_unavailable(self.resource_name()).to_wire();
+                return (answer, transaction::After::Open);
+            }
+        };
+        let request_ended = Ending {
+            outcome: "failed",
+            error: Some(transaction::REQUEST_ENDED),
+            rows: None,
+            duration_ms: None,
+            began_nothing: false,
+        };
+        // The request may have ended while the entry was written: then
+        // nothing is sent.
+        if transaction::has_ended(alive) {
+            if let Err(error) = self.log.finish(id, &request_ended).await {
+                self.unlogged(&error);
+            }
+            let after = transaction::After::Ended(transaction::REQUEST_ENDED);
+            return (transaction::no_transaction_wire(), after);
+        }
+        let ran = tokio::select! {
+            biased;
+            _ = &mut *alive => None,
+            outcome = held.run(&self.sql, &self.params, self.values, cap) => Some(outcome),
+        };
+        let Some(outcome) = ran else {
+            // The request ended while the statement ran: what the
+            // connection is doing is not known, so it is stopped.
+            if let Err(error) = self.log.finish(id, &request_ended).await {
+                self.unlogged(&error);
+            }
+            return (
+                transaction::no_transaction_wire(),
+                transaction::After::Abandoned,
+            );
+        };
+        let ending = self.ending_of(&outcome);
+        if let Err(error) = self.log.finish(id, &ending).await {
+            self.unlogged(&error);
+        }
+        let after = if held.is_open() {
+            transaction::After::Open
+        } else {
+            transaction::After::Ended(match &outcome.result {
+                Err(Failure::Limit(limit)) => limit.name(),
+                _ => "unavailable",
+            })
+        };
+        (self.answer_of(outcome), after)
+    }
+
+    /// How the operation's entry is completed, from its outcome.
+    fn ending_of<'o>(&self, outcome: &'o Outcome) -> Ending<'o> {
         let duration_ms = outcome
             .duration
             .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
-        let ending = match &outcome.result {
+        match &outcome.result {
             Ok(rows) => Ending {
                 outcome: "allowed",
                 error: None,
@@ -748,9 +1161,10 @@ impl Work {
                     Kind::Execute => rows
                         .affected
                         .or_else(|| u64::try_from(rows.rows.len()).ok()),
-                    Kind::Query => u64::try_from(rows.rows.len()).ok(),
+                    Kind::Query | Kind::Begin(_) => u64::try_from(rows.rows.len()).ok(),
                 },
                 duration_ms,
+                began_nothing: false,
             },
             Err(failure) => Ending {
                 outcome: "failed",
@@ -761,11 +1175,13 @@ impl Work {
                 }),
                 rows: None,
                 duration_ms,
+                began_nothing: false,
             },
-        };
-        if let Err(error) = self.log.finish(id, &ending).await {
-            self.unlogged(&error);
         }
+    }
+
+    /// What Application code receives, from the operation's outcome.
+    fn answer_of(&self, outcome: Outcome) -> Value {
         match outcome.result {
             Ok(rows) => ok_to_wire(rows.into_wire(self.kind == Kind::Execute, self.values)),
             Err(Failure::Database { code, message }) => {
