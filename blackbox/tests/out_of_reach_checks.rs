@@ -31,7 +31,6 @@ use blackbox::own_database::{Migration, OwnDatabase, assert_did_not_run, ident, 
 use blackbox::scenario::lines;
 
 const CAPTURE_CHANGED: Answers = &[refused("capture-changed")];
-const CAPTURE_MISSING: Answers = &[refused("capture-missing")];
 const CHANGED_OR_MISSING: Answers = &[refused("capture-changed"), refused("capture-missing")];
 const DEFERRABLE: Answers = &[refused("deferrable")];
 const JSON_CAST: Answers = &[refused("json-cast")];
@@ -135,7 +134,7 @@ fn a_capture_trigger_switched_off_dropped_renamed_or_replaced_is_refused_also_wh
             ]
         })
         .mentioning("children"),
-        Case::statements("drop-and-recreate-calling-its-own-function", CAPTURE_CHANGED, |db| {
+        Case::statements("drop-and-recreate-calling-its-own-function", CHANGED_OR_MISSING, |db| {
             let trigger = capture_trigger(db, "things", ON_UPDATE);
             vec![
                 r#"CREATE FUNCTION "fake"() RETURNS trigger LANGUAGE plpgsql AS $f$ BEGIN RETURN NULL; END $f$"#.to_owned(),
@@ -245,16 +244,20 @@ fn a_table_without_its_whole_capture_at_the_end_or_with_another_trigger_on_a_vm_
         })
         .mentioning("things"),
         // A table made by the Version's first migration loses its capture
-        // in the second: no trigger of it existed before the Version.
-        Case::migrations("new-table-capture-dropped-later", CAPTURE_MISSING, |_| {
-            vec![
-                Migration::new(
-                    "0004_fresh",
-                    &[r#"CREATE TABLE "fresh" ("id" integer PRIMARY KEY NOT NULL, "v" text);"#],
-                ),
-                Migration::new(
-                    "0005_uncaptured",
-                    &["DO $f$
+        // in the second: its capture existed before the second migration
+        // and is missing at the end, so either rule is true.
+        Case::migrations(
+            "new-table-capture-dropped-later",
+            CHANGED_OR_MISSING,
+            |_| {
+                vec![
+                    Migration::new(
+                        "0004_fresh",
+                        &[r#"CREATE TABLE "fresh" ("id" integer PRIMARY KEY NOT NULL, "v" text);"#],
+                    ),
+                    Migration::new(
+                        "0005_uncaptured",
+                        &["DO $f$
 DECLARE t record;
 BEGIN
   FOR t IN SELECT tg.tgname FROM pg_trigger tg JOIN pg_proc p ON p.oid = tg.tgfoid
@@ -263,9 +266,10 @@ BEGIN
     EXECUTE format('DROP TRIGGER %I ON fresh', t.tgname);
   END LOOP;
 END $f$;"],
-                ),
-            ]
-        })
+                    ),
+                ]
+            },
+        )
         .naming(ANY_MIGRATION)
         .mentioning("fresh"),
         // a-attacks.sql A58: a trigger of its own on a vm function.

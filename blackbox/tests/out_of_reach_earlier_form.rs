@@ -7,8 +7,9 @@
 //!
 //! The harness's superuser gives the schema `vm` and everything the
 //! platform's own role owns back to the owner role (`REASSIGN OWNED`, which
-//! also gives it the database) and lets the owner role log in: the earlier
-//! form. The program is then started again on the same platform database.
+//! also gives it the database), lets the owner role log in, and drops the
+//! platform's own role: the earlier form, as a program from before the
+//! ticket left it. A second variant leaves that role in place. The program is then started again on the same platform database.
 //! Before it serves, the three roles stand as CONTRACT.md says, and the
 //! keys, the history, the record of migrations and every table's rows are
 //! as they were; Version 1 still serves and a change is still recorded.
@@ -61,9 +62,21 @@ fn data(db: &OwnDatabase) -> String {
     text
 }
 
+/// What a program from before the ticket left: no platform's own role at
+/// all.
 #[test]
 fn an_own_database_in_the_earlier_form_is_brought_to_three_roles_at_start_with_its_data_unchanged()
 {
+    earlier_form_brought_to_three_roles(true);
+}
+
+/// The same with the platform's own role still there (owning nothing).
+#[test]
+fn an_own_database_in_the_earlier_form_with_the_platform_s_role_left_is_brought_to_three_roles() {
+    earlier_form_brought_to_three_roles(false);
+}
+
+fn earlier_form_brought_to_three_roles(drop_the_role: bool) {
     let own = start();
     let db = install_seeded(&own, APP);
     let before = data(&db);
@@ -87,6 +100,15 @@ fn an_own_database_in_the_earlier_form_is_brought_to_three_roles_at_start_with_i
         ident(&db.name),
         o = ident(&db.owner)
     ));
+    if drop_the_role && db.role_exists(&platform) {
+        superuser.batch(&format!("DROP OWNED BY {}", ident(&platform)));
+        db.instance()
+            .batch(&format!("DROP ROLE {}", ident(&platform)));
+        assert!(
+            !db.role_exists(&platform),
+            "the harness's own check: the platform's own role dropped"
+        );
+    }
     drop(superuser);
     assert_eq!(
         db.column(

@@ -31,8 +31,8 @@
 use blackbox::User;
 use blackbox::history::{APP, history_after, last_history_id, vm_functions};
 use blackbox::out_of_reach::{
-    Answers, Case, ON_TRUNCATE, WRITER, base_and, capture_trigger, case, failed, fill,
-    install_seeded, run_cases, start,
+    ANY_CODE, Answers, Case, ON_TRUNCATE, WRITER, base_and, capture_trigger, case, failed, fill,
+    install_seeded, run_cases, run_lenient_cases, start,
 };
 use blackbox::own_database::{Migration, ident};
 use blackbox::scenario::lines;
@@ -40,6 +40,8 @@ use serde_json::json;
 
 const DENIED: Answers = &[failed("42501")];
 const TRUNCATE_REFUSED: Answers = &[failed("VM002")];
+/// CONTRACT.md: "`42501`, or another refusal of Postgres's own".
+const DENIED_ANY: Answers = &[failed(ANY_CODE)];
 
 #[test]
 fn a_migration_cannot_read_the_keys_or_carry_them_out() {
@@ -421,112 +423,120 @@ fn a_migration_cannot_create_in_vm_move_into_it_or_change_what_is_there() {
 fn a_migration_cannot_become_another_role_give_rights_or_change_the_database_or_the_roles() {
     let own = start();
     let cases = vec![
-        case("set-role-platform", DENIED, &["SET ROLE {p}"]),
-        case("set-local-role-platform", DENIED, &["SET LOCAL ROLE {p}"]),
-        case("set-role-runtime", DENIED, &["SET ROLE {r}"]),
+        case("set-role-platform", DENIED_ANY, &["SET ROLE {p}"]),
+        case(
+            "set-local-role-platform",
+            DENIED_ANY,
+            &["SET LOCAL ROLE {p}"],
+        ),
+        case("set-role-runtime", DENIED_ANY, &["SET ROLE {r}"]),
         case(
             "set-session-authorization",
-            DENIED,
+            DENIED_ANY,
             &["SET SESSION AUTHORIZATION {p}"],
         ),
         case(
             "set-config-role",
-            DENIED,
+            DENIED_ANY,
             &["SELECT set_config('role', {p_literal}, false)"],
         ),
-        case("grant-platform-to-owner", DENIED, &["GRANT {p} TO {o}"]),
-        case("grant-runtime-to-owner", DENIED, &["GRANT {r} TO {o}"]),
-        case("grant-owner-to-runtime", DENIED, &["GRANT {o} TO {r}"]),
+        case("grant-platform-to-owner", DENIED_ANY, &["GRANT {p} TO {o}"]),
+        case("grant-runtime-to-owner", DENIED_ANY, &["GRANT {r} TO {o}"]),
+        case("grant-owner-to-runtime", DENIED_ANY, &["GRANT {o} TO {r}"]),
         case(
             "revoke-owner-from-platform",
-            DENIED,
+            DENIED_ANY,
             &["REVOKE {o} FROM {p}"],
         ),
         case(
             "default-privileges-of-the-platform-s-role",
-            DENIED,
+            DENIED_ANY,
             &["ALTER DEFAULT PRIVILEGES FOR ROLE {p} GRANT SELECT ON TABLES TO {o}"],
         ),
         case(
             "database-settings",
-            DENIED,
+            DENIED_ANY,
             &["ALTER DATABASE {d} SET search_path = public, pg_catalog"],
         ),
         case(
             "database-session-replication-role",
-            DENIED,
+            DENIED_ANY,
             &["ALTER DATABASE {d} SET session_replication_role = replica"],
         ),
         case(
             "database-owner",
-            DENIED,
+            DENIED_ANY,
             &["ALTER DATABASE {d} OWNER TO {o}"],
         ),
         case(
             "database-rename",
-            DENIED,
+            DENIED_ANY,
             &[r#"ALTER DATABASE {d} RENAME TO "elsewhere""#],
         ),
         case(
             "database-connection-limit",
-            DENIED,
+            DENIED_ANY,
             &["ALTER DATABASE {d} CONNECTION LIMIT 1"],
         ),
         case(
             "database-comment",
-            DENIED,
+            DENIED_ANY,
             &["COMMENT ON DATABASE {d} IS 'mine'"],
         ),
         case(
             "platform-role-password",
-            DENIED,
+            DENIED_ANY,
             &["ALTER ROLE {p} PASSWORD 'pwned'"],
         ),
         case(
             "runtime-role-password",
-            DENIED,
+            DENIED_ANY,
             &["ALTER ROLE {r} PASSWORD 'pwned'"],
         ),
         case(
             "runtime-role-settings",
-            DENIED,
+            DENIED_ANY,
             &["ALTER ROLE {r} SET extra_float_digits = -15"],
         ),
-        case("runtime-role-no-login", DENIED, &["ALTER ROLE {r} NOLOGIN"]),
+        case(
+            "runtime-role-no-login",
+            DENIED_ANY,
+            &["ALTER ROLE {r} NOLOGIN"],
+        ),
         case(
             "owner-gives-itself-login",
-            DENIED,
+            DENIED_ANY,
             &["ALTER ROLE {o} LOGIN"],
         ),
         case(
             "owner-gives-itself-createrole",
-            DENIED,
+            DENIED_ANY,
             &["ALTER ROLE {o} CREATEROLE"],
         ),
         case(
             "owner-gives-itself-valid-until",
-            DENIED,
+            DENIED_ANY,
             &["ALTER ROLE {o} VALID UNTIL 'infinity'"],
         ),
         case(
             "create-a-role",
-            DENIED,
+            DENIED_ANY,
             &[r#"CREATE ROLE "intruder" LOGIN"#],
         ),
-        case("drop-the-runtime-role", DENIED, &["DROP ROLE {r}"]),
+        case("drop-the-runtime-role", DENIED_ANY, &["DROP ROLE {r}"]),
         case(
             "session-replication-role",
-            DENIED,
+            DENIED_ANY,
             &["SET session_replication_role = replica"],
         ),
         case(
             "local-session-replication-role",
-            DENIED,
+            DENIED_ANY,
             &["SET LOCAL session_replication_role = replica"],
         ),
         case(
             "session-replication-role-by-set-config",
-            DENIED,
+            DENIED_ANY,
             &["SELECT set_config('session_replication_role', 'replica', true)"],
         ),
     ];
@@ -611,9 +621,9 @@ fn a_migration_cannot_truncate_a_table_that_has_history() {
     run_cases(&own, "truncate", cases);
 }
 
-/// CONTRACT.md: "It can still read `vm.identity()` and call what the
-/// runtime role may call": a migration that reads `vm.history` (which the
-/// runtime role may) and `vm.identity()` applies.
+/// CONTRACT.md: "It can still read `vm.history`, and `vm.identity()`,
+/// which during a migration answers the Contributor who sent the Version
+/// as `user_id`, `actor` `migration` and no request."
 #[test]
 fn a_migration_can_still_read_the_identity_and_the_history() {
     let own = start();
@@ -635,7 +645,219 @@ fn a_migration_can_still_read_the_identity_and_the_history() {
         sent.describe()
     );
     assert!(db.has_table("history_seen") && db.has_table("identity_seen"));
+    assert_eq!(
+        db.column("SELECT n::text FROM history_seen"),
+        vec![blackbox::history::history_count(&db).to_string()],
+        "expected the migration to have read every row of vm.history"
+    );
+    let identity = blackbox::history::row_json(&db, "identity_seen", "true");
+    assert_eq!(
+        identity,
+        json!({ "user_id": blackbox::INSTALLER, "application": APP, "actor": "migration", "request": null }),
+        "expected vm.identity() during a migration to answer the Contributor, actor migration, no request"
+    );
     let _ = capture_trigger(&db, "history_seen", blackbox::out_of_reach::ON_INSERT);
+}
+
+/// CONTRACT.md: "a few such attempts Postgres answers with a warning and
+/// does nothing, and then the Version applies and the platform's part is as
+/// before"; and "A migration may change the migration role's own password
+/// or settings ... it is not refused and is of no use". Each ends `201` or
+/// `422`; either way the platform's part is as before, the owner role
+/// cannot log in, and a later migration still cannot read `vm.keys`.
+#[test]
+fn grants_postgres_answers_with_a_warning_change_nothing_of_the_platform_s() {
+    let own = start();
+    let lenient = |name: &'static str, template: &'static str| {
+        Case::statements(name, DENIED_ANY, move |db| vec![fill(template, db)])
+    };
+    let cases = vec![
+        lenient("grant-all-on-schema-vm", "GRANT ALL ON SCHEMA vm TO {o}"),
+        lenient(
+            "grant-create-on-schema-vm",
+            "GRANT CREATE ON SCHEMA vm TO {o}",
+        ),
+        lenient(
+            "grant-usage-on-schema-vm-to-runtime",
+            "GRANT USAGE, CREATE ON SCHEMA vm TO {r}",
+        ),
+        lenient(
+            "grant-select-on-all-tables-in-vm",
+            "GRANT SELECT ON ALL TABLES IN SCHEMA vm TO {o}",
+        ),
+        lenient(
+            "grant-all-on-all-tables-in-vm",
+            "GRANT ALL ON ALL TABLES IN SCHEMA vm TO {o}",
+        ),
+        lenient(
+            "grant-all-on-all-sequences-in-vm",
+            "GRANT ALL ON ALL SEQUENCES IN SCHEMA vm TO {o}",
+        ),
+        lenient(
+            "grant-execute-on-all-functions-in-vm",
+            "GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA vm TO {o}",
+        ),
+        lenient("grant-all-on-history", "GRANT ALL ON vm.history TO {o}"),
+        lenient(
+            "grant-select-on-history-to-public",
+            "GRANT SELECT ON vm.history TO PUBLIC",
+        ),
+        lenient(
+            "revoke-select-on-history-from-runtime",
+            "REVOKE SELECT ON vm.history FROM {r}",
+        ),
+        lenient(
+            "revoke-all-on-schema-vm",
+            "REVOKE ALL ON SCHEMA vm FROM {r}",
+        ),
+        lenient(
+            "revoke-execute-on-identity",
+            "REVOKE EXECUTE ON FUNCTION vm.identity() FROM {r}",
+        ),
+        lenient(
+            "grant-connect-on-the-database",
+            "GRANT ALL ON DATABASE {d} TO {o}",
+        ),
+        lenient(
+            "revoke-connect-on-the-database",
+            "REVOKE CONNECT ON DATABASE {d} FROM {r}",
+        ),
+        lenient(
+            "default-privileges-in-schema-vm",
+            "ALTER DEFAULT PRIVILEGES IN SCHEMA vm GRANT SELECT ON TABLES TO {o}",
+        ),
+        lenient(
+            "its-own-password",
+            "ALTER ROLE CURRENT_USER PASSWORD 'pwned'",
+        ),
+        lenient(
+            "its-own-settings",
+            "ALTER ROLE CURRENT_USER SET search_path = public, pg_catalog",
+        ),
+        lenient(
+            "its-own-settings-in-the-database",
+            "ALTER ROLE CURRENT_USER IN DATABASE {d} SET work_mem = '64MB'",
+        ),
+    ];
+    run_lenient_cases(&own, "warned", cases, true);
+}
+
+/// CONTRACT.md: "Whatever else a migration tries that Postgres refuses to
+/// a role without superuser (temporary objects, untrusted languages and
+/// extensions, event triggers, publications of all tables, the server's
+/// files, other sessions, the statistics), the Version fails or applies as
+/// Postgres decides, and either way the platform's part is as before."
+/// a-attacks.sql A46 to A56, A65 and large objects.
+#[test]
+fn whatever_else_postgres_decides_the_platform_s_part_is_as_before() {
+    let own = start();
+    let lenient = |name: &'static str, templates: &'static [&'static str]| {
+        Case::statements(name, DENIED_ANY, move |db| {
+            templates.iter().map(|t| fill(t, db)).collect()
+        })
+    };
+    let cases = vec![
+        lenient(
+            "temporary-table",
+            &[r#"CREATE TEMP TABLE "scratch" ("i" integer)"#],
+        ),
+        lenient(
+            "temporary-function",
+            &["CREATE FUNCTION pg_temp.scratch() RETURNS integer LANGUAGE sql AS 'SELECT 1'"],
+        ),
+        lenient("dblink", &["CREATE EXTENSION dblink"]),
+        lenient("postgres-fdw", &["CREATE EXTENSION postgres_fdw"]),
+        lenient("untrusted-language", &["CREATE LANGUAGE plpython3u"]),
+        lenient("untrusted-extension", &["CREATE EXTENSION adminpack"]),
+        lenient(
+            "c-function",
+            &[r#"CREATE FUNCTION "c_fn"() RETURNS integer LANGUAGE c AS 'libc.so.6', 'getpid'"#],
+        ),
+        lenient(
+            "event-trigger",
+            &[
+                r#"CREATE FUNCTION "on_ddl"() RETURNS event_trigger LANGUAGE plpgsql AS $f$ BEGIN END $f$"#,
+                r#"CREATE EVENT TRIGGER "on_ddl" ON ddl_command_start EXECUTE FUNCTION "on_ddl"()"#,
+            ],
+        ),
+        lenient(
+            "publication-of-all-tables",
+            &[r#"CREATE PUBLICATION "everything" FOR ALL TABLES"#],
+        ),
+        lenient(
+            "publication-of-a-captured-table",
+            &[r#"CREATE PUBLICATION "things_only" FOR TABLE "things""#],
+        ),
+        lenient(
+            "subscription",
+            &[
+                r#"CREATE SUBSCRIPTION "s" CONNECTION 'dbname=postgres' PUBLICATION "p" WITH (connect = false)"#,
+            ],
+        ),
+        lenient(
+            "read-a-server-file",
+            &["SELECT pg_read_file('postgresql.conf')"],
+        ),
+        lenient(
+            "read-a-binary-server-file",
+            &["SELECT pg_read_binary_file('postgresql.conf')"],
+        ),
+        lenient("list-a-server-directory", &["SELECT pg_ls_dir('.')"]),
+        lenient(
+            "stat-a-server-file",
+            &["SELECT pg_stat_file('postgresql.conf')"],
+        ),
+        lenient(
+            "copy-to-a-server-file",
+            &[r#"COPY "keyless" TO '/tmp/vm-blackbox-copy'"#],
+        ),
+        lenient(
+            "copy-from-a-program",
+            &[r#"COPY "keyless" FROM PROGRAM 'true'"#],
+        ),
+        lenient(
+            "import-a-large-object-from-a-file",
+            &["SELECT lo_import('/etc/hostname')"],
+        ),
+        lenient("large-object", &["SELECT lo_create(424242)"]),
+        lenient("large-object-from-bytea", &["SELECT lo_from_bytea(0, 'x')"]),
+        lenient(
+            "terminate-the-platform-s-sessions",
+            &["SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename = {p_literal}"],
+        ),
+        lenient(
+            "cancel-the-runtime-role-s-sessions",
+            &["SELECT pg_cancel_backend(pid) FROM pg_stat_activity WHERE usename <> current_user"],
+        ),
+        lenient("reset-the-statistics", &["SELECT pg_stat_reset()"]),
+        lenient(
+            "reset-a-table-s-statistics",
+            &["SELECT pg_stat_reset_single_table_counters('things'::regclass)"],
+        ),
+        lenient(
+            "reset-shared-statistics",
+            &["SELECT pg_stat_reset_shared('bgwriter')"],
+        ),
+        lenient("set-unlogged", &[r#"ALTER TABLE "things" SET UNLOGGED"#]),
+        lenient(
+            "set-unlogged-and-back",
+            &[
+                r#"ALTER TABLE "things" SET UNLOGGED"#,
+                r#"ALTER TABLE "things" SET LOGGED"#,
+            ],
+        ),
+        lenient("alter-system", &["ALTER SYSTEM SET work_mem = '1MB'"]),
+        lenient("reload-the-configuration", &["SELECT pg_reload_conf()"]),
+        lenient("checkpoint", &["CHECKPOINT"]),
+        lenient("superuser-only-setting", &["SET log_statement = 'none'"]),
+        lenient("load-a-library", &["LOAD 'auto_explain'"]),
+        lenient(
+            "create-a-tablespace",
+            &[r#"CREATE TABLESPACE "elsewhere" LOCATION '/tmp'"#],
+        ),
+        lenient("create-a-database", &[r#"CREATE DATABASE "elsewhere""#]),
+    ];
+    run_lenient_cases(&own, "else", cases, false);
 }
 
 /// a-attacks.sql A70 to A75: functions named like what the capture calls,

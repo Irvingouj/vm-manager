@@ -211,6 +211,12 @@ fn one(db: &OwnDatabase, sql: &str) -> String {
 /// header. The keys appear only as a digest, so that a failing test never
 /// prints them.
 pub fn platform_part(db: &OwnDatabase) -> String {
+    platform_part_skipping(db, None)
+}
+
+/// [`platform_part`] without the rows of the table `vm.<skip>` (for a
+/// Version that applies, the record of migrations grows).
+pub fn platform_part_skipping(db: &OwnDatabase, skip: Option<&str>) -> String {
     let p = literal(&platform_role(db));
     let mut parts: Vec<(String, String)> = vec![
         (
@@ -343,6 +349,9 @@ pub fn platform_part(db: &OwnDatabase) -> String {
           WHERE n.nspname = 'vm' AND c.relkind IN ('r', 'p', 'm') ORDER BY 1",
     );
     for table in tables {
+        if Some(table.as_str()) == skip {
+            continue;
+        }
         let name = crate::own_database::ident(&table);
         let rows = if table == "keys" {
             one(
@@ -438,6 +447,10 @@ pub fn can_log_in(db: &OwnDatabase, role: &str) -> bool {
 /// `migration-refused`.
 pub type Answers = &'static [(&'static str, &'static str)];
 
+/// For [`failed`]: any SQLSTATE (CONTRACT.md: "`42501`, or another
+/// refusal of Postgres's own").
+pub const ANY_CODE: &str = "*";
+
 /// `422 migration-failed` with this SQLSTATE.
 pub const fn failed(code: &'static str) -> (&'static str, &'static str) {
     ("migration-failed", code)
@@ -467,7 +480,9 @@ pub fn assert_answer(sent: &Response, answers: Answers, migration: &str, mention
     };
     let got = error[field].as_str().unwrap_or_default();
     assert!(
-        answers.iter().any(|(r, c)| *r == reason && *c == got),
+        answers
+            .iter()
+            .any(|(r, c)| *r == reason && (*c == got || (*c == ANY_CODE && !got.is_empty()))),
         "expected one of {answers:?} (reason, then `code` for migration-failed or `rule` for migration-refused), got {error}"
     );
     if migration == ANY_MIGRATION {
@@ -743,5 +758,104 @@ pub fn assert_three_roles(own: &Own, db: &OwnDatabase, context: &str) {
             Some("false".to_owned()),
         ]],
         "{context}: expected the platform's role {limited} still only CREATEDB and CREATEROLE"
+    );
+}
+
+const READ_KEYS_DENIED: Answers = &[failed("42501")];
+
+/// The rows of `vm.migrations`, each as text, ordered.
+pub fn record_of_migrations(db: &OwnDatabase) -> Vec<String> {
+    db.column("SELECT t::text FROM vm.migrations t ORDER BY 1")
+}
+
+/// Runs every case on `own`, each on a fresh Application, for attempts
+/// whose outcome CONTRACT.md leaves to Postgres: the Version is `201` or
+/// `422`, and either way the platform's part is as before. When `422`,
+/// the whole database is untouched as for any failed Version. When `201`,
+/// the platform's part but the record of migrations is as before, and the
+/// record still holds every earlier row. Either way the owner role cannot
+/// log in, and when `keys_after` a later migration still cannot read
+/// `vm.keys` (`422 migration-failed 42501`).
+pub fn run_lenient_cases(own: &Own, prefix: &str, cases: Vec<Case>, keys_after: bool) {
+    let mut failures = Vec::new();
+    let total = cases.len();
+    for (i, case) in cases.into_iter().enumerate() {
+        let application = format!("{prefix}-{i}");
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            let db = install_seeded(own, &application);
+            let before = untouched(&db);
+            let platform_before = platform_part_skipping(&db, Some("migrations"));
+            let record_before = record_of_migrations(&db);
+            let pending = (case.pending)(&db);
+            let mut list = base_and(&pending);
+            let sent = own.send(&application, &list);
+            match sent.status {
+                422 => {
+                    let reason = sent.json()["error"]["reason"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_owned();
+                    assert!(
+                        reason == "migration-failed" || reason == "migration-refused",
+                        "expected migration-failed or migration-refused, got\n{}",
+                        sent.describe()
+                    );
+                    assert_untouched(
+                        own,
+                        &db,
+                        &application,
+                        &before,
+                        "after the Version that failed",
+                    );
+                }
+                201 => {
+                    let after = platform_part_skipping(&db, Some("migrations"));
+                    assert!(
+                        after == platform_before,
+                        "the Version applied; expected the platform's part as before, but these differ:\n{}",
+                        differences(&platform_before, &after)
+                    );
+                    let record = record_of_migrations(&db);
+                    let lost: Vec<&String> = record_before
+                        .iter()
+                        .filter(|r| !record.contains(r))
+                        .collect();
+                    assert!(
+                        lost.is_empty(),
+                        "expected the record of migrations to keep every earlier row, these are gone or changed:\n{lost:#?}"
+                    );
+                }
+                _ => panic!("expected `201` or `422`, got\n{}", sent.describe()),
+            }
+            assert!(
+                !can_log_in(&db, &db.owner),
+                "expected the owner role {} unable to log in once the Version was answered",
+                db.owner
+            );
+            if keys_after {
+                if sent.status != 201 {
+                    list.truncate(list.len().saturating_sub(pending.len()));
+                }
+                list.push(Migration::new(
+                    "0009_read_keys",
+                    &["SELECT * FROM vm.keys;"],
+                ));
+                let read = own.send(&application, &list);
+                assert_answer(&read, READ_KEYS_DENIED, "0009_read_keys", None);
+            }
+        }));
+        if let Err(payload) = outcome {
+            let why: String = panic_text(payload.as_ref()).chars().take(3000).collect();
+            failures.push(format!(
+                "--- case {:?} (Application {application}) ---\n{why}",
+                case.name
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} of {total} Versions did not leave the platform's part as before:\n{}",
+        failures.len(),
+        failures.join("\n")
     );
 }
