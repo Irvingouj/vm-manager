@@ -291,12 +291,16 @@ pub async fn run(courier: Arc<Courier>, route: Route) {
     let mut line: Option<Line> = None;
     let mut marks = Marks::default();
     loop {
+        // A step that fails fails every request made before it began, also
+        // those not yet given a mark (it may fail before it takes one).
+        let asked_before = shipping.asked.load(Ordering::Acquire);
         match courier.step(&route, &mut line, &mut marks).await {
             Ok(true) => continue,
             Ok(false) => {}
             Err(step) => {
                 line = None;
                 marks.waiting.clear();
+                marks.seen = marks.seen.max(asked_before);
                 log::record(
                     "history-not-shipped",
                     serde_json::json!({ "application": &*route.application, "problem": step }),
