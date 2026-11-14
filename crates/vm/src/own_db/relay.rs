@@ -119,11 +119,13 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const MARK: &str = "SELECT pg_catalog.max(b.id) FROM vm.outbox b";
 
 /// The next batch of the outbox, oldest first: the ids, and the rows as
-/// one JSON array (of `jsonb_build_object` of each), cut at [`BATCH_ROWS`]
-/// and, past the first, [`BATCH_BYTES`]. Both null when it is empty.
+/// one JSON array (of `json_build_object` of each), cut at [`BATCH_ROWS`]
+/// and, past the first, [`BATCH_BYTES`]. Both null when it is empty. Built
+/// as `json`, which is text, not `jsonb`: a batch of 1,000 rows is read in
+/// about half the time (research part H).
 const READ_BATCH: &str = "
 SELECT pg_catalog.array_agg(x.id ORDER BY x.id),
-       pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object(
+       pg_catalog.json_agg(pg_catalog.json_build_object(
            'id', x.id, 'at', x.at, 'schema_name', x.schema_name, 'table_name', x.table_name,
            'kind', x.kind, 'key', x.key, 'old', x.old, 'new', x.new, 'changed', x.changed,
            'user_id', x.user_id, 'actor', x.actor, 'request', x.request,
