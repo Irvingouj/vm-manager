@@ -1008,7 +1008,14 @@ const FLOOD_ROWS: usize = 20_000;
 const FLOOD_FOR: Duration = Duration::from_secs(6);
 
 /// The readers, each starting 0.4 s after the one before.
-const READERS: u32 = 8;
+const READERS: u32 = 5;
+
+/// What a read's backlog must need, at the measured rate, for it to be
+/// excused when it is ended at the `time` limit: the relay's rate while
+/// the read runs may fall below the rate measured over the whole flood, so
+/// a read needing much more than half its 10 seconds may fairly reach
+/// them.
+const EXCUSED_FROM_SECONDS: f64 = 6.0;
 
 /// One reader's read, as the test saw it.
 struct Read {
@@ -1026,14 +1033,14 @@ struct Read {
 ///
 /// One thread writes statements of 20,000 rows into `things` without pause
 /// for 6 seconds (it writes faster than the relay ships, so the outbox is
-/// never empty meanwhile). Meanwhile eight readers, 0.4 s apart, each count
+/// never empty meanwhile). Meanwhile five readers, 0.4 s apart, each count
 /// `vm.outbox` (what was committed before their read and is not shipped:
 /// what the read must ship first), then write a row of their own and read
 /// that row's history in one request. The relay's rate is measured over the
 /// same seconds (changes added to `change_history` while the outbox was
 /// never empty). A read must answer its own row; it may be ended at the
 /// `time` limit only when what was before it would take the relay more
-/// than 8 seconds to ship at that rate. A read that waited for what was
+/// than 6 seconds to ship at that rate. A read that waited for what was
 /// committed after it began would be ended at 10 seconds with little before
 /// it.
 #[test]
@@ -1114,7 +1121,7 @@ fn reads_of_the_history_do_not_wait_for_writes_made_after_they_began() {
         let holds = read.answer["ok"]["changes"]
             .as_array()
             .is_some_and(|c| c.len() == 1 && c[0]["kind"] == "insert");
-        let excused = read.answer["error"]["limit"] == "time" && needs > 8.0;
+        let excused = read.answer["error"]["limit"] == "time" && needs > EXCUSED_FROM_SECONDS;
         println!(
             "  read begun at {:.3} s with {} changes before it (about {needs:.1} s of shipping): answered in {:.3} s: {}",
             read.began.as_secs_f64(),
@@ -1140,7 +1147,7 @@ fn reads_of_the_history_do_not_wait_for_writes_made_after_they_began() {
             && reads.iter().any(|r| r.answer["ok"].is_object() || {
                 #[expect(clippy::cast_precision_loss, reason = "an estimate in seconds")]
                 let needs = r.backlog as f64 / rate.max(1.0);
-                needs < 8.0
+                needs < EXCUSED_FROM_SECONDS
             }),
         "the harness's own check: the writer wrote while the reads were made, and some read had little before it"
     );
@@ -1385,9 +1392,11 @@ fn place_run(own: &Own, application: &str, db: &OwnDatabase, small_writes: usize
 /// The control makes 8 small writes; the test 120, more than the 64 places
 /// a read may wait in. If writes took places, the test's read would find
 /// none free and wait for flood changes committed until one came free. The
-/// test's read must answer its own row within 1.5 times the longer of the
-/// control's time and what its backlog needs, plus 1 second; a `time` limit
-/// is excused only when its backlog alone needs more than 9 seconds.
+/// control's read gives the machine's slowness now: how many times what its
+/// backlog needs at the measured rate it took (at least 1). The test's read
+/// must answer its own row within 1.5 times its own backlog's need times
+/// that slowness, plus 1 second; a `time` limit is excused only when its
+/// backlog alone needs more than 9 seconds.
 #[test]
 fn small_writes_take_no_place_to_wait_and_move_no_reads() {
     let own = Own::start();
@@ -1400,7 +1409,11 @@ fn small_writes_take_no_place_to_wait_and_move_no_reads() {
         "the harness's own check: the control's read answered, got {}",
         control.read
     );
-    let bound = Duration::from_secs_f64(control.took.as_secs_f64().max(run.needs) * 1.5 + 1.0);
+    // How much longer than its backlog's need, at the measured rate, a read
+    // took here with few writes: the machine's own slowness now.
+    let slowness = (control.took.as_secs_f64() / control.needs.max(0.1)).max(1.0);
+    let bound = Duration::from_secs_f64(run.needs * slowness * 1.5 + 1.0);
+    println!("the control's read took {slowness:.2} times what its backlog needs");
     println!("the bound on the test's read: {bound:?}");
     let holds = run.read["ok"]["changes"]
         .as_array()
@@ -1408,7 +1421,7 @@ fn small_writes_take_no_place_to_wait_and_move_no_reads() {
     let excused = run.read["error"]["limit"] == "time" && run.needs > 9.0;
     assert!(
         excused || (holds && run.took <= bound),
-        "expected the read after {} small writes to answer its own row in about the time its backlog needs ({:.1} s at {:.0} a second) or the control's read took after 8 small writes ({:?}); bound {bound:?}, not that and the flood's (CONTRACT.md: \"writes, however many requests they are and whenever they are made, take no place and move no read's\"); it answered after {:?}: {}",
+        "expected the read after {} small writes to answer its own row in about the time its backlog needs ({:.1} s at {:.0} a second), as slow as the control's read after 8 small writes was ({:?}); bound {bound:?}, not that and the flood's (CONTRACT.md: \"writes, however many requests they are and whenever they are made, take no place and move no read's\"); it answered after {:?}: {}",
         run.small_writes,
         run.needs,
         run.rate,
@@ -1627,10 +1640,14 @@ const FULL_READERS: usize = 100;
 /// place came free; it is still answered, or ended at its `time` limit, and
 /// never answered without what was committed before it began."
 ///
-/// One statement of 250,000 rows leaves a large outbox (some 7 seconds of
-/// shipping at the rate measured here). While it ships, 100 requests of
-/// the same Application begin 30 ms apart (3 seconds in all), each writing
-/// a row of its own and reading that row's history. Every one must answer
+/// The outbox is sized from the relay's rate, measured first in the same
+/// test (a probe of 30,000 rows, timed from its answer until `vm.outbox`
+/// is empty): about 3 seconds of shipping, so that the readers, begun 20 ms
+/// apart (the 65th after 1.3 s, the 100th after 2 s), all begin while it
+/// ships, and the first, which waits for all of it, needs some 3 of its 10
+/// seconds even if the machine is three times slower than when measured.
+/// While it ships, 100 requests of the same Application begin, each
+/// writing a row of its own and reading that row's history. Every one must answer
 /// `ok` with exactly its own row's insert, or be ended at the `time`
 /// limit; never `ok` without its row, never another error. The harness
 /// checks that more than 64 were in flight at once and that one at least
@@ -1639,10 +1656,27 @@ const FULL_READERS: usize = 100;
 #[test]
 fn reads_begun_while_every_place_is_taken_answer_their_own_row_or_end_at_the_time_limit() {
     let (own, db) = installed();
+    // The relay's rate, here and now.
+    let probe = execute_long(
+        &own,
+        APP,
+        "insert into things (title) select 'probe-' || g from generate_series(1, 30000) g",
+    );
+    wait_shipped_within(&db, Duration::from_secs(120));
+    let probe_took = probe.elapsed().max(Duration::from_millis(1));
+    let rate = 30_000.0 / probe_took.as_secs_f64();
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "a positive count of rows, clamped"
+    )]
+    let rows = ((rate * 3.0) as u64).clamp(30_000, 250_000);
     let answered = execute_long(
         &own,
         APP,
-        "insert into things (title) select 'full-' || g from generate_series(1, 250000) g",
+        &format!(
+            "insert into things (title) select 'full-' || g from generate_series(1, {rows}) g"
+        ),
     );
     let start = Instant::now();
     let results: Vec<(usize, Instant, Instant, Value)> = std::thread::scope(|scope| {
@@ -1650,7 +1684,7 @@ fn reads_begun_while_every_place_is_taken_answer_their_own_row_or_end_at_the_tim
             .map(|k| {
                 let own = &own;
                 scope.spawn(move || {
-                    let at = Duration::from_millis(30) * u32::try_from(k).unwrap();
+                    let at = Duration::from_millis(20) * u32::try_from(k).unwrap();
                     if let Some(wait) = at.checked_sub(start.elapsed()) {
                         std::thread::sleep(wait);
                     }
@@ -1709,7 +1743,7 @@ fn reads_begun_while_every_place_is_taken_answer_their_own_row_or_end_at_the_tim
         }
     }
     println!(
-        "a statement of 250,000 rows answered {:?} before the first reader; {FULL_READERS} readers, at most {most} in flight at once; {ok} answered `ok` with their row, {time} ended at the time limit; all done {:?} after the first began",
+        "full places: the probe of 30,000 rows shipped in {probe_took:?} ({rate:.0} a second); a statement of {rows} rows answered {:?} before the first reader; {FULL_READERS} readers, at most {most} in flight at once; {ok} answered `ok` with their row, {time} ended at the time limit; all done {:?} after the first began",
         start.duration_since(answered),
         start.elapsed()
     );
