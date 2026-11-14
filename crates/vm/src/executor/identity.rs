@@ -65,6 +65,51 @@ impl IdentityKey {
         ctx.push_str(identity);
         ctx
     }
+
+    /// What lets the host's statements during a migration keep the rows a
+    /// rewrite reads, and record them, under `identity` (from [`identity`])
+    /// in the transaction whose key is `transaction_key`
+    /// (blackbox/CONTRACT.md, "A rewrite records each row it changed"):
+    /// the 64 hex digits of `sha256(k2 || sha256(k1 || "vm.rewrite v1\n" ||
+    /// transaction_key || "\n" || identity))`, then `identity`.
+    /// `vm.rewrite_who` computes the same. Unlike the value of `vm.ctx`,
+    /// which the migration's code can read, it is only ever a parameter of
+    /// the host's own statements.
+    pub fn rewrite_token(&self, transaction_key: &str, identity: &str) -> RewriteToken {
+        let inner = Sha256::new()
+            .chain_update(self.k1)
+            .chain_update(b"vm.rewrite v1\n")
+            .chain_update(transaction_key.as_bytes())
+            .chain_update(b"\n")
+            .chain_update(identity.as_bytes())
+            .finalize();
+        let tag = Sha256::new()
+            .chain_update(self.k2)
+            .chain_update(inner)
+            .finalize();
+        let mut token = crate::registry::hex(&tag);
+        token.push_str(identity);
+        RewriteToken(token)
+    }
+}
+
+/// From [`IdentityKey::rewrite_token`]. No `Display`; its `Debug` shows
+/// nothing of it.
+pub struct RewriteToken(String);
+
+impl RewriteToken {
+    /// The token, to be sent as a parameter: never in a statement's text,
+    /// which code running in the statement could read
+    /// (`current_query()`), never in a log or a message.
+    pub fn as_parameter(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for RewriteToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("RewriteToken(<hidden>)")
+    }
 }
 
 /// Who a transaction is for, as `vm.ctx` carries it: a JSON object with
@@ -131,6 +176,20 @@ mod tests {
         assert_ne!(ctx, key.attach("10/2/5", &who));
         let other = IdentityKey::from_parts(&[1; 32], &[3; 32]).unwrap();
         assert_ne!(ctx, other.attach("10/1/5", &who));
+    }
+
+    #[test]
+    fn a_rewrite_token_is_not_the_attached_identity_and_never_prints() {
+        let key = IdentityKey::from_parts(&[1; 32], &[2; 32]).unwrap();
+        let who = identity("alice", "board", "migration", None, Some("0001_x"));
+        let token = key.rewrite_token("10/1/5", &who);
+        assert_eq!(format!("{token:?}"), "RewriteToken(<hidden>)");
+        assert!(token.as_parameter().ends_with(&who));
+        assert_ne!(token.as_parameter(), key.attach("10/1/5", &who));
+        assert_ne!(
+            token.as_parameter(),
+            key.rewrite_token("10/2/5", &who).as_parameter()
+        );
     }
 
     #[test]

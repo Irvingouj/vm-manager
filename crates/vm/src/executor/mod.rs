@@ -48,7 +48,7 @@ use tokio::sync::{Semaphore, SemaphorePermit};
 use tokio::time::Instant;
 
 use crate::log;
-pub use identity::{IdentityKey, identity};
+pub use identity::{IdentityKey, RewriteToken, identity};
 use wire::{Connection, Exchange, WireError};
 
 /// A password for a shared database. No `Display`; its `Debug` shows
