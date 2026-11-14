@@ -1045,3 +1045,90 @@ fn a_table_made_to_inherit_from_another_has_no_entry() {
         );
     }
 }
+
+/// CONTRACT.md, `enum-value-renamed`: "on every table with a column whose
+/// values hold values of that type: the type itself, an array, a domain, a
+/// range or multirange, or a composite type with such an attribute, of it
+/// or of any of these in turn, to any depth". A later Version makes, over
+/// `public.mood`, one table per way of holding it, each column `v`:
+///
+/// - `t_dom_dom`: a domain over a domain over the enum;
+/// - `t_dom_array`: an array of a domain over the enum;
+/// - `t_composite`: a composite type with an attribute of the enum;
+/// - `t_composite_array`: a composite type with an attribute that is an
+///   array of the enum;
+/// - `t_range` and `t_multirange`: a range over the enum, and its
+///   multirange;
+/// - `t_row`: the row type of the table `holder (id, m mood)`;
+///
+/// and `t_none (id, v text, w integer[])`, which holds none. Each gets a
+/// row; the next Version renames `sad`: every one of them (and `holder`,
+/// and the tables of [`Structure`] that hold the enum) has the entry with
+/// its `columns`, `t_none` has none.
+#[test]
+fn an_enum_value_renamed_is_an_entry_through_every_type_that_holds_the_enum() {
+    let mut s = Structure::start();
+    s.send_ok(&[Migration::new(
+        "0004_holders",
+        &[
+            r#"CREATE DOMAIN "mood_d1" AS "mood";"#,
+            r#"CREATE DOMAIN "mood_d2" AS "mood_d1";"#,
+            r#"CREATE TYPE "mood_pair" AS ("m" "mood", "n" text);"#,
+            r#"CREATE TYPE "mood_bag" AS ("ms" "mood"[]);"#,
+            r#"CREATE TYPE "mood_range" AS RANGE (subtype = "mood");"#,
+            r#"CREATE TABLE "holder" (
+	"id" integer PRIMARY KEY NOT NULL,
+	"m" "mood"
+);"#,
+            r#"CREATE TABLE "t_dom_dom" ("id" integer PRIMARY KEY NOT NULL, "v" "mood_d2");"#,
+            r#"CREATE TABLE "t_dom_array" ("id" integer PRIMARY KEY NOT NULL, "v" "mood_d1"[]);"#,
+            r#"CREATE TABLE "t_composite" ("id" integer PRIMARY KEY NOT NULL, "v" "mood_pair");"#,
+            r#"CREATE TABLE "t_composite_array" ("id" integer PRIMARY KEY NOT NULL, "v" "mood_bag");"#,
+            r#"CREATE TABLE "t_range" ("id" integer PRIMARY KEY NOT NULL, "v" "mood_range");"#,
+            r#"CREATE TABLE "t_multirange" ("id" integer PRIMARY KEY NOT NULL, "v" "mood_multirange");"#,
+            r#"CREATE TABLE "t_row" ("id" integer PRIMARY KEY NOT NULL, "v" "holder");"#,
+            r#"CREATE TABLE "t_none" ("id" integer PRIMARY KEY NOT NULL, "v" text, "w" integer[]);"#,
+        ],
+    )]);
+    let writes = [
+        "insert into holder (id, m) values (1, 'sad')",
+        "insert into t_dom_dom (id, v) values (1, 'sad')",
+        "insert into t_dom_array (id, v) values (1, '{sad,happy}')",
+        "insert into t_composite (id, v) values (1, row('sad', 'n'))",
+        "insert into t_composite_array (id, v) values (1, row('{sad}'))",
+        "insert into t_range (id, v) values (1, '[happy,sad]')",
+        "insert into t_multirange (id, v) values (1, '{[happy,sad]}')",
+        "insert into t_row (id, v) values (1, row(1, 'sad'))",
+        "insert into t_none (id, v, w) values (1, 'sad', '{1}')",
+    ];
+    let calls: Vec<Value> = writes.iter().map(|w| own_execute("user", w)).collect();
+    let (_, answers) = s.own.run(&User::new(WRITER), APP, &calls);
+    for (sql, answer) in writes.iter().zip(&answers) {
+        assert_ok(answer, &format!("the harness's own check: {sql}"));
+    }
+    let last = last_history_id(&s.db);
+    let migration = "0005_rename_mood";
+    s.send_ok(&[Migration::new(
+        migration,
+        &[r#"ALTER TYPE "public"."mood" RENAME VALUE 'sad' TO 'blue';"#],
+    )]);
+    let renamed = |columns: &[&str]| json!({ "change": "enum-value-renamed", "type": "public.mood", "from": "sad", "to": "blue", "columns": columns });
+    assert_structure_rows(
+        &history_after(&s.db, last),
+        &[
+            ("moods", renamed(&["mood"])),
+            ("mood_lists", renamed(&["moods"])),
+            ("two_moods", renamed(&["a", "b"])),
+            ("holder", renamed(&["m"])),
+            ("t_dom_dom", renamed(&["v"])),
+            ("t_dom_array", renamed(&["v"])),
+            ("t_composite", renamed(&["v"])),
+            ("t_composite_array", renamed(&["v"])),
+            ("t_range", renamed(&["v"])),
+            ("t_multirange", renamed(&["v"])),
+            ("t_row", renamed(&["v"])),
+        ],
+        migration,
+        "an enum's value renamed: an entry on every table with a column holding it, through domains, arrays, composite types, ranges, multiranges and row types; none on t_none",
+    );
+}

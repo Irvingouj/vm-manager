@@ -1252,3 +1252,368 @@ fn one_applications_large_shipments_do_not_hold_up_another_applications() {
         "the harness's own check: the five still had changes to ship when the sixth's write was shipped; make LARGE_OUTBOX larger"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Only a read takes a place to wait; at most 32 relay connections.
+// ---------------------------------------------------------------------------
+
+/// Rows of the statement that leaves the large outbox of the test below.
+const BACKLOG_ROWS: usize = 150_000;
+
+/// How long the small writes are spread over.
+const SMALL_WRITES_OVER: Duration = Duration::from_millis(1500);
+
+/// What one run of the scenario below measured.
+struct PlaceRun {
+    small_writes: usize,
+    rate: f64,
+    backlog: i64,
+    /// What the backlog needs at the rate, in seconds.
+    needs: f64,
+    took: Duration,
+    read: Value,
+    flooded: usize,
+}
+
+/// The scenario of the test below in `application`, with `small_writes`
+/// small write requests spread over [`SMALL_WRITES_OVER`].
+fn place_run(own: &Own, application: &str, db: &OwnDatabase, small_writes: usize) -> PlaceRun {
+    let shipped_before = count_now(db, "true");
+    let answered = execute_long(
+        own,
+        application,
+        &format!(
+            "insert into things (title) select 'backlog-' || g from generate_series(1, {BACKLOG_ROWS}) g"
+        ),
+    );
+    let gap = SMALL_WRITES_OVER / u32::try_from(small_writes).unwrap();
+    for i in 0..small_writes {
+        let (_, answers) = own.run(
+            &bob(),
+            application,
+            &[own_execute(
+                "application",
+                &format!("insert into counters (name, n) values ('small-{i}', {i})"),
+            )],
+        );
+        assert_ok(&answers[0], "the harness's own check: a small write");
+        std::thread::sleep(gap);
+    }
+    let backlog = outbox_count(db);
+    let shipped = count_now(db, "true") - shipped_before;
+    #[expect(clippy::cast_precision_loss, reason = "a rate for a bound")]
+    let rate = shipped as f64 / answered.elapsed().as_secs_f64();
+    let stop_flood = std::sync::atomic::AtomicBool::new(false);
+    let (took, read, flooded) = std::thread::scope(|scope| {
+        let flood = scope.spawn(|| {
+            let begun = Instant::now();
+            let mut n = 0_usize;
+            while begun.elapsed() < Duration::from_secs(6)
+                && !stop_flood.load(std::sync::atomic::Ordering::Relaxed)
+            {
+                let (_, answers) = own.run_body(
+                    &bob(),
+                    application,
+                    &json!({ "calls": [own_execute(
+                        "application",
+                        &format!("insert into things (title) select 'flood-{n}-' || g from generate_series(1, 20000) g"),
+                    )] }),
+                    LONG_REQUEST,
+                );
+                assert_ok(&answers[0], "the harness's own check: a statement of the flood");
+                n += 1;
+            }
+            n
+        });
+        let began = Instant::now();
+        let (_, answers) = own.run_body(
+            &alice(),
+            application,
+            &json!({ "calls": [
+                own_execute("user", "insert into things (id, title) values (990001, 'the reader')"),
+                history_call("user", "public", "things", &json!({ "key": { "id": 990001 } })),
+            ] }),
+            Duration::from_secs(30),
+        );
+        let took = began.elapsed();
+        stop_flood.store(true, std::sync::atomic::Ordering::Relaxed);
+        (took, answers[1].clone(), flood.join().unwrap())
+    });
+    wait_shipped_within(db, Duration::from_secs(300));
+    #[expect(clippy::cast_precision_loss, reason = "an estimate in seconds")]
+    let needs = backlog as f64 / rate.max(1.0);
+    let run = PlaceRun {
+        small_writes,
+        rate,
+        backlog,
+        needs,
+        took,
+        read,
+        flooded,
+    };
+    println!(
+        "{application}: a statement of {BACKLOG_ROWS} rows, then {} small writes over {SMALL_WRITES_OVER:?}: the relay shipped {:.0} changes a second; the read began with {} changes before it (about {:.1} s of shipping) and answered in {:?} while {} flood statements of 20,000 rows were written: {}",
+        run.small_writes,
+        run.rate,
+        run.backlog,
+        run.needs,
+        run.took,
+        run.flooded,
+        if run.read["ok"].is_object() {
+            "ok"
+        } else {
+            "not ok"
+        }
+    );
+    run
+}
+
+/// CONTRACT.md, "Nobody waits for what is not theirs": "Only a read is
+/// given a place to wait for a shipment, never a write: writes, however
+/// many requests they are and whenever they are made, take no place and
+/// move no read's."
+///
+/// The scenario, run twice, each time in an Application of its own: (a)
+/// one statement of 200,000 rows leaves a large outbox; (b) while it ships,
+/// small write requests of the same Application, one by one, spread over
+/// 4 seconds; (c) then a request that writes a row and reads its history,
+/// `vm.outbox` counted just before it (its backlog: what it must ship
+/// first), and from that moment a flood of 20,000-row statements, which
+/// outruns the relay, for up to 6 seconds. The relay's rate is measured
+/// from the statement's answer to the read's start.
+///
+/// The control makes 8 small writes; the test 120, more than the 64 places
+/// a read may wait in. If writes took places, the test's read would find
+/// none free and wait for flood changes committed until one came free. The
+/// test's read must answer its own row within 1.5 times the longer of the
+/// control's time and what its backlog needs, plus 1 second; a `time` limit
+/// is excused only when its backlog alone needs more than 9 seconds.
+#[test]
+fn small_writes_take_no_place_to_wait_and_move_no_reads() {
+    let own = Own::start();
+    let control_db = own.install("control", &history_standard());
+    let db = own.install(APP, &history_standard());
+    let control = place_run(&own, "control", &control_db, 8);
+    let run = place_run(&own, APP, &db, 120);
+    assert!(
+        control.read["ok"].is_object(),
+        "the harness's own check: the control's read answered, got {}",
+        control.read
+    );
+    let bound = Duration::from_secs_f64(control.took.as_secs_f64().max(run.needs) * 1.5 + 1.0);
+    println!("the bound on the test's read: {bound:?}");
+    let holds = run.read["ok"]["changes"]
+        .as_array()
+        .is_some_and(|c| c.len() == 1 && c[0]["kind"] == "insert");
+    let excused = run.read["error"]["limit"] == "time" && run.needs > 9.0;
+    assert!(
+        excused || (holds && run.took <= bound),
+        "expected the read after {} small writes to answer its own row in about the time its backlog needs ({:.1} s at {:.0} a second) or the control's read took after 8 small writes ({:?}); bound {bound:?}, not that and the flood's (CONTRACT.md: \"writes, however many requests they are and whenever they are made, take no place and move no read's\"); it answered after {:?}: {}",
+        run.small_writes,
+        run.needs,
+        run.rate,
+        control.took,
+        run.took,
+        run.read
+    );
+}
+
+/// The Applications with large outboxes in the test below: more than the
+/// relay's 32 connections.
+const CROWD: usize = 36;
+
+/// Rows of each one's outbox.
+const CROWD_ROWS: usize = 25_000;
+
+/// CONTRACT.md, "Nobody waits for what is not theirs": "The relay keeps at
+/// most 32 connections to own databases at once (their `application_name`
+/// is `vm relay`), and an own database keeps one no longer than one batch
+/// while another waits for one. So the promise holds also when more than
+/// 32 own databases have large outboxes to ship at once: a write of yet
+/// another Application is shipped, and a read of its history answered,
+/// after a number of batches that does not grow with the size of the
+/// others' outboxes."
+///
+/// 36 Applications each write 25,000 rows while the administrator holds a
+/// lock on `change_history` (their shipments wait, fail, and are not tried
+/// again until asked); the program is stopped, the lock released, and the
+/// program started again on the same databases, which asks for all 36
+/// shipments at once (900,000 changes). At once, and at the same time,
+/// one more Application writes a row left to the relay alone, and another
+/// writes a row and reads its history. Meanwhile the administrator counts, every 20 ms, the
+/// sessions named `vm relay` in these own databases: never more than 32.
+///
+/// The bound, from measurement: the rate at which the 37 outboxes are
+/// shipped (all changes over the time until all are empty) gives the time
+/// of one batch of 1,000 changes; the read and the write must each be done
+/// within the time of 3 batches of each of the 38 Applications,
+/// plus 2 seconds (the program's start and connections), while a relay
+/// that shipped one outbox after another would make them wait for most of
+/// the 900,000.
+#[test]
+fn more_than_32_own_databases_shipping_at_once_hold_up_no_other_and_use_at_most_32_relay_connections()
+ {
+    let setup = Instant::now();
+    let own = Own::start();
+    let names: Vec<String> = (1..=CROWD).map(|i| format!("crowd-{i:02}")).collect();
+    let dbs: Vec<OwnDatabase> = std::thread::scope(|scope| {
+        let handles: Vec<_> = names
+            .chunks(6)
+            .map(|chunk| {
+                let own = &own;
+                scope.spawn(move || {
+                    chunk
+                        .iter()
+                        .map(|name| own.install(name, &history_standard()))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap())
+            .collect()
+    });
+    let lone = own.install("lone", &history_standard());
+    let reader = own.install("lone-reader", &history_standard());
+    let installed = setup.elapsed();
+    let lock = LockedHistory::lock(&lone);
+    std::thread::scope(|scope| {
+        for chunk in names.chunks(6) {
+            let own = &own;
+            scope.spawn(move || {
+                for name in chunk {
+                    execute_long(
+                        own,
+                        name,
+                        &format!("insert into things (title) select 'crowd-' || g from generate_series(1, {CROWD_ROWS}) g"),
+                    );
+                }
+            });
+        }
+    });
+    let stopped = stop(own);
+    lock.release();
+    let waiting: i64 = dbs.iter().map(outbox_count).sum();
+    let written = setup.elapsed();
+    assert_eq!(
+        waiting,
+        i64::try_from(CROWD * CROWD_ROWS).unwrap(),
+        "the harness's own check: every change of the {CROWD} Applications still in their outboxes before the start"
+    );
+    let databases: Vec<String> = dbs
+        .iter()
+        .map(|d| d.name.clone())
+        .chain([lone.name.clone(), reader.name])
+        .collect();
+    let in_list = databases
+        .iter()
+        .map(|n| literal(n))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sampling = std::sync::atomic::AtomicBool::new(true);
+    let restarted = Instant::now();
+    let (own, most_relay, samples, lone_read, read_took, lone_shipped, all_shipped) =
+        std::thread::scope(|scope| {
+            let sampler = scope.spawn(|| {
+                let sql = blackbox::sql::Sql::connect(&blackbox::postgres::shared().url("postgres"))
+                    .unwrap();
+                let mut most = 0_i64;
+                let mut samples = 0_usize;
+                while sampling.load(std::sync::atomic::Ordering::Relaxed) {
+                    let n: i64 = sql
+                        .value(&format!(
+                            "SELECT count(*)::text FROM pg_stat_activity WHERE application_name = 'vm relay' AND datname IN ({in_list})"
+                        ))
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(0);
+                    most = most.max(n);
+                    samples += 1;
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                (most, samples)
+            });
+            let own = stopped.start();
+            let (shipped_after, (read, read_took)) = std::thread::scope(|inner| {
+                // One Application's write left to the relay alone.
+                let relay_alone = inner.spawn(|| {
+                    let (_, answer) = own.one(
+                        &alice(),
+                        "lone",
+                        &own_execute(
+                            "user",
+                            "insert into things (id, title) values (1, 'lone one')",
+                        ),
+                    );
+                    assert_ok(
+                        &answer,
+                        "the harness's own check: the lone Application's write",
+                    );
+                    let (_, shipped_after) = wait_count(
+                        &lone,
+                        &inserted_title("lone one"),
+                        1,
+                        Duration::from_secs(60),
+                    );
+                    shipped_after
+                });
+                // Another's write, then at once a read of its history.
+                let (_, answer) = own.one(
+                    &alice(),
+                    "lone-reader",
+                    &own_execute(
+                        "user",
+                        "insert into things (id, title) values (1, 'reader one')",
+                    ),
+                );
+                assert_ok(
+                    &answer,
+                    "the harness's own check: the reading Application's write",
+                );
+                let read_began = Instant::now();
+                let (_, read) = own.one(
+                    &alice(),
+                    "lone-reader",
+                    &history_call("user", "public", "things", &json!({ "key": { "id": 1 } })),
+                );
+                let read_took = read_began.elapsed();
+                (relay_alone.join().unwrap(), (read, read_took))
+            });
+            for db in &dbs {
+                wait_shipped_within(db, Duration::from_secs(300));
+            }
+            let all = restarted.elapsed();
+            sampling.store(false, std::sync::atomic::Ordering::Relaxed);
+            let (most, samples) = sampler.join().unwrap();
+            (own, most, samples, read, read_took, shipped_after, all)
+        });
+    drop(own);
+    #[expect(clippy::cast_precision_loss, reason = "a rate for a bound")]
+    let rate = waiting as f64 / all_shipped.as_secs_f64();
+    let batch = 1_000.0 / rate;
+    #[expect(clippy::cast_precision_loss, reason = "a count of batches")]
+    let bound = Duration::from_secs_f64(3.0 * (CROWD as f64 + 2.0) * batch + 2.0);
+    println!(
+        "{CROWD} Applications installed in {installed:?}, their {waiting} changes written by {written:?}; after the start all were shipped in {all_shipped:?} ({rate:.0} a second, a batch of 1,000 every {:.1} ms); the lone Application's write shipped by the relay {lone_shipped:?} after it, the other's read after its write answered in {read_took:?} (bound {bound:?}); at most {most_relay} `vm relay` sessions in {samples} samples",
+        batch * 1_000.0
+    );
+    assert!(
+        samples > 10 && most_relay > 0,
+        "the harness's own check: the relay's sessions were seen ({samples} samples, at most {most_relay})"
+    );
+    assert!(
+        most_relay <= 32,
+        "expected at most 32 sessions named `vm relay` in these own databases at once (CONTRACT.md: \"The relay keeps at most 32 connections to own databases at once\"), saw {most_relay}"
+    );
+    let holds = lone_read["ok"]["changes"]
+        .as_array()
+        .is_some_and(|c| c.len() == 1);
+    assert!(
+        holds && read_took <= bound,
+        "expected the reading Application's read answered with its change within {bound:?} (3 batches of each of the 38 Applications at the measured rate, plus 2 s), not after the others' outboxes; it took {read_took:?}: {lone_read}"
+    );
+    assert!(
+        lone_shipped <= bound,
+        "expected the lone Application's write shipped by the relay within {bound:?}, not after the others' outboxes; it took {lone_shipped:?}"
+    );
+}
