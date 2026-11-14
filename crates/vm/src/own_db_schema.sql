@@ -875,8 +875,9 @@ $f$;
 -- still: `column-dropped`, `column-type`, `table-rewritten` (a new file
 -- node and no `column-type` entry; on a partitioned table, when a table
 -- under it was), `enum-value-renamed` (one per value renamed, on every
--- such table with a column of the type, of a domain over it or an array of
--- it, at any depth), `partition-attached` (a table that was there,
+-- such table with a column of a type that holds it: a domain over it, an
+-- array, a range or multirange over it, a composite type or row type with
+-- an attribute of it, at any depth), `partition-attached` (a table that was there,
 -- attached) and `partition-detached` (detached or dropped), under the
 -- table's name now. On a table that is gone, or whose name another table
 -- has now, and that was not a partition: `table-dropped` or
@@ -890,12 +891,53 @@ DECLARE
     v_now jsonb;
     v_at timestamptz := pg_catalog.clock_timestamp();
     v_made integer;
+    v_enums oid[] := '{}';
+    v_types oid[] := '{}';
 BEGIN
     IF (v_who ->> 'actor') IS DISTINCT FROM 'platform' OR (v_who ->> 'migration') IS NULL THEN
         RAISE EXCEPTION USING ERRCODE = '42501',
             MESSAGE = 'only the platform records a change of structure';
     END IF;
     v_now := vm.structure_snapshot();
+    -- The types whose values hold a renamed enum's: the enum, and every
+    -- domain over one of these, array of one, range over one and its
+    -- multirange, and composite type with an attribute of one (a table's
+    -- row type among them), to any depth; as pairs (enum, type). Looked
+    -- for only when a label changed: the statement that would look costs
+    -- its plan's start (a hash table for the recursion) even when it finds
+    -- nothing, about 5 ms (research section 13).
+    IF EXISTS (SELECT FROM pg_catalog.jsonb_each(p_before -> 'enums') o
+                 JOIN pg_catalog.jsonb_each(v_now -> 'enums') w ON w.key = o.key
+                WHERE (w.value ->> 1) IS DISTINCT FROM (o.value ->> 1)) THEN
+        WITH RECURSIVE renamed AS (
+            SELECT DISTINCT (o.value ->> 0)::oid AS typid
+              FROM pg_catalog.jsonb_each(p_before -> 'enums') o
+              JOIN pg_catalog.jsonb_each(v_now -> 'enums') w ON w.key = o.key
+             WHERE (w.value ->> 1) IS DISTINCT FROM (o.value ->> 1)),
+        holding (enum, typid) AS (
+            SELECT r.typid, r.typid FROM renamed r
+            UNION
+            SELECT h.enum, x.typid
+              FROM holding h
+              CROSS JOIN LATERAL (
+                  SELECT t.oid FROM pg_catalog.pg_type t
+                   WHERE t.typtype = 'd' AND t.typbasetype = h.typid
+                  UNION ALL
+                  SELECT u.typarray FROM pg_catalog.pg_type u
+                   WHERE u.oid = h.typid AND u.typarray <> 0
+                  UNION ALL
+                  SELECT g.rngtypid FROM pg_catalog.pg_range g WHERE g.rngsubtype = h.typid
+                  UNION ALL
+                  SELECT g.rngmultitypid FROM pg_catalog.pg_range g WHERE g.rngsubtype = h.typid
+                  UNION ALL
+                  SELECT c.oid FROM pg_catalog.pg_attribute a
+                    JOIN pg_catalog.pg_type c ON c.typrelid = a.attrelid
+                   WHERE a.atttypid = h.typid AND a.attnum > 0 AND NOT a.attisdropped) x(typid))
+        SELECT coalesce(pg_catalog.array_agg(h.enum ORDER BY h.enum, h.typid), '{}'),
+               coalesce(pg_catalog.array_agg(h.typid ORDER BY h.enum, h.typid), '{}')
+          INTO v_enums, v_types
+          FROM holding h;
+    END IF;
     WITH RECURSIVE b AS (
         SELECT t.key AS id, t.value ->> 's' AS s, t.value ->> 'n' AS n, t.value AS v
           FROM pg_catalog.jsonb_each(p_before -> 'tables') t),
@@ -920,16 +962,10 @@ BEGIN
           FROM pg_catalog.jsonb_each(p_before -> 'enums') o
           JOIN pg_catalog.jsonb_each(v_now -> 'enums') w ON w.key = o.key
          WHERE (w.value ->> 1) IS DISTINCT FROM (o.value ->> 1)),
-    -- The types whose values hold a renamed enum's: the enum, and every
-    -- domain over one of these and array of one of these, to any depth.
+    -- The types whose values hold a renamed enum's (v_enums, v_types).
     holding (enum, typid) AS (
-        SELECT DISTINCT r.typid, r.typid FROM renamed r
-        UNION
-        SELECT h.enum, t.oid
-          FROM holding h
-          JOIN pg_catalog.pg_type u ON u.oid = h.typid
-          JOIN pg_catalog.pg_type t
-            ON (t.typtype = 'd' AND t.typbasetype = h.typid) OR t.oid = u.typarray),
+        SELECT u.enum, u.typid
+          FROM ROWS FROM (pg_catalog.unnest(v_enums), pg_catalog.unnest(v_types)) u(enum, typid)),
     -- Written anew, and no type change says why.
     rewritten AS (
         SELECT k.id FROM kept k
