@@ -1041,6 +1041,575 @@ BEGIN
 END
 $f$;
 
+-- A rewrite records each row it changed (blackbox/CONTRACT.md, "A rewrite
+-- records each row it changed"; ADR 0017, third slice).
+--
+-- The host, on the migration role's own session and in the migration's
+-- transaction:
+--
+-- - at the start of each migration, `vm.rewrite_begin` notes every table
+--   there is (the tables with history when the migration began) and its
+--   file node;
+-- - before a statement it knows rewrites (seen so in an earlier run, or
+--   foreseen from its text), `vm.rewrite_before` reads the rows of those
+--   tables into `vm.rewrite_rows`;
+-- - after every statement, `vm.rewrites_seen()` says whether a noted table
+--   has a new file node; if one has, `vm.rewrite_after` says which (by the
+--   table at the top of its partitions, and its name when the migration
+--   began), and `vm.rewrite_record_after` reads their rows again and
+--   records each row that differs (`vm.rewrite_record`).
+--
+-- The reading is done as the migration role, never with the platform's
+-- rights: `vm.rewrite_before`, `vm.rewrite_read` and
+-- `vm.rewrite_record_after` are SECURITY INVOKER, so whatever reading the
+-- table runs (a policy, a cast) runs with the migration role's rights
+-- only. No identity of the platform's is attached meanwhile: the
+-- migration's own is, as for its statements.
+--
+-- What lets the reading put rows where the migration cannot is a token:
+-- the host's tag over the transaction's key and the migration's identity,
+-- made with the own database's keys (`vm.keys`, which the migration role
+-- cannot read), passed as a parameter of the host's statements and from
+-- there as an argument, never in a statement's text (which
+-- `current_query()` would show to code running in it). Every function
+-- that writes in `vm` checks it (`vm.rewrite_who`), and checks that the
+-- statement running is one of the host's, by its exact text: code of the
+-- migration's runs inside its own statements, whose text is the
+-- migration's. The tables are the platform's role's alone; the functions
+-- that write them are SECURITY DEFINER and touch nothing outside `vm` and
+-- the catalog.
+CREATE UNLOGGED TABLE IF NOT EXISTS vm.rewrite_nodes (
+    relid oid PRIMARY KEY,
+    node oid NOT NULL,
+    s text NOT NULL,
+    n text NOT NULL
+);
+CREATE UNLOGGED TABLE IF NOT EXISTS vm.rewrite_columns (
+    relid oid NOT NULL,
+    phase smallint NOT NULL,
+    attnum smallint NOT NULL,
+    name text NOT NULL,
+    virtual boolean NOT NULL,
+    key smallint,
+    PRIMARY KEY (relid, phase, attnum)
+);
+CREATE UNLOGGED TABLE IF NOT EXISTS vm.rewrite_rows (
+    id bigint GENERATED ALWAYS AS IDENTITY,
+    relid oid NOT NULL,
+    phase smallint NOT NULL,
+    j jsonb NOT NULL,
+    n jsonb
+);
+
+-- The identity a token of the host's carries, once its tag is checked
+-- against the keys and this transaction, and the statement running is one
+-- of the host's own; raises VM001 otherwise.
+CREATE OR REPLACE FUNCTION vm.rewrite_who(p_token text) RETURNS jsonb
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER PARALLEL UNSAFE
+SET search_path = pg_catalog, pg_temp
+AS $f$
+DECLARE
+    v_k1 bytea;
+    v_k2 bytea;
+    v_who text;
+BEGIN
+    IF p_token IS NULL OR pg_catalog.length(p_token) <= 64
+       OR pg_catalog.current_query() IS NULL
+       OR pg_catalog.current_query() NOT IN (
+           'SELECT vm.rewrite_begin($1)',
+           'SELECT vm.rewrite_before($1, $2::pg_catalog.text[], ARRAY(SELECT pg_catalog.to_regclass(x)::pg_catalog.oid FROM pg_catalog.unnest($3::pg_catalog.text[]) x))',
+           'SELECT r.relid, r.s, r.n, r.read FROM vm.rewrite_after($1) r',
+           'SELECT vm.rewrite_record_after($1, $2::pg_catalog.oid[])',
+           'SELECT vm.rewrite_done($1, false)',
+           'SELECT vm.rewrite_done($1, true)') THEN
+        RAISE EXCEPTION USING ERRCODE = 'VM001',
+            MESSAGE = 'only the platform reads and records a rewrite';
+    END IF;
+    SELECT k.k1, k.k2 INTO v_k1, v_k2 FROM vm.keys k;
+    v_who := pg_catalog.substr(p_token, 65);
+    IF v_k1 IS NULL OR v_k2 IS NULL
+       OR pg_catalog.encode(pg_catalog.sha256(v_k2 || pg_catalog.sha256(v_k1 || pg_catalog.convert_to(
+              'vm.rewrite v1' || pg_catalog.chr(10) || vm.transaction_key() || pg_catalog.chr(10) || v_who,
+              'UTF8'))), 'hex')
+          IS DISTINCT FROM pg_catalog.substr(p_token, 1, 64) THEN
+        RAISE EXCEPTION USING ERRCODE = 'VM001',
+            MESSAGE = 'only the platform reads and records a rewrite';
+    END IF;
+    RETURN v_who::jsonb;
+END
+$f$;
+
+-- At the start of a migration: every table there is now, with its file
+-- node and its name (a partitioned table's node is 0, its partitions'
+-- move). What was left of an earlier migration's is gone.
+CREATE OR REPLACE FUNCTION vm.rewrite_begin(p_token text) RETURNS integer
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER PARALLEL UNSAFE
+SET search_path = pg_catalog, pg_temp
+AS $f$
+DECLARE
+    v_made integer;
+BEGIN
+    PERFORM vm.rewrite_who(p_token);
+    DELETE FROM vm.rewrite_rows;
+    DELETE FROM vm.rewrite_columns;
+    DELETE FROM vm.rewrite_nodes;
+    INSERT INTO vm.rewrite_nodes (relid, node, s, n)
+    SELECT c.oid, c.relfilenode, n.nspname::text, c.relname::text
+      FROM pg_catalog.pg_class c
+      JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+     WHERE c.relkind IN ('r', 'p')
+       AND n.nspname <> 'vm' AND n.nspname <> 'information_schema'
+       AND pg_catalog.left(n.nspname, 3) <> 'pg_';
+    GET DIAGNOSTICS v_made = ROW_COUNT;
+    RETURN v_made;
+END
+$f$;
+
+-- Whether a table noted at the start of the migration has a new file
+-- node: asked after every statement. Reads only `vm` and the catalog,
+-- writes nothing.
+CREATE OR REPLACE FUNCTION vm.rewrites_seen() RETURNS boolean
+LANGUAGE sql STABLE SECURITY DEFINER PARALLEL UNSAFE
+SET search_path = pg_catalog, pg_temp
+AS $f$
+SELECT EXISTS (SELECT FROM vm.rewrite_nodes r
+                 JOIN pg_catalog.pg_class c ON c.oid OPERATOR(pg_catalog.=) r.relid
+                WHERE c.relfilenode OPERATOR(pg_catalog.<>) r.node)
+$f$;
+
+-- The tables with history the statement just run rewrote, each as the
+-- table at the top of its partitions (itself, when it is none), with its
+-- name when the migration began, and whether its rows were read before
+-- the statement; their new file nodes noted.
+CREATE OR REPLACE FUNCTION vm.rewrite_after(p_token text)
+RETURNS TABLE (relid oid, s text, n text, read boolean)
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER PARALLEL UNSAFE
+SET search_path = pg_catalog, pg_temp
+AS $f$
+BEGIN
+    PERFORM vm.rewrite_who(p_token);
+    RETURN QUERY
+    WITH moved AS (
+        UPDATE vm.rewrite_nodes r SET node = c.relfilenode
+          FROM pg_catalog.pg_class c
+         WHERE c.oid = r.relid AND c.relfilenode <> r.node
+        RETURNING r.relid),
+    roots AS (
+        SELECT DISTINCT coalesce(pg_catalog.pg_partition_root(m.relid), m.relid) AS root FROM moved m)
+    SELECT t.relid, t.s, t.n,
+           EXISTS (SELECT FROM vm.rewrite_columns k WHERE k.relid = t.relid AND k.phase = 0)
+      FROM roots x
+      JOIN vm.rewrite_nodes t ON t.relid = x.root
+      JOIN pg_catalog.pg_class c ON c.oid = t.relid
+     ORDER BY t.s, t.n;
+END
+$f$;
+
+-- The tables whose rows are to be read before a statement: those noted
+-- under the names `p_names` (schema and name by turns, as when the
+-- migration began) and, for each table of `p_relids` and every table
+-- under it, the table at the top of its partitions; only tables noted at
+-- the start of the migration. What an earlier statement left is gone.
+CREATE OR REPLACE FUNCTION vm.rewrite_roots(p_token text, p_names text[], p_relids oid[])
+RETURNS oid[]
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER PARALLEL UNSAFE
+SET search_path = pg_catalog, pg_temp
+AS $f$
+DECLARE
+    v_roots oid[];
+BEGIN
+    PERFORM vm.rewrite_who(p_token);
+    DELETE FROM vm.rewrite_rows;
+    DELETE FROM vm.rewrite_columns;
+    WITH RECURSIVE named AS (
+        SELECT t.relid
+          FROM pg_catalog.generate_subscripts(p_names, 1) i
+          JOIN vm.rewrite_nodes t
+            ON t.s = p_names[i] AND t.n = p_names[i + 1]
+         WHERE i % 2 = 1),
+    under (relid) AS (
+        SELECT x FROM pg_catalog.unnest(p_relids) x WHERE x IS NOT NULL
+        UNION
+        SELECT h.inhrelid FROM pg_catalog.pg_inherits h JOIN under u ON h.inhparent = u.relid),
+    roots AS (
+        SELECT relid FROM named
+        UNION
+        SELECT coalesce(pg_catalog.pg_partition_root(u.relid), u.relid) FROM under u)
+    SELECT coalesce(pg_catalog.array_agg(r.relid ORDER BY r.relid), '{}')
+      INTO v_roots
+      FROM roots r
+     WHERE EXISTS (SELECT FROM vm.rewrite_nodes t WHERE t.relid = r.relid);
+    RETURN v_roots;
+END
+$f$;
+
+-- Keeps what a reading `p_phase` (0 before the statement, 1 after) of
+-- the table `p_relid` read. Without rows, it begins: the table's columns
+-- as the reading sees them (number, name, whether virtual, place in the
+-- primary key), what an earlier reading of the same phase kept gone.
+-- With rows, each as the capture records it (`p_rows`) with the names of
+-- its `json` and `jsonb` columns holding JSON null (`p_nulls`).
+CREATE OR REPLACE FUNCTION vm.rewrite_keep(p_token text, p_relid oid, p_phase smallint,
+                                           p_rows jsonb[], p_nulls jsonb[])
+RETURNS integer
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER PARALLEL UNSAFE
+SET search_path = pg_catalog, pg_temp
+AS $f$
+DECLARE
+    v_made integer;
+BEGIN
+    PERFORM vm.rewrite_who(p_token);
+    IF p_rows IS NULL THEN
+        IF NOT EXISTS (SELECT FROM vm.rewrite_nodes t WHERE t.relid = p_relid) THEN
+            RAISE EXCEPTION USING ERRCODE = 'VM001',
+                MESSAGE = 'only a table noted at the start of the migration is read';
+        END IF;
+        DELETE FROM vm.rewrite_columns k WHERE k.relid = p_relid AND k.phase = p_phase;
+        DELETE FROM vm.rewrite_rows r WHERE r.relid = p_relid AND r.phase = p_phase;
+        INSERT INTO vm.rewrite_columns (relid, phase, attnum, name, virtual, key)
+        SELECT p_relid, p_phase, a.attnum, a.attname::text, a.attgenerated = 'v',
+               (SELECT pg_catalog.array_position(i.indkey::int2[], a.attnum)::smallint
+                  FROM pg_catalog.pg_index i
+                 WHERE i.indrelid = p_relid AND i.indisprimary)
+          FROM pg_catalog.pg_attribute a
+         WHERE a.attrelid = p_relid AND a.attnum > 0 AND NOT a.attisdropped;
+        GET DIAGNOSTICS v_made = ROW_COUNT;
+        RETURN v_made;
+    END IF;
+    IF NOT EXISTS (SELECT FROM vm.rewrite_columns k WHERE k.relid = p_relid AND k.phase = p_phase) THEN
+        RAISE EXCEPTION USING ERRCODE = 'VM001',
+            MESSAGE = 'rows are kept only for a reading begun';
+    END IF;
+    INSERT INTO vm.rewrite_rows (relid, phase, j, n)
+    SELECT p_relid, p_phase, x.j, x.n
+      FROM ROWS FROM (pg_catalog.unnest(p_rows), pg_catalog.unnest(p_nulls)) x(j, n);
+    GET DIAGNOSTICS v_made = ROW_COUNT;
+    RETURN v_made;
+END
+$f$;
+
+-- One reading of the table `p_relid`'s own rows (`ONLY`; a partitioned
+-- table's are its partitions', in its form), as the migration role
+-- (SECURITY INVOKER), the settings that change how values print pinned as
+-- in the capture, row security off. Refused when row security would apply
+-- to the reading (VM004), or a cast to json or jsonb of the Application's
+-- exists (VM003: `to_jsonb` would call it). Each row is the object of its
+-- columns as `to_jsonb` makes it, a virtual generated column null (as in
+-- the capture, and never computed). The rows go to `vm.rewrite_keep` in
+-- chunks of 5,000, so that no more than a chunk is held here at once.
+-- Answers how many rows.
+CREATE OR REPLACE FUNCTION vm.rewrite_read(p_token text, p_relid oid, p_phase smallint)
+RETURNS bigint
+LANGUAGE plpgsql VOLATILE PARALLEL UNSAFE
+SET search_path = pg_catalog, pg_temp
+SET TimeZone = 'UTC'
+SET extra_float_digits = 1
+SET IntervalStyle = 'postgres'
+SET DateStyle = 'ISO, YMD'
+SET bytea_output = 'hex'
+SET row_security = off
+AS $f$
+DECLARE
+    v_kind "char";
+    v_pairs text[];
+    v_row text;
+    v_tests text;
+    v_nulls text;
+    v_js jsonb[] := '{}';
+    v_ns jsonb[] := '{}';
+    v_held integer := 0;
+    v_read bigint := 0;
+    v_r record;
+BEGIN
+    PERFORM vm.capture_guard();
+    SELECT c.relkind INTO v_kind FROM pg_catalog.pg_class c WHERE c.oid = p_relid;
+    IF v_kind IS NULL THEN
+        RAISE EXCEPTION USING ERRCODE = 'VM001',
+            MESSAGE = 'the table to read is not there';
+    END IF;
+    IF pg_catalog.row_security_active(p_relid) THEN
+        RAISE EXCEPTION USING ERRCODE = 'VM004',
+            MESSAGE = pg_catalog.format(
+                'row security applies to the table %s as its owner reads it (FORCE ROW LEVEL SECURITY), so the platform cannot read all its rows before and after a statement that writes them anew, to record each row it changed: take FORCE ROW LEVEL SECURITY off before the statement and put it back after it',
+                p_relid::pg_catalog.regclass);
+    END IF;
+    PERFORM vm.rewrite_keep(p_token, p_relid, p_phase, NULL, NULL);
+    -- `jsonb_build_object` takes at most 50 pairs: one per 50 columns.
+    SELECT pg_catalog.array_agg(x.o ORDER BY x.g)
+      INTO v_pairs
+      FROM (SELECT (a.i - 1) / 50 AS g,
+                   'pg_catalog.jsonb_build_object(' || pg_catalog.string_agg(
+                       CASE WHEN a.attgenerated = 'v'
+                            THEN pg_catalog.format('%L, NULL::pg_catalog.jsonb', a.attname)
+                            ELSE pg_catalog.format('%L, vm_row.%I', a.attname, a.attname) END,
+                       ', ' ORDER BY a.attnum) || ')' AS o
+              FROM (SELECT t.attname, t.attnum, t.attgenerated,
+                           pg_catalog.row_number() OVER (ORDER BY t.attnum) AS i
+                      FROM pg_catalog.pg_attribute t
+                     WHERE t.attrelid = p_relid AND t.attnum > 0 AND NOT t.attisdropped) a
+             GROUP BY 1) x;
+    v_row := coalesce(pg_catalog.array_to_string(v_pairs, ' OPERATOR(pg_catalog.||) '),
+                      '''{}''::pg_catalog.jsonb');
+    SELECT pg_catalog.string_agg(
+               pg_catalog.format('(%L, pg_catalog.%s(vm_row.%I) OPERATOR(pg_catalog.=) %L)',
+                                 a.attname,
+                                 CASE WHEN a.atttypid = 'pg_catalog.json'::pg_catalog.regtype
+                                      THEN 'json_typeof' ELSE 'jsonb_typeof' END,
+                                 a.attname, 'null'),
+               ', ' ORDER BY a.attnum)
+      INTO v_tests
+      FROM pg_catalog.pg_attribute a
+     WHERE a.attrelid = p_relid AND a.attnum > 0 AND NOT a.attisdropped AND a.attgenerated <> 'v'
+       AND a.atttypid IN ('pg_catalog.json'::pg_catalog.regtype, 'pg_catalog.jsonb'::pg_catalog.regtype);
+    IF v_tests IS NULL THEN
+        v_nulls := 'NULL::pg_catalog.jsonb';
+    ELSE
+        v_nulls := 'pg_catalog.to_jsonb(ARRAY(SELECT v.c FROM (VALUES ' || v_tests || ') AS v(c, n) WHERE v.n))';
+    END IF;
+    FOR v_r IN EXECUTE pg_catalog.format('SELECT %s AS j, %s AS n FROM %s %s vm_row',
+                                         v_row, v_nulls,
+                                         CASE WHEN v_kind = 'p' THEN '' ELSE 'ONLY' END,
+                                         p_relid::pg_catalog.regclass) LOOP
+        v_js := pg_catalog.array_append(v_js, v_r.j);
+        v_ns := pg_catalog.array_append(v_ns, v_r.n);
+        v_held := v_held + 1;
+        IF v_held >= 5000 THEN
+            v_read := v_read + vm.rewrite_keep(p_token, p_relid, p_phase, v_js, v_ns);
+            v_js := '{}';
+            v_ns := '{}';
+            v_held := 0;
+        END IF;
+    END LOOP;
+    IF v_held > 0 THEN
+        v_read := v_read + vm.rewrite_keep(p_token, p_relid, p_phase, v_js, v_ns);
+    END IF;
+    RETURN v_read;
+END
+$f$;
+
+-- Before a statement: the rows of the tables `vm.rewrite_roots` names,
+-- read as the migration role. Answers how many rows.
+CREATE OR REPLACE FUNCTION vm.rewrite_before(p_token text, p_names text[], p_relids oid[])
+RETURNS bigint
+LANGUAGE plpgsql VOLATILE PARALLEL UNSAFE
+SET search_path = pg_catalog, pg_temp
+AS $f$
+DECLARE
+    v_root oid;
+    v_read bigint := 0;
+BEGIN
+    FOREACH v_root IN ARRAY vm.rewrite_roots(p_token, p_names, p_relids) LOOP
+        v_read := v_read + vm.rewrite_read(p_token, v_root, 0::smallint);
+    END LOOP;
+    RETURN v_read;
+END
+$f$;
+
+-- After a statement that rewrote the tables `p_relids` (each read before
+-- it): their rows read again, as the migration role, and recorded.
+-- Answers how many entries.
+CREATE OR REPLACE FUNCTION vm.rewrite_record_after(p_token text, p_relids oid[])
+RETURNS bigint
+LANGUAGE plpgsql VOLATILE PARALLEL UNSAFE
+SET search_path = pg_catalog, pg_temp
+AS $f$
+DECLARE
+    v_root oid;
+    v_made bigint := 0;
+BEGIN
+    FOREACH v_root IN ARRAY p_relids LOOP
+        PERFORM vm.rewrite_read(p_token, v_root, 1::smallint);
+        v_made := v_made + vm.rewrite_record(p_token, v_root);
+    END LOOP;
+    RETURN v_made;
+END
+$f$;
+
+-- Compares the rows of `p_relid` read before and after the statement and
+-- records each that differs, under the identity the token carries, in
+-- the outbox; then forgets them. Answers how many entries. Touches only
+-- `vm` and the catalog: no value is cast to a type of the Application's,
+-- nothing of the Application's runs. A table without a primary key that
+-- is the same columns before and after is compared as a multiset of
+-- rows, and refused (VM005) when they differ.
+CREATE OR REPLACE FUNCTION vm.rewrite_record(p_token text, p_relid oid) RETURNS bigint
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER PARALLEL UNSAFE
+SET search_path = pg_catalog, pg_temp
+AS $f$
+DECLARE
+    v_who jsonb := vm.rewrite_who(p_token);
+    v_at timestamptz := pg_catalog.clock_timestamp();
+    v_schema text;
+    v_table text;
+    v_keyed boolean;
+    v_made bigint;
+BEGIN
+    IF NOT EXISTS (SELECT FROM vm.rewrite_columns k WHERE k.relid = p_relid AND k.phase = 0)
+       OR NOT EXISTS (SELECT FROM vm.rewrite_columns k WHERE k.relid = p_relid AND k.phase = 1) THEN
+        RAISE EXCEPTION USING ERRCODE = 'VM001',
+            MESSAGE = 'a rewrite is recorded only from its two readings';
+    END IF;
+    SELECT n.nspname::text, c.relname::text INTO v_schema, v_table
+      FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+     WHERE c.oid = p_relid;
+    -- Paired by the key only when it is the same columns before and after.
+    SELECT EXISTS (SELECT FROM vm.rewrite_columns k WHERE k.relid = p_relid AND k.phase = 0 AND k.key IS NOT NULL)
+       AND NOT EXISTS (
+           SELECT FROM (SELECT k.attnum FROM vm.rewrite_columns k
+                         WHERE k.relid = p_relid AND k.phase = 0 AND k.key IS NOT NULL) b
+           FULL JOIN (SELECT k.attnum FROM vm.rewrite_columns k
+                       WHERE k.relid = p_relid AND k.phase = 1 AND k.key IS NOT NULL) a
+             ON a.attnum = b.attnum
+          WHERE a.attnum IS NULL OR b.attnum IS NULL)
+      INTO v_keyed;
+    IF NOT v_keyed THEN
+        IF EXISTS (
+            WITH common AS (
+                SELECT b.attnum, b.name AS bname, a.name AS aname
+                  FROM vm.rewrite_columns b
+                  JOIN vm.rewrite_columns a ON a.relid = b.relid AND a.attnum = b.attnum AND a.phase = 1
+                 WHERE b.relid = p_relid AND b.phase = 0 AND NOT b.virtual AND NOT a.virtual),
+            rows_before AS (
+                SELECT (SELECT coalesce(pg_catalog.jsonb_object_agg(c.aname, r.j -> c.bname), '{}') FROM common c) AS v,
+                       (SELECT coalesce(pg_catalog.jsonb_agg(c.aname ORDER BY c.attnum), '[]') FROM common c
+                         WHERE coalesce(r.n ? c.bname, false)) AS z
+                  FROM vm.rewrite_rows r WHERE r.relid = p_relid AND r.phase = 0),
+            rows_after AS (
+                SELECT (SELECT coalesce(pg_catalog.jsonb_object_agg(c.aname, r.j -> c.aname), '{}') FROM common c) AS v,
+                       (SELECT coalesce(pg_catalog.jsonb_agg(c.aname ORDER BY c.attnum), '[]') FROM common c
+                         WHERE coalesce(r.n ? c.aname, false)) AS z
+                  FROM vm.rewrite_rows r WHERE r.relid = p_relid AND r.phase = 1),
+            counted_before AS (SELECT x.v, x.z, pg_catalog.count(*) AS c FROM rows_before x GROUP BY x.v, x.z),
+            counted_after AS (SELECT x.v, x.z, pg_catalog.count(*) AS c FROM rows_after x GROUP BY x.v, x.z)
+            SELECT FROM counted_before b
+              FULL JOIN counted_after a ON a.v = b.v AND a.z = b.z
+             WHERE a.c IS DISTINCT FROM b.c) THEN
+            RAISE EXCEPTION USING ERRCODE = 'VM005',
+                MESSAGE = pg_catalog.format(
+                    'the statement wrote the rows of the table %I.%I anew with other values, and the table has no primary key that is the same columns before and after the statement, so its rows cannot be paired to record each one that changed: give it a primary key in an earlier statement',
+                    v_schema, v_table);
+        END IF;
+        DELETE FROM vm.rewrite_rows r WHERE r.relid = p_relid;
+        DELETE FROM vm.rewrite_columns k WHERE k.relid = p_relid;
+        RETURN 0;
+    END IF;
+    WITH cb AS (SELECT * FROM vm.rewrite_columns k WHERE k.relid = p_relid AND k.phase = 0),
+    ca AS (SELECT * FROM vm.rewrite_columns k WHERE k.relid = p_relid AND k.phase = 1),
+    common AS (
+        SELECT b.attnum, b.name AS bname, a.name AS aname
+          FROM cb b JOIN ca a ON a.attnum = b.attnum
+         WHERE NOT b.virtual AND NOT a.virtual),
+    key_before AS (SELECT b.name, b.attnum FROM cb b WHERE b.key IS NOT NULL),
+    key_after AS (SELECT a.name, a.attnum FROM ca a WHERE a.key IS NOT NULL),
+    rb AS (
+        SELECT r.id, r.j, r.n,
+               (SELECT pg_catalog.jsonb_agg(r.j -> k.name ORDER BY k.attnum) FROM key_before k) AS k
+          FROM vm.rewrite_rows r WHERE r.relid = p_relid AND r.phase = 0),
+    ra AS (
+        SELECT r.id, r.j, r.n,
+               (SELECT pg_catalog.jsonb_agg(r.j -> k.name ORDER BY k.attnum) FROM key_after k) AS k
+          FROM vm.rewrite_rows r WHERE r.relid = p_relid AND r.phase = 1),
+    exact AS (SELECT b.id AS bid, a.id AS aid FROM rb b JOIN ra a ON a.k = b.k),
+    -- The rows the exact pairing left: each key's values made text the
+    -- way a number, a boolean and the string that reads the same agree
+    -- (a number without trailing zeros, a boolean as `true`/`false`, a
+    -- string that reads as a number as that number), for the loose
+    -- pairing only.
+    left_before AS (
+        SELECT b.id, b.k,
+               (SELECT pg_catalog.jsonb_agg(
+                       CASE pg_catalog.jsonb_typeof(e.v)
+                            WHEN 'number' THEN pg_catalog.to_jsonb(pg_catalog.trim_scale((e.v #>> '{}')::pg_catalog.numeric)::pg_catalog.text)
+                            WHEN 'boolean' THEN pg_catalog.to_jsonb(e.v #>> '{}')
+                            WHEN 'string' THEN
+                                CASE WHEN pg_catalog.pg_input_is_valid(e.v #>> '{}', 'numeric')
+                                     THEN pg_catalog.to_jsonb(pg_catalog.trim_scale((e.v #>> '{}')::pg_catalog.numeric)::pg_catalog.text)
+                                     ELSE e.v END
+                            ELSE e.v END
+                       ORDER BY e.o)
+                  FROM pg_catalog.jsonb_array_elements(b.k) WITH ORDINALITY e(v, o)) AS t
+          FROM rb b
+         WHERE NOT EXISTS (SELECT FROM exact e WHERE e.bid = b.id)),
+    left_after AS (
+        SELECT a.id, a.k,
+               (SELECT pg_catalog.jsonb_agg(
+                       CASE pg_catalog.jsonb_typeof(e.v)
+                            WHEN 'number' THEN pg_catalog.to_jsonb(pg_catalog.trim_scale((e.v #>> '{}')::pg_catalog.numeric)::pg_catalog.text)
+                            WHEN 'boolean' THEN pg_catalog.to_jsonb(e.v #>> '{}')
+                            WHEN 'string' THEN
+                                CASE WHEN pg_catalog.pg_input_is_valid(e.v #>> '{}', 'numeric')
+                                     THEN pg_catalog.to_jsonb(pg_catalog.trim_scale((e.v #>> '{}')::pg_catalog.numeric)::pg_catalog.text)
+                                     ELSE e.v END
+                            ELSE e.v END
+                       ORDER BY e.o)
+                  FROM pg_catalog.jsonb_array_elements(a.k) WITH ORDINALITY e(v, o)) AS t
+          FROM ra a
+         WHERE NOT EXISTS (SELECT FROM exact e WHERE e.aid = a.id)),
+    loose AS (
+        SELECT b.id AS bid, a.id AS aid
+          FROM (SELECT x.*, pg_catalog.count(*) OVER (PARTITION BY x.t) AS c FROM left_before x) b
+          JOIN (SELECT x.*, pg_catalog.count(*) OVER (PARTITION BY x.t) AS c FROM left_after x) a
+            ON a.t = b.t
+         -- Paired when each is the only one so made on its side, and each
+         -- key column is equal as JSON values or is a number or a boolean
+         -- against a string.
+         WHERE b.c = 1 AND a.c = 1
+           AND pg_catalog.jsonb_array_length(b.k) = pg_catalog.jsonb_array_length(a.k)
+           AND NOT EXISTS (
+               SELECT FROM pg_catalog.jsonb_array_elements(b.k) WITH ORDINALITY x(v, o)
+                 JOIN pg_catalog.jsonb_array_elements(a.k) WITH ORDINALITY y(v, o) ON y.o = x.o
+                WHERE x.v <> y.v
+                  AND NOT ((pg_catalog.jsonb_typeof(x.v) IN ('number', 'boolean') AND pg_catalog.jsonb_typeof(y.v) = 'string')
+                           OR (pg_catalog.jsonb_typeof(y.v) IN ('number', 'boolean') AND pg_catalog.jsonb_typeof(x.v) = 'string')))),
+    pairs AS (SELECT * FROM exact UNION ALL SELECT * FROM loose),
+    entries AS (
+        SELECT 'update' AS kind, a.j AS key_row, 1 AS side, b.j AS old, a.j AS new, b.n AS old_nulls, a.n AS new_nulls,
+               (SELECT pg_catalog.jsonb_agg(c.aname ORDER BY c.attnum) FROM common c
+                 WHERE (b.j -> c.bname) IS DISTINCT FROM (a.j -> c.aname)
+                    OR coalesce(b.n ? c.bname, false) IS DISTINCT FROM coalesce(a.n ? c.aname, false)) AS changed
+          FROM pairs p
+          JOIN rb b ON b.id = p.bid
+          JOIN ra a ON a.id = p.aid
+        UNION ALL
+        SELECT 'delete', b.j, 0, b.j, NULL, b.n, NULL, NULL
+          FROM rb b WHERE NOT EXISTS (SELECT FROM pairs p WHERE p.bid = b.id)
+        UNION ALL
+        SELECT 'insert', a.j, 1, NULL, a.j, NULL, a.n, NULL
+          FROM ra a WHERE NOT EXISTS (SELECT FROM pairs p WHERE p.aid = a.id))
+    INSERT INTO vm.outbox (at, schema_name, table_name, kind, key, old, new, changed,
+                           user_id, application, actor, request, migration, json_nulls)
+    SELECT v_at, v_schema, v_table, e.kind,
+           CASE WHEN e.side = 0
+                THEN (SELECT pg_catalog.jsonb_object_agg(k.name, e.key_row -> k.name) FROM key_before k)
+                ELSE (SELECT pg_catalog.jsonb_object_agg(k.name, e.key_row -> k.name) FROM key_after k) END,
+           e.old, e.new, e.changed,
+           v_who ->> 'user_id', v_who ->> 'application', v_who ->> 'actor', NULL, v_who ->> 'migration',
+           vm.json_nulls(e.old_nulls, e.new_nulls)
+      FROM entries e
+     WHERE e.kind <> 'update' OR e.changed IS NOT NULL;
+    GET DIAGNOSTICS v_made = ROW_COUNT;
+    DELETE FROM vm.rewrite_rows r WHERE r.relid = p_relid;
+    DELETE FROM vm.rewrite_columns k WHERE k.relid = p_relid;
+    RETURN v_made;
+END
+$f$;
+-- What is left of a statement's readings gone; with `p_end`, at the end
+-- of a migration, the tables noted at its start too: nothing of the
+-- rewrites is left in `vm`.
+CREATE OR REPLACE FUNCTION vm.rewrite_done(p_token text, p_end boolean) RETURNS void
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER PARALLEL UNSAFE
+SET search_path = pg_catalog, pg_temp
+AS $f$
+BEGIN
+    PERFORM vm.rewrite_who(p_token);
+    DELETE FROM vm.rewrite_rows;
+    DELETE FROM vm.rewrite_columns;
+    IF p_end THEN
+        DELETE FROM vm.rewrite_nodes;
+    END IF;
+END
+$f$;
+
 SELECT vm.capture_new_tables();
 
 -- New functions are executable by PUBLIC: none is by anyone but the

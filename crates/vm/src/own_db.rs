@@ -65,10 +65,9 @@
 //! to this one, its history, keys and rows unchanged; and the migration
 //! role is closed. One that cannot be is not served until it can.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::future::Future;
-use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock};
 use std::time::Duration;
@@ -95,11 +94,11 @@ pub use history::{HistoryAnswer, HistoryRead};
 pub const BREAKPOINT: &str = "--> statement-breakpoint";
 
 /// The form of the platform's part of an own database this program brings
-/// every one to: 3 is three roles and `own_db_schema.sql` as it is (the
-/// history shipped from `vm.outbox`; 2 kept it in `vm.history`). Raise it
-/// whenever `own_db_schema.sql` or the roles change, so that every own
-/// database is brought to the new form at the next start.
-pub const FORM: i32 = 3;
+/// every one to: 4 is three roles and `own_db_schema.sql` as it is (3 had
+/// no reading of a rewrite's rows; 2 kept the history in `vm.history`).
+/// Raise it whenever `own_db_schema.sql` or the roles change, so that
+/// every own database is brought to the new form at the next start.
+pub const FORM: i32 = 4;
 
 /// The longest opening a connection to an own database may take.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -190,7 +189,13 @@ fn vm_grants(owner: &str, runtime: &str) -> String {
              vm.capture_problems(), vm.applied_migrations(),
              vm.structure_state(), vm.record_migration(integer, text, text),
              vm.application_owned(oid), vm.structure_snapshot(),
-             vm.record_structure(jsonb) TO {owner};
+             vm.record_structure(jsonb), vm.capture_guard(),
+             vm.rewrite_begin(text), vm.rewrites_seen(), vm.rewrite_after(text),
+             vm.rewrite_roots(text, text[], oid[]),
+             vm.rewrite_keep(text, oid, smallint, jsonb[], jsonb[]),
+             vm.rewrite_read(text, oid, smallint), vm.rewrite_before(text, text[], oid[]),
+             vm.rewrite_record_after(text, oid[]), vm.rewrite_record(text, oid),
+             vm.rewrite_done(text, boolean) TO {owner};
          GRANT EXECUTE ON FUNCTION vm.before_commit() TO {runtime};"
     )
 }
@@ -1859,15 +1864,20 @@ impl OwnDatabases {
         outcome
     }
 
-    /// The migrations' transaction, on the migration role's own session:
+    /// The migrations' transaction, on the migration role's own session,
+    /// run up to [`RUNS`] times ([`Self::run`]): a run that saw a statement
+    /// write anew a table with history whose rows it had not read before
+    /// the statement is undone, and the next reads them. Each run:
     ///
     /// - the advisory lock, then the record of migrations read again (as
     ///   `vm.applied_migrations()`); the list must still continue it;
     /// - per pending migration: its identity attached (`actor`
     ///   `migration`); the capture triggers' catalog rows read
-    ///   (`vm.capture_state()`) and kept here; each statement sent alone
-    ///   over the extended protocol, the transaction's key
-    ///   (`vm.transaction_key()`) asked after each and required unchanged;
+    ///   (`vm.capture_state()`) and kept here; the tables with history
+    ///   noted (`vm.rewrite_begin`); each statement sent alone over the
+    ///   extended protocol, the transaction's key (`vm.transaction_key()`)
+    ///   asked after each and required unchanged, a table it wrote anew
+    ///   recorded row by row as [`Self::run`] says;
     ///   `SET CONSTRAINTS ALL IMMEDIATE` and `CLOSE ALL`, so that nothing of
     ///   the migration's is left to run at the commit; the capture
     ///   triggers' rows read again and compared (`capture-changed`); the
@@ -1880,8 +1890,50 @@ impl OwnDatabases {
     /// Every statement the host sends here calls a function by its schema,
     /// or is `SET CONSTRAINTS` or `CLOSE`, with values as parameters: no
     /// name, operator or type a migration could put first on the search
-    /// path is looked up.
+    /// path is looked up, but for the names of the tables a statement is
+    /// foreseen to write anew, which `vm.rewrite_before`'s statement looks
+    /// up as the statement will (`pg_catalog.to_regclass`, which finds a
+    /// table and runs nothing).
     async fn apply(&self, work: &Work<'_>) -> Result<(), Problem> {
+        let mut learnt = Learnt::new();
+        for run in 1..=RUNS {
+            match self.run(work, &learnt, run == RUNS).await? {
+                Ran::Committed => return Ok(()),
+                Ran::Learnt(found) => {
+                    for (statement, tables) in found {
+                        learnt.entry(statement).or_default().extend(tables);
+                    }
+                }
+            }
+        }
+        Err(Problem::internal(
+            "applying migrations: the last run neither committed nor refused",
+        ))
+    }
+
+    /// One run of [`Self::apply`], on a session of its own: committed, or
+    /// undone with what it learnt of the statements that write tables anew
+    /// (blackbox/CONTRACT.md, "A statement may run more than once").
+    /// `learnt` is what earlier runs did; in the `last` run, a statement
+    /// seen to write anew a table it was not known to is refused
+    /// (`rewrite-unsteady`).
+    ///
+    /// Before a statement known to write tables anew (by `learnt`, or
+    /// foreseen from its text), their rows are read
+    /// (`vm.rewrite_before`); after every statement, whether a table with
+    /// history was written anew is asked with the transaction's key
+    /// (`vm.rewrites_seen()`); if one was, which (`vm.rewrite_after`), and
+    /// those read before are read again and their changed rows recorded
+    /// (`vm.rewrite_record_after`). One not read before is learnt: the
+    /// rest of the run only learns (nothing is read), and is undone.
+    ///
+    /// The readings run as the migration role with the migration's own
+    /// identity attached, as its statements do, never the platform's: a
+    /// reading can run code of the Application's (a policy, a cast), which
+    /// would run with the reader's rights. What they read is kept in `vm`
+    /// by functions that need the migration's [`executor::RewriteToken`],
+    /// which only these statements carry, as a parameter.
+    async fn run(&self, work: &Work<'_>, learnt: &Learnt, last: bool) -> Result<Ran, Problem> {
         let deadline = work.deadline;
         let timed_out = || Problem::timed_out("applying migrations: they did not finish in time");
         let unavailable = |e: &tokio_postgres::Error| Problem::postgres("applying migrations", e);
@@ -1938,7 +1990,7 @@ impl OwnDatabases {
         let pending = work.list.get(applied.len()..).unwrap_or_default();
         let plans = work.plans.get(skip..).unwrap_or_default();
         if pending.is_empty() {
-            return Ok(());
+            return Ok(Ran::Committed);
         }
         let transaction_key: String = within(
             deadline,
@@ -1958,7 +2010,11 @@ impl OwnDatabases {
             },
             None => unavailable(&error),
         };
-        for (migration, statements) in pending.iter().zip(plans) {
+        // What this run found that earlier ones had not; once anything is,
+        // the rest of the run only learns.
+        let mut found = Learnt::new();
+        for (index, (migration, statements)) in pending.iter().zip(plans).enumerate() {
+            let place = applied.len().saturating_add(index);
             // The migration's own identity, valid in this transaction only.
             let who = executor::identity(
                 work.sender,
@@ -1976,6 +2032,17 @@ impl OwnDatabases {
             .await
             .ok_or_else(timed_out)?
             .map_err(|e| unavailable(&e))?;
+            // The tables with history as the migration begins, which its
+            // statements' rewrites are seen against.
+            let token = work.key.rewrite_token(&transaction_key, &who);
+            within(
+                deadline,
+                &cancel,
+                transaction.query_one(REWRITE_BEGIN, &[&token.as_parameter()]),
+            )
+            .await
+            .ok_or_else(timed_out)?
+            .map_err(|e| failed(migration, e))?;
             let before = within(deadline, &cancel, capture_state(&transaction))
                 .await
                 .ok_or_else(timed_out)?
@@ -1991,29 +2058,80 @@ impl OwnDatabases {
             .ok_or_else(timed_out)?
             .and_then(|row| row.try_get(0))
             .map_err(|e| failed(migration, e))?;
-            for range in statements {
-                let Some(statement) = migration.sql.get(range.clone()) else {
-                    return Err(Problem::internal(
-                        "applying migrations: a statement's place in its migration was lost",
-                    ));
+            // Each statement, then `SET CONSTRAINTS ALL IMMEDIATE`: the
+            // deferred triggers the migration left run there, and may
+            // write tables anew as a statement may. Nothing of the
+            // migration's may be left to run at the commit, after the
+            // checks.
+            let steps = statements.iter().map(Some).chain([None]);
+            for (number, planned) in steps.enumerate() {
+                let (statement, foreseen, line) = match planned {
+                    Some(planned) => {
+                        let Some(statement) = migration.sql.get(planned.range.clone()) else {
+                            return Err(Problem::internal(
+                                "applying migrations: a statement's place in its migration was lost",
+                            ));
+                        };
+                        (
+                            statement,
+                            planned.rewrites.as_slice(),
+                            format!(
+                                "the statement on line {}",
+                                migration_text::line_of(&migration.sql, planned.range.start)
+                            ),
+                        )
+                    }
+                    None => (
+                        "SET CONSTRAINTS ALL IMMEDIATE",
+                        &[][..],
+                        "a deferred trigger it left to run at its end".to_owned(),
+                    ),
                 };
+                let remembered = learnt.get(&(place, number));
+                let reading = found.is_empty() && (remembered.is_some() || !foreseen.is_empty());
+                if reading {
+                    let names: Vec<&str> = remembered
+                        .into_iter()
+                        .flatten()
+                        .flat_map(|(schema, table)| [schema.as_str(), table.as_str()])
+                        .collect();
+                    within(
+                        deadline,
+                        &cancel,
+                        transaction
+                            .query_one(REWRITE_BEFORE, &[&token.as_parameter(), &names, &foreseen]),
+                    )
+                    .await
+                    .ok_or_else(timed_out)?
+                    .map_err(|e| rewrite_problem(migration, e, &failed))?;
+                }
                 // The statement and the question of the transaction's key
-                // after it travel together: each its own extended-protocol
-                // exchange (one statement per Parse, which Postgres refuses
-                // to hold two), sent at once, answered in order. If the
-                // statement fails, the question fails after it.
-                let (ran, key_now) = within(deadline, &cancel, async {
-                    let (ran, key_now) = tokio::join!(
+                // after it (and whether it wrote a table with history anew)
+                // travel together: each its own extended-protocol exchange
+                // (one statement per Parse, which Postgres refuses to hold
+                // two), sent at once, answered in order. If the statement
+                // fails, the question fails after it.
+                let (ran, after) = within(deadline, &cancel, async {
+                    let (ran, after) = tokio::join!(
                         transaction.query_typed(statement, &[]),
-                        transaction.query_typed_one("SELECT vm.transaction_key()", &[]),
+                        transaction.query_typed_one(
+                            "SELECT vm.transaction_key(), vm.rewrites_seen()",
+                            &[]
+                        ),
                     );
-                    Ok((ran, key_now))
+                    Ok((ran, after))
                 })
                 .await
                 .ok_or_else(timed_out)?
                 .map_err(|e| unavailable(&e))?;
                 ran.map_err(|e| failed(migration, e))?;
-                let key_now: Option<String> = key_now.and_then(|row| row.try_get(0)).ok();
+                let (key_now, seen): (Option<String>, bool) = match after {
+                    Ok(row) => (
+                        row.try_get(0).ok(),
+                        row.try_get(1).map_err(|e| unavailable(&e))?,
+                    ),
+                    Err(_) => (None, false),
+                };
                 if key_now.as_deref() != Some(transaction_key.as_str()) {
                     return Err(Problem::refused(
                         migration,
@@ -2021,15 +2139,86 @@ impl OwnDatabases {
                         "a statement of the migration ended the platform's transaction: the platform applies all of a Version's migrations in one transaction that it begins and commits itself; remove whatever ends, commits or chains it".to_owned(),
                     ));
                 }
-            }
-            // Nothing of the migration's may be left to run at the commit,
-            // after the checks.
-            for settle in ["SET CONSTRAINTS ALL IMMEDIATE", "CLOSE ALL"] {
-                within(deadline, &cancel, transaction.execute(settle, &[]))
+                if seen {
+                    let rewritten = within(
+                        deadline,
+                        &cancel,
+                        transaction.query(REWRITE_AFTER, &[&token.as_parameter()]),
+                    )
                     .await
                     .ok_or_else(timed_out)?
                     .map_err(|e| failed(migration, e))?;
+                    let mut read = Vec::with_capacity(rewritten.len());
+                    let mut new = BTreeSet::new();
+                    for row in &rewritten {
+                        let relid: u32 = row.try_get(0).map_err(|e| unavailable(&e))?;
+                        let schema: String = row.try_get(1).map_err(|e| unavailable(&e))?;
+                        let table: String = row.try_get(2).map_err(|e| unavailable(&e))?;
+                        let was_read: bool = row.try_get(3).map_err(|e| unavailable(&e))?;
+                        let name = (schema, table);
+                        if was_read {
+                            read.push(relid);
+                        } else if !remembered.is_some_and(|known| known.contains(&name)) {
+                            new.insert(name);
+                        }
+                    }
+                    if !new.is_empty() {
+                        if last {
+                            let mut tables: Vec<String> = remembered
+                                .into_iter()
+                                .flatten()
+                                .chain(&new)
+                                .map(|(schema, table)| format!("{schema}.{table}"))
+                                .collect();
+                            tables.sort();
+                            tables.dedup();
+                            return Err(Problem::refused(
+                                migration,
+                                "rewrite-unsteady",
+                                format!(
+                                    "{line} of the migration {} wrote anew, in each of the platform's {RUNS} runs of it, a table with history it had not written anew in an earlier run, so the platform never had that table's rows from before it to record each row it changed; tables it was seen to write anew: {}. Make it write the same tables each time it runs",
+                                    migration.name,
+                                    tables.join(", ")
+                                ),
+                            ));
+                        }
+                        found.entry((place, number)).or_default().extend(new);
+                    } else if !read.is_empty() && found.is_empty() {
+                        within(
+                            deadline,
+                            &cancel,
+                            transaction
+                                .query_one(REWRITE_RECORD_AFTER, &[&token.as_parameter(), &read]),
+                        )
+                        .await
+                        .ok_or_else(timed_out)?
+                        .map_err(|e| rewrite_problem(migration, e, &failed))?;
+                    }
+                }
+                if reading {
+                    within(
+                        deadline,
+                        &cancel,
+                        transaction.query_one(REWRITE_DONE, &[&token.as_parameter()]),
+                    )
+                    .await
+                    .ok_or_else(timed_out)?
+                    .map_err(|e| failed(migration, e))?;
+                }
             }
+            within(deadline, &cancel, transaction.execute("CLOSE ALL", &[]))
+                .await
+                .ok_or_else(timed_out)?
+                .map_err(|e| failed(migration, e))?;
+            // Nothing of the rewrites is left in `vm`.
+            within(
+                deadline,
+                &cancel,
+                transaction.query_one(REWRITE_END, &[&token.as_parameter()]),
+            )
+            .await
+            .ok_or_else(timed_out)?
+            .map_err(|e| failed(migration, e))?;
             let after = within(deadline, &cancel, capture_state(&transaction))
                 .await
                 .ok_or_else(timed_out)?
@@ -2109,6 +2298,14 @@ impl OwnDatabases {
             .await
             .ok_or_else(timed_out)?
             .map_err(|e| failed(migration, e))?;
+        }
+        // A run that learnt is undone; the next knows more.
+        if !found.is_empty() {
+            within(deadline, &cancel, transaction.rollback())
+                .await
+                .ok_or_else(timed_out)?
+                .map_err(|e| unavailable(&e))?;
+            return Ok(Ran::Learnt(found));
         }
         // The record, under the platform's own identity, which no migration
         // can attach; then read back.
@@ -2215,6 +2412,7 @@ impl OwnDatabases {
         // pending stays: the next comparison settles it by the record (a
         // pending state whose record never comes to be is never used, and
         // is replaced by the next Version's).
+        let committed = committed.map(|()| Ran::Committed);
         if committed.is_ok() {
             let settled = tokio::time::timeout(
                 CLOSE_TIMEOUT,
@@ -2360,6 +2558,60 @@ async fn structure_rows(client: &impl GenericClient) -> Result<Structure, tokio_
     Ok(structure)
 }
 
+/// The most runs of a Version's migrations (blackbox/CONTRACT.md, "A
+/// statement may run more than once").
+const RUNS: usize = 5;
+
+/// What runs of a Version's migrations learnt: for each statement (the
+/// migration's place in the list, the statement's in the migration, its
+/// `SET CONSTRAINTS ALL IMMEDIATE` after the last), the tables with history
+/// it was seen to write anew, by schema and name as the migration began.
+type Learnt = BTreeMap<(usize, usize), BTreeSet<(String, String)>>;
+
+/// How a run of [`OwnDatabases::apply`] ended, when no rule was broken.
+enum Ran {
+    Committed,
+    /// Undone, having seen statements write anew tables it had not the
+    /// rows of from before them.
+    Learnt(Learnt),
+}
+
+// The host's statements that keep in `vm` what a rewrite's readings read,
+// and record it, each with the migration's [`executor::RewriteToken`] as
+// `$1`. `vm.rewrite_who` accepts the token only while one of these very
+// texts is the statement running: change them together.
+const REWRITE_BEGIN: &str = "SELECT vm.rewrite_begin($1)";
+const REWRITE_BEFORE: &str = "SELECT vm.rewrite_before($1, $2::pg_catalog.text[], ARRAY(SELECT pg_catalog.to_regclass(x)::pg_catalog.oid FROM pg_catalog.unnest($3::pg_catalog.text[]) x))";
+const REWRITE_AFTER: &str = "SELECT r.relid, r.s, r.n, r.read FROM vm.rewrite_after($1) r";
+const REWRITE_RECORD_AFTER: &str = "SELECT vm.rewrite_record_after($1, $2::pg_catalog.oid[])";
+const REWRITE_DONE: &str = "SELECT vm.rewrite_done($1, false)";
+const REWRITE_END: &str = "SELECT vm.rewrite_done($1, true)";
+
+/// A reading's or a recording's failure as the Version's answer: what
+/// makes the reading untrue (a cast to json the Application made, row
+/// security that applies to the migration role) and a table whose rows
+/// cannot be paired are refusals by their rule; anything else is the
+/// migration's failure.
+fn rewrite_problem(
+    migration: &Migration,
+    error: tokio_postgres::Error,
+    failed: &impl Fn(&Migration, tokio_postgres::Error) -> Problem,
+) -> Problem {
+    let refusal = error.as_db_error().and_then(|db| match db.code().code() {
+        "VM003" => Some((
+            "json-cast",
+            "a cast to json or jsonb from a type of the Application's, whose function is not Postgres's own, exists when the platform reads the rows of a table the migration writes anew, to record each row it changed: reading them would run it. Drop the cast before the statement that writes the table anew".to_owned(),
+        )),
+        "VM004" => Some(("rewrite-row-security", db.message().to_owned())),
+        "VM005" => Some(("rewrite-without-key", db.message().to_owned())),
+        _ => None,
+    });
+    match refusal {
+        Some((rule, message)) => Problem::refused(migration, rule, message),
+        None => failed(migration, error),
+    }
+}
+
 /// What [`OwnDatabases::apply`] works on.
 struct Work<'a> {
     names: &'a Names,
@@ -2373,8 +2625,8 @@ struct Work<'a> {
     /// The length of the record of migrations when the text was checked:
     /// `plans` are of `list` from there on.
     checked_from: usize,
-    /// Each pending migration's statements, as byte ranges of its text.
-    plans: &'a [Vec<Range<usize>>],
+    /// Each pending migration's statements.
+    plans: &'a [Vec<migration_text::Statement>],
     deadline: Instant,
 }
 
@@ -2382,7 +2634,7 @@ struct Work<'a> {
 /// ranges of it, off the async workers; or the first rule broken, by the
 /// migration that broke it. The task is awaited by the caller, so it has
 /// an owner.
-async fn plan(pending: &[Migration]) -> Result<Vec<Vec<Range<usize>>>, Problem> {
+async fn plan(pending: &[Migration]) -> Result<Vec<Vec<migration_text::Statement>>, Problem> {
     // Copied: the parser runs on a blocking thread, which needs the texts
     // as its own; once per Version sent.
     let texts: Vec<(String, String)> = pending

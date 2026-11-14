@@ -4,7 +4,8 @@
 //! ADR 0017).
 //!
 //! Interface: [`statements`], a migration's text in, where its single
-//! statements are in it (byte ranges), in order, or the rule it breaks
+//! statements are in it (byte ranges), in order, each with the tables it
+//! is foreseen to write anew ([`Statement`]), or the rule it breaks
 //! ([`Refusal`]).
 //!
 //! The text is split at `drizzle-kit`'s breakpoint lines, then each part
@@ -35,7 +36,7 @@
 use std::ops::Range;
 
 use pg_query::NodeEnum;
-use pg_query::protobuf::{Token, TransactionStmtKind};
+use pg_query::protobuf::{AlterTableType, Token, TransactionStmtKind};
 
 use crate::own_db::BREAKPOINT;
 
@@ -51,9 +52,23 @@ pub struct Refusal {
     pub message: String,
 }
 
-/// Where the single statements of the migration `sql` are in it, in order,
-/// as byte ranges (each a valid `str` boundary pair).
-pub fn statements(sql: &str) -> Result<Vec<Range<usize>>, Refusal> {
+/// One single statement of a migration.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Statement {
+    /// Where it is in the migration's text: a byte range, each end a valid
+    /// `str` boundary.
+    pub range: Range<usize>,
+    /// The tables it names in an `ALTER TABLE ... ALTER COLUMN ... TYPE`,
+    /// each as Postgres reads a qualified name (`"schema"."table"`, or
+    /// `"table"` alone as the statement wrote it): those it will most
+    /// likely write anew (blackbox/CONTRACT.md, "A rewrite records each row
+    /// it changed"). Only a saving: what a statement writes anew is seen
+    /// from the catalogs after it, whatever its text.
+    pub rewrites: Vec<String>,
+}
+
+/// Where the single statements of the migration `sql` are in it, in order.
+pub fn statements(sql: &str) -> Result<Vec<Statement>, Refusal> {
     let mut found = Vec::new();
     let mut offset = 0_usize;
     for part in sql.split(BREAKPOINT) {
@@ -127,10 +142,44 @@ pub fn statements(sql: &str) -> Result<Vec<Range<usize>>, Refusal> {
                 });
             }
             let from = start.saturating_add(at.unwrap_or(0));
-            found.push(from..from.saturating_add(text.len()));
+            found.push(Statement {
+                range: from..from.saturating_add(text.len()),
+                rewrites: rewrites(node),
+            });
         }
     }
     Ok(found)
+}
+
+/// The table an `ALTER TABLE` changes the type of a column of, as a
+/// qualified name in Postgres's quoting; none for any other statement.
+fn rewrites(node: Option<&NodeEnum>) -> Vec<String> {
+    let Some(NodeEnum::AlterTableStmt(alter)) = node else {
+        return Vec::new();
+    };
+    let retypes = alter.cmds.iter().any(|cmd| {
+        matches!(
+            cmd.node.as_ref(),
+            Some(NodeEnum::AlterTableCmd(cmd)) if cmd.subtype() == AlterTableType::AtAlterColumnType
+        )
+    });
+    match alter.relation.as_ref() {
+        Some(relation) if retypes && !relation.relname.is_empty() => {
+            let mut name = String::new();
+            if !relation.schemaname.is_empty() {
+                name.push_str(&quoted(&relation.schemaname));
+                name.push('.');
+            }
+            name.push_str(&quoted(&relation.relname));
+            vec![name]
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// `name` as a quoted identifier.
+fn quoted(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
 }
 
 /// The refusal of a part the parser cannot read: Postgres's words, and the
@@ -189,7 +238,7 @@ fn leading(text: &str) -> usize {
 }
 
 /// The line, counted from 1, of the byte `at` of `text`.
-fn line_of(text: &str, at: usize) -> usize {
+pub(crate) fn line_of(text: &str, at: usize) -> usize {
     let before = text.get(..at).unwrap_or(text);
     before.matches('\n').count().saturating_add(1)
 }
@@ -237,8 +286,26 @@ mod tests {
         statements(sql)
             .unwrap()
             .into_iter()
-            .map(|r| sql.get(r).unwrap())
+            .map(|s| sql.get(s.range).unwrap())
             .collect()
+    }
+
+    #[test]
+    fn a_change_of_a_column_s_type_is_foreseen_to_write_its_table_anew() {
+        let found = statements(
+            "ALTER TABLE public.\"Odd\"\"Name\" ALTER COLUMN a TYPE bigint; ALTER TABLE ONLY t ADD COLUMN b int, ALTER b TYPE text USING b::text; ALTER TABLE t ADD COLUMN c int; UPDATE t SET a = 1",
+        )
+        .unwrap();
+        let rewrites: Vec<&[String]> = found.iter().map(|s| s.rewrites.as_slice()).collect();
+        assert_eq!(
+            rewrites,
+            [
+                &["\"public\".\"Odd\"\"Name\"".to_owned()][..],
+                &["\"t\"".to_owned()][..],
+                &[][..],
+                &[][..],
+            ]
+        );
     }
 
     #[test]
