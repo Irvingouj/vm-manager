@@ -16,28 +16,36 @@
 //! what is not theirs"):
 //!
 //! - **one shipment task per own database at a time** ([`Shipping`]): a
-//!   request while one runs is remembered (`asked`), and the running task
-//!   makes another pass; so the relay's tasks are at most the own
-//!   databases;
-//! - **a pass ships up to a mark**: the greatest id in the outbox when the
-//!   pass begins. Everything committed before a request was made is
-//!   visible then, so a pass that began after the request ships it; what
-//!   is committed later is the next pass's. A read of the history waits for
-//!   one such pass, never for writes made after it asked;
+//!   request while one runs is counted (`asked`), and the running task goes
+//!   on; so the relay's tasks are at most the own databases;
+//! - **what a request waits for**: a write's request is shipped once the
+//!   task sees the outbox empty at a look made after it. A read's (waited
+//!   for) is given a mark, the greatest id in the outbox at the task's next
+//!   look, and is served once a batch has shipped an id at least the mark,
+//!   or the outbox is seen empty after it asked: everything committed
+//!   before it asked is visible at that look, so a read never waits for
+//!   writes made after it asked. At most [`MARKS`] reads hold a mark at
+//!   once per own database; a read that finds every place taken is given
+//!   one when a place comes free, at a later look ([`run`]);
 //! - **turns of one batch**: [`AT_ONCE`] batches at once in the program,
 //!   across own databases. A shipment takes a turn for each batch and gives
 //!   it back after it, and the turns are handed out first come, first
 //!   served (Tokio's semaphore is fair); so another Application's batch is
 //!   at most the batches already waiting, one per own database, behind. A
 //!   turn is waited for at most [`TURN_WAIT`]: with each turn at most three
-//!   steps of [`STEP_TIMEOUT`], that is reached only when the databases
-//!   stop answering, and a shipment asked at start does not fail for want
-//!   of a turn otherwise;
-//! - **one connection per shipping own database**, as its platform role,
-//!   kept by its task between batches and passes, and for [`IDLE`] after
-//!   the last, then closed; at most [`LINES`] such connections in the
-//!   program. A task that finds none free asks the idle ones to close
-//!   theirs, and waits at most [`TURN_WAIT`];
+//!   steps of [`STEP_TIMEOUT`] and the opening of one connection, that is
+//!   reached only when the databases stop answering, and a shipment asked
+//!   at start does not fail for want of a turn otherwise;
+//! - **connections**: at most [`LINES`] to own databases in the program, in
+//!   use, kept and being closed together. A task takes one only for a
+//!   batch, in its turn, and puts it back in the [`Courier`]'s cache after
+//!   it: its own database's if it is there; else one opened in a free
+//!   place; else in the place of the one put back longest ago, which is
+//!   closed first. So at most [`AT_ONCE`] are in use, and a task never
+//!   waits for another to give one up (only, at most [`TURN_WAIT`], for a
+//!   session being closed). A task with nothing more asked waits [`IDLE`],
+//!   then closes its own database's connection if it is still in the
+//!   cache, before it ends: no session outlives its task;
 //! - **a batch** is at most [`BATCH_ROWS`] changes and, past its first,
 //!   [`BATCH_BYTES`] of `old` and `new` as text, read by the own database
 //!   as one JSON text and sent on as one parameter: what the program holds
@@ -62,7 +70,8 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, watch};
@@ -99,10 +108,6 @@ pub const IDLE: Duration = Duration::from_secs(10);
 /// Reads one own database gives a mark at most at once: its places to
 /// wait ([`Marks`]).
 const MARKS: usize = 64;
-
-/// How often a task waiting for a connection asks again for one to be
-/// given up.
-const ASK_AGAIN: Duration = Duration::from_millis(100);
 
 /// How long a connection given up is waited for to end before its place
 /// is given back.
@@ -236,13 +241,20 @@ pub struct Courier {
     pub port: u16,
     /// [`AT_ONCE`] batches at once.
     pub turns: Semaphore,
-    /// [`LINES`] connections at once.
-    pub lines: Arc<Semaphore>,
-    /// Told when a task waits for a connection: the idle ones close theirs.
-    pub wanted: Notify,
-    /// Tasks waiting for a connection now: a task that would idle with its
-    /// connection closes it instead.
-    pub wanting: AtomicUsize,
+    /// [`LINES`] connections at once: in the cache, in use, and being
+    /// closed, together.
+    lines: Arc<Semaphore>,
+    /// The connections not in use, the one put back longest ago first: at
+    /// most [`LINES`], one per own database. Locked only to take or put
+    /// back, never across an await.
+    cache: Mutex<VecDeque<Kept>>,
+}
+
+/// A connection in the cache, and the Application whose own database it is
+/// to.
+struct Kept {
+    application: Arc<str>,
+    line: Line,
 }
 
 impl Courier {
@@ -253,9 +265,30 @@ impl Courier {
             port,
             turns: Semaphore::new(AT_ONCE),
             lines: Arc::new(Semaphore::new(LINES)),
-            wanted: Notify::new(),
-            wanting: AtomicUsize::new(0),
+            cache: Mutex::new(VecDeque::with_capacity(LINES)),
         }
+    }
+
+    fn cache(&self) -> MutexGuard<'_, VecDeque<Kept>> {
+        // A panic while it was held left it whole: every change to it is
+        // one call of a `VecDeque` method.
+        self.cache.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The connection to `application`'s own database put back in the
+    /// cache, if it is still there.
+    fn take(&self, application: &str) -> Option<Line> {
+        let mut cache = self.cache();
+        let at = cache.iter().position(|k| &*k.application == application)?;
+        cache.remove(at).map(|k| k.line)
+    }
+
+    /// Puts a connection back, as the one used last.
+    fn put_back(&self, application: &Arc<str>, line: Line) {
+        self.cache().push_back(Kept {
+            application: Arc::clone(application),
+            line,
+        });
     }
 }
 
@@ -269,30 +302,13 @@ pub struct Route {
     pub known: Arc<super::Known>,
 }
 
-/// One task counted in [`Courier::wanting`] while it lives, even if the
-/// task is ended while it waits.
-struct Wanting<'a>(&'a AtomicUsize);
-
-impl<'a> Wanting<'a> {
-    fn new(count: &'a AtomicUsize) -> Self {
-        count.fetch_add(1, Ordering::SeqCst);
-        Self(count)
-    }
-}
-
-impl Drop for Wanting<'_> {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::SeqCst);
-    }
-}
-
 /// A connection to the own database as its platform role, and its place
 /// among the [`LINES`]. The task that drives the connection is owned here
-/// and ended when this is dropped; the place is given back after it.
+/// and ended when this is dropped; the place goes with it.
 struct Line {
     client: Option<Client>,
     task: JoinHandle<()>,
-    _permit: OwnedSemaphorePermit,
+    permit: Option<OwnedSemaphorePermit>,
 }
 
 impl Line {
@@ -300,13 +316,14 @@ impl Line {
         self.client.as_ref().filter(|c| !c.is_closed())
     }
 
-    /// Ends the session before the place is given back: the client goes,
-    /// the connection says goodbye to the server and its task ends (at most
-    /// [`CLOSE_WAIT`]), so that no more than [`LINES`] sessions are open at
-    /// once.
-    async fn close(mut self) {
+    /// Ends the session and answers its place: the client goes, the
+    /// connection says goodbye to the server and its task ends (waited for
+    /// at most [`CLOSE_WAIT`]), so that the place is free again only when
+    /// the session is gone, and no more than [`LINES`] are open at once.
+    async fn close(mut self) -> Option<OwnedSemaphorePermit> {
         self.client = None;
         tokio::time::timeout(CLOSE_WAIT, &mut self.task).await.ok();
+        self.permit.take()
     }
 }
 
@@ -317,8 +334,10 @@ impl Drop for Line {
 }
 
 /// The shipment task of one own database. It ships while anything is
-/// asked of it; then, with its connection kept, waits [`IDLE`] for another
-/// request before it ends.
+/// asked of it, a batch at a time, each in a turn of its own and with its
+/// connection taken from the cache for it; then it waits [`IDLE`] for
+/// another request, and before it ends closes its connection if it is
+/// still in the cache.
 ///
 /// A write's request is given no mark: the task ships until the outbox is
 /// empty at a look made after the request (a batch with nothing in it), so
@@ -328,25 +347,23 @@ impl Drop for Line {
 /// most [`MARKS`] at once. Everything committed before the read asked is
 /// visible at that look, so has an id at most the mark; batches go in the
 /// order of ids; so once a batch has shipped an id at least the mark, or
-/// the outbox is seen empty after the mark was taken, all of it is shipped
-/// and the read is served. A read that finds every place taken is given a
-/// mark only when one comes free, at a look later still: what it waits for
-/// then includes everything committed before it asked. No read is served
+/// the outbox is seen empty after the read asked, all of it is shipped and
+/// the read is served. A read that finds every place taken is given a mark
+/// only when one comes free, at a look later still: what it waits for then
+/// includes everything committed before it asked. No read is served
 /// otherwise; a failure fails it.
 pub async fn run(courier: Arc<Courier>, route: Route) {
     let shipping = &route.known.shipping;
-    let mut line: Option<Line> = None;
     let mut marks = Marks::default();
     loop {
         // A step that fails fails every read asked before it began, also
         // those not yet given a mark.
         let asked_before = shipping.asked.load(Ordering::SeqCst);
         let reads_before = shipping.reads.load(Ordering::SeqCst);
-        match courier.step(&route, &mut line, &mut marks).await {
+        match courier.step(&route, &mut marks).await {
             Ok(true) => continue,
             Ok(false) => {}
             Err(step) => {
-                line = None;
                 marks.waiting.clear();
                 marks.seen_reads = marks.seen_reads.max(reads_before);
                 marks.seen_asked = marks.seen_asked.max(asked_before);
@@ -368,25 +385,16 @@ pub async fn run(courier: Arc<Courier>, route: Route) {
         if shipping.asked.load(Ordering::SeqCst) != marks.seen_asked {
             continue;
         }
-        if line.is_some() {
-            // Listening before looking: a task that starts wanting a
-            // connection after the look is heard (`notify_waiters` wakes
-            // only a listener that is there).
-            let wanted = courier.wanted.notified();
-            tokio::pin!(wanted);
-            wanted.as_mut().enable();
-            if courier.wanting.load(Ordering::SeqCst) == 0 {
-                let asked = tokio::select! {
-                    () = shipping.wake.notified() => true,
-                    () = &mut wanted => false,
-                    () = tokio::time::sleep(IDLE) => false,
-                };
-                if asked {
-                    continue;
-                }
-            }
+        // Idle, the connection in the cache for the next request. A request
+        // made since the look above has stored its wake-up (`notify_one`).
+        let asked = tokio::select! {
+            () = shipping.wake.notified() => true,
+            () = tokio::time::sleep(IDLE) => false,
+        };
+        if asked {
+            continue;
         }
-        if let Some(open) = line.take() {
+        if let Some(open) = courier.take(&route.application) {
             open.close().await;
         }
         shipping.running.store(false, Ordering::SeqCst);
@@ -413,17 +421,13 @@ struct Marks {
 }
 
 impl Courier {
-    /// One step of a shipment task, in a turn of its own: a connection if it
-    /// has none, a mark for the reads asked since the last if a place is
+    /// One step of a shipment task, in a turn of its own and with its
+    /// connection: a mark for the reads asked since the last if a place is
     /// free, then one batch. `true` when there may be more to do, `false`
-    /// when the outbox was seen empty and nothing new was asked; or the step
-    /// that failed.
-    async fn step(
-        &self,
-        route: &Route,
-        line: &mut Option<Line>,
-        marks: &mut Marks,
-    ) -> Result<bool, &'static str> {
+    /// when everything asked is shipped; or the step that failed. The
+    /// connection is put back in the cache after a step that did not fail,
+    /// and closed after one that did.
+    async fn step(&self, route: &Route, marks: &mut Marks) -> Result<bool, &'static str> {
         let shipping = &route.known.shipping;
         if !route.known.in_form.load(Ordering::Acquire) {
             return Err("the own database is not in this program's form");
@@ -431,52 +435,90 @@ impl Courier {
         if shipping.asked.load(Ordering::SeqCst) == marks.seen_asked && marks.waiting.is_empty() {
             return Ok(false);
         }
-        let turn = self.turn(line).await?;
-        if line.as_ref().is_some_and(|l| l.client().is_none()) {
-            *line = None;
+        let turn = tokio::time::timeout(TURN_WAIT, self.turns.acquire())
+            .await
+            .map_err(|_| "waiting for a turn to ship: none came")?
+            .map_err(|_| "waiting for a turn to ship: the program is stopping")?;
+        let line = self.line(route).await?;
+        let done = self.batch(route, &line, marks).await;
+        drop(turn);
+        if done.is_ok() {
+            self.put_back(&route.application, line);
+        } else {
+            line.close().await;
         }
-        if line.is_none() {
-            let permit = self.line().await?;
-            *line = Some(
-                self.connect(route, permit)
-                    .await
-                    .map_err(|_| "connecting to the own database as its platform role")?,
-            );
+        done
+    }
+
+    /// A connection to `route`'s own database for one batch: its own from
+    /// the cache; else one opened in a free place; else in the place of
+    /// the connection put back longest ago, closed first. Only a task with
+    /// a turn takes one, and gives it back before the turn, so at most
+    /// [`AT_ONCE`] are in use, and with [`LINES`] places there is one to
+    /// take unless sessions are being closed by tasks that end: then it is
+    /// waited for, at most [`TURN_WAIT`].
+    async fn line(&self, route: &Route) -> Result<Line, &'static str> {
+        let open = "connecting to the own database as its platform role";
+        let mut permit = None;
+        if let Some(line) = self.take(&route.application) {
+            if line.client().is_some() {
+                return Ok(line);
+            }
+            permit = line.close().await;
         }
+        if permit.is_none() {
+            permit = Arc::clone(&self.lines).try_acquire_owned().ok();
+        }
+        if permit.is_none() {
+            let oldest = self.cache().pop_front();
+            if let Some(oldest) = oldest {
+                permit = oldest.line.close().await;
+            }
+        }
+        let permit = match permit {
+            Some(permit) => permit,
+            None => tokio::time::timeout(TURN_WAIT, Arc::clone(&self.lines).acquire_owned())
+                .await
+                .map_err(|_| "waiting for a connection to ship: none came")?
+                .map_err(|_| "waiting for a connection to ship: the program is stopping")?,
+        };
+        self.connect(route, permit).await.map_err(|_| open)
+    }
+
+    /// One batch, on `line`.
+    async fn batch(
+        &self,
+        route: &Route,
+        line: &Line,
+        marks: &mut Marks,
+    ) -> Result<bool, &'static str> {
+        let shipping = &route.known.shipping;
         let client = line
-            .as_ref()
-            .and_then(Line::client)
+            .client()
             .ok_or("connecting to the own database as its platform role")?;
         // `asked` before `reads`: every read counted in the one is counted
-        // in the other (`Shipping::ask`).
+        // in the other (`Shipping::ask`). Both before the looks below.
         let asked = shipping.asked.load(Ordering::SeqCst);
         let reads = shipping.reads.load(Ordering::SeqCst);
         if reads > marks.seen_reads && marks.waiting.len() < MARKS {
             let mark = within("reading the outbox", read_mark(client)).await?;
-            marks.seen_reads = reads;
             match mark {
-                Some(mark) => marks.waiting.push_back((reads, mark)),
+                Some(mark) => {
+                    marks.seen_reads = reads;
+                    marks.waiting.push_back((reads, mark));
+                }
                 None => {
-                    // Empty after every request so far: all are served.
-                    marks.waiting.clear();
-                    marks.seen_asked = asked;
-                    shipping
-                        .passes
-                        .send_modify(|p| p.shipped = p.shipped.max(reads));
+                    serve_all(shipping, marks, asked, reads);
                     return Ok(false);
                 }
             }
         }
         let (ids, rows) = within("reading the outbox", read_batch(client)).await?;
         let (Some(ids), Some(rows)) = (ids, rows) else {
-            // Empty after every mark and every request seen at this step.
-            marks.seen_asked = asked;
-            if let Some(&(last, _)) = marks.waiting.back() {
-                shipping
-                    .passes
-                    .send_modify(|p| p.shipped = p.shipped.max(last));
-            }
-            marks.waiting.clear();
+            // Empty at a look made after every request counted above: all
+            // of them are served, also reads that hold no mark because
+            // every place was taken.
+            serve_all(shipping, marks, asked, reads);
             return Ok(true);
         };
         within(
@@ -489,7 +531,6 @@ impl Courier {
             delete_batch(client, &ids),
         )
         .await?;
-        drop(turn);
         let top = ids.last().copied().unwrap_or(i64::MIN);
         while let Some(&(ticket, mark)) = marks.waiting.front() {
             if mark > top {
@@ -501,67 +542,6 @@ impl Courier {
                 .send_modify(|p| p.shipped = p.shipped.max(ticket));
         }
         Ok(true)
-    }
-
-    /// A turn for one batch, first come, first served. While it waits, a
-    /// task that keeps a connection gives it up when another task, whose
-    /// turn has come, needs one: the one asked is the last to have begun
-    /// waiting, so the farthest from its own turn (`notify_last`). So a
-    /// connection is kept for no longer than one batch while another waits
-    /// for one, and a connection is opened only when a turn comes to a task
-    /// without one.
-    async fn turn(
-        &self,
-        line: &mut Option<Line>,
-    ) -> Result<tokio::sync::SemaphorePermit<'_>, &'static str> {
-        let acquire = tokio::time::timeout(TURN_WAIT, self.turns.acquire());
-        tokio::pin!(acquire);
-        loop {
-            if line.is_none() {
-                return Self::turn_of(acquire.await);
-            }
-            let wanted = self.wanted.notified();
-            tokio::pin!(wanted);
-            tokio::select! {
-                got = &mut acquire => return Self::turn_of(got),
-                () = &mut wanted => {
-                    if let Some(open) = line.take() {
-                        open.close().await;
-                    }
-                }
-            }
-        }
-    }
-
-    fn turn_of<T, E>(
-        got: Result<Result<T, E>, tokio::time::error::Elapsed>,
-    ) -> Result<T, &'static str> {
-        got.map_err(|_| "waiting for a turn to ship: none came")?
-            .map_err(|_| "waiting for a turn to ship: the program is stopping")
-    }
-
-    /// A place among the [`LINES`]: at once if one is free; else a task
-    /// that keeps a connection it does not use is asked to give it up, and
-    /// asked again every [`ASK_AGAIN`] (a request may go to a task just
-    /// then taking its turn), until one is free.
-    async fn line(&self) -> Result<OwnedSemaphorePermit, &'static str> {
-        if let Ok(permit) = Arc::clone(&self.lines).try_acquire_owned() {
-            return Ok(permit);
-        }
-        let _wanting = Wanting::new(&self.wanting);
-        let acquire = tokio::time::timeout(TURN_WAIT, Arc::clone(&self.lines).acquire_owned());
-        tokio::pin!(acquire);
-        loop {
-            self.wanted.notify_last();
-            tokio::select! {
-                got = &mut acquire => {
-                    return got
-                        .map_err(|_| "waiting for a connection to ship: none came")?
-                        .map_err(|_| "waiting for a connection to ship: the program is stopping");
-                }
-                () = tokio::time::sleep(ASK_AGAIN) => {}
-            }
-        }
     }
 
     /// A connection to the own database as its platform role, in the place
@@ -592,7 +572,7 @@ impl Courier {
         Ok(Line {
             client: Some(client),
             task,
-            _permit: permit,
+            permit: Some(permit),
         })
     }
 
@@ -617,6 +597,17 @@ impl Courier {
             })
             .await
     }
+}
+
+/// Every request counted in `asked` and every read counted in `reads` is
+/// served: the outbox was seen empty at a look made after them.
+fn serve_all(shipping: &Shipping, marks: &mut Marks, asked: u64, reads: u64) {
+    marks.seen_asked = asked;
+    marks.seen_reads = marks.seen_reads.max(reads);
+    marks.waiting.clear();
+    shipping
+        .passes
+        .send_modify(|p| p.shipped = p.shipped.max(reads));
 }
 
 /// The mark: the greatest id in the outbox now; `None` when it is empty.
