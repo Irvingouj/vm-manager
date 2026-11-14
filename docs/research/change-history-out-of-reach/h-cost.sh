@@ -30,6 +30,9 @@
 #               1,000,000 changes kept, with and without a key; the plan
 #   start       (AFTER only) a start with 50 own databases, each with an
 #               outbox of 1,000 changes
+#   capture     the capture trigger's own time for a one-row INSERT
+#               (EXPLAIN ANALYZE, as the administrator); on AFTER also
+#               without the capture's look for json and jsonb columns
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(git -C "$HERE" rev-parse --show-toplevel)"
@@ -75,11 +78,11 @@ run() { # run LABEL BINARY PARTS
 echo "# $(date -u +%FT%TZ) on $(uname -srm), $(nproc) CPUs"
 for round in 1 2; do
   echo "#### round $round"
-  run before "$BEFORE" writes,where,migrations
+  run before "$BEFORE" writes,where,migrations,capture
   if [ -n "$MIDDLE" ]; then
     run middle "$MIDDLE" writes,where
   fi
-  run after "$AFTER" writes,where,migrations,snapshot
+  run after "$AFTER" writes,where,migrations,snapshot,capture
 done
 run after "$AFTER" after
 run after "$AFTER" ship

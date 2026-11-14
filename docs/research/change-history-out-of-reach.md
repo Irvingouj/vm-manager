@@ -340,95 +340,111 @@ A single SELECT 1 round trip took 0.09 to 0.10 ms [verified]. A Version with not
 
 ## 13. H. What ticket #62 costs: the history in the platform database, shipped from an outbox (added 2026-11-13 by the implementation agent)
 
-Provenance of this part: written by the implementation agent of ticket #62, and rewritten after the first review. Every figure in the tables is from one run of `docs/research/change-history-out-of-reach/h-cost.sh`. Its whole output is `h-cost.log` beside this file (exit 0, 277 s in all, 32 s of it building) [verified]. The script follows `g-cost.sh`. It builds `vm` with `cargo build --release` at three commits, each in a git worktree of its own:
+Provenance of this part: written by the implementation agent of ticket #62, and rewritten after each review. Every figure in the tables is from one run of `docs/research/change-history-out-of-reach/h-cost.sh`. Its whole output is `h-cost.log` beside this file (exit 0, 281 s in all, 33 s of it building) [verified]. The script follows `g-cost.sh`. It builds `vm` with `cargo build --release` at three commits, each in a git worktree of its own:
 
 - **before**: `9255bea`, the last commit before the ticket's program.
 - **middle**: `1d4b9f6`, the ticket's program while each shipment still opened a connection of its own.
-- **after**: `ef61013`, the relay that keeps one connection per shipping own database.
+- **after**: `15a403e`, the relay of the third review: one connection per shipping own database, given up between batches while another own database waits for one; marks only for reads; a batch read as `json`.
 
-Each is driven through the black-box harness on Postgres 18, on a shared 12-CPU VM. `h_cost.rs` is copied into `blackbox/tests/` for the run and removed after it. The middle build runs only the parts `writes` and `where`. What follows from the figures is marked.
+Each is driven through the black-box harness on Postgres 18, on a shared 12-CPU VM. `h_cost.rs` is copied into `blackbox/tests/` for the run and removed after it. The middle build runs only the parts `writes` and `where`. What follows from the figures is marked. Between runs on other hours this VM's figures for the same build moved by up to 0.3 ms a write (`/tmp/t62/h-noship.log`, below), so only differences within one run are compared.
 
 **Where a write's time goes.** One `INSERT` through `execute`, from the HTTP request to its answer. "Back to back" is 300 writes in a row. "Apart" is 100 writes with 100 ms between them, so that the shipment of the write before has ended. `things` has a `jsonb` column, so the capture's scan for JSON `null` runs; `parents` has none. Medians from rounds 1 and 2:
 
 | | `things` back to back | `parents` back to back | `things` 100 ms apart | `parents` 100 ms apart | sessions opened in the own database during 300 writes |
 |---|---|---|---|---|---|
-| before | 6.57 / 6.62 ms | 6.57 / 6.57 ms | 7.69 / 7.53 ms | 7.69 / 7.68 ms | 0 |
-| middle | 7.04 / 7.14 ms | 7.02 / 7.09 ms | 7.93 / 7.94 ms | 7.90 / 7.90 ms | 300 |
-| after | 6.84 / 6.88 ms | 6.78 / 6.84 ms | 7.82 / 7.83 ms | 7.83 / 7.82 ms | 0 |
+| before | 6.62 / 6.54 ms | 6.68 / 6.61 ms | 7.65 / 7.69 ms | 7.69 / 7.66 ms | 0 |
+| middle | 7.10 / 7.07 ms | 7.00 / 7.08 ms | 7.91 / 7.91 ms | 7.93 / 7.87 ms | 300 |
+| after | 6.91 / 6.84 ms | 6.87 / 6.77 ms | 7.81 / 7.85 ms | 7.81 / 7.84 ms | 0 |
 
 All figures in the table are [verified]. What they show:
 
-- **Each write's shipment opened a connection.** The middle build opened one new session in the own database per write: 300 for 300 writes. The after build opened none, because it reuses the connection it keeps. The count is `pg_stat_database.sessions`, read before and after the writes [verified].
-- **The connection is most of the cost back to back.** The extra cost over before fell from 0.42 to 0.57 ms (middle) to 0.21 to 0.30 ms (after). So about half of it was the connection opened per shipment [reasoned from the table].
-- **The rest is in the write itself.** With 100 ms between writes, so that no shipment overlaps the next write, after is still 0.14 to 0.30 ms slower than before. The middle build is slower by about the same.
-- **The JSON-null scan is not that rest.** The cost is the same on `parents`, which has no `json` or `jsonb` column, so the capture's second scan does not run there [reasoned from the table].
-- **What the rest is, I did not measure apart.** The capture's insert into `vm.outbox` replaces its insert into `vm.history`. The other differences on a write's path are the `json_nulls` call and the shipment asked for after the answer (a task started, or the idle one woken) [from code].
-- **The `write` part agrees.** 400 writes in a row: before 6.59 / 6.58 ms, middle 7.03 / 7.13 ms, after 6.85 / 6.81 ms [verified].
+- **Each write's shipment opened a connection** in the middle build: 300 new sessions in the own database for 300 writes. The after build opened none, because it reuses the connection it keeps. The count is `pg_stat_database.sessions`, read before and after the writes [verified].
+- **The connection was most of the cost back to back.** Over before, middle is 0.32 to 0.53 ms slower, after 0.16 to 0.30 ms [reasoned from the table].
+- **With 100 ms between writes** after is 0.12 to 0.18 ms slower than before [reasoned from the table].
+- **The `write` part agrees.** 400 writes in a row: before 6.56 / 6.64 ms, middle 7.11 / 7.11 ms, after 6.85 / 6.80 ms [verified].
 
-**The kept connection.** A shipment task keeps its connection to the own database (as its platform role) between batches and for 10 s after its last. At most 32 such connections exist in the program. A task that finds none free asks the idle ones to close theirs, and an idle task closes its connection at once while another waits [from code, `crates/vm/src/own_db/relay.rs`]. The first version of this, without that last rule, made the start with 50 own databases below wait 10 s for want of a connection: a read of the 50th Application timed out in the harness [verified, an earlier run of the `start` part, not kept].
+**The capture alone.** The part `capture`: the capture trigger's own time for a one-row `INSERT`, as `EXPLAIN (ANALYZE, FORMAT JSON)` reports it (`Triggers`, the `vm_capture_*` ones). It is run by the harness's administrator in a session of its own, with an identity attached as the host attaches one (signed with the own database's keys over the transaction), each `INSERT` in a transaction rolled back; 30 to warm up, then 200. Then, on the after build only, the same with the capture's look for `json` and `jsonb` columns cut out of `vm.capture()` (the `SELECT ... INTO v_tests` statement replaced by `v_tests := NULL`, so the JSON-null scan does not run either), and the function put back. Medians of the trigger's time, rounds 1 and 2:
 
-**Does the next write wait for the shipment?** Ten times, a write of 10,000 rows (median 80.0 ms), then at once a write of one row:
+| | `things` | `parents` |
+|---|---|---|
+| before | 0.197 / 0.193 ms | 0.194 / 0.194 ms |
+| after | 0.274 / 0.274 ms | 0.204 / 0.207 ms |
+| after, without the look for `json` columns | 0.199 / 0.198 ms | 0.198 / 0.200 ms |
 
-- When the one-row write was sent, the outbox still held 9,000 of the 10,000 changes, every round [verified].
-- The one-row write took 7.92 ms, against 7.64 ms with the outbox empty [verified].
+All figures in the table are [verified]. The whole `INSERT`, triggers included, is 0.010 to 0.013 ms more than its trigger in every row [verified, `h-cost.log`]. What they show [reasoned from the table]:
+
+- **The capture's share is the look for `json` columns and, where there are some, the JSON-null scan.** Without them the capture costs what it cost before, within 0.006 ms: writing to `vm.outbox` costs no more than writing to `vm.history` did.
+- **On `things`** (a `jsonb` column) the look and the scan are 0.075 ms, of the 0.17 to 0.30 ms a write is slower. The scan is the `EXECUTE` of a statement built for the table, planned at each call; it is what keeps a JSON `null` apart from SQL null (`json_nulls`), so it was kept.
+- **On `parents`** (none) the look alone is 0.006 to 0.007 ms, of the 0.12 to 0.19 ms.
+
+**What is left outside the capture.** On `parents`, about 0.11 to 0.19 ms of a write is not in the trigger. Two ad hoc runs, through the same harness with the `where` part, release builds made in this session, not kept in the repository:
+
+- **The shipment each write asks for.** A build of `15a403e` whose writes ask for no shipment, alternated with `15a403e` itself, three rounds (`/tmp/t62/h-noship.log`): back to back the shipment costs 0.03 to 0.17 ms on `things` and −0.01 to 0.19 ms on `parents`; 100 ms apart nothing measurable (−0.10 to +0.07 ms on either) [verified]. So back to back part of the rest is the shipment sharing the instance with the next write; apart it is not that [reasoned].
+- **Asking for it after the Operation log's entry is finished** rather than before, so that its first batch does not share the platform database with that write: no difference beyond this VM's noise, two rounds (`/tmp/t62/h-shiplate.log`) [verified]. Not kept.
+- **The host's code on a write's path** changed only by that ask: a counter, a flag, and a task started or woken [from code, `git diff 9255bea 15a403e -- crates/vm/src/gateway`].
+- So about 0.1 ms of a write 100 ms apart is in neither the capture nor the shipment, and I did not find where it is [not verified]. It is about a third of the round-to-round noise of this VM.
+
+**The kept connection.** A shipment task keeps its connection to the own database (as its platform role) between batches and for 10 s after its last. At most 32 such connections are open in the program at any moment. A task without one, whose turn has come, asks for one: a task that keeps one and is waiting for its turn, or idle, closes it, and the place is given back only once the session has ended [from code, `crates/vm/src/own_db/relay.rs`]. So an own database keeps a connection no longer than one batch while another waits for one; the test `more_than_32_own_databases_shipping_at_once_hold_up_no_other_and_use_at_most_32_relay_connections` samples `pg_stat_activity` for it [verified, it passes, `/tmp/t62/r3-json-full.log`].
+
+**Does the next write wait for the shipment?** Ten times, a write of 10,000 rows (median 81.4 ms), then at once a write of one row:
+
+- When the one-row write was sent, the outbox still held 8,000 of the 10,000 changes, every round [verified].
+- The one-row write took 7.91 ms, against 7.57 ms with the outbox empty [verified].
 - It does not wait for the shipment. It does share the instance with it [reasoned].
 
-**Shipping 100,000 changes** (one `execute` inserting 100,000 rows of `things`): answered after 0.791 s. The outbox was empty 2.596 s after the answer, and the 100,000 changes were in `change_history` in 100 transactions (distinct `xmin`), so in batches of 1,000 [verified].
+**Shipping 100,000 changes** (one `execute` inserting 100,000 rows of `things`): answered after 0.786 s. The outbox was empty 2.050 s after the answer, and the 100,000 changes were in `change_history` in 100 transactions (distinct `xmin`), so in batches of 1,000 [verified]. It was 2.596 s in the run before this one. The relay now reads a batch as `json` (`json_build_object`, `json_agg`) rather than `jsonb`: on a batch of 1,000 rows of `things`, the read went from a median of 13.2 ms to 6.7 ms over about 250 batches; the write to `change_history` stayed at 13.4 to 14.1 ms. Timed per step in a debug build that wrote a line per step to a file, while the test `reads_begun_while_every_place_is_taken_answer_their_own_row_or_end_at_the_time_limit` ran alone (250,000 rows); the step files were summarised in the session and not kept, the tests' output is `/tmp/t62/r3-trace-alone.log` and `/tmp/t62/r3-trace-json2.log` [verified]. A `json` write (`json_populate_recordset`) was tried too and was no faster (15.0 ms), so the write still parses `jsonb`. That test, run with the other tests of its file, failed with the earlier build, and with the build of `55f9637` too (`/tmp/t62/r3-old-full.log`): no read was answered within its 10 s while the 250,000 rows shipped beside the other tests. With the `json` read it passed three times out of three in that company (`/tmp/t62/r3-json-full*.log`) [verified]; its margin there is thin: 30 to 44 of its 100 reads answered `ok`, the rest at the time limit.
 
 **Reading 100 changes with `history`.** Timed from the HTTP request to its answer: 5 reads to warm up, then 50 timed. The medians:
 
 | changes kept for the Application | no key | key `{ id: 7 }` | key `{ id: "7" }` |
 |---|---|---|---|
-| 1,000 | 9.10 ms | 9.56 ms | 9.69 ms |
-| 1,000,000 | 9.18 ms | 9.58 ms | 9.62 ms |
+| 1,000 | 9.22 ms | 9.81 ms | 9.66 ms |
+| 1,000,000 | 9.33 ms | 9.75 ms | 9.78 ms |
 
 - **What the changes are.** The 1,000 are 10 rows of `things` inserted, then updated 99 times each, through the program. The 1,000,000 are those plus 999,000 more that the harness's superuser wrote into `change_history`: copies of the 1,000 under 9,990 other keys, with greater ids [verified].
 - **The time does not grow with what is kept** [verified].
-- **The keyed read's plan** was taken with 1,000,000 kept. It is the program's statement for a row's changes, copied into `h_cost.rs` with its parameters written in. It reads the row's changes with a backward scan of `change_history_row` (43 buffers), and the `structure` entries with a backward scan of the partial index `change_history_structure`. Execution took 0.25 ms [verified].
-- **Faster than the first run.** Reads went from about 12.4 to 13.1 ms in the first run of this part to about 9.1 to 9.7 ms now [verified, both logs; the first is in this file's history]. The shipment a read waits for no longer opens a connection [reasoned].
+- **The keyed read's plan** was taken with 1,000,000 kept. It is the program's statement for a row's changes, copied into `h_cost.rs` with its parameters written in. It reads the row's changes with a backward scan of `change_history_row` (43 buffers), and the `structure` entries with a backward scan of the partial index `change_history_structure`. Execution took 0.27 ms [verified].
 
 **A Version's migrations and the structure comparison.** A Version adding one migration to those already applied, median of 5, by number of tables of ten columns each. Two figures per cell: rounds 1 and 2.
 
 | tables | before, `SELECT 1` | after, `SELECT 1` | before, a column retyped | after, a column retyped | `vm.structure_snapshot()` alone (after) |
 |---|---|---|---|---|---|
-| 10 | 29.7 / 29.4 ms | 34.8 / 34.1 ms | 30.9 / 30.8 ms | 35.9 / 35.3 ms | 0.56 ms (4.9 kB) |
-| 100 | 34.7 / 33.8 ms | 49.0 / 49.0 ms | 35.9 / 35.0 ms | 48.7 / 49.1 ms | 3.2 / 3.1 ms (36.7 kB) |
-| 500 | 57.2 / 56.6 ms | 125.9 / 125.2 ms | 58.0 / 57.3 ms | 127.2 / 126.9 ms | 14.6 / 14.4 ms (178 kB) |
+| 10 | 29.6 / 29.7 ms | 34.6 / 34.5 ms | 31.0 / 30.9 ms | 35.2 / 35.6 ms | 0.55 / 0.57 ms (4.9 kB) |
+| 100 | 34.0 / 34.4 ms | 49.3 / 47.9 ms | 35.1 / 35.5 ms | 49.2 / 48.8 ms | 3.2 / 3.1 ms (36.7 kB) |
+| 500 | 56.7 / 57.6 ms | 127.6 / 126.7 ms | 57.7 / 57.9 ms | 129.8 / 126.6 ms | 14.6 / 14.3 ms (178 kB) |
 
 All figures in the table are [verified].
 
-- **What the comparison costs.** About 5 ms a migration at 10 tables, 15 ms at 100 and 68 ms at 500 [reasoned from the table].
-- **What makes it up.** Per migration the program takes `vm.structure_snapshot()` before it. After it, `vm.record_structure()` takes the snapshot again and compares the two in SQL; the first snapshot travels to the server and back as a parameter in between [from code]. At 500 tables the two snapshots are about 29 ms of the 68 [reasoned].
+- **What the comparison costs.** About 5 ms a migration at 10 tables, 13 to 15 ms at 100 and 69 to 71 ms at 500 [reasoned from the table].
+- **What makes it up.** Per migration the program takes `vm.structure_snapshot()` before it. After it, `vm.record_structure()` takes the snapshot again and compares the two in SQL; the first snapshot travels to the server and back as a parameter in between [from code]. At 500 tables the two snapshots are about 29 ms of the 70 [reasoned].
 - **It grows with every table of the own database**, whether or not the migration touched it [from code].
-- **A slip found by measuring, and fixed.** The first version of the partition rule found the tables under a partitioned table with a recursive CTE. In a fresh session, which is how each Version's migrations run, that recursive CTE made the comparison 5.8 ms slower. Ad hoc probes, run through the harness as the superuser and not kept in the repository (`/tmp/t62/probe2/fresh.log`, `fresh2.log`, `fresh3.log`):
-  - The comparison's statement, run once per fresh session: 1.85 ms before the partition rule, 7.66 ms with the recursive CTE, 2.49 ms with `pg_partition_tree()`.
-  - A Version with one `SELECT 1` migration: about 32.5 ms at `26afd5b` against 38.6 to 39.6 ms at `1d4b9f6` (`/tmp/t62/probe2/versions.log`).
-  - The kept connection did not affect this: with the relay's idle session ended before each Version, the time was the same (`/tmp/t62/probe2/probe.log`).
-  - All of this is [verified]. The table above is with `pg_partition_tree()`.
+- **Two slips found by measuring, and fixed.** Ad hoc probes, run through the harness as the superuser and not kept in the repository; each times the comparison's statement once per fresh session, which is how each Version's migrations run, median of 15 or 31 sessions. All of this is [verified]:
+  - The first version of the partition rule found the tables under a partitioned table with a recursive CTE: 1.85 ms before the partition rule, 7.66 ms with the recursive CTE, 2.49 ms with `pg_partition_tree()` (`/tmp/t62/probe2/fresh.log`, `fresh2.log`, `fresh3.log`). A Version with one `SELECT 1` migration took about 32.5 ms at `26afd5b` against 38.6 to 39.6 ms at `1d4b9f6` (`/tmp/t62/probe2/versions.log`). The kept connection did not affect this (`/tmp/t62/probe2/probe.log`).
+  - The types that hold a renamed enum (domains, arrays, ranges, multiranges, composite and row types, to any depth) are found by a recursive CTE. Written into the comparison's statement it made that statement 2.54 ms → 8.67 ms, also when no enum was renamed and the CTE was never executed: Postgres builds the hash table of a recursive `UNION` when the plan starts, sized from its estimate (683,199 rows, from the catalog scans), and `EXPLAIN (ANALYZE)` shows 6.6 ms of execution with every node of it `never executed`; with `UNION ALL` it was 2.68 ms (`/tmp/t62/probe2/holding.log`, `holding2.log`). So `vm.record_structure()` now looks for those types in a statement of its own, only when a label changed; with none changed, the check and the comparison together take 2.29 / 2.30 ms against 2.54 / 2.55 ms before the change (`/tmp/t62/probe2/holding3.log`). The table above is with that.
 - **What was not tried.** Taking the snapshot only of tables that have history, or comparing only when the catalogs moved, would cut the rest; neither was tried [not verified].
 
 **A start with 50 own databases, each with an outbox of 1,000 changes.** The changes were written while the harness held a lock on `change_history`, so that no shipment got through. The program was then killed, the lock released, and the program started on the same platform database. Results [verified]:
 
-- `listening` 0.023 s after the start began;
-- a write to the first Application, sent at once, answered in 35.7 ms;
-- a `history` read of the fiftieth Application's history answered in 326 ms;
-- every outbox empty 2.777 s after the start, the 50,000 changes in `change_history`;
+- `listening` 0.014 s after the start began;
+- a write to the first Application, sent at once, answered in 30.3 ms;
+- a `history` read of the fiftieth Application's history answered in 271 ms;
+- every outbox empty 4.753 s after the start, the 50,000 changes in `change_history`;
 - no `history-not-shipped` record after the restart.
+
+It was 2.777 s in the run before this one, when a task kept its connection until it was idle. Now 50 own databases share 32 connections a batch at a time, so connections are closed and opened again between batches; that is the cost of keeping 32 as a bound at every moment [reasoned; the number of connections opened was not counted in this run].
 
 **What bounds the relay** [from code]:
 
 - **Tasks.** At most one shipment task per own database. A request made while one runs is served by that task.
-- **What a read waits for.** A request is served by a mark: the greatest id in the outbox when the task next looks after the request was made. That is at most one batch later. The request is served once a batch ships an id at least the mark, or nothing is left up to it. Writes after that do not hold it up. At most 64 marks wait per task; past that the last mark is moved up.
+- **A write** is given no mark: the task ships until it sees the outbox empty at a look made after the write asked.
+- **A read** is given a mark: the greatest id in the outbox when the task next looks after the read asked, at most one batch later. It is served once a batch ships an id at least the mark, or the outbox is seen empty after the mark was taken. Writes after that do not hold it up. At most 64 reads hold a mark at once per own database; a read that finds every place taken is given a mark when one comes free, at a look later still, so what it waits for still includes everything committed before it asked, and it is answered, or ended at its time limit.
 - **Turns.** A batch takes a turn of its own. At most 4 batches run at once in the program. The turns are handed out first come, first served, so another Application's batch waits behind at most one batch per own database. A turn is waited for at most 600 s, which only databases that stop answering reach. So a shipment asked at start does not fail for want of a turn.
 - **Connections.** At most 32 to own databases, as above. For the length of one batch's write, one connection of the platform database's pool of 16, so the Operation log keeps at least 12.
 - **Batches and steps.** A batch is at most 1,000 changes and, past the first, 4 MiB. Each step is ended after 10 s.
-- **After a failure.** A task that failed tries again after 1 s if it was asked again meanwhile.
-
-The tests `reads_of_the_history_do_not_wait_for_writes_made_after_they_began` and `one_applications_large_shipments_do_not_hold_up_another_applications` pass [verified, `/tmp/t62/r2-t3.log`].
+- **After a failure.** A task that failed fails every read asked before the step began, and tries again after 1 s if it was asked again meanwhile.
 
 [not verified]:
 
 - the figures on Postgres 16 and 17;
-- the write's remaining 0.15 to 0.3 ms, measured apart from the rest of the write;
-- with other sessions writing at the same time;
-- more than 32 own databases shipping at once beyond the start above.
+- where the last 0.1 ms or so of a write 100 ms apart goes;
+- with other sessions writing at the same time.

@@ -7,7 +7,7 @@
 //! it drives the real `vm` binary (`VM_BIN`) beside the harness's Postgres
 //! through the harness, as the black-box tests do. `H_PARTS` says which
 //! parts run: `writes` and `migrations` work with a program from before the
-//! ticket; `where` works with both; `snapshot`, `after`, `ship`, `reads` and `start` need the ticket's program.
+//! ticket; `where` and `capture` work with both; `snapshot`, `after`, `ship`, `reads` and `start` need the ticket's program.
 //!
 //! It prints lines beginning with `H ` and asserts only that what it times
 //! succeeded.
@@ -435,6 +435,55 @@ fn h_cost() {
             first_read.as_secs_f64() * 1000.0,
             empty_after.as_secs_f64()
         );
+    }
+
+    if parts.contains("capture") {
+        // The capture alone: the capture trigger's own time for a one-row
+        // INSERT, as `EXPLAIN (ANALYZE)` reports it, run by the harness's
+        // administrator with an identity attached as the host attaches one
+        // (signed with the own database's keys over the transaction), each
+        // in a transaction rolled back. Then, on the ticket's program, the
+        // same with the capture's look for `json` and `jsonb` columns taken
+        // out, to see what that statement costs.
+        let sql = db.superuser();
+        let attach = "SELECT pg_catalog.length(pg_catalog.set_config('vm.ctx', pg_catalog.encode(pg_catalog.sha256(k.k2 || pg_catalog.sha256(k.k1 || pg_catalog.convert_to('vm.ctx v1' || pg_catalog.chr(10) || vm.transaction_key() || pg_catalog.chr(10) || i.v, 'UTF8'))), 'hex') || i.v, true)) FROM vm.keys k, (SELECT '{\"user_id\":\"h\",\"application\":\"cost\",\"actor\":\"user\",\"request\":\"00000000-0000-0000-0000-000000000000\",\"migration\":null}'::text AS v) i";
+        let measure = |label: &str| {
+            for (table, column) in [("things", "title"), ("parents", "name")] {
+                let mut trigger = Vec::new();
+                let mut whole = Vec::new();
+                for i in 0..230_i64 {
+                    let rows = sql.batch(&format!(
+                        "BEGIN; {attach}; EXPLAIN (ANALYZE, FORMAT JSON) INSERT INTO {table} (id, {column}) VALUES ({}, 'a write'); ROLLBACK",
+                        900_000 + i
+                    ));
+                    let plan: Value = serde_json::from_str(rows.last().unwrap()[0].as_deref().unwrap()).unwrap();
+                    let triggers = plan[0]["Triggers"].as_array().cloned().unwrap_or_default();
+                    let capture: f64 = triggers
+                        .iter()
+                        .filter(|t| t["Trigger Name"].as_str().unwrap_or("").starts_with("vm_capture"))
+                        .map(|t| t["Time"].as_f64().unwrap())
+                        .sum();
+                    assert!(!triggers.is_empty(), "no trigger reported: {plan}");
+                    if i >= 30 {
+                        trigger.push(Duration::from_secs_f64(capture / 1000.0));
+                        whole.push(Duration::from_secs_f64(plan[0]["Execution Time"].as_f64().unwrap() / 1000.0));
+                    }
+                }
+                println!("H capture{label}, {table}: the capture trigger {} ; the whole INSERT {}", summary(&trigger), summary(&whole));
+            }
+        };
+        measure("");
+        let definition = value(&sql, "SELECT pg_catalog.pg_get_functiondef('vm.capture()'::pg_catalog.regprocedure)");
+        if let (Some(from), Some(to)) = (
+            definition.find("SELECT pg_catalog.string_agg("),
+            definition.find("'pg_catalog.jsonb'::pg_catalog.regtype);"),
+        ) {
+            let to = to + "'pg_catalog.jsonb'::pg_catalog.regtype);".len();
+            let variant = format!("{}v_tests := NULL;{}", &definition[..from], &definition[to..]);
+            sql.batch(&variant);
+            measure(" without the look for json columns");
+            sql.batch(&definition);
+        }
     }
     drop(db);
 }
