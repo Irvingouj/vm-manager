@@ -1047,17 +1047,21 @@ $f$;
 -- The host, on the migration role's own session and in the migration's
 -- transaction:
 --
--- - at the start of each migration, `vm.rewrite_begin` notes every table
---   there is (the tables with history when the migration began) and its
---   file node;
--- - before a statement it knows rewrites (seen so in an earlier run, or
---   foreseen from its text), `vm.rewrite_before` reads the rows of those
---   tables into `vm.rewrite_rows`;
--- - after every statement, `vm.rewrites_seen()` says whether a noted table
---   has a new file node; if one has, `vm.rewrite_after` says which (by the
---   table at the top of its partitions, and its name when the migration
---   began), and `vm.rewrite_record_after` reads their rows again and
---   records each row that differs (`vm.rewrite_record`).
+-- - at the start of each migration, `vm.rewrite_begin` brings up to date
+--   the tables it watches (`vm.rewrite_nodes`): every table there is (the
+--   tables with history when the migration began), its name and its file
+--   node; a partitioned table, its partitions;
+-- - before a statement an earlier run saw write tables anew,
+--   `vm.rewrite_before` reads the rows of those tables into
+--   `vm.rewrite_rows`;
+-- - after every statement, `vm.rewrites_seen()` says whether a watched
+--   table has a new file node, or a watched partitioned table other
+--   partitions; if so, `vm.rewrite_after` says which tables with history
+--   were written anew (each the highest above the table written anew in
+--   its partition tree that had history when the migration began, by its
+--   name then), watching from then on the partitions made under them, and
+--   `vm.rewrite_record_after` reads their rows again and records each row
+--   that differs (`vm.rewrite_record`).
 --
 -- The reading is done as the migration role, never with the platform's
 -- rights: `vm.rewrite_before`, `vm.rewrite_read` and
@@ -1078,11 +1082,26 @@ $f$;
 -- migration's. The tables are the platform's role's alone; the functions
 -- that write them are SECURITY DEFINER and touch nothing outside `vm` and
 -- the catalog.
+--
+-- The platform's own SQLSTATEs, each with one meaning: VM001 no verifiable
+-- identity, or a call that is not the host's; VM002 `TRUNCATE` of a table
+-- with history; VM003 a cast to json of the Application's; VM004 a commit
+-- refused while a strong lock is held (`vm.before_commit`); VM005 a
+-- rewrite of a table whose rows cannot be paired; VM006 row security that
+-- applies to a rewrite's reading.
+--
+-- `vm.rewrite_nodes`: `history`, whether the table was there when the
+-- migration began (a partition made by the migration is not, until the
+-- next migration); `node`, its file node when last looked at (none for a
+-- partitioned table); `kids`, a partitioned table's partitions when last
+-- looked at (none for any other).
 CREATE UNLOGGED TABLE IF NOT EXISTS vm.rewrite_nodes (
     relid oid PRIMARY KEY,
     node oid,
     s text NOT NULL,
-    n text NOT NULL
+    n text NOT NULL,
+    history boolean NOT NULL,
+    kids oid[]
 );
 CREATE UNLOGGED TABLE IF NOT EXISTS vm.rewrite_columns (
     relid oid NOT NULL,
@@ -1120,7 +1139,7 @@ BEGIN
        OR pg_catalog.current_query() IS NULL
        OR pg_catalog.current_query() NOT IN (
            'SELECT vm.rewrite_begin($1)',
-           'SELECT vm.rewrite_before($1, $2::pg_catalog.text[], ARRAY(SELECT pg_catalog.to_regclass(x)::pg_catalog.oid FROM pg_catalog.unnest($3::pg_catalog.text[]) x))',
+           'SELECT vm.rewrite_before($1, $2::pg_catalog.text[])',
            'SELECT r.relid, r.s, r.n, r.read FROM vm.rewrite_after($1) r',
            'SELECT vm.rewrite_record_after($1, $2::pg_catalog.oid[])',
            'SELECT vm.rewrite_done($1, false)',
@@ -1142,9 +1161,11 @@ BEGIN
 END
 $f$;
 
--- At the start of a migration: every table there is now, with its file
--- node and its name (a partitioned table has none: its partitions'
--- move). What was left of an earlier migration's is gone.
+-- At the start of a migration: the watched tables brought up to date. Of
+-- the run's first migration, every table there is; of each next one, the
+-- tables gone forgotten, the tables renamed under their new names, the
+-- tables the migration before made noted, and every table had history
+-- from now on. Answers how many tables were noted anew.
 CREATE OR REPLACE FUNCTION vm.rewrite_begin(p_token text) RETURNS integer
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER PARALLEL UNSAFE
 SET search_path = pg_catalog, pg_temp
@@ -1153,67 +1174,137 @@ DECLARE
     v_made integer;
 BEGIN
     PERFORM vm.rewrite_who(p_token);
-    TRUNCATE vm.rewrite_rows, vm.rewrite_columns, vm.rewrite_nodes;
-    INSERT INTO vm.rewrite_nodes (relid, node, s, n)
-    SELECT c.oid, pg_catalog.pg_relation_filenode(c.oid), n.nspname::text, c.relname::text
+    DELETE FROM vm.rewrite_nodes r
+     WHERE NOT EXISTS (SELECT FROM pg_catalog.pg_class c WHERE c.oid = r.relid);
+    UPDATE vm.rewrite_nodes r SET s = ns.nspname::text, n = c.relname::text, history = true
+      FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace ns ON ns.oid = c.relnamespace
+     WHERE c.oid = r.relid
+       AND (NOT r.history OR r.s <> ns.nspname::text OR r.n <> c.relname::text);
+    INSERT INTO vm.rewrite_nodes (relid, node, s, n, history, kids)
+    SELECT c.oid, pg_catalog.pg_relation_filenode(c.oid), ns.nspname::text, c.relname::text, true,
+           CASE WHEN c.relkind = 'p'
+                THEN ARRAY(SELECT i.inhrelid FROM pg_catalog.pg_inherits i
+                            WHERE i.inhparent = c.oid ORDER BY i.inhrelid) END
       FROM pg_catalog.pg_class c
-      JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+      JOIN pg_catalog.pg_namespace ns ON ns.oid = c.relnamespace
      WHERE c.relkind IN ('r', 'p')
-       AND n.nspname <> 'vm' AND n.nspname <> 'information_schema'
-       AND pg_catalog.left(n.nspname, 3) <> 'pg_';
+       AND ns.nspname <> 'vm' AND ns.nspname <> 'information_schema'
+       AND pg_catalog.left(ns.nspname, 3) <> 'pg_'
+       AND NOT EXISTS (SELECT FROM vm.rewrite_nodes x WHERE x.relid = c.oid);
     GET DIAGNOSTICS v_made = ROW_COUNT;
     RETURN v_made;
 END
 $f$;
 
--- Whether a table noted at the start of the migration has a new file
--- node, or is gone: asked after every statement. Reads only `vm` and the
--- catalog (by `pg_relation_filenode`, from Postgres's cache: no join of
--- `pg_class`, whose plan would be made on no statistics), writes nothing.
+-- Whether a watched table has a new file node or is gone, or a watched
+-- partitioned table has other partitions: asked after every statement.
+-- Reads only `vm` and the catalog (the file node by
+-- `pg_relation_filenode`, from Postgres's cache: no join of `pg_class`,
+-- whose plan would be made on no statistics; the partitions by the index
+-- of `pg_inherits`), writes nothing.
 CREATE OR REPLACE FUNCTION vm.rewrites_seen() RETURNS boolean
 LANGUAGE sql STABLE SECURITY DEFINER PARALLEL UNSAFE
 SET search_path = pg_catalog, pg_temp
 AS $f$
-SELECT EXISTS (SELECT FROM vm.rewrite_nodes r
-                WHERE pg_catalog.pg_relation_filenode(r.relid) IS DISTINCT FROM r.node)
+SELECT EXISTS (
+    SELECT FROM vm.rewrite_nodes r
+     WHERE CASE WHEN r.kids IS NULL
+                THEN pg_catalog.pg_relation_filenode(r.relid) IS DISTINCT FROM r.node
+                ELSE r.kids IS DISTINCT FROM ARRAY(
+                         SELECT i.inhrelid FROM pg_catalog.pg_inherits i
+                          WHERE i.inhparent OPERATOR(pg_catalog.=) r.relid
+                          ORDER BY i.inhrelid) END)
 $f$;
 
--- The tables with history the statement just run rewrote, each as the
--- table at the top of its partitions (itself, when it is none), with its
--- name when the migration began, and whether its rows were read before
--- the statement; their new file nodes noted, and the tables gone
--- forgotten.
+-- After a statement `vm.rewrites_seen()` said yes to: the tables with
+-- history it wrote anew, with their names when the migration began, and
+-- whether their rows were read before the statement. Each is the highest
+-- table above one written anew in its partition tree (itself included)
+-- that had history when the migration began: a partition the migration
+-- made counts for the partitioned table with history above it, and a
+-- table with history put under a partitioned table the migration made
+-- counts for itself. Written anew are a watched table whose file node
+-- changed, and a partition not watched before, found under a watched
+-- partitioned table, whose file node is not its oid (Postgres gives a
+-- table made the file node that is its oid, and a table written anew
+-- another: part I of docs/research/change-history-out-of-reach.md; what
+-- else changes it, such as `SET UNLOGGED`, makes the table read when it
+-- need not be, never missed). The partitions found are watched from now
+-- on, the new file nodes and partitions noted, the tables gone forgotten.
 CREATE OR REPLACE FUNCTION vm.rewrite_after(p_token text)
 RETURNS TABLE (relid oid, s text, n text, read boolean)
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER PARALLEL UNSAFE
 SET search_path = pg_catalog, pg_temp
 AS $f$
+DECLARE
+    v_moved oid[];
+    v_made oid[];
+    v_tops oid[] := '{}';
+    v_table oid;
+    v_up oid;
+    v_best oid;
 BEGIN
     PERFORM vm.rewrite_who(p_token);
     DELETE FROM vm.rewrite_nodes r
      WHERE NOT EXISTS (SELECT FROM pg_catalog.pg_class c WHERE c.oid = r.relid);
-    RETURN QUERY
     WITH moved AS (
         UPDATE vm.rewrite_nodes r SET node = pg_catalog.pg_relation_filenode(r.relid)
-         WHERE pg_catalog.pg_relation_filenode(r.relid) IS DISTINCT FROM r.node
-        RETURNING r.relid),
-    roots AS (
-        SELECT DISTINCT coalesce(pg_catalog.pg_partition_root(m.relid), m.relid) AS root FROM moved m)
+         WHERE r.kids IS NULL
+           AND pg_catalog.pg_relation_filenode(r.relid) IS DISTINCT FROM r.node
+        RETURNING r.relid)
+    SELECT coalesce(pg_catalog.array_agg(m.relid), '{}') INTO v_moved FROM moved m;
+    WITH RECURSIVE under (relid) AS (
+        SELECT i.inhrelid FROM vm.rewrite_nodes p
+          JOIN pg_catalog.pg_inherits i ON i.inhparent = p.relid
+         WHERE p.kids IS NOT NULL
+        UNION
+        SELECT i.inhrelid FROM under u JOIN pg_catalog.pg_inherits i ON i.inhparent = u.relid),
+    made AS (
+        INSERT INTO vm.rewrite_nodes (relid, node, s, n, history, kids)
+        SELECT c.oid, pg_catalog.pg_relation_filenode(c.oid), ns.nspname::text, c.relname::text, false,
+               CASE WHEN c.relkind = 'p'
+                    THEN ARRAY(SELECT i.inhrelid FROM pg_catalog.pg_inherits i
+                                WHERE i.inhparent = c.oid ORDER BY i.inhrelid) END
+          FROM under u
+          JOIN pg_catalog.pg_class c ON c.oid = u.relid
+          JOIN pg_catalog.pg_namespace ns ON ns.oid = c.relnamespace
+         WHERE c.relispartition AND c.relkind IN ('r', 'p')
+           AND NOT EXISTS (SELECT FROM vm.rewrite_nodes x WHERE x.relid = c.oid)
+        RETURNING vm.rewrite_nodes.relid, vm.rewrite_nodes.node)
+    SELECT coalesce(pg_catalog.array_agg(m.relid) FILTER (WHERE m.node <> m.relid), '{}')
+      INTO v_made FROM made m;
+    UPDATE vm.rewrite_nodes r
+       SET kids = ARRAY(SELECT i.inhrelid FROM pg_catalog.pg_inherits i
+                         WHERE i.inhparent = r.relid ORDER BY i.inhrelid)
+     WHERE r.kids IS NOT NULL;
+    FOREACH v_table IN ARRAY v_moved || v_made LOOP
+        v_best := NULL;
+        v_up := v_table;
+        WHILE v_up IS NOT NULL LOOP
+            IF EXISTS (SELECT FROM vm.rewrite_nodes t WHERE t.relid = v_up AND t.history) THEN
+                v_best := v_up;
+            END IF;
+            v_up := (SELECT i.inhparent FROM pg_catalog.pg_inherits i
+                       JOIN pg_catalog.pg_class c ON c.oid = i.inhrelid
+                      WHERE i.inhrelid = v_up AND c.relispartition);
+        END LOOP;
+        IF v_best IS NOT NULL AND NOT v_best = ANY (v_tops) THEN
+            v_tops := v_tops || v_best;
+        END IF;
+    END LOOP;
+    RETURN QUERY
     SELECT t.relid, t.s, t.n,
            EXISTS (SELECT FROM vm.rewrite_columns k WHERE k.relid = t.relid AND k.phase = 0)
-      FROM roots x
-      JOIN vm.rewrite_nodes t ON t.relid = x.root
-      JOIN pg_catalog.pg_class c ON c.oid = t.relid
+      FROM vm.rewrite_nodes t
+     WHERE t.relid = ANY (v_tops)
      ORDER BY t.s, t.n;
 END
 $f$;
 
--- The tables whose rows are to be read before a statement: those noted
--- under the names `p_names` (schema and name by turns, as when the
--- migration began) and, for each table of `p_relids` and every table
--- under it, the table at the top of its partitions; only tables noted at
--- the start of the migration. What an earlier statement left is gone.
-CREATE OR REPLACE FUNCTION vm.rewrite_roots(p_token text, p_names text[], p_relids oid[])
+-- The tables whose rows are to be read before a statement: those with
+-- history noted under the names `p_names` (schema and name by turns, as
+-- when the migration began). What an earlier statement left is gone.
+CREATE OR REPLACE FUNCTION vm.rewrite_roots(p_token text, p_names text[])
 RETURNS oid[]
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER PARALLEL UNSAFE
 SET search_path = pg_catalog, pg_temp
@@ -1222,25 +1313,15 @@ DECLARE
     v_roots oid[];
 BEGIN
     PERFORM vm.rewrite_who(p_token);
-    TRUNCATE vm.rewrite_rows, vm.rewrite_columns;
-    WITH RECURSIVE named AS (
-        SELECT t.relid
-          FROM pg_catalog.generate_subscripts(p_names, 1) i
-          JOIN vm.rewrite_nodes t
-            ON t.s = p_names[i] AND t.n = p_names[i + 1]
-         WHERE i % 2 = 1),
-    under (relid) AS (
-        SELECT x FROM pg_catalog.unnest(p_relids) x WHERE x IS NOT NULL
-        UNION
-        SELECT h.inhrelid FROM pg_catalog.pg_inherits h JOIN under u ON h.inhparent = u.relid),
-    roots AS (
-        SELECT relid FROM named
-        UNION
-        SELECT coalesce(pg_catalog.pg_partition_root(u.relid), u.relid) FROM under u)
-    SELECT coalesce(pg_catalog.array_agg(r.relid ORDER BY r.relid), '{}')
+    IF EXISTS (SELECT FROM vm.rewrite_columns) OR EXISTS (SELECT FROM vm.rewrite_rows) THEN
+        TRUNCATE vm.rewrite_rows, vm.rewrite_columns;
+    END IF;
+    SELECT coalesce(pg_catalog.array_agg(DISTINCT t.relid), '{}')
       INTO v_roots
-      FROM roots r
-     WHERE EXISTS (SELECT FROM vm.rewrite_nodes t WHERE t.relid = r.relid);
+      FROM pg_catalog.generate_subscripts(p_names, 1) i
+      JOIN vm.rewrite_nodes t
+        ON t.s = p_names[i] AND t.n = p_names[i + 1] AND t.history
+     WHERE i % 2 = 1;
     RETURN v_roots;
 END
 $f$;
@@ -1262,9 +1343,9 @@ DECLARE
 BEGIN
     PERFORM vm.rewrite_who(p_token);
     IF p_rows IS NULL THEN
-        IF NOT EXISTS (SELECT FROM vm.rewrite_nodes t WHERE t.relid = p_relid) THEN
+        IF NOT EXISTS (SELECT FROM vm.rewrite_nodes t WHERE t.relid = p_relid AND t.history) THEN
             RAISE EXCEPTION USING ERRCODE = 'VM001',
-                MESSAGE = 'only a table noted at the start of the migration is read';
+                MESSAGE = 'only a table with history when the migration began is read';
         END IF;
         IF EXISTS (SELECT FROM vm.rewrite_columns k WHERE k.relid = p_relid AND k.phase = p_phase) THEN
             RAISE EXCEPTION USING ERRCODE = 'VM001',
@@ -1298,7 +1379,7 @@ $f$;
 -- in the capture, and `lc_monetary` (how `money` prints) to the
 -- database's own, so that a statement cannot make the two readings of a
 -- value print differently; row security off. Refused when row security would apply
--- to the reading (VM004), or a cast to json or jsonb of the Application's
+-- to the reading (VM006), or a cast to json or jsonb of the Application's
 -- exists (VM003: `to_jsonb` would call it). Each row is the object of its
 -- columns as `to_jsonb` makes it, a virtual generated column null (as in
 -- the capture, and never computed). The rows go to `vm.rewrite_keep` in
@@ -1335,7 +1416,7 @@ BEGIN
             MESSAGE = 'the table to read is not there';
     END IF;
     IF pg_catalog.row_security_active(p_relid) THEN
-        RAISE EXCEPTION USING ERRCODE = 'VM004',
+        RAISE EXCEPTION USING ERRCODE = 'VM006',
             MESSAGE = pg_catalog.format(
                 'row security applies to the table %s as its owner reads it (FORCE ROW LEVEL SECURITY), so the platform cannot read all its rows before and after a statement that writes them anew, to record each row it changed: take FORCE ROW LEVEL SECURITY off before the statement and put it back after it',
                 p_relid::pg_catalog.regclass);
@@ -1396,7 +1477,7 @@ $f$;
 
 -- Before a statement: the rows of the tables `vm.rewrite_roots` names,
 -- read as the migration role. Answers how many rows.
-CREATE OR REPLACE FUNCTION vm.rewrite_before(p_token text, p_names text[], p_relids oid[])
+CREATE OR REPLACE FUNCTION vm.rewrite_before(p_token text, p_names text[])
 RETURNS bigint
 LANGUAGE plpgsql VOLATILE PARALLEL UNSAFE
 SET search_path = pg_catalog, pg_temp
@@ -1405,7 +1486,7 @@ DECLARE
     v_root oid;
     v_read bigint := 0;
 BEGIN
-    FOREACH v_root IN ARRAY vm.rewrite_roots(p_token, p_names, p_relids) LOOP
+    FOREACH v_root IN ARRAY vm.rewrite_roots(p_token, p_names) LOOP
         v_read := v_read + vm.rewrite_read(p_token, v_root, 0::smallint);
     END LOOP;
     RETURN v_read;
@@ -1603,8 +1684,11 @@ BEGIN
     RETURN v_made;
 END
 $f$;
--- What is left of a statement's readings gone; with `p_end`, at the end
--- of a migration, the tables noted at its start too: nothing of the
+
+-- What is left of a statement's readings gone (`TRUNCATE`: a reading may
+-- leave many rows, which `DELETE` would leave dead for the next to scan),
+-- only when there is something; with `p_end`, once all the migrations
+-- have run, the watched tables too (`DELETE`: a few rows): nothing of the
 -- rewrites is left in `vm`.
 CREATE OR REPLACE FUNCTION vm.rewrite_done(p_token text, p_end boolean) RETURNS void
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER PARALLEL UNSAFE
@@ -1612,10 +1696,11 @@ SET search_path = pg_catalog, pg_temp
 AS $f$
 BEGIN
     PERFORM vm.rewrite_who(p_token);
-    IF p_end THEN
-        TRUNCATE vm.rewrite_rows, vm.rewrite_columns, vm.rewrite_nodes;
-    ELSE
+    IF EXISTS (SELECT FROM vm.rewrite_columns) OR EXISTS (SELECT FROM vm.rewrite_rows) THEN
         TRUNCATE vm.rewrite_rows, vm.rewrite_columns;
+    END IF;
+    IF p_end THEN
+        DELETE FROM vm.rewrite_nodes;
     END IF;
 END
 $f$;
