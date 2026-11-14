@@ -522,7 +522,7 @@ pub fn assert_answer(sent: &Response, answers: Answers, migration: &str, mention
 }
 
 /// Makes a [`Case`]'s pending migrations once its own database is known.
-pub type MakePending = Box<dyn Fn(&OwnDatabase) -> Vec<Migration>>;
+pub type MakePending = Box<dyn Fn(&OwnDatabase) -> Vec<Migration> + Send + Sync>;
 
 /// For [`Case::naming`]: the answer may name any of the pending
 /// migrations (CONTRACT.md does not say which one a check made after the
@@ -551,7 +551,7 @@ impl Case {
     pub fn statements(
         name: &'static str,
         answers: Answers,
-        statements: impl Fn(&OwnDatabase) -> Vec<String> + 'static,
+        statements: impl Fn(&OwnDatabase) -> Vec<String> + Send + Sync + 'static,
     ) -> Self {
         Self {
             name,
@@ -571,7 +571,7 @@ impl Case {
     pub fn migrations(
         name: &'static str,
         answers: Answers,
-        pending: impl Fn(&OwnDatabase) -> Vec<Migration> + 'static,
+        pending: impl Fn(&OwnDatabase) -> Vec<Migration> + Send + Sync + 'static,
     ) -> Self {
         Self {
             name,
@@ -624,16 +624,60 @@ pub fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
         .unwrap_or_else(|| "(a panic without a message)".to_owned())
 }
 
-/// Runs every case on `own` (see [`start`]), each on a fresh Application
-/// `<prefix>-<i>` installed by [`install_seeded`]: sends [`base`] and the
+/// How many hostile Versions [`run_cases`] and [`run_lenient_cases`] have
+/// in hand at once, each case with an Application of its own: fewer than
+/// the 8 Versions the program applies at once (CONTRACT.md, "The migration
+/// role's password"), since each case sends two (its first Version, then
+/// the hostile one) one after the other.
+pub const CASES_AT_ONCE: usize = 6;
+
+/// Runs `one` for every case, [`CASES_AT_ONCE`] at a time on as many
+/// threads, each taking the next case not yet taken; returns what each
+/// that failed said, in the cases' order. The threads are scoped: all have
+/// ended when this returns.
+pub fn side_by_side(
+    cases: &[Case],
+    one: impl Fn(usize, &Case) -> Option<String> + Sync,
+) -> Vec<String> {
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let failed = std::sync::Mutex::new(Vec::new());
+    std::thread::scope(|scope| {
+        for _ in 0..CASES_AT_ONCE.min(cases.len()) {
+            scope.spawn(|| {
+                loop {
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(case) = cases.get(i) else { break };
+                    if let Some(why) = one(i, case) {
+                        failed
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .push((i, why));
+                    }
+                }
+            });
+        }
+    });
+    let mut failed = failed
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    failed.sort_by_key(|(i, _)| *i);
+    failed.into_iter().map(|(_, why)| why).collect()
+}
+
+/// Runs every case on `own` (see [`start`]), [`CASES_AT_ONCE`] side by
+/// side, each on a fresh Application `<prefix>-<i>` installed by
+/// [`install_seeded`]: sends [`base`] and the
 /// case's migrations, and checks the answer, that the database is
 /// [`untouched`], that Version 1 still serves, and that the owner role
 /// cannot log in. Every case runs whatever the others did; the test fails
 /// at the end with every case that failed.
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "every caller hands over the cases it built and has no use for them after"
+)]
 pub fn run_cases(own: &Own, prefix: &str, cases: Vec<Case>) {
-    let mut failures = Vec::new();
     let total = cases.len();
-    for (i, case) in cases.into_iter().enumerate() {
+    let failures = side_by_side(&cases, |i, case| {
         let application = format!("{prefix}-{i}");
         let outcome = catch_unwind(AssertUnwindSafe(|| {
             let db = install_seeded(own, &application);
@@ -663,16 +707,16 @@ pub fn run_cases(own: &Own, prefix: &str, cases: Vec<Case>) {
                 db.owner
             );
         }));
-        if let Err(payload) = outcome {
+        outcome.err().map(|payload| {
             // The program's whole log is in some messages: the first part
             // is what says why.
             let why: String = panic_text(payload.as_ref()).chars().take(3000).collect();
-            failures.push(format!(
+            format!(
                 "--- case {:?} (Application {application}) ---\n{why}",
                 case.name
-            ));
-        }
-    }
+            )
+        })
+    });
     assert!(
         failures.is_empty(),
         "{} of {total} hostile Versions were not answered and kept out as CONTRACT.md says:\n{}",
@@ -800,7 +844,8 @@ pub fn record_of_migrations(db: &OwnDatabase) -> Vec<String> {
     db.column("SELECT t::text FROM vm.migrations t ORDER BY 1")
 }
 
-/// Runs every case on `own`, each on a fresh Application, for attempts
+/// Runs every case on `own`, [`CASES_AT_ONCE`] side by side, each on a
+/// fresh Application, for attempts
 /// whose outcome CONTRACT.md leaves to Postgres: the Version is `201` or
 /// `422`, and either way the platform's part is as before. When `422`,
 /// the whole database is untouched as for any failed Version. When `201`,
@@ -808,10 +853,13 @@ pub fn record_of_migrations(db: &OwnDatabase) -> Vec<String> {
 /// record still holds every earlier row. Either way the owner role cannot
 /// log in, and when `keys_after` a later migration still cannot read
 /// `vm.keys` (`422 migration-failed 42501`).
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "every caller hands over the cases it built and has no use for them after"
+)]
 pub fn run_lenient_cases(own: &Own, prefix: &str, cases: Vec<Case>, keys_after: bool) {
-    let mut failures = Vec::new();
     let total = cases.len();
-    for (i, case) in cases.into_iter().enumerate() {
+    let failures = side_by_side(&cases, |i, case| {
         let application = format!("{prefix}-{i}");
         let outcome = catch_unwind(AssertUnwindSafe(|| {
             let db = install_seeded(own, &application);
@@ -876,14 +924,14 @@ pub fn run_lenient_cases(own: &Own, prefix: &str, cases: Vec<Case>, keys_after: 
                 assert_answer(&read, READ_KEYS_DENIED, "0009_read_keys", None);
             }
         }));
-        if let Err(payload) = outcome {
+        outcome.err().map(|payload| {
             let why: String = panic_text(payload.as_ref()).chars().take(3000).collect();
-            failures.push(format!(
+            format!(
                 "--- case {:?} (Application {application}) ---\n{why}",
                 case.name
-            ));
-        }
-    }
+            )
+        })
+    });
     assert!(
         failures.is_empty(),
         "{} of {total} Versions did not leave the platform's part as before:\n{}",
