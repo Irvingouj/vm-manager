@@ -452,6 +452,17 @@ All figures in the table are [verified].
 - **Batches and steps.** A batch is at most 1,000 changes and, past the first, 4 MiB. Each step is ended after 10 s.
 - **After a failure.** A task that failed fails every read asked before the step began, and tries again after 1 s if it was asked again meanwhile.
 
+**Run again by the driving session** at `ee959c4` (the final commit of the ticket's program: `4d1eb5f` with two comments changed), on the same VM with nothing else running: `h-cost.rerun.log` beside this file (exit 0, 280 s) [verified]. Its figures agree with those above:
+
+- a write back to back: before 6.63 / 6.65 ms, middle 7.10 / 7.02 ms, after 6.78 / 6.82 ms (400 in a row); 100 ms apart, after is 0.15 to 0.22 ms slower than before;
+- the capture trigger alone: before 0.195 to 0.197 ms on either table; after 0.273 / 0.272 ms on `things` and 0.206 / 0.203 ms on `parents`; after, without the look for `json` columns, 0.196 to 0.200 ms;
+- a Version with one migration of `SELECT 1`: 30.0 / 29.8 ms before and 34.4 / 34.8 ms after at 10 tables, 56.8 / 57.3 ms before and 128.6 / 127.1 ms after at 500;
+- 100,000 rows in one `execute`: answered after 0.784 s, the outbox empty 2.042 s after the answer, 100 transactions;
+- a `history` read of 100 changes: 9.14 to 9.68 ms with 1,000 kept, 9.26 to 9.71 ms with 1,000,000;
+- the start with 50 own databases: every change in `change_history` 0.411 s after the start, 106 sessions opened.
+
+The ad hoc runs named above under `/tmp/t62/` (the builds without a shipment, the one-turn shipment, the traces of single steps, the probes of the comparison's statement) were not run again by the driving session: they are the implementation agent's, read from its logs or its report.
+
 [not verified]:
 
 - the figures on Postgres 16 and 17;
