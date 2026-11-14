@@ -1617,3 +1617,125 @@ fn more_than_32_own_databases_shipping_at_once_hold_up_no_other_and_use_at_most_
         "expected the lone Application's write shipped by the relay within {bound:?}, not after the others' outboxes; it took {lone_shipped:?}"
     );
 }
+
+/// The readers of the test below.
+const FULL_READERS: usize = 100;
+
+/// CONTRACT.md, "Nobody waits for what is not theirs": "One own database
+/// has 64 such places for reads begun at different moments. While they are
+/// all taken, a read that begins waits also for what was committed until a
+/// place came free; it is still answered, or ended at its `time` limit, and
+/// never answered without what was committed before it began."
+///
+/// One statement of 250,000 rows leaves a large outbox (some 7 seconds of
+/// shipping at the rate measured here). While it ships, 100 requests of
+/// the same Application begin 30 ms apart (3 seconds in all), each writing
+/// a row of its own and reading that row's history. Every one must answer
+/// `ok` with exactly its own row's insert, or be ended at the `time`
+/// limit; never `ok` without its row, never another error. The harness
+/// checks that more than 64 were in flight at once and that one at least
+/// answered `ok`; at the end every row written is in `change_history`
+/// exactly once.
+#[test]
+fn reads_begun_while_every_place_is_taken_answer_their_own_row_or_end_at_the_time_limit() {
+    let (own, db) = installed();
+    let answered = execute_long(
+        &own,
+        APP,
+        "insert into things (title) select 'full-' || g from generate_series(1, 250000) g",
+    );
+    let start = Instant::now();
+    let results: Vec<(usize, Instant, Instant, Value)> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..FULL_READERS)
+            .map(|k| {
+                let own = &own;
+                scope.spawn(move || {
+                    let at = Duration::from_millis(30) * u32::try_from(k).unwrap();
+                    if let Some(wait) = at.checked_sub(start.elapsed()) {
+                        std::thread::sleep(wait);
+                    }
+                    let id = 800_000 + k;
+                    let began = Instant::now();
+                    let (_, answers) = own.run_body(
+                        &User::new(&format!("reader-{k}")),
+                        APP,
+                        &json!({ "calls": [
+                            own_execute("user", &format!("insert into things (id, title) values ({id}, 'full-reader-{k}')")),
+                            history_call("user", "public", "things", &json!({ "key": { "id": id } })),
+                        ] }),
+                        Duration::from_secs(40),
+                    );
+                    assert_ok(&answers[0], "the harness's own check: a reader's write");
+                    (k, began, Instant::now(), answers[1].clone())
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    // The most requests in flight at once, from their begin and end times.
+    let mut events: Vec<(Instant, i32)> = results
+        .iter()
+        .flat_map(|(_, b, e, _)| [(*b, 1), (*e, -1)])
+        .collect();
+    events.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    let mut now = 0;
+    let mut most = 0;
+    for (_, step) in &events {
+        now += step;
+        most = most.max(now);
+    }
+    let mut ok = 0;
+    let mut time = 0;
+    let mut wrong = Vec::new();
+    for (k, _, _, answer) in &results {
+        let id = 800_000 + k;
+        let changes = answer["ok"]["changes"].as_array();
+        if let Some(changes) = changes {
+            let own_row = changes.len() == 1
+                && changes[0]["kind"] == "insert"
+                && changes[0]["key"] == json!({ "id": id })
+                && changes[0]["user_id"] == format!("reader-{k}");
+            if own_row {
+                ok += 1;
+            } else {
+                wrong.push(format!(
+                    "  reader {k}: `ok` without exactly its own row's insert: {answer}"
+                ));
+            }
+        } else if answer["error"]["kind"] == "limit" && answer["error"]["limit"] == "time" {
+            time += 1;
+        } else {
+            wrong.push(format!("  reader {k}: {answer}"));
+        }
+    }
+    println!(
+        "a statement of 250,000 rows answered {:?} before the first reader; {FULL_READERS} readers, at most {most} in flight at once; {ok} answered `ok` with their row, {time} ended at the time limit; all done {:?} after the first began",
+        start.duration_since(answered),
+        start.elapsed()
+    );
+    assert!(
+        wrong.is_empty(),
+        "expected every read begun while the places are taken to answer its own row or end at the time limit (CONTRACT.md: \"it is still answered, or ended at its `time` limit, and never answered without what was committed before it began\"):\n{}",
+        wrong.join("\n")
+    );
+    assert!(
+        most > 64 && ok >= 1,
+        "the harness's own check: more than 64 reads in flight at once (at most {most}) and one at least answered `ok` ({ok})"
+    );
+    wait_shipped_within(&db, Duration::from_secs(300));
+    let mut not_once = Vec::new();
+    for k in 0..FULL_READERS {
+        let n = count_now(
+            &db,
+            &format!("h.key = '{{\"id\": {}}}'::jsonb", 800_000 + k),
+        );
+        if n != 1 {
+            not_once.push(format!("  row {}: {n} times", 800_000 + k));
+        }
+    }
+    assert!(
+        not_once.is_empty(),
+        "expected every reader's row in change_history exactly once:\n{}",
+        not_once.join("\n")
+    );
+}
