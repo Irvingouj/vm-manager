@@ -22,6 +22,14 @@ read from the table: ok [('{"a": 2, "b": 4, "id": 1}',)]
 one that calls the Application's function: ERROR 0A000 generation expression uses user-defined function
 a virtual column's expression changed: ok; new file node: False
 a stored generated column's expression changed: ok; new file node: True
+CREATE TABLE, only made: file node is the table's oid: t
+CREATE TABLE AS, only made: file node is the table's oid: t
+a partition made, only made: file node is the table's oid: t
+a partition made and filled in one statement: file node is the table's oid: t
+a partition made, filled and its column retyped through the partitioned table in one statement: file node is the table's oid: f
+a table made and written anew by SET UNLOGGED in one statement: file node is the table's oid: f
+a table made earlier, attached as a partition: file node is the table's oid: t
+the partitioned table's file node, and its partitions after the partition made: ok [(None, '{q1,q2,q3,m4}')]
 ######## Postgres 16 (16.15.0)
 version [('16.15',)]
 integer to bigint: ok; new file node: True
@@ -43,6 +51,14 @@ through the partitioned table, the partition: ok; new file node: True
 pg_input_is_valid: ok [('f', 't')]
 a virtual generated column: ERROR 42601 syntax error at or near "VIRTUAL"
 a stored generated column's expression changed: ERROR 42601 syntax error at or near "EXPRESSION"; new file node: False
+CREATE TABLE, only made: file node is the table's oid: t
+CREATE TABLE AS, only made: file node is the table's oid: t
+a partition made, only made: file node is the table's oid: t
+a partition made and filled in one statement: file node is the table's oid: t
+a partition made, filled and its column retyped through the partitioned table in one statement: file node is the table's oid: f
+a table made and written anew by SET UNLOGGED in one statement: file node is the table's oid: f
+a table made earlier, attached as a partition: file node is the table's oid: t
+the partitioned table's file node, and its partitions after the partition made: ok [(None, '{q1,q2,q3,m4}')]
 ######## Postgres 17 (17.11.0)
 version [('17.11',)]
 integer to bigint: ok; new file node: True
@@ -64,3 +80,11 @@ through the partitioned table, the partition: ok; new file node: True
 pg_input_is_valid: ok [('f', 't')]
 a virtual generated column: ERROR 42601 syntax error at or near "VIRTUAL"
 a stored generated column's expression changed: ok; new file node: True
+CREATE TABLE, only made: file node is the table's oid: t
+CREATE TABLE AS, only made: file node is the table's oid: t
+a partition made, only made: file node is the table's oid: t
+a partition made and filled in one statement: file node is the table's oid: t
+a partition made, filled and its column retyped through the partitioned table in one statement: file node is the table's oid: f
+a table made and written anew by SET UNLOGGED in one statement: file node is the table's oid: f
+a table made earlier, attached as a partition: file node is the table's oid: t
+the partitioned table's file node, and its partitions after the partition made: ok [(None, '{q1,q2,q3,m4}')]

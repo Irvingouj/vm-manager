@@ -55,3 +55,26 @@ if r.ok:
     rewrites("a virtual column's expression changed", "g", "ALTER TABLE g ALTER COLUMN b SET EXPRESSION AS (a * 3)")
 r = c.one("CREATE TABLE h (id int PRIMARY KEY, a int, b int GENERATED ALWAYS AS (a * 2) STORED)")
 rewrites("a stored generated column's expression changed", "h", "ALTER TABLE h ALTER COLUMN b SET EXPRESSION AS (a * 3)")
+# Added by the implementation agent of ticket 63, second round: what tells a
+# table made and written anew in one statement from one only made.
+def made(label, t, sql):
+    r = c.one(sql)
+    if not r.ok:
+        print(f"{label}: ERROR {r.sqlstate} {r.message}")
+        return
+    same = c.one(f"SELECT relfilenode = oid FROM pg_class WHERE oid = '{t}'::regclass").rows[0][0]
+    print(f"{label}: file node is the table's oid: {same}")
+made("CREATE TABLE, only made", "m1", "CREATE TABLE m1 (id int PRIMARY KEY, a int)")
+made("CREATE TABLE AS, only made", "m2", "CREATE TABLE m2 AS SELECT g AS id FROM generate_series(1, 10) g")
+c.one("CREATE TABLE q (id int, a int, PRIMARY KEY (id)) PARTITION BY RANGE (id)")
+made("a partition made, only made", "q1", "CREATE TABLE q1 PARTITION OF q FOR VALUES FROM (0) TO (100)")
+made("a partition made and filled in one statement", "q2",
+     "DO $$ BEGIN CREATE TABLE q2 PARTITION OF q FOR VALUES FROM (100) TO (200); INSERT INTO q VALUES (150, 1); END $$")
+made("a partition made, filled and its column retyped through the partitioned table in one statement", "q3",
+     "DO $$ BEGIN CREATE TABLE q3 PARTITION OF q FOR VALUES FROM (200) TO (300); INSERT INTO q VALUES (250, 1); ALTER TABLE q ALTER COLUMN a TYPE bigint USING a + 1; END $$")
+made("a table made and written anew by SET UNLOGGED in one statement", "m3",
+     "DO $$ BEGIN CREATE TABLE m3 (id int); ALTER TABLE m3 SET UNLOGGED; END $$")
+c.one("CREATE TABLE m4 (id int NOT NULL, a bigint)")
+made("a table made earlier, attached as a partition", "m4", "ALTER TABLE q ATTACH PARTITION m4 FOR VALUES FROM (300) TO (400)")
+show("the partitioned table's file node, and its partitions after the partition made",
+     "SELECT pg_relation_filenode('q'), (SELECT array_agg(inhrelid::regclass::text ORDER BY inhrelid) FROM pg_inherits WHERE inhparent = 'q'::regclass)")
