@@ -774,7 +774,7 @@ impl OwnDatabases {
     /// was answered (blackbox/CONTRACT.md, "Shipping: When"). Nothing for an
     /// Application without an own database.
     pub fn ship(&self, application: &str) {
-        self.ask_shipment(application);
+        self.ask_shipment(application, false);
     }
 
     /// Asks for a shipment of `application`'s outbox and waits for it:
@@ -783,9 +783,9 @@ impl OwnDatabases {
     /// database. Before a read of the history; the caller bounds the wait
     /// (the shipment goes on by itself if it stops waiting).
     pub async fn ship_and_wait(&self, application: &str) -> bool {
-        match self.ask_shipment(application) {
-            Some((known, ticket)) => known.shipping.wait(ticket).await,
-            None => false,
+        match self.ask_shipment(application, true) {
+            Some((known, Some(ticket))) => known.shipping.wait(ticket).await,
+            _ => false,
         }
     }
 
@@ -802,24 +802,25 @@ impl OwnDatabases {
             .map(Arc::clone)
             .collect();
         for name in &names {
-            self.ask_shipment(name);
+            self.ask_shipment(name, false);
         }
     }
 
     /// A request for a shipment, its task started unless one runs; the own
-    /// database's state and the request's number, to wait for it.
-    fn ask_shipment(&self, application: &str) -> Option<(Arc<Known>, u64)> {
+    /// database's state and, when `waited` (a read's), the request's number
+    /// to wait for it.
+    fn ask_shipment(&self, application: &str, waited: bool) -> Option<(Arc<Known>, Option<u64>)> {
         let (name, known) = self.known(application)?;
-        let (ticket, start) = known.shipping.ask();
+        let (ticket, start) = known.shipping.ask(waited);
         if !start {
             return Some((known, ticket));
         }
         let Ok(names) = self.names(known.number) else {
-            known.shipping.give_up(ticket);
+            known.shipping.give_up();
             return Some((known, ticket));
         };
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-            known.shipping.give_up(ticket);
+            known.shipping.give_up();
             return Some((known, ticket));
         };
         let route = relay::Route {
