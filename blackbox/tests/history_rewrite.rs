@@ -677,6 +677,97 @@ $d$;"#],
         ),
         "the rewrite's entry, `old` the row before the statement",
     );
+    // CONTRACT.md: the rewrite's entries have ids "greater than those ...
+    // of the rows the statement itself changed (an `UPDATE` in the same
+    // `DO` block)".
+    assert!(
+        find(60)["id"].as_i64() > find(6)["id"].as_i64(),
+        "the rewrite's entry after the UPDATE of the same statement:\n{}",
+        lines(&rows)
+    );
+}
+
+/// CONTRACT.md, "What this does not close": "A change of type that
+/// Postgres makes without writing the rows anew records no row: the stored
+/// values are the same. For `timestamp` to `timestamptz` while the
+/// session's time zone is UTC, the JSON form of the same instant gains its
+/// offset from then on; the `column-type` entry is what says so."
+#[test]
+fn timestamp_to_timestamptz_under_utc_without_using_records_no_row_only_the_column_type_entry() {
+    let mut r = Rewrite::start();
+    let last = last_history_id(&r.db);
+    let before = r.filenode("vals");
+    let migration = "0004_ts_with_zone";
+    r.send_ok(&[Migration::new(
+        migration,
+        &[
+            r#"SET TIME ZONE 'UTC';"#,
+            r#"ALTER TABLE "vals" ALTER COLUMN "ts" SET DATA TYPE timestamptz;"#,
+        ],
+    )]);
+    assert_eq!(
+        before,
+        r.filenode("vals"),
+        "the harness's own check: Postgres did not write vals anew"
+    );
+    let rows = row_entries(&r.db, last);
+    assert!(
+        rows.is_empty(),
+        "no row written anew: no row entry; got\n{}",
+        lines(&rows)
+    );
+    let structure = structure_after(&r.db, last);
+    let found: Vec<(&Value, &Value)> = structure
+        .iter()
+        .map(|e| (&e["table_name"], &e["structure"]))
+        .collect();
+    assert_eq!(
+        found,
+        vec![(
+            &json!("vals"),
+            &json!({ "change": "column-type", "column": "ts", "from": "timestamp without time zone", "to": "timestamp with time zone" })
+        )],
+        "the column-type entry, and nothing else"
+    );
+}
+
+/// CONTRACT.md, "A table without a primary key": a table whose primary key
+/// "was dropped and made again on the same columns in the statement" is
+/// paired by it. One `ALTER TABLE` drops `keyed`'s key, changes `v` and
+/// makes the key again on `id`: each row is an update.
+#[test]
+fn a_primary_key_dropped_and_made_again_on_the_same_columns_still_pairs_the_rows() {
+    let mut r = Rewrite::start();
+    let last = last_history_id(&r.db);
+    let migration = "0004_key_made_again";
+    r.send_ok(&[Migration::new(
+        migration,
+        &[
+            r#"ALTER TABLE "keyed" DROP CONSTRAINT "keyed_pkey", ALTER COLUMN "v" SET DATA TYPE text USING "v" || '!', ADD PRIMARY KEY ("id");"#,
+        ],
+    )]);
+    assert_row_entries(
+        &row_entries(&r.db, last),
+        &[
+            migration_update(
+                migration,
+                "keyed",
+                id_key(1),
+                json!({ "id": 1, "v": "a" }),
+                json!({ "id": 1, "v": "a!" }),
+                json!(["v"]),
+            ),
+            migration_update(
+                migration,
+                "keyed",
+                id_key(2),
+                json!({ "id": 2, "v": "b" }),
+                json!({ "id": 2, "v": "b!" }),
+                json!(["v"]),
+            ),
+        ],
+        "the key made again on id: rows paired by it, an update each",
+    );
 }
 
 // ---------------------------------------------------------------------------
