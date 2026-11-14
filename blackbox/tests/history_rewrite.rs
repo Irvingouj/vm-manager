@@ -1806,3 +1806,283 @@ fn a_statement_that_rewrites_two_tables_in_turn_settles_and_is_recorded_as_the_r
         "the run that stayed: its table's row, once; the other table none",
     );
 }
+
+// ---------------------------------------------------------------------------
+// Second pass: partitions the migration made, tables put under a new
+// partitioned table, renames, and what follows the statement.
+// ---------------------------------------------------------------------------
+
+/// A Version that drops both partitions of `parted` (so `parted` has
+/// history and no partition), then the migrations `more`; failing unless
+/// `201`. Returns the last history id before `more`'s Version.
+fn parted_without_partitions(r: &mut Rewrite) -> i64 {
+    r.send_ok(&[Migration::new(
+        "0004_no_partitions",
+        &[
+            r#"DROP TABLE "parted_2026";"#,
+            r#"DROP TABLE "parted_2027";"#,
+        ],
+    )]);
+    assert!(
+        r.db.column(
+            "SELECT count(*)::text FROM pg_inherits WHERE inhparent = 'public.parted'::regclass"
+        ) == vec!["0".to_owned()],
+        "the harness's own check: parted has no partition"
+    );
+    last_history_id(&r.db)
+}
+
+/// The entries of `rows` of `public.parted` of this kind, keyed by `id`,
+/// with `v` of `old` and of `new`, sorted.
+fn parted_entries(rows: &[Value], kind: &str) -> Vec<(Value, Value, Value)> {
+    let mut found: Vec<(Value, Value, Value)> = rows
+        .iter()
+        .filter(|e| e["table_name"] == "parted" && e["kind"] == kind)
+        .map(|e| {
+            (
+                e["key"].clone(),
+                e["old"].get("v").cloned().unwrap_or(Value::Null),
+                e["new"].get("v").cloned().unwrap_or(Value::Null),
+            )
+        })
+        .collect();
+    found.sort_by_key(|f| f.0.to_string());
+    found
+}
+
+/// CONTRACT.md: "A partition the migration itself made under a partitioned
+/// table with history is part of that table: when a statement writes it
+/// anew, also the statement that made it, the partitioned table's rows are
+/// recorded as above." `parted` has no partition when the migration
+/// begins; the migration makes one, inserts two rows through `parted`
+/// (recorded as inserts, as always), then retypes `v` through `parted`
+/// with `USING`: each row is an `update` under `parted`.
+#[test]
+fn a_partition_the_migration_made_written_anew_is_recorded_under_the_partitioned_table() {
+    let mut r = Rewrite::start();
+    let last = parted_without_partitions(&mut r);
+    let migration = "0005_new_partition";
+    r.send_ok(&[Migration::new(
+        migration,
+        &[
+            r#"CREATE TABLE "parted_new" PARTITION OF "parted" FOR VALUES FROM ('2026-01-01') TO ('2030-01-01');"#,
+            r#"INSERT INTO "parted" ("id", "day", "v") VALUES (5, '2026-05-01', 1), (6, '2026-06-01', 2);"#,
+            r#"ALTER TABLE "parted" ALTER COLUMN "v" SET DATA TYPE bigint USING "v" + 10;"#,
+        ],
+    )]);
+    let rows = row_entries(&r.db, last);
+    let key = |id: i64, day: &str| json!({ "id": id, "day": day });
+    let row = |id: i64, day: &str, v: i64| json!({ "id": id, "day": day, "v": v });
+    let by = || Change::by_migration(INSTALLER, migration).on("public", "parted");
+    assert_row_entries(
+        &rows,
+        &[
+            by().insert(key(5, "2026-05-01"), row(5, "2026-05-01", 1)),
+            by().insert(key(6, "2026-06-01"), row(6, "2026-06-01", 2)),
+            by().update(
+                key(5, "2026-05-01"),
+                row(5, "2026-05-01", 1),
+                row(5, "2026-05-01", 11),
+                json!(["v"]),
+            ),
+            by().update(
+                key(6, "2026-06-01"),
+                row(6, "2026-06-01", 2),
+                row(6, "2026-06-01", 12),
+                json!(["v"]),
+            ),
+        ],
+        "the inserts through parted, then each row rewritten in the partition the migration made, under parted",
+    );
+}
+
+/// The same, in one `DO` block that makes the partition, fills it and
+/// rewrites it. Before the statement `parted` held no row, so by
+/// CONTRACT.md's "a row after with none before is one of `kind` `insert`
+/// with its `new`" the rewrite's entries are inserts of the rows as they
+/// are after the statement, beside the capture's inserts of the rows as
+/// they were put in. Either way the history ends with each row as it is.
+#[test]
+fn a_partition_made_filled_and_rewritten_in_one_statement_is_recorded_under_the_partitioned_table()
+{
+    let mut r = Rewrite::start();
+    let last = parted_without_partitions(&mut r);
+    let migration = "0005_new_partition_in_one";
+    r.send_ok(&[Migration::new(
+        migration,
+        &[r#"DO $d$
+BEGIN
+  CREATE TABLE "parted_new" PARTITION OF "parted" FOR VALUES FROM ('2026-01-01') TO ('2030-01-01');
+  INSERT INTO "parted" ("id", "day", "v") VALUES (5, '2026-05-01', 1), (6, '2026-06-01', 2);
+  ALTER TABLE "parted" ALTER COLUMN "v" SET DATA TYPE bigint USING "v" + 10;
+END
+$d$;"#],
+    )]);
+    let rows = row_entries(&r.db, last);
+    let k5 = json!({ "id": 5, "day": "2026-05-01" });
+    let k6 = json!({ "id": 6, "day": "2026-06-01" });
+    let mut want = vec![
+        (k5.clone(), Value::Null, json!(1)),
+        (k5, Value::Null, json!(11)),
+        (k6.clone(), Value::Null, json!(2)),
+        (k6, Value::Null, json!(12)),
+    ];
+    want.sort_by_key(|f| f.0.to_string());
+    let mut got = parted_entries(&rows, "insert");
+    got.sort_by_key(|f| format!("{} {}", f.0, f.2));
+    want.sort_by_key(|f| format!("{} {}", f.0, f.2));
+    assert_eq!(
+        got,
+        want,
+        "under parted: the capture's inserts (v 1 and 2) and the rewrite's (v 11 and 12); got\n{}",
+        lines(&rows)
+    );
+    assert_eq!(
+        rows.len(),
+        4,
+        "nothing else, and nothing under parted_new: {}",
+        lines(&rows)
+    );
+    for e in &rows {
+        assert_eq!(e["migration"], migration, "{e}");
+        assert_eq!(e["actor"], "migration", "{e}");
+    }
+}
+
+/// CONTRACT.md: "\"At the top\" among the tables that had history when the
+/// migration began: when the migration itself puts such a table under a
+/// new partitioned table and rewrites it through that one, the rows are
+/// recorded under the table's own name." `other` is attached to `np`,
+/// which the migration makes, and rewritten through `np`.
+#[test]
+fn a_table_put_under_a_new_partitioned_table_and_rewritten_through_it_is_recorded_under_its_own_name()
+ {
+    let mut r = Rewrite::start();
+    let last = last_history_id(&r.db);
+    let migration = "0004_under_np";
+    r.send_ok(&[Migration::new(
+        migration,
+        &[
+            r#"CREATE TABLE "np" (
+	"id" integer NOT NULL,
+	"v" integer,
+	CONSTRAINT "np_pk" PRIMARY KEY("id")
+) PARTITION BY RANGE ("id");"#,
+            r#"ALTER TABLE "np" ATTACH PARTITION "other" FOR VALUES FROM (0) TO (1000);"#,
+            r#"ALTER TABLE "np" ALTER COLUMN "v" SET DATA TYPE bigint USING "v" + 1;"#,
+        ],
+    )]);
+    assert_row_entries(
+        &row_entries(&r.db, last),
+        &[migration_update(
+            migration,
+            "other",
+            id_key(1),
+            json!({ "id": 1, "v": 1 }),
+            json!({ "id": 1, "v": 2 }),
+            json!(["v"]),
+        )],
+        "other's row under other, not under np",
+    );
+}
+
+/// CONTRACT.md: `table_name` is the table's name at the time of the change
+/// ("history is kept under the table's name at the time of each change"),
+/// and a rewrite's entry is "like a row an `UPDATE` changed", made by the
+/// statement: a table renamed and rewritten in one `DO` block has its
+/// entries under the name after the statement; one renamed by an earlier
+/// statement of the same migration, under its new name.
+#[test]
+fn a_table_renamed_and_rewritten_has_its_entries_under_the_name_after_the_statement() {
+    let mut r = Rewrite::start();
+    let last = last_history_id(&r.db);
+    let migration = "0004_renamed";
+    r.send_ok(&[Migration::new(
+        migration,
+        &[
+            r#"DO $d$
+BEGIN
+  ALTER TABLE "amounts" RENAME TO "sums";
+  ALTER TABLE "sums" ALTER COLUMN "amount" SET DATA TYPE numeric USING 0;
+END
+$d$;"#,
+            r#"ALTER TABLE "wide" RENAME TO "broad";"#,
+            r#"ALTER TABLE "broad" ALTER COLUMN "i" SET DATA TYPE bigint USING "i" + 1;"#,
+        ],
+    )]);
+    assert_row_entries(
+        &row_entries(&r.db, last),
+        &[
+            migration_update(
+                migration,
+                "sums",
+                id_key(1),
+                json!({ "id": 1, "amount": 5, "note": "five!" }),
+                json!({ "id": 1, "amount": 0, "note": "five!" }),
+                json!(["amount"]),
+            ),
+            migration_update(
+                migration,
+                "sums",
+                id_key(3),
+                json!({ "id": 3, "amount": null, "note": "none" }),
+                json!({ "id": 3, "amount": 0, "note": "none" }),
+                json!(["amount"]),
+            ),
+            migration_update(
+                migration,
+                "broad",
+                id_key(1),
+                json!({ "id": 1, "i": 12, "v": "vee", "n": 1.5, "c": "c1" }),
+                json!({ "id": 1, "i": 13, "v": "vee", "n": 1.5, "c": "c1" }),
+                json!(["i"]),
+            ),
+        ],
+        "renamed in the statement: under sums; renamed before it: under broad",
+    );
+}
+
+/// CONTRACT.md: the rewrite's entries have ids "less than those of what
+/// the migration changes after it". A rewrite of `amounts`, then an update
+/// of its row 2.
+#[test]
+fn a_rewrites_entries_come_before_what_the_migration_changes_after_it() {
+    let mut r = Rewrite::start();
+    let last = last_history_id(&r.db);
+    let migration = "0004_then_update";
+    r.send_ok(&[Migration::new(
+        migration,
+        &[
+            r#"ALTER TABLE "amounts" ALTER COLUMN "amount" SET DATA TYPE bigint USING coalesce("amount", 0) + 1;"#,
+            r#"UPDATE "amounts" SET "note" = 'after' WHERE "id" = 2;"#,
+        ],
+    )]);
+    let rows = row_entries(&r.db, last);
+    let later: Vec<&Value> = rows
+        .iter()
+        .filter(|e| e["changed"] == json!(["note"]))
+        .collect();
+    let rewrite: Vec<Value> = rows
+        .iter()
+        .filter(|e| e["changed"] == json!(["amount"]))
+        .cloned()
+        .collect();
+    assert!(
+        later.len() == 1 && rewrite.len() == 3 && rows.len() == 4,
+        "expected the rewrite's three entries and the later update; got\n{}",
+        lines(&rows)
+    );
+    let later_id = later[0]["id"].as_i64().unwrap();
+    assert!(
+        rewrite
+            .iter()
+            .all(|e| e["id"].as_i64().is_some_and(|id| id < later_id)),
+        "the rewrite's entries before the update the migration made after it ({later_id}):\n{}",
+        lines(&rows)
+    );
+    assert_eq!(
+        later[0]["old"],
+        json!({ "id": 2, "amount": 1, "note": "zero" }),
+        "the later update's old is the row as the rewrite left it"
+    );
+}
