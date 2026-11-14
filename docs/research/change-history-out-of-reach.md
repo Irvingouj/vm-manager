@@ -468,3 +468,37 @@ The ad hoc runs named above under `/tmp/t62/` (the builds without a shipment, th
 - the figures on Postgres 16 and 17;
 - where the last 0.1 ms or so of a write 100 ms apart goes;
 - with other sessions writing at the same time.
+
+## 14. I. A table's rows written anew: what Postgres does (added 2026-11-14 by the driving session, for the third slice, ticket #63)
+
+Provenance: run by the driving session with `docs/research/change-history-out-of-reach/i-facts.sh` (it starts a server of each version, runs `i_facts.py` as a role without superuser that owns its database, and stops it); the whole output is `i-facts.log` beside this file, exit 0. Everything below is [verified] on Postgres 16.15, 17.11 and 18.6, with the same answer on each unless a version is named.
+
+**Which statements give a table a new file node** (`pg_class.relfilenode` before and after):
+
+| statement | new file node |
+|---|---|
+| `ALTER COLUMN a TYPE bigint` from `integer` | yes |
+| `ALTER COLUMN v TYPE text` from `varchar(50)` | no |
+| `ALTER COLUMN n TYPE numeric(12,4)` from `numeric(10,2)` | yes (`1.50` reads `1.5000` after, and the two are equal as `jsonb`) |
+| `ALTER COLUMN ts TYPE timestamptz` from `timestamp`, the session's `TimeZone` being `UTC` | no |
+| `ALTER COLUMN a TYPE bigint USING 0`, the type it had | yes |
+| `SET UNLOGGED` | yes |
+| `ADD COLUMN r float8 DEFAULT random()` | yes |
+| `ADD COLUMN k int DEFAULT 7` | no |
+| `ALTER COLUMN a TYPE numeric USING a + 1` through `EXECUTE` in a `DO` block | yes |
+| a stored generated column's expression changed (`SET EXPRESSION`, Postgres 17 and 18; a syntax error on 16) | yes |
+| a virtual generated column's expression changed (Postgres 18) | no |
+
+So a new file node is what a statement that changes stored values through a rewrite always leaves, whatever its text; and a type change that leaves none changed no stored value. One of those changes the JSON form all the same: `timestamp` to `timestamptz` under `UTC` (the same instant, read with its offset from then on).
+
+**Comparing values as `jsonb`.** `'5'::jsonb = '"5"'::jsonb` is false; `'12'::jsonb = '12.0'::jsonb` is true.
+
+**Row security and the owner's reading.** With `ENABLE ROW LEVEL SECURITY` and not `FORCE`, the owner reads every row and `row_security_active()` is false for it. With `FORCE ROW LEVEL SECURITY` and no policy the owner reads no row, and `row_security_active()` is true. With `row_security` set to `off`, the owner's read of such a table fails with `42501` ("query would be affected by row-level security policy") rather than answer fewer rows.
+
+**Partitions.** A partition's column cannot be retyped by itself (`42P16`, "cannot alter inherited column"); retyped through the partitioned table, the partition has a new file node. So a rewrite that changes a partition's values comes through the partitioned table.
+
+**Virtual generated columns (Postgres 18).** Read from the table, `to_jsonb` of the row holds the column's computed value (the capture records it as null: `blackbox/CONTRACT.md`, "The capture itself"; not run again here). One whose expression calls a function of the Application's is refused by Postgres (`0A000`, "generation expression uses user-defined function"). On 16 and 17 `VIRTUAL` is a syntax error.
+
+**`pg_input_is_valid('abc', 'integer')`** is false and `('5', 'integer')` true, on all three.
+
+[not verified]: `CLUSTER` and `SET ACCESS METHOD`; an `INHERITS` child rewritten through its parent; what a rewrite costs in time (the implementation's part).

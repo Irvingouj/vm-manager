@@ -1,0 +1,66 @@
+######## Postgres 18 (18.6.0)
+version [('18.6',)]
+integer to bigint: ok; new file node: True
+varchar(50) to text: ok; new file node: False
+numeric(10,2) to numeric(12,4): ok; new file node: True
+the numeric after, as jsonb: ok [('1.5000', 't')]
+timestamp to timestamptz, TimeZone UTC: ok; new file node: False
+USING 0 to the type it had: ok; new file node: True
+SET UNLOGGED: ok; new file node: True
+ADD COLUMN with a volatile default: ok; new file node: True
+ADD COLUMN with a constant default: ok; new file node: False
+the same through a DO block: ok; new file node: True
+jsonb 5 = "5": ok [('f', 't')]
+enabled, not forced: the owner counts: ok [('2', 'f')]
+forced, no policy: the owner counts: ok [('0', 't')]
+forced, row_security off: ERROR 42501 query would be affected by row-level security policy for table "s"
+a partition's column retyped by itself: ERROR 42P16 cannot alter inherited column "a"
+through the partitioned table, the partition: ok; new file node: True
+pg_input_is_valid: ok [('f', 't')]
+a virtual generated column: made
+read from the table: ok [('{"a": 2, "b": 4, "id": 1}',)]
+one that calls the Application's function: ERROR 0A000 generation expression uses user-defined function
+a virtual column's expression changed: ok; new file node: False
+a stored generated column's expression changed: ok; new file node: True
+######## Postgres 16 (16.15.0)
+version [('16.15',)]
+integer to bigint: ok; new file node: True
+varchar(50) to text: ok; new file node: False
+numeric(10,2) to numeric(12,4): ok; new file node: True
+the numeric after, as jsonb: ok [('1.5000', 't')]
+timestamp to timestamptz, TimeZone UTC: ok; new file node: False
+USING 0 to the type it had: ok; new file node: True
+SET UNLOGGED: ok; new file node: True
+ADD COLUMN with a volatile default: ok; new file node: True
+ADD COLUMN with a constant default: ok; new file node: False
+the same through a DO block: ok; new file node: True
+jsonb 5 = "5": ok [('f', 't')]
+enabled, not forced: the owner counts: ok [('2', 'f')]
+forced, no policy: the owner counts: ok [('0', 't')]
+forced, row_security off: ERROR 42501 query would be affected by row-level security policy for table "s"
+a partition's column retyped by itself: ERROR 42P16 cannot alter inherited column "a"
+through the partitioned table, the partition: ok; new file node: True
+pg_input_is_valid: ok [('f', 't')]
+a virtual generated column: ERROR 42601 syntax error at or near "VIRTUAL"
+a stored generated column's expression changed: ERROR 42601 syntax error at or near "EXPRESSION"; new file node: False
+######## Postgres 17 (17.11.0)
+version [('17.11',)]
+integer to bigint: ok; new file node: True
+varchar(50) to text: ok; new file node: False
+numeric(10,2) to numeric(12,4): ok; new file node: True
+the numeric after, as jsonb: ok [('1.5000', 't')]
+timestamp to timestamptz, TimeZone UTC: ok; new file node: False
+USING 0 to the type it had: ok; new file node: True
+SET UNLOGGED: ok; new file node: True
+ADD COLUMN with a volatile default: ok; new file node: True
+ADD COLUMN with a constant default: ok; new file node: False
+the same through a DO block: ok; new file node: True
+jsonb 5 = "5": ok [('f', 't')]
+enabled, not forced: the owner counts: ok [('2', 'f')]
+forced, no policy: the owner counts: ok [('0', 't')]
+forced, row_security off: ERROR 42501 query would be affected by row-level security policy for table "s"
+a partition's column retyped by itself: ERROR 42P16 cannot alter inherited column "a"
+through the partitioned table, the partition: ok; new file node: True
+pg_input_is_valid: ok [('f', 't')]
+a virtual generated column: ERROR 42601 syntax error at or near "VIRTUAL"
+a stored generated column's expression changed: ok; new file node: True
