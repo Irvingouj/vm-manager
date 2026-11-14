@@ -59,6 +59,7 @@ pub mod history_earlier;
 pub mod history_kept;
 pub mod history_op;
 pub mod history_reading;
+pub mod history_rewrite;
 pub mod history_shipping;
 pub mod history_structure;
 pub mod http;

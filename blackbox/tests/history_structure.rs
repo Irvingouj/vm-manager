@@ -22,6 +22,9 @@
 //! - `table-rewritten`: a column's type "changed" to itself with `USING`,
 //!   `CLUSTER`, `SET LOGGED`, a column added with a volatile default; none
 //!   when a `column-type` entry of the same migration explains the rewrite;
+//!   since "A rewrite records each row it changed" (`history_rewrite.rs`),
+//!   a row whose value such a migration changed is an entry too, and the
+//!   tests whose rewrites change values expect it;
 //! - an enum value renamed: `columns` in the table's column order;
 //! - a partition attached or detached: the entry is the parent's, the
 //!   partition's own history has none;
@@ -47,6 +50,9 @@ use blackbox::history::{
     last_history_id,
 };
 use blackbox::history_op::changes_of;
+use blackbox::history_rewrite::{
+    assert_between, assert_row_entries, migration_update, row_entries,
+};
 use blackbox::history_structure::{
     Structure, WRITER, answered_ids, assert_structure_change, assert_structure_row,
     assert_structure_rows, newest_first, send_chronicle, structure_entries,
@@ -102,10 +108,13 @@ fn a_column_type_changed_with_or_without_using_is_an_entry_after_the_rows_change
         "the harness's own check: the Version changed the type"
     );
     let rows = history_after(&s.db, last);
+    // Since "A rewrite records each row it changed": `code` from '10' and
+    // '20' to 10 and 20 changes each row of priced (a string and a number
+    // differ); `size` to bigint and `price` to numeric(12,3) change no value.
     assert_eq!(
         rows.len(),
-        4,
-        "expected the migration's update of things and one structure entry per column whose type it changed, got:\n{}",
+        6,
+        "expected the migration's update of things, one update per row of priced whose code became a number, and one structure entry per column whose type it changed, got:\n{}",
         lines(&rows)
     );
     assert_change(
@@ -121,7 +130,46 @@ fn a_column_type_changed_with_or_without_using_is_an_entry_after_the_rows_change
         "the update the migration made before changing the type, recorded first",
     );
     let update_id = rows[0]["id"].as_i64().unwrap();
-    let structure: Vec<Value> = rows[1..].to_vec();
+    let rewritten: Vec<Value> = rows[1..]
+        .iter()
+        .filter(|r| r["kind"] != "structure")
+        .cloned()
+        .collect();
+    let structure: Vec<Value> = rows[1..]
+        .iter()
+        .filter(|r| r["kind"] == "structure")
+        .cloned()
+        .collect();
+    let priced =
+        |id: i64, price: f64, code: Value| json!({ "id": id, "price": price, "code": code });
+    assert_row_entries(
+        &rewritten,
+        &[
+            migration_update(
+                migration,
+                "priced",
+                json!({ "id": 1 }),
+                priced(1, 1.5, json!("10")),
+                priced(1, 1.5, json!(10)),
+                json!(["code"]),
+            ),
+            migration_update(
+                migration,
+                "priced",
+                json!({ "id": 2 }),
+                priced(2, 2.25, json!("20")),
+                priced(2, 2.25, json!(20)),
+                json!(["code"]),
+            ),
+        ],
+        "the rows the USING changed",
+    );
+    assert_between(
+        &rewritten,
+        Some(update_id),
+        &structure,
+        "the rewrite's entries",
+    );
     for row in &structure {
         assert!(
             row["id"].as_i64().is_some_and(|id| id > update_id),
@@ -698,8 +746,23 @@ fn a_table_rewritten_with_no_column_type_entry_to_say_why_is_an_entry() {
         );
     }
     let rewritten = || json!({ "change": "table-rewritten" });
+    // Since "A rewrite records each row it changed": of these rewrites only
+    // `swapped`'s changes a value ('s1' to 2); `priced`'s upper() leaves
+    // digits as they were, and `no_moods`'s `r` is only in `new`.
+    assert_row_entries(
+        &row_entries(&s.db, last),
+        &[migration_update(
+            migration,
+            "swapped",
+            json!({ "id": 1 }),
+            json!({ "id": 1, "label": "s1" }),
+            json!({ "id": 1, "label": 2 }),
+            json!(["label"]),
+        )],
+        "the one row whose value a rewrite changed",
+    );
     assert_structure_rows(
-        &history_after(&s.db, last),
+        &structure_entries(&s.db, last),
         &[
             ("priced", rewritten()),
             ("plain", rewritten()),

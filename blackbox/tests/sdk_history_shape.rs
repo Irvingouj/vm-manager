@@ -15,7 +15,9 @@
 //!   the end of the migration that made it ... one for each such change a
 //!   later migration makes, of the same Version or of a later one"): the
 //!   drop of `gone` is one on `reshaped`, the change of `code`'s type one on
-//!   `recast`; and each read is one operation `history`.
+//!   `recast`; since "A rewrite records each row it changed", recast's row,
+//!   whose `code` went from '5' to 5, is one more; and each read is one
+//!   operation `history`.
 //!
 //! Read in the present shape, a dropped column is not shown, an added one is
 //! null, a renamed one is null under its new name; in `changed`, a column
@@ -115,10 +117,13 @@ fn a_value_that_no_longer_casts_fails_the_read_and_changes_nothing_stored() {
     let user = ann();
     let stored = || history_where(&sdk.own, "h.table_name = 'recast'");
     let before = stored();
+    // Since "A rewrite records each row it changed", 0002_reshape's `code`
+    // from '5' to 5 is an entry too: recast was made by an earlier migration
+    // of the same Version.
     assert_eq!(
         before.len(),
-        3,
-        "the harness's own check: 0001_seed's insert and update of recast, and 0002_reshape's structure entry, are recorded:\n{}",
+        4,
+        "the harness's own check: 0001_seed's insert and update of recast, and 0002_reshape's entry of the row it rewrote and its structure entry, are recorded:\n{}",
         lines(&before)
     );
     for actor in ["user", "application"] {

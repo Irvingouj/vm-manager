@@ -967,7 +967,9 @@ fn a_key_that_is_not_exactly_the_primary_key_answers_no_row_and_a_value_its_type
 /// table's primary key columns (one missing, another column, a name the
 /// table does not have, any key for a table without a primary key) answers
 /// no row's changes (the `structure` entries only)". On `shapes` after
-/// [`RESHAPE`], which has two `structure` entries and two changes of row 1.
+/// [`RESHAPE`], which has two `structure` entries and three changes of row
+/// 1 (since "A rewrite records each row it changed", `d` from '12' to 12 is
+/// one).
 #[test]
 fn a_key_that_is_not_exactly_the_primary_key_answers_the_structure_entries_only() {
     let (own, _db, _, _) = reshaped();
@@ -979,8 +981,8 @@ fn a_key_that_is_not_exactly_the_primary_key_answers_the_structure_entries_only(
         .collect();
     assert_eq!(
         (all.len(), structure_ids.len()),
-        (4, 2),
-        "the harness's own check: shapes has two structure entries and two changes of row 1, got {all:?}"
+        (5, 2),
+        "the harness's own check: shapes has two structure entries and three changes of row 1, got {all:?}"
     );
     let (_, of_row, _) = read_ok(
         &own,
@@ -990,7 +992,7 @@ fn a_key_that_is_not_exactly_the_primary_key_answers_the_structure_entries_only(
     );
     assert_eq!(
         of_row.len(),
-        4,
+        5,
         "the control: the primary key answers the row's changes and the structure entries, got {of_row:?}"
     );
     let mut failures = Vec::new();
@@ -1420,10 +1422,14 @@ fn the_answer_is_in_the_tables_present_shape() {
             json!(["id", "bb", "c", "d", "e"]),
             "{context}: expected the present columns: `a` dropped, `b` renamed `bb`, `e` added"
         );
+        // Since "A rewrite records each row it changed": `d` from '12' to
+        // 12 is an entry of its own, after the update, before the structure
+        // entries; its `old` was the row just before the statement, when
+        // `b` was already `bb`.
         assert_eq!(
             changes.len(),
-            4,
-            "{context}: two structure entries, the update, the insert; got {changes:?}"
+            5,
+            "{context}: two structure entries, the rewrite's entry, the update, the insert; got {changes:?}"
         );
         assert_newest_first(&changes, &context);
         let mut structures: Vec<Value> = changes[..2]
@@ -1442,8 +1448,23 @@ fn the_answer_is_in_the_tables_present_shape() {
             assert_structure(change, &s, &context);
         }
         let key = json!({ "id": 1 });
+        assert_change_fields(&changes[2], &context);
+        let mut rewrite = changes[2].clone();
+        let o = rewrite.as_object_mut().unwrap();
+        o.remove("id");
+        o.remove("at");
+        assert_eq!(
+            rewrite,
+            json!({
+                "kind": "update", "key": key,
+                "old": [1, "y", 6, 12, null], "new": [1, "y", 6, 12, null], "changed": ["d"],
+                "user_id": INSTALLER, "application": APP, "actor": "migration",
+                "request": null, "migration": RESHAPE, "structure": null,
+            }),
+            "{context}: the rewrite's entry, `d` '12' then 12 (each cast to integer when read), `bb` as it was then"
+        );
         assert_row_change(
-            &changes[2],
+            &changes[3],
             &RowChange::update(
                 "bob",
                 "application",
@@ -1458,7 +1479,7 @@ fn the_answer_is_in_the_tables_present_shape() {
             ),
         );
         assert_row_change(
-            &changes[3],
+            &changes[4],
             &RowChange::insert(
                 "alice",
                 "user",
@@ -1504,13 +1525,16 @@ fn the_answer_is_in_the_tables_present_shape() {
 #[test]
 fn a_value_that_no_longer_fits_its_column_fails_the_read_whole() {
     let (own, _db, _, _) = reshaped();
-    // `retyped`, newest first: the column-type entry, row 2 ('42'), row 1
-    // ('abc', which no integer is).
+    // `retyped`, newest first: the column-type entry; the rewrite's entries
+    // of rows 1 ('abc' then 0) and 2 ('42' then 42), in an order
+    // CONTRACT.md does not give (since "A rewrite records each row it
+    // changed"); the inserts of row 2 ('42') and row 1 ('abc', which no
+    // integer is).
     for (extra, code) in [
         (json!({}), Some("22P02")),
         (json!({ "key": { "id": 1 } }), Some("22P02")),
         (json!({ "limit": 3 }), Some("22P02")),
-        (json!({ "limit": 2 }), None),
+        (json!({ "limit": 1 }), None),
         (json!({ "key": { "id": 2 } }), None),
     ] {
         let (response, answer) = read(&own, APP, &alice(), &public("user", "retyped", &extra));
@@ -1535,17 +1559,38 @@ fn a_value_that_no_longer_fits_its_column_fails_the_read_whole() {
             }
             None => {
                 let changes = ok_changes(&answer, &context);
-                assert_eq!(changes.len(), 2, "{context}: {changes:?}");
+                let want = if extra.get("limit").is_some() { 1 } else { 3 };
+                assert_eq!(changes.len(), want, "{context}: {changes:?}");
                 assert_structure(
                     &changes[0],
                     &json!({ "change": "column-type", "column": "v", "from": "text", "to": "integer" }),
                     &context,
                 );
-                assert_eq!(
-                    changes[1]["new"],
-                    json!([2, 42]),
-                    "{context}: '42' cast to integer"
-                );
+                if want == 3 {
+                    assert_eq!(
+                        (
+                            &changes[1]["kind"],
+                            &changes[1]["migration"],
+                            &changes[1]["changed"]
+                        ),
+                        (&json!("update"), &json!(RESHAPE), &json!(["v"])),
+                        "{context}: the rewrite's entry of row 2: {}",
+                        changes[1]
+                    );
+                    for change in &changes[1..] {
+                        assert_eq!(
+                            change["new"],
+                            json!([2, 42]),
+                            "{context}: '42' cast to integer"
+                        );
+                    }
+                    assert_eq!(
+                        changes[1]["old"],
+                        json!([2, 42]),
+                        "{context}: the rewrite's `old` '42', cast to integer"
+                    );
+                    assert_eq!(changes[2]["kind"], "insert", "{context}: {}", changes[2]);
+                }
             }
         }
     }
