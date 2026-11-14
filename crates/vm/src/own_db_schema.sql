@@ -879,8 +879,8 @@ $f$;
 -- array, a range or multirange over it, a composite type or row type with
 -- an attribute of it, at any depth), `partition-attached` (a table that
 -- was there, attached) and `partition-detached` (detached or dropped),
--- under the table's name now. On a table that is gone, or whose name another table
--- has now, and that was not a partition: `table-dropped` or
+-- under the table's name now. On a table that is gone, or whose name
+-- another table has now, and that was not a partition: `table-dropped` or
 -- `table-replaced`, under the name it had.
 CREATE OR REPLACE FUNCTION vm.record_structure(p_before jsonb) RETURNS integer
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER PARALLEL UNSAFE

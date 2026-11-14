@@ -120,7 +120,8 @@ const RETRY_AFTER: Duration = Duration::from_secs(1);
 /// The longest opening the connection to the own database may take.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// The greatest id in the outbox now: the mark a pass ships up to.
+/// The greatest id in the outbox now: the mark a read is given, and
+/// served by once a batch has shipped an id at least as great.
 const MARK: &str = "SELECT pg_catalog.max(b.id) FROM vm.outbox b";
 
 /// The next batch of the outbox, oldest first: the ids, and the rows as
