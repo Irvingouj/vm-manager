@@ -1150,9 +1150,7 @@ DECLARE
     v_made integer;
 BEGIN
     PERFORM vm.rewrite_who(p_token);
-    DELETE FROM vm.rewrite_rows;
-    DELETE FROM vm.rewrite_columns;
-    DELETE FROM vm.rewrite_nodes;
+    TRUNCATE vm.rewrite_rows, vm.rewrite_columns, vm.rewrite_nodes;
     INSERT INTO vm.rewrite_nodes (relid, node, s, n)
     SELECT c.oid, pg_catalog.pg_relation_filenode(c.oid), n.nspname::text, c.relname::text
       FROM pg_catalog.pg_class c
@@ -1221,8 +1219,7 @@ DECLARE
     v_roots oid[];
 BEGIN
     PERFORM vm.rewrite_who(p_token);
-    DELETE FROM vm.rewrite_rows;
-    DELETE FROM vm.rewrite_columns;
+    TRUNCATE vm.rewrite_rows, vm.rewrite_columns;
     WITH RECURSIVE named AS (
         SELECT t.relid
           FROM pg_catalog.generate_subscripts(p_names, 1) i
@@ -1248,7 +1245,7 @@ $f$;
 -- Keeps what a reading `p_phase` (0 before the statement, 1 after) of
 -- the table `p_relid` read. Without rows, it begins: the table's columns
 -- as the reading sees them (number, name, whether virtual, place in the
--- primary key), what an earlier reading of the same phase kept gone.
+-- primary key); once per table and phase between two clearings.
 -- With rows, each as the capture records it (`p_rows`) with the names of
 -- its `json` and `jsonb` columns holding JSON null (`p_nulls`).
 CREATE OR REPLACE FUNCTION vm.rewrite_keep(p_token text, p_relid oid, p_phase smallint,
@@ -1266,8 +1263,10 @@ BEGIN
             RAISE EXCEPTION USING ERRCODE = 'VM001',
                 MESSAGE = 'only a table noted at the start of the migration is read';
         END IF;
-        DELETE FROM vm.rewrite_columns k WHERE k.relid = p_relid AND k.phase = p_phase;
-        DELETE FROM vm.rewrite_rows r WHERE r.relid = p_relid AND r.phase = p_phase;
+        IF EXISTS (SELECT FROM vm.rewrite_columns k WHERE k.relid = p_relid AND k.phase = p_phase) THEN
+            RAISE EXCEPTION USING ERRCODE = 'VM001',
+                MESSAGE = 'a table is read once before a statement and once after it';
+        END IF;
         INSERT INTO vm.rewrite_columns (relid, phase, attnum, name, virtual, key)
         SELECT p_relid, p_phase, a.attnum, a.attname::text, a.attgenerated = 'v',
                (SELECT pg_catalog.array_position(i.indkey::int2[], a.attnum)::smallint
@@ -1429,7 +1428,7 @@ $f$;
 
 -- Compares the rows of `p_relid` read before and after the statement and
 -- records each that differs, under the identity the token carries, in
--- the outbox; then forgets them. Answers how many entries. Touches only
+-- the outbox (`vm.rewrite_done` forgets them). Answers how many entries. Touches only
 -- `vm` and the catalog: no value is cast to a type of the Application's,
 -- nothing of the Application's runs. A table without a primary key that
 -- is the same columns before and after is compared as a multiset of
@@ -1496,8 +1495,6 @@ BEGIN
                     'the statement wrote the rows of the table %I.%I anew with other values, and the table has no primary key that is the same columns before and after the statement, so its rows cannot be paired to record each one that changed: give it a primary key in an earlier statement',
                     v_schema, v_table);
         END IF;
-        DELETE FROM vm.rewrite_rows r WHERE r.relid = p_relid;
-        DELETE FROM vm.rewrite_columns k WHERE k.relid = p_relid;
         RETURN 0;
     END IF;
     -- The expressions the comparison is made of, written once per table
@@ -1597,8 +1594,6 @@ BEGIN
     $q$, v_key_before, v_key_after, v_object_before, v_object_after, v_changed)
     USING p_relid, v_at, v_schema, v_table, v_who;
     GET DIAGNOSTICS v_made = ROW_COUNT;
-    DELETE FROM vm.rewrite_rows r WHERE r.relid = p_relid;
-    DELETE FROM vm.rewrite_columns k WHERE k.relid = p_relid;
     RETURN v_made;
 END
 $f$;
@@ -1611,10 +1606,10 @@ SET search_path = pg_catalog, pg_temp
 AS $f$
 BEGIN
     PERFORM vm.rewrite_who(p_token);
-    DELETE FROM vm.rewrite_rows;
-    DELETE FROM vm.rewrite_columns;
     IF p_end THEN
-        DELETE FROM vm.rewrite_nodes;
+        TRUNCATE vm.rewrite_rows, vm.rewrite_columns, vm.rewrite_nodes;
+    ELSE
+        TRUNCATE vm.rewrite_rows, vm.rewrite_columns;
     END IF;
 END
 $f$;
