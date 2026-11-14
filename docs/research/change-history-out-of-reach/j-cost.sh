@@ -16,7 +16,9 @@
 # through this checkout's black-box harness (`VM_BIN`), beside the
 # harness's own Postgres 18, by `j_cost.rs`, which is copied into
 # blackbox/tests/ for the run and removed after it, as are the worktrees.
-# Run it on a quiet machine and not beside a gate. J_ROWS (default 100000)
+# J_STAGES (default "1 2 breakdown big") runs only some of what follows,
+# so that the run can be made in parts. Run it on a quiet machine and not
+# beside a gate. J_ROWS (default 100000)
 # is the rewritten table's size; at the end, `rewrite` runs once more on
 # each binary at 1,000,000 rows, one Version of each kind.
 #   statements  a Version that rewrites nothing: one statement's cost and
@@ -71,15 +73,21 @@ run() { # run LABEL BINARY PARTS [ROWS ROUNDS]
     cargo test -q -p blackbox --test j_cost -- --nocapture 2>&1) | grep -E '^J |^test result|panicked'
 }
 echo "# $(date -u +%FT%TZ) on $(uname -srm), $(nproc) CPUs"
-for round in 1 2; do
-  echo "#### round $round"
-  run before "$BEFORE" statements,rewrite
-  if [ -n "$MIDDLE" ]; then
-    run middle "$MIDDLE" statements,rewrite
-  fi
-  run after "$AFTER" statements,rewrite
+for stage in ${J_STAGES:-1 2 breakdown big}; do
+  case "$stage" in
+    1|2)
+      echo "#### round $stage"
+      run before "$BEFORE" statements,rewrite
+      if [ -n "$MIDDLE" ]; then
+        run middle "$MIDDLE" statements,rewrite
+      fi
+      run after "$AFTER" statements,rewrite
+      ;;
+    breakdown) run after "$AFTER" breakdown ;;
+    big)
+      run before "$BEFORE" rewrite 1000000 1
+      run after "$AFTER" rewrite 1000000 1
+      ;;
+  esac
 done
-run after "$AFTER" breakdown
-run before "$BEFORE" rewrite 1000000 1
-run after "$AFTER" rewrite 1000000 1
 echo "# whole run: ${SECONDS} s"

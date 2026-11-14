@@ -505,50 +505,87 @@ So a new file node is what a statement that changes stored values through a rewr
 
 **A table made, and made and written anew in one statement** (added 2026-11-14 by the implementation agent of ticket #63, in its second round; the script's last lines, marked so in `i_facts.py`, and their output in `i-facts.log`). On 16, 17 and 18 alike [verified]: a table only made has the file node that is its own oid: `CREATE TABLE`, `CREATE TABLE AS`, a partition made with `PARTITION OF`, a partition made and filled in one `DO` block, and a table made earlier and attached as a partition. A partition made, filled and its column retyped through the partitioned table in one `DO` block, and a table made and set `UNLOGGED` in one `DO` block, have a file node other than their oid. A partitioned table has no file node (`pg_relation_filenode` is null); the partitions made are seen in `pg_inherits`. What the program relies on: a table it had not seen, found under a partitioned table with history, whose file node is not its oid, was written anew since it was made, and is read as rewritten. A file node that changes without the values changing (`SET UNLOGGED`, `TRUNCATE`, a table made, written anew and only later attached) makes it read too much, never miss a rewrite [reasoned from these facts and from Postgres giving a new file node to every rewrite, part I above].
 
-## 15. J. What ticket #63 costs: a rewrite read before and after, and compared (added 2026-11-14 by the implementation agent)
+## 15. J. What ticket #63 costs: a rewrite read before and after, and compared (added 2026-11-14 by the implementation agent, rewritten in its second round)
 
-Provenance of this part: written by the implementation agent of ticket #63. Every figure below is from one run of `docs/research/change-history-out-of-reach/j-cost.sh`; its whole output is `j-cost.log` beside this file (exit 0, 324 s in all, 22 s of it building) [verified]. The script follows `h-cost.sh`: it builds `vm` with `cargo build --release` at two commits, each in a git worktree of its own, and drives each through the black-box harness beside its Postgres 18 with `j_cost.rs`, copied into `blackbox/tests/` for the run and removed after it. The builds are **before**, `9643cb1` (the last commit before the ticket's program), and **after**, `ddfceff` (the ticket's program as handed back). The machine is a shared VM with 12 CPUs. Earlier runs at earlier commits of the ticket are not kept; what they taught is said where it changed the program.
+Provenance of this part: written by the implementation agent of ticket #63, and rewritten after the first review from a new run. Every figure below is from that run of `docs/research/change-history-out-of-reach/j-cost.sh`, made in three parts so that each fits the agent's ten-minute limit on a command (`J_STAGES=1`, `J_STAGES=2`, `J_STAGES="breakdown big"`). Their outputs, one after the other, are `j-cost.log` beside this file (each exit 0; 253, 251 and 259 s, about 33 s of each building or checking the builds) [verified]. The script follows `h-cost.sh`. It builds `vm` with `cargo build --release` at three commits, each in a git worktree of its own, and drives each through the black-box harness beside its Postgres 18 with `j_cost.rs`, which is copied into `blackbox/tests/` for the run and removed after it. The builds are:
 
-**A Version that rewrites nothing.** One statement's cost, measured as in parts G and H: a Version whose last migration is 301 `SELECT 1` against one whose last migration is one, over 300, medians of five, two rounds [verified]:
+- **before**: `9643cb1`, the last commit before the ticket's program;
+- **middle**: `e9a6ce8`, the ticket's first round, which foresaw a rewrite from a statement's text and noted every table anew at each migration;
+- **after**: `381cf21`, the second round, whose program is that of `e7c918d`.
 
-| | 10 tables | 500 tables |
-|---|---|---|
-| before | 0.196, 0.192 ms | 0.189, 0.199 ms |
-| after | 0.221, 0.222 ms | 0.248, 0.246 ms |
+The machine is a shared VM with 12 CPUs. The figures of the first round's own run (a table of four columns) are in this file's history; this run's table has five more columns, so the two runs' rewrite figures are not to be compared with each other.
 
-After each statement the question that travels with it now also asks `vm.rewrites_seen()`: for each table noted at the migration's start, whether `pg_relation_filenode` differs from what was noted [from code]. That is 0.025 ms more per statement at 10 tables and about 0.05 ms at 500 [verified, the table]. A first form joined the noted tables to `pg_class`; its plan was made with no statistics for the noted tables (filled in the same transaction) and cost 0.38 ms a statement at 10 tables and 0.69 ms at 500 [verified in an earlier run of the script at `c24b230`, whose log is `/tmp/t63/j-cost.try1.log` on the machine it ran on, not in the repository; the cause measured alone on a scratch server, 0.10 against 0.21 ms per question at 10 tables with and without `ANALYZE` (`/tmp/t63/bench/seen.py`, likewise not kept)]. A Version with one migration of one `SELECT 1` took 35.4 and 35.4 ms before and 38.4 and 39.2 ms after at 10 tables, 129.0 and 127.8 ms before and 134.2 and 131.8 ms after at 500 [verified]: noting the tables at the migration's start and forgetting them at its end, about 3 to 4 ms [reasoned from these figures].
+**A Version that rewrites nothing.** Two figures, as in parts G and H, medians of five, two rounds each [verified]:
 
-**A rewrite of 100,000 rows.** `big` has 100,000 rows of four columns (`integer` key, `integer`, `text`, `timestamptz`), filled by an earlier migration. Each Version is one migration of one statement, three of each kind per round, two rounds; between Versions the outbox is waited for until empty and `vm.outbox` and `big` are vacuumed [verified, the script]. Medians [verified]:
+- one statement: a Version whose last migration is 301 `SELECT 1` against one whose last migration is one, over 300;
+- one migration: a Version of 21 migrations of one `SELECT 1` each against one of one, over 20.
 
-| a Version that | before | after | runs (after) |
+| | a statement, 10 tables | a statement, 500 tables | a migration, 10 tables | a migration, 500 tables |
+|---|---|---|---|---|
+| before | 0.196, 0.195 ms | 0.183, 0.196 ms | 5.86, 5.77 ms | 74.0, 74.2 ms |
+| middle | 0.216, 0.217 ms | 0.244, 0.248 ms | 7.68, 7.72 ms | 76.3, 75.5 ms |
+| after | 0.219, 0.220 ms | 0.264, 0.255 ms | 6.54, 6.59 ms | 74.7, 74.6 ms |
+
+Per statement, after each statement the question that travels with it also asks `vm.rewrites_seen()` [from code]:
+
+- for each watched table, whether `pg_relation_filenode` differs from what was noted;
+- for each partitioned one, whether its partitions in `pg_inherits` differ.
+
+That is about 0.02 ms more per statement at 10 tables and 0.06 to 0.08 ms at 500 [verified, the table]. A first form joined the noted tables to `pg_class`, planned with no statistics; it cost 0.38 ms a statement at 10 tables and 0.69 ms at 500 [verified in a run of the first round, log not in the repository].
+
+Per migration, the first round noted every table anew at each migration's start and emptied its three tables at its end (`TRUNCATE`): 1.8 ms a migration at 10 tables and 1.3 to 2.3 ms at 500 [reasoned from the table, middle against before]. Now [from code]:
+
+- the run's first migration notes every table;
+- each next one only brings the noting up to date: tables gone forgotten, names changed, the tables the migration before made added;
+- the readings' tables are emptied only when they hold something;
+- the noting is deleted once, after the last migration.
+
+What is left is 0.7 to 0.8 ms a migration at 10 tables and 0.4 to 0.7 ms at 500 [reasoned from the table, after against before]. Most of a migration's cost at 500 tables (74 ms before the ticket) is not this ticket's [verified, the table]: the capture's checks, which part G measured.
+
+**A rewrite of 100,000 rows.** `big` has 100,000 rows of nine columns: an `integer` key, an `integer`, a `text`, a `timestamptz` and five `varchar(50)`. It is filled by an earlier migration. Each Version is one migration of one statement, three of each kind per round, two rounds. Between Versions the outbox is waited for until empty, and `vm.outbox` and `big` are vacuumed [verified, the script]. Medians [verified]:
+
+| a Version that | before | middle | after | runs (after) |
+|---|---|---|---|---|
+| retypes a column `USING amount + 1`: every row changes | 189, 193 ms | 2235, 2272 ms | 2403, 2403 ms | 2 |
+| retypes a column with no `USING`: no row changes | 185, 187 ms | 1491, 1512 ms | 1652, 1650 ms | 2 |
+| retypes it `USING amount + 1` through `EXECUTE` in a `DO` block | 186, 187 ms | 2382, 2381 ms | 2414, 2366 ms | 2 |
+| changes a `varchar(50)` column to `text`, which Postgres does without writing the rows anew | 133, 132 ms | 501, 504 ms | 137, 136 ms | 1 |
+
+Runs are counted by `vm.rewrite_begin`'s calls in the function statistics below: one migration, so one call per run [verified]. Nothing is foreseen from a statement's text any more, so every rewrite is learnt in the first run, which is undone, and read in the second [from code]. That costs a plain `ALTER ... TYPE` 150 to 170 ms more than in the first round, which foresaw it and read it in its first run [verified, the table: 2403 against 2235 and 2272 ms; 1652 against 1491 and 1512 ms]. In return, a change of type that writes no row anew costs what it cost before the ticket: 137 and 136 ms against 133 and 132 ms. The first round read the whole table for it: 501 and 504 ms [verified].
+
+Where the time of one Version goes, from Postgres's function statistics: `track_functions = 'all'` on the own database for one more Version of each kind; total time, which includes what the function calls [verified]:
+
+| | every row changes (2237 ms) | no row changes (1502 ms) | in a `DO` block (2231 ms) |
 |---|---|---|---|
-| retypes a column `USING amount + 1`: every row changes | 187, 180 ms | 1668, 1675 ms | 1 |
-| retypes a column with no `USING`: no row changes | 182, 178 ms | 1051, 1048 ms | 1 |
-| retypes it `USING amount + 1` through `EXECUTE` in a `DO` block | 183, 183 ms | 1790, 1793 ms | 2 |
+| the reading before (`vm.rewrite_before`) | 369 ms | 371 ms | 360 ms |
+| the reading after (`vm.rewrite_record_after` less `vm.rewrite_record`) | 357 ms | 361 ms | 359 ms |
+| of both, keeping the rows in `vm` (`vm.rewrite_keep`, 42 calls) | 157 ms | 162 ms | 156 ms |
+| the comparison and the entries written (`vm.rewrite_record`) | 1337 ms | 591 ms | 1331 ms |
+| the noting, both runs (`vm.rewrite_begin`, 2 calls) | 3.2 ms | 3.3 ms | 3.0 ms |
+| a statement's question (`vm.rewrites_seen`, 4 calls) | 0.7 ms | 0.6 ms | 0.7 ms |
 
-The runs are counted by `vm.rewrite_begin`'s calls in the function statistics below (one migration, so one call per run) [verified]. A plain `ALTER ... TYPE` is foreseen from its text and read before it in the first run; the same statement in a `DO` block is seen only after it, so the first run learns and is undone, and the second reads [from code]. That second run cost 120 ms here (1790 against 1668) [verified]: the first run does not read, so it costs about what a Version cost before the ticket.
+So of an every-row Version, the two readings are 32% and the comparison with its 100,000 entries 60%. With no row changed, the readings are 49% and the comparison 39% [reasoned from the table]. The rest, about 170 ms, is the first run and the Version's other steps [reasoned].
 
-Where the time of one Version goes, from Postgres's function statistics (`track_functions = 'all'` on the own database for one more Version of each kind; total time, which includes what the function calls) [verified]:
+Two changes made in the course of the first round, from runs whose logs are not in the repository [verified in those runs]:
 
-| | every row changes (1585 ms) | no row changes (972 ms) | in a `DO` block (1674 ms) |
-|---|---|---|---|
-| the reading before (`vm.rewrite_before`) | 221 ms | 233 ms | 224 ms |
-| the reading after (`vm.rewrite_record_after` less `vm.rewrite_record`) | 216 ms | 214 ms | 214 ms |
-| of both, keeping the rows in `vm` (`vm.rewrite_keep`, 42 calls) | 148 ms | 151 ms | 146 ms |
-| the comparison and the entries written (`vm.rewrite_record`) | 1057 ms | 433 ms | 1063 ms |
-| what is left of the readings cleared (`vm.rewrite_done`, `TRUNCATE`) | 4 ms | 5 ms | 5 ms |
-| a statement's question (`vm.rewrites_seen`) | 0.2 ms | 0.1 ms | 0.3 ms |
+- the comparison's per-row subqueries became expressions written once per table: `vm.rewrite_record` went from 1.74 s to 1.06 s with every row of the four-column table changed;
+- the readings, cleared with `DELETE`, left 200,000 dead rows per Version for the next to scan, until they were cleared with `TRUNCATE`: a Version in a `DO` block went from 3.7 s to 1.8 s.
 
-So of an every-row Version, the two readings are 28% and the comparison with its 100,000 entries 67%; with no row changed, the readings are 46% and the comparison 45% [reasoned from the table]. Two changes made in the course of the ticket, each from an earlier run of this script (`/tmp/t63/j-cost.try1.log` to `try3.log` on the machine they ran on, not in the repository): the comparison's per-row subqueries became expressions written once per table (`vm.rewrite_record` from 1.74 s to 1.06 s with every row changed); and the readings were cleared with `DELETE`, which left 200,000 dead rows per Version in `vm.rewrite_rows` for the next to scan, until they were cleared with `TRUNCATE` (a Version in a `DO` block from 3.7 s to 1.8 s) [verified in those runs, logs not kept].
-
-**What the time limit makes impossible.** The same three Versions once at 1,000,000 rows [verified]:
+**What the time limit makes impossible.** The same Versions once at 1,000,000 rows [verified]:
 
 | a Version that | before | after |
 |---|---|---|
-| changes every row | 515 ms | 16,013 ms |
-| changes no row | 513 ms | 10,057 ms |
-| changes every row, in a `DO` block | 521 ms | 16,438 ms |
+| changes every row | 556 ms | 22,689 ms |
+| changes no row | 602 ms | 15,408 ms |
+| changes every row, in a `DO` block | 596 ms | 22,614 ms |
+| changes `varchar(50)` to `text` | 35 ms | 40 ms |
 
-From 100,000 to 1,000,000 rows the time after grew about tenfold, about 16 us a row with every row changed [reasoned from the two tables]. At that rate a rewrite that changes every row of a table of about 2.8 million rows, or one that changes none of about 4.5 million, takes the 45 s a Version's migrations have, and the Version fails as timed out; before the ticket the same statement took about 0.5 s per million rows, so tables up to tens of millions of rows could be rewritten within the limit [reasoned by linear extrapolation, not run beyond 1,000,000 rows]. A table that size whose every row changes also writes as many entries of the history, which part H's shipping then carries [from code].
+From 100,000 to 1,000,000 rows the time after grew about ninefold: about 22 us a row with every row changed, about 15 us with none [reasoned from the two tables]. At that rate, with rows like these, the 45 s a Version's migrations have are reached at about 2 million rows by a rewrite that changes every row, and at about 3 million by one that changes none; the Version then fails as timed out. Before the ticket the same statement took about 0.6 s per million rows, so tables of tens of millions of rows could be rewritten within the limit [reasoned by linear extrapolation, not run beyond 1,000,000 rows]. A table that size whose every row changes also writes as many entries of the history, which part H's shipping then carries [from code].
 
-[not verified]: the figures on Postgres 16 and 17; with other sessions writing meanwhile; rows wider than four columns, or with large `jsonb` values; memory, which is bounded per reading by its chunks of 5,000 rows in `vm.rewrite_read` and otherwise left to Postgres's `work_mem` in the comparison's hash joins [from code].
+[not verified]:
+
+- the figures on Postgres 16 and 17;
+- with other sessions writing meanwhile;
+- with large `jsonb` values;
+- memory, which is bounded per reading by its chunks of 5,000 rows in `vm.rewrite_read` and otherwise left to Postgres's `work_mem` in the comparison's hash joins [from code];
+- what watching the partitions a migration makes costs when it makes many: each statement after asks, per watched partitioned table, its partitions by the index of `pg_inherits` [from code, not measured].

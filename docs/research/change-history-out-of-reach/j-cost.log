@@ -1,93 +1,139 @@
-# building: before 9643cb1, after ddfceff
-# built in 22 s
-# 2026-11-14T21:02:03Z on Linux 6.8.0-1070-azure x86_64, 12 CPUs
+# building: before 9643cb1, after 381cf21, middle e9a6ce8
+# built in 33 s
+# 2026-11-14T23:27:58Z on Linux 6.8.0-1070-azure x86_64, 12 CPUs
 #### round 1
 ######## before: vm at before, parts statements,rewrite, J_ROWS 100000, J_ROUNDS 3
-J tables=10: a Version with one migration of one `SELECT 1` median 35.4 ms [34 36 35 35 36]; of 301 median 94.4 ms [96 94 94 94 99]; a statement 0.196 ms
-J tables=500: a Version with one migration of one `SELECT 1` median 129.0 ms [131 128 129 127 129]; of 301 median 185.7 ms [228 187 185 186 185]; a statement 0.189 ms
-J rows=100000: the table filled by a migration in 723 ms
-J rows=100000, every row changes (ALTER ... TYPE ... USING amount + 1): a Version median 187 ms [184 189 187]
-J rows=100000, no row changes (ALTER ... TYPE): a Version median 182 ms [184 181 182]
-J rows=100000, every row changes, the statement in a DO block: a Version median 183 ms [183 175 183]
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 14.21s
+J tables=10: a Version with one migration of one `SELECT 1` median 35.2 ms [35 35 35 36 36]; of 301 median 94.0 ms [94 94 94 94 95]; a statement 0.196 ms
+J tables=10: a Version with 21 migrations of one `SELECT 1` median 152.4 ms [155 152 152 151 153]; a migration 5.860 ms
+J tables=500: a Version with one migration of one `SELECT 1` median 134.4 ms [134 130 136 131 171]; of 301 median 189.3 ms [190 188 188 191 189]; a statement 0.183 ms
+J tables=500: a Version with 21 migrations of one `SELECT 1` median 1614.7 ms [1615 1601 1617 1644 1606]; a migration 74.013 ms
+J rows=100000: the table filled by a migration in 854 ms
+J rows=100000, every row changes (ALTER ... TYPE ... USING amount + 1): a Version median 189 ms [189 191 186]
+J rows=100000, no row changes (ALTER ... TYPE): a Version median 185 ms [185 185 182]
+J rows=100000, every row changes, the statement in a DO block: a Version median 186 ms [185 186 188]
+J rows=100000, varchar(50) to text (no rewrite): a Version median 133 ms [131 133 172]
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 48.27s
+######## middle: vm at middle, parts statements,rewrite, J_ROWS 100000, J_ROUNDS 3
+J tables=10: a Version with one migration of one `SELECT 1` median 38.7 ms [38 39 39 39 39]; of 301 median 103.5 ms [103 103 103 104 105]; a statement 0.216 ms
+J tables=10: a Version with 21 migrations of one `SELECT 1` median 192.2 ms [192 191 195 191 193]; a migration 7.675 ms
+J tables=500: a Version with one migration of one `SELECT 1` median 134.2 ms [136 134 132 135 134]; of 301 median 207.5 ms [209 209 208 207 207]; a statement 0.244 ms
+J tables=500: a Version with 21 migrations of one `SELECT 1` median 1659.6 ms [1668 1662 1656 1660 1643]; a migration 76.267 ms
+J rows=100000: the table filled by a migration in 868 ms
+J rows=100000, every row changes (ALTER ... TYPE ... USING amount + 1): a Version median 2235 ms [2235 2271 2228]
+J rows=100000, no row changes (ALTER ... TYPE): a Version median 1491 ms [1513 1491 1484]
+J rows=100000, every row changes, the statement in a DO block: a Version median 2382 ms [2387 2382 2374]
+J rows=100000, varchar(50) to text (no rewrite): a Version median 501 ms [513 495 501]
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 85.22s
 ######## after: vm at after, parts statements,rewrite, J_ROWS 100000, J_ROUNDS 3
-J tables=10: a Version with one migration of one `SELECT 1` median 38.4 ms [38 38 38 38 38]; of 301 median 104.6 ms [102 105 104 106 105]; a statement 0.221 ms
-J tables=500: a Version with one migration of one `SELECT 1` median 134.2 ms [176 135 134 134 131]; of 301 median 208.5 ms [207 209 207 209 208]; a statement 0.248 ms
-J rows=100000: the table filled by a migration in 737 ms
-J rows=100000, every row changes (ALTER ... TYPE ... USING amount + 1): a Version median 1668 ms [1660 1668 1689]
-J rows=100000, no row changes (ALTER ... TYPE): a Version median 1051 ms [1059 1034 1051]
-J rows=100000, every row changes, the statement in a DO block: a Version median 1790 ms [1790 1790 1841]
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 41.94s
+J tables=10: a Version with one migration of one `SELECT 1` median 37.9 ms [37 37 38 38 39]; of 301 median 103.5 ms [103 103 105 104 104]; a statement 0.219 ms
+J tables=10: a Version with 21 migrations of one `SELECT 1` median 168.7 ms [169 167 169 168 169]; a migration 6.543 ms
+J tables=500: a Version with one migration of one `SELECT 1` median 132.1 ms [133 132 132 132 132]; of 301 median 211.3 ms [211 210 211 215 214]; a statement 0.264 ms
+J tables=500: a Version with 21 migrations of one `SELECT 1` median 1625.5 ms [1645 1622 1621 1683 1626]; a migration 74.673 ms
+J rows=100000: the table filled by a migration in 861 ms
+J rows=100000, every row changes (ALTER ... TYPE ... USING amount + 1): a Version median 2403 ms [2447 2403 2388]
+J rows=100000, no row changes (ALTER ... TYPE): a Version median 1652 ms [1652 1658 1638]
+J rows=100000, every row changes, the statement in a DO block: a Version median 2414 ms [2385 2416 2414]
+J rows=100000, varchar(50) to text (no rewrite): a Version median 137 ms [141 137 135]
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 84.67s
+# whole run: 253 s
+exit 0
+# building: before 9643cb1, after 381cf21, middle e9a6ce8
+# built in 32 s
+# 2026-11-14T23:32:19Z on Linux 6.8.0-1070-azure x86_64, 12 CPUs
 #### round 2
 ######## before: vm at before, parts statements,rewrite, J_ROWS 100000, J_ROUNDS 3
-J tables=10: a Version with one migration of one `SELECT 1` median 35.4 ms [35 36 35 35 35]; of 301 median 93.0 ms [93 92 95 94 93]; a statement 0.192 ms
-J tables=500: a Version with one migration of one `SELECT 1` median 127.8 ms [128 128 130 126 127]; of 301 median 187.5 ms [191 187 186 188 187]; a statement 0.199 ms
-J rows=100000: the table filled by a migration in 715 ms
-J rows=100000, every row changes (ALTER ... TYPE ... USING amount + 1): a Version median 180 ms [179 224 180]
-J rows=100000, no row changes (ALTER ... TYPE): a Version median 178 ms [179 173 178]
-J rows=100000, every row changes, the statement in a DO block: a Version median 183 ms [183 175 183]
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 14.07s
+J tables=10: a Version with one migration of one `SELECT 1` median 35.8 ms [34 35 36 36 37]; of 301 median 94.5 ms [97 94 94 94 95]; a statement 0.195 ms
+J tables=10: a Version with 21 migrations of one `SELECT 1` median 151.1 ms [156 150 151 153 151]; a migration 5.766 ms
+J tables=500: a Version with one migration of one `SELECT 1` median 131.0 ms [131 173 130 130 133]; of 301 median 189.6 ms [190 188 185 190 195]; a statement 0.196 ms
+J tables=500: a Version with 21 migrations of one `SELECT 1` median 1614.8 ms [1615 1610 1601 1619 1674]; a migration 74.194 ms
+J rows=100000: the table filled by a migration in 853 ms
+J rows=100000, every row changes (ALTER ... TYPE ... USING amount + 1): a Version median 193 ms [195 193 191]
+J rows=100000, no row changes (ALTER ... TYPE): a Version median 187 ms [187 189 182]
+J rows=100000, every row changes, the statement in a DO block: a Version median 187 ms [187 184 190]
+J rows=100000, varchar(50) to text (no rewrite): a Version median 132 ms [132 132 132]
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 48.23s
+######## middle: vm at middle, parts statements,rewrite, J_ROWS 100000, J_ROUNDS 3
+J tables=10: a Version with one migration of one `SELECT 1` median 38.5 ms [38 40 38 39 40]; of 301 median 103.5 ms [103 103 103 105 104]; a statement 0.217 ms
+J tables=10: a Version with 21 migrations of one `SELECT 1` median 192.8 ms [193 194 192 196 193]; a migration 7.715 ms
+J tables=500: a Version with one migration of one `SELECT 1` median 133.5 ms [135 132 132 133 136]; of 301 median 208.0 ms [209 208 207 207 208]; a statement 0.248 ms
+J tables=500: a Version with 21 migrations of one `SELECT 1` median 1643.1 ms [1643 1642 1646 1664 1632]; a migration 75.482 ms
+J rows=100000: the table filled by a migration in 864 ms
+J rows=100000, every row changes (ALTER ... TYPE ... USING amount + 1): a Version median 2272 ms [2272 2278 2259]
+J rows=100000, no row changes (ALTER ... TYPE): a Version median 1512 ms [1512 1499 1546]
+J rows=100000, every row changes, the statement in a DO block: a Version median 2381 ms [2381 2370 2419]
+J rows=100000, varchar(50) to text (no rewrite): a Version median 504 ms [503 508 504]
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 85.44s
 ######## after: vm at after, parts statements,rewrite, J_ROWS 100000, J_ROUNDS 3
-J tables=10: a Version with one migration of one `SELECT 1` median 39.2 ms [38 39 40 38 39]; of 301 median 105.7 ms [103 106 108 104 106]; a statement 0.222 ms
-J tables=500: a Version with one migration of one `SELECT 1` median 131.8 ms [133 132 130 131 133]; of 301 median 205.5 ms [206 208 204 205 204]; a statement 0.246 ms
-J rows=100000: the table filled by a migration in 719 ms
-J rows=100000, every row changes (ALTER ... TYPE ... USING amount + 1): a Version median 1675 ms [1675 1676 1668]
-J rows=100000, no row changes (ALTER ... TYPE): a Version median 1048 ms [1056 1030 1048]
-J rows=100000, every row changes, the statement in a DO block: a Version median 1793 ms [1763 1793 1796]
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 41.71s
+J tables=10: a Version with one migration of one `SELECT 1` median 37.6 ms [37 37 38 38 39]; of 301 median 103.8 ms [104 104 104 103 104]; a statement 0.220 ms
+J tables=10: a Version with 21 migrations of one `SELECT 1` median 169.5 ms [170 168 168 170 170]; a migration 6.594 ms
+J tables=500: a Version with one migration of one `SELECT 1` median 133.7 ms [134 134 131 131 134]; of 301 median 210.3 ms [210 209 210 253 216]; a statement 0.255 ms
+J tables=500: a Version with 21 migrations of one `SELECT 1` median 1625.2 ms [1627 1622 1609 1625 1650]; a migration 74.576 ms
+J rows=100000: the table filled by a migration in 852 ms
+J rows=100000, every row changes (ALTER ... TYPE ... USING amount + 1): a Version median 2403 ms [2420 2403 2395]
+J rows=100000, no row changes (ALTER ... TYPE): a Version median 1650 ms [1669 1647 1650]
+J rows=100000, every row changes, the statement in a DO block: a Version median 2366 ms [2358 2393 2366]
+J rows=100000, varchar(50) to text (no rewrite): a Version median 136 ms [141 134 136]
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 84.92s
+# whole run: 251 s
+exit 0
+# building: before 9643cb1, after 381cf21, middle e9a6ce8
+# built in 33 s
+# 2026-11-14T23:36:35Z on Linux 6.8.0-1070-azure x86_64, 12 CPUs
 ######## after: vm at after, parts breakdown, J_ROWS 100000, J_ROUNDS 3
-J rows=100000: the table filled by a migration in 554 ms
-J rows=100000, every row changes (ALTER ... TYPE ... USING amount + 1), with function statistics: a Version 1585 ms; rows' entries 100000
+J rows=100000: the table filled by a migration in 696 ms
+J rows=100000, every row changes (ALTER ... TYPE ... USING amount + 1), with function statistics: a Version 2237 ms; rows' entries 100000
 J     capture_guard: calls 2, total 0.4 ms, self 0.4 ms
-J     rewrite_after: calls 1, total 0.7 ms, self 0.6 ms
-J     rewrite_before: calls 1, total 220.6 ms, self 0.2 ms
-J     rewrite_begin: calls 1, total 2.0 ms, self 1.5 ms
-J     rewrite_done: calls 2, total 4.2 ms, self 3.8 ms
-J     rewrite_keep: calls 42, total 147.5 ms, self 141.8 ms
-J     rewrite_read: calls 2, total 435.7 ms, self 287.8 ms
-J     rewrite_record: calls 1, total 1057.0 ms, self 873.4 ms
-J     rewrite_record_after: calls 1, total 1273.4 ms, self 0.2 ms
-J     rewrite_roots: calls 1, total 0.9 ms, self 0.8 ms
-J     rewrite_who: calls 48, total 7.0 ms, self 1.2 ms
-J     rewrites_seen: calls 2, total 0.2 ms, self 0.2 ms
-J rows=100000, no row changes (ALTER ... TYPE), with function statistics: a Version 972 ms; rows' entries 0
+J     rewrite_after: calls 2, total 2.8 ms, self 2.5 ms
+J     rewrite_before: calls 1, total 368.5 ms, self 0.2 ms
+J     rewrite_begin: calls 2, total 3.2 ms, self 2.2 ms
+J     rewrite_done: calls 2, total 1.2 ms, self 0.9 ms
+J     rewrite_keep: calls 42, total 157.2 ms, self 151.7 ms
+J     rewrite_read: calls 2, total 724.3 ms, self 566.7 ms
+J     rewrite_record: calls 1, total 1336.9 ms, self 1153.7 ms
+J     rewrite_record_after: calls 1, total 1693.5 ms, self 0.2 ms
+J     rewrite_roots: calls 1, total 0.5 ms, self 0.3 ms
+J     rewrite_who: calls 50, total 7.5 ms, self 1.5 ms
+J     rewrites_seen: calls 4, total 0.7 ms, self 0.7 ms
+J rows=100000, no row changes (ALTER ... TYPE), with function statistics: a Version 1502 ms; rows' entries 0
 J     capture_guard: calls 2, total 0.4 ms, self 0.4 ms
-J     rewrite_after: calls 1, total 0.8 ms, self 0.6 ms
-J     rewrite_before: calls 1, total 233.3 ms, self 0.2 ms
-J     rewrite_begin: calls 1, total 2.1 ms, self 1.6 ms
-J     rewrite_done: calls 2, total 4.9 ms, self 4.6 ms
-J     rewrite_keep: calls 42, total 150.8 ms, self 145.0 ms
-J     rewrite_read: calls 2, total 446.0 ms, self 294.8 ms
-J     rewrite_record: calls 1, total 433.4 ms, self 433.3 ms
-J     rewrite_record_after: calls 1, total 647.4 ms, self 0.2 ms
-J     rewrite_roots: calls 1, total 0.9 ms, self 0.8 ms
-J     rewrite_who: calls 48, total 7.1 ms, self 1.2 ms
-J     rewrites_seen: calls 2, total 0.1 ms, self 0.1 ms
-J rows=100000, every row changes, the statement in a DO block, with function statistics: a Version 1674 ms; rows' entries 100000
+J     rewrite_after: calls 2, total 2.7 ms, self 2.4 ms
+J     rewrite_before: calls 1, total 371.3 ms, self 0.2 ms
+J     rewrite_begin: calls 2, total 3.3 ms, self 2.3 ms
+J     rewrite_done: calls 2, total 1.1 ms, self 0.8 ms
+J     rewrite_keep: calls 42, total 161.8 ms, self 156.2 ms
+J     rewrite_read: calls 2, total 731.1 ms, self 568.8 ms
+J     rewrite_record: calls 1, total 591.4 ms, self 591.3 ms
+J     rewrite_record_after: calls 1, total 952.0 ms, self 0.2 ms
+J     rewrite_roots: calls 1, total 0.4 ms, self 0.3 ms
+J     rewrite_who: calls 50, total 7.5 ms, self 1.6 ms
+J     rewrites_seen: calls 4, total 0.6 ms, self 0.6 ms
+J rows=100000, every row changes, the statement in a DO block, with function statistics: a Version 2231 ms; rows' entries 100000
 J     capture_guard: calls 2, total 0.4 ms, self 0.4 ms
-J     rewrite_after: calls 2, total 1.7 ms, self 1.4 ms
-J     rewrite_before: calls 1, total 223.7 ms, self 0.2 ms
-J     rewrite_begin: calls 2, total 4.0 ms, self 3.2 ms
-J     rewrite_done: calls 3, total 5.4 ms, self 4.9 ms
-J     rewrite_keep: calls 42, total 146.2 ms, self 140.2 ms
-J     rewrite_read: calls 2, total 436.3 ms, self 289.7 ms
-J     rewrite_record: calls 1, total 1062.9 ms, self 873.0 ms
-J     rewrite_record_after: calls 1, total 1276.9 ms, self 0.2 ms
-J     rewrite_roots: calls 1, total 0.9 ms, self 0.8 ms
-J     rewrite_who: calls 51, total 7.9 ms, self 1.6 ms
-J     rewrites_seen: calls 4, total 0.3 ms, self 0.3 ms
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 14.88s
+J     rewrite_after: calls 2, total 2.7 ms, self 2.4 ms
+J     rewrite_before: calls 1, total 359.6 ms, self 0.2 ms
+J     rewrite_begin: calls 2, total 3.0 ms, self 2.2 ms
+J     rewrite_done: calls 2, total 1.7 ms, self 1.0 ms
+J     rewrite_keep: calls 42, total 155.6 ms, self 149.8 ms
+J     rewrite_read: calls 2, total 718.1 ms, self 562.1 ms
+J     rewrite_record: calls 1, total 1331.3 ms, self 1147.4 ms
+J     rewrite_record_after: calls 1, total 1690.6 ms, self 0.2 ms
+J     rewrite_roots: calls 1, total 0.4 ms, self 0.3 ms
+J     rewrite_who: calls 50, total 8.0 ms, self 1.9 ms
+J     rewrites_seen: calls 4, total 0.7 ms, self 0.7 ms
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 18.10s
 ######## before: vm at before, parts rewrite, J_ROWS 1000000, J_ROUNDS 1
-J rows=1000000: the table filled by a migration in 5119 ms
-J rows=1000000, every row changes (ALTER ... TYPE ... USING amount + 1): a Version median 515 ms [515]
-J rows=1000000, no row changes (ALTER ... TYPE): a Version median 513 ms [513]
-J rows=1000000, every row changes, the statement in a DO block: a Version median 521 ms [521]
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 33.34s
+J rows=1000000: the table filled by a migration in 6267 ms
+J rows=1000000, every row changes (ALTER ... TYPE ... USING amount + 1): a Version median 556 ms [556]
+J rows=1000000, no row changes (ALTER ... TYPE): a Version median 602 ms [602]
+J rows=1000000, every row changes, the statement in a DO block: a Version median 596 ms [596]
+J rows=1000000, varchar(50) to text (no rewrite): a Version median 35 ms [35]
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 37.13s
 ######## after: vm at after, parts rewrite, J_ROWS 1000000, J_ROUNDS 1
-J rows=1000000: the table filled by a migration in 5148 ms
-J rows=1000000, every row changes (ALTER ... TYPE ... USING amount + 1): a Version median 16013 ms [16013]
-J rows=1000000, no row changes (ALTER ... TYPE): a Version median 10057 ms [10057]
-J rows=1000000, every row changes, the statement in a DO block: a Version median 16438 ms [16438]
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 140.86s
-# whole run: 324 s
+J rows=1000000: the table filled by a migration in 6360 ms
+J rows=1000000, every row changes (ALTER ... TYPE ... USING amount + 1): a Version median 22689 ms [22689]
+J rows=1000000, no row changes (ALTER ... TYPE): a Version median 15408 ms [15408]
+J rows=1000000, every row changes, the statement in a DO block: a Version median 22614 ms [22614]
+J rows=1000000, varchar(50) to text (no rewrite): a Version median 40 ms [40]
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 170.92s
+# whole run: 259 s
 exit 0
