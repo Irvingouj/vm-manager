@@ -1292,7 +1292,9 @@ $f$;
 -- One reading of the table `p_relid`'s own rows (`ONLY`; a partitioned
 -- table's are its partitions', in its form), as the migration role
 -- (SECURITY INVOKER), the settings that change how values print pinned as
--- in the capture, row security off. Refused when row security would apply
+-- in the capture, and `lc_monetary` (how `money` prints) to the
+-- database's own, so that a statement cannot make the two readings of a
+-- value print differently; row security off. Refused when row security would apply
 -- to the reading (VM004), or a cast to json or jsonb of the Application's
 -- exists (VM003: `to_jsonb` would call it). Each row is the object of its
 -- columns as `to_jsonb` makes it, a virtual generated column null (as in
@@ -1308,6 +1310,7 @@ SET extra_float_digits = 1
 SET IntervalStyle = 'postgres'
 SET DateStyle = 'ISO, YMD'
 SET bytea_output = 'hex'
+SET lc_monetary FROM CURRENT
 SET row_security = off
 AS $f$
 DECLARE
