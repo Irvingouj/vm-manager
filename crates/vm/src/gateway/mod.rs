@@ -986,15 +986,16 @@ impl<'a> Call<'a> {
 const HISTORY_LIMIT: i64 = 1000;
 const HISTORY_DEFAULT_LIMIT: i64 = 100;
 
-/// The arguments of `history`, read strictly: `own` exactly `true`; `as`
-/// as for `query`; `table` a string; `schema` a string, `public` when not
-/// given; `key` an object whose values are each null, a string, a number or
-/// a boolean; `limit` an integer from 1 to 1000; `before` a string of
-/// decimal digits; `values` as for `query`. Arguments it does not have are
-/// ignored (`resource`, `tx`, `sql`, ...).
 /// The longest name of a schema or table `history` takes, in bytes.
 const HISTORY_NAME_BYTES: usize = 63;
 
+/// The arguments of `history`, read strictly: `own` exactly `true`; `as`
+/// as for `query`; `table` a string; `schema` a string, `public` when not
+/// given, neither longer than [`HISTORY_NAME_BYTES`]; `key` an object whose
+/// values are each null, a string, a number or a boolean; `limit` an
+/// integer from 1 to 1000; `before` a string of decimal digits; `values` as
+/// for `query`. Arguments it does not have are ignored (`resource`, `tx`,
+/// `sql`, ...).
 fn read_history(args: &Value) -> Result<(authz::Actor, HistoryRead), &'static str> {
     let Some(args) = args.as_object() else {
         return Err(
