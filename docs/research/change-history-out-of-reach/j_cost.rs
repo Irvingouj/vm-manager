@@ -130,19 +130,30 @@ fn j_cost() {
             let many: Vec<&str> = vec!["SELECT 1;"; 301];
             let mut one = Vec::new();
             let mut more = Vec::new();
+            let mut migrations = Vec::new();
             for _ in 0..5 {
                 push(&mut list, &["SELECT 1;"]);
                 one.push(send_ok(&own, app, &list));
                 push(&mut list, &many);
                 more.push(send_ok(&own, app, &list));
+                for _ in 0..21 {
+                    push(&mut list, &["SELECT 1;"]);
+                }
+                migrations.push(send_ok(&own, app, &list));
             }
             let per = (ms(median(&more)) - ms(median(&one))) / 300.0;
+            let per_migration = (ms(median(&migrations)) - ms(median(&one))) / 20.0;
             println!(
                 "J tables={target}: a Version with one migration of one `SELECT 1` median {:.1} ms [{}]; of 301 median {:.1} ms [{}]; a statement {per:.3} ms",
                 ms(median(&one)),
                 list_ms(&one),
                 ms(median(&more)),
                 list_ms(&more)
+            );
+            println!(
+                "J tables={target}: a Version with 21 migrations of one `SELECT 1` median {:.1} ms [{}]; a migration {per_migration:.3} ms",
+                ms(median(&migrations)),
+                list_ms(&migrations)
             );
         }
     }
@@ -152,7 +163,7 @@ fn j_cost() {
         let app = "rewrite";
         let db = own.install(app, &list);
         let make = format!(
-            r#"CREATE TABLE "big" ("id" integer PRIMARY KEY NOT NULL, "amount" integer NOT NULL, "note" text NOT NULL, "at" timestamp with time zone NOT NULL DEFAULT '2026-01-01T00:00:00Z');"#
+            r#"CREATE TABLE "big" ("id" integer PRIMARY KEY NOT NULL, "amount" integer NOT NULL, "note" text NOT NULL, "at" timestamp with time zone NOT NULL DEFAULT '2026-01-01T00:00:00Z', "w1" varchar(50) DEFAULT 'w', "w2" varchar(50) DEFAULT 'w', "w3" varchar(50) DEFAULT 'w', "w4" varchar(50) DEFAULT 'w', "w5" varchar(50) DEFAULT 'w');"#
         );
         let fill = format!(
             r#"INSERT INTO "big" ("id", "amount", "note") SELECT g, g % 1000, 'a note of row ' || g FROM generate_series(1, {n}) g;"#
@@ -196,6 +207,22 @@ fn j_cost() {
                     list_ms(&times)
                 );
             }
+            // A change of type Postgres makes in the catalog alone: each
+            // round another column, `varchar(50)` to `text`.
+            let mut times = Vec::new();
+            for w in 1..=rounds().min(5) {
+                let text = format!(r#"ALTER TABLE "big" ALTER COLUMN "w{w}" SET DATA TYPE text;"#);
+                push(&mut list, &[text.as_str()]);
+                let (took, status) = send(&own, app, &list);
+                assert_eq!(status, 201, "varchar(50) to text");
+                times.push(took);
+                settle(&db);
+            }
+            println!(
+                "J rows={n}, varchar(50) to text (no rewrite): a Version median {:.0} ms [{}]",
+                ms(median(&times)),
+                list_ms(&times)
+            );
         }
         if parts.contains("breakdown") {
             // The vm functions' own times, from Postgres's function

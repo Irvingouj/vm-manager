@@ -3,10 +3,12 @@
 # (a rewrite records each row it changed) costs, measured with the real
 # program on Postgres 18.
 #
-#   docs/research/change-history-out-of-reach/j-cost.sh [BEFORE [AFTER]]
+#   docs/research/change-history-out-of-reach/j-cost.sh [BEFORE [AFTER [MIDDLE]]]
 #
 # BEFORE, AFTER: the commits to compare (by default 9643cb1, the last
-# commit before the ticket's program, and HEAD). Each is checked out in a
+# commit before the ticket's program, and HEAD); MIDDLE (by default
+# e9a6ce8, the ticket's first round; "" leaves it out) is measured in
+# `statements` and `rewrite` too. Each is checked out in a
 # git worktree of its own in a temporary directory and its `vm` built there
 # with `cargo build --release -p vm --bin vm`, into one target directory
 # kept between runs (target/j-cost); `.tools/libclang` is filled by
@@ -17,12 +19,12 @@
 # Run it on a quiet machine and not beside a gate. J_ROWS (default 100000)
 # is the rewritten table's size; at the end, `rewrite` runs once more on
 # each binary at 1,000,000 rows, one Version of each kind.
-#   statements  a Version that rewrites nothing: one statement's cost, at
-#               10 and 500 tables
+#   statements  a Version that rewrites nothing: one statement's cost and
+#               one migration's, at 10 and 500 tables
 #   rewrite     a Version retyping a column of a table of J_ROWS rows:
 #               every row changed, none changed, every row changed with the
-#               statement in a DO block (which the platform does not
-#               foresee from its text)
+#               statement in a DO block; and a column's `varchar(50)`
+#               changed to `text`, which Postgres makes without a rewrite
 #   breakdown   (AFTER only) the same three once more, with Postgres's
 #               function statistics: where the time went, and how many runs
 set -euo pipefail
@@ -30,6 +32,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(git -C "$HERE" rev-parse --show-toplevel)"
 BEFORE_COMMIT="${1:-9643cb1}"
 AFTER_COMMIT="${2:-HEAD}"
+MIDDLE_COMMIT="${3-e9a6ce8}"
 TEST="$ROOT/blackbox/tests/j_cost.rs"
 WORK="$(mktemp -d)"
 export CARGO_TARGET_DIR="$ROOT/target/j-cost"
@@ -52,9 +55,13 @@ build() { # build LABEL COMMIT: echoes the binary's path
   cp "$CARGO_TARGET_DIR/release/vm" "$WORK/vm-$1"
   echo "$WORK/vm-$1"
 }
-echo "# building: before $(git -C "$ROOT" rev-parse --short "$BEFORE_COMMIT"), after $(git -C "$ROOT" rev-parse --short "$AFTER_COMMIT")"
+echo "# building: before $(git -C "$ROOT" rev-parse --short "$BEFORE_COMMIT"), after $(git -C "$ROOT" rev-parse --short "$AFTER_COMMIT")${MIDDLE_COMMIT:+, middle $(git -C "$ROOT" rev-parse --short "$MIDDLE_COMMIT")}"
 BEFORE="$(build before "$BEFORE_COMMIT")"
 AFTER="$(build after "$AFTER_COMMIT")"
+MIDDLE=""
+if [ -n "$MIDDLE_COMMIT" ]; then
+  MIDDLE="$(build middle "$MIDDLE_COMMIT")"
+fi
 echo "# built in ${SECONDS} s"
 cp "$HERE/j_cost.rs" "$TEST"
 run() { # run LABEL BINARY PARTS [ROWS ROUNDS]
@@ -67,6 +74,9 @@ echo "# $(date -u +%FT%TZ) on $(uname -srm), $(nproc) CPUs"
 for round in 1 2; do
   echo "#### round $round"
   run before "$BEFORE" statements,rewrite
+  if [ -n "$MIDDLE" ]; then
+    run middle "$MIDDLE" statements,rewrite
+  fi
   run after "$AFTER" statements,rewrite
 done
 run after "$AFTER" breakdown
