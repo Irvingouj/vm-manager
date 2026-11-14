@@ -533,7 +533,7 @@ Per statement, after each statement the question that travels with it also asks 
 
 That is about 0.02 ms more per statement at 10 tables and 0.06 to 0.08 ms at 500 [verified, the table]. A first form joined the noted tables to `pg_class`, planned with no statistics; it cost 0.38 ms a statement at 10 tables and 0.69 ms at 500 [verified in a run of the first round, log not in the repository].
 
-Per migration, the first round noted every table anew at each migration's start and emptied its three tables at its end (`TRUNCATE`): 1.8 ms a migration at 10 tables and 1.3 to 2.3 ms at 500 [reasoned from the table, middle against before]. Now [from code]:
+Per migration, the first round noted every table anew at each migration's start and emptied its three tables at its end (`TRUNCATE`): 1.8 to 1.9 ms a migration at 10 tables and 1.3 to 2.3 ms at 500 [reasoned from the table, middle against before]. Now [from code]:
 
 - the run's first migration notes every table;
 - each next one only brings the noting up to date: tables gone forgotten, names changed, the tables the migration before made added;
