@@ -877,9 +877,9 @@ $f$;
 -- under it was), `enum-value-renamed` (one per value renamed, on every
 -- such table with a column of a type that holds it: a domain over it, an
 -- array, a range or multirange over it, a composite type or row type with
--- an attribute of it, at any depth), `partition-attached` (a table that was there,
--- attached) and `partition-detached` (detached or dropped), under the
--- table's name now. On a table that is gone, or whose name another table
+-- an attribute of it, at any depth), `partition-attached` (a table that
+-- was there, attached) and `partition-detached` (detached or dropped),
+-- under the table's name now. On a table that is gone, or whose name another table
 -- has now, and that was not a partition: `table-dropped` or
 -- `table-replaced`, under the name it had.
 CREATE OR REPLACE FUNCTION vm.record_structure(p_before jsonb) RETURNS integer
@@ -938,7 +938,7 @@ BEGIN
           INTO v_enums, v_types
           FROM holding h;
     END IF;
-    WITH RECURSIVE b AS (
+    WITH b AS (
         SELECT t.key AS id, t.value ->> 's' AS s, t.value ->> 'n' AS n, t.value AS v
           FROM pg_catalog.jsonb_each(p_before -> 'tables') t),
     a AS (
