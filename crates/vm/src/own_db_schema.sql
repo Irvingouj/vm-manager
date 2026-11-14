@@ -1080,7 +1080,7 @@ $f$;
 -- the catalog.
 CREATE UNLOGGED TABLE IF NOT EXISTS vm.rewrite_nodes (
     relid oid PRIMARY KEY,
-    node oid NOT NULL,
+    node oid,
     s text NOT NULL,
     n text NOT NULL
 );
@@ -1140,7 +1140,7 @@ END
 $f$;
 
 -- At the start of a migration: every table there is now, with its file
--- node and its name (a partitioned table's node is 0, its partitions'
+-- node and its name (a partitioned table has none: its partitions'
 -- move). What was left of an earlier migration's is gone.
 CREATE OR REPLACE FUNCTION vm.rewrite_begin(p_token text) RETURNS integer
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER PARALLEL UNSAFE
@@ -1154,7 +1154,7 @@ BEGIN
     DELETE FROM vm.rewrite_columns;
     DELETE FROM vm.rewrite_nodes;
     INSERT INTO vm.rewrite_nodes (relid, node, s, n)
-    SELECT c.oid, c.relfilenode, n.nspname::text, c.relname::text
+    SELECT c.oid, pg_catalog.pg_relation_filenode(c.oid), n.nspname::text, c.relname::text
       FROM pg_catalog.pg_class c
       JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
      WHERE c.relkind IN ('r', 'p')
@@ -1166,21 +1166,22 @@ END
 $f$;
 
 -- Whether a table noted at the start of the migration has a new file
--- node: asked after every statement. Reads only `vm` and the catalog,
--- writes nothing.
+-- node, or is gone: asked after every statement. Reads only `vm` and the
+-- catalog (by `pg_relation_filenode`, from Postgres's cache: no join of
+-- `pg_class`, whose plan would be made on no statistics), writes nothing.
 CREATE OR REPLACE FUNCTION vm.rewrites_seen() RETURNS boolean
 LANGUAGE sql STABLE SECURITY DEFINER PARALLEL UNSAFE
 SET search_path = pg_catalog, pg_temp
 AS $f$
 SELECT EXISTS (SELECT FROM vm.rewrite_nodes r
-                 JOIN pg_catalog.pg_class c ON c.oid OPERATOR(pg_catalog.=) r.relid
-                WHERE c.relfilenode OPERATOR(pg_catalog.<>) r.node)
+                WHERE pg_catalog.pg_relation_filenode(r.relid) IS DISTINCT FROM r.node)
 $f$;
 
 -- The tables with history the statement just run rewrote, each as the
 -- table at the top of its partitions (itself, when it is none), with its
 -- name when the migration began, and whether its rows were read before
--- the statement; their new file nodes noted.
+-- the statement; their new file nodes noted, and the tables gone
+-- forgotten.
 CREATE OR REPLACE FUNCTION vm.rewrite_after(p_token text)
 RETURNS TABLE (relid oid, s text, n text, read boolean)
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER PARALLEL UNSAFE
@@ -1188,11 +1189,12 @@ SET search_path = pg_catalog, pg_temp
 AS $f$
 BEGIN
     PERFORM vm.rewrite_who(p_token);
+    DELETE FROM vm.rewrite_nodes r
+     WHERE NOT EXISTS (SELECT FROM pg_catalog.pg_class c WHERE c.oid = r.relid);
     RETURN QUERY
     WITH moved AS (
-        UPDATE vm.rewrite_nodes r SET node = c.relfilenode
-          FROM pg_catalog.pg_class c
-         WHERE c.oid = r.relid AND c.relfilenode <> r.node
+        UPDATE vm.rewrite_nodes r SET node = pg_catalog.pg_relation_filenode(r.relid)
+         WHERE pg_catalog.pg_relation_filenode(r.relid) IS DISTINCT FROM r.node
         RETURNING r.relid),
     roots AS (
         SELECT DISTINCT coalesce(pg_catalog.pg_partition_root(m.relid), m.relid) AS root FROM moved m)
@@ -1442,6 +1444,11 @@ DECLARE
     v_schema text;
     v_table text;
     v_keyed boolean;
+    v_key_before text;
+    v_key_after text;
+    v_object_before text;
+    v_object_after text;
+    v_changed text;
     v_made bigint;
 BEGIN
     IF NOT EXISTS (SELECT FROM vm.rewrite_columns k WHERE k.relid = p_relid AND k.phase = 0)
@@ -1493,23 +1500,29 @@ BEGIN
         DELETE FROM vm.rewrite_columns k WHERE k.relid = p_relid;
         RETURN 0;
     END IF;
-    WITH cb AS (SELECT * FROM vm.rewrite_columns k WHERE k.relid = p_relid AND k.phase = 0),
-    ca AS (SELECT * FROM vm.rewrite_columns k WHERE k.relid = p_relid AND k.phase = 1),
-    common AS (
-        SELECT b.attnum, b.name AS bname, a.name AS aname
-          FROM cb b JOIN ca a ON a.attnum = b.attnum
-         WHERE NOT b.virtual AND NOT a.virtual),
-    key_before AS (SELECT b.name, b.attnum FROM cb b WHERE b.key IS NOT NULL),
-    key_after AS (SELECT a.name, a.attnum FROM ca a WHERE a.key IS NOT NULL),
-    rb AS (
-        SELECT r.id, r.j, r.n,
-               (SELECT pg_catalog.jsonb_agg(r.j -> k.name ORDER BY k.attnum) FROM key_before k) AS k
-          FROM vm.rewrite_rows r WHERE r.relid = p_relid AND r.phase = 0),
-    ra AS (
-        SELECT r.id, r.j, r.n,
-               (SELECT pg_catalog.jsonb_agg(r.j -> k.name ORDER BY k.attnum) FROM key_after k) AS k
-          FROM vm.rewrite_rows r WHERE r.relid = p_relid AND r.phase = 1),
-    exact AS (SELECT b.id AS bid, a.id AS aid FROM rb b JOIN ra a ON a.k = b.k),
+    -- The expressions the comparison is made of, written once per table
+    -- from its columns (names as literals): no subquery per row.
+    SELECT 'pg_catalog.jsonb_build_array(' || pg_catalog.string_agg(pg_catalog.format('r.j -> %L', k.name), ', ' ORDER BY k.attnum) || ')',
+           'pg_catalog.jsonb_build_object(' || pg_catalog.string_agg(pg_catalog.format('%L, b.j -> %L', k.name, k.name), ', ' ORDER BY k.attnum) || ')'
+      INTO v_key_before, v_object_before
+      FROM vm.rewrite_columns k WHERE k.relid = p_relid AND k.phase = 0 AND k.key IS NOT NULL;
+    SELECT 'pg_catalog.jsonb_build_array(' || pg_catalog.string_agg(pg_catalog.format('r.j -> %L', k.name), ', ' ORDER BY k.attnum) || ')',
+           'pg_catalog.jsonb_build_object(' || pg_catalog.string_agg(pg_catalog.format('%L, a.j -> %L', k.name, k.name), ', ' ORDER BY k.attnum) || ')'
+      INTO v_key_after, v_object_after
+      FROM vm.rewrite_columns k WHERE k.relid = p_relid AND k.phase = 1 AND k.key IS NOT NULL;
+    SELECT 'ARRAY[' || coalesce(pg_catalog.string_agg(pg_catalog.format(
+               'CASE WHEN (b.j -> %L) IS DISTINCT FROM (a.j -> %L) OR coalesce(b.n ? %L, false) <> coalesce(a.n ? %L, false) THEN %L END',
+               b.name, a.name, b.name, a.name, a.name), ', ' ORDER BY b.attnum), '') || ']::text[]'
+      INTO v_changed
+      FROM vm.rewrite_columns b
+      JOIN vm.rewrite_columns a ON a.relid = b.relid AND a.attnum = b.attnum AND a.phase = 1
+     WHERE b.relid = p_relid AND b.phase = 0 AND NOT b.virtual AND NOT a.virtual;
+    EXECUTE pg_catalog.format($q$
+    WITH rb AS MATERIALIZED (
+        SELECT r.id, r.j, r.n, %1$s AS k FROM vm.rewrite_rows r WHERE r.relid = $1 AND r.phase = 0),
+    ra AS MATERIALIZED (
+        SELECT r.id, r.j, r.n, %2$s AS k FROM vm.rewrite_rows r WHERE r.relid = $1 AND r.phase = 1),
+    exact AS MATERIALIZED (SELECT b.id AS bid, a.id AS aid FROM rb b JOIN ra a ON a.k = b.k),
     -- The rows the exact pairing left: each key's values made text the
     -- way a number, a boolean and the string that reads the same agree
     -- (a number without trailing zeros, a boolean as `true`/`false`, a
@@ -1545,14 +1558,14 @@ BEGIN
                   FROM pg_catalog.jsonb_array_elements(a.k) WITH ORDINALITY e(v, o)) AS t
           FROM ra a
          WHERE NOT EXISTS (SELECT FROM exact e WHERE e.aid = a.id)),
+    -- Paired when each is the only one so made on its side, and each key
+    -- column is equal as JSON values or is a number or a boolean against
+    -- a string.
     loose AS (
         SELECT b.id AS bid, a.id AS aid
           FROM (SELECT x.*, pg_catalog.count(*) OVER (PARTITION BY x.t) AS c FROM left_before x) b
           JOIN (SELECT x.*, pg_catalog.count(*) OVER (PARTITION BY x.t) AS c FROM left_after x) a
             ON a.t = b.t
-         -- Paired when each is the only one so made on its side, and each
-         -- key column is equal as JSON values or is a number or a boolean
-         -- against a string.
          WHERE b.c = 1 AND a.c = 1
            AND pg_catalog.jsonb_array_length(b.k) = pg_catalog.jsonb_array_length(a.k)
            AND NOT EXISTS (
@@ -1561,32 +1574,28 @@ BEGIN
                 WHERE x.v <> y.v
                   AND NOT ((pg_catalog.jsonb_typeof(x.v) IN ('number', 'boolean') AND pg_catalog.jsonb_typeof(y.v) = 'string')
                            OR (pg_catalog.jsonb_typeof(y.v) IN ('number', 'boolean') AND pg_catalog.jsonb_typeof(x.v) = 'string')))),
-    pairs AS (SELECT * FROM exact UNION ALL SELECT * FROM loose),
+    pairs AS MATERIALIZED (SELECT * FROM exact UNION ALL SELECT * FROM loose),
     entries AS (
-        SELECT 'update' AS kind, a.j AS key_row, 1 AS side, b.j AS old, a.j AS new, b.n AS old_nulls, a.n AS new_nulls,
-               (SELECT pg_catalog.jsonb_agg(c.aname ORDER BY c.attnum) FROM common c
-                 WHERE (b.j -> c.bname) IS DISTINCT FROM (a.j -> c.aname)
-                    OR coalesce(b.n ? c.bname, false) IS DISTINCT FROM coalesce(a.n ? c.aname, false)) AS changed
+        SELECT 'update' AS kind, %4$s AS key, b.j AS old, a.j AS new, b.n AS old_nulls, a.n AS new_nulls,
+               pg_catalog.array_remove(%5$s, NULL) AS changed
           FROM pairs p
           JOIN rb b ON b.id = p.bid
           JOIN ra a ON a.id = p.aid
         UNION ALL
-        SELECT 'delete', b.j, 0, b.j, NULL, b.n, NULL, NULL
+        SELECT 'delete', %3$s, b.j, NULL, b.n, NULL, NULL
           FROM rb b WHERE NOT EXISTS (SELECT FROM pairs p WHERE p.bid = b.id)
         UNION ALL
-        SELECT 'insert', a.j, 1, NULL, a.j, NULL, a.n, NULL
+        SELECT 'insert', %4$s, NULL, a.j, NULL, a.n, NULL
           FROM ra a WHERE NOT EXISTS (SELECT FROM pairs p WHERE p.aid = a.id))
     INSERT INTO vm.outbox (at, schema_name, table_name, kind, key, old, new, changed,
                            user_id, application, actor, request, migration, json_nulls)
-    SELECT v_at, v_schema, v_table, e.kind,
-           CASE WHEN e.side = 0
-                THEN (SELECT pg_catalog.jsonb_object_agg(k.name, e.key_row -> k.name) FROM key_before k)
-                ELSE (SELECT pg_catalog.jsonb_object_agg(k.name, e.key_row -> k.name) FROM key_after k) END,
-           e.old, e.new, e.changed,
-           v_who ->> 'user_id', v_who ->> 'application', v_who ->> 'actor', NULL, v_who ->> 'migration',
+    SELECT $2, $3, $4, e.kind, e.key, e.old, e.new, pg_catalog.to_jsonb(e.changed),
+           $5 ->> 'user_id', $5 ->> 'application', $5 ->> 'actor', NULL, $5 ->> 'migration',
            vm.json_nulls(e.old_nulls, e.new_nulls)
       FROM entries e
-     WHERE e.kind <> 'update' OR e.changed IS NOT NULL;
+     WHERE e.kind <> 'update' OR pg_catalog.cardinality(e.changed) > 0
+    $q$, v_key_before, v_key_after, v_object_before, v_object_after, v_changed)
+    USING p_relid, v_at, v_schema, v_table, v_who;
     GET DIAGNOSTICS v_made = ROW_COUNT;
     DELETE FROM vm.rewrite_rows r WHERE r.relid = p_relid;
     DELETE FROM vm.rewrite_columns k WHERE k.relid = p_relid;
