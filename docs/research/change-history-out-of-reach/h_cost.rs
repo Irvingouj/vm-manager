@@ -402,11 +402,46 @@ fn h_cost() {
         let stopped = stop(own);
         lock.batch("ROLLBACK");
         let waiting: i64 = dbs.iter().map(outbox_count).sum();
+        // Sessions opened in the 50 own databases (`pg_stat_database`,
+        // whose counts reach the view up to a second late).
+        let names: Vec<String> = dbs.iter().map(|d| literal(&d.name)).collect();
+        let sessions_query = format!(
+            "SELECT coalesce(sum(sessions), 0)::text FROM pg_stat_database WHERE datname IN ({})",
+            names.join(", ")
+        );
+        let sessions = |sql: &blackbox::sql::Sql| -> i64 { value(sql, &sessions_query).parse().unwrap_or(-1) };
+        let instance = dbs[0].instance();
+        std::thread::sleep(Duration::from_millis(1500));
+        let sessions_before = sessions(&instance);
         let started = Instant::now();
         let own = stopped.start();
         let listening = started.elapsed();
-        let first_write = write(&own, &dbs[0].application, 900_001);
-        let first_read = read(&own, &dbs[49].application, &json!({ "limit": 1 })).0;
+        // When every change is in change_history: polled every 10 ms on one
+        // connection to the platform database, from the start on, while
+        // the write and the read below are made.
+        let in_history = std::thread::scope(|scope| {
+            let poll = scope.spawn(|| loop {
+                let n: i64 = value(
+                    &lock,
+                    "SELECT count(*)::text FROM change_history WHERE application LIKE 's%' AND new->>'title' = 'at-start'",
+                )
+                .parse()
+                .unwrap_or(-1);
+                if n >= waiting {
+                    break started.elapsed();
+                }
+                assert!(started.elapsed() < Duration::from_secs(600), "{n} of {waiting} shipped");
+                std::thread::sleep(Duration::from_millis(10));
+            });
+            let first_write = write(&own, &dbs[0].application, 900_001);
+            let first_read = read(&own, &dbs[49].application, &json!({ "limit": 1 })).0;
+            (poll.join().unwrap(), first_write, first_read)
+        });
+        let (in_history, first_write, first_read) = in_history;
+        // Read before the outboxes are looked at below, which opens
+        // sessions of its own.
+        std::thread::sleep(Duration::from_millis(1500));
+        let opened = sessions(&instance) - sessions_before;
         let mut empty_after = Duration::ZERO;
         loop {
             let left: i64 = dbs.iter().map(outbox_count).sum();
@@ -429,10 +464,11 @@ fn h_cost() {
             .filter(|r| r["event"] == "history-not-shipped")
             .count();
         println!(
-            "H start with 50 own databases, {waiting} changes in their outboxes: listening after {:.3} s; a write sent then answered in {:.3} ms, a read of another Application's history in {:.3} ms; every outbox empty {:.3} s after the start; {shipped} of them in change_history; {not_shipped} history-not-shipped records after the restart",
+            "H start with 50 own databases, {waiting} changes in their outboxes: listening after {:.3} s; a write sent then answered in {:.3} ms, a read of another Application's history in {:.3} ms; every change in change_history {:.3} s after the start; {opened} sessions opened in the 50 own databases from the start until 1.5 s after that; every outbox seen empty by a sweep of them that ended {:.3} s after the start; {shipped} of them in change_history; {not_shipped} history-not-shipped records after the restart",
             listening.as_secs_f64(),
             first_write.as_secs_f64() * 1000.0,
             first_read.as_secs_f64() * 1000.0,
+            in_history.as_secs_f64(),
             empty_after.as_secs_f64()
         );
     }
