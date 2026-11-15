@@ -3,7 +3,8 @@
 //!
 //! `vm sign-in`, `vm sign-out`, `vm whoami`, `vm resources`, `vm
 //! applications`, `vm pull` ([`pull`]), `vm new` ([`new`]), `vm check`
-//! ([`check`]), `vm generate` ([`generate`]) and `vm deploy` ([`deploy`]),
+//! ([`check`]), `vm generate` ([`generate`]), `vm deploy` ([`deploy`]),
+//! `vm versions` and `vm go-back` ([`versions`]) and `vm logs` ([`logs`]),
 //! each with `--json`. Each command is one short run on one
 //! thread: a current-thread runtime, at most a few requests to the
 //! installation ([`client`]), the credential file ([`credential_file`]), and
@@ -27,17 +28,21 @@ mod data_loss;
 mod deploy;
 mod drizzle;
 mod generate;
+mod logs;
 mod new;
 mod project_tools;
 mod pull;
 mod template;
 mod theirs;
+mod versions;
 
 pub use check::CheckArgs;
 pub use deploy::DeployArgs;
 pub use generate::GenerateArgs;
+pub use logs::LogsArgs;
 pub use new::NewArgs;
 pub use pull::PullArgs;
+pub use versions::{GoBackArgs, VersionsArgs};
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, ErrorKind, Write};
@@ -124,6 +129,9 @@ pub enum Command {
     Check(CheckArgs),
     Generate(GenerateArgs),
     Deploy(DeployArgs),
+    Versions(VersionsArgs),
+    GoBack(GoBackArgs),
+    Logs(LogsArgs),
 }
 
 /// A message: the tool's own words, or the installation's (a refusal's
@@ -250,6 +258,17 @@ struct Done {
     text: String,
 }
 
+impl Done {
+    /// A command that printed as it went (`vm logs --follow`): nothing more
+    /// is printed at its end.
+    fn printed() -> Self {
+        Self {
+            json: Value::Null,
+            text: String::new(),
+        }
+    }
+}
+
 /// Runs a command of the tool and prints its outcome.
 pub fn run(command: Command) -> ExitCode {
     let json = match &command {
@@ -259,6 +278,9 @@ pub fn run(command: Command) -> ExitCode {
         Command::Check(args) => args.output.json,
         Command::Generate(args) => args.output.json,
         Command::Deploy(args) => args.output.json,
+        Command::Versions(args) => args.output.json,
+        Command::GoBack(args) => args.output.json,
+        Command::Logs(args) => args.output.json,
         Command::SignOut(o)
         | Command::Whoami(o)
         | Command::Resources(o)
@@ -281,6 +303,9 @@ pub fn run(command: Command) -> ExitCode {
                 Command::Check(args) => check::check(&args).await,
                 Command::Generate(args) => generate::generate(&args).await,
                 Command::Deploy(args) => deploy::deploy(&args).await,
+                Command::Versions(args) => versions::versions(&args).await,
+                Command::GoBack(args) => versions::go_back(&args).await,
+                Command::Logs(args) => logs::logs(&args).await,
             }
         }),
         Err(error) => Err(Ending::new(
@@ -291,7 +316,9 @@ pub fn run(command: Command) -> ExitCode {
     };
     let (code, written) = match outcome {
         Ok(done) => {
-            let written = if json {
+            let written = if done.json.is_null() && done.text.is_empty() {
+                Ok(())
+            } else if json {
                 write_to(&mut io::stdout().lock(), &json_line(&done.json))
             } else {
                 write_to(&mut io::stdout().lock(), &done.text)

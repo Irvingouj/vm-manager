@@ -12,12 +12,16 @@
 //! and `GET /v1/resources`); git (on the `PATH`, the project in a
 //! repository with a commit, nothing of the project's folder
 //! uncommitted); `node` and the packages; the Manifest (the SDK's
-//! tooling) and the Application of its name (`not-a-contributor`); each
+//! tooling) and the Application of its name (`not-a-contributor`), with
+//! its latest Version's migrations; each
 //! declared Resource that is registered and pulled, pulled again (a
 //! changed structure written into `resources/<name>/`, the only files the
-//! deploy writes in the project); the four checks; data loss (only with a
-//! Version serving); the serving Version's migrations against the
-//! project's (`migrations-diverged`); the bundle. Only then is anything
+//! deploy writes in the project); the four checks; data loss (only when the
+//! Application has a Version); the latest Version's migrations against the
+//! project's (`migrations-diverged`); the bundle. The latest Version, not
+//! the serving one: after going back they differ, and the latest's
+//! migrations are the ones applied (blackbox/CONTRACT.md, "Deploying after
+//! going back"). Only then is anything
 //! sent: the Application created when there is none, and the Version.
 //!
 //! **Endings.** Everything up to the bundle is held to `--timeout` (300 s
@@ -88,9 +92,9 @@ pub struct DeployArgs {
     /// The project to deploy; without it, the current directory.
     #[arg(long)]
     pub project: Option<PathBuf>,
-    /// Deploy although a migration this Version adds destroys data while a
-    /// Version is serving. Only when the Builder has clearly said that this
-    /// data may be lost.
+    /// Deploy although a migration this Version adds destroys data while the
+    /// Application already has a Version. Only when the Builder has clearly
+    /// said that this data may be lost.
     #[arg(long)]
     pub allow_data_loss: bool,
     /// The longest the deploy may take on this machine, in seconds (1 to
@@ -274,6 +278,12 @@ struct VersionMigrations {
     migrations: Vec<Recorded>,
 }
 
+/// The Application's Versions, oldest first, as the API lists them.
+#[derive(Deserialize)]
+struct VersionList {
+    versions: Vec<VersionMigrations>,
+}
+
 #[derive(Deserialize)]
 struct Recorded {
     name: String,
@@ -283,8 +293,9 @@ struct Recorded {
 /// The Application of the Manifest's name, when the installation has one.
 struct Existing {
     application: Application,
-    /// The serving Version's migrations, when one serves.
-    serving: Option<Vec<Recorded>>,
+    /// The latest Version's migrations, when the Application has a
+    /// Version: the ones applied to its own database.
+    latest: Option<Vec<Recorded>>,
 }
 
 /// One migration of `migrations/`, in the journal's order.
@@ -425,19 +436,19 @@ async fn prepared(
 
     stage.set(Stage::ReadingMigrations);
     let migrations = project_migrations(project)?;
-    let serving = existing.as_ref().and_then(|e| e.serving.as_ref());
-    let served: BTreeSet<&str> = serving
+    let latest = existing.as_ref().and_then(|e| e.latest.as_ref());
+    let applied: BTreeSet<&str> = latest
         .map(|list| list.iter().map(|m| m.name.as_str()).collect())
         .unwrap_or_default();
     let added: Vec<&ProjectMigration> = migrations
         .iter()
-        .filter(|m| !served.contains(m.name.as_str()))
+        .filter(|m| !applied.contains(m.name.as_str()))
         .collect();
-    if serving.is_some() && !args.allow_data_loss {
+    if latest.is_some() && !args.allow_data_loss {
         loses_nothing(project, &migrations, &added)?;
     }
-    if let Some(serving) = serving {
-        continues(serving, &migrations)?;
+    if let Some(latest) = latest {
+        continues(latest, &migrations)?;
     }
 
     stage.set(Stage::Bundling);
@@ -554,8 +565,9 @@ fn definition_fingerprint(project: &Path, name: &str) -> Option<String> {
 }
 
 /// Step 4: the Application of the Manifest's name, when there is one, of
-/// which the User must be a Contributor; and its serving Version's
-/// migrations.
+/// which the User must be a Contributor; and its latest Version's
+/// migrations, which are the ones applied (also after going back, when
+/// another Version serves).
 async fn application(kept: &Kept, manifest: &Manifest) -> Result<Option<Existing>, Ending> {
     let name = &manifest.name;
     if check_name(name).is_err() {
@@ -604,19 +616,20 @@ async fn application(kept: &Kept, manifest: &Manifest) -> Result<Option<Existing
             ),
         ));
     }
-    let serving = match application.serving_version {
-        Some(number) => {
-            let version: VersionMigrations = shaped(
+    // An Application with a Version always has one serving.
+    let latest = match application.serving_version {
+        Some(_) => {
+            let list: VersionList = shaped(
                 kept.connect,
-                get_signed_in(kept, &format!("/v1/applications/{name}/versions/{number}")).await?,
+                get_signed_in(kept, &format!("/v1/applications/{name}/versions")).await?,
             )?;
-            Some(version.migrations)
+            list.versions.into_iter().last().map(|v| v.migrations)
         }
         None => None,
     };
     Ok(Some(Existing {
         application,
-        serving,
+        latest,
     }))
 }
 
@@ -925,7 +938,7 @@ fn loses_nothing(
         }));
     }
     let message = format!(
-        "A migration this Version adds destroys data, and a Version is serving, so the rows are there now: this is asked again at deploy, even when vm generate was allowed to write it, and nothing was sent. {}",
+        "A migration this Version adds destroys data, and the Application already has a Version, so the rows are there now: this is asked again at deploy, even when vm generate was allowed to write it, and nothing was sent. {}",
         data_loss::ask_the_builder(&lost.join("; "), "vm deploy")
     );
     let text = format!("{}\n{text}", Theirs::from(message.as_str()));
@@ -944,25 +957,25 @@ fn loses_nothing(
     ))
 }
 
-/// Step 8: the serving Version's migrations are the beginning of the
+/// Step 8: the latest Version's migrations are the beginning of the
 /// project's, by name and by the SHA-256 of their text.
-fn continues(serving: &[Recorded], migrations: &[ProjectMigration]) -> Result<(), Ending> {
-    for (at, recorded) in serving.iter().enumerate() {
+fn continues(latest: &[Recorded], migrations: &[ProjectMigration]) -> Result<(), Ending> {
+    for (at, recorded) in latest.iter().enumerate() {
         let ours = migrations.get(at);
         let why = match ours {
             None => format!(
-                "the serving Version has the migration {}, which migrations/ does not have",
+                "the Application's latest Version has the migration {}, which migrations/ does not have",
                 recorded.name
             ),
             Some(ours) if ours.name != recorded.name => format!(
-                "the serving Version's migration number {} is {}, and the project's is {}",
+                "the latest Version's migration number {} is {}, and the project's is {}",
                 at.saturating_add(1),
                 recorded.name,
                 ours.name
             ),
             Some(ours) if hex(&Sha256::digest(ours.sql.as_bytes())) != recorded.sha256 => {
                 format!(
-                    "the migration {} differs from the one the serving Version has (its text changed since it was deployed)",
+                    "the migration {} differs from the one the latest Version has (its text changed since it was deployed)",
                     recorded.name
                 )
             }
@@ -972,7 +985,7 @@ fn continues(serving: &[Recorded], migrations: &[ProjectMigration]) -> Result<()
             1,
             "migrations-diverged",
             &format!(
-                "The project's migrations do not continue the serving Version's: {why}. Bring migrations/ in line with the repository's history (a deployed migration is never changed or removed; another Contributor's migrations may not be pulled into your copy yet: git pull), then run vm deploy again; nothing was sent"
+                "The project's migrations do not continue the Application's latest Version's (its migrations are the ones applied, also after going back): {why}. Bring migrations/ in line with the repository's history (a deployed migration is never changed or removed; another Contributor's migrations may not be pulled into your copy yet: git pull), then run vm deploy again; nothing was sent"
             ),
         ));
     }

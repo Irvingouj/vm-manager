@@ -4,8 +4,8 @@
 //! <ip:port> [--stand-in-sign-in] [--administrators-group <Group>]` serves the Applications kept in the
 //! platform database, and the platform's API (blackbox/CONTRACT.md).
 //! `vm sign-in`, `vm sign-out`, `vm whoami`, `vm resources`, `vm
-//! applications`, `vm pull`, `vm new`, `vm check` and `vm generate` are the
-//! Builder's tool
+//! applications`, `vm pull`, `vm new`, `vm check`, `vm generate`, `vm
+//! deploy`, `vm versions`, `vm go-back` and `vm logs` are the Builder's tool
 //! (vm::tool). `vm --version` names the execution core.
 
 use std::io::Write;
@@ -88,6 +88,15 @@ enum Command {
     /// check it, and send it as the Application's new Version, which goes
     /// live at its address.
     Deploy(tool::DeployArgs),
+    /// The Application's Versions: each one's commit, when and by whom it
+    /// was deployed, and which one serves.
+    Versions(tool::VersionsArgs),
+    /// Serve an earlier Version again, at once: the one before the serving
+    /// Version, or --to <number>. Migrations are not undone.
+    GoBack(tool::GoBackArgs),
+    /// What the Application printed and the errors it did not catch,
+    /// request by request; --follow prints new entries as they come.
+    Logs(tool::LogsArgs),
 }
 
 #[derive(clap::Args)]
@@ -149,6 +158,9 @@ fn main() -> ExitCode {
         Some(Command::Check(args)) => tool::run(tool::Command::Check(args)),
         Some(Command::Generate(args)) => tool::run(tool::Command::Generate(args)),
         Some(Command::Deploy(args)) => tool::run(tool::Command::Deploy(args)),
+        Some(Command::Versions(args)) => tool::run(tool::Command::Versions(args)),
+        Some(Command::GoBack(args)) => tool::run(tool::Command::GoBack(args)),
+        Some(Command::Logs(args)) => tool::run(tool::Command::Logs(args)),
         None => {
             say_on_stderr(
                 "vm: name a command (see vm --help): vm sign-in ..., vm serve ..., or vm --version",
