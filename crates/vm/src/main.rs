@@ -3,8 +3,8 @@
 //! `VM_DATABASE_URL=postgres://... vm serve --domain <domain> --listen
 //! <ip:port> [--stand-in-sign-in] [--administrators-group <Group>]` serves the Applications kept in the
 //! platform database, and the platform's API (blackbox/CONTRACT.md).
-//! `vm sign-in`, `vm sign-out`, `vm whoami`, `vm resources` and `vm
-//! applications` are the Builder's tool (vm::tool). `vm --version` names the
+//! `vm sign-in`, `vm sign-out`, `vm whoami`, `vm resources`, `vm
+//! applications` and `vm pull` are the Builder's tool (vm::tool). `vm --version` names the
 //! execution core.
 
 use std::io::Write;
@@ -69,6 +69,10 @@ enum Command {
     Resources(tool::Output),
     /// The Applications you contribute to: name, description, address.
     Applications(tool::Output),
+    /// Pull a Resource's structure into the project, as a typed Drizzle
+    /// definition (resources/<name>/schema.ts) and its link
+    /// (resources/<name>/index.ts).
+    Pull(tool::PullArgs),
 }
 
 #[derive(clap::Args)]
@@ -125,6 +129,7 @@ fn main() -> ExitCode {
         Some(Command::Whoami(output)) => tool::run(tool::Command::Whoami(output)),
         Some(Command::Resources(output)) => tool::run(tool::Command::Resources(output)),
         Some(Command::Applications(output)) => tool::run(tool::Command::Applications(output)),
+        Some(Command::Pull(args)) => tool::run(tool::Command::Pull(args)),
         None => {
             say_on_stderr(
                 "vm: name a command (see vm --help): vm sign-in ..., vm serve ..., or vm --version",

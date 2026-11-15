@@ -1,8 +1,8 @@
 //! The tool: the same program run on a Builder's machine by their Coding
 //! agent (ADR 0006, ADR 0015; blackbox/CONTRACT.md, "The tool").
 //!
-//! `vm sign-in`, `vm sign-out`, `vm whoami`, `vm resources` and `vm
-//! applications`, each with `--json`. Each command is one short run on one
+//! `vm sign-in`, `vm sign-out`, `vm whoami`, `vm resources`, `vm
+//! applications` and `vm pull` ([`pull`]), each with `--json`. Each command is one short run on one
 //! thread: a current-thread runtime, at most a few requests to the
 //! installation ([`client`]), the credential file ([`credential_file`]), and
 //! an [`Ending`] whose exit code says what kind of ending it was:
@@ -19,7 +19,10 @@
 
 mod client;
 mod credential_file;
+mod pull;
 mod theirs;
+
+pub use pull::PullArgs;
 
 use std::io::{self, Write};
 use std::net::SocketAddr;
@@ -99,6 +102,7 @@ pub enum Command {
     Whoami(Output),
     Resources(Output),
     Applications(Output),
+    Pull(PullArgs),
 }
 
 /// A message: the tool's own words, or the installation's (a refusal's
@@ -156,6 +160,7 @@ struct Done {
 pub fn run(command: Command) -> ExitCode {
     let json = match &command {
         Command::SignIn(args) => args.output.json,
+        Command::Pull(args) => args.output.json,
         Command::SignOut(o)
         | Command::Whoami(o)
         | Command::Resources(o)
@@ -173,6 +178,7 @@ pub fn run(command: Command) -> ExitCode {
                 Command::Whoami(_) => whoami().await,
                 Command::Resources(_) => resources().await,
                 Command::Applications(_) => applications().await,
+                Command::Pull(args) => pull::pull(&args).await,
             }
         }),
         Err(error) => Err(Ending::new(
