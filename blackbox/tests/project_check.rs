@@ -25,8 +25,8 @@ use std::path::Path;
 
 use blackbox::project::{
     NOTES_AND_TAGS_SCHEMA_TS, NOTES_RENAMED_SCHEMA_TS, NOTES_SCHEMA_TS, Report, SCHEMA_FIRST_LINE,
-    check, check_in_words, checked_project, generate_migrations, holds_number, manifest_ts,
-    pulled_by_hand, sql_files, type_errors,
+    Tree, check, check_in_words, checked_project, generate_migrations, holds_number, manifest_ts,
+    pulled_by_hand, sql_files, stack_line_in, type_errors,
 };
 use blackbox::scenario::{CONTACT, Scenario};
 use blackbox::sdk::{TempProject, run_tooling};
@@ -604,6 +604,20 @@ fn the_check_reads_no_drizzle_config() {
     Report::failed(&check(&machine, &behind.dir)).problem("migrations", "migrations-behind");
 }
 
+/// Fails unless a message with a tool's words holds its error and not its
+/// stack: no line of a stack trace and no path of the check's own folder.
+fn assert_words_not_stack(message: &str) {
+    assert_eq!(
+        stack_line_in(message),
+        None,
+        "expected the tool's error without its stack, got {message:?}"
+    );
+    assert!(
+        !message.contains("vm-check-"),
+        "expected no path of the check's own folder, got {message:?}"
+    );
+}
+
 /// Fails unless the report has one problem of the check `migrations`,
 /// `own-schema-failed`, whose message has `words` (the tool's own) and
 /// says to correct `src/db/schema.ts`; and the types check was made too.
@@ -624,6 +638,7 @@ fn assert_own_schema_failed(report: &Report, words: &str) {
         message.contains("src/db/schema.ts") && message.to_lowercase().contains("correct"),
         "expected the message to say to correct src/db/schema.ts, got {message:?}"
     );
+    assert_words_not_stack(message);
     assert!(
         report.problems_for("type-error").iter().any(|p| p["file"]
             .as_str()
@@ -723,7 +738,8 @@ fn first_snapshot(migrations: &Path) -> std::path::PathBuf {
 }
 
 /// Fails unless the report has one problem of the check `migrations`,
-/// `migrations-unreadable`, whose message has `words` (drizzle-kit's own),
+/// `migrations-unreadable`, whose message has `words` (drizzle-kit's own,
+/// or the file it names),
 /// says migrations are never edited by hand and to bring the folder back
 /// as it was last committed; and the types check was made too.
 fn assert_migrations_unreadable(report: &Report, words: &str) {
@@ -744,6 +760,7 @@ fn assert_migrations_unreadable(report: &Report, words: &str) {
         lower.contains("by hand") && lower.contains("committed"),
         "expected the message to say migrations are never edited by hand and to bring the folder back as it was last committed, got {message:?}"
     );
+    assert_words_not_stack(message);
     assert!(
         report.problems_for("type-error").iter().any(|p| p["file"]
             .as_str()
@@ -781,6 +798,16 @@ fn a_journal_removed_beside_its_migration_and_snapshot_is_migrations_unreadable(
     });
     let report = Report::failed(&check(&machine, &project.dir));
     assert_migrations_unreadable(&report, "no such file or directory");
+    // drizzle-kit names the journal of the copy; the message names the
+    // project's.
+    let problem = report.problem("migrations", "migrations-unreadable");
+    assert!(
+        problem["message"]
+            .as_str()
+            .unwrap()
+            .contains("migrations/meta/_journal.json"),
+        "expected the message to name migrations/meta/_journal.json, got {problem}"
+    );
 }
 
 /// drizzle-kit reads the snapshots it finds in `meta/`, not those the
@@ -798,16 +825,43 @@ fn a_snapshot_removed_is_migrations_behind() {
 }
 
 /// drizzle-kit does not read the `.sql` files: with one removed and its
-/// journal entry and snapshot still there, it says "No schema changes" and
-/// writes nothing. By the contract the folder is then in step.
+/// journal entry and snapshot still there, it says "No schema changes".
+/// The check sees that the journal and the files do not agree.
 #[test]
-fn a_migration_file_removed_with_its_journal_and_snapshot_kept_is_in_step_as_drizzle_kit_sees_it() {
+fn a_migration_the_journal_names_whose_sql_file_is_gone_is_migrations_unreadable() {
     let (_vm, machine) = signed_in();
-    let project = spoiled_migrations("check-sql-gone", |m| {
-        for sql in sql_files(m.parent().unwrap()) {
-            std::fs::remove_file(m.join(sql)).unwrap();
-        }
+    let project = spoiled_migrations("check-sql-gone", |_| {});
+    let gone = sql_files(&project.dir).into_iter().next().unwrap();
+    std::fs::remove_file(project.path(&format!("migrations/{gone}"))).unwrap();
+    let report = Report::failed(&check(&machine, &project.dir));
+    assert_migrations_unreadable(&report, &format!("migrations/{gone}"));
+}
+
+#[test]
+fn a_sql_file_the_journal_does_not_name_is_migrations_unreadable() {
+    let (_vm, machine) = signed_in();
+    let project = spoiled_migrations("check-sql-stray", |m| {
+        std::fs::write(
+            m.join("0001_stray.sql"),
+            "ALTER TABLE \"notes\" ADD COLUMN \"extra\" text;\n",
+        )
+        .unwrap();
     });
-    std::fs::remove_file(project.path("src/broken.ts")).unwrap();
+    let report = Report::failed(&check(&machine, &project.dir));
+    assert_migrations_unreadable(&report, "migrations/0001_stray.sql");
+}
+
+/// A new project's `migrations/`: only `.gitkeep`, no journal, no
+/// migration, and a schema with no table. In step: the journal the
+/// contract asks to agree with the files is not there to disagree.
+#[test]
+fn a_migrations_folder_with_only_gitkeep_and_no_table_is_in_step() {
+    let (_vm, machine) = signed_in();
+    let project = checked_project("check-gitkeep-only");
+    assert_eq!(
+        Tree::of(&project.path("migrations")).paths(),
+        [".gitkeep"],
+        "the harness's own check"
+    );
     Report::clean(&check(&machine, &project.dir));
 }

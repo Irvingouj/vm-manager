@@ -929,6 +929,51 @@ pub fn html_text(html: &str) -> String {
     out
 }
 
+/// The first piece of `text` that reads as a line of a stack trace: `at `
+/// (at the start or after white space) followed, before the next line end
+/// or ` / `, by `(<anonymous>)`, a `node:` module, or a place written
+/// `:<line>:<column>`. Ordinary words ("look at the file") are not one.
+pub fn stack_line_in(text: &str) -> Option<String> {
+    for piece in text.split(['\n']).flat_map(|line| line.split(" / ")) {
+        let mut rest = piece;
+        while let Some(at) = rest.find("at ") {
+            let before = rest.get(..at).unwrap_or_default();
+            let after = rest.get(at + 3..).unwrap_or_default();
+            let starts_word = before.is_empty() || before.ends_with(char::is_whitespace);
+            if starts_word
+                && (after.contains("<anonymous>") || after.contains("node:") || has_place(after))
+            {
+                return Some(piece.trim().to_owned());
+            }
+            rest = after;
+        }
+    }
+    None
+}
+
+/// Whether `text` holds `:<digits>:<digits>`.
+fn has_place(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut index = 0;
+    while let Some(colon) = bytes
+        .get(index..)
+        .and_then(|b| b.iter().position(|c| *c == b':'))
+    {
+        let start = index + colon + 1;
+        let digits = |from: usize| {
+            bytes
+                .get(from..)
+                .map_or(0, |b| b.iter().take_while(|c| c.is_ascii_digit()).count())
+        };
+        let first = digits(start);
+        if first > 0 && bytes.get(start + first) == Some(&b':') && digits(start + first + 1) > 0 {
+            return true;
+        }
+        index = start;
+    }
+    false
+}
+
 /// The code points written `\u{<hex>}` in a text.
 pub fn escapes_in(text: &str) -> Vec<u32> {
     text.split("\\u{")
@@ -962,6 +1007,26 @@ mod tests {
     fn the_commands_of_the_help_are_read() {
         let help = "Usage: vm [COMMAND]\n\nCommands:\n  serve   Serve\n  sign-in  Sign in\n  help  Print\n\nOptions:\n  -h\n";
         assert_eq!(help_commands(help), ["serve", "sign-in", "help"]);
+    }
+
+    #[test]
+    fn stack_lines_are_told_from_ordinary_words() {
+        assert!(
+            stack_line_in(
+                "SyntaxError: bad / at JSON.parse (<anonymous>) / at f (/x/bin.cjs:8134:28)"
+            )
+            .is_some()
+        );
+        assert!(stack_line_in("Error: no\n    at Object.openSync (node:fs:560:18)").is_some());
+        assert!(stack_line_in("    at /home/x/bin.cjs:16783:22").is_some());
+        assert!(
+            stack_line_in("look at the file src/db/schema.ts, line 3: then run vm check at 10:30")
+                .is_none()
+        );
+        assert!(
+            stack_line_in("bring the folder back as it was last committed; what at first")
+                .is_none()
+        );
     }
 
     #[test]
