@@ -865,3 +865,75 @@ fn a_migrations_folder_with_only_gitkeep_and_no_table_is_in_step() {
     );
     Report::clean(&check(&machine, &project.dir));
 }
+
+/// drizzle-kit reads `{}` in place of its snapshot, ends with 0, writes
+/// nothing, and says on standard output
+/// `migrations/meta/0000_snapshot.json data is malformed`.
+#[test]
+fn a_snapshot_that_is_json_but_no_snapshot_is_migrations_unreadable() {
+    let (_vm, machine) = signed_in();
+    let project = spoiled_migrations("check-snapshot-not-a-snapshot", |m| {
+        std::fs::write(first_snapshot(m), "{}\n").unwrap();
+    });
+    let report = Report::failed(&check(&machine, &project.dir));
+    assert_migrations_unreadable(&report, "data is malformed");
+    let problem = report.problem("migrations", "migrations-unreadable");
+    assert!(
+        problem["message"]
+            .as_str()
+            .unwrap()
+            .contains("migrations/meta/0000_snapshot.json"),
+        "expected the message to name the project's migrations/meta/0000_snapshot.json, got {problem}"
+    );
+}
+
+#[test]
+fn of_more_than_ten_files_that_do_not_agree_ten_are_named_and_how_many_more() {
+    let (_vm, machine) = signed_in();
+    let strays: Vec<String> = (1..=12).map(|i| format!("{i:04}_stray.sql")).collect();
+    let project = spoiled_migrations("check-sql-strays", |m| {
+        for stray in &strays {
+            std::fs::write(m.join(stray), "SELECT 1;\n").unwrap();
+        }
+    });
+    let report = Report::failed(&check(&machine, &project.dir));
+    assert_eq!(
+        report.problems_for("migrations-unreadable").len(),
+        1,
+        "expected one problem for all the files\n{}",
+        report.run.describe()
+    );
+    assert_migrations_unreadable(&report, "migrations/");
+    let problem = report.problem("migrations", "migrations-unreadable");
+    let message = problem["message"].as_str().unwrap();
+    let named = strays
+        .iter()
+        .filter(|s| message.contains(&format!("migrations/{s}")))
+        .count();
+    assert_eq!(
+        named, 10,
+        "expected ten of the twelve files named, got {named}: {message:?}"
+    );
+    assert!(
+        holds_number(message, 2) && message.contains("more"),
+        "expected the message to say there are 2 more, got {message:?}"
+    );
+}
+
+#[test]
+fn a_journal_larger_than_4_mib_is_migrations_unreadable() {
+    let (_vm, machine) = signed_in();
+    let project = spoiled_migrations("check-journal-large", |m| {
+        let journal = m.join("meta/_journal.json");
+        let mut text = std::fs::read_to_string(&journal).unwrap();
+        text.push_str(&" ".repeat(4 * 1024 * 1024 + 1));
+        text.push('\n');
+        std::fs::write(&journal, text).unwrap();
+    });
+    // The harness's own check: still a valid journal.
+    let journal = std::fs::read_to_string(project.path("migrations/meta/_journal.json")).unwrap();
+    assert!(serde_json::from_str::<Value>(&journal).is_ok());
+    assert!(journal.len() > 4 * 1024 * 1024);
+    let report = Report::failed(&check(&machine, &project.dir));
+    assert_migrations_unreadable(&report, "migrations/meta/_journal.json");
+}
