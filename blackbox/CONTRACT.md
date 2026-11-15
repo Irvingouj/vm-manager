@@ -1118,3 +1118,72 @@ vm applications [--json]
 - **Until the ticket on Contributors and sharing says who can open an Application, the list holds the Applications the User is a Contributor of** (`contributor` true), and no other. That ticket adds the ones shared with them.
 - `vm applications --json` prints the same object. Without `--json`, one block per Application: name, description, address, and whether a Version is serving.
 - With none: `{ "applications": [] }`, and in words that the User contributes to no Application yet.
+
+## Pulling a Resource's structure (ticket: Pull a Resource's structure as a typed Drizzle definition)
+
+The Structure puller (ADR 0003, ADR 0012, ADR 0014). The platform reads a shared database's catalogs and answers a Drizzle definition and a fingerprint; the tool writes them into the project.
+
+### The structure login
+
+- `POST /v1/resources` takes, in `connection`, an optional `"structure": { "role": "...", "password": "..." }`, beside `read` and `write`. Like every other part of `connection` it is in no answer, log record or error message.
+- A pull connects with the structure login when the Resource has one, and with the read login otherwise. It never uses the write login.
+
+### What a pull reads
+
+- **Catalogs only.** Every statement the puller sends is a fixed text of the program's, with values as parameters, that reads from `pg_catalog` and nothing else: no table, view or function of the shared database's own, no row of any of them, and no statistics (`pg_statistic`, `pg_stats`, `pg_stat_*`, `pg_class.reltuples`). It runs in a read-only transaction and changes no setting but its own session's (`search_path`, a statement timeout, the transaction's read-only state). With statement logging fully on in the shared database, the server log shows it.
+- A pull is held to 10 seconds in all and to an answer of 4 MiB. Past either: `503` `structure-unavailable` (time) or `422` `structure-too-large`.
+
+### On the platform's API
+
+`GET /v1/resources/<name>/structure`, by a signed-in User:
+
+```json
+{ "resource": "devops", "fingerprint": "sha256:<64 hex>", "your_access": "structure" | "read" | "write",
+  "schema_ts": "<the definition, as text>",
+  "unsupported": [ { "schema": "public", "table": "sites", "column": "area", "type": "polygon" } ] }
+```
+
+- Allowed for a User who holds a Grant on the Resource at any level (`structure` is enough). The decision is the Authorization decision's, with `structure` needed.
+- No Grant: `403` with reason `no-grant`; the message names the Resource's `contact` as whom to ask and says not to build against the Resource until then. Beside `reason` and `message` the error has `"resource"` and `"contact"`. Nothing is sent to the shared database.
+- No such Resource: `404` `not-found`. A shared database that cannot be reached, refuses the login, or does not answer in time: `503` `structure-unavailable`, with nothing about the connection in it.
+- Every pull, allowed or refused, has one entry in the Operation log: `operation` `structure`, `application` and `version` null, `request` the request's id, `user` the User, `resource`, `statement` null, `outcome` `allowed`, `refused` (`reason` `no-grant`) or `failed` (`error` `unavailable`, `time` or `bytes`), `rows` null. It is written before anything is sent to the shared database; if it cannot be written the pull is `503` `unavailable` and nothing is sent.
+
+### What is in the structure
+
+- Every ordinary table, partitioned table, view and materialized view of every schema except Postgres's own (`pg_catalog`, `information_schema`, `pg_toast`, and any `pg_*`), whatever the pulling login may do with them. A partition is not listed apart from its partitioned table. Tables of an extension are listed like any other.
+- Of each: its schema and name; its columns in order, each with its type, whether it may be null, whether it has a default (and the default's expression), whether it is an identity column (always or by default) or a generated column; of a table also its primary key, its unique constraints and its foreign keys (columns, the table and columns referred to, `ON DELETE` and `ON UPDATE`).
+- Every enum type a listed column uses, with its labels in order.
+- Not in the structure: indexes that back no constraint, check constraints, triggers, functions, privileges, row security, comments, sequences, owners, storage. Changing one of these changes neither the definition nor the fingerprint.
+
+### The fingerprint
+
+- `sha256:` and 64 hex digits, over the structure as listed above and nothing else: the same structure gives the same fingerprint, whichever login pulled it, on whichever server, however and in whatever order its tables were made (object ids and creation order are not in it).
+- Any change to what is listed gives another: a table, view, column, enum label, key or foreign key added, dropped or renamed; a column's type, nullability, default, identity or generation changed; a column moved.
+
+### The definition
+
+`schema_ts` is one TypeScript module for `drizzle-orm/pg-core` (0.45 or later, below 1.0) that type-checks under the project's `tsconfig.json`:
+
+- Its first lines are `// Generated by vm pull. Do not edit.` and `// Resource: <name>  Fingerprint: sha256:<64 hex>`.
+- A table of schema `public` is `export const <name> = pgTable("<table>", { ... })`; one of another schema hangs off `export const <schema>Schema = pgSchema("<schema>")`. A view is `pgView("<view>", { ... }).existing()`, a materialized view `pgMaterializedView(...).existing()`. An enum is `pgEnum`, or `<schema>Schema.enum`.
+- **Export names.** A table, view or enum of `public` is exported under its name in camel case (`incident_notes` → `incidentNotes`); one of another schema under the schema's name and its own, in camel case (`crm.accounts` → `crmAccounts`). A column's key is its name in camel case; the column's real name is always given. Where two names would meet, or a name is no TypeScript identifier or is a reserved word, a `_` and a number are added, in the order of the names as Postgres sorts them (`C` collation): the result depends on the structure alone.
+- **Types expressed**: `smallint`, `integer`, `bigint` (Drizzle's `bigint` with `mode: "number"`, as `drizzle-kit pull` writes it), `smallserial`, `serial` and `bigserial` where a column is one, `boolean`, `text`, `varchar(n)`, `char(n)`, `numeric(p,s)`, `real`, `double precision`, `date`, `time` with and without time zone, `timestamp`, `timestamptz` (with their precision), `interval`, `uuid`, `json`, `jsonb`, an enum, and an array of any of these (any number of dimensions as one). `date`, `timestamp` and `timestamptz` are in Drizzle's `mode: "string"`: the value is the text Postgres prints, as the host hands it over.
+- **A type it cannot express** (`bytea`, a range, a geometric or network type, a domain, a composite, an extension's type, ...) is not dropped: the column is in the definition as a custom type whose TypeScript type is `unknown` and whose database type is the type's name, and it is listed in `unsupported`. Its value reads as the text Postgres prints.
+- A primary key of one column is `.primaryKey()` on it, of several a `primaryKey({ columns: [...] })`; `NOT NULL` is `.notNull()`; a default is `.default(sql\`<expression>\`)`; identity is `.generatedAlwaysAsIdentity()` or `.generatedByDefaultAsIdentity()`; a generated column `.generatedAlwaysAs(sql\`<expression>\`)`; unique constraints and foreign keys are in the table's extra config (`unique(...)`, `foreignKey({ ... })` with its actions). So an `insert` type-checks without the columns that have a default, and not without a required one.
+- The same structure gives the same text, byte for byte: tables by schema then name, as Postgres sorts them (`C` collation); columns in their order.
+- No relations are generated in this ticket: `resources/<name>/relations.ts`, when a project has one, is the Builder's.
+
+### The tool
+
+```
+vm pull <resource> [--project <directory>] [--json]
+```
+
+- The project is `--project`, or the current directory. A directory without `manifest.ts` is not one: reason `not-a-project`, exit code `1`, nothing written.
+- It asks the installation for the structure and writes two files: `resources/<name>/schema.ts` (the definition, as answered) and `resources/<name>/index.ts` (the generated link of "A project", with the `relations` lines exactly when `resources/<name>/relations.ts` is there). It makes the folders it needs. Each file is written whole or not at all.
+- It prints `{ "resource", "fingerprint", "your_access", "files": [ { "path": "resources/<name>/schema.ts", "changed": <bool> }, ... ], "unsupported": [ ... ] }`, exit code `0`. `path` is relative to the project. Without `--json`, the same in words; each unsupported column is one line that names the table, the column and the type, and says the column is typed `unknown`.
+- **Pulling twice changes nothing**: the second pull of an unchanged structure writes no file (each `changed` is false, the files' bytes and modification times are as they were).
+- A file at one of the two paths that does not begin with the generated first line was not written by the tool: it is not overwritten; reason `not-generated`, exit code `1`, the message names the file.
+- **Refused** (`no-grant`): exit code `3`, the API's reason and message (whom to ask; do not build against the Resource), and nothing is written or changed, also when an earlier pull's files are there.
+- Not signed in, an installation that cannot be reached, and the other endings are as for every command.
+- A Resource's name is checked by the tool before it is used in a path: what is not a Resource's name as the API takes one is exit code `2`.
