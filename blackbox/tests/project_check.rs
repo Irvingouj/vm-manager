@@ -401,28 +401,36 @@ fn more_than_fifty_type_errors_give_fifty_and_how_many_more() {
     };
     report.assert_shape();
     let types = report.of_check("types");
-    let located: Vec<&Value> = types
-        .iter()
-        .filter(|p| p["reason"] == json!("type-error") && p["line"].is_number())
-        .collect();
     assert_eq!(
-        located.len(),
-        50,
-        "expected at most 50 type errors, each with its line\n{}",
+        types.len(),
+        51,
+        "expected 50 type errors and one last problem saying how many more\n{}",
         run.describe()
     );
-    for (index, problem) in located.iter().enumerate() {
+    for (index, problem) in types.iter().take(50).enumerate() {
+        assert_eq!(problem["reason"], json!("type-error"), "{problem}");
+        assert!(
+            problem["file"]
+                .as_str()
+                .is_some_and(|f| f.ends_with("src/many.ts")),
+            "{problem}"
+        );
         assert_eq!(problem["line"], json!(index + 1), "{problem}");
+        assert_eq!(problem["column"], json!(14), "{problem}");
     }
-    let rest: Vec<&Value> = types.iter().filter(|p| !p["line"].is_number()).collect();
+    let last = &types[50];
+    assert_eq!(last["reason"], json!("type-error"), "{last}");
+    assert_eq!(last["more"], json!(10), "expected `more`: 10, got {last}");
+    for field in ["file", "line", "column"] {
+        assert!(
+            last.get(field).is_none(),
+            "expected the last problem to have no `{field}`, got {last}"
+        );
+    }
+    let message = last["message"].as_str().unwrap();
     assert!(
-        types.len() <= 51
-            && rest.iter().any(|p| {
-                let message = p["message"].as_str().unwrap_or_default();
-                holds_number(message, 10) && message.contains("more")
-            }),
-        "expected, after the 50, how many more (10)\n{}",
-        run.describe()
+        holds_number(message, 10) && message.contains("more"),
+        "expected the last problem's message to say how many more (10), got {message:?}"
     );
 }
 
@@ -594,4 +602,98 @@ fn the_check_reads_no_drizzle_config() {
     behind.write("elsewhere/migrations/.gitkeep", "");
     behind.write("drizzle.config.ts", elsewhere_config);
     Report::failed(&check(&machine, &behind.dir)).problem("migrations", "migrations-behind");
+}
+
+/// Fails unless the report has one problem of the check `migrations`,
+/// `own-schema-failed`, whose message has `words` (the tool's own) and
+/// says to correct `src/db/schema.ts`; and the types check was made too.
+fn assert_own_schema_failed(report: &Report, words: &str) {
+    assert_eq!(
+        report.of_check("migrations").len(),
+        1,
+        "expected one problem of the migrations check\n{}",
+        report.run.describe()
+    );
+    let problem = report.problem("migrations", "own-schema-failed");
+    let message = problem["message"].as_str().unwrap();
+    assert!(
+        message.contains(words),
+        "expected the message to have drizzle-kit's own words {words:?}, got {message:?}"
+    );
+    assert!(
+        message.contains("src/db/schema.ts") && message.to_lowercase().contains("correct"),
+        "expected the message to say to correct src/db/schema.ts, got {message:?}"
+    );
+    assert!(
+        report.problems_for("type-error").iter().any(|p| p["file"]
+            .as_str()
+            .is_some_and(|f| f.ends_with("src/broken.ts"))),
+        "expected the other checks still made (the type error in src/broken.ts)\n{}",
+        report.run.describe()
+    );
+}
+
+#[test]
+fn an_own_schema_that_is_not_there_is_own_schema_failed() {
+    let (_vm, machine) = signed_in();
+    let project = checked_project("check-schema-missing");
+    std::fs::remove_file(project.path("src/db/schema.ts")).unwrap();
+    project.write("src/broken.ts", ONE_TYPE_ERROR);
+    let report = Report::failed(&check(&machine, &project.dir));
+    assert_own_schema_failed(&report, "No schema files found");
+}
+
+#[test]
+fn an_own_schema_that_throws_when_loaded_is_own_schema_failed() {
+    let (_vm, machine) = signed_in();
+    let project = checked_project("check-schema-throws");
+    project.write(
+        "src/db/schema.ts",
+        "throw new Error(\"the schema refuses to load\");\nexport {};\n",
+    );
+    project.write("src/broken.ts", ONE_TYPE_ERROR);
+    let report = Report::failed(&check(&machine, &project.dir));
+    assert_own_schema_failed(&report, "the schema refuses to load");
+}
+
+#[test]
+fn an_own_schema_that_imports_what_is_not_there_is_own_schema_failed() {
+    let (_vm, machine) = signed_in();
+    let project = checked_project("check-schema-import");
+    project.write(
+        "src/db/schema.ts",
+        "import { nothing } from \"./not-there.ts\";\nexport const x = nothing;\n",
+    );
+    project.write("src/broken.ts", ONE_TYPE_ERROR);
+    let report = Report::failed(&check(&machine, &project.dir));
+    assert_own_schema_failed(&report, "Cannot find module './not-there.ts'");
+    // tsc says so too, with its place.
+    assert!(
+        report.problems_for("type-error").iter().any(|p| p["file"]
+            .as_str()
+            .is_some_and(|f| f.ends_with("src/db/schema.ts"))
+            && p["line"] == json!(1)),
+        "{}",
+        report.run.describe()
+    );
+}
+
+#[test]
+fn a_compiler_error_with_no_place_is_a_type_error_with_null_file_line_and_column() {
+    let (_vm, machine) = signed_in();
+    let project = checked_project("check-no-tsconfig");
+    std::fs::remove_file(project.path("tsconfig.json")).unwrap();
+    let report = Report::failed(&check(&machine, &project.dir));
+    let problem = report.problem("types", "type-error");
+    for field in ["file", "line", "column"] {
+        assert!(
+            problem.get(field).is_some_and(Value::is_null),
+            "expected `{field}` null for an error the compiler gives with no place, got {problem}"
+        );
+    }
+    let message = problem["message"].as_str().unwrap();
+    assert!(
+        message.contains("tsconfig.json"),
+        "expected the compiler's message (it names tsconfig.json), got {message:?}"
+    );
 }

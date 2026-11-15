@@ -386,3 +386,47 @@ fn vm_check_whose_standard_output_or_error_is_closed_ends_without_a_crash() {
         }
     }
 }
+
+#[test]
+fn the_command_line_is_looked_at_before_the_project_and_the_sign_in() {
+    let machine = Machine::new();
+    let empty = machine.root().join("empty");
+    fs::create_dir_all(&empty).unwrap();
+    let run = machine.run_into_files(
+        &check_args(empty.to_str().unwrap(), &["--timeout", "0"]),
+        &[],
+        CHECK_TIMEOUT,
+    );
+    assert_eq!(
+        run.code,
+        Some(2),
+        "expected a wrong --timeout to be 2 before anything else\n{}",
+        run.describe()
+    );
+}
+
+#[test]
+fn the_project_is_looked_at_before_the_sign_in() {
+    let machine = Machine::new();
+    let empty = machine.root().join("empty");
+    fs::create_dir_all(&empty).unwrap();
+    check(&machine, &empty).json_error(1, "not-a-project");
+}
+
+#[test]
+fn the_sign_in_is_looked_at_before_node_and_the_packages() {
+    let machine = Machine::new();
+    let project = checked_project("needs-order-node");
+    let empty = stand_ins(&machine.root().join("no-node"), &[]);
+    machine
+        .run_into_files(
+            &check_args(project.dir.to_str().unwrap(), &[]),
+            &[("PATH", empty.to_str().unwrap())],
+            CHECK_TIMEOUT,
+        )
+        .json_error(4, "not-signed-in");
+    // Not installed either: still 4.
+    let bare = machine.root().join("bare");
+    write_checked(&bare);
+    check(&machine, &bare).json_error(4, "not-signed-in");
+}
