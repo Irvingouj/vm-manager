@@ -21,7 +21,9 @@ openworkers-runtime-v8 = { git = "https://github.com/openworkers/openworkers-run
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
 http-body-util = "0.1"
-hyper = { version = "1", features = ["server", "http1"] }
+# The client side is the tool's (crates/vm/src/tool): plain HTTP/1.1 to the
+# installation, driven on the tool's own single thread.
+hyper = { version = "1", features = ["server", "client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

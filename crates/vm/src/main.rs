@@ -27,11 +27,16 @@ use vm::registry::{Registry, is_dns_label};
 use vm::resources::Resources;
 use vm::runner::{self, RequestRunner};
 use vm::sign_in::{NoSignIn, SignIn, StandInSignIn};
+use vm::tool;
 use vm::tool_credentials::{DEFAULT_LIFETIME, ToolCredentials};
 use vm::{log, server};
 
 #[derive(Parser)]
-#[command(name = "vm", disable_version_flag = true)]
+#[command(
+    name = "vm",
+    disable_version_flag = true,
+    after_help = tool::EXIT_CODES
+)]
 struct Cli {
     /// Print the version and the execution core, and exit.
     #[arg(short = 'V', long)]
@@ -49,6 +54,20 @@ enum Command {
     /// Serve Applications, each on <name>.<domain>, and the platform's API
     /// on api.<domain>. The platform database is named by VM_DATABASE_URL.
     Serve(Serve),
+    /// Sign the tool in to an installation, and keep its credential in your
+    /// own configuration folder.
+    SignIn(tool::SignInArgs),
+    /// End the tool's credential at the installation and remove it from
+    /// this machine.
+    SignOut(tool::Output),
+    /// Who the tool is signed in as: the User, their Groups, the
+    /// installation.
+    Whoami(tool::Output),
+    /// Every registered Resource: its description, your Access level, and
+    /// whom to ask.
+    Resources(tool::Output),
+    /// The Applications you contribute to: name, description, address.
+    Applications(tool::Output),
 }
 
 #[derive(clap::Args)]
@@ -100,6 +119,11 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        Some(Command::SignIn(args)) => tool::run(tool::Command::SignIn(args)),
+        Some(Command::SignOut(output)) => tool::run(tool::Command::SignOut(output)),
+        Some(Command::Whoami(output)) => tool::run(tool::Command::Whoami(output)),
+        Some(Command::Resources(output)) => tool::run(tool::Command::Resources(output)),
+        Some(Command::Applications(output)) => tool::run(tool::Command::Applications(output)),
         None => {
             eprintln!(
                 "vm: name a command (see vm --help): vm sign-in ..., vm serve ..., or vm --version"

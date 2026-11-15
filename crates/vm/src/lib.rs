@@ -35,6 +35,7 @@
 //!   calls, JSON out.
 //! - [`tool_credentials`]: the credentials the Builder's tool signs in to
 //!   the API with, kept in the platform database as digests.
+//! - [`tool`]: the same program run as the Builder's command-line tool.
 //! - [`log`]: the program's log, one JSON record per line.
 //! - [`server`]: the listening socket and the connections.
 
@@ -54,5 +55,6 @@ pub mod runner;
 pub mod server;
 pub mod sign_in;
 pub mod statement;
+pub mod tool;
 pub mod tool_credentials;
 pub mod user;
