@@ -753,7 +753,10 @@ impl Api {
         if method == Method::GET {
             let all = self.resources.list();
             let resources = ResourcesView {
-                resources: all.iter().map(|r| ResourceRead::of(r, user)).collect(),
+                resources: {
+                    let groups = groups_of(user);
+                    all.iter().map(|r| ResourceRead::of(r, &groups)).collect()
+                },
             };
             return Ok(Answer::json(StatusCode::OK, &resources));
         }
@@ -788,7 +791,10 @@ impl Api {
             return no_resource();
         };
         if method == Method::GET {
-            Answer::json(StatusCode::OK, &ResourceRead::of(&resource, user))
+            Answer::json(
+                StatusCode::OK,
+                &ResourceRead::of(&resource, &groups_of(user)),
+            )
         } else {
             Answer::method_not_allowed(method, "GET")
         }
@@ -1039,14 +1045,20 @@ struct ResourceRead<'a> {
 }
 
 impl<'a> ResourceRead<'a> {
-    fn of(resource: &'a resources::Resource, user: &User) -> Self {
-        let groups: Vec<&str> = user.groups.iter().map(String::as_str).collect();
-        let held = resource.with_grants(|grants| authz::held(&groups, grants));
+    /// `groups`: the reader's, as [`groups_of`] gives them, once a request.
+    fn of(resource: &'a resources::Resource, groups: &[&str]) -> Self {
+        let held = resource.with_grants(|grants| authz::held(groups, grants));
         Self {
             face: ResourceView::of(resource),
             your_access: held.map(resources::level_name),
         }
     }
+}
+
+/// The User's Groups as the Authorization decision takes them: borrowed,
+/// not copied.
+fn groups_of(user: &User) -> Vec<&str> {
+    user.groups.iter().map(String::as_str).collect()
 }
 
 #[derive(Serialize)]
