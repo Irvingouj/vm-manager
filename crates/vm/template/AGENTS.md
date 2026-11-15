@@ -27,6 +27,9 @@ Run them from this folder. Each has `--help` and `--json` (one JSON object on st
 | `vm generate` | writes the next migration from `src/db/schema.ts` into `migrations/`; stops before one that destroys data |
 | `vm check` | checks the Manifest, the Resources, the migrations and the types |
 | `vm deploy` | checks the committed project again, builds it and puts it live as the Application's next Version |
+| `vm versions <name>` | the Application's Versions: commit, when, by whom, and which one serves |
+| `vm go-back <name>` | serves the Version before the serving one again, at once (`--to <n>` for an earlier one) |
+| `vm logs <name>` | what the Application printed and the errors it did not catch, request by request |
 
 If a command says you are not signed in, ask the Builder to run `vm sign-in` (it needs their details), then run yours again.
 
@@ -67,7 +70,13 @@ A migration destroys data when it drops a table, a column or a schema, or change
 
 `vm deploy` sends the project as it is in its last commit, so a deploy needs everything committed: it refuses uncommitted changes and names the files; commit them (or add what is not part of the Application to `.gitignore`) and deploy again. It pulls every declared Resource again: when a shared structure changed, it updates `resources/<name>/` and builds against it (commit those files after), and it fails only if the code no longer type-checks against it. It then makes the checks of `vm check`, and stops on any problem as the check does.
 
-A migration that destroys data is asked about again at deploy when a Version is already serving, because the rows are there now, even if `vm generate --allow-data-loss` wrote it; it also counts rows you delete in a migration written by hand. Such a migration removes rows with `DELETE`, never with `TRUNCATE`, which the platform refuses. `vm deploy --allow-data-loss` has the same rule as for `vm generate`: tell the Builder exactly what would be lost and ask, unless the Builder has already clearly said that this data may be lost. If a migration fails in the database, nothing is changed and the Version that was serving, if any, goes on serving: read the database's error in the output.
+A migration that destroys data is asked about again at deploy when the Application already has a Version, because the rows are there now, even if `vm generate --allow-data-loss` wrote it; it also counts rows you delete in a migration written by hand. Such a migration removes rows with `DELETE`, never with `TRUNCATE`, which the platform refuses. `vm deploy --allow-data-loss` has the same rule as for `vm generate`: tell the Builder exactly what would be lost and ask, unless the Builder has already clearly said that this data may be lost. If a migration fails in the database, nothing is changed and the Version that was serving, if any, goes on serving: read the database's error in the output.
+
+## Debugging, and going back
+
+To debug, read `vm logs <name>`: one entry for each request, with the User, the Version, what the code printed and any error it did not catch, with its stack. Every response carries `x-vm-request-id`; `vm logs <name> --request <id>` shows that request's entry alone. `vm logs <name> --after <next>`, with the `next` of the last run, reads only what came since. `vm logs <name> --follow` prints entries as they come and does not end by itself: run it only where it can be stopped, never as a step that must finish.
+
+`vm go-back <name>` is the quick way out of a bad deploy: the Version before it serves again at once, and nothing is asked. It does not undo migrations: the own database keeps what they made, the older code runs against it, and `migrations/` keeps them, since the next deploy must still carry every deployed migration. `vm versions <name>` shows which Version serves.
 
 ## Telling the Builder who can see the Application
 
