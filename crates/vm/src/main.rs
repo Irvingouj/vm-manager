@@ -3,7 +3,9 @@
 //! `VM_DATABASE_URL=postgres://... vm serve --domain <domain> --listen
 //! <ip:port> [--stand-in-sign-in] [--administrators-group <Group>]` serves the Applications kept in the
 //! platform database, and the platform's API (blackbox/CONTRACT.md).
-//! `vm --version` names the execution core.
+//! `vm sign-in`, `vm sign-out`, `vm whoami`, `vm resources` and `vm
+//! applications` are the Builder's tool (vm::tool). `vm --version` names the
+//! execution core.
 
 use std::net::SocketAddr;
 use std::process::ExitCode;
@@ -25,6 +27,7 @@ use vm::registry::{Registry, is_dns_label};
 use vm::resources::Resources;
 use vm::runner::{self, RequestRunner};
 use vm::sign_in::{NoSignIn, SignIn, StandInSignIn};
+use vm::tool_credentials::{DEFAULT_LIFETIME, ToolCredentials};
 use vm::{log, server};
 
 #[derive(Parser)]
@@ -63,7 +66,14 @@ struct Serve {
     /// one is.
     #[arg(long)]
     administrators_group: Option<String>,
+    /// How long a tool credential lives from its sign-in, in seconds.
+    #[arg(long, default_value_t = DEFAULT_LIFETIME.as_secs(),
+          value_parser = clap::value_parser!(u64).range(1..=MAX_TOOL_CREDENTIAL_LIFETIME))]
+    tool_credential_lifetime: u64,
 }
+
+/// The longest lifetime `--tool-credential-lifetime` takes: ten years.
+const MAX_TOOL_CREDENTIAL_LIFETIME: u64 = 10 * 366 * 24 * 60 * 60;
 
 fn main() -> ExitCode {
     let cli = match Cli::try_parse() {
@@ -91,7 +101,9 @@ fn main() -> ExitCode {
             }
         },
         None => {
-            eprintln!("vm: name a command: vm serve ..., or vm --version");
+            eprintln!(
+                "vm: name a command (see vm --help): vm sign-in ..., vm serve ..., or vm --version"
+            );
             ExitCode::from(2)
         }
     }
@@ -170,6 +182,10 @@ fn run(serve: &Serve) -> Result<(), String> {
         own.ship_all();
         let registry = Arc::new(registry);
         let resources = Arc::new(resources);
+        let credentials = Arc::new(ToolCredentials::new(
+            Arc::clone(&database),
+            Duration::from_secs(serve.tool_credential_lifetime),
+        ));
         let log = Arc::new(OperationLog::new(database));
         let gateway: Arc<dyn Gateway> = Arc::new(PlatformGateway::new(
             Arc::clone(&resources),
@@ -202,12 +218,14 @@ fn run(serve: &Serve) -> Result<(), String> {
                 Arc::clone(&registry),
                 resources,
                 log,
+                Arc::clone(&credentials),
                 Arc::clone(&domain),
                 administrators,
             ),
             domain,
             registry,
             sign_in,
+            credentials,
             runner,
             max_request_body_bytes: 1024 * 1024,
         });

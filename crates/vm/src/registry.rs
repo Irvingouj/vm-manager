@@ -105,6 +105,14 @@ pub struct ApplicationRecord {
     pub created_at: String,
 }
 
+/// An Application as a list of them shows it.
+#[derive(Debug)]
+pub struct ListedApplication {
+    pub name: String,
+    pub description: Option<String>,
+    pub serving_version: Option<u64>,
+}
+
 /// A Version as the registry reports it; the bundle itself is not in it.
 #[derive(Debug)]
 pub struct VersionRecord {
@@ -385,6 +393,37 @@ impl Registry {
             created_by: get(&row, 4)?,
             created_at: get(&row, 5)?,
         }))
+    }
+
+    /// The Applications `user` is a Contributor of, by name (compared byte
+    /// by byte, whatever the database's collation).
+    pub async fn contributed_to(&self, user: &str) -> Result<Vec<ListedApplication>, DbError> {
+        let rows = self
+            .database
+            .pool()
+            .run(async |client: &mut Client| {
+                client
+                    .query(
+                        "SELECT a.name, a.description, a.serving_version
+                         FROM applications a
+                         JOIN contributors c ON c.application_id = a.id
+                         WHERE c.user_id = $1
+                         ORDER BY a.name COLLATE \"C\"",
+                        &[&user],
+                    )
+                    .await
+                    .map_err(DbError::from)
+            })
+            .await?;
+        rows.iter()
+            .map(|row| {
+                Ok(ListedApplication {
+                    name: get(row, 0)?,
+                    description: get(row, 1)?,
+                    serving_version: get::<Option<i32>>(row, 2)?.map(number_of).transpose()?,
+                })
+            })
+            .collect()
     }
 
     /// Whether `user` is a Contributor of `name`; `None` when there is no

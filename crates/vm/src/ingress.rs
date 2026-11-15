@@ -1,10 +1,15 @@
 //! Ingress: takes an HTTP request off the wire and answers it.
 //!
 //! In order (blackbox/CONTRACT.md, "Responses the program itself gives"):
-//! a request id; the `Host`; who the User is ([`SignIn`]); then either the
-//! platform's API (`api.<domain>`, [`Api`]) or an Application
-//! (`<application>.<domain>`), whose serving Version the Application
-//! registry holds in memory, run by the Request runner. Its own
+//! a request id; the `Host`; a malformed stand-in sign-in ([`SignIn`]);
+//! then who the User is. On the platform's API (`api.<domain>`, [`Api`]) an
+//! `Authorization` header, when there is one, decides alone: a tool
+//! credential ([`ToolCredentials`]) that is alive signs its User in, and
+//! anything else is the `401` of anyone not signed in, whatever stand-in
+//! headers come with it. On an Application's address
+//! (`<application>.<domain>`) only the [`SignIn`] counts; its serving
+//! Version, which the Application registry holds in memory, is run by the
+//! Request runner. Its own
 //! refusals are short plain text. Every answer carries `x-vm-request-id`,
 //! and the request's `request` record is written just before the answer
 //! goes, after everything the Application did with it.
@@ -21,12 +26,13 @@ use hyper::{HeaderMap, Request, Response, StatusCode};
 use openworkers_core::{HttpMethod, HttpRequest, RequestBody};
 use serde_json::json;
 
-use crate::api::Api;
+use crate::api::{Answer, Api, SignedInWith};
 use crate::gateway::Transactions;
 use crate::log;
 use crate::registry::Registry;
 use crate::runner::{InFlight, Outcome, RequestRunner};
 use crate::sign_in::{RESERVED_HEADER_PREFIX, SignIn, SignedIn, remove_reserved_headers};
+use crate::tool_credentials::{self, Presented, ToolCredentials};
 
 /// The header that names a request, in every answer and every record.
 pub const REQUEST_ID_HEADER: &str = "x-vm-request-id";
@@ -43,6 +49,8 @@ pub struct Ingress {
     pub registry: Arc<Registry>,
     pub api: Api,
     pub sign_in: Box<dyn SignIn>,
+    /// Tool credentials: a sign-in on the API only.
+    pub credentials: Arc<ToolCredentials>,
     pub runner: RequestRunner,
     /// The largest request body read; past it the answer is 413.
     pub max_request_body_bytes: usize,
@@ -77,27 +85,40 @@ impl Ingress {
                 own(StatusCode::BAD_REQUEST, "Bad request: no Host header.\n"),
             );
         };
-        let user = match self.sign_in.user_of(&parts.headers) {
-            SignedIn::User(user) => user,
-            SignedIn::Malformed(_) => {
-                return finish(
-                    &known,
-                    own(
-                        StatusCode::BAD_REQUEST,
-                        "Bad request: the sign-in is malformed.\n",
-                    ),
-                );
-            }
-            SignedIn::NotSignedIn => {
-                return finish(&known, own(StatusCode::UNAUTHORIZED, "Not signed in.\n"));
-            }
-        };
-
+        let stated = self.sign_in.user_of(&parts.headers);
+        if let SignedIn::Malformed(_) = stated {
+            return finish(
+                &known,
+                own(
+                    StatusCode::BAD_REQUEST,
+                    "Bad request: the sign-in is malformed.\n",
+                ),
+            );
+        }
         let name = host
             .strip_suffix(&*self.domain)
             .and_then(|rest| rest.strip_suffix('.'))
             .filter(|name| !name.contains('.'));
         if name == Some(API_NAME) {
+            // On the API an `Authorization` header decides alone; the
+            // stand-in's headers beside it count for nothing.
+            let (user, with) = match tool_credentials::presented(&parts.headers) {
+                Presented::Absent => match stated {
+                    SignedIn::User(user) => (user, SignedInWith::Otherwise),
+                    SignedIn::NotSignedIn | SignedIn::Malformed(_) => {
+                        return finish(&known, not_signed_in());
+                    }
+                },
+                Presented::Present(None) => return finish(&known, not_signed_in()),
+                Presented::Present(Some(digest)) => match self.credentials.user_of(digest).await {
+                    Ok(Some(user)) => (user, SignedInWith::ToolCredential(digest)),
+                    Ok(None) => return finish(&known, not_signed_in()),
+                    Err(error) => {
+                        let answer = Answer::unavailable(&error);
+                        return finish(&known, api_response(answer));
+                    }
+                },
+            };
             let known = Known {
                 user: Some(&user.id),
                 ..known
@@ -106,19 +127,22 @@ impl Ingress {
                 .api
                 .handle(
                     &user,
+                    with,
                     &parts.method,
                     parts.uri.path(),
                     parts.uri.query(),
                     body,
                 )
                 .await;
-            let mut response = Response::new(Full::new(answer.body));
-            *response.status_mut() = answer.status;
-            response
-                .headers_mut()
-                .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-            return finish(&known, response);
+            return finish(&known, api_response(answer));
         }
+        // On an Application's address a tool credential is no sign-in.
+        let user = match stated {
+            SignedIn::User(user) => user,
+            SignedIn::NotSignedIn | SignedIn::Malformed(_) => {
+                return finish(&known, not_signed_in());
+            }
+        };
         // From memory: no round trip to the platform database. The request
         // holds this Version until it ends, whatever is sent meanwhile.
         let Some(serving) = name.and_then(|name| self.registry.serving(name)) else {
@@ -255,6 +279,24 @@ fn for_application(headers: &HeaderMap) -> HashMap<String, String> {
             .or_insert_with(|| value.into_owned());
     }
     joined
+}
+
+/// The `401` of anyone not signed in, whatever was asked for and however
+/// the sign-in failed.
+fn not_signed_in() -> Response<Full<Bytes>> {
+    own(StatusCode::UNAUTHORIZED, "Not signed in.\n")
+}
+
+/// An answer of the API as an HTTP response.
+fn api_response(answer: Answer) -> Response<Full<Bytes>> {
+    let mut response = Response::new(Full::new(answer.body));
+    *response.status_mut() = answer.status;
+    if answer.status != StatusCode::NO_CONTENT {
+        response
+            .headers_mut()
+            .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    }
+    response
 }
 
 /// One of the program's own answers.

@@ -8,6 +8,10 @@
 //! `not-a-contributor`, `malformed`, then the rest. Adding an endpoint is a
 //! [`Route`] and a handler.
 //!
+//! Tool credentials are made and ended here, and `GET /v1/me` says who is
+//! signed in; whether a request was signed in with a tool credential comes
+//! from Ingress ([`SignedInWith`]).
+//!
 //! Resources, Grants and the Operation log are here too. A Platform
 //! administrator is a member of the Group named at start
 //! (`--administrators-group`); without one, no one is. A body that registers
@@ -40,7 +44,17 @@ use crate::resources::{
     self, Connection, GrantWritten, Login, NewResource, Registered, Resources, is_resource_name,
     level_of,
 };
+use crate::tool_credentials::{Digest, MakeError, ToolCredentials};
 use crate::user::User;
+
+/// How the request's User was signed in.
+#[derive(Clone, Copy, Debug)]
+pub enum SignedInWith {
+    /// With a tool credential, named by its digest.
+    ToolCredential(Digest),
+    /// Otherwise (for now: the stand-in).
+    Otherwise,
+}
 
 /// The largest request body the API reads; past it the answer is `413`.
 pub const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
@@ -100,7 +114,7 @@ impl Answer {
         )
     }
 
-    fn unavailable(error: &DbError) -> Self {
+    pub(crate) fn unavailable(error: &DbError) -> Self {
         log::record(
             "platform-database-failed",
             json!({ "error": error.to_string() }),
@@ -132,6 +146,12 @@ enum Route<'a> {
     Grants(&'a str),
     /// `/v1/operation-log`
     OperationLog,
+    /// `/v1/me`
+    Me,
+    /// `/v1/tool-credentials`
+    ToolCredentials,
+    /// `/v1/tool-credentials/current`
+    CurrentToolCredential,
 }
 
 impl Route<'_> {
@@ -163,6 +183,9 @@ impl<'a> Route<'a> {
             ["resources", name] => Some(Self::Resource(name)),
             ["resources", name, "grants"] => Some(Self::Grants(name)),
             ["operation-log"] => Some(Self::OperationLog),
+            ["me"] => Some(Self::Me),
+            ["tool-credentials"] => Some(Self::ToolCredentials),
+            ["tool-credentials", "current"] => Some(Self::CurrentToolCredential),
             _ => None,
         }
     }
@@ -438,6 +461,7 @@ pub struct Api {
     registry: Arc<Registry>,
     resources: Arc<Resources>,
     log: Arc<OperationLog>,
+    credentials: Arc<ToolCredentials>,
     domain: Arc<str>,
     /// The Group whose members are Platform administrators, if any.
     administrators: Option<Arc<str>>,
@@ -448,6 +472,7 @@ impl Api {
         registry: Arc<Registry>,
         resources: Arc<Resources>,
         log: Arc<OperationLog>,
+        credentials: Arc<ToolCredentials>,
         domain: Arc<str>,
         administrators: Option<Arc<str>>,
     ) -> Self {
@@ -455,6 +480,7 @@ impl Api {
             registry,
             resources,
             log,
+            credentials,
             domain,
             administrators,
         }
@@ -466,10 +492,12 @@ impl Api {
             .is_some_and(|group| user.groups.iter().any(|g| g == group))
     }
 
-    /// Answers one request of a signed-in `user`.
+    /// Answers one request of a signed-in `user`, signed in `with` a tool
+    /// credential or otherwise.
     pub async fn handle(
         &self,
         user: &User,
+        with: SignedInWith,
         method: &Method,
         path: &str,
         query: Option<&str>,
@@ -495,7 +523,7 @@ impl Api {
         };
         let Some(route) = Route::of(path) else {
             return Answer::not_found(
-                "the API has no such path: its paths are /v1/applications, /v1/applications/<name>, /v1/applications/<name>/versions, /v1/applications/<name>/versions/<number>, /v1/resources, /v1/resources/<name>, /v1/resources/<name>/grants and /v1/operation-log",
+                "the API has no such path: its paths are /v1/me, /v1/tool-credentials, /v1/tool-credentials/current, /v1/applications, /v1/applications/<name>, /v1/applications/<name>/versions, /v1/applications/<name>/versions/<number>, /v1/resources, /v1/resources/<name>, /v1/resources/<name>/grants and /v1/operation-log",
             );
         };
         if route.for_administrators(method) && !self.is_administrator(user) {
@@ -507,7 +535,10 @@ impl Api {
         }
         let answer = match route {
             Route::Resources => self.resources_route(user, method, &body).await,
-            Route::Resource(name) => Ok(self.resource(method, name)),
+            Route::Resource(name) => Ok(self.resource(user, method, name)),
+            Route::Me => Ok(self.me(user, method)),
+            Route::ToolCredentials => Ok(self.make_credential(user, with, method, &body).await),
+            Route::CurrentToolCredential => self.end_credential(with, method).await,
             Route::Grants(name) => self.grants(method, name, &body).await,
             Route::OperationLog => self.operation_log(method, query).await,
             Route::Applications => self.applications(user, method, &body).await,
@@ -524,8 +555,24 @@ impl Api {
         method: &Method,
         body: &[u8],
     ) -> Result<Answer, DbError> {
+        if method == Method::GET {
+            let listed = self.registry.contributed_to(&user.id).await?;
+            let view = ListedApplicationsView {
+                applications: listed
+                    .iter()
+                    .map(|a| ListedApplicationView {
+                        name: &a.name,
+                        description: a.description.as_deref(),
+                        address: format!("{}.{}", a.name, self.domain),
+                        contributor: true,
+                        serving_version: a.serving_version,
+                    })
+                    .collect(),
+            };
+            return Ok(Answer::json(StatusCode::OK, &view));
+        }
         if method != Method::POST {
-            return Ok(Answer::method_not_allowed(method, "POST"));
+            return Ok(Answer::method_not_allowed(method, "GET or POST"));
         }
         let request = match CreateApplication::read(body) {
             Ok(request) => request,
@@ -706,7 +753,7 @@ impl Api {
         if method == Method::GET {
             let all = self.resources.list();
             let resources = ResourcesView {
-                resources: all.iter().map(|r| ResourceView::of(r)).collect(),
+                resources: all.iter().map(|r| ResourceRead::of(r, user)).collect(),
             };
             return Ok(Answer::json(StatusCode::OK, &resources));
         }
@@ -736,12 +783,12 @@ impl Api {
         })
     }
 
-    fn resource(&self, method: &Method, name: &str) -> Answer {
+    fn resource(&self, user: &User, method: &Method, name: &str) -> Answer {
         let Some(resource) = self.resources.get(name) else {
             return no_resource();
         };
         if method == Method::GET {
-            Answer::json(StatusCode::OK, &ResourceView::of(&resource))
+            Answer::json(StatusCode::OK, &ResourceRead::of(&resource, user))
         } else {
             Answer::method_not_allowed(method, "GET")
         }
@@ -781,6 +828,87 @@ impl Api {
                 },
             ),
             GrantWritten::NoSuchResource => no_resource(),
+        })
+    }
+
+    /// `GET /v1/me`: who is signed in.
+    fn me(&self, user: &User, method: &Method) -> Answer {
+        if method != Method::GET {
+            return Answer::method_not_allowed(method, "GET");
+        }
+        Answer::json(
+            StatusCode::OK,
+            &MeView {
+                user: &user.id,
+                groups: &user.groups,
+                platform_administrator: self.is_administrator(user),
+            },
+        )
+    }
+
+    /// `POST /v1/tool-credentials`: a tool credential for a User signed in
+    /// otherwise. The answer is the only one that ever holds a credential.
+    async fn make_credential(
+        &self,
+        user: &User,
+        with: SignedInWith,
+        method: &Method,
+        body: &[u8],
+    ) -> Answer {
+        if method != Method::POST {
+            return Answer::method_not_allowed(method, "POST");
+        }
+        if let SignedInWith::ToolCredential(_) = with {
+            return Answer::error(
+                StatusCode::FORBIDDEN,
+                "not-with-a-tool-credential",
+                "a tool credential cannot make another: sign in again with `vm sign-in`",
+            );
+        }
+        if !body.iter().all(u8::is_ascii_whitespace)
+            && let Err(problem) = Object::read(body)
+        {
+            return Answer::malformed(&problem, "an empty body, or {}");
+        }
+        let made = match self.credentials.make(user).await {
+            Ok(made) => made,
+            Err(MakeError::Database(error)) => return Answer::unavailable(&error),
+            Err(MakeError::Randomness) => {
+                log::record("randomness-failed", json!({ "for": "a tool credential" }));
+                return Answer::error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "unavailable",
+                    "the platform could not make a credential: try again shortly",
+                );
+            }
+        };
+        Answer::json(
+            StatusCode::CREATED,
+            &MadeView {
+                credential: made.credential.expose(),
+                user: &user.id,
+                groups: &user.groups,
+                platform_administrator: self.is_administrator(user),
+                expires_at: &made.expires_at,
+            },
+        )
+    }
+
+    /// `DELETE /v1/tool-credentials/current`: ends the credential the
+    /// request was signed in with.
+    async fn end_credential(&self, with: SignedInWith, method: &Method) -> Result<Answer, DbError> {
+        if method != Method::DELETE {
+            return Ok(Answer::method_not_allowed(method, "DELETE"));
+        }
+        let SignedInWith::ToolCredential(digest) = with else {
+            return Ok(Answer::not_found(
+                "this request was not signed in with a tool credential, so there is none to end: send it with the credential in `Authorization: Bearer`",
+            ));
+        };
+        self.credentials.end(digest).await?;
+        Ok(Answer {
+            status: StatusCode::NO_CONTENT,
+            body: Bytes::new(),
         })
     }
 
@@ -901,9 +1029,62 @@ impl<'a> ResourceView<'a> {
     }
 }
 
+/// A Resource as a signed-in User reads it: its public face and the
+/// highest Access level they hold on it through their Groups.
+#[derive(Serialize)]
+struct ResourceRead<'a> {
+    #[serde(flatten)]
+    face: ResourceView<'a>,
+    your_access: Option<&'static str>,
+}
+
+impl<'a> ResourceRead<'a> {
+    fn of(resource: &'a resources::Resource, user: &User) -> Self {
+        let groups: Vec<&str> = user.groups.iter().map(String::as_str).collect();
+        let held = resource.with_grants(|grants| authz::held(&groups, grants));
+        Self {
+            face: ResourceView::of(resource),
+            your_access: held.map(resources::level_name),
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct ResourcesView<'a> {
-    resources: Vec<ResourceView<'a>>,
+    resources: Vec<ResourceRead<'a>>,
+}
+
+/// `GET /v1/me`.
+#[derive(Serialize)]
+struct MeView<'a> {
+    user: &'a str,
+    groups: &'a [String],
+    platform_administrator: bool,
+}
+
+/// The answer of `POST /v1/tool-credentials`.
+#[derive(Serialize)]
+struct MadeView<'a> {
+    credential: &'a str,
+    user: &'a str,
+    groups: &'a [String],
+    platform_administrator: bool,
+    expires_at: &'a str,
+}
+
+/// An Application in `GET /v1/applications`.
+#[derive(Serialize)]
+struct ListedApplicationView<'a> {
+    name: &'a str,
+    description: Option<&'a str>,
+    address: String,
+    contributor: bool,
+    serving_version: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct ListedApplicationsView<'a> {
+    applications: Vec<ListedApplicationView<'a>>,
 }
 
 #[derive(Serialize)]

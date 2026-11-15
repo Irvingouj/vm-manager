@@ -27,6 +27,7 @@ hyper-util.workspace = true
 serde.workspace = true
 serde_json = { workspace = true, features = ["raw_value"] }
 fallible-iterator.workspace = true
+getrandom.workspace = true
 pg_query.workspace = true
 postgres-protocol.workspace = true
 sha2.workspace = true

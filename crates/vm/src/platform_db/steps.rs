@@ -242,6 +242,28 @@ pub const STEPS: &[Step] = &[
             WHERE kind = 'structure';
     ",
     },
+    Step {
+        number: 8,
+        name: "tool credentials",
+        sql: "
+        -- The tool's credentials (crate::tool_credentials; blackbox/
+        -- CONTRACT.md, \"The tool\"), each kept only as the SHA-256 of its
+        -- text: what is here signs nobody in. The User and the Groups are
+        -- those of the moment it was made, in the order first stated. A row
+        -- is deleted when its credential is signed out; expired rows are
+        -- deleted whenever a credential is made.
+        CREATE TABLE tool_credentials (
+            digest bytea PRIMARY KEY CHECK (length(digest) = 32),
+            user_id text NOT NULL,
+            groups text[] NOT NULL,
+            created_at timestamptz NOT NULL DEFAULT now(),
+            expires_at timestamptz NOT NULL
+        );
+        CREATE INDEX tool_credentials_expires ON tool_credentials (expires_at);
+        -- The Applications a User contributes to (GET /v1/applications).
+        CREATE INDEX contributors_user ON contributors (user_id);
+    ",
+    },
 ];
 
 /// The advisory lock every step's transaction takes first: "vm steps".

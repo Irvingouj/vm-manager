@@ -33,6 +33,8 @@
 //!   Versions, and the serving Version of each, held in memory too.
 //! - [`api`]: the platform's API at `api.<domain>`: HTTP in, registry
 //!   calls, JSON out.
+//! - [`tool_credentials`]: the credentials the Builder's tool signs in to
+//!   the API with, kept in the platform database as digests.
 //! - [`log`]: the program's log, one JSON record per line.
 //! - [`server`]: the listening socket and the connections.
 
@@ -52,4 +54,5 @@ pub mod runner;
 pub mod server;
 pub mod sign_in;
 pub mod statement;
+pub mod tool_credentials;
 pub mod user;

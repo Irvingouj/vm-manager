@@ -122,8 +122,10 @@ pub fn decide(question: &Question<'_>) -> Decision {
     }
 }
 
-/// The highest level any of `groups` is granted, if any.
-fn held(groups: &[&str], grants: &[Grant<'_>]) -> Option<AccessLevel> {
+/// The highest level any of `groups` is granted, if any: the level a User
+/// holds on a Resource, by the same ordering the decision uses (the
+/// platform's API shows it as `your_access`).
+pub fn held(groups: &[&str], grants: &[Grant<'_>]) -> Option<AccessLevel> {
     grants
         .iter()
         .filter(|grant| groups.contains(&grant.group))
