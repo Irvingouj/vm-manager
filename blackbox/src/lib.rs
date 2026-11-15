@@ -57,7 +57,12 @@
 //!   and committed, `vm deploy` and what it printed;
 //! - [`logs`] is what the tests of Versions, going back and logs share:
 //!   the fixture that prints what it is asked, going back, and reading an
-//!   Application's log entries.
+//!   Application's log entries;
+//! - [`local`] is what the tests of the local loop share: `vm request` and
+//!   `vm local ...` on a machine with its own data folder and `TMPDIR`, what
+//!   they printed, the local Postgres seen from outside, a mirror that hands
+//!   over Postgres's archive, and a project whose handler does what each
+//!   path says.
 //!
 //! Every wait has a timeout, so a failing test fails within seconds and
 //! never hangs. Each test starts its own program on its own port, so tests
@@ -85,6 +90,7 @@ pub mod history_shipping;
 pub mod history_structure;
 pub mod http;
 pub mod left_behind;
+pub mod local;
 pub mod log;
 pub mod logs;
 pub mod out_of_reach;

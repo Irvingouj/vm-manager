@@ -91,9 +91,15 @@ fn pull_args<'a>(resource: &'a str, dir: &'a str, json: bool) -> Vec<&'a str> {
     args
 }
 
-/// Fails unless `files` lists exactly the two generated files with these
-/// `changed` values.
-fn assert_files(printed: &Value, resource: &str, schema_changed: bool, index_changed: bool) {
+/// Fails unless `files` lists exactly the three generated files with these
+/// `changed` values (`standin.sql` since the ticket on the local loop).
+fn assert_files(
+    printed: &Value,
+    resource: &str,
+    schema_changed: bool,
+    index_changed: bool,
+    standin_changed: bool,
+) {
     let mut files: Vec<(String, bool)> = printed["files"]
         .as_array()
         .unwrap_or_else(|| panic!("expected `files` as an array, got {printed}"))
@@ -113,8 +119,9 @@ fn assert_files(printed: &Value, resource: &str, schema_changed: bool, index_cha
         vec![
             (format!("resources/{resource}/index.ts"), index_changed),
             (format!("resources/{resource}/schema.ts"), schema_changed),
+            (format!("resources/{resource}/standin.sql"), standin_changed),
         ],
-        "expected the two files, by their paths relative to the project, got {printed}"
+        "expected the three files, by their paths relative to the project, got {printed}"
     );
 }
 
@@ -135,6 +142,7 @@ fn pull_writes_the_definition_and_the_link_and_prints_what_it_did() {
             "files",
             "fingerprint",
             "resource",
+            "test_users",
             "unsupported",
             "your_access"
         ],
@@ -147,7 +155,7 @@ fn pull_writes_the_definition_and_the_link_and_prints_what_it_did() {
         printed["unsupported"], api_answer["unsupported"],
         "expected the unsupported columns as the API answers them"
     );
-    assert_files(&printed, STOCK, true, true);
+    assert_files(&printed, STOCK, true, true, true);
     let schema = fs::read_to_string(dir.join("resources/stock/schema.ts")).unwrap();
     assert_eq!(
         schema,
@@ -173,8 +181,8 @@ fn pull_writes_the_definition_and_the_link_and_prints_what_it_did() {
     let written = names(&snapshot(&dir));
     assert_eq!(
         written.len(),
-        3,
-        "expected the manifest and the two files, nothing else, got {written:?}"
+        5,
+        "expected the manifest, the three files and vm.dev.json (made by the pull), nothing else, got {written:?}"
     );
 }
 
@@ -205,7 +213,7 @@ fn with_relations_the_link_has_the_relations_lines_and_relations_is_left_alone()
     let printed = machine
         .run(&pull_args(STOCK, dir.to_str().unwrap(), true))
         .ok_json();
-    assert_files(&printed, STOCK, false, true);
+    assert_files(&printed, STOCK, false, true, false);
     assert_eq!(
         fs::read_to_string(dir.join("resources/stock/index.ts")).unwrap(),
         link(STOCK, false)
@@ -235,13 +243,13 @@ fn pulling_twice_changes_nothing() {
     let first = machine
         .run(&pull_args(STOCK, dir.to_str().unwrap(), true))
         .ok_json();
-    assert_files(&first, STOCK, true, true);
+    assert_files(&first, STOCK, true, true, true);
     let before = snapshot(&dir);
     std::thread::sleep(Duration::from_millis(1100));
     let second = machine
         .run(&pull_args(STOCK, dir.to_str().unwrap(), true))
         .ok_json();
-    assert_files(&second, STOCK, false, false);
+    assert_files(&second, STOCK, false, false, false);
     assert_eq!(second["fingerprint"], first["fingerprint"]);
     let after = snapshot(&dir);
     assert_eq!(
@@ -257,7 +265,7 @@ fn pulling_twice_changes_nothing() {
 }
 
 #[test]
-fn a_changed_structure_rewrites_the_definition_only() {
+fn a_changed_structure_rewrites_the_definition_and_the_standin_only() {
     let stock = Stock::ready();
     let machine = Machine::new();
     machine.sign_in(&stock.scenario.vm, &rita());
@@ -273,7 +281,7 @@ fn a_changed_structure_rewrites_the_definition_only() {
         .run(&pull_args(STOCK, dir.to_str().unwrap(), true))
         .ok_json();
     assert_ne!(second["fingerprint"], first["fingerprint"]);
-    assert_files(&second, STOCK, true, false);
+    assert_files(&second, STOCK, true, false, true);
     assert!(
         fs::read_to_string(dir.join("resources/stock/schema.ts"))
             .unwrap()
@@ -365,7 +373,11 @@ fn without_a_grant_the_pull_is_refused_and_nothing_is_written_or_changed() {
         .superuser()
         .batch("ALTER TABLE sites ADD COLUMN region text");
     let before = snapshot(&dir);
-    assert_eq!(before.len(), 3);
+    assert_eq!(
+        before.len(),
+        5,
+        "the manifest, the three files and vm.dev.json"
+    );
     std::thread::sleep(Duration::from_millis(50));
     nora_machine
         .run(&pull_args(STOCK, dir.to_str().unwrap(), true))

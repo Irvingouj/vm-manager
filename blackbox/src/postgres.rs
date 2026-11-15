@@ -430,6 +430,88 @@ fn downloaded(major: u32) -> Result<PathBuf, String> {
     }
 }
 
+/// zonky's archive of this major version for this machine, as Maven lays it
+/// out: the version, the platform's name, the SHA-256 pinned above, and the
+/// path below a repository's base URL
+/// (`io/zonky/test/postgres/embedded-postgres-binaries-<platform>/<version>/embedded-postgres-binaries-<platform>-<version>.jar`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Archive {
+    pub version: String,
+    pub platform: String,
+    pub sha256: String,
+    pub maven_path: String,
+}
+
+/// The [`Archive`] of this major version for this machine; `None` when the
+/// harness knows none.
+pub fn archive_of(major: u32) -> Option<Archive> {
+    ARCHIVES
+        .iter()
+        .find(|(m, _, os, arch, _, _)| {
+            *m == major && *os == std::env::consts::OS && *arch == std::env::consts::ARCH
+        })
+        .map(|(_, version, _, _, platform, sha256)| {
+            let artifact = format!("embedded-postgres-binaries-{platform}");
+            Archive {
+                version: (*version).to_owned(),
+                platform: (*platform).to_owned(),
+                sha256: (*sha256).to_owned(),
+                maven_path: format!(
+                    "io/zonky/test/postgres/{artifact}/{version}/{artifact}-{version}.jar"
+                ),
+            }
+        })
+}
+
+/// The bytes of zonky's archive of this major version for this machine
+/// (the jar itself, not unpacked), kept in the per-user cache beside the
+/// unpacked binaries: fetched from Maven Central once, checked against the
+/// SHA-256 pinned above, and read from the cache after. For the tests of
+/// the local loop's download, which serve it from a mirror of the
+/// harness's own. Fails the test when it cannot be had.
+pub fn archive_bytes(major: u32) -> Vec<u8> {
+    let archive = archive_of(major).unwrap_or_else(|| {
+        panic!(
+            "the harness knows no archive of Postgres {major} for {} {}",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        )
+    });
+    let cache = cache_dir().unwrap_or_else(|problem| panic!("{problem}"));
+    let file = cache.join(
+        archive
+            .maven_path
+            .rsplit('/')
+            .next()
+            .unwrap_or("postgres.jar"),
+    );
+    if let Ok(bytes) = fs::read(&file)
+        && hex(&Sha256::digest(&bytes)) == archive.sha256
+    {
+        return bytes;
+    }
+    let url = format!("https://repo1.maven.org/maven2/{}", archive.maven_path);
+    eprintln!(
+        "blackbox: downloading the Postgres archive once, from {url}, to {}",
+        file.display()
+    );
+    let bytes = fetch(&url, MAX_ARCHIVE_BYTES).unwrap_or_else(|problem| panic!("{problem}"));
+    let actual = hex(&Sha256::digest(&bytes));
+    assert_eq!(
+        actual, archive.sha256,
+        "the archive downloaded from {url} is not the one pinned in the harness"
+    );
+    fs::create_dir_all(&cache)
+        .unwrap_or_else(|e| panic!("cannot create the cache {}: {e}", cache.display()));
+    let partial = cache.join(format!(".archive-{}-{}", std::process::id(), unique()));
+    fs::write(&partial, &bytes)
+        .unwrap_or_else(|e| panic!("cannot write {}: {e}", partial.display()));
+    if fs::rename(&partial, &file).is_err() {
+        drop(fs::remove_file(&partial));
+    }
+    bytes
+}
+
 fn fetch(url: &str, limit: u64) -> Result<Vec<u8>, String> {
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(DOWNLOAD_TIMEOUT))

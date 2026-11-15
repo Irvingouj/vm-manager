@@ -115,13 +115,15 @@ fn the_answer_holds_the_resource_its_fingerprint_the_users_access_the_definition
     assert_eq!(
         keys(&answer),
         [
+            "contact",
             "fingerprint",
             "resource",
             "schema_ts",
+            "standin_sql",
             "unsupported",
             "your_access"
         ],
-        "expected exactly the fields of CONTRACT.md, got {answer}"
+        "expected exactly the fields of CONTRACT.md (with `standin_sql` and `contact` since the ticket on the local loop), got {answer}"
     );
     assert_eq!(answer["resource"], json!(STOCK));
     assert_eq!(answer["your_access"], json!("read"));
