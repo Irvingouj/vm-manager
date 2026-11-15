@@ -1,4 +1,4 @@
-//! `vm versions <application> [--json]` and `vm go-back <application>
+//! `vm versions <application> [--limit <n>] [--json]` and `vm go-back <application>
 //! [--to <number>] [--json]` (blackbox/CONTRACT.md, "Versions, going back,
 //! and logs: The commands").
 //!
@@ -30,6 +30,9 @@ use crate::registry::check_name;
 pub struct VersionsArgs {
     /// The Application, by name.
     pub application: String,
+    /// How many of the newest Versions to print: 1 to 1000.
+    #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u16).range(1..=1000))]
+    pub limit: u16,
     #[command(flatten)]
     pub output: Output,
 }
@@ -52,6 +55,7 @@ pub struct GoBackArgs {
 struct Application {
     address: Theirs,
     serving_version: Option<u64>,
+    latest_version: Option<u64>,
 }
 
 /// A Version as `GET /v1/applications/<name>/versions` lists it.
@@ -107,9 +111,19 @@ pub(super) async fn versions(args: &VersionsArgs) -> Result<Done, Ending> {
     let application = application(&kept, name).await?;
     let list: VersionList = shaped(
         kept.connect,
-        get_signed_in(&kept, &format!("/v1/applications/{name}/versions")).await?,
+        get_signed_in(
+            &kept,
+            &format!("/v1/applications/{name}/versions?limit={}", args.limit),
+        )
+        .await?,
     )?;
     let serving = application.serving_version;
+    // Numbers run from 1 without a gap: those before the first printed are
+    // the ones not shown.
+    let not_shown = list
+        .versions
+        .first()
+        .map_or(0, |first| first.number.saturating_sub(1));
     let mut text = String::new();
     if list.versions.is_empty() {
         writeln!(
@@ -139,6 +153,21 @@ pub(super) async fn versions(args: &VersionsArgs) -> Result<Done, Ending> {
         )
         .ok();
     }
+    if not_shown > 0 {
+        let (versions, are, them) = if not_shown == 1 {
+            ("Version", "is", "it")
+        } else {
+            ("Versions", "are", "them")
+        };
+        writeln!(
+            text,
+            "{not_shown} older {versions} {are} not shown: vm versions {name} --limit <n> shows {them} too (up to 1000)."
+        )
+        .ok();
+        if let Some(number) = serving.filter(|&n| n <= not_shown) {
+            writeln!(text, "Version {number}, one of those, serves.").ok();
+        }
+    }
     let versions: Vec<_> = list
         .versions
         .iter()
@@ -157,6 +186,7 @@ pub(super) async fn versions(args: &VersionsArgs) -> Result<Done, Ending> {
             "application": name,
             "address": application.address,
             "serving_version": serving,
+            "latest_version": application.latest_version,
             "versions": versions,
         }),
         text,

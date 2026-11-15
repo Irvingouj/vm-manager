@@ -254,12 +254,12 @@ fn encoded(text: &str) -> String {
 #[derive(Deserialize)]
 struct EntryWords {
     time: Theirs,
-    request: Option<Theirs>,
+    request: Theirs,
     version: u64,
-    user: Option<Theirs>,
-    method: Option<Theirs>,
-    path: Option<Theirs>,
-    status: Option<u64>,
+    user: Theirs,
+    method: Theirs,
+    path: Theirs,
+    status: u64,
     printed: Vec<PrintedWords>,
     uncaught: Vec<String>,
     truncated: bool,
@@ -270,6 +270,7 @@ struct EntryWords {
 struct PrintedWords {
     level: Theirs,
     message: String,
+    loading: bool,
 }
 
 /// One entry in words: its first line, its printed lines, its uncaught
@@ -292,34 +293,22 @@ fn entry_words(entry: &Value, text: &mut String) {
     } else {
         ""
     };
-    let none = Theirs::from("-");
-    match &entry.request {
-        Some(request) => {
-            let status = entry
-                .status
-                .map_or_else(|| "-".to_owned(), |s| s.to_string());
-            writeln!(
-                text,
-                "{}  request {request}  user {}  Version {}  {} {}  {status}{cut}",
-                entry.time,
-                entry.user.as_ref().unwrap_or(&none),
-                entry.version,
-                entry.method.as_ref().unwrap_or(&none),
-                entry.path.as_ref().unwrap_or(&none),
-            )
-            .ok();
-        }
-        None => {
-            writeln!(
-                text,
-                "{}  outside a request  Version {}{cut}",
-                entry.time, entry.version
-            )
-            .ok();
-        }
-    }
+    writeln!(
+        text,
+        "{}  request {}  user {}  Version {}  {} {}  {}{cut}",
+        entry.time,
+        entry.request,
+        entry.user,
+        entry.version,
+        entry.method,
+        entry.path,
+        entry.status,
+    )
+    .ok();
     for printed in &entry.printed {
-        let head = format!("  {}: ", printed.level);
+        // A line the script printed while it was loaded for the request.
+        let loading = if printed.loading { " (loading)" } else { "" };
+        let head = format!("  {}{loading}: ", printed.level);
         lines(text, &head, "      ", &printed.message);
     }
     for error in &entry.uncaught {

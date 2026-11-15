@@ -265,6 +265,8 @@ struct Application {
     address: String,
     contributors: Vec<Contributor>,
     serving_version: Option<u64>,
+    /// The highest-numbered Version, `None` when there is none.
+    latest_version: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -276,12 +278,6 @@ struct Contributor {
 #[derive(Deserialize)]
 struct VersionMigrations {
     migrations: Vec<Recorded>,
-}
-
-/// The Application's Versions, oldest first, as the API lists them.
-#[derive(Deserialize)]
-struct VersionList {
-    versions: Vec<VersionMigrations>,
 }
 
 #[derive(Deserialize)]
@@ -616,14 +612,14 @@ async fn application(kept: &Kept, manifest: &Manifest) -> Result<Option<Existing
             ),
         ));
     }
-    // An Application with a Version always has one serving.
-    let latest = match application.serving_version {
-        Some(_) => {
-            let list: VersionList = shaped(
+    // That one Version, read by itself: never the list of them.
+    let latest = match application.latest_version {
+        Some(number) => {
+            let version: VersionMigrations = shaped(
                 kept.connect,
-                get_signed_in(kept, &format!("/v1/applications/{name}/versions")).await?,
+                get_signed_in(kept, &format!("/v1/applications/{name}/versions/{number}")).await?,
             )?;
-            list.versions.into_iter().last().map(|v| v.migrations)
+            Some(version.migrations)
         }
         None => None,
     };

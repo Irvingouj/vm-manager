@@ -515,6 +515,28 @@ fn logs_query(query: Option<&str>) -> Option<app_logs::Query> {
     })
 }
 
+/// The most Versions one answer holds.
+const MAX_VERSIONS: u16 = 1000;
+
+/// The `?limit` of a list of Versions: the newest 1 to [`MAX_VERSIONS`], by
+/// default all of those; `None` when malformed or given twice. Other parameters are
+/// ignored.
+fn versions_limit(query: Option<&str>) -> Option<u16> {
+    let mut limit = None;
+    for pair in query.unwrap_or("").split('&') {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        if key != "limit" {
+            continue;
+        }
+        if limit.is_some() {
+            return None;
+        }
+        let given = plain_limit(&percent_decoded(value)?)?;
+        limit = Some((given <= MAX_VERSIONS).then_some(given)?);
+    }
+    Some(limit.unwrap_or(MAX_VERSIONS))
+}
+
 /// A limit written plainly: digits, no sign, no leading zero, 1 to 1000.
 fn plain_limit(text: &str) -> Option<u16> {
     let canonical = !text.is_empty()
@@ -713,7 +735,7 @@ impl Api {
             Route::OperationLog => self.operation_log(method, query).await,
             Route::Applications => self.applications(user, method, &body).await,
             Route::Application(name) => self.application(method, name).await,
-            Route::Versions(name) => self.versions(user, method, name, &body).await,
+            Route::Versions(name) => self.versions(user, method, name, query, &body).await,
             Route::Version(name, number) => self.version(method, name, number).await,
             Route::GoBack(name) => self.go_back(user, method, name, &body).await,
             Route::Logs(name) => self.logs(user, method, name, query).await,
@@ -799,11 +821,24 @@ impl Api {
         user: &User,
         method: &Method,
         name: &str,
+        query: Option<&str>,
         body: &[u8],
     ) -> Result<Answer, DbError> {
         if method == Method::GET {
+            let Some(limit) = versions_limit(query) else {
+                // Malformed; but an Application that is not there is that
+                // first.
+                return Ok(match self.find(name).await? {
+                    Some(_) => Answer::error(
+                        StatusCode::BAD_REQUEST,
+                        "malformed",
+                        "the parameters are not the ones asked for: ?limit is a whole number from 1 to 1000, at most once",
+                    ),
+                    None => no_application(),
+                });
+            };
             let versions = if check_name(name).is_ok() {
-                self.registry.versions(name).await?
+                self.registry.versions(name, limit).await?
             } else {
                 None
             };
@@ -1381,6 +1416,7 @@ impl Api {
                 .map(|user| ContributorView { user })
                 .collect(),
             serving_version: application.serving_version,
+            latest_version: application.latest_version,
             created_by: &application.created_by,
             created_at: &application.created_at,
         }
@@ -1395,6 +1431,7 @@ struct ApplicationView<'a> {
     address: String,
     contributors: Vec<ContributorView<'a>>,
     serving_version: Option<u64>,
+    latest_version: Option<u64>,
     created_by: &'a str,
     created_at: &'a str,
 }

@@ -5,10 +5,13 @@
 //!
 //! Interface: [`start`] once, which answers the [`Logs`] handle and the
 //! [`Writer`] that owns the writing task; then, per request, its context
-//! collects into [`Collected`] (held by the request in flight), and
-//! [`Logs::request_ended`] makes the request's [`Entry`] when Ingress has its
-//! answer; [`Logs::printed_outside`] makes an entry of its own for a line
-//! printed with no request in flight. [`Logs::read`] answers the API.
+//! collects into [`Collected`] (held by the request in flight): first what
+//! the script printed while it was loaded for the request (`loading`), then
+//! the request's own lines and its uncaught errors. [`Logs::request_ended`]
+//! makes the request's [`Entry`] when Ingress has its answer; from then on
+//! the request's [`Collected`] takes nothing more (what code prints after
+//! its request ended is in the program's log only). [`Logs::read`] answers
+//! the API.
 //!
 //! **Never in a request's way.** An entry is handed to a bounded queue with
 //! `try_send`, which neither waits nor blocks: when [`QUEUE`] entries are
@@ -20,8 +23,11 @@
 //!
 //! **The writer.** One task, owned by [`Writer`] (aborted when it is
 //! dropped), takes what is waiting, up to [`BATCH`] entries at once and
-//! without waiting for more, inserts them in one statement, and deletes all
-//! but the newest [`KEPT`] entries of each Application it wrote for. Every
+//! without waiting for more, and inserts them in one statement. An
+//! Application is trimmed to its newest [`KEPT`] entries in the same
+//! transaction when the batch would take it past [`TRIM_EVERY`] entries
+//! written since its last trim, and at its first batch after the program
+//! started: so it never has more than `KEPT + TRIM_EVERY` (5,100). Every
 //! write is held to [`WRITE_TIMEOUT`] besides the pool's own limits. Since
 //! one writer inserts in queue order, an entry's `id` grows with the order
 //! requests ended and with when it became readable: it is the cursor.
@@ -29,14 +35,18 @@
 //! **Bounds**, each stated in the contract: a message is cut to
 //! [`MESSAGE_BYTES`] and an uncaught error to [`UNCAUGHT_BYTES`] (at a
 //! character boundary); a request keeps at most [`PRINTED_RECORDS`] printed
-//! records and [`PRINTED_BYTES`] of messages (the record that would pass it
-//! is not kept, nor any after it) and [`UNCAUGHT_RECORDS`] uncaught errors.
-//! So one waiting entry holds at most about 64 KiB of messages and 160 KiB
-//! of errors, and the queue at most [`QUEUE`] of them. The counts of dropped
-//! entries are one number per Application.
+//! records and [`PRINTED_BYTES`] of messages, loading lines included (the
+//! record that would pass it is not kept, nor any after it), and
+//! [`UNCAUGHT_RECORDS`] uncaught errors. So one waiting entry holds at most
+//! 64 KiB of messages and 160 KiB of errors, besides its path (as long as
+//! the request's head allows) and a few hundred bytes of facts and record
+//! overhead; the whole queue, [`QUEUE`] of them, at worst about 230 MiB.
+//! The counts of dropped entries are one number per Application that has
+//! some; the writer's counts since the last trim are one number per
+//! Application that has had an entry since the program started.
 
 use std::borrow::Cow;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -60,11 +70,15 @@ pub const QUEUE: usize = 1024;
 /// Entries the writer takes and inserts at once.
 const BATCH: usize = 64;
 
-/// The longest one write (an insert and its trimming) may take.
+/// The longest one write (an insert, and its trimming when due) may take.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The entries of an Application kept; older ones are deleted.
 pub const KEPT: i64 = 5000;
+
+/// The entries an Application may have written since its last trim: the
+/// batch that would pass it trims.
+const TRIM_EVERY: u64 = 100;
 
 /// The longest message of a printed record kept.
 pub const MESSAGE_BYTES: usize = 8192;
@@ -85,10 +99,12 @@ pub const UNCAUGHT_RECORDS: usize = 10;
 pub const MAX_READ: u16 = 1000;
 
 /// One printed record of an entry.
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 struct Printed {
     level: &'static str,
     message: String,
+    /// Printed while the script was loaded for the request.
+    loading: bool,
 }
 
 /// What a request's context collected for its entry. Held by the request
@@ -107,6 +123,8 @@ struct Kept {
     /// A record was not kept for the 64 KiB: none after it is either.
     full: bool,
     truncated: bool,
+    /// The entry was made: nothing more is taken.
+    taken: bool,
 }
 
 impl Collected {
@@ -114,10 +132,14 @@ impl Collected {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// A printed record of the request, kept within the bounds. `message`
-    /// is moved in, not copied.
-    pub fn printed(&self, level: &'static str, mut message: String) {
+    /// A printed record, kept within the bounds: `loading` when the script
+    /// printed it while it was loaded for the request. `message` is moved
+    /// in, not copied. After the entry was made it is dropped.
+    pub fn printed(&self, level: &'static str, mut message: String, loading: bool) {
         let mut kept = self.lock();
+        if kept.taken {
+            return;
+        }
         if kept.full || kept.printed.len() >= PRINTED_RECORDS {
             kept.truncated = true;
             return;
@@ -132,12 +154,19 @@ impl Collected {
             return;
         }
         kept.bytes = bytes;
-        kept.printed.push(Printed { level, message });
+        kept.printed.push(Printed {
+            level,
+            message,
+            loading,
+        });
     }
 
     /// An uncaught error of the request, kept within the bounds.
     pub fn uncaught(&self, error: &str) {
         let mut kept = self.lock();
+        if kept.taken {
+            return;
+        }
         if kept.uncaught.len() >= UNCAUGHT_RECORDS {
             kept.truncated = true;
             return;
@@ -152,8 +181,12 @@ impl Collected {
         kept.uncaught.push(error);
     }
 
+    /// What was collected; from now on nothing more is.
     fn take(&self) -> Kept {
-        std::mem::take(&mut *self.lock())
+        let mut kept = self.lock();
+        let taken = std::mem::take(&mut *kept);
+        kept.taken = true;
+        taken
     }
 }
 
@@ -167,24 +200,17 @@ fn cut(text: &mut String, bytes: usize) -> bool {
     true
 }
 
-/// The facts of the request an entry is for.
-#[derive(Debug)]
-struct RequestFacts {
-    id: Arc<str>,
-    user: String,
-    method: Method,
-    path: String,
-    status: u16,
-}
-
 /// One log entry, waiting to be written.
 #[derive(Debug)]
 pub struct Entry {
     application: Arc<str>,
     version: u64,
     time: SystemTime,
-    /// `None` for what was printed outside a request.
-    request: Option<RequestFacts>,
+    request: Arc<str>,
+    user: String,
+    method: Method,
+    path: String,
+    status: u16,
     printed: Vec<Printed>,
     uncaught: Vec<String>,
     truncated: bool,
@@ -282,42 +308,18 @@ impl Logs {
             application: Arc::clone(&in_flight.application),
             version: in_flight.version,
             time: SystemTime::now(),
-            request: Some(RequestFacts {
-                id: Arc::clone(&in_flight.request),
-                // Copied: the entry outlives the request. The User's id is
-                // at most 256 bytes; the path is as long as the request's
-                // head allows; a method is a constant but for one that is
-                // not standard.
-                user: in_flight.user.id.clone(),
-                method: method.clone(),
-                path: path.to_owned(),
-                status: status.as_u16(),
-            }),
+            request: Arc::clone(&in_flight.request),
+            // Copied: the entry outlives the request. The User's id is at
+            // most 256 bytes; the path is as long as the request's head
+            // allows; a method is a constant but for one that is not
+            // standard.
+            user: in_flight.user.id.clone(),
+            method: method.clone(),
+            path: path.to_owned(),
+            status: status.as_u16(),
             printed: kept.printed,
             uncaught: kept.uncaught,
             truncated: kept.truncated,
-            dropped_before: 0,
-        });
-    }
-
-    /// Makes the entry of one line printed outside a request by Version
-    /// `version` of `application`. `message` is moved in, not copied.
-    pub fn printed_outside(
-        &self,
-        application: &Arc<str>,
-        version: u64,
-        level: &'static str,
-        mut message: String,
-    ) {
-        let truncated = cut(&mut message, MESSAGE_BYTES);
-        self.keep(Entry {
-            application: Arc::clone(application),
-            version,
-            time: SystemTime::now(),
-            request: None,
-            printed: vec![Printed { level, message }],
-            uncaught: Vec::new(),
-            truncated,
             dropped_before: 0,
         });
     }
@@ -340,7 +342,7 @@ impl Logs {
     pub async fn read(&self, application: &str, query: &Query) -> Result<Page, DbError> {
         let limit = i64::from(query.limit);
         let request = query.request.as_deref();
-        let rows = self
+        let (rows, last) = self
             .database
             .pool()
             .run(async |client: &mut Client| {
@@ -349,16 +351,18 @@ impl Logs {
                         client
                             .query(
                                 concat!(
-                                    "SELECT id, ",
-                                    rfc3339!("made_at"),
-                                    ", request, version, user_id, method, path, status,
-                                       printed, uncaught, truncated, dropped_before
-                                     FROM log_entries
-                                     WHERE application = $1 AND id > $2
-                                       AND ($3::text IS NULL OR request = $3)
-                                     ORDER BY id LIMIT $4"
+                                    "SELECT e.id, ",
+                                    rfc3339!("e.made_at"),
+                                    ", e.request, e.version, e.user_id, e.method, e.path,
+                                       e.status, e.printed, e.uncaught, e.truncated,
+                                       e.dropped_before
+                                     FROM log_entries e
+                                     JOIN applications a ON a.id = e.application_id
+                                     WHERE a.name = $1 AND e.id > $2
+                                       AND ($3::text IS NULL OR e.request = $3)
+                                     ORDER BY e.id LIMIT $4"
                                 ),
-                                &[&application, &after, &request, &limit],
+                                &[&application, after, &request, &limit],
                             )
                             .await
                     }
@@ -366,14 +370,16 @@ impl Logs {
                         client
                             .query(
                                 concat!(
-                                    "SELECT * FROM (SELECT id, ",
-                                    rfc3339!("made_at"),
-                                    ", request, version, user_id, method, path, status,
-                                       printed, uncaught, truncated, dropped_before
-                                     FROM log_entries
-                                     WHERE application = $1
-                                       AND ($2::text IS NULL OR request = $2)
-                                     ORDER BY id DESC LIMIT $3) newest
+                                    "SELECT * FROM (SELECT e.id, ",
+                                    rfc3339!("e.made_at"),
+                                    ", e.request, e.version, e.user_id, e.method, e.path,
+                                       e.status, e.printed, e.uncaught, e.truncated,
+                                       e.dropped_before
+                                     FROM log_entries e
+                                     JOIN applications a ON a.id = e.application_id
+                                     WHERE a.name = $1
+                                       AND ($2::text IS NULL OR e.request = $2)
+                                     ORDER BY e.id DESC LIMIT $3) newest
                                      ORDER BY id"
                                 ),
                                 &[&application, &request, &limit],
@@ -396,22 +402,17 @@ impl Logs {
                 Ok((rows, last))
             })
             .await?;
-        let (rows, last) = rows;
         let mut entries = Vec::with_capacity(rows.len());
         for row in &rows {
             entries.push(EntryView {
-                id: row.try_get::<_, i64>(0).map_err(DbError::from)?.to_string(),
+                id: row.try_get::<_, i64>(0).map_err(DbError::from)?,
                 time: row.try_get(1).map_err(DbError::from)?,
                 request: row.try_get(2).map_err(DbError::from)?,
                 version: number(row.try_get::<_, i32>(3).map_err(DbError::from)?)?,
                 user: row.try_get(4).map_err(DbError::from)?,
                 method: row.try_get(5).map_err(DbError::from)?,
                 path: row.try_get(6).map_err(DbError::from)?,
-                status: row
-                    .try_get::<_, Option<i32>>(7)
-                    .map_err(DbError::from)?
-                    .map(number)
-                    .transpose()?,
+                status: number(row.try_get::<_, i32>(7).map_err(DbError::from)?)?,
                 printed: row.try_get(8).map_err(DbError::from)?,
                 uncaught: row.try_get(9).map_err(DbError::from)?,
                 truncated: row.try_get(10).map_err(DbError::from)?,
@@ -419,7 +420,8 @@ impl Logs {
             });
         }
         let next = match (entries.last(), &query.after, last) {
-            (Some(entry), _, _) => entry.id.clone(),
+            (Some(entry), _, _) => entry.id.to_string(),
+            // Copied: the answer is written from it; a cursor is a few digits.
             (None, Some((_, given)), _) => given.clone(),
             (None, None, Some(last)) => last.to_string(),
             (None, None, None) => "0".to_owned(),
@@ -447,7 +449,8 @@ pub struct Query {
 }
 
 /// A cursor as the API gives it: the decimal digits of an entry's `id`, or
-/// `0`, with no sign and no leading zero.
+/// `0`, with no sign and no leading zero. Opaque to the caller: one made up
+/// in this form is taken, and answers as a place in the log.
 pub fn cursor(text: &str) -> Option<i64> {
     let canonical = !text.is_empty()
         && text.bytes().all(|b| b.is_ascii_digit())
@@ -465,18 +468,24 @@ pub struct Page {
 /// An entry as the API answers it.
 #[derive(Debug, Serialize)]
 pub struct EntryView {
-    id: String,
+    #[serde(serialize_with = "as_text")]
+    id: i64,
     time: String,
-    request: Option<String>,
+    request: String,
     version: u64,
-    user: Option<String>,
-    method: Option<String>,
-    path: Option<String>,
-    status: Option<u64>,
+    user: String,
+    method: String,
+    path: String,
+    status: u64,
     printed: Value,
     uncaught: Value,
     truncated: bool,
     dropped_before: u64,
+}
+
+/// A cursor is text.
+fn as_text<S: serde::Serializer>(id: &i64, serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.collect_str(id)
 }
 
 /// An entry as the writer sends it to the database, in one JSON array.
@@ -485,11 +494,11 @@ struct Row<'a> {
     application: &'a str,
     version: u64,
     time_us: i64,
-    request: Option<&'a str>,
-    user_id: Option<&'a str>,
-    method: Option<&'a str>,
-    path: Option<&'a str>,
-    status: Option<u16>,
+    request: &'a str,
+    user_id: &'a str,
+    method: &'a str,
+    path: &'a str,
+    status: u16,
     printed: Vec<RowPrinted<'a>>,
     uncaught: Vec<Cow<'a, str>>,
     truncated: bool,
@@ -500,6 +509,7 @@ struct Row<'a> {
 struct RowPrinted<'a> {
     level: &'static str,
     message: Cow<'a, str>,
+    loading: bool,
 }
 
 /// Postgres's `jsonb` cannot hold U+0000: it is written U+FFFD. Copied only
@@ -520,22 +530,22 @@ impl<'a> Row<'a> {
             .ok()
             .and_then(|d| i64::try_from(d.as_micros()).ok())
             .unwrap_or(0);
-        let request = entry.request.as_ref();
         Self {
             application: &entry.application,
             version: entry.version,
             time_us,
-            request: request.map(|r| &*r.id),
-            user_id: request.map(|r| r.user.as_str()),
-            method: request.map(|r| r.method.as_str()),
-            path: request.map(|r| r.path.as_str()),
-            status: request.map(|r| r.status),
+            request: &entry.request,
+            user_id: &entry.user,
+            method: entry.method.as_str(),
+            path: &entry.path,
+            status: entry.status,
             printed: entry
                 .printed
                 .iter()
                 .map(|p| RowPrinted {
                     level: p.level,
                     message: storable(&p.message),
+                    loading: p.loading,
                 })
                 .collect(),
             uncaught: entry.uncaught.iter().map(|u| storable(u)).collect(),
@@ -552,6 +562,10 @@ async fn write_all(
     database: Arc<PlatformDatabase>,
     dropped: Arc<Dropped>,
 ) {
+    // Entries written for each Application since its last trim: one number
+    // per Application that has had an entry since the program started. An
+    // Application not here has not been trimmed since then.
+    let mut since_trim: HashMap<Arc<str>, u64> = HashMap::new();
     let mut batch = Vec::with_capacity(BATCH);
     loop {
         // Returns as soon as one entry waits, with up to BATCH of them: no
@@ -559,17 +573,37 @@ async fn write_all(
         if receiver.recv_many(&mut batch, BATCH).await == 0 {
             return;
         }
-        let inserted = tokio::time::timeout(WRITE_TIMEOUT, insert(&database, &batch)).await;
-        match failure(inserted) {
+        let mut in_batch: BTreeMap<&Arc<str>, u64> = BTreeMap::new();
+        for entry in &batch {
+            *in_batch.entry(&entry.application).or_insert(0) += 1;
+        }
+        let due: Vec<&str> = in_batch
+            .iter()
+            .filter(|(application, n)| {
+                since_trim
+                    .get(&***application)
+                    .is_none_or(|since| since.saturating_add(**n) > TRIM_EVERY)
+            })
+            .map(|(application, _)| &***application)
+            .collect();
+        let written = tokio::time::timeout(WRITE_TIMEOUT, write(&database, &batch, &due)).await;
+        let failed = match written {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some(error.to_string()),
+            Err(_) => Some(format!(
+                "writing took longer than {} ms",
+                WRITE_TIMEOUT.as_millis()
+            )),
+        };
+        match failed {
             None => {
-                // Older entries are deleted after; when that fails, the next
-                // write deletes them.
-                let trimmed = tokio::time::timeout(WRITE_TIMEOUT, trim(&database, &batch)).await;
-                if let Some(error) = failure(trimmed) {
-                    log::record(
-                        "log-entries-not-trimmed",
-                        serde_json::json!({ "error": error }),
-                    );
+                for (application, n) in &in_batch {
+                    let since = since_trim.entry(Arc::clone(application)).or_insert(0);
+                    *since = if due.contains(&&***application) {
+                        0
+                    } else {
+                        since.saturating_add(*n)
+                    };
                 }
             }
             Some(error) => {
@@ -588,30 +622,22 @@ async fn write_all(
     }
 }
 
-/// What went wrong with a write held to [`WRITE_TIMEOUT`], if anything.
-fn failure(written: Result<Result<(), DbError>, tokio::time::error::Elapsed>) -> Option<String> {
-    match written {
-        Ok(Ok(())) => None,
-        Ok(Err(error)) => Some(error.to_string()),
-        Err(_) => Some(format!(
-            "writing took longer than {} ms",
-            WRITE_TIMEOUT.as_millis()
-        )),
-    }
-}
-
-/// Inserts `batch`, in its order, in one statement.
-async fn insert(database: &PlatformDatabase, batch: &[Entry]) -> Result<(), DbError> {
+/// Inserts `batch`, in its order, in one statement, and trims each
+/// Application of `due` to its newest [`KEPT`] entries, in one
+/// transaction. An entry of an Application that is not there is skipped.
+async fn write(database: &PlatformDatabase, batch: &[Entry], due: &[&str]) -> Result<(), DbError> {
     let rows: Vec<Row<'_>> = batch.iter().map(Row::of).collect();
+    let offset = KEPT - 1;
     database
         .pool()
         .run(async |client: &mut Client| {
-            client
+            let transaction = client.transaction().await.map_err(DbError::from)?;
+            transaction
                 .execute(
-                    "INSERT INTO log_entries (application, version, made_at, request, user_id,
+                    "INSERT INTO log_entries (application_id, version, made_at, request, user_id,
                                               method, path, status, printed, uncaught,
                                               truncated, dropped_before)
-                     SELECT r.application, r.version,
+                     SELECT a.id, r.version,
                             to_timestamp(r.time_us::double precision / 1000000),
                             r.request, r.user_id, r.method, r.path, r.status, r.printed,
                             r.uncaught, r.truncated, r.dropped_before
@@ -623,41 +649,28 @@ async fn insert(database: &PlatformDatabase, batch: &[Entry]) -> Result<(), DbEr
                           WITH ORDINALITY AS r(application, version, time_us, request,
                               user_id, method, path, status, printed, uncaught, truncated,
                               dropped_before, ord)
+                     JOIN applications a ON a.name = r.application
                      ORDER BY r.ord",
                     &[&Json(&rows)],
                 )
                 .await
                 .map_err(DbError::from)?;
-            Ok(())
-        })
-        .await
-}
-
-/// Deletes all but the newest [`KEPT`] entries of each Application of
-/// `batch`.
-async fn trim(database: &PlatformDatabase, batch: &[Entry]) -> Result<(), DbError> {
-    let applications: Vec<&str> = batch
-        .iter()
-        .map(|e| &*e.application)
-        .collect::<BTreeSet<&str>>()
-        .into_iter()
-        .collect();
-    let offset = KEPT - 1;
-    database
-        .pool()
-        .run(async |client: &mut Client| {
-            client
-                .execute(
-                    "DELETE FROM log_entries e
-                     USING (SELECT a.name,
-                                   (SELECT l.id FROM log_entries l WHERE l.application = a.name
-                                    ORDER BY l.id DESC OFFSET $2::bigint LIMIT 1) AS oldest_kept
-                            FROM unnest($1::text[]) AS a(name)) k
-                     WHERE e.application = k.name AND e.id < k.oldest_kept",
-                    &[&applications, &offset],
-                )
-                .await
-                .map_err(DbError::from)?;
+            if !due.is_empty() {
+                transaction
+                    .execute(
+                        "DELETE FROM log_entries e
+                         USING (SELECT a.id,
+                                       (SELECT l.id FROM log_entries l
+                                        WHERE l.application_id = a.id
+                                        ORDER BY l.id DESC OFFSET $2::bigint LIMIT 1) AS oldest_kept
+                                FROM applications a WHERE a.name = ANY($1::text[])) k
+                         WHERE e.application_id = k.id AND e.id < k.oldest_kept",
+                        &[&due, &offset],
+                    )
+                    .await
+                    .map_err(DbError::from)?;
+            }
+            transaction.commit().await.map_err(DbError::from)?;
             Ok(())
         })
         .await

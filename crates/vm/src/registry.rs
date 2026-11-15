@@ -110,6 +110,8 @@ pub struct ApplicationRecord {
     /// User ids, in the order they became Contributors.
     pub contributors: Vec<String>,
     pub serving_version: Option<u64>,
+    /// The highest-numbered Version; `None` when there is none.
+    pub latest_version: Option<u64>,
     pub created_by: String,
     /// RFC 3339, UTC.
     pub created_at: String,
@@ -390,6 +392,7 @@ impl Registry {
             description: get(&row, 1)?,
             contributors: vec![get(&row, 2)?],
             serving_version: None,
+            latest_version: None,
             created_by: get(&row, 2)?,
             created_at: get(&row, 3)?,
         }))
@@ -410,7 +413,8 @@ impl Registry {
                                          '{}'::text[]),
                                 a.serving_version, a.created_by, ",
                             rfc3339!("a.created_at"),
-                            " FROM applications a WHERE a.name = $1"
+                            ", (SELECT max(v.number) FROM versions v WHERE v.application_id = a.id)
+                              FROM applications a WHERE a.name = $1"
                         ),
                         &[&name],
                     )
@@ -424,6 +428,7 @@ impl Registry {
             description: get(&row, 1)?,
             contributors: get(&row, 2)?,
             serving_version: get::<Option<i32>>(&row, 3)?.map(number_of).transpose()?,
+            latest_version: get::<Option<i32>>(&row, 6)?.map(number_of).transpose()?,
             created_by: get(&row, 4)?,
             created_at: get(&row, 5)?,
         }))
@@ -839,9 +844,14 @@ impl Registry {
         })
     }
 
-    /// The Versions of `name`, oldest first; `None` when there is no such
-    /// Application.
-    pub async fn versions(&self, name: &str) -> Result<Option<Vec<VersionRecord>>, DbError> {
+    /// The newest `limit` Versions of `name`, oldest first; `None` when
+    /// there is no such Application.
+    pub async fn versions(
+        &self,
+        name: &str,
+        limit: u16,
+    ) -> Result<Option<Vec<VersionRecord>>, DbError> {
+        let limit = i64::from(limit);
         let rows = self
             .database
             .pool()
@@ -853,11 +863,13 @@ impl Registry {
                                     v.bundle_sha256, v.created_by, ",
                             rfc3339!("v.created_at"),
                             ", v.migrations, v.structures FROM applications a
-                              LEFT JOIN versions v ON v.application_id = a.id
+                              LEFT JOIN LATERAL (
+                                  SELECT * FROM versions n WHERE n.application_id = a.id
+                                  ORDER BY n.number DESC LIMIT $2) v ON true
                               WHERE a.name = $1
                               ORDER BY v.number"
                         ),
-                        &[&name],
+                        &[&name, &limit],
                     )
                     .await
                     .map_err(DbError::from)

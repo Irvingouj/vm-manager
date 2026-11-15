@@ -310,29 +310,31 @@ pub const STEPS: &[Step] = &[
         -- the row's lock, so the program's memory follows the latest change
         -- whatever order changes report back in (crate::registry).
         ALTER TABLE applications ADD COLUMN serving_generation bigint NOT NULL DEFAULT 0;
-        -- One entry for each request an Application's code was given, and
-        -- one for each line printed outside a request (crate::app_logs).
-        -- Written by one writer, so `id` grows in the order entries became
-        -- readable: it is the cursor. The newest 5,000 of an Application
-        -- are kept.
+        -- One entry for each request an Application's code was given
+        -- (crate::app_logs). Written by one writer, so `id` grows in the
+        -- order entries became readable: it is the cursor. The newest 5,000
+        -- of an Application are kept (at most 5,100 between trims). Keyed
+        -- by the Application's id, and gone with it.
         CREATE TABLE log_entries (
             id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-            application text NOT NULL,
+            application_id bigint NOT NULL REFERENCES applications (id) ON DELETE CASCADE,
             version integer NOT NULL,
             made_at timestamptz NOT NULL,
-            request text,
-            user_id text,
-            method text,
-            path text,
-            status integer,
-            -- [ { level, message } ], in order.
+            request text NOT NULL,
+            user_id text NOT NULL,
+            method text NOT NULL,
+            path text NOT NULL,
+            status integer NOT NULL,
+            -- [ { level, message, loading } ], in order: what the script
+            -- printed while it was loaded for the request, then the request's
+            -- own lines.
             printed jsonb NOT NULL,
             -- [ \"<message and stack>\" ], in order.
             uncaught jsonb NOT NULL,
             truncated boolean NOT NULL,
             dropped_before bigint NOT NULL
         );
-        CREATE INDEX log_entries_application ON log_entries (application, id);
+        CREATE INDEX log_entries_application ON log_entries (application_id, id);
     ",
     },
 ];

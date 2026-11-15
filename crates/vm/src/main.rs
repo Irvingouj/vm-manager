@@ -270,7 +270,7 @@ fn run(serve: &Serve) -> Result<(), String> {
             Arc::clone(&log),
             tokio::runtime::Handle::current(),
         ));
-        let runner = RequestRunner::start(&runner::Limits::default(), &gateway, &logs)
+        let runner = RequestRunner::start(&runner::Limits::default(), &gateway)
             .map_err(|e| format!("cannot start the engine threads: {e}"))?;
         let domain: Arc<str> = Arc::from(domain);
         let listener = TcpListener::bind(serve.listen)

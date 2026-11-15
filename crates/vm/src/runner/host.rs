@@ -21,7 +21,6 @@ use openworkers_core::{
 use serde_json::{Value, json};
 
 use super::InFlight;
-use crate::app_logs::Logs;
 use crate::gateway::{Decision, Gateway, Refusal, ok_to_wire};
 use crate::log;
 
@@ -35,12 +34,11 @@ pub const PLATFORM_BINDING: &str = "__vm_platform";
 pub struct HostOps {
     in_flight: Arc<InFlight>,
     gateway: Arc<dyn Gateway>,
-    /// Where a line printed with no request in flight goes, as an entry
-    /// of its own; what the request printed goes into
-    /// `in_flight.collected`.
-    logs: Arc<Logs>,
     /// The request is in flight: its event has started and not ended.
     active: AtomicBool,
+    /// The request's event has ended: what is printed from now on is in
+    /// no entry (crate::app_logs), only in the program's log.
+    ended: AtomicBool,
     /// The glue has asked whose request this is.
     begun: AtomicBool,
     /// The Application threw, rejected or answered with something that is
@@ -49,12 +47,12 @@ pub struct HostOps {
 }
 
 impl HostOps {
-    pub fn new(in_flight: Arc<InFlight>, gateway: Arc<dyn Gateway>, logs: Arc<Logs>) -> Self {
+    pub fn new(in_flight: Arc<InFlight>, gateway: Arc<dyn Gateway>) -> Self {
         Self {
             in_flight,
             gateway,
-            logs,
             active: AtomicBool::new(false),
+            ended: AtomicBool::new(false),
             begun: AtomicBool::new(false),
             failed: AtomicBool::new(false),
         }
@@ -68,6 +66,7 @@ impl HostOps {
     /// The request is over: from now on this context speaks for no one,
     /// and every transaction it left open is rolled back.
     pub fn end(&self) {
+        self.ended.store(true, Ordering::SeqCst);
         self.active.store(false, Ordering::SeqCst);
         self.in_flight.transactions.end();
     }
@@ -204,16 +203,13 @@ impl OperationsHandler for HostOps {
                 "message": &message,
             }),
         );
-        // Then the message itself, moved, into the log entry: the
-        // request's, or one of its own when no request is in flight.
-        match in_flight {
-            Some(in_flight) => in_flight.collected.printed(level, message),
-            None => self.logs.printed_outside(
-                &self.in_flight.application,
-                self.in_flight.version,
-                level,
-                message,
-            ),
+        // Then the message itself, moved, into the request's log entry:
+        // printed by the request, or by the script while it was loaded for
+        // the request (`loading`). After the request ended, into none.
+        if in_flight.is_some() {
+            self.in_flight.collected.printed(level, message, false);
+        } else if !self.ended.load(Ordering::SeqCst) {
+            self.in_flight.collected.printed(level, message, true);
         }
     }
 }

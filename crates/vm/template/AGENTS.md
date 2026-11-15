@@ -74,7 +74,7 @@ A migration that destroys data is asked about again at deploy when the Applicati
 
 ## Debugging, and going back
 
-To debug, read `vm logs <name>`: one entry for each request, with the User, the Version, what the code printed and any error it did not catch, with its stack. Every response carries `x-vm-request-id`; `vm logs <name> --request <id>` shows that request's entry alone. `vm logs <name> --after <next>`, with the `next` of the last run, reads only what came since. `vm logs <name> --follow` prints entries as they come and does not end by itself: run it only where it can be stopped, never as a step that must finish.
+To debug, read `vm logs <name>`: one entry for each request the code handled, with the User, the Version, what the code printed for it (also while the script was loading) and any error it did not catch, with its stack. Every response carries `x-vm-request-id`; `vm logs <name> --request <id>` shows that request's entry alone. `vm logs <name> --after <next>`, with the `next` of the last run, reads only what came since. `vm logs <name> --follow` prints entries as they come and does not end by itself: run it only where it can be stopped, never as a step that must finish.
 
 `vm go-back <name>` is the quick way out of a bad deploy: the Version before it serves again at once, and nothing is asked. It does not undo migrations: the own database keeps what they made, the older code runs against it, and `migrations/` keeps them, since the next deploy must still carry every deployed migration. `vm versions <name>` shows which Version serves.
 
