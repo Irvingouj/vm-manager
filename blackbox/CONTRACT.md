@@ -519,7 +519,7 @@ From this ticket on, an Application is a TypeScript project written with the SDK
 
 ### A project
 
-Until the ticket on the project template, a project is these files:
+A project is these files (the section "A project: the template, creating one and checking one" says what a new one holds besides):
 
 ```
 manifest.ts                    export default defineManifest({ ... })
@@ -1190,3 +1190,77 @@ vm pull <resource> [--project <directory>] [--json]
 - Not signed in, an installation that cannot be reached, and the other endings are as for every command.
 - A Resource's name is checked by the tool before it is used in a path: what is not a Resource's name as the API takes one is exit code `2`.
 - The tool writes inside the project only: when `resources` or `resources/<name>` is a symbolic link, or `schema.ts` or `index.ts` there is one, nothing is written anywhere; reason `not-a-project`, exit code `1`, the message names the link.
+
+## A project: the template, creating one and checking one (ticket: The project template, and creating and checking a project)
+
+What a Coding agent starts from (ADR 0006), and the one command that says whether a project will deploy.
+
+### Creating a project
+
+```
+vm new <name> [--directory <directory>] [--json]
+```
+
+- `<name>` is an Application's name as the API takes one; anything else, or one of the platform's own names, is exit code `2`.
+- The project is made in `--directory`, or in `./<name>`. A directory that is there and not empty is reason `directory-not-empty`, and a path that is there and is no directory is reason `not-a-directory`: exit code `1`, and nothing is written. An empty directory is used; a missing one is made (with its parents). A file that cannot be written is reason `project-file`, exit code `1`, and the message names it.
+- It needs no installation and no sign-in, and runs nothing but itself: no `npm`, no `git`, no network.
+- It prints `{ "project": "<absolute path>", "name": "<name>", "files": [ "<path relative to the project>", ... ], "next": [ "<command>", ... ] }`, the files by path; `next` is what to run now, in order, the first being `npm install`. Without `--json`, the same in words.
+- The same program makes the same project: every file's bytes depend only on the program and `<name>`.
+
+### What a new project holds
+
+```
+AGENTS.md                 the instruction file for the Coding agent (below)
+CLAUDE.md                 one line: @AGENTS.md
+manifest.ts               defineManifest({ name: "<name>", description: "...", resources: {} }), a plain literal
+src/index.ts              defineApp(manifest, { fetch }) answering one page that greets the signed-in User by id
+src/db/schema.ts          the own database's Drizzle schema, with no table yet
+migrations/               empty but for `.gitkeep`, which keeps the folder
+vm.dev.json               the test Users file: one User, `outsider`, in no Group, and no Grant
+package.json              private; dependencies @vm/sdk, drizzle-orm; devDependencies typescript, drizzle-kit, esbuild; exact versions
+tsconfig.json             strict; "paths": { "@vm/own-structure": ["./src/db/schema.ts"] }; includes manifest.ts, src, resources
+.gitignore                node_modules/, and the tool's own folder .vm/ but for .vm/packages/
+.vm/packages/vm-sdk-<version>.tgz   the SDK this program carries, which package.json names by this path
+```
+
+- The SDK is not fetched from anywhere: the program carries it and writes it into the project, and `package.json` depends on that file (`"@vm/sdk": "file:.vm/packages/vm-sdk-<version>.tgz"`). So `npm install` needs the registry (or its cache) only for the other packages. Their versions are exact and are those of the repository's own lock file, which from this ticket on has `drizzle-kit` too: what a project installs is what the gate tested.
+- **A new project installs and passes the check untouched**: `npm install`, then `vm check`, ends with `0`, with no problem, no warning and no note.
+- **A new project is an Application as it stands**: built with the SDK's tooling and sent as a Version, it answers `GET /` with `200`, `text/html`, and a page that has the User's id, written as text of the page (escaped for HTML).
+- `vm.dev.json` is `{ "about": "<what the file is for>", "users": [ { "id": "outsider", "displayName": "Outsider (no access)", "email": "outsider@example.com", "groups": [] } ], "grants": [] }`. The local loop's tickets say how it is used.
+
+### The instruction file
+
+`AGENTS.md` is written for the Coding agent, in plain words, at most 120 lines. It says what an Application is and how it reaches data (`ctx.user().db(name)`, `ctx.user().ownDb()`, `ctx.app().ownDb()`), that access belongs to people and a refusal for a missing Grant is not a bug to work around, and how to work: look for an existing Application first, find the data, keep the Application's own data in its own database, check, deploy. It names only commands this program has: every `vm <command>` in it is one that `vm --help` lists, and each later ticket that adds a command adds it to the file.
+
+It carries the three corrections of `docs/research/agent-facing-discovery.md`:
+
+- **Data loss.** A migration that destroys data is never confirmed by the agent on its own: it tells the Builder exactly what would be lost and asks, **unless the Builder has already clearly said that this data may be lost**, in which case it goes on and says what was lost. The file has the words `unless the Builder has already clearly said that this data may be lost`.
+- **The test User with no access.** The file says `vm.dev.json` holds a test User, `outsider`, in no Group and so with no Grant, and tells the agent to check what that User gets before it calls the work done. The file names `vm.dev.json` and `outsider` in one paragraph.
+- **Who can see a new Application.** The agent is told to report who can see a new Application **from the tool's own output**, naming the people or Groups the tool named, and never from its own guess. The file has the words `from the tool's own output`.
+
+And one rule the trial showed is needed: when `vm pull` is refused for want of a Grant, the agent stops and tells the Builder which Resource, what for, and whom to ask; it does not invent the Resource's tables, mock its data or quietly drop the feature.
+
+### Checking a project
+
+```
+vm check [--project <directory>] [--timeout <seconds>] [--json]
+```
+
+The project is `--project` or the current directory; one without `manifest.ts` is `not-a-project`, as for `vm pull`. The check needs the tool signed in (it asks the installation which Resources are registered and what the Builder holds), Node 22 or later on the `PATH`, and the project's packages installed. It writes nothing in the project. It makes four checks, each from what is on the machine now, and reports every problem it finds, not only the first:
+
+| `check` | What must hold | `reason` when it does not |
+|---|---|---|
+| `manifest` | `manifest.ts` is a plain literal of the right shape (as the SDK's tooling reads it, without running it) | the tooling's own: `manifest-missing`, `manifest-not-literal`, `manifest-invalid`, with `file`, `line`, `column` |
+| `resources` | every Resource the Manifest declares is registered on the installation | `resource-not-registered` |
+| | and is pulled: `resources/<name>/schema.ts` and `resources/<name>/index.ts` are both there, each beginning with the first line `vm pull` gives it | `resource-not-pulled` |
+| `migrations` | `migrations/` is in step with `src/db/schema.ts`: generating migrations now would write none. `migrations/` is as `drizzle-kit generate --dialect postgresql --schema src/db/schema.ts --out migrations` leaves it. A change `drizzle-kit` asks a question about and writes nothing for (a renamed column) is not in step either | `migrations-behind` |
+| `types` | the project type-checks (`tsc --noEmit` with the project's own `tsconfig.json` and TypeScript) | `type-error`, one problem per error, with `file`, `line`, `column` and the compiler's message; at most 50, and then how many more |
+
+- **Every problem's message names the fix**: for `manifest-not-literal`, what was found and that the Manifest must be a plain literal because the platform reads it without running code; for `resource-not-registered`, that no such Resource is registered, the names that are, and to correct the name or ask a Platform administrator; for `resource-not-pulled`, the command `vm pull <name>` (and, when a file is there that the tool did not write, which file, and that it is to be moved away first); for `migrations-behind`, that `src/db/schema.ts` changed since the last migration and how migrations are generated (the ticket on generating migrations gives the command; until then the message says to generate one with `drizzle-kit generate`); for `type-error`, the file and line.
+- **A warning does not fail the check.** When the Builder's own Access level on a declared Resource is below the declared one (`structure` or none against `read`; `read` against `write`), the check warns: reason `own-grant-below-declared`, with `resource`, `declared`, `held` (`"structure"`, `"read"`, or `null` for no Grant) and `contact`; the message says that the Builder, and every User whose Groups hold no Grant at that level, will be refused that Resource's operations by the Application, and whom to ask.
+- **A note says what is worth knowing.** A Resource that is pulled (a folder `resources/<name>/` whose `schema.ts` begins with the first line `vm pull` gives it) and not declared in the Manifest is a note: reason `pulled-not-declared`, with `resource`; the message says to declare it or remove the folder.
+- With `--json`, standard output is one object: `{ "ok": <bool>, "problems": [ { "check", "reason", "message", ... } ], "warnings": [ { "reason", "message", ... } ], "notes": [ { "reason", "message", ... } ] }`, and when `ok` is false also `"error": { "reason": "check-failed", "message": "<how many problems, and the first>" }`, as every command that does not end with `0` has. Without `--json`, the problems, warnings and notes in words: on standard output when the check passes, on standard error when it fails. Text of the installation's and of the project's files is printed as the tool prints any text that is not its own.
+- **Exit codes**: `0` when there is no problem (warnings and notes or not); `1` when there is a problem (`check-failed`); `4` not signed in; and as for every command otherwise. What the check itself needs and does not find is exit code `1` with its own reason and the fix: `node-missing` (no `node` on the `PATH`, or older than 22), `not-installed` (the project's packages are not installed: run `npm install`; decided by whether `@vm/sdk`, `typescript` and `drizzle-kit` resolve from the project as Node resolves them).
+- **The check has an end**: 300 seconds in all, or `--timeout <seconds>` (a whole number from 1 to 3600; anything else is exit code `2`). Past it the check ends with exit code `1`, reason `check-timed-out`, and the message names the check it was in. What it starts it also stops: nothing of it is left running, whether the check ended in time or not.
+- The check runs the project's own tools (`tsc`, `drizzle-kit`, the SDK's tooling) and so whatever `src/db/schema.ts` imports: as the Builder, on the Builder's machine, like any build. It does not run `src/index.ts` or the Manifest, and it reads no `drizzle.config.*`: the schema is `src/db/schema.ts` and the migrations are in `migrations/`, always.
+- When the Manifest cannot be read, the `resources` check has nothing to go by and is left out; the other checks are still made.
