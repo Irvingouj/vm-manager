@@ -5,6 +5,7 @@
   "workspaces": [
     "sdk",
     "blackbox/sdk-types",
+    "blackbox/project-tools",
     "blackbox/fixtures/sdk/*"
   ],
   "scripts": {

@@ -41,6 +41,9 @@
 //!   [`changed_outside`] what those of what something else changed share;
 //! - [`tool`] runs the program as the Builder's command-line tool, on a
 //!   temporary directory standing for the Builder's machine;
+//! - [`project`] is what the tests of creating and checking a project
+//!   share: `vm new`, `vm check` and its report, a project of the
+//!   harness's own, a tree snapshot, whether a process runs, a tarball;
 //! - [`structure`] is what the tests of pulling a Resource's structure
 //!   share: a fixture shared database with the common shapes, the
 //!   generated link, and a reading of the server log that says whether a
@@ -75,6 +78,7 @@ pub mod out_of_reach;
 pub mod own_database;
 pub mod postgres;
 pub mod program;
+pub mod project;
 pub mod records;
 pub mod scenario;
 pub mod sdk;

@@ -261,6 +261,68 @@ impl Machine {
         }
     }
 
+    /// Runs `vm <args>` on this machine with these environment variables
+    /// added, its standard output and error written to files rather than
+    /// pipes, killed at `timeout`. For a run that may leave a process of
+    /// its own behind: a pipe held open by such a process would keep a
+    /// reader of it waiting, a file does not.
+    pub fn run_into_files(&self, args: &[&str], env: &[(&str, &str)], timeout: Duration) -> Run {
+        self.run_into_files_in(&self.cwd(), args, env, timeout)
+    }
+
+    /// As [`Machine::run_into_files`], run in the directory `cwd`.
+    pub fn run_into_files_in(
+        &self,
+        cwd: &Path,
+        args: &[&str],
+        env: &[(&str, &str)],
+        timeout: Duration,
+    ) -> Run {
+        let outputs = std::env::temp_dir().join(format!("vm-blackbox-run-{}", token()));
+        fs::create_dir_all(&outputs)
+            .unwrap_or_else(|e| panic!("cannot make {}: {e}", outputs.display()));
+        let open = |name: &str| {
+            fs::File::create(outputs.join(name))
+                .unwrap_or_else(|e| panic!("cannot make {name} in {}: {e}", outputs.display()))
+        };
+        let mut command = self.command(args, env, None);
+        command
+            .current_dir(cwd)
+            .stdin(Stdio::null())
+            .stdout(open("stdout"))
+            .stderr(open("stderr"));
+        let began = Instant::now();
+        let mut child = command
+            .spawn()
+            .unwrap_or_else(|e| panic!("cannot run the tool: {e}"));
+        let deadline = began + timeout;
+        let status = loop {
+            if let Ok(Some(status)) = child.try_wait() {
+                break Some(status);
+            }
+            if Instant::now() >= deadline {
+                drop(child.kill());
+                drop(child.wait());
+                break None;
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+        let elapsed = began.elapsed();
+        let read = |name: &str| {
+            let bytes = fs::read(outputs.join(name)).unwrap_or_default();
+            String::from_utf8_lossy(&bytes).into_owned()
+        };
+        let run = Run {
+            args: args.iter().map(|a| (*a).to_owned()).collect(),
+            code: status.and_then(|s| s.code()),
+            stdout: read("stdout"),
+            stderr: read("stderr"),
+            elapsed,
+        };
+        drop(fs::remove_dir_all(&outputs));
+        run
+    }
+
     /// Runs `vm <args>` on this machine with its standard output or error
     /// broken before it can write anything; `stdout` of the [`Run`] is
     /// empty, and so is `stderr` when standard error is closed.

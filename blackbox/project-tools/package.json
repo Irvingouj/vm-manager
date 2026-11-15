@@ -1,0 +1,11 @@
+{
+  "name": "vm-project-tools",
+  "private": true,
+  "description": "The tools a project made by `vm new` runs, installed once at the root so that the black-box tests of `vm check` (blackbox/CONTRACT.md, \"A project: the template, creating one and checking one\") find them as Node resolves them from a project under the repository: drizzle-kit, beside the SDK's own drizzle-orm, typescript and esbuild.",
+  "devDependencies": {
+    "drizzle-kit": "0.31.11",
+    "drizzle-orm": "0.45.4",
+    "esbuild": "0.28.2",
+    "typescript": "5.9.3"
+  }
+}
