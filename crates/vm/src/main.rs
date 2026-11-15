@@ -7,6 +7,7 @@
 //! applications` are the Builder's tool (vm::tool). `vm --version` names the
 //! execution core.
 
+use std::io::Write;
 use std::net::SocketAddr;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -108,14 +109,14 @@ fn main() -> ExitCode {
         }
     };
     match cli.command {
-        _ if cli.version => {
-            version();
-            ExitCode::SUCCESS
-        }
+        _ if cli.version => match version() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(_) => ExitCode::FAILURE,
+        },
         Some(Command::Serve(serve)) => match run(&serve) {
             Ok(()) => ExitCode::SUCCESS,
             Err(message) => {
-                eprintln!("vm serve: {message}");
+                say_on_stderr(&format!("vm serve: {message}"));
                 ExitCode::FAILURE
             }
         },
@@ -125,24 +126,36 @@ fn main() -> ExitCode {
         Some(Command::Resources(output)) => tool::run(tool::Command::Resources(output)),
         Some(Command::Applications(output)) => tool::run(tool::Command::Applications(output)),
         None => {
-            eprintln!(
-                "vm: name a command (see vm --help): vm sign-in ..., vm serve ..., or vm --version"
+            say_on_stderr(
+                "vm: name a command (see vm --help): vm sign-in ..., vm serve ..., or vm --version",
             );
             ExitCode::from(2)
         }
     }
 }
 
-fn version() {
-    println!("vm {}", env!("CARGO_PKG_VERSION"));
-    println!(
-        "execution core: openworkers-core v0.18.1, openworkers-runtime-v8 v0.18.7 (patched, vendor/VENDORED.md)"
-    );
+/// A line on standard error; when standard error is gone, there is no one
+/// to tell, and the program goes on to its exit code.
+fn say_on_stderr(line: &str) {
+    let mut err = std::io::stderr().lock();
+    writeln!(err, "{line}").and_then(|()| err.flush()).ok();
+}
+
+/// Written through a handle, so that a closed standard output is an error,
+/// not a panic.
+fn version() -> std::io::Result<()> {
     let snapshot = match openworkers_runtime_v8::platform::get_snapshot() {
         Some(_) => "present",
         None => "none",
     };
-    println!("V8 startup snapshot: {snapshot}");
+    let mut out = std::io::stdout().lock();
+    writeln!(out, "vm {}", env!("CARGO_PKG_VERSION"))?;
+    writeln!(
+        out,
+        "execution core: openworkers-core v0.18.1, openworkers-runtime-v8 v0.18.7 (patched, vendor/VENDORED.md)"
+    )?;
+    writeln!(out, "V8 startup snapshot: {snapshot}")?;
+    out.flush()
 }
 
 fn run(serve: &Serve) -> Result<(), String> {

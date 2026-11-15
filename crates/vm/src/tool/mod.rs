@@ -11,11 +11,17 @@
 //!   checks below); `3` refused, or waiting for the Builder; `4` not signed
 //!   in.
 //!
-//! Every message says what to do next. None holds the credential.
+//! Every message says what to do next. None holds the credential. Without
+//! `--json`, text that came from the installation reaches words only through
+//! [`Theirs`], which escapes control characters. Output is written through
+//! handles whose errors are taken: a closed standard output or standard
+//! error ends the command, never with a panic.
 
 mod client;
 mod credential_file;
+mod theirs;
 
+use std::io::{self, Write};
 use std::net::SocketAddr;
 use std::process::ExitCode;
 
@@ -25,6 +31,7 @@ use serde_json::{Value, json};
 
 use client::{Failure, Installation, Reply, Sign};
 use credential_file::{Found, Kept, Place, Secret};
+use theirs::Theirs;
 
 use crate::registry::is_dns_label;
 use crate::sign_in::MAX_STAND_IN_VALUE_BYTES;
@@ -94,19 +101,43 @@ pub enum Command {
     Applications(Output),
 }
 
+/// A message: the tool's own words, or the installation's (a refusal's
+/// `message`), which are escaped when printed as words.
+enum Said {
+    Ours(String),
+    Theirs(Theirs),
+}
+
+impl Said {
+    fn words(&self) -> String {
+        match self {
+            Self::Ours(text) => text.clone(),
+            Self::Theirs(text) => text.to_string(),
+        }
+    }
+
+    fn json(&self) -> Value {
+        match self {
+            Self::Ours(text) => json!(text),
+            Self::Theirs(text) => json!(text),
+        }
+    }
+}
+
 /// How a command that did not end with `0` ended.
 struct Ending {
     code: u8,
-    reason: String,
-    message: String,
+    /// Only ever printed in JSON.
+    reason: Value,
+    message: Said,
 }
 
 impl Ending {
     fn new(code: u8, reason: &str, message: String) -> Self {
         Self {
             code,
-            reason: reason.to_owned(),
-            message,
+            reason: json!(reason),
+            message: Said::Ours(message),
         }
     }
 
@@ -150,27 +181,64 @@ pub fn run(command: Command) -> ExitCode {
             format!("the tool could not start ({error}): run the command again"),
         )),
     };
-    match outcome {
+    let (code, written) = match outcome {
         Ok(done) => {
-            if json {
-                println!("{}", done.json);
+            let written = if json {
+                write_to(&mut io::stdout().lock(), &json_line(&done.json))
             } else {
-                print!("{}", done.text);
-            }
-            ExitCode::SUCCESS
+                write_to(&mut io::stdout().lock(), &done.text)
+            };
+            (0, written)
         }
         Err(ending) => {
-            if json {
-                println!(
-                    "{}",
-                    json!({ "error": { "reason": ending.reason, "message": ending.message } })
-                );
+            let written = if json {
+                let body = json!({ "error": { "reason": ending.reason, "message": ending.message.json() } });
+                write_to(&mut io::stdout().lock(), &json_line(&body))
             } else {
-                eprintln!("{}", ending.message);
-            }
-            ExitCode::from(ending.code)
+                write_to(
+                    &mut io::stderr().lock(),
+                    &format!("{}\n", ending.message.words()),
+                )
+            };
+            (ending.code, written)
+        }
+    };
+    match written {
+        Ok(()) => ExitCode::from(code),
+        Err(error) => {
+            // Standard error may be gone too: then there is no one to tell.
+            write_to(
+                &mut io::stderr().lock(),
+                &format!("vm: the output could not be written ({error}); the command's outcome is lost: run it again with its output kept\n"),
+            )
+            .ok();
+            ExitCode::from(1)
         }
     }
+}
+
+/// `value` as one line of JSON in which no control character is raw.
+/// serde_json escapes C0 on its own but leaves DEL and C1 as they are,
+/// which JSON allows; a terminal does not, so they are escaped here too.
+/// Outside strings the compact form holds no control character, so this
+/// changes only strings, and only how they are written.
+fn json_line(value: &Value) -> String {
+    let mut line = String::new();
+    for c in value.to_string().chars() {
+        if c.is_control() {
+            put!(line, "\\u{:04x}", u32::from(c));
+        } else {
+            line.push(c);
+        }
+    }
+    line.push('\n');
+    line
+}
+
+/// Writes all of `text` and flushes; the error, if any, is the caller's.
+fn write_to(out: &mut impl Write, text: &str) -> io::Result<()> {
+    out.write_all(text.as_bytes())?;
+    out.flush()
 }
 
 // The command line's own checks: each failure is exit code 2, by clap.
@@ -238,13 +306,13 @@ fn sign_in_again(kept: &Kept) -> String {
         "vm sign-in --domain {} --connect {} --stand-in-user {}",
         shell_word(&kept.domain),
         kept.connect,
-        shell_word(&kept.user)
+        shell_word(&kept.user.to_string())
     );
     if !kept.groups.is_empty() {
         put!(
             command,
             " --stand-in-groups {}",
-            shell_word(&kept.groups.join(","))
+            shell_word(&listed(&kept.groups, ","))
         );
     }
     command
@@ -307,7 +375,11 @@ fn not_success(connect: SocketAddr, reply: &Reply) -> Ending {
         (Some(reason), Some(message)) => {
             // The platform could not do it now: a failure, not a refusal.
             let code = if reply.status.is_server_error() { 1 } else { 3 };
-            Ending::new(code, reason, message.to_owned())
+            Ending {
+                code,
+                reason: json!(reason),
+                message: Said::Theirs(Theirs::from(message)),
+            }
         }
         _ => unexpected(
             connect,
@@ -357,26 +429,38 @@ fn shaped<T: for<'de> Deserialize<'de>>(connect: SocketAddr, value: Value) -> Re
 #[derive(Deserialize)]
 struct Made {
     credential: String,
-    user: String,
-    groups: Vec<String>,
+    user: Theirs,
+    groups: Vec<Theirs>,
     platform_administrator: bool,
-    expires_at: String,
+    expires_at: Theirs,
 }
 
 /// What `GET /v1/me` answers.
 #[derive(Deserialize)]
 struct Me {
-    user: String,
-    groups: Vec<String>,
+    user: Theirs,
+    groups: Vec<Theirs>,
     platform_administrator: bool,
 }
 
-fn who_in_words(domain: &str, user: &str, groups: &[String], administrator: bool) -> String {
+/// `texts` in words, joined by `between`.
+fn listed(texts: &[Theirs], between: &str) -> String {
+    let mut joined = String::new();
+    for (n, text) in texts.iter().enumerate() {
+        if n > 0 {
+            joined.push_str(between);
+        }
+        put!(joined, "{text}");
+    }
+    joined
+}
+
+fn who_in_words(domain: &str, user: &Theirs, groups: &[Theirs], administrator: bool) -> String {
     let mut text = format!("Signed in to {domain} as {user}");
     if groups.is_empty() {
         text.push_str(", in no Group.\n");
     } else {
-        say!(text, ", in the Groups {}.", groups.join(", "));
+        say!(text, ", in the Groups {}.", listed(groups, ", "));
     }
     if administrator {
         text.push_str("You are a Platform administrator.\n");
@@ -542,12 +626,12 @@ async fn whoami() -> Result<Done, Ending> {
 /// Access level, nothing of its connection or what is inside it.
 #[derive(Deserialize, serde::Serialize)]
 struct ListedResource {
-    name: String,
-    kind: String,
-    description: String,
-    owner: String,
-    contact: String,
-    your_access: Option<String>,
+    name: Theirs,
+    kind: Theirs,
+    description: Theirs,
+    owner: Theirs,
+    contact: Theirs,
+    your_access: Option<Theirs>,
 }
 
 #[derive(Deserialize)]
@@ -571,16 +655,19 @@ async fn resources() -> Result<Done, Ending> {
         say!(text, "{} ({})", r.name, r.kind);
         say!(text, "  {}", r.description);
         say!(text, "  Owner: {}", r.owner);
-        match r.your_access.as_deref() {
+        match &r.your_access {
             None => {
                 say!(text, "  Your access: no access: ask {}", r.contact);
             }
             Some(level) => {
-                let meaning = match level {
-                    "structure" => " (its structure only: rows cannot be read at this level)",
-                    "read" => " (rows can be read)",
-                    "write" => " (rows can be read and written)",
-                    _ => "",
+                let meaning = if level.is("structure") {
+                    " (its structure only: rows cannot be read at this level)"
+                } else if level.is("read") {
+                    " (rows can be read)"
+                } else if level.is("write") {
+                    " (rows can be read and written)"
+                } else {
+                    ""
                 };
                 say!(text, "  Your access: {level}{meaning}");
                 say!(text, "  For more, ask: {}", r.contact);
@@ -597,9 +684,9 @@ async fn resources() -> Result<Done, Ending> {
 /// An Application as `GET /v1/applications` lists it.
 #[derive(Deserialize, serde::Serialize)]
 struct ListedApplication {
-    name: String,
-    description: Option<String>,
-    address: String,
+    name: Theirs,
+    description: Option<Theirs>,
+    address: Theirs,
     contributor: bool,
     serving_version: Option<u64>,
 }

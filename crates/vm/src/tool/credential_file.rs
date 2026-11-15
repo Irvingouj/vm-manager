@@ -20,6 +20,9 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use super::theirs::Theirs;
+use crate::registry::is_dns_label;
+
 /// The file's name in the folder.
 const FILE_NAME: &str = "tool-credential.json";
 
@@ -58,13 +61,15 @@ impl Secret {
 
 /// What the tool keeps after signing in.
 pub struct Kept {
+    /// Checked: DNS labels joined by dots.
     pub domain: String,
     pub connect: SocketAddr,
-    pub user: String,
-    pub groups: Vec<String>,
+    /// As the installation said.
+    pub user: Theirs,
+    pub groups: Vec<Theirs>,
     pub credential: Secret,
     /// RFC 3339, as the installation said.
-    pub expires_at: String,
+    pub expires_at: Theirs,
 }
 
 /// The file as written, borrowed from what is kept.
@@ -73,10 +78,10 @@ struct Written<'a> {
     form: u32,
     domain: &'a str,
     connect: SocketAddr,
-    user: &'a str,
-    groups: &'a [String],
+    user: &'a Theirs,
+    groups: &'a [Theirs],
     credential: &'a str,
-    expires_at: &'a str,
+    expires_at: &'a Theirs,
 }
 
 /// The file as read.
@@ -85,10 +90,10 @@ struct OnDisk {
     form: u32,
     domain: String,
     connect: SocketAddr,
-    user: String,
-    groups: Vec<String>,
+    user: Theirs,
+    groups: Vec<Theirs>,
     credential: String,
-    expires_at: String,
+    expires_at: Theirs,
 }
 
 /// What reading found.
@@ -158,7 +163,11 @@ impl Place {
             return Err(garbled());
         }
         let on_disk: OnDisk = serde_json::from_slice(&bytes).map_err(|_| garbled())?;
-        if on_disk.form != FORM || !on_disk.connect.ip().is_loopback() {
+        if on_disk.form != FORM
+            || !on_disk.connect.ip().is_loopback()
+            || on_disk.domain.is_empty()
+            || !on_disk.domain.split('.').all(is_dns_label)
+        {
             return Err(garbled());
         }
         let credential = Secret::new(on_disk.credential).ok_or_else(garbled)?;
