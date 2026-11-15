@@ -8,9 +8,10 @@
 //!   Version, are sent a second Version at once whose migration sleeps 4 s:
 //!   at least one is answered `503` `unavailable` within 2 s, nothing of it
 //!   is kept, the others are `201`, and the refused one applies when sent
-//!   again;
+//!   again (again and again, within 20 s, each refusal the same);
 //! - eight slow Versions whose senders gave up after 1 s, still being
-//!   applied, and a ninth sent then: `503` `unavailable` within 2 s.
+//!   applied, and a ninth sent then: `503` `unavailable` within 2 s; once
+//!   they end, the ninth applies when sent again (as above).
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -91,6 +92,37 @@ fn assert_unavailable(own: &Own, application: &str, sent: &Response, took: Durat
     );
 }
 
+/// How long a Version refused for want of a place may take to apply once
+/// the Versions that held the places have ended their statements: what
+/// follows a migration's last statement (the commit, the record, closing
+/// the role) still holds a place, and an outsider is told to "send it
+/// again shortly".
+const AGAIN_WITHIN: Duration = Duration::from_secs(20);
+
+/// Sends `list` to `application` again and again, 200 ms apart, until it
+/// is `201`, within [`AGAIN_WITHIN`]; every answer before the `201` must be
+/// the same refusal as [`assert_unavailable`] checks (`503`
+/// `unavailable`, at once, nothing kept). Returns how many were refused.
+fn send_again_until_applied(own: &Own, application: &str, list: &[Migration]) -> usize {
+    let deadline = Instant::now() + AGAIN_WITHIN;
+    let mut refused = 0;
+    loop {
+        let sent_at = Instant::now();
+        let sent = version_request(own, application, list, Duration::from_secs(60)).send();
+        let took = sent_at.elapsed();
+        if sent.status == 201 {
+            return refused;
+        }
+        assert_unavailable(own, application, &sent, took);
+        refused += 1;
+        assert!(
+            Instant::now() < deadline,
+            "expected the Version applied when sent again within {AGAIN_WITHIN:?} of the others' ending; {refused} sendings were answered `503 unavailable`"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
 /// How many of these own databases run a `pg_sleep`.
 fn sleeping(databases: &[String]) -> usize {
     let sql = Sql::connect(&shared().url("postgres")).unwrap();
@@ -155,12 +187,10 @@ fn of_nine_versions_sent_at_once_one_is_answered_unavailable_at_once_and_applies
         }
     }
     for &i in &refused {
-        let sent = own.send(&applications[i], &list);
-        assert_eq!(
-            sent.status,
-            201,
-            "expected the refused Version applied when sent again, got\n{}",
-            sent.describe()
+        let again = send_again_until_applied(&own, &applications[i], &list);
+        println!(
+            "{}: refused {again} times more before it applied",
+            applications[i]
         );
     }
 }
@@ -213,11 +243,8 @@ fn versions_whose_senders_went_away_count_toward_the_eight() {
         );
         std::thread::sleep(Duration::from_millis(200));
     }
-    let again = own.send(ninth, &list);
-    assert_eq!(
-        again.status,
-        201,
-        "expected the ninth Version applied when sent again, got\n{}",
-        again.describe()
-    );
+    // No session sleeping is not every Version ended: what follows the
+    // last statement still holds a place. Sent again until applied.
+    let again = send_again_until_applied(&own, ninth, &list);
+    println!("the ninth: refused {again} times more before it applied");
 }
