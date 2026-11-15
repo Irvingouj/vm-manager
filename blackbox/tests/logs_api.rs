@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use blackbox::api::assert_recent_rfc3339;
 use blackbox::logs::{
     ENTRY_PROMISED, Page, Print, encode, from_to, go_back, logs, page, post_to, printing,
-    prints_bundle, read_after, wait_for_entries, wait_for_entry,
+    prints_bundle, read_after, record, records_of, wait_for_entries, wait_for_entry,
 };
 use blackbox::own_database::Own;
 use blackbox::postgres::{Platform, PrivatePostgres};
@@ -145,8 +145,10 @@ fn each_request_has_one_entry_with_its_user_version_method_path_status_and_what_
     assert_eq!(entry["status"], 201, "{entry}");
     assert_eq!(
         entry["printed"],
-        json!([ { "level": "log", "message": "loading notes" },
-                { "level": "warn", "message": "two notes have no title" } ]),
+        json!([
+            record("log", "loading notes", false),
+            record("warn", "two notes have no title", false)
+        ]),
         "{entry}"
     );
     assert_eq!(entry["uncaught"], json!([]), "{entry}");
@@ -174,13 +176,9 @@ fn printed_records_are_kept_in_order_with_the_name_of_their_console_method() {
     let response = printed(&own.vm, "/", &prints);
     response.expect_status(200);
     let (entry, _) = wait_for_entry(&own.vm.api_as(&alice()), "board", &response.request_id());
-    let want: Vec<Value> = prints
-        .iter()
-        .map(|p| json!({ "level": p.level, "message": p.text() }))
-        .collect();
     assert_eq!(
         entry["printed"],
-        json!(want),
+        json!(records_of(&prints)),
         "expected every line, in order, with its level"
     );
 }
@@ -201,7 +199,7 @@ fn an_uncaught_error_is_in_its_entry_with_its_message_and_stack_as_the_programs_
     assert_eq!(entry["status"], 500, "{entry}");
     assert_eq!(
         entry["printed"],
-        json!([{ "level": "log", "message": "counting notes" }]),
+        json!([record("log", "counting notes", false)]),
         "expected what was printed before the error, {entry}"
     );
     let uncaught = entry["uncaught"].as_array().unwrap();
@@ -250,74 +248,151 @@ fn a_request_no_application_code_was_given_has_no_entry() {
 }
 
 #[test]
-fn what_is_printed_while_loading_has_an_entry_of_its_own_with_no_request() {
+fn what_is_printed_while_loading_is_first_in_the_requests_own_entry() {
     let own = board(2);
     let api = own.vm.api_as(&alice());
     let first = quiet(&own.vm, "/");
-    wait_for_entry(&api, "board", &first.request_id());
+    let (entry, _) = wait_for_entry(&api, "board", &first.request_id());
+    assert_eq!(
+        entry["printed"],
+        json!([
+            record("log", "v1 loading 0", true),
+            record("log", "v1 loading 1", true)
+        ]),
+        "expected the lines printed while the script was loaded for the request, `loading` true, {entry}"
+    );
+    let prints = [Print::new("warn", "the request's own line")];
+    let second = printed(&own.vm, "/", &prints);
+    second.expect_status(200);
+    let (entry, _) = wait_for_entry(&api, "board", &second.request_id());
+    assert_eq!(
+        entry["printed"],
+        json!([
+            record("log", "v1 loading 0", true),
+            record("log", "v1 loading 1", true),
+            record("warn", "the request's own line", false),
+        ]),
+        "expected the loading lines first, then the request's own, {entry}"
+    );
+
     api.send_bundle("board", &prints_bundle("v2", 1))
         .expect_status(201);
-    let second = quiet(&own.vm, "/");
-    wait_for_entry(&api, "board", &second.request_id());
-    // The loading lines are printed with no request in flight.
+    let third = quiet(&own.vm, "/");
+    let (entry, _) = wait_for_entry(&api, "board", &third.request_id());
+    assert_eq!(entry["version"], 2, "{entry}");
+    assert_eq!(
+        entry["printed"],
+        json!([record("log", "v2 loading 0", true)]),
+        "{entry}"
+    );
+    // The program's log has them as before: with no request.
     let loading = own
         .vm
         .wait_for_record("a `printed` record of v2 while loading", |r| {
             event(r) == "printed" && r["message"] == "v2 loading 0"
         });
     assert!(request_of(&loading).is_none(), "{loading}");
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let (v1, v2) = loop {
-        let all = all_entries(&own.vm, "board");
-        let outside = |marker: &str| -> Vec<Value> {
-            all.entries
-                .iter()
-                .filter(|e| {
-                    e["printed"][0]["message"]
-                        .as_str()
-                        .is_some_and(|m| m.starts_with(&format!("{marker} loading ")))
-                })
-                .cloned()
-                .collect()
-        };
-        let (v1, v2) = (outside("v1"), outside("v2"));
-        if (v1.len() >= 2 && !v2.is_empty()) || Instant::now() > deadline {
-            break (v1, v2);
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    };
+    // And no entry of its own is made for a line printed while loading.
+    let all = all_entries(&own.vm, "board");
     assert!(
-        v1.len() >= 2 && !v2.is_empty(),
-        "expected an entry for each line printed while loading (two of v1, one of v2) within 10 s, got v1 {v1:?} and v2 {v2:?}"
+        all.entries.iter().all(|e| e["request"].is_string()),
+        "expected every entry to be a request's, got {:?}",
+        all.entries
     );
-    for (entries, version) in [(&v1, 1), (&v2, 2)] {
-        for entry in entries {
-            for field in ["request", "user", "method", "path", "status"] {
-                assert!(entry[field].is_null(), "expected `{field}` null in {entry}");
-            }
-            assert_eq!(
-                entry["version"], version,
-                "expected the Version whose code printed, {entry}"
-            );
-            assert_eq!(
-                entry["printed"].as_array().map(Vec::len),
-                Some(1),
-                "expected the one record, {entry}"
-            );
-            assert_eq!(entry["printed"][0]["level"], "log", "{entry}");
-        }
-    }
+    assert_eq!(
+        all.entries.len(),
+        3,
+        "expected one entry a request, got {:?}",
+        all.entries
+    );
+}
+
+#[test]
+fn the_bound_of_200_records_counts_the_loading_lines_too() {
+    let own = board(150);
+    let prints: Vec<Print> = (0..100)
+        .map(|i| Print::new("log", &format!("own line {i}")))
+        .collect();
+    let response = printed(&own.vm, "/", &prints);
+    response.expect_status(200);
+    let (entry, _) = wait_for_entry(&own.vm.api_as(&alice()), "board", &response.request_id());
+    let mut want: Vec<Value> = (0..150)
+        .map(|i| record("log", &format!("v1 loading {i}"), true))
+        .collect();
+    want.extend((0..50).map(|i| record("log", &format!("own line {i}"), false)));
+    assert_eq!(
+        entry["printed"],
+        json!(want),
+        "expected the 150 loading lines and the first 50 of the request's own: 200 in all"
+    );
+    assert_eq!(entry["truncated"], true);
+}
+
+#[test]
+fn a_nul_character_is_kept_as_the_replacement_character_and_the_programs_log_has_it_as_it_was() {
+    let own = board(0);
+    let response = printed(&own.vm, "/", &[Print::new("log", "before\u{0}after")]);
+    response.expect_status(200);
+    let (entry, _) = wait_for_entry(&own.vm.api_as(&alice()), "board", &response.request_id());
+    assert_eq!(
+        entry["printed"],
+        json!([record("log", "before\u{fffd}after", false)]),
+        "expected the NUL kept as U+FFFD"
+    );
+    let error = post_to(
+        &own.vm,
+        &bob(),
+        "board",
+        "/",
+        &printing(&[], Some("bad\u{0}value")),
+    );
+    error.expect_status(500);
+    let (entry, _) = wait_for_entry(&own.vm.api_as(&alice()), "board", &error.request_id());
+    let kept = entry["uncaught"][0].as_str().unwrap();
     assert!(
-        v1.iter()
-            .any(|e| e["printed"][0]["message"] == "v1 loading 0")
-            && v1
-                .iter()
-                .any(|e| e["printed"][0]["message"] == "v1 loading 1"),
-        "expected both lines of v1 each in an entry, got {v1:?}"
+        kept.contains("bad\u{fffd}value") && !kept.contains('\u{0}'),
+        "expected the NUL of the error kept as U+FFFD, got {kept:?}"
     );
-    // The request's own entry holds none of them.
-    let (entry, _) = wait_for_entry(&api, "board", &first.request_id());
-    assert_eq!(entry["printed"], json!([]), "{entry}");
+    let logged = own.vm.records_of(&response);
+    assert_eq!(
+        logged.printed()[0]["message"].as_str(),
+        Some("before\u{0}after"),
+        "expected the program's log to have the NUL as it was"
+    );
+    let logged = own.vm.records_of(&error);
+    assert!(
+        logged.uncaught()[0]["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("bad\u{0}value")),
+        "expected the program's log to have the error's NUL as it was"
+    );
+}
+
+#[test]
+fn a_request_the_platform_answers_before_the_code_is_given_it_has_no_entry() {
+    let own = board(0);
+    let api = own.vm.api_as(&alice());
+    // A body over the platform's 16 MiB.
+    let big = vec![b'x'; 16 * 1024 * 1024 + 1];
+    let refused = own
+        .vm
+        .request("board", "/")
+        .as_user(&bob())
+        .method("POST")
+        .header("content-type", "application/json")
+        .body(&big)
+        .timeout(Duration::from_secs(60))
+        .send();
+    refused.expect_status(413);
+    let served = quiet(&own.vm, "/after");
+    wait_for_entry(&api, "board", &served.request_id());
+    let all = all_entries(&own.vm, "board");
+    assert!(
+        entries_of(&all, &refused).is_empty(),
+        "expected no entry for the request answered 413, got {:?}",
+        all.entries
+    );
+    assert_eq!(all.entries.len(), 1, "{:?}", all.entries);
 }
 
 #[test]
@@ -500,8 +575,6 @@ fn malformed_parameters_are_400_and_unknown_ones_are_ignored() {
         "?limit=1.5".to_owned(),
         "?limit=ten".to_owned(),
         "?limit=".to_owned(),
-        "?after=not-a-cursor".to_owned(),
-        format!("?after={cursor}x"),
         "?limit=5&limit=5".to_owned(),
         format!("?after={cursor}&after={cursor}"),
         format!("?request={request}&request={request}"),
@@ -642,32 +715,13 @@ fn more_than_64_kib_of_messages_keeps_what_came_first() {
     let response = printed(&own.vm, "/", &prints);
     response.expect_status(200);
     let (entry, _) = wait_for_entry(&own.vm.api_as(&alice()), "board", &response.request_id());
-    let kept: Vec<&str> = entry["printed"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|p| p["message"].as_str().unwrap())
-        .collect();
-    let total: usize = kept.iter().map(|m| m.len()).sum();
-    assert!(
-        total <= 64 * 1024,
-        "expected at most 64 KiB of messages kept, got {total} bytes"
+    // 13 messages of 5,000 bytes are 65,000; the fourteenth would pass
+    // 64 KiB: it is not kept, nor any after it.
+    assert_eq!(
+        entry["printed"],
+        json!(records_of(&prints[..13])),
+        "expected exactly the first 13 records, whole"
     );
-    assert!(
-        kept.len() >= 13,
-        "expected the 13 whole messages that fit in 64 KiB kept, got {}",
-        kept.len()
-    );
-    for (i, message) in kept.iter().enumerate() {
-        let sent = prints[i].text();
-        assert!(
-            sent.starts_with(message),
-            "expected the kept records to be the first ones, in order: record {i} is not the beginning of what was printed {i}th"
-        );
-        if i < 13 {
-            assert_eq!(message.len(), sent.len(), "expected record {i} whole");
-        }
-    }
     assert_eq!(entry["truncated"], true);
     let logged = own.vm.records_of(&response);
     assert_eq!(

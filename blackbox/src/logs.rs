@@ -116,6 +116,19 @@ impl Print {
     }
 }
 
+/// A record of `printed` as an entry holds it.
+pub fn record(level: &str, message: &str, loading: bool) -> Value {
+    json!({ "level": level, "message": message, "loading": loading })
+}
+
+/// The records of `printed` these make, printed by the request itself.
+pub fn records_of(prints: &[Print]) -> Vec<Value> {
+    prints
+        .iter()
+        .flat_map(|p| std::iter::repeat_n(record(&p.level, &p.text(), false), p.times))
+        .collect()
+}
+
 /// The body that makes `fixtures/prints.js` print these, then throw
 /// `throw` when given.
 pub fn printing(prints: &[Print], throw: Option<&str>) -> Value {
@@ -282,10 +295,15 @@ pub fn assert_entry_shape(entry: &Value) {
         inner.sort_unstable();
         assert_eq!(
             inner,
-            ["level", "message"],
-            "expected each of `printed` to be {{ level, message }} in {entry}"
+            ["level", "loading", "message"],
+            "expected each of `printed` to be {{ level, message, loading }} in {entry}"
         );
-        assert!(record["level"].is_string() && record["message"].is_string());
+        assert!(
+            record["level"].is_string()
+                && record["message"].is_string()
+                && record["loading"].is_boolean(),
+            "expected `level` and `message` text and `loading` a boolean in {entry}"
+        );
     }
     let uncaught = entry["uncaught"]
         .as_array()

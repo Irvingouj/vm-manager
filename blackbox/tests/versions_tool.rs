@@ -79,12 +79,19 @@ fn vm_versions_lists_each_version_with_its_commit_when_and_by_whom_and_which_ser
     let listed = machine.run(&["versions", "board", "--json"]).ok_json();
     assert_eq!(
         keys(&listed),
-        ["address", "application", "serving_version", "versions"],
+        [
+            "address",
+            "application",
+            "latest_version",
+            "serving_version",
+            "versions"
+        ],
         "{listed}"
     );
     assert_eq!(listed["application"], "board");
     assert_eq!(listed["address"], format!("board.{DOMAIN}"));
     assert_eq!(listed["serving_version"], 2);
+    assert_eq!(listed["latest_version"], 3);
     let api = own.vm.api_as(&alice());
     let want: Vec<Value> = api
         .versions("board")
@@ -138,20 +145,82 @@ fn vm_versions_in_words_has_a_line_for_each_version_and_marks_the_serving_one() 
             "expected Version {n}'s line to say who deployed it, got {line:?}"
         );
     }
+    // The word `serving`, on the serving line only.
     let says_serving = |line: &str| {
-        let lower = line.to_lowercase();
-        lower.contains("serving") && !lower.contains("not serving")
+        line.split(|c: char| !c.is_alphanumeric())
+            .any(|w| w.eq_ignore_ascii_case("serving"))
     };
     assert!(
         says_serving(&line_of(2)),
         "expected the line of Version 2 marked as serving, got\n{text}"
     );
-    for n in [1, 3] {
-        assert!(
-            !says_serving(&line_of(n)),
-            "expected only the serving Version's line marked, Version {n}'s is too:\n{text}"
-        );
+    let marked: Vec<&str> = text.lines().filter(|l| says_serving(l)).collect();
+    assert_eq!(
+        marked,
+        [line_of(2).as_str()],
+        "expected no other line to have the word `serving`, got\n{text}"
+    );
+}
+
+#[test]
+fn vm_versions_limit_prints_the_newest_and_says_how_many_are_not_shown() {
+    let own = Own::start();
+    with_versions(&own.vm, "board", 3);
+    let machine = machine_as(&own.vm, &alice());
+    let listed = machine
+        .run(&["versions", "board", "--limit", "2", "--json"])
+        .ok_json();
+    let numbers: Vec<u64> = listed["versions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v["number"].as_u64().unwrap())
+        .collect();
+    assert_eq!(
+        numbers,
+        [2, 3],
+        "expected the newest 2, oldest first, {listed}"
+    );
+    assert_eq!(listed["latest_version"], 3, "{listed}");
+    let text = machine
+        .run(&["versions", "board", "--limit", "2"])
+        .ok_text();
+    let short: String = commit_of(1).chars().take(7).collect();
+    assert!(
+        !text.contains(&short),
+        "expected Version 1 not shown with --limit 2, got\n{text}"
+    );
+    assert!(
+        text.lines().any(|l| l.contains("--limit")
+            && l.split(|c: char| !c.is_ascii_alphanumeric())
+                .any(|w| w == "1")),
+        "expected the words to say how many older Versions are not shown (1) and that --limit shows more, got\n{text}"
+    );
+    for limit in ["0", "1001", "-1", "two"] {
+        machine
+            .run(&["versions", "board", "--limit", limit, "--json"])
+            .expect_code(2);
     }
+}
+
+#[test]
+fn vm_versions_names_the_serving_version_also_when_its_line_is_not_printed() {
+    let own = Own::start();
+    with_versions(&own.vm, "board", 3);
+    go_back(&own.vm.api_as(&alice()), "board", &from_to(3, Some(1))).expect_status(200);
+    let machine = machine_as(&own.vm, &alice());
+    let listed = machine
+        .run(&["versions", "board", "--limit", "1", "--json"])
+        .ok_json();
+    assert_eq!(listed["serving_version"], 1, "{listed}");
+    assert_eq!(listed["latest_version"], 3, "{listed}");
+    assert_eq!(
+        listed["versions"].as_array().map(Vec::len),
+        Some(1),
+        "{listed}"
+    );
+    assert_eq!(listed["versions"][0]["number"], 3, "{listed}");
+    assert_eq!(listed["versions"][0]["serving"], false, "{listed}");
 }
 
 #[test]
@@ -162,7 +231,7 @@ fn vm_versions_of_an_application_with_no_version_says_vm_deploy_sends_the_first(
     assert_eq!(
         machine.run(&["versions", "empty", "--json"]).ok_json(),
         json!({ "application": "empty", "address": format!("empty.{DOMAIN}"),
-                "serving_version": null, "versions": [] })
+                "serving_version": null, "latest_version": null, "versions": [] })
     );
     let text = machine.run(&["versions", "empty"]).ok_text();
     assert!(
@@ -414,7 +483,10 @@ fn vm_help_lists_versions_go_back_and_logs_and_each_help_names_its_options() {
             "expected `vm --help` to list `{command}`, got {commands:?}"
         );
     }
-    assert_help_names(&machine.run(&["versions", "--help"]), &["--json"]);
+    assert_help_names(
+        &machine.run(&["versions", "--help"]),
+        &["--limit", "--json"],
+    );
     assert_help_names(&machine.run(&["go-back", "--help"]), &["--to", "--json"]);
     assert_help_names(
         &machine.run(&["logs", "--help"]),

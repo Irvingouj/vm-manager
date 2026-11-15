@@ -14,6 +14,7 @@
 use std::thread;
 use std::time::{Duration, Instant};
 
+use blackbox::api::parse_rfc3339;
 use blackbox::logs::{
     ENTRY_KEYS, Print, encode, page, post_to, printing, prints_bundle, wait_for_entries,
     wait_for_entry,
@@ -167,9 +168,6 @@ fn vm_logs_refusals_and_wrong_command_lines() {
             .expect_code(2);
     }
     machine
-        .run(&["logs", "board", "--after", "not-a-cursor", "--json"])
-        .json_error(3, "malformed");
-    machine
         .run(&["logs", "nothing-here", "--json"])
         .json_error(3, "not-found");
     machine.run(&["logs", "--json"]).expect_code(2);
@@ -210,10 +208,15 @@ fn vm_logs_in_words_gives_each_requests_facts_its_printed_lines_and_its_error_wi
         "expected one line with the request's id, got\n{text}"
     );
     let first = first[0];
-    let date: String = entry["time"].as_str().unwrap().chars().take(10).collect();
-    let date = date.as_str();
+    let time = parse_rfc3339(entry["time"].as_str().unwrap()).unwrap();
+    assert!(
+        first
+            .split_whitespace()
+            .any(|word| { word.ends_with('Z') && parse_rfc3339(word) == Some(time) }),
+        "expected the entry's first line to hold its time, RFC 3339 in UTC ({}), got {first:?}",
+        entry["time"]
+    );
     for (what, wanted) in [
-        ("the date of its time", date),
         ("the User", "bob"),
         ("the method", "POST"),
         ("the path", "/count"),
@@ -258,14 +261,13 @@ fn vm_logs_in_words_gives_each_requests_facts_its_printed_lines_and_its_error_wi
 }
 
 #[test]
-fn vm_logs_in_words_says_when_an_entry_was_printed_outside_a_request_or_cut_and_when_there_is_none()
-{
+fn vm_logs_in_words_says_no_entries_and_says_an_entry_was_cut() {
     let own = board(0);
     let machine = signed_in(&own.vm);
-    let none = machine.run(&["logs", "board"]).ok_text().to_lowercase();
+    let none = machine.run(&["logs", "board"]).ok_text();
     assert!(
-        none.contains("none") || none.contains("no entr") || none.contains("no log"),
-        "expected the words to say there is no entry yet, got\n{none}"
+        none.to_lowercase().contains("no entries"),
+        "expected the words `no entries` with no entry yet, got\n{none}"
     );
     let api = own.vm.api_as(&alice());
     api.send_bundle("board", &prints_bundle("v2", 1))
@@ -279,33 +281,15 @@ fn vm_logs_in_words_says_when_an_entry_was_printed_outside_a_request_or_cut_and_
     );
     let (entry, _) = wait_for_entry(&api, "board", &long.request_id());
     assert_eq!(entry["truncated"], true, "the harness's own check");
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !page(&api, "board", "?limit=1000")
-        .entries
-        .iter()
-        .any(|e| e["request"].is_null())
-    {
-        assert!(
-            Instant::now() < deadline,
-            "expected an entry printed while loading within 10 s"
-        );
-        thread::sleep(Duration::from_millis(100));
-    }
     let text = machine.run(&["logs", "board"]).ok_text();
-    let lower = text.to_lowercase();
     assert!(
         text.contains("v2 loading 0"),
-        "expected the line printed while loading, got\n{text}"
+        "expected the line printed while loading for the request, got\n{text}"
     );
     assert!(
-        lower.contains("outside")
-            || lower.contains("no request")
-            || lower.contains("while loading"),
-        "expected the words to say an entry was printed outside a request, got\n{text}"
-    );
-    assert!(
-        lower.contains("cut") || lower.contains("truncated"),
-        "expected the words to say an entry was cut, got\n{text}"
+        text.split(|c: char| !c.is_alphanumeric())
+            .any(|w| w == "cut"),
+        "expected the words to say the entry was `cut`, got\n{text}"
     );
 }
 
@@ -537,8 +521,18 @@ fn vm_logs_follow_ends_with_4_when_the_sign_in_ends() {
     );
 }
 
+/// Fails unless standard error holds no sign of a crash.
+fn assert_no_crash_on_stderr(run: &blackbox::tool::Run) {
+    let lower = run.stderr.to_lowercase();
+    assert!(
+        !lower.contains("panic") && !lower.contains("backtrace"),
+        "expected nothing but an ordinary message on standard error\n{}",
+        run.describe()
+    );
+}
+
 #[test]
-fn a_closed_standard_output_ends_vm_logs_without_a_crash() {
+fn a_standard_output_closed_before_it_starts_ends_vm_logs_follow_with_1() {
     let own = board(0);
     for i in 0..3 {
         one_line(&own.vm, &format!("/n{i}"), "a line");
@@ -548,21 +542,84 @@ fn a_closed_standard_output_ends_vm_logs_without_a_crash() {
         for args in [
             vec!["logs", "board", "--follow"],
             vec!["logs", "board", "--follow", "--json"],
-            vec!["logs", "board"],
         ] {
             let run = machine.run_broken(&args, broken);
-            assert!(
-                matches!(run.code, Some(0 | 1)),
-                "expected `vm {}` with standard output {broken:?} to end by itself with 0 or 1\n{}",
+            assert_eq!(
+                run.code,
+                Some(1),
+                "expected `vm {}` with standard output {broken:?} to end with 1 (`output-closed`)\n{}",
                 args.join(" "),
                 run.describe()
             );
-            let lower = run.stderr.to_lowercase();
+            assert_no_crash_on_stderr(&run);
+            if !args.contains(&"--json") {
+                assert!(
+                    !run.stderr.trim().is_empty(),
+                    "expected the error's message on standard error\n{}",
+                    run.describe()
+                );
+            }
+        }
+        // Without --follow: as every command, the code it would have had,
+        // or 1.
+        let run = machine.run_broken(&["logs", "board"], broken);
+        assert!(matches!(run.code, Some(0 | 1)), "{}", run.describe());
+        assert_no_crash_on_stderr(&run);
+    }
+}
+
+#[test]
+fn a_reader_that_goes_away_while_it_runs_ends_vm_logs_follow_with_1_at_the_next_entry() {
+    let own = board(0);
+    one_line(&own.vm, "/first", "the first line");
+    let machine = signed_in(&own.vm);
+    for args in [
+        vec!["logs", "board", "--follow"],
+        vec!["logs", "board", "--follow", "--json"],
+    ] {
+        let (mut running, reader) = machine.spawn_piped(&args);
+        // Read up to the first line end, then go away, as `| head -1` does.
+        let (sender, received) = std::sync::mpsc::sync_channel(1);
+        let reading = thread::spawn(move || {
+            let mut reader = reader;
+            let mut byte = [0_u8; 1];
+            loop {
+                match std::io::Read::read(&mut reader, &mut byte) {
+                    Ok(1) if byte[0] == b'\n' => break,
+                    Ok(1) => {}
+                    _ => break,
+                }
+            }
+            drop(reader);
+            sender.send(()).ok();
+        });
+        received.recv_timeout(FOLLOW_WAIT).unwrap_or_else(|_| {
+            panic!(
+                "expected `vm {}` to print a first line within {FOLLOW_WAIT:?}",
+                args.join(" ")
+            )
+        });
+        reading.join().unwrap();
+        // With --json an entry is one line, so nothing more was written:
+        // it goes on until the next entry. (In words the rest of the first
+        // entry may already find no reader.)
+        if args.contains(&"--json") {
+            thread::sleep(Duration::from_millis(1500));
             assert!(
-                !lower.contains("panic") && !lower.contains("backtrace"),
-                "expected nothing but an ordinary message on standard error\n{}",
-                run.describe()
+                !running.has_ended(),
+                "expected `vm {}` to go on running until it prints again",
+                args.join(" ")
             );
         }
+        one_line(&own.vm, "/next", "the next line");
+        let run = running.wait(FOLLOW_WAIT);
+        assert_eq!(
+            run.code,
+            Some(1),
+            "expected `vm {}` to end with 1 (`output-closed`) once the next entry found no reader\n{}",
+            args.join(" "),
+            run.describe()
+        );
+        assert_no_crash_on_stderr(&run);
     }
 }

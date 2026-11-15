@@ -311,6 +311,38 @@ impl Machine {
         }
     }
 
+    /// Starts `vm <args>` on this machine with its standard output a pipe
+    /// whose reading end the test holds (and may drop while it runs), its
+    /// standard error written to a file; returns at once. The [`Run`] that
+    /// [`Running::wait`] gives has an empty standard output.
+    pub fn spawn_piped(&self, args: &[&str]) -> (Running, std::io::PipeReader) {
+        let outputs = std::env::temp_dir().join(format!("vm-blackbox-run-{}", token()));
+        fs::create_dir_all(&outputs)
+            .unwrap_or_else(|e| panic!("cannot make {}: {e}", outputs.display()));
+        let stderr = fs::File::create(outputs.join("stderr"))
+            .unwrap_or_else(|e| panic!("cannot make stderr in {}: {e}", outputs.display()));
+        let (reader, writer) =
+            std::io::pipe().unwrap_or_else(|e| panic!("cannot make a pipe: {e}"));
+        let mut command = self.command(args, &[], None);
+        command.stdin(Stdio::null()).stdout(writer).stderr(stderr);
+        let began = Instant::now();
+        let child = command
+            .spawn()
+            .unwrap_or_else(|e| panic!("cannot run the tool: {e}"));
+        // The parent's copy of the writing end goes, so that only `vm`
+        // holds it.
+        drop(command);
+        (
+            Running {
+                args: args.iter().map(|a| (*a).to_owned()).collect(),
+                child,
+                outputs,
+                began,
+            },
+            reader,
+        )
+    }
+
     /// Runs `vm <args>` on this machine with its standard output or error
     /// broken before it can write anything; `stdout` of the [`Run`] is
     /// empty, and so is `stderr` when standard error is closed.

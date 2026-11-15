@@ -23,6 +23,7 @@ use blackbox::deploy::{
 use blackbox::generate::{Generated, NOTES_WITH_TITLE_SCHEMA_TS, generate, project_with};
 use blackbox::own_database::OwnDatabase;
 use blackbox::project::{NOTES_SCHEMA_TS, manifest_ts};
+use blackbox::records::event;
 use blackbox::sdk::TempProject;
 use blackbox::tool::Machine;
 use blackbox::{Vm, VmOptions};
@@ -116,6 +117,30 @@ fn after_going_back_a_deploy_applies_only_what_it_adds_to_the_latest_version() {
         db.column("SELECT body FROM notes ORDER BY id"),
         ["first", "second", "third"],
         "expected the rows of the seed once and the new one"
+    );
+    // No deploy read the list of Versions, only the one Version: every
+    // request to the API has a `request` record with its method and path.
+    let lists: Vec<Value> = vm
+        .records()
+        .into_iter()
+        .filter(|r| {
+            event(r) == "request"
+                && r["method"] == "GET"
+                && r["path"] == "/v1/applications/back-board/versions"
+        })
+        .collect();
+    assert_eq!(
+        lists,
+        Vec::<Value>::new(),
+        "expected no deploy to read the list of Versions"
+    );
+    assert!(
+        vm.records().iter().any(|r| event(r) == "request"
+            && r["method"] == "GET"
+            && r["path"]
+                .as_str()
+                .is_some_and(|p| p.starts_with("/v1/applications/back-board/versions/"))),
+        "expected a deploy to read the latest Version by itself (GET .../versions/<number>)"
     );
     assert_eq!(versions_of(&vm, "back-board"), (3, json!(3)));
 }
