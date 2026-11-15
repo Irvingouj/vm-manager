@@ -1,0 +1,12 @@
+{
+  "about": "The test Users of this project, their Groups and those Groups' Grants, for trying the Application on this machine. outsider is in no Group and so holds no Grant: try the Application as outsider before you call the work done.",
+  "users": [
+    {
+      "id": "outsider",
+      "displayName": "Outsider (no access)",
+      "email": "outsider@example.com",
+      "groups": []
+    }
+  ],
+  "grants": []
+}

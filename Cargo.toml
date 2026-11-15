@@ -45,7 +45,13 @@ pg_query = "18.1.0"
 postgres-protocol = "0.6"
 # How postgres-protocol hands over the fields of a message.
 fallible-iterator = "0.2"
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "sync", "macros", "time", "io-util"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "sync", "macros", "time", "io-util", "process"] }
+# Stopping a whole process group (`vm check` runs each of the project's
+# tools in a group of its own), behind a safe interface.
+rustix = { version = "1", default-features = false, features = ["std", "process"] }
+# The SDK's tarball that `vm new` writes, made by crates/vm/build.rs.
+tar = { version = "0.4", default-features = false }
+flate2 = "1"
 uuid = { version = "1", features = ["v4"] }
 
 # Lints are set here once; every crate of ours inherits them with

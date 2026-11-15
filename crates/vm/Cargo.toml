@@ -34,6 +34,12 @@ sha2.workspace = true
 tokio-postgres.workspace = true
 tokio.workspace = true
 uuid.workspace = true
+rustix.workspace = true
+
+[build-dependencies]
+flate2.workspace = true
+serde_json.workspace = true
+tar.workspace = true
 
 [dev-dependencies]
 # Only for the harness's private Postgres, which the platform database's own

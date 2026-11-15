@@ -24,7 +24,10 @@ use serde_json::json;
 
 use super::credential_file::Place;
 use super::theirs::Theirs;
-use super::{Done, Ending, Output, get_signed_in, read_kept, shaped, unexpected};
+use super::{
+    Done, Ending, Output, file_problem as project_file, get_signed_in, project_of, read_kept,
+    shaped, unexpected,
+};
 use crate::resources::is_resource_name;
 use crate::structure::FIRST_LINE as SCHEMA_FIRST_LINE;
 
@@ -42,7 +45,7 @@ pub struct PullArgs {
 }
 
 /// The first line of the generated link.
-const INDEX_FIRST_LINE: &str = "// Generated. Do not edit.";
+pub(super) const INDEX_FIRST_LINE: &str = "// Generated. Do not edit.";
 
 /// The largest generated file read to compare: above what a pull answers.
 const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
@@ -84,26 +87,7 @@ struct Generated {
 }
 
 pub(super) async fn pull(args: &PullArgs) -> Result<Done, Ending> {
-    let project = match &args.project {
-        Some(project) => project.clone(),
-        None => std::env::current_dir().map_err(|error| {
-            Ending::new(
-                1,
-                "project-file",
-                format!("the current directory cannot be read ({error}): run vm pull in your project, or give it with --project"),
-            )
-        })?,
-    };
-    if !project.join("manifest.ts").is_file() {
-        return Err(Ending::new(
-            1,
-            "not-a-project",
-            format!(
-                "{} is not a project: it has no manifest.ts. Run vm pull in your project's folder, or give it with --project; nothing was written",
-                project.display()
-            ),
-        ));
-    }
+    let project = project_of(args.project.as_deref(), "vm pull")?;
     let name = &args.resource;
     let folder = project.join("resources").join(name);
     let files = [
@@ -336,9 +320,5 @@ fn write_whole(path: &Path, content: &[u8]) -> io::Result<()> {
 }
 
 fn file_problem(what: &str, how: &str, error: &io::Error) -> Ending {
-    Ending::new(
-        1,
-        "project-file",
-        format!("{what} {how} ({error}): make it writable by you, then run vm pull again"),
-    )
+    project_file(what, how, error, "vm pull")
 }

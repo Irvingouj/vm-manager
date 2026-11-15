@@ -1,0 +1,4 @@
+node_modules/
+# The tool's own folder, but for the SDK's package, which is kept.
+.vm/*
+!.vm/packages/

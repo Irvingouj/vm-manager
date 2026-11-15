@@ -1,0 +1,14 @@
+{
+  "name": "{{name}}",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@vm/sdk": "file:.vm/packages/vm-sdk-{{sdk}}.tgz",
+    "drizzle-orm": "{{drizzle-orm}}"
+  },
+  "devDependencies": {
+    "drizzle-kit": "{{drizzle-kit}}",
+    "esbuild": "{{esbuild}}",
+    "typescript": "{{typescript}}"
+  }
+}

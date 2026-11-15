@@ -2,7 +2,8 @@
 //! agent (ADR 0006, ADR 0015; blackbox/CONTRACT.md, "The tool").
 //!
 //! `vm sign-in`, `vm sign-out`, `vm whoami`, `vm resources`, `vm
-//! applications` and `vm pull` ([`pull`]), each with `--json`. Each command is one short run on one
+//! applications`, `vm pull` ([`pull`]), `vm new` ([`new`]) and `vm check`
+//! ([`check`]), each with `--json`. Each command is one short run on one
 //! thread: a current-thread runtime, at most a few requests to the
 //! installation ([`client`]), the credential file ([`credential_file`]), and
 //! an [`Ending`] whose exit code says what kind of ending it was:
@@ -17,15 +18,22 @@
 //! handles whose errors are taken: a closed standard output or standard
 //! error ends the command, never with a panic.
 
+mod check;
+mod child;
 mod client;
 mod credential_file;
+mod new;
 mod pull;
+mod template;
 mod theirs;
 
+pub use check::CheckArgs;
+pub use new::NewArgs;
 pub use pull::PullArgs;
 
 use std::io::{self, Write};
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use hyper::{Method, StatusCode};
@@ -103,6 +111,8 @@ pub enum Command {
     Resources(Output),
     Applications(Output),
     Pull(PullArgs),
+    New(NewArgs),
+    Check(CheckArgs),
 }
 
 /// A message: the tool's own words, or the installation's (a refusal's
@@ -134,6 +144,9 @@ struct Ending {
     /// Only ever printed in JSON.
     reason: Value,
     message: Said,
+    /// What is printed instead of the error alone: with `--json` this
+    /// object (which holds the `error`), else these words.
+    detail: Option<Box<Done>>,
 }
 
 impl Ending {
@@ -142,6 +155,18 @@ impl Ending {
             code,
             reason: json!(reason),
             message: Said::Ours(message),
+            detail: None,
+        }
+    }
+
+    /// A check that found problems: `message` holds text of the project's
+    /// and the installation's, and `report` is what is printed.
+    fn check_failed(message: &str, report: Done) -> Self {
+        Self {
+            code: 1,
+            reason: json!("check-failed"),
+            message: Said::Theirs(Theirs::from(message)),
+            detail: Some(Box::new(report)),
         }
     }
 
@@ -161,6 +186,8 @@ pub fn run(command: Command) -> ExitCode {
     let json = match &command {
         Command::SignIn(args) => args.output.json,
         Command::Pull(args) => args.output.json,
+        Command::New(args) => args.output.json,
+        Command::Check(args) => args.output.json,
         Command::SignOut(o)
         | Command::Whoami(o)
         | Command::Resources(o)
@@ -179,6 +206,8 @@ pub fn run(command: Command) -> ExitCode {
                 Command::Resources(_) => resources().await,
                 Command::Applications(_) => applications().await,
                 Command::Pull(args) => pull::pull(&args).await,
+                Command::New(args) => new::new(&args),
+                Command::Check(args) => check::check(&args).await,
             }
         }),
         Err(error) => Err(Ending::new(
@@ -195,6 +224,18 @@ pub fn run(command: Command) -> ExitCode {
                 write_to(&mut io::stdout().lock(), &done.text)
             };
             (0, written)
+        }
+        Err(Ending {
+            code,
+            detail: Some(report),
+            ..
+        }) => {
+            let written = if json {
+                write_to(&mut io::stdout().lock(), &json_line(&report.json))
+            } else {
+                write_to(&mut io::stderr().lock(), &report.text)
+            };
+            (code, written)
         }
         Err(ending) => {
             let written = if json {
@@ -284,6 +325,41 @@ fn stand_in_value(text: &str) -> Result<String, String> {
         ));
     }
     Ok(text.to_owned())
+}
+
+/// The project of a command: `given`, or the current directory; one
+/// without `manifest.ts` is `not-a-project`.
+fn project_of(given: Option<&Path>, command: &str) -> Result<PathBuf, Ending> {
+    let project = match given {
+        Some(project) => project.to_path_buf(),
+        None => std::env::current_dir().map_err(|error| {
+            Ending::new(
+                1,
+                "project-file",
+                format!("the current directory cannot be read ({error}): run {command} in your project, or give it with --project"),
+            )
+        })?,
+    };
+    if !project.join("manifest.ts").is_file() {
+        return Err(Ending::new(
+            1,
+            "not-a-project",
+            format!(
+                "{} is not a project: it has no manifest.ts. Run {command} in your project's folder, or give it with --project; nothing was written",
+                Theirs::from(project.display().to_string().as_str())
+            ),
+        ));
+    }
+    Ok(project)
+}
+
+/// A file or folder of the project that cannot be read, written or made.
+fn file_problem(what: &str, how: &str, error: &io::Error, command: &str) -> Ending {
+    Ending::new(
+        1,
+        "project-file",
+        format!("{what} {how} ({error}): make it writable by you, then run {command} again"),
+    )
 }
 
 /// The installation of what is kept.
@@ -386,6 +462,7 @@ fn not_success(connect: SocketAddr, reply: &Reply) -> Ending {
                 code,
                 reason: json!(reason),
                 message: Said::Theirs(Theirs::from(message)),
+                detail: None,
             }
         }
         _ => unexpected(
