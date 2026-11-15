@@ -1258,7 +1258,7 @@ The project is `--project` or the current directory; one without `manifest.ts` i
 | `types` | the project type-checks (`tsc --noEmit` with the project's own `tsconfig.json` and TypeScript) | `type-error`, one problem per error, with `file`, `line`, `column` and the compiler's message; at most 50, and then one last problem of the same check and reason, with `"more": <how many more>` and no `file`, `line` or `column`, whose message says how many more |
 
 - A tool's own words in a message are its error, not its stack: no line of a stack trace, and no path of the check's own folder (a file of the copy of `migrations/` is named as the project's, `migrations/...`).
-- **Every problem's message names the fix**: for `manifest-not-literal`, what was found and that the Manifest must be a plain literal because the platform reads it without running code; for `resource-not-registered`, that no such Resource is registered, the names that are, and to correct the name or ask a Platform administrator; for `resource-not-pulled`, the command `vm pull <name>` (and, when a file is there that the tool did not write, which file, and that it is to be moved away first); for `migrations-behind`, that `src/db/schema.ts` changed since the last migration and how migrations are generated (the ticket on generating migrations gives the command; until then the message says to generate one with `drizzle-kit generate`); for `type-error`, the file and line (an error the compiler gives with no place, such as a `tsconfig.json` that is not there, is a `type-error` whose `file`, `line` and `column` are null).
+- **Every problem's message names the fix**: for `manifest-not-literal`, what was found and that the Manifest must be a plain literal because the platform reads it without running code; for `resource-not-registered`, that no such Resource is registered, the names that are, and to correct the name or ask a Platform administrator; for `resource-not-pulled`, the command `vm pull <name>` (and, when a file is there that the tool did not write, which file, and that it is to be moved away first); for `migrations-behind`, that `src/db/schema.ts` changed since the last migration and how migrations are generated (the command `vm generate`, of the section "Generating migrations"); for `type-error`, the file and line (an error the compiler gives with no place, such as a `tsconfig.json` that is not there, is a `type-error` whose `file`, `line` and `column` are null).
 - **A warning does not fail the check.** When the Builder's own Access level on a declared Resource is below the declared one (`structure` or none against `read`; `read` against `write`), the check warns: reason `own-grant-below-declared`, with `resource`, `declared`, `held` (`"structure"`, `"read"`, or `null` for no Grant) and `contact`; the message says that the Builder, and every User whose Groups hold no Grant at that level, will be refused that Resource's operations by the Application, and whom to ask.
 - **A note says what is worth knowing.** A Resource that is pulled (a folder `resources/<name>/` whose `schema.ts` begins with the first line `vm pull` gives it) and not declared in the Manifest is a note: reason `pulled-not-declared`, with `resource`; the message says to declare it or remove the folder.
 - With `--json`, standard output is one object: `{ "ok": <bool>, "problems": [ { "check", "reason", "message", ... } ], "warnings": [ { "reason", "message", ... } ], "notes": [ { "reason", "message", ... } ] }`, and when `ok` is false also `"error": { "reason": "check-failed", "message": "<how many problems, and the first>" }`, as every command that does not end with `0` has. Without `--json`, the problems, warnings and notes in words: on standard output when the check passes, on standard error when it fails. Text of the installation's and of the project's files is printed as the tool prints any text that is not its own.
@@ -1268,3 +1268,70 @@ The project is `--project` or the current directory; one without `manifest.ts` i
 - What the check needs to write, it writes in a folder of its own (mode `0700`) in the system's temporary folder (`TMPDIR`), the tools it runs included (that folder is their `TMPDIR`), and removes it in every ending: passed, failed, out of time, interrupted. This holds too for a project whose `tsconfig.json` has the compiler keep build information (`incremental`, `composite`): none is written in the project.
 - The check runs the project's own tools (`tsc`, `drizzle-kit`, the SDK's tooling), each found as Node resolves its package from the project and run with the `node` on the `PATH` (`typescript`'s `tsc` and `drizzle-kit` by the `bin` of their `package.json`; the SDK's `tooling/main.js`), and so whatever `src/db/schema.ts` imports: as the Builder, on the Builder's machine, like any build. It does not run `src/index.ts` or the Manifest, and it reads no `drizzle.config.*`: the schema is `src/db/schema.ts` and the migrations are in `migrations/`, always.
 - When the Manifest cannot be read, the `resources` check has nothing to go by and is left out; the other checks are still made.
+
+## Generating migrations (ticket: Generate migrations, stopping before data is lost)
+
+Nobody writes a migration by hand: the tool makes it from `src/db/schema.ts`, by running the project's `drizzle-kit` on the Builder's machine, and stops before one that destroys data.
+
+### The command
+
+```
+vm generate [--project <directory>] [--name <name>] [--allow-data-loss] [--empty] [--timeout <seconds>] [--json]
+```
+
+- The project, `node`, the packages, the end of the command (`--timeout`, 300 seconds without it, `check-timed-out` becoming `generate-timed-out`), an interruption, the folder of its own in `TMPDIR`, the process groups, and the way a tool's words are quoted are all as for `vm check`. It needs no sign-in and asks the installation nothing. What is looked at first, in order: the command line (`2`), the project (`not-a-project`), `node` (`node-missing`), the packages (`not-installed`; only `drizzle-kit` is needed).
+- It runs `drizzle-kit generate --dialect postgresql --schema src/db/schema.ts` against a copy of `migrations/` in its own folder, looks at what that wrote, and only then writes in the project. **Nothing is written in the project unless a migration is generated**: every other ending leaves every file and folder of the project as it was.
+- **A migration generated** is three files in `migrations/`: the migration `<name>.sql`, its snapshot `meta/<number>_snapshot.json`, and the journal `meta/_journal.json`, each written whole (a temporary file beside it, then renamed), the journal last. It prints, exit code `0`:
+
+  ```json
+  { "generated": { "name": "0001_add_notes", "file": "migrations/0001_add_notes.sql", "statements": 2, "destroys": [] },
+    "files": [ "migrations/0001_add_notes.sql", "migrations/meta/0001_snapshot.json", "migrations/meta/_journal.json" ] }
+  ```
+
+  `files` in the order of their paths. Without `--json`, the same in words, with the SQL's statements, and saying to read them and to commit the three files.
+- `--name <name>` gives the migration's name after its number (`0001_<name>`): 1 to 100 lower-case letters, digits and `_`; anything else is exit code `2`. Without it the name is `drizzle-kit`'s own.
+- **Nothing to generate**: when `src/db/schema.ts` has not changed since the last migration, exit code `0`, `{ "generated": null, "files": [] }`, and in words that the migrations are in step with the schema. Nothing is written.
+- After a migration is generated, `vm check` finds `migrations/` in step, and generating again generates nothing.
+- **The platform applies what it generates**: the migrations of `migrations/`, in the journal's order, each as `{ "name": "<its tag>", "sql": "<the file's text>" }`, are what a Version carries (section "Migrations travel with the Version").
+
+### A migration that destroys data
+
+A generated migration destroys data when one of its statements:
+
+| The statement | What is lost | In `destroys` |
+|---|---|---|
+| drops a table | the table's rows | `{ "what": "table", "table": "<schema.table>" }` |
+| drops a column | the column's values | `{ "what": "column", "table", "column" }` |
+| changes a column's type to one that is not wider | values that do not fit the new type are cut or the migration fails | `{ "what": "type", "table", "column", "from": "<type>", "to": "<type>" }` |
+| drops a schema | what was in it | `{ "what": "schema", "schema": "<name>" }` |
+
+- **Wider** is exactly: `smallint` to `integer` or `bigint`; `integer` to `bigint`; `real` to `double precision`; `varchar(n)` to `varchar(m)` with m ≥ n, to `varchar` without a length, or to `text`; `char(n)` to `text`; `numeric(p,s)` to `numeric(p2,s2)` with s2 ≥ s and p2 − s2 ≥ p − s, or to `numeric` without precision. Every other change of type counts as destroying: the tool does not guess. The old type is read from the last snapshot; a type it cannot find there counts as not wider.
+- **It stops**: exit code `3`, reason `data-loss`, nothing written. Beside `reason` and `message` the error has `"destroys": [ ... ]` (every one, in the order of the statements) and `"statements": [ "<each destroying statement>" ]`. The message names each thing that would be lost, says that deploying an older Version later does not bring it back, and says: ask the Builder, telling them exactly what would be lost, unless the Builder has already clearly said that this data may be lost; then run the command again with `--allow-data-loss`.
+- **With `--allow-data-loss`** the migration is generated as any other, exit code `0`, and `generated.destroys` lists what it destroys; in words it says what will be lost when the migration is applied.
+- `--allow-data-loss` on a migration that destroys nothing changes nothing.
+- The decision is made on the statements, read with the platform's own Postgres parser (the one that splits a migration), not on a pattern in the text: `DROP TABLE` inside a string or a comment is not a statement. A migration the parser cannot read stops the command with reason `migration-unparseable`, exit code `1`, nothing written.
+
+### A change `drizzle-kit` asks about
+
+When a table or a column disappears from `src/db/schema.ts` and another appears in the same place, `drizzle-kit` asks whether it was renamed, and without a terminal it writes nothing and still ends with `0`. The tool notices: exit code `1`, reason `rename-not-generated`, nothing written, and never a word that says a migration was generated. The message says that `drizzle-kit` cannot tell a rename from a removal and an addition, and gives the path that needs no question, one step at a time, each followed by `vm generate`:
+
+1. add the new column (or table) to `src/db/schema.ts`, keeping the old one: `vm generate`;
+2. copy the values: `vm generate --empty --name <name>` writes an empty migration; put the one statement that copies the values in it (`UPDATE ... SET <new> = <old>`);
+3. remove the old column (or table) from `src/db/schema.ts`: `vm generate`, which stops for the data that the old one holds, as above.
+
+### An empty migration
+
+`vm generate --empty [--name <name>]` writes a migration with no statement, for the Builder's own SQL (copying values, as above): the only migration ever edited by hand, and only until it is committed. It is generated only when the schema is in step with the migrations (otherwise reason `migrations-behind`, exit code `1`: generate the pending change first). Output as for a generated migration, with `"statements": 0`. What is written into it afterwards is not looked at by this command; the deploy looks at every migration it sends.
+
+### What stops it before `drizzle-kit` is asked
+
+As `vm check` reports them, here as the command's ending (exit code `1`, nothing written): `own-schema-failed` and `migrations-unreadable`, with the same messages.
+
+### The instruction file and the check
+
+From this ticket on, the template's `AGENTS.md` names `vm generate` in its table of commands and in its rules (where it said how to run `drizzle-kit` by hand), and `vm check`'s `migrations-behind` message gives the command `vm generate`.
+
+### What this does not close
+
+- A removed enum label, a tightened constraint (`NOT NULL`, a check, a unique) and a dropped default make a migration that may fail on the rows that are there; they lose nothing and are not stopped.
+- What a Builder writes into an empty migration is theirs; the deploy asks again about every migration that destroys data when a Version is already serving.
