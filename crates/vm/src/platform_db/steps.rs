@@ -275,6 +275,20 @@ pub const STEPS: &[Step] = &[
         CREATE INDEX tool_credentials_user ON tool_credentials (user_id, made);
     ",
     },
+    Step {
+        number: 10,
+        name: "pulls of a structure in the operation log",
+        sql: "
+        -- A pull of a Resource's structure (crate::structure; blackbox/
+        -- CONTRACT.md, \"Pulling a Resource's structure\") is no
+        -- Application's operation and sends no statement of its own: its
+        -- entry has `application`, `version` and `statement` null.
+        ALTER TABLE operation_log
+            ALTER COLUMN application DROP NOT NULL,
+            ALTER COLUMN version DROP NOT NULL,
+            ALTER COLUMN statement DROP NOT NULL;
+    ",
+    },
 ];
 
 /// The advisory lock every step's transaction takes first: "vm steps".

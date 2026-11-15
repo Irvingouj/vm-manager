@@ -19,8 +19,10 @@
 //! never prints, and stored as the [`sealed`] module writes them, the one
 //! place that knows the stored form (the ticket "Resources and Grants in
 //! full" encrypts it there). Each Resource holds a pool per login (crate::
-//! executor): its read pool, and its write pool when it was registered
-//! with a write login. A pool connects on first use.
+//! executor): its read pool, its write pool when it was registered with a
+//! write login, and its structure pool when it was registered with a
+//! structure login (the Structure puller's, crate::structure). A pool
+//! connects on first use.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -64,8 +66,8 @@ pub fn is_resource_name(name: &str) -> bool {
 }
 
 /// Where a Resource's database is and its logins, as the Platform
-/// administrator gave them: the read login, and optionally the write login.
-/// Never printed: its `Debug` shows nothing.
+/// administrator gave them: the read login, and optionally the write login
+/// and the structure login. Never printed: its `Debug` shows nothing.
 #[derive(Serialize, Deserialize)]
 pub struct Connection {
     host: String,
@@ -75,6 +77,10 @@ pub struct Connection {
     /// Absent in what was stored before write logins existed.
     #[serde(default)]
     write: Option<Login>,
+    /// The login the Structure puller prefers (blackbox/CONTRACT.md, "The
+    /// structure login"). Absent in what was stored before it existed.
+    #[serde(default)]
+    structure: Option<Login>,
 }
 
 /// A login to a shared database. Never printed: it has no `Debug` of its
@@ -104,6 +110,7 @@ impl Connection {
         database: String,
         read: Login,
         write: Option<Login>,
+        structure: Option<Login>,
     ) -> Self {
         Self {
             host,
@@ -111,11 +118,12 @@ impl Connection {
             database,
             read,
             write,
+            structure,
         }
     }
 
-    /// The pools of `resource`: the read login's, and the write login's if
-    /// there is one, each with `limits`.
+    /// The pools of `resource`: the read login's, and the write login's and
+    /// the structure login's if there are, each with `limits`.
     fn into_pools(self, resource: &str, limits: &executor::Limits) -> Pools {
         let target = |login: Login, host: String, database: String| {
             Target::new(
@@ -133,6 +141,12 @@ impl Connection {
             let source = Source::Resource(resource.to_owned());
             executor::Pool::new(source, Levels::Only(Level::Write), target, limits.clone())
         });
+        let structure = self.structure.map(|login| {
+            // Copied, as the write login's target is.
+            let target = target(login, self.host.clone(), self.database.clone());
+            let source = Source::Resource(resource.to_owned());
+            executor::Pool::new(source, Levels::Only(Level::Read), target, limits.clone())
+        });
         let read = target(self.read, self.host, self.database);
         Pools {
             read: executor::Pool::new(
@@ -142,6 +156,7 @@ impl Connection {
                 limits.clone(),
             ),
             write,
+            structure,
         }
     }
 }
@@ -152,6 +167,8 @@ impl Connection {
 struct Pools {
     read: executor::Pool,
     write: Option<executor::Pool>,
+    /// The structure login's, which reads in read-only transactions only.
+    structure: Option<executor::Pool>,
 }
 
 /// The stored form of a [`Connection`]: the one place that writes and reads
@@ -214,6 +231,13 @@ impl Resource {
     /// The pool of the write login, if the Resource has one.
     pub fn write_pool(&self) -> Option<&executor::Pool> {
         self.pools.write.as_ref()
+    }
+
+    /// The pool the Structure puller reads the catalogs with: the structure
+    /// login's when the Resource has one, else the read login's. Never the
+    /// write login's.
+    pub fn structure_pool(&self) -> &executor::Pool {
+        self.pools.structure.as_ref().unwrap_or(&self.pools.read)
     }
 
     /// Runs `decide` with the Grants on this Resource, as the Authorization
@@ -584,6 +608,10 @@ mod tests {
                 "secret_writer".into(),
                 "secret-write-password".into(),
             )),
+            Some(Login::new(
+                "secret_structure".into(),
+                "secret-structure-password".into(),
+            )),
         );
         assert_eq!(format!("{connection:?}"), "Connection(<hidden>)");
         let stored = sealed::seal(&connection).unwrap();
@@ -594,10 +622,15 @@ mod tests {
             opened.write.map(|w| w.role).as_deref(),
             Some("secret_writer")
         );
+        assert_eq!(
+            opened.structure.map(|s| s.role).as_deref(),
+            Some("secret_structure")
+        );
         assert!(sealed::open(b"not what was stored").is_none());
         // What was stored before write logins existed still opens.
         let older = br#"{"host":"h","port":1,"database":"d","read":{"role":"r","password":"p"}}"#;
         let opened = sealed::open(older).unwrap();
         assert!(opened.write.is_none());
+        assert!(opened.structure.is_none());
     }
 }

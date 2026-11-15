@@ -584,6 +584,59 @@ impl Held<'_> {
         }
     }
 
+    /// Begins a read-only transaction at `isolation` with nothing of the
+    /// host's in it: no label, no identity, only the `BEGIN` (the Structure
+    /// puller's, crate::structure, which is no operation of an
+    /// Application's and changes no setting but its own session's). A
+    /// checkout of
+    /// [`Level::Write`] is refused. A reused connection the server had
+    /// closed is replaced once by a new one; on a failure the connection is
+    /// given up.
+    pub async fn begin_unlabelled(&mut self, isolation: Option<Isolation>) -> Result<(), Failure> {
+        if self.level != Level::Read {
+            return Err(Failure::Unavailable);
+        }
+        let limit = self.pool.limits.statement;
+        let Some(connection) = self.connection.as_mut() else {
+            return Err(Failure::Unavailable);
+        };
+        self.begun = true;
+        let mut began = connection.begin_plain(Level::Read, isolation, limit).await;
+        if matches!(began, Err(Exchange::Stale)) && self.reused {
+            self.connection = None;
+            let mut fresh = self.pool.open().await.map_err(|()| Failure::Unavailable)?;
+            began = fresh.begin_plain(Level::Read, isolation, limit).await;
+            self.connection = Some(fresh);
+        }
+        self.reused = false;
+        began.map_err(|_| {
+            self.connection = None;
+            self.pool.report("a transaction could not be begun");
+            Failure::Unavailable
+        })
+    }
+
+    /// As [`Held::run`], every value as text, with no bound on the rows
+    /// but `max_bytes` on what the rows take as they arrive (counted as
+    /// [`Held::run`] counts them): past it the statement is stopped with
+    /// [`Limit::Bytes`] before more is held.
+    pub async fn run_bounded(
+        &mut self,
+        sql: &str,
+        params: &[Param],
+        cap: Instant,
+        max_bytes: usize,
+    ) -> Outcome {
+        // A copy of the pool's few numbers, with two of them changed.
+        let limits = Limits {
+            max_rows: usize::MAX,
+            max_bytes,
+            ..self.pool.limits.clone()
+        };
+        self.run_within(sql, params, Values::Text, cap, &limits)
+            .await
+    }
+
     /// Whether the transaction is still open on its connection.
     pub fn is_open(&self) -> bool {
         self.connection.is_some()
@@ -607,6 +660,20 @@ impl Held<'_> {
         values: Values,
         cap: Instant,
     ) -> Outcome {
+        let pool = self.pool;
+        self.run_within(sql, params, values, cap, &pool.limits)
+            .await
+    }
+
+    /// [`Held::run`] under `limits`.
+    async fn run_within(
+        &mut self,
+        sql: &str,
+        params: &[Param],
+        values: Values,
+        cap: Instant,
+        limits: &Limits,
+    ) -> Outcome {
         let Some(connection) = self.connection.as_mut() else {
             return unavailable();
         };
@@ -615,9 +682,7 @@ impl Held<'_> {
             params,
             values,
         };
-        let run = connection
-            .statement(&statement, &self.pool.limits, cap)
-            .await;
+        let run = connection.statement(&statement, limits, cap).await;
         if matches!(run.result, Err(Failure::Unavailable)) {
             self.pool
                 .report("the connection failed during a statement in a transaction");

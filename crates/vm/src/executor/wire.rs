@@ -568,6 +568,31 @@ impl Connection {
             .map_err(|_| Exchange::Failed)?
     }
 
+    /// Begins a transaction at `level` and `isolation` with nothing else in
+    /// it: the `BEGIN` alone, no label, within `limit`. Succeeds only when
+    /// it was answered without an error and the server is in the
+    /// transaction.
+    pub(super) async fn begin_plain(
+        &mut self,
+        level: Level,
+        isolation: Option<Isolation>,
+        limit: Duration,
+    ) -> Result<(), Exchange> {
+        let exchange = async {
+            let mut out = BytesMut::new();
+            encode_host(begin_of(level, isolation), &[], &mut out).map_err(|_| Exchange::Failed)?;
+            frontend::sync(&mut out);
+            self.send(&mut out).await.map_err(|_| Exchange::Stale)?;
+            match self.host_answer(false).await? {
+                b'T' => Ok(()),
+                _ => Err(Exchange::Failed),
+            }
+        };
+        timeout(limit, exchange)
+            .await
+            .map_err(|_| Exchange::Failed)?
+    }
+
     /// Reads the answer to statements of the host's own, up to the Sync:
     /// the transaction status, or `Failed` if any of them failed.
     async fn host_answer(&mut self, mut answered: bool) -> Result<u8, Exchange> {

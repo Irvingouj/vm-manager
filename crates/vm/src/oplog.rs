@@ -8,6 +8,10 @@
 //! that failed before its statement was sent ([`OperationLog::whole`] any
 //! whole entry, such as the host's own `rollback`); [`OperationLog::begin`] writes an allowed one's as `unfinished`
 //! before its statement is sent, and [`OperationLog::finish`] completes it.
+//! A pull of a Resource's structure (crate::structure), which is no
+//! Application's, has [`OperationLog::begin_structure`] and
+//! [`OperationLog::refused_structure`]: `application`, `version` and
+//! `statement` null.
 //! Each write has [`WRITE_TIMEOUT`]. [`OperationLog::newest`] reads.
 //!
 //! An entry holds no value from a statement, a parameter or a row: the
@@ -216,6 +220,58 @@ impl OperationLog {
         .await
     }
 
+    /// Writes the entry of an allowed pull of `resource`'s structure by
+    /// `user` in `request`, `unfinished`, before anything is sent to the
+    /// shared database, and answers its id. [`OperationLog::finish`]
+    /// completes it.
+    pub async fn begin_structure(
+        &self,
+        request: &str,
+        user: &str,
+        resource: &str,
+    ) -> Result<i64, DbError> {
+        self.write(async |client: &mut Client| {
+            let row = client
+                .query_one(
+                    "INSERT INTO operation_log (request, user_id, application, version, resource,
+                                                actor, own_database, operation, statement, outcome)
+                     VALUES ($1, $2, NULL, NULL, $3, 'user', false, 'structure', NULL,
+                             'unfinished')
+                     RETURNING id",
+                    &[&request, &user, &resource],
+                )
+                .await
+                .map_err(DbError::from)?;
+            row.try_get(0).map_err(DbError::from)
+        })
+        .await
+    }
+
+    /// Writes the whole entry of a refused pull of `resource`'s structure.
+    pub async fn refused_structure(
+        &self,
+        request: &str,
+        user: &str,
+        resource: &str,
+        reason: &str,
+    ) -> Result<(), DbError> {
+        self.write(async |client: &mut Client| {
+            client
+                .execute(
+                    "INSERT INTO operation_log (request, user_id, application, version, resource,
+                                                actor, own_database, operation, statement, outcome,
+                                                reason)
+                     VALUES ($1, $2, NULL, NULL, $3, 'user', false, 'structure', NULL,
+                             'refused', $4)",
+                    &[&request, &user, &resource, &reason],
+                )
+                .await
+                .map_err(DbError::from)?;
+            Ok(())
+        })
+        .await
+    }
+
     async fn write<T>(
         &self,
         operation: impl AsyncFnOnce(&mut Client) -> Result<T, DbError>,
@@ -256,13 +312,13 @@ impl OperationLog {
             entry.insert("time".into(), get::<String>(row, 1)?.into());
             entry.insert("request".into(), get::<Option<String>>(row, 2)?.into());
             entry.insert("user".into(), get::<Option<String>>(row, 3)?.into());
-            entry.insert("application".into(), get::<String>(row, 4)?.into());
-            entry.insert("version".into(), get::<i32>(row, 5)?.into());
+            entry.insert("application".into(), get::<Option<String>>(row, 4)?.into());
+            entry.insert("version".into(), get::<Option<i32>>(row, 5)?.into());
             entry.insert("resource".into(), get::<Option<String>>(row, 6)?.into());
             entry.insert("actor".into(), get::<String>(row, 14)?.into());
             entry.insert("own_database".into(), get::<bool>(row, 15)?.into());
             entry.insert("operation".into(), get::<String>(row, 7)?.into());
-            entry.insert("statement".into(), get::<String>(row, 8)?.into());
+            entry.insert("statement".into(), get::<Option<String>>(row, 8)?.into());
             entry.insert("outcome".into(), get::<String>(row, 9)?.into());
             entry.insert("reason".into(), get::<Option<String>>(row, 10)?.into());
             entry.insert("error".into(), get::<Option<String>>(row, 11)?.into());
