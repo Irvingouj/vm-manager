@@ -1055,8 +1055,8 @@ $f$;
 --   `vm.rewrite_before` reads the rows of those tables into
 --   `vm.rewrite_rows`;
 -- - after every statement, `vm.rewrites_seen()` says whether a watched
---   table has a new file node, or a watched partitioned table other
---   partitions; if so, `vm.rewrite_after` says which tables with history
+--   table has a new file node, or a watched partitioned table may have
+--   other partitions; if so, `vm.rewrite_after` says which tables with history
 --   were written anew (each the highest above the table written anew in
 --   its partition tree that had history when the migration began, by its
 --   name then), watching from then on the partitions made under them, and
@@ -1095,6 +1095,22 @@ $f$;
 -- next migration); `node`, its file node when last looked at (none for a
 -- partitioned table); `kids`, a partitioned table's partitions when last
 -- looked at (none for any other).
+--
+-- `vm.rewrite_mark`: one row, this transaction's count of rows written in
+-- `pg_inherits` (`vm.rewrite_inherits()`) when the watched partitioned
+-- tables' partitions were last noted. A table's partitions change only by
+-- a row of `pg_inherits` written, which this count, the transaction's own,
+-- counts at once, and which it keeps when a subtransaction is rolled back:
+-- it only grows within the transaction (part I of
+-- docs/research/change-history-out-of-reach.md, on 16, 17 and 18; it is
+-- written out to the statistics, and begins again, only between
+-- transactions). So after a statement whose count is the noted one, the
+-- partitions are as noted, and are not read. Counted only with
+-- `track_counts` on (a superuser's setting; on by default); with it off,
+-- the count is unknown and the partitions are read after every statement.
+CREATE UNLOGGED TABLE IF NOT EXISTS vm.rewrite_mark (
+    inherits bigint
+);
 CREATE UNLOGGED TABLE IF NOT EXISTS vm.rewrite_nodes (
     relid oid PRIMARY KEY,
     node oid,
@@ -1180,6 +1196,8 @@ BEGIN
       FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace ns ON ns.oid = c.relnamespace
      WHERE c.oid = r.relid
        AND (NOT r.history OR r.s <> ns.nspname::text OR r.n <> c.relname::text);
+    INSERT INTO vm.rewrite_mark (inherits)
+    SELECT vm.rewrite_inherits() WHERE NOT EXISTS (SELECT FROM vm.rewrite_mark);
     INSERT INTO vm.rewrite_nodes (relid, node, s, n, history, kids)
     SELECT c.oid, pg_catalog.pg_relation_filenode(c.oid), ns.nspname::text, c.relname::text, true,
            CASE WHEN c.relkind = 'p'
@@ -1196,24 +1214,45 @@ BEGIN
 END
 $f$;
 
+-- This transaction's count of rows written in `pg_inherits` (see
+-- `vm.rewrite_mark`), or none with `track_counts` off.
+CREATE OR REPLACE FUNCTION vm.rewrite_inherits() RETURNS bigint
+LANGUAGE sql VOLATILE SECURITY DEFINER PARALLEL UNSAFE
+SET search_path = pg_catalog, pg_temp
+AS $f$
+SELECT CASE WHEN pg_catalog.current_setting('track_counts')::boolean
+            THEN pg_catalog.pg_stat_get_xact_tuples_inserted('pg_catalog.pg_inherits'::pg_catalog.regclass)
+                 OPERATOR(pg_catalog.+) pg_catalog.pg_stat_get_xact_tuples_updated('pg_catalog.pg_inherits'::pg_catalog.regclass)
+                 OPERATOR(pg_catalog.+) pg_catalog.pg_stat_get_xact_tuples_deleted('pg_catalog.pg_inherits'::pg_catalog.regclass) END
+$f$;
+
 -- Whether a watched table has a new file node or is gone, or a watched
--- partitioned table has other partitions: asked after every statement.
--- Reads only `vm` and the catalog (the file node by
+-- partitioned table may have other partitions: asked after every
+-- statement. Reads only `vm` and the catalog (the file node by
 -- `pg_relation_filenode`, from Postgres's cache: no join of `pg_class`,
--- whose plan would be made on no statistics; the partitions by the index
--- of `pg_inherits`), writes nothing.
+-- whose plan would be made on no statistics), writes nothing. The
+-- partitions are compared only when the count of `vm.rewrite_mark` is
+-- unknown; otherwise a count other than the one noted says yes, and
+-- `vm.rewrite_after` finds out which partitions, if any, are new.
 CREATE OR REPLACE FUNCTION vm.rewrites_seen() RETURNS boolean
-LANGUAGE sql STABLE SECURITY DEFINER PARALLEL UNSAFE
+LANGUAGE sql VOLATILE SECURITY DEFINER PARALLEL UNSAFE
 SET search_path = pg_catalog, pg_temp
 AS $f$
 SELECT EXISTS (
-    SELECT FROM vm.rewrite_nodes r
-     WHERE CASE WHEN r.kids IS NULL
-                THEN pg_catalog.pg_relation_filenode(r.relid) IS DISTINCT FROM r.node
-                ELSE r.kids IS DISTINCT FROM ARRAY(
-                         SELECT i.inhrelid FROM pg_catalog.pg_inherits i
-                          WHERE i.inhparent OPERATOR(pg_catalog.=) r.relid
-                          ORDER BY i.inhrelid) END)
+           SELECT FROM vm.rewrite_nodes r
+            WHERE r.kids IS NULL
+              AND pg_catalog.pg_relation_filenode(r.relid) IS DISTINCT FROM r.node)
+    OR (SELECT CASE WHEN k.n IS NULL
+                    THEN EXISTS (
+                        SELECT FROM vm.rewrite_nodes r
+                         WHERE r.kids IS NOT NULL
+                           AND r.kids IS DISTINCT FROM ARRAY(
+                               SELECT i.inhrelid FROM pg_catalog.pg_inherits i
+                                WHERE i.inhparent OPERATOR(pg_catalog.=) r.relid
+                                ORDER BY i.inhrelid))
+                    ELSE NOT EXISTS (SELECT FROM vm.rewrite_mark m
+                                      WHERE m.inherits OPERATOR(pg_catalog.=) k.n) END
+          FROM (SELECT vm.rewrite_inherits() AS n) k)
 $f$;
 
 -- After a statement `vm.rewrites_seen()` said yes to: the tables with
@@ -1230,7 +1269,10 @@ $f$;
 -- another: part I of docs/research/change-history-out-of-reach.md; what
 -- else changes it, such as `SET UNLOGGED`, makes the table read when it
 -- need not be, never missed). The partitions found are watched from now
--- on, the new file nodes and partitions noted, the tables gone forgotten.
+-- on, the new file nodes and partitions noted, the tables gone forgotten;
+-- a row is written again only for a table whose file node or partitions
+-- changed, and only under a partitioned table whose partitions changed
+-- are partitions looked for.
 CREATE OR REPLACE FUNCTION vm.rewrite_after(p_token text)
 RETURNS TABLE (relid oid, s text, n text, read boolean)
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER PARALLEL UNSAFE
@@ -1253,10 +1295,18 @@ BEGIN
            AND pg_catalog.pg_relation_filenode(r.relid) IS DISTINCT FROM r.node
         RETURNING r.relid)
     SELECT coalesce(pg_catalog.array_agg(m.relid), '{}') INTO v_moved FROM moved m;
-    WITH RECURSIVE under (relid) AS (
-        SELECT i.inhrelid FROM vm.rewrite_nodes p
+    WITH RECURSIVE changed AS (
+        UPDATE vm.rewrite_nodes r SET kids = k.now
+          FROM (SELECT p.relid,
+                       ARRAY(SELECT i.inhrelid FROM pg_catalog.pg_inherits i
+                              WHERE i.inhparent = p.relid ORDER BY i.inhrelid) AS now
+                  FROM vm.rewrite_nodes p
+                 WHERE p.kids IS NOT NULL) k
+         WHERE r.relid = k.relid AND r.kids IS DISTINCT FROM k.now
+        RETURNING r.relid),
+    under (relid) AS (
+        SELECT i.inhrelid FROM changed p
           JOIN pg_catalog.pg_inherits i ON i.inhparent = p.relid
-         WHERE p.kids IS NOT NULL
         UNION
         SELECT i.inhrelid FROM under u JOIN pg_catalog.pg_inherits i ON i.inhparent = u.relid),
     made AS (
@@ -1273,10 +1323,8 @@ BEGIN
         RETURNING vm.rewrite_nodes.relid, vm.rewrite_nodes.node)
     SELECT coalesce(pg_catalog.array_agg(m.relid) FILTER (WHERE m.node <> m.relid), '{}')
       INTO v_made FROM made m;
-    UPDATE vm.rewrite_nodes r
-       SET kids = ARRAY(SELECT i.inhrelid FROM pg_catalog.pg_inherits i
-                         WHERE i.inhparent = r.relid ORDER BY i.inhrelid)
-     WHERE r.kids IS NOT NULL;
+    UPDATE vm.rewrite_mark m SET inherits = vm.rewrite_inherits()
+     WHERE m.inherits IS DISTINCT FROM vm.rewrite_inherits();
     FOREACH v_table IN ARRAY v_moved || v_made LOOP
         v_best := NULL;
         v_up := v_table;
@@ -1688,7 +1736,7 @@ $f$;
 -- What is left of a statement's readings gone (`TRUNCATE`: a reading may
 -- leave many rows, which `DELETE` would leave dead for the next to scan),
 -- only when there is something; with `p_end`, once all the migrations
--- have run, the watched tables too (`DELETE`: a few rows): nothing of the
+-- have run, the watched tables and the mark too (`DELETE`): nothing of the
 -- rewrites is left in `vm`.
 CREATE OR REPLACE FUNCTION vm.rewrite_done(p_token text, p_end boolean) RETURNS void
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER PARALLEL UNSAFE
@@ -1701,6 +1749,7 @@ BEGIN
     END IF;
     IF p_end THEN
         DELETE FROM vm.rewrite_nodes;
+        DELETE FROM vm.rewrite_mark;
     END IF;
 END
 $f$;
