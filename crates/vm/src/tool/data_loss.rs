@@ -359,16 +359,13 @@ struct SnapshotTable {
 /// `wanted`; a column it does not have, or a snapshot it cannot read, gives
 /// none. A column whose type is the project's own (with a `typeSchema`) is
 /// given as no type.
-pub(super) fn snapshot_types(
+pub(super) fn snapshot_types<'w>(
     bytes: &[u8],
-    wanted: &BTreeSet<ColumnKey>,
+    wanted: impl IntoIterator<Item = (&'w str, &'w str, &'w str)>,
 ) -> BTreeMap<ColumnKey, String> {
     let mut by_table: Wanted<'_> = BTreeMap::new();
     for (schema, table, column) in wanted {
-        by_table
-            .entry((schema.as_str(), table.as_str()))
-            .or_default()
-            .insert(column.as_str());
+        by_table.entry((schema, table)).or_default().insert(column);
     }
     let mut types = BTreeMap::new();
     let mut reader = serde_json::Deserializer::from_slice(bytes);
@@ -768,6 +765,12 @@ mod tests {
         );
     }
 
+    fn borrowed(wanted: &BTreeSet<ColumnKey>) -> impl Iterator<Item = (&str, &str, &str)> {
+        wanted
+            .iter()
+            .map(|(s, t, c)| (s.as_str(), t.as_str(), c.as_str()))
+    }
+
     fn key(table: &str, column: &str) -> ColumnKey {
         ("public".into(), table.into(), column.into())
     }
@@ -789,7 +792,7 @@ mod tests {
             ("archive".into(), "old".into(), "v".into()),
         ]
         .into();
-        let types = snapshot_types(snapshot, &wanted);
+        let types = snapshot_types(snapshot, borrowed(&wanted));
         assert_eq!(
             types,
             [
@@ -801,8 +804,8 @@ mod tests {
             ]
             .into()
         );
-        assert!(snapshot_types(b"{ not json", &wanted).is_empty());
-        assert!(snapshot_types(b"[]", &wanted).is_empty());
+        assert!(snapshot_types(b"{ not json", borrowed(&wanted)).is_empty());
+        assert!(snapshot_types(b"[]", borrowed(&wanted)).is_empty());
     }
 
     #[test]

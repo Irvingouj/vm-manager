@@ -67,7 +67,7 @@ use serde_json::{Map, Value, json};
 
 use super::child::{Kept, Lines, Sink};
 use super::credential_file::Place;
-use super::drizzle::{self, BRING_BACK, Outcome};
+use super::drizzle::{self, Outcome};
 use super::project_tools::{
     Bounded, Cx, DEFAULT_TIMEOUT, Scratch, Signals, TEXT_BYTES, Who, ended, node_is_there,
     own_folder_failed, tool_failed,
@@ -566,10 +566,6 @@ fn pulled(project: &Path, name: &str, found: &mut Found) {
         "message": format!("manifest.ts declares {name}, and it is not pulled: {}. To pull it, {fix}, then run vm check again", wrong.join("; ")),
     }));
 }
-/// The fix said with every `migrations-unreadable` of the check.
-const BRING_BACK_THEN: &str =
-    "then generate the migrations the schema needs with drizzle-kit and run vm check again";
-
 /// The `migrations` check: `drizzle-kit generate` against a copy of
 /// `migrations/` in the check's own folder, and the copy read by the check
 /// itself ([`drizzle::generate`], which says how it is decided).
@@ -578,10 +574,10 @@ async fn migrations(cx: &Cx<'_>, packages: &Packages, found: &mut Found) -> Resu
     let outcome = drizzle::generate(cx, &packages.drizzle_kit, &[], &WHO).await?;
     let behind = |message: &str| json!({ "check": "migrations", "reason": "migrations-behind", "message": message });
     match outcome {
-        Outcome::Unreadable(what) => found.problems.push(json!({
+        Outcome::Unreadable { what, stray } => found.problems.push(json!({
             "check": "migrations",
             "reason": "migrations-unreadable",
-            "message": format!("{what}. {BRING_BACK}, {BRING_BACK_THEN}"),
+            "message": drizzle::unreadable_message(&what, stray, &WHO),
         })),
         Outcome::Written(_) => found.problems.push(behind(
             "src/db/schema.ts changed since the last migration in migrations/: generating migrations now would write one. Generate it with `vm generate`, which writes it into migrations/ and stops before one that destroys data (then ask the Builder, as it says), read the SQL it wrote, then run vm check again",

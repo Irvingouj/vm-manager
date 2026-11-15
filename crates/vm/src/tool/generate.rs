@@ -27,14 +27,20 @@
 //! renamed over). This is after the time and outside the signals' reach
 //! (their handlers stay in place, so a signal then ends nothing), and has
 //! no wait in it: the three writes are not cut off half way by the
-//! command. What only a crash or `SIGKILL` between two of them can leave:
+//! command. All three or none: when one cannot be written, the files
+//! written before it (new files: the journal, which replaces the old one,
+//! is last) and the folders made for it, when empty, are removed again
+//! ([`Undo`]), and only what could not be removed is named as left. What
+//! only a crash or `SIGKILL` between two of them can leave:
 //! the `.sql` file alone, or with its snapshot, which the journal does not
 //! name (`vm check` and `vm generate` then say `migrations-unreadable`,
 //! naming it), and at most one temporary file `.<name>.vm-generate`,
 //! which no command reads and the next write of that file removes.
 //!
 //! The tool writes inside the project only: when `migrations/` or
-//! `migrations/meta/` is a symbolic link, nothing is written.
+//! `migrations/meta/` is a symbolic link, it is `not-a-project`, found out
+//! before `drizzle-kit` runs, and nothing is written (looked at again when
+//! writing).
 //!
 //! **Blocking work.** As for `vm check`: the copying, the reading and the
 //! writing of the project's files, and the parsing of the generated
@@ -51,8 +57,8 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
-use super::data_loss::{self, ColumnKey, Destroyed, Found};
-use super::drizzle::{self, BRING_BACK, Journal, Outcome};
+use super::data_loss::{self, Destroyed, Found};
+use super::drizzle::{self, Journal, Outcome};
 use super::project_tools::{
     Bounded, Cx, DEFAULT_TIMEOUT, Scratch, Signals, Who, drizzle_kit, node_is_there,
     own_folder_failed,
@@ -229,6 +235,13 @@ async fn decided(
     stage.set(Stage::Packages);
     let kit = drizzle_kit(project, &WHO)?;
     stage.set(Stage::Copying);
+    // Found out before drizzle-kit runs: a link would be written through.
+    for (path, shown) in [
+        (project.join("migrations"), "migrations/"),
+        (project.join("migrations").join("meta"), "migrations/meta/"),
+    ] {
+        no_link(&path, shown)?;
+    }
     drizzle::copy_migrations(&cx, &WHO)?;
 
     let mut extra: Vec<&OsStr> = Vec::new();
@@ -269,10 +282,13 @@ async fn decided(
 /// The ending of what stops the command before a migration is generated.
 fn stopped(outcome: Outcome) -> Ending {
     match outcome {
-        Outcome::Unreadable(what) => Ending::new(
+        Outcome::Unreadable { what, stray } => Ending::new(
             1,
             "migrations-unreadable",
-            format!("{what}. {BRING_BACK}, then run vm generate again; nothing was written"),
+            format!(
+                "{}; nothing was written",
+                drizzle::unreadable_message(&what, stray, &WHO)
+            ),
         ),
         Outcome::SchemaFailed(how) => {
             Ending::new(1, "own-schema-failed", drizzle::schema_failed(&how, &WHO))
@@ -379,7 +395,7 @@ fn read_generated(cx: &Cx<'_>, file: &str, allow_data_loss: bool) -> Result<Migr
         })
     })?;
     let found = data_loss::found(text, &statements);
-    let wanted: std::collections::BTreeSet<ColumnKey> = found
+    let wanted: Vec<(&str, &str, &str)> = found
         .iter()
         .filter_map(|(_, f)| match f {
             Found::Type {
@@ -387,7 +403,7 @@ fn read_generated(cx: &Cx<'_>, file: &str, allow_data_loss: bool) -> Result<Migr
                 table,
                 column,
                 ..
-            } => Some((schema.clone(), table.clone(), column.clone())),
+            } => Some((schema.as_str(), table.as_str(), column.as_str())),
             _ => None,
         })
         .collect();
@@ -399,7 +415,7 @@ fn read_generated(cx: &Cx<'_>, file: &str, allow_data_loss: bool) -> Result<Migr
         )
         .ok()
         .flatten()
-        .map(|bytes| data_loss::snapshot_types(&bytes, &wanted))
+        .map(|bytes| data_loss::snapshot_types(&bytes, wanted.iter().copied()))
         .unwrap_or_default(),
         _ => Default::default(),
     };
@@ -487,16 +503,9 @@ fn push_statement(text: &mut String, statement: &str) {
     }
 }
 
-/// That `path` of the project (shown as `shown`) is no symbolic link, and a
-/// folder (made when it is not there).
-fn own_folder(path: &Path, shown: &str) -> Result<(), Ending> {
-    let problem = |how: &str| {
-        Ending::new(
-            1,
-            "project-file",
-            format!("{shown} {how}: vm generate writes the migration there; nothing was written"),
-        )
-    };
+/// That `path` of the project (shown as `shown`) is no symbolic link (one
+/// that is not there is none).
+fn no_link(path: &Path, shown: &str) -> Result<(), Ending> {
     match fs::symlink_metadata(path) {
         Ok(meta) if meta.file_type().is_symlink() => Err(Ending::new(
             1,
@@ -505,22 +514,94 @@ fn own_folder(path: &Path, shown: &str) -> Result<(), Ending> {
                 "{shown} is a symbolic link: vm generate writes inside the project only. Replace it with a folder of the project's own, then run vm generate again; nothing was written"
             ),
         )),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(project_file(&format!("{shown} cannot be read ({error})"))),
+    }
+}
+
+fn project_file(what: &str) -> Ending {
+    Ending::new(
+        1,
+        "project-file",
+        format!(
+            "{what}; nothing was written. Make migrations/ readable and writable by you, then run vm generate again"
+        ),
+    )
+}
+
+/// What [`write`] did in the project, undone in reverse when a later step
+/// fails: the folders it made and the files it wrote. Each written file is
+/// a new one (the migration, its snapshot), so removing it is the project
+/// as it was; the journal, which replaces the old one, is written last.
+#[derive(Default)]
+struct Undo<'a> {
+    made: Vec<(&'a Path, &'a str)>,
+    written: Vec<(&'a Path, &'a str)>,
+}
+
+impl<'a> Undo<'a> {
+    /// Undoes it all; what could not be undone, by its path in the project.
+    fn undo(self) -> Vec<&'a str> {
+        let mut left = Vec::new();
+        for (path, shown) in self.written.into_iter().rev() {
+            if fs::remove_file(path).is_err() {
+                left.push(shown);
+            }
+        }
+        // A folder made here is removed only when nothing is in it.
+        for (path, shown) in self.made.into_iter().rev() {
+            if fs::remove_dir(path).is_err() {
+                left.push(shown);
+            }
+        }
+        left
+    }
+}
+
+/// Why [`write`] stopped: what, and whether it is a link (`not-a-project`)
+/// rather than a file problem (`project-file`).
+struct Stop {
+    what: String,
+    link: bool,
+}
+
+impl Stop {
+    fn file(what: String) -> Self {
+        Self { what, link: false }
+    }
+}
+
+/// That `path` of the project is a folder, and no link: made when it is
+/// not there (and then recorded in `done`).
+fn folder<'a>(path: &'a Path, shown: &'a str, done: &mut Undo<'a>) -> Result<(), Stop> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => Err(Stop {
+            what: format!(
+                "{shown} became a symbolic link while vm generate ran: it writes inside the project only"
+            ),
+            link: true,
+        }),
         Ok(meta) if meta.is_dir() => Ok(()),
-        Ok(_) => Err(problem("is not a folder")),
-        Err(error) if error.kind() == ErrorKind::NotFound => DirBuilder::new()
-            .create(path)
-            .map_err(|error| problem(&format!("cannot be made ({error})"))),
-        Err(error) => Err(problem(&format!("cannot be read ({error})"))),
+        Ok(_) => Err(Stop::file(format!("{shown} is not a folder"))),
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            DirBuilder::new()
+                .create(path)
+                .map_err(|error| Stop::file(format!("{shown} cannot be made ({error})")))?;
+            done.made.push((path, shown));
+            Ok(())
+        }
+        Err(error) => Err(Stop::file(format!("{shown} cannot be read ({error})"))),
     }
 }
 
 /// Writes the migration's three files into `migrations/`, each whole, the
-/// journal last; the files, by path, in the order of their paths.
+/// journal last: all three or none. When a step fails, what was done
+/// before it is undone, and the message says whether anything is left.
+/// The files, by path, in the order of their paths.
 fn write(project: &Path, migration: &Migration) -> Result<Vec<String>, Ending> {
     let migrations = project.join("migrations");
     let meta = migrations.join("meta");
-    own_folder(&migrations, "migrations/")?;
-    own_folder(&meta, "migrations/meta/")?;
     let files = [
         (
             format!("migrations/{}.sql", migration.tag),
@@ -538,26 +619,42 @@ fn write(project: &Path, migration: &Migration) -> Result<Vec<String>, Ending> {
             &migration.journal,
         ),
     ];
-    let mut written: Vec<&str> = Vec::new();
-    for (shown, path, content) in &files {
-        write_whole(path, content, "vm-generate").map_err(|error| {
-            let before = if written.is_empty() {
-                "nothing was written".to_owned()
-            } else {
-                format!(
-                    "{} were written before it and are left: bring migrations/ back as it was last committed (git checkout -- migrations, and remove those files)",
-                    written.join(" and ")
-                )
-            };
-            Ending::new(
-                1,
-                "project-file",
-                format!(
-                    "{shown} cannot be written ({error}); {before}. Make migrations/ writable by you, then run vm generate again"
-                ),
+    let mut done = Undo::default();
+    let mut steps = || -> Result<(), Stop> {
+        folder(&migrations, "migrations/", &mut done)?;
+        folder(&meta, "migrations/meta/", &mut done)?;
+        for (shown, path, content) in &files {
+            write_whole(path, content, "vm-generate")
+                .map_err(|error| Stop::file(format!("{shown} cannot be written ({error})")))?;
+            done.written.push((path, shown));
+        }
+        Ok(())
+    };
+    if let Err(Stop { what, link }) = steps() {
+        let left = done.undo();
+        let after = if left.is_empty() {
+            "nothing was left: what was written before it was removed again".to_owned()
+        } else {
+            format!(
+                "these were written or made and could not be removed again, and are left: {}; remove them",
+                left.join(", ")
             )
-        })?;
-        written.push(shown);
+        };
+        let fix = if link {
+            "replace it with a folder of the project's own, then run vm generate again"
+        } else {
+            "make migrations/ writable by you, then run vm generate again"
+        };
+        let reason = if link {
+            "not-a-project"
+        } else {
+            "project-file"
+        };
+        return Err(Ending::new(
+            1,
+            reason,
+            format!("{what}; {after}. To fix it, {fix}"),
+        ));
     }
     let mut shown: Vec<String> = files.into_iter().map(|(shown, _, _)| shown).collect();
     shown.sort();

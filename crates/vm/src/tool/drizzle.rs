@@ -43,9 +43,29 @@ pub(super) const MAX_JOURNAL_BYTES: u64 = 4 * 1024 * 1024;
 /// message.
 const MAX_NAMED: usize = 10;
 
-/// The beginning of the fix said with every `migrations-unreadable`; each
-/// command ends it with what to run then.
-pub(super) const BRING_BACK: &str = "Migrations are never edited by hand: bring migrations/ back as it was last committed (git checkout -- migrations, or git restore migrations)";
+/// The message of `migrations-unreadable`, the same from `vm check` and
+/// `vm generate`: what is wrong (`what`, named as the project's), and the
+/// fix: bring the folder back as it was last committed, remove a `.sql`
+/// file the journal does not name if it was never committed (when there is
+/// one: `stray`), then `vm generate` for the migrations the schema needs.
+pub(super) fn unreadable_message(what: &str, stray: bool, who: &Who) -> String {
+    let stray = if stray {
+        "; a .sql file the journal does not name is not removed by that if it was never committed (git does not know it): remove it yourself"
+    } else {
+        ""
+    };
+    let then = if who.command == "vm generate" {
+        "then run `vm generate` again for the migrations the schema then needs".to_owned()
+    } else {
+        format!(
+            "then generate the migrations the schema then needs with `vm generate` and run {} again",
+            who.command
+        )
+    };
+    format!(
+        "{what}. Migrations are never edited by hand: bring migrations/ back as it was last committed (git checkout -- migrations, or git restore migrations){stray}; {then}"
+    )
+}
 
 /// How much of `migrations/` is left to copy.
 struct Budget {
@@ -129,6 +149,8 @@ pub(super) fn sql_files(dir: &Path) -> BTreeSet<String> {
 struct Unreadable {
     file: String,
     why: String,
+    /// Whether a `.sql` file is there that the journal does not name.
+    stray: bool,
 }
 
 /// The journal `drizzle-kit` keeps: the migrations, in order, by tag.
@@ -170,6 +192,7 @@ fn read_migrations(copy: &Path, sql: &BTreeSet<String>) -> Result<(), Unreadable
                 Some(first) => Err(Unreadable {
                     file: journal_file,
                     why: format!("is not there, and migrations/{first} is"),
+                    stray: true,
                 }),
             };
         }
@@ -177,6 +200,7 @@ fn read_migrations(copy: &Path, sql: &BTreeSet<String>) -> Result<(), Unreadable
             return Err(Unreadable {
                 file: journal_file,
                 why: format!("cannot be read ({error})"),
+                stray: false,
             });
         }
     };
@@ -184,14 +208,17 @@ fn read_migrations(copy: &Path, sql: &BTreeSet<String>) -> Result<(), Unreadable
         .map_err(|error| Unreadable {
             file: journal_file.clone(),
             why: format!("cannot be read ({error})"),
+            stray: false,
         })?
         .ok_or_else(|| Unreadable {
             file: journal_file.clone(),
             why: format!("is larger than {} MiB", MAX_JOURNAL_BYTES / (1024 * 1024)),
+            stray: false,
         })?;
     let journal: Journal = serde_json::from_slice(&text).map_err(|error| Unreadable {
         file: journal_file.clone(),
         why: format!("is not the journal drizzle-kit writes ({error})"),
+        stray: false,
     })?;
 
     // Every snapshot, without keeping it: the copy is bounded already.
@@ -210,11 +237,13 @@ fn read_migrations(copy: &Path, sql: &BTreeSet<String>) -> Result<(), Unreadable
         let opened = File::open(copy.join("meta").join(&name)).map_err(|error| Unreadable {
             file: file.clone(),
             why: format!("cannot be read ({error})"),
+            stray: false,
         })?;
         serde_json::from_reader::<_, serde::de::IgnoredAny>(io::BufReader::new(opened)).map_err(
             |error| Unreadable {
                 file,
                 why: format!("is not a snapshot drizzle-kit writes ({error})"),
+                stray: false,
             },
         )?;
     }
@@ -224,6 +253,7 @@ fn read_migrations(copy: &Path, sql: &BTreeSet<String>) -> Result<(), Unreadable
         .into_iter()
         .map(|e| format!("{}.sql", e.tag))
         .collect();
+    let stray = sql.difference(&tags).next().is_some();
     let mut wrong = Vec::new();
     for gone in tags.difference(sql) {
         wrong.push(format!(
@@ -247,14 +277,16 @@ fn read_migrations(copy: &Path, sql: &BTreeSet<String>) -> Result<(), Unreadable
     Err(Unreadable {
         file: "migrations/".to_owned(),
         why: format!("does not agree with its journal: {why}"),
+        stray,
     })
 }
 
 /// What `drizzle-kit generate` did with the copy of `migrations/`.
 pub(super) enum Outcome {
     /// `migrations/` cannot be read: what is wrong, named as the project's
-    /// (the message's beginning, before [`BRING_BACK`]).
-    Unreadable(String),
+    /// (the message's beginning: see [`unreadable_message`]), and whether a
+    /// `.sql` file is there that the journal does not name.
+    Unreadable { what: String, stray: bool },
     /// It wrote these `.sql` files (by name), which were not there before.
     Written(BTreeSet<String>),
     /// Nothing to generate: the schema is in step with the migrations.
@@ -320,12 +352,12 @@ pub(super) async fn generate(
             .starts_with("Error: Interactive prompts require a TTY")
     });
     let tool_said = cx.words(&err_text, &out_text);
-    Ok(if let Err(Unreadable { file, why }) = read {
+    Ok(if let Err(Unreadable { file, why, stray }) = read {
         let mut what = format!("{file} {why}");
         if written.is_empty() && !in_step && !asked && !tool_said.is_empty() {
             what.push_str(&format!("; drizzle-kit says: {tool_said}"));
         }
-        Outcome::Unreadable(what)
+        Outcome::Unreadable { what, stray }
     } else if !written.is_empty() {
         Outcome::Written(written)
     } else if in_step {
@@ -333,10 +365,13 @@ pub(super) async fn generate(
     } else if asked {
         Outcome::Asked
     } else if cx.names_the_copy(&err_text) || cx.names_the_copy(&out_text) {
-        Outcome::Unreadable(format!(
-            "drizzle-kit cannot read migrations/ (it {}: {tool_said})",
-            ended(ran.status)
-        ))
+        Outcome::Unreadable {
+            what: format!(
+                "drizzle-kit cannot read migrations/ (it {}: {tool_said})",
+                ended(ran.status)
+            ),
+            stray: false,
+        }
     } else {
         Outcome::SchemaFailed(format!("it {}: {tool_said}", ended(ran.status)))
     })
