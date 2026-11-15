@@ -1336,3 +1336,71 @@ From this ticket on, the template's `AGENTS.md` names `vm generate` in its table
 
 - A removed enum label, a tightened constraint (`NOT NULL`, a check, a unique) and a dropped default make a migration that may fail on the rows that are there; they lose nothing and are not stopped.
 - What a Builder writes into an empty migration is theirs; the deploy asks again about every migration that destroys data when a Version is already serving.
+
+## Deploying (ticket: Deploy: a Version built on the Contributor's machine goes live)
+
+One explicit command that never waits for an approval (ADR 0009, ADR 0016). The Version is built on the Contributor's machine and sent whole; the platform creates the Application at its first deploy, applies the migrations, and switches the address.
+
+### On the platform's API
+
+- `POST /v1/applications/<name>/versions` takes one more field, optional: `"structures": { "<resource>": "sha256:<64 hex>" }`, the fingerprint of each shared structure the Version was built against. Every key must be a Resource the Version declares and every value a fingerprint in that form; otherwise `400 malformed`. Left out, it is an empty object. The Version's record gains `"structures"`, as sent, for ever.
+- Nothing else of the API changes: the tool creates the Application with `POST /v1/applications` when there is none of the Manifest's name, with the Manifest's `description`.
+
+### The command
+
+```
+vm deploy [--project <directory>] [--allow-data-loss] [--timeout <seconds>] [--json]
+```
+
+The project, `node`, the packages, the folder of its own in `TMPDIR`, the process groups, an interruption and the way a tool's words are quoted are as for `vm check`. `--timeout` (300 seconds without it; `deploy-timed-out`) holds everything the command does on the machine; sending the Version has its own end, below. What is looked at, in this order, each ending the command when it does not hold:
+
+1. The command line (`2`), the project (`not-a-project`), the sign-in (`4`).
+2. **Git.** `git` on the `PATH` (`git-missing`); the project is inside a Git repository with at least one commit (`not-a-repository`); and **nothing of the project's folder is uncommitted**: no file changed, staged, removed or untracked (ignored files do not count), else reason `uncommitted-changes`, exit code `1`, with `"files": [ "<path relative to the project>", ... ]` (at most 50, and `"more": <n>` when there are more), and a message that says to commit them and deploy again. The Version's commit is the repository's `HEAD`.
+3. `node` and the packages, as for `vm check`.
+4. **The Application.** When the installation has an Application of the Manifest's name and the User is not a Contributor of it: exit code `3`, reason `not-a-contributor`; the message names its Contributors and says to ask one of them, or to choose another `name` in `manifest.ts`. Nothing is built or sent. When it has none, the deploy will create it.
+5. **Each declared Resource is pulled again**, as `vm pull` does. A structure that has changed since it was pulled is written into `resources/<name>/` (the only files a deploy changes in the project). A Resource the User holds no Grant on cannot be pulled, and neither can one whose shared database does not answer (`structure-unavailable`): the pulled definition in the project is used as it is, with the fingerprint its second line gives, and the deploy warns (below). A declared Resource that is not registered, or not pulled, is left to the checks.
+6. **The checks of `vm check`**, on the project as it now is: `manifest`, `resources`, `migrations`, `types`. A problem ends the deploy exactly as it ends the check: exit code `1`, reason `check-failed`, the same report. So a changed structure fails the deploy only when the code no longer type-checks against it; the files stay updated, and the message of the failed deploy says which Resources' structure changed.
+7. **Data loss.** When a Version is already serving and a migration this Version adds destroys data (as "Generating migrations" decides it, and besides: a `TRUNCATE` or a `DELETE`, which only a migration written by hand has; `{ "what": "rows", "table" }`): exit code `3`, reason `data-loss`, with `migration` beside `destroys` and `statements` for each such migration, unless `--allow-data-loss` is given. The message is the one of `vm generate`, and says this is asked again at deploy because the rows are there now. With no Version serving, nothing is asked: there are no rows.
+8. The migrations the serving Version has must be the beginning of the project's (same names, same text): else reason `migrations-diverged`, exit code `1`, saying which migration differs and to bring `migrations/` in line with the repository's history (another Contributor's migrations may not be pulled yet).
+
+Then the Application is bundled with the SDK's tooling (a project that does not build: reason `build-failed`, exit code `1`, with the tooling's `errors`), the Application is created when there is none, and the Version is sent: the bundle, the Declared access of the Manifest, the migrations of `migrations/` in the journal's order, the commit, and the fingerprints.
+
+### What it prints
+
+Exit code `0`:
+
+```json
+{ "application": "incident-board", "address": "incident-board.<domain>", "version": 3,
+  "created": false, "git_commit": "<40 hex>",
+  "migrations_applied": [ "0002_add_notes" ],
+  "structures": { "devops": "sha256:..." },
+  "pulled": [ { "resource": "devops", "changed": true, "files": [ "resources/devops/schema.ts" ] } ],
+  "visible_to": { "contributors": [ "<user id>", ... ] },
+  "warnings": [ ... ], "notes": [ ... ] }
+```
+
+- `created` is true when this deploy created the Application. `migrations_applied` are those this Version added. `pulled` has every declared Resource, by name; `files` are the ones the deploy changed.
+- **Who can see it**: `visible_to.contributors` are the Application's Contributors, by user id, as the installation answers them. In words: that the Application is live at its address as Version n, and that it is visible to its Contributors only, each by name, and to nobody else until it is shared. The words never say more than that (no Group, no "your team").
+- When a structure changed: the words (and a note, reason `structure-updated`, with `resource` and `files`) say that the pulled definition was updated, that the Version was built against the new structure, and to commit those files.
+- **Warnings and notes** are the check's (`own-grant-below-declared`, `pulled-not-declared`); the deploy goes on. For a declared Resource the User holds no Grant on, the warning also says its structure could not be pulled again and the definition in the project was used. For one whose shared database did not answer, the warning is reason `structure-not-pulled`, with `resource`, and says the same.
+
+### What the installation may answer
+
+- `migration-failed` (`422`): exit code `1`, the reason, and beside it `migration`, `code` and `database_message` as the API gave them; the message has the database's error and says the previous Version goes on serving and nothing was changed.
+- `migration-refused` (`422`): exit code `1`, with `rule` and `migration`.
+- `not-a-contributor` (`403`, when the User stopped being one meanwhile), `migrations-diverged` (`409`), `too-large` (`413`: the bundle and the migrations together are over 16 MiB): the API's reason and message, exit code `3` for the first and `1` for the others.
+- Sending a Version waits up to 120 seconds for the answer (migrations run before it). Past that: exit code `1`, reason `unreachable`, and the message says the Version may or may not have gone live and to look with `vm applications` before deploying again.
+
+### From a new project
+
+A project made by `vm new`, with its packages installed and committed, deploys as it stands: `vm deploy` creates the Application, and a signed-in User gets the template's page at `<name>.<domain>`.
+
+### The instruction file
+
+From this ticket on the template's `AGENTS.md` names `vm deploy` in its table of commands and in "How to work" (in place of the sentence that there is no deploy command), says a deploy needs everything committed, that a destroying migration is asked about again at deploy, and that the agent tells the Builder who can see the Application from the deploy's own output.
+
+### What this does not close
+
+- The Application's `description` is the Manifest's at its first deploy; a later change of it is not sent.
+- The confirmation for data loss is the tool's: the API takes a Version whose migrations destroy data from whoever is a Contributor.
+- A structure that changes between the pull and the answer is not noticed until the next deploy.
