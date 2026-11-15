@@ -117,6 +117,19 @@ fn some_of_the_declared_resources_or_none_and_an_empty_object_are_taken() {
         sent.expect_status(201);
         assert_eq!(sent.json()["structures"], structures);
     }
+    // `null` is taken as an empty object.
+    let sent = api.send_version("board", &body(Some(Value::Null)));
+    sent.expect_status(201);
+    assert_eq!(
+        sent.json()["structures"],
+        json!({}),
+        "expected `null` taken as an empty object"
+    );
+    let number = sent.json()["number"].as_u64().unwrap();
+    assert_eq!(
+        api.get_version("board", number).expect_status(200).json()["structures"],
+        json!({})
+    );
     // A Resource declared at `structure` may have its fingerprint too.
     let mut at_structure = version_body_declaring(&marked_bundle("s"), &[("catalog", "structure")]);
     at_structure["structures"] = json!({ "catalog": fp('9') });
@@ -151,6 +164,10 @@ fn malformed() -> Vec<(&'static str, Value)> {
         (
             "a value with a digit that is not hex",
             json!({ "devops": format!("sha256:{}g", "a".repeat(63)) }),
+        ),
+        (
+            "upper-case hex digits",
+            json!({ "devops": format!("sha256:{}", "A".repeat(64)) }),
         ),
         ("an empty value", json!({ "devops": "" })),
         ("a number for a value", json!({ "devops": 7 })),

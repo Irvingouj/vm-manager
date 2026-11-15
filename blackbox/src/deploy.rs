@@ -227,12 +227,12 @@ pub fn commit_all(dir: &Path, message: &str) -> String {
     head(dir)
 }
 
-/// The commit `HEAD` names, 40 hex digits.
+/// The commit `HEAD` names: 40 hex digits (64 in a SHA-256 repository).
 pub fn head(dir: &Path) -> String {
     let text = git_ok(dir, &["rev-parse", "HEAD"]).trim().to_owned();
     assert!(
-        text.len() == 40 && text.bytes().all(|b| b.is_ascii_hexdigit()),
-        "the harness's own check: expected HEAD as 40 hex digits, got {text:?}"
+        (text.len() == 40 || text.len() == 64) && text.bytes().all(|b| b.is_ascii_hexdigit()),
+        "the harness's own check: expected HEAD as 40 (or, SHA-256, 64) hex digits, got {text:?}"
     );
     text
 }
@@ -606,35 +606,52 @@ pub struct DataLossAtDeploy {
 
 impl DataLossAtDeploy {
     /// Fails unless the run ended with `3`, reason `data-loss`, and the
-    /// error gives, for each migration it stops for, `migration` beside
-    /// `destroys` and `statements` (CONTRACT.md, "Deploying", step 7).
-    ///
-    /// The contract does not say where these are when there are several;
-    /// the harness takes the error itself when it has `migration` (one
-    /// migration), else the objects of the error's one array whose items
-    /// have `migration`.
+    /// error is exactly `{ reason, message, migrations: [ { migration,
+    /// destroys, statements } ] }` (CONTRACT.md, "Deploying", step 7), each
+    /// item those three fields and no other.
     pub fn of(run: &Run) -> Self {
         let message = run.json_error(3, "data-loss");
         let body = run.json();
         let error = &body["error"];
+        let mut keys: Vec<&str> = error
+            .as_object()
+            .map(|o| o.keys().map(String::as_str).collect())
+            .unwrap_or_default();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["message", "migrations", "reason"],
+            "expected the error to be {{ reason, message, migrations }}\n{}",
+            run.describe()
+        );
         let read = |item: &Value| -> Destroying {
+            let mut inner: Vec<&str> = item
+                .as_object()
+                .map(|o| o.keys().map(String::as_str).collect())
+                .unwrap_or_default();
+            inner.sort_unstable();
+            assert_eq!(
+                inner,
+                ["destroys", "migration", "statements"],
+                "expected each of `migrations` to be {{ migration, destroys, statements }}, got {item}"
+            );
             let migration = item["migration"]
                 .as_str()
                 .unwrap_or_else(|| panic!("expected `migration` a string in {item}"))
                 .to_owned();
             let destroys = item["destroys"]
                 .as_array()
-                .unwrap_or_else(|| {
-                    panic!("expected `destroys` an array beside `migration` in {item}")
-                })
+                .unwrap_or_else(|| panic!("expected `destroys` an array in {item}"))
                 .clone();
             let statements = item["statements"]
                 .as_array()
-                .unwrap_or_else(|| {
-                    panic!("expected `statements` an array beside `migration` in {item}")
-                })
+                .unwrap_or_else(|| panic!("expected `statements` an array in {item}"))
                 .iter()
-                .map(|s| s.as_str().unwrap_or_default().to_owned())
+                .map(|s| {
+                    s.as_str()
+                        .unwrap_or_else(|| panic!("expected each statement a string in {item}"))
+                        .to_owned()
+                })
                 .collect();
             Destroying {
                 migration,
@@ -642,26 +659,12 @@ impl DataLossAtDeploy {
                 statements,
             }
         };
-        let migrations = if error.get("migration").is_some() {
-            vec![read(error)]
-        } else {
-            let lists: Vec<&Vec<Value>> = error
-                .as_object()
-                .map(|o| {
-                    o.values()
-                        .filter_map(Value::as_array)
-                        .filter(|a| a.iter().any(|i| i.get("migration").is_some()))
-                        .collect()
-                })
-                .unwrap_or_default();
-            match lists.as_slice() {
-                [one] => one.iter().map(read).collect(),
-                _ => panic!(
-                    "expected the error to give `migration` beside `destroys` and `statements` for each migration it stops for\n{}",
-                    run.describe()
-                ),
-            }
-        };
+        let migrations: Vec<Destroying> = error["migrations"]
+            .as_array()
+            .unwrap_or_else(|| panic!("expected `migrations` an array\n{}", run.describe()))
+            .iter()
+            .map(read)
+            .collect();
         Self {
             run: run.clone(),
             message,

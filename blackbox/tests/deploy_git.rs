@@ -286,3 +286,78 @@ fn a_project_in_a_sub_folder_of_a_repository_counts_only_its_own_folder() {
     );
     assert_eq!(vm.api_as(&dana()).versions("sub-board").len(), 1);
 }
+
+#[test]
+fn uncommitted_files_are_each_named_as_they_are_in_the_order_of_their_paths() {
+    let vm = vm();
+    let machine = signed_in(&vm);
+    let project = deploy_project("deploy-uncommitted-names", "names-board");
+    // A folder git does not know: each of its files, not the folder.
+    project.write("drafts/a.txt", "a\n");
+    project.write("drafts/deeper/b.txt", "b\n");
+    // Names with a space and with a letter that is not ASCII.
+    project.write("with space.txt", "s\n");
+    project.write("café.txt", "c\n");
+    // A file renamed: both its names.
+    git_ok(&project.dir, &["mv", "src/index.ts", "src/main.ts"]);
+    let run = deploy(&machine, &project.dir, &[]);
+    run.json_error(1, "uncommitted-changes");
+    let error = run.json()["error"].clone();
+    let files: Vec<String> = error["files"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected `files`\n{}", run.describe()))
+        .iter()
+        .map(|f| f.as_str().unwrap().to_owned())
+        .collect();
+    let mut want: Vec<String> = [
+        "café.txt",
+        "drafts/a.txt",
+        "drafts/deeper/b.txt",
+        "src/index.ts",
+        "src/main.ts",
+        "with space.txt",
+    ]
+    .iter()
+    .map(|f| (*f).to_owned())
+    .collect();
+    want.sort();
+    assert_eq!(
+        files,
+        want,
+        "expected each file by its own path, as it is (no quoting, no escapes), in the order of their paths\n{}",
+        run.describe()
+    );
+    assert!(error.get("more").is_none());
+    assert_not_created(&vm, "names-board", "names");
+}
+
+#[test]
+fn a_repository_in_the_sha_256_object_format_is_not_a_repository() {
+    let vm = vm();
+    let machine = signed_in(&vm);
+    let dir = TempProject::new("deploy-sha256");
+    write_checked(&dir.dir);
+    fs::write(dir.dir.join("manifest.ts"), manifest_ts("sha-board", "{}")).unwrap();
+    let made = blackbox::deploy::git(&dir.dir, &["init", "-q", "--object-format=sha256"]);
+    if made.code != Some(0) {
+        eprintln!(
+            "SKIPPED: this machine's git cannot make a SHA-256 repository\n{}",
+            made.describe()
+        );
+        return;
+    }
+    let commit = commit_all(&dir.dir, "first");
+    assert_eq!(
+        commit.len(),
+        64,
+        "the harness's own check: a SHA-256 commit"
+    );
+    let before = project_tree(&dir.dir);
+    let message = deploy(&machine, &dir.dir, &[]).json_error(1, "not-a-repository");
+    assert!(!message.trim().is_empty());
+    assert_not_created(&vm, "sha-board", "a SHA-256 repository");
+    assert_eq!(
+        before.differences(&project_tree(&dir.dir)),
+        Vec::<String>::new()
+    );
+}

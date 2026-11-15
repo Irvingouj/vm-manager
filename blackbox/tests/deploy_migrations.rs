@@ -26,11 +26,11 @@ use blackbox::deploy::{
     deploy, deploy_in_words, init_repository, project_tree, signed_in,
 };
 use blackbox::generate::{
-    Generated, NOTES_WITH_TITLE_SCHEMA_TS, assert_data_loss_message, column, generate, journal,
-    journal_tags, project_with,
+    Generated, NOTES_WITH_TITLE_SCHEMA_TS, amount_schema, assert_data_loss_message,
+    assert_destroys, column, generate, journal, journal_tags, project_with, type_change,
 };
 use blackbox::own_database::OwnDatabase;
-use blackbox::project::{NOTES_SCHEMA_TS, manifest_ts};
+use blackbox::project::{NOTES_SCHEMA_TS, manifest_ts, squashed};
 use blackbox::sdk::TempProject;
 use blackbox::tool::Machine;
 use blackbox::{Vm, VmOptions};
@@ -250,23 +250,34 @@ fn a_hand_written_delete_or_truncate_is_rows_destroyed() {
     assert_eq!(loss.migrations[0].statements.len(), 1);
     assert!(loss.migrations[0].statements[0].contains("DELETE FROM"));
 
-    // The same migration, not yet deployed, now a TRUNCATE.
-    fs::write(
-        project.dir.join(format!("migrations/{tag}.sql")),
-        "TRUNCATE \"notes\";\n",
-    )
-    .unwrap();
-    commit_all(&project.dir, "truncate");
-    let loss = DataLossAtDeploy::of(&deploy(&machine, &project.dir, &[]));
-    assert_eq!(loss.migrations[0].destroys, vec![rows], "a TRUNCATE");
-    assert!(loss.migrations[0].statements[0].contains("TRUNCATE"));
     let db = own(&vm, "rows-board");
     assert_eq!(db.column("SELECT count(*) FROM notes"), ["2"]);
     assert_eq!(versions_of(&vm, "rows-board"), (1, json!(1)));
 
+    // Confirmed: the DELETE applies, Version 2 serves.
     let deployed = Deployed::of(&deploy(&machine, &project.dir, &["--allow-data-loss"]));
-    assert_eq!(deployed.migrations_applied, [tag]);
-    assert_eq!(db.column("SELECT count(*) FROM notes"), ["0"]);
+    assert_eq!(deployed.version, 2);
+    assert_eq!(deployed.migrations_applied, std::slice::from_ref(&tag));
+    assert_eq!(db.column("SELECT body FROM notes ORDER BY id"), ["first"]);
+
+    // A TRUNCATE: asked about as rows destroyed; once allowed, the platform
+    // refuses it (it never truncates a table that has history: VM002), and
+    // Version 2 goes on serving with the row still there.
+    let truncating = hand_written(&machine, &project, "empty_notes", "TRUNCATE \"notes\";\n");
+    commit_all(&project.dir, "truncate");
+    let loss = DataLossAtDeploy::of(&deploy(&machine, &project.dir, &[]));
+    assert_eq!(loss.migrations.len(), 1);
+    assert_eq!(loss.migrations[0].migration, truncating);
+    assert_eq!(loss.migrations[0].destroys, vec![rows], "a TRUNCATE");
+    assert!(loss.migrations[0].statements[0].contains("TRUNCATE"));
+    let run = deploy(&machine, &project.dir, &["--allow-data-loss"]);
+    run.json_error(1, "migration-failed");
+    let error = run.json()["error"].clone();
+    assert_eq!(error["code"], json!("VM002"), "{}", run.describe());
+    assert_eq!(error["migration"], json!(truncating));
+    assert_ne!(error.get("created"), Some(&json!(true)));
+    assert_eq!(versions_of(&vm, "rows-board"), (2, json!(2)));
+    assert_eq!(db.column("SELECT body FROM notes ORDER BY id"), ["first"]);
 }
 
 #[test]
@@ -377,10 +388,19 @@ fn a_migration_that_fails_in_the_database_leaves_the_previous_version_serving() 
         message.contains(database_message),
         "expected the message to have the database's error ({database_message:?}), got {message:?}"
     );
-    let lower = message.to_lowercase();
+    let lower = squashed(&message).to_lowercase();
     assert!(
-        lower.contains("previous") && lower.contains("serving"),
-        "expected the message to say the previous Version goes on serving, got {message:?}"
+        lower.contains("goes on serving") || lower.contains("go on serving"),
+        "expected the message to say the Version that was serving goes on serving, got {message:?}"
+    );
+    assert!(
+        lower.contains("nothing"),
+        "expected the message to say nothing was changed, got {message:?}"
+    );
+    assert_ne!(
+        error.get("created"),
+        Some(&json!(true)),
+        "a deploy that did not create the Application has no `created: true`"
     );
     deploy_in_words(&machine, &project.dir, &[]).text_error(1);
     assert_eq!(versions_of(&vm, "failing-board"), (1, json!(1)));
@@ -429,4 +449,338 @@ fn a_migration_the_platform_refuses_is_migration_refused_with_its_rule() {
     assert_eq!(error["migration"], json!(committing));
     assert_eq!(versions_of(&vm, "refused-board"), (1, json!(1)));
     assert_eq!(vm.get_as(&dana(), "refused-board", "/").status, 200);
+}
+
+#[test]
+fn two_added_migrations_that_destroy_are_each_named_in_their_order() {
+    let vm = vm();
+    let machine = signed_in(&vm);
+    let project = notes_project(&machine, "deploy-two-losses", "two-losses-board");
+    Deployed::of(&deploy(&machine, &project.dir, &[]));
+    let dropping = generated(&machine, &project, NOTES_SCHEMA_TS, &["--allow-data-loss"]);
+    let deleting = hand_written(
+        &machine,
+        &project,
+        "drop_second",
+        "DELETE FROM \"notes\" WHERE \"body\" = 'second';\n",
+    );
+    commit_all(&project.dir, "two losses");
+    let run = deploy(&machine, &project.dir, &[]);
+    let loss = DataLossAtDeploy::of(&run);
+    let names: Vec<&str> = loss
+        .migrations
+        .iter()
+        .map(|m| m.migration.as_str())
+        .collect();
+    assert_eq!(
+        names,
+        [dropping.name.as_str(), deleting.as_str()],
+        "expected one item for each destroying migration, in their order\n{}",
+        run.describe()
+    );
+    blackbox::generate::assert_destroys(
+        &loss.migrations[0].destroys,
+        &[column("public.notes", "title")],
+        "the first",
+    );
+    assert_eq!(loss.migrations[0].statements.len(), 1);
+    assert!(loss.migrations[0].statements[0].contains("DROP COLUMN"));
+    assert_eq!(
+        loss.migrations[1].destroys,
+        vec![json!({ "what": "rows", "table": "public.notes" })]
+    );
+    assert_eq!(loss.migrations[1].statements.len(), 1);
+    assert!(loss.migrations[1].statements[0].contains("DELETE FROM"));
+    assert_eq!(versions_of(&vm, "two-losses-board"), (1, json!(1)));
+
+    let deployed = Deployed::of(&deploy(&machine, &project.dir, &["--allow-data-loss"]));
+    assert_eq!(deployed.migrations_applied, [dropping.name, deleting]);
+    let db = own(&vm, "two-losses-board");
+    assert!(!notes_columns(&db).contains(&"title".to_owned()));
+    assert_eq!(db.column("SELECT body FROM notes ORDER BY id"), ["first"]);
+}
+
+/// A project named `name` whose own table `notes` has a column `amount`
+/// of the Drizzle builder `builder`, its first migration made, a row in
+/// it, deployed as Version 1.
+fn deployed_amount(
+    vm: &Vm,
+    machine: &Machine,
+    label: &str,
+    name: &str,
+    builder: &str,
+) -> TempProject {
+    let project = project_with(label, &amount_schema(builder));
+    project.write("manifest.ts", &manifest_ts(name, "{}"));
+    hand_written(
+        machine,
+        &project,
+        "one_row",
+        "INSERT INTO \"notes\" (\"amount\") VALUES ('7');\n",
+    );
+    init_repository(&project.dir);
+    commit_all(&project.dir, "amount");
+    let first = Deployed::of(&deploy(machine, &project.dir, &[]));
+    assert_eq!(first.version, 1);
+    assert_eq!(versions_of(vm, name), (1, json!(1)));
+    project
+}
+
+#[test]
+fn a_narrowing_type_change_is_asked_about_at_deploy() {
+    let vm = vm();
+    let machine = signed_in(&vm);
+    let project = deployed_amount(
+        &vm,
+        &machine,
+        "deploy-narrowing",
+        "narrowing-board",
+        "text(\"amount\")",
+    );
+    let narrowing = generated(
+        &machine,
+        &project,
+        &amount_schema("varchar(\"amount\", { length: 10 })"),
+        &["--allow-data-loss"],
+    );
+    commit_all(&project.dir, "narrow amount");
+    let loss = DataLossAtDeploy::of(&deploy(&machine, &project.dir, &[]));
+    assert_eq!(loss.migrations.len(), 1);
+    assert_eq!(loss.migrations[0].migration, narrowing.name);
+    assert_destroys(
+        &loss.migrations[0].destroys,
+        &[type_change("public.notes", "amount", "text", "varchar(10)")],
+        "text to varchar(10)",
+    );
+    assert_eq!(versions_of(&vm, "narrowing-board"), (1, json!(1)));
+    let deployed = Deployed::of(&deploy(&machine, &project.dir, &["--allow-data-loss"]));
+    assert_eq!(deployed.version, 2);
+}
+
+#[test]
+fn a_widening_type_change_is_not_asked_about() {
+    let vm = vm();
+    let machine = signed_in(&vm);
+    let project = deployed_amount(
+        &vm,
+        &machine,
+        "deploy-widening",
+        "widening-board",
+        "integer(\"amount\")",
+    );
+    // `vm generate` writes a widening without --allow-data-loss.
+    let widening = generated(
+        &machine,
+        &project,
+        &amount_schema("bigint(\"amount\", { mode: \"number\" })"),
+        &[],
+    );
+    assert_eq!(widening.destroys, Vec::<Value>::new());
+    commit_all(&project.dir, "widen amount");
+    let deployed = Deployed::of(&deploy(&machine, &project.dir, &[]));
+    assert_eq!(deployed.version, 2);
+    assert_eq!(deployed.migrations_applied, [widening.name]);
+}
+
+#[test]
+fn each_type_change_is_judged_against_the_snapshot_of_the_migration_before_it() {
+    let vm = vm();
+    let machine = signed_in(&vm);
+    let project = deployed_amount(
+        &vm,
+        &machine,
+        "deploy-two-types",
+        "two-types-board",
+        "integer(\"amount\")",
+    );
+    // integer to bigint (wider), then bigint to integer (not): only the
+    // second is asked about, and from `bigint`, the type its own previous
+    // snapshot has.
+    let widening = generated(
+        &machine,
+        &project,
+        &amount_schema("bigint(\"amount\", { mode: \"number\" })"),
+        &[],
+    );
+    let narrowing = generated(
+        &machine,
+        &project,
+        &amount_schema("integer(\"amount\")"),
+        &["--allow-data-loss"],
+    );
+    commit_all(&project.dir, "widen then narrow");
+    let run = deploy(&machine, &project.dir, &[]);
+    let loss = DataLossAtDeploy::of(&run);
+    assert_eq!(
+        loss.migrations
+            .iter()
+            .map(|m| m.migration.as_str())
+            .collect::<Vec<_>>(),
+        [narrowing.name.as_str()],
+        "expected only the narrowing asked about\n{}",
+        run.describe()
+    );
+    assert_destroys(
+        &loss.migrations[0].destroys,
+        &[type_change("public.notes", "amount", "bigint", "integer")],
+        "bigint to integer, after integer to bigint",
+    );
+    let deployed = Deployed::of(&deploy(&machine, &project.dir, &["--allow-data-loss"]));
+    assert_eq!(deployed.migrations_applied, [widening.name, narrowing.name]);
+}
+
+#[test]
+fn a_delete_in_a_with_is_rows_destroyed_and_one_in_a_string_or_a_comment_is_not() {
+    let vm = vm();
+    let machine = signed_in(&vm);
+    let project = notes_project(&machine, "deploy-with-delete", "with-delete-board");
+    Deployed::of(&deploy(&machine, &project.dir, &[]));
+
+    // Words only: in a string and in comments.
+    let words = hand_written(
+        &machine,
+        &project,
+        "only_words",
+        "-- DELETE FROM \"notes\";\n/* TRUNCATE \"notes\"; */\nSELECT 'DELETE FROM notes; TRUNCATE notes';\n",
+    );
+    commit_all(&project.dir, "words");
+    let deployed = Deployed::of(&deploy(&machine, &project.dir, &[]));
+    assert_eq!(
+        deployed.version, 2,
+        "expected no question for DELETE in a string or a comment"
+    );
+    assert_eq!(deployed.migrations_applied, [words]);
+
+    // A DELETE in a WITH.
+    let with = hand_written(
+        &machine,
+        &project,
+        "with_delete",
+        "WITH gone AS (DELETE FROM \"notes\" WHERE \"title\" IS NULL RETURNING id) SELECT count(*) FROM gone;\n",
+    );
+    commit_all(&project.dir, "with delete");
+    let loss = DataLossAtDeploy::of(&deploy(&machine, &project.dir, &[]));
+    assert_eq!(loss.migrations.len(), 1);
+    assert_eq!(loss.migrations[0].migration, with);
+    assert_eq!(
+        loss.migrations[0].destroys,
+        vec![json!({ "what": "rows", "table": "public.notes" })]
+    );
+    assert_eq!(loss.migrations[0].statements.len(), 1);
+    assert!(loss.migrations[0].statements[0].contains("WITH"));
+    assert_eq!(versions_of(&vm, "with-delete-board"), (2, json!(2)));
+    assert_eq!(
+        own(&vm, "with-delete-board").column("SELECT count(*) FROM notes"),
+        ["2"]
+    );
+}
+
+#[test]
+fn an_added_migration_the_parser_cannot_read_is_migration_unparseable() {
+    let vm = vm();
+    let machine = signed_in(&vm);
+    let project = notes_project(&machine, "deploy-unparseable", "unparseable-board");
+    Deployed::of(&deploy(&machine, &project.dir, &[]));
+    hand_written(&machine, &project, "broken", "CREATE TABLE ((( broken;\n");
+    commit_all(&project.dir, "broken SQL");
+    let before = project_tree(&project.dir);
+    deploy(&machine, &project.dir, &[]).json_error(1, "migration-unparseable");
+    assert_eq!(versions_of(&vm, "unparseable-board"), (1, json!(1)));
+    assert_eq!(
+        before.differences(&project_tree(&project.dir)),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn a_migration_whose_text_is_not_utf_8_is_migrations_unreadable() {
+    let vm = vm();
+    let machine = signed_in(&vm);
+    let project = notes_project(&machine, "deploy-not-utf8", "not-utf8-board");
+    Deployed::of(&deploy(&machine, &project.dir, &[]));
+    let made = Generated::made(
+        &generate(&machine, &project.dir, &["--empty", "--name", "latin"]),
+        &project.dir,
+    );
+    fs::write(
+        project.dir.join(&made.file),
+        b"SELECT 'caf\xe9';\n".as_slice(),
+    )
+    .unwrap();
+    commit_all(&project.dir, "latin-1 bytes");
+    let before = project_tree(&project.dir);
+    deploy(&machine, &project.dir, &[]).json_error(1, "migrations-unreadable");
+    assert_eq!(versions_of(&vm, "not-utf8-board"), (1, json!(1)));
+    assert_eq!(
+        before.differences(&project_tree(&project.dir)),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn an_application_this_deploy_created_stays_when_its_version_is_not_taken() {
+    let vm = vm();
+    let machine = signed_in(&vm);
+    let project = blackbox::project::checked_project("deploy-created-stays");
+    project.write("manifest.ts", &manifest_ts("stays-board", "{}"));
+    let failing = hand_written(
+        &machine,
+        &project,
+        "into_nowhere",
+        "INSERT INTO \"nowhere\" VALUES (1);\n",
+    );
+    init_repository(&project.dir);
+    commit_all(&project.dir, "a migration that fails");
+    let run = deploy(&machine, &project.dir, &[]);
+    let message = run.json_error(1, "migration-failed");
+    let error = run.json()["error"].clone();
+    assert_eq!(error["created"], json!(true), "{}", run.describe());
+    assert_eq!(error["migration"], json!(failing));
+    let database_message = error["database_message"].as_str().unwrap_or_default();
+    assert!(
+        !database_message.is_empty() && message.contains(database_message),
+        "expected the message to have the database's error, got {message:?}"
+    );
+    let lower = squashed(&message).to_lowercase();
+    assert!(
+        lower.contains("no version") && (lower.contains("exists") || lower.contains("created")),
+        "expected the message to say the Application now exists with no Version, got {message:?}"
+    );
+    // There was no Version serving: the message may give the contract's
+    // sentence ("when there was one"), and never says a previous Version
+    // goes on serving without it.
+    if lower.contains("goes on serving") || lower.contains("go on serving") {
+        assert!(
+            lower.contains("when") || lower.contains("if there"),
+            "expected no word that a Version goes on serving at a first deploy, but for the contract's \"when there was one\", got {message:?}"
+        );
+    }
+    assert!(
+        !lower.contains("previous version goes on serving"),
+        "expected no previous Version said to serve at a first deploy, got {message:?}"
+    );
+    let api = vm.api_as(&dana());
+    let application = api.application("stays-board");
+    assert_eq!(application["serving_version"], Value::Null);
+    assert_eq!(application["contributors"], json!([{ "user": "dana" }]));
+    assert_eq!(api.versions("stays-board"), Vec::<Value>::new());
+    let page = vm.get_as(&dana(), "stays-board", "/");
+    assert_ne!(
+        page.status,
+        200,
+        "expected nothing at the address of an Application with no Version\n{}",
+        page.describe()
+    );
+
+    // The migration corrected (it was never taken) and committed.
+    fs::write(
+        project.dir.join(format!("migrations/{failing}.sql")),
+        "SELECT 1;\n",
+    )
+    .unwrap();
+    commit_all(&project.dir, "corrected");
+    let deployed = Deployed::of(&deploy(&machine, &project.dir, &[]));
+    assert!(!deployed.created, "expected `created` false the next time");
+    assert_eq!(deployed.version, 1);
+    assert_eq!(api.application("stays-board")["serving_version"], json!(1));
 }

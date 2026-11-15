@@ -276,6 +276,12 @@ fn agents_md_names_vm_deploy_and_how_a_deploy_goes() {
         "a destroying migration is asked about again at deploy",
         &["again", "data"],
     );
+    assert!(
+        paragraphs
+            .iter()
+            .any(|p| p.contains("delete") && p.contains("truncate") && p.contains("never")),
+        "expected AGENTS.md to say a migration written by hand removes rows with DELETE and never with TRUNCATE\n{text}"
+    );
     any(
         "who can see the Application is told from the deploy's own output",
         &["own output", "see"],

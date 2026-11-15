@@ -271,6 +271,7 @@ fn a_structure_the_code_no_longer_type_checks_against_fails_the_deploy_and_stays
         .batch("ALTER TABLE incidents DROP COLUMN title");
     let new = fingerprint_now(&scenario, &dana(), "devops");
     let before = project_tree(&project.dir);
+    let versions_before = scenario.vm.api_as(&dana()).versions("incompatible-board");
     let run = deploy(&machine, &project.dir, &[]);
     let report = Report::failed(&run);
     let errors = report.problems_for("type-error");
@@ -293,7 +294,11 @@ fn a_structure_the_code_no_longer_type_checks_against_fails_the_deploy_and_stays
     );
     // No Version; the files stay updated.
     let api = scenario.vm.api_as(&dana());
-    assert_eq!(api.versions("incompatible-board").len(), 1);
+    assert_eq!(
+        api.versions("incompatible-board"),
+        versions_before,
+        "expected the list of Versions unchanged"
+    );
     assert_eq!(
         api.application("incompatible-board")["serving_version"],
         json!(1)
@@ -309,14 +314,6 @@ fn a_structure_the_code_no_longer_type_checks_against_fails_the_deploy_and_stays
         &project.dir,
         &["resources/devops"],
         "a failed deploy",
-    );
-    // The previous Version goes on serving.
-    assert_eq!(
-        scenario
-            .vm
-            .get_as(&dana(), "incompatible-board", "/")
-            .status,
-        200
     );
 }
 
