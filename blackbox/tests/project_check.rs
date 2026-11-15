@@ -697,3 +697,117 @@ fn a_compiler_error_with_no_place_is_a_type_error_with_null_file_line_and_column
         "expected the compiler's message (it names tsconfig.json), got {message:?}"
     );
 }
+
+/// The checked project with the `notes` table and its one migration
+/// generated, then changed by `spoil` (in `migrations/`), with a type error
+/// in `src/broken.ts`.
+fn spoiled_migrations(label: &str, spoil: impl Fn(&Path)) -> TempProject {
+    let project = checked_project(label);
+    project.write("src/db/schema.ts", NOTES_SCHEMA_TS);
+    let generated = generate_migrations(&project.dir);
+    assert_eq!(sql_files(&project.dir).len(), 1, "{}", generated.describe());
+    spoil(&project.path("migrations"));
+    project.write("src/broken.ts", ONE_TYPE_ERROR);
+    project
+}
+
+/// The first `*_snapshot.json` in `migrations/meta`.
+fn first_snapshot(migrations: &Path) -> std::path::PathBuf {
+    let mut found: Vec<std::path::PathBuf> = std::fs::read_dir(migrations.join("meta"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.to_string_lossy().ends_with("_snapshot.json"))
+        .collect();
+    found.sort();
+    found.into_iter().next().unwrap()
+}
+
+/// Fails unless the report has one problem of the check `migrations`,
+/// `migrations-unreadable`, whose message has `words` (drizzle-kit's own),
+/// says migrations are never edited by hand and to bring the folder back
+/// as it was last committed; and the types check was made too.
+fn assert_migrations_unreadable(report: &Report, words: &str) {
+    assert_eq!(
+        report.of_check("migrations").len(),
+        1,
+        "expected one problem of the migrations check\n{}",
+        report.run.describe()
+    );
+    let problem = report.problem("migrations", "migrations-unreadable");
+    let message = problem["message"].as_str().unwrap();
+    let lower = message.to_lowercase();
+    assert!(
+        message.contains(words),
+        "expected the message to have drizzle-kit's own words {words:?}, got {message:?}"
+    );
+    assert!(
+        lower.contains("by hand") && lower.contains("committed"),
+        "expected the message to say migrations are never edited by hand and to bring the folder back as it was last committed, got {message:?}"
+    );
+    assert!(
+        report.problems_for("type-error").iter().any(|p| p["file"]
+            .as_str()
+            .is_some_and(|f| f.ends_with("src/broken.ts"))),
+        "expected the other checks still made (the type error in src/broken.ts)\n{}",
+        report.run.describe()
+    );
+}
+
+#[test]
+fn a_journal_that_is_not_json_is_migrations_unreadable() {
+    let (_vm, machine) = signed_in();
+    let project = spoiled_migrations("check-journal-not-json", |m| {
+        std::fs::write(m.join("meta/_journal.json"), "{ not json\n").unwrap();
+    });
+    let report = Report::failed(&check(&machine, &project.dir));
+    assert_migrations_unreadable(&report, "Expected property name");
+}
+
+#[test]
+fn a_snapshot_that_is_not_json_is_migrations_unreadable() {
+    let (_vm, machine) = signed_in();
+    let project = spoiled_migrations("check-snapshot-not-json", |m| {
+        std::fs::write(first_snapshot(m), "{ not json\n").unwrap();
+    });
+    let report = Report::failed(&check(&machine, &project.dir));
+    assert_migrations_unreadable(&report, "Expected property name");
+}
+
+#[test]
+fn a_journal_removed_beside_its_migration_and_snapshot_is_migrations_unreadable() {
+    let (_vm, machine) = signed_in();
+    let project = spoiled_migrations("check-journal-gone", |m| {
+        std::fs::remove_file(m.join("meta/_journal.json")).unwrap();
+    });
+    let report = Report::failed(&check(&machine, &project.dir));
+    assert_migrations_unreadable(&report, "no such file or directory");
+}
+
+/// drizzle-kit reads the snapshots it finds in `meta/`, not those the
+/// journal names: with the snapshot gone it takes the folder for one with
+/// no migration and would write one. That is `migrations-behind`.
+#[test]
+fn a_snapshot_removed_is_migrations_behind() {
+    let (_vm, machine) = signed_in();
+    let project = spoiled_migrations("check-snapshot-gone", |m| {
+        std::fs::remove_file(first_snapshot(m)).unwrap();
+    });
+    let report = Report::failed(&check(&machine, &project.dir));
+    report.problem("migrations", "migrations-behind");
+    assert_eq!(report.of_check("migrations").len(), 1);
+}
+
+/// drizzle-kit does not read the `.sql` files: with one removed and its
+/// journal entry and snapshot still there, it says "No schema changes" and
+/// writes nothing. By the contract the folder is then in step.
+#[test]
+fn a_migration_file_removed_with_its_journal_and_snapshot_kept_is_in_step_as_drizzle_kit_sees_it() {
+    let (_vm, machine) = signed_in();
+    let project = spoiled_migrations("check-sql-gone", |m| {
+        for sql in sql_files(m.parent().unwrap()) {
+            std::fs::remove_file(m.join(sql)).unwrap();
+        }
+    });
+    std::fs::remove_file(project.path("src/broken.ts")).unwrap();
+    Report::clean(&check(&machine, &project.dir));
+}

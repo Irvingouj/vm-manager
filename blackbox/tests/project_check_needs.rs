@@ -430,3 +430,189 @@ fn the_sign_in_is_looked_at_before_node_and_the_packages() {
     write_checked(&bare);
     check(&machine, &bare).json_error(4, "not-signed-in");
 }
+
+/// A `TMPDIR` of the machine's own, made empty.
+fn own_tmpdir(machine: &Machine) -> std::path::PathBuf {
+    let tmp = machine.root().join("tmp");
+    fs::create_dir_all(&tmp).unwrap();
+    tmp
+}
+
+/// What is in `dir`, by name.
+fn listed(dir: &std::path::Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+/// Waits until `pids` holds at least `n` process ids, at most `limit`;
+/// returns them.
+fn wait_for_pids(pids: &std::path::Path, n: usize, limit: Duration) -> Vec<u32> {
+    let deadline = std::time::Instant::now() + limit;
+    loop {
+        let found = pids_in(pids);
+        if found.len() >= n || std::time::Instant::now() >= deadline {
+            return found;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn an_interrupted_check_stops_what_it_started_and_ends_interrupted() {
+    let (_vm, machine) = signed_in();
+    let tmp = own_tmpdir(&machine);
+    for signal in ["INT", "TERM", "HUP"] {
+        let project = checked_project(&format!("needs-interrupted-{signal}"));
+        let pids = project.dir.with_extension("pids");
+        let _cleanup = KillOnDrop(pids.clone());
+        project.write("src/db/schema.ts", &schema_starting_a_child(&pids, true));
+        let running = machine.spawn_into_files(
+            &machine.cwd(),
+            &check_args(project.dir.to_str().unwrap(), &[]),
+            &[("TMPDIR", tmp.to_str().unwrap())],
+        );
+        let started = wait_for_pids(&pids, 2, Duration::from_secs(60));
+        assert!(
+            started.len() >= 2,
+            "{signal}: the harness's own check: expected the schema to have recorded itself and its child, found {started:?}"
+        );
+        let sent = std::time::Instant::now();
+        running.signal(signal);
+        let run = running.wait(Duration::from_secs(30));
+        let waited = sent.elapsed();
+        let message = run.json_error(1, "interrupted");
+        assert!(!message.trim().is_empty());
+        assert!(
+            waited < Duration::from_secs(10),
+            "{signal}: expected the check to end within a few seconds of the signal, took {waited:?}"
+        );
+        let left = still_running_after(&started, Duration::from_secs(1));
+        assert!(
+            left.is_empty(),
+            "{signal}: expected nothing the check started, nor what that started, still running; running: {left:?}"
+        );
+        assert_eq!(
+            listed(&tmp),
+            Vec::<String>::new(),
+            "{signal}: expected the check's own folder removed"
+        );
+        drop(fs::remove_file(&pids));
+    }
+}
+
+#[test]
+fn the_check_writes_in_a_folder_of_its_own_in_tmpdir_and_removes_it_in_every_ending() {
+    use std::os::unix::fs::PermissionsExt;
+    let (_vm, machine) = signed_in();
+    let tmp = own_tmpdir(&machine);
+    let env = [("TMPDIR", tmp.to_str().unwrap())];
+
+    // While it runs: one folder, mode 0700. Then out of time.
+    let project = checked_project("needs-own-folder");
+    let pids = project.dir.with_extension("pids");
+    let _cleanup = KillOnDrop(pids.clone());
+    project.write("src/db/schema.ts", &schema_starting_a_child(&pids, true));
+    let running = machine.spawn_into_files(
+        &machine.cwd(),
+        &check_args(project.dir.to_str().unwrap(), &["--timeout", "10"]),
+        &env,
+    );
+    let started = wait_for_pids(&pids, 2, Duration::from_secs(60));
+    assert!(started.len() >= 2, "the harness's own check: {started:?}");
+    let inside = listed(&tmp);
+    assert_eq!(
+        inside.len(),
+        1,
+        "expected one folder of the check's own in TMPDIR while it runs, got {inside:?}"
+    );
+    let folder = tmp.join(&inside[0]);
+    let meta = fs::symlink_metadata(&folder).unwrap();
+    assert!(meta.is_dir(), "expected a folder, got {meta:?}");
+    assert_eq!(
+        meta.permissions().mode() & 0o7777,
+        0o700,
+        "expected the check's folder of mode 0700"
+    );
+    let run = running.wait(Duration::from_secs(60));
+    run.json_error(1, "check-timed-out");
+    assert_eq!(
+        listed(&tmp),
+        Vec::<String>::new(),
+        "out of time: expected it removed"
+    );
+    drop(fs::remove_file(&pids));
+
+    // Passed.
+    let passing = checked_project("needs-own-folder-pass");
+    Report::clean(&machine.run_into_files(
+        &check_args(passing.dir.to_str().unwrap(), &[]),
+        &env,
+        CHECK_TIMEOUT,
+    ));
+    assert_eq!(
+        listed(&tmp),
+        Vec::<String>::new(),
+        "passed: expected it removed"
+    );
+
+    // Failed.
+    passing.write("src/broken.ts", "export const wrong: number = \"text\";\n");
+    passing.write("src/db/schema.ts", NOTES_SCHEMA_TS);
+    Report::failed(&machine.run_into_files(
+        &check_args(passing.dir.to_str().unwrap(), &[]),
+        &env,
+        CHECK_TIMEOUT,
+    ));
+    assert_eq!(
+        listed(&tmp),
+        Vec::<String>::new(),
+        "failed: expected it removed"
+    );
+}
+
+#[test]
+fn a_tsconfig_that_keeps_build_information_has_none_written_in_the_project() {
+    let (_vm, machine) = signed_in();
+    let tmp = own_tmpdir(&machine);
+    for option in ["\"incremental\": true", "\"composite\": true"] {
+        let project = checked_project("needs-build-information");
+        let config = blackbox::sdk::TSCONFIG.replace(
+            "\"strict\": true,",
+            &format!("\"strict\": true,\n    {option},"),
+        );
+        assert!(config.contains(option), "the harness's own check");
+        project.write("tsconfig.json", &config);
+        std::thread::sleep(Duration::from_millis(50));
+        let before = Tree::of(&project.dir);
+        Report::clean(&machine.run_into_files(
+            &check_args(project.dir.to_str().unwrap(), &[]),
+            &[("TMPDIR", tmp.to_str().unwrap())],
+            CHECK_TIMEOUT,
+        ));
+        assert_eq!(
+            before.differences(&Tree::of(&project.dir)),
+            Vec::<String>::new(),
+            "{option}: expected no build information (tsconfig.tsbuildinfo) written in the project"
+        );
+        assert_eq!(listed(&tmp), Vec::<String>::new(), "{option}");
+    }
+}
+
+#[test]
+fn node_is_looked_at_before_the_packages() {
+    let (_vm, machine) = signed_in();
+    let bare = machine.root().join("bare");
+    write_checked(&bare);
+    let empty = stand_ins(&machine.root().join("no-node"), &[]);
+    machine
+        .run_into_files(
+            &check_args(bare.to_str().unwrap(), &[]),
+            &[("PATH", empty.to_str().unwrap())],
+            CHECK_TIMEOUT,
+        )
+        .json_error(1, "node-missing");
+}

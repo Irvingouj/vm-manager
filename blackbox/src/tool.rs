@@ -278,6 +278,14 @@ impl Machine {
         env: &[(&str, &str)],
         timeout: Duration,
     ) -> Run {
+        self.spawn_into_files(cwd, args, env).wait(timeout)
+    }
+
+    /// Starts `vm <args>` on this machine in `cwd`, with these environment
+    /// variables added and its output written to files, and returns at
+    /// once: the test may signal it ([`Running::signal`]) and then waits
+    /// for it ([`Running::wait`]). Killed if dropped while running.
+    pub fn spawn_into_files(&self, cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> Running {
         let outputs = std::env::temp_dir().join(format!("vm-blackbox-run-{}", token()));
         fs::create_dir_all(&outputs)
             .unwrap_or_else(|e| panic!("cannot make {}: {e}", outputs.display()));
@@ -292,35 +300,15 @@ impl Machine {
             .stdout(open("stdout"))
             .stderr(open("stderr"));
         let began = Instant::now();
-        let mut child = command
+        let child = command
             .spawn()
             .unwrap_or_else(|e| panic!("cannot run the tool: {e}"));
-        let deadline = began + timeout;
-        let status = loop {
-            if let Ok(Some(status)) = child.try_wait() {
-                break Some(status);
-            }
-            if Instant::now() >= deadline {
-                drop(child.kill());
-                drop(child.wait());
-                break None;
-            }
-            thread::sleep(Duration::from_millis(10));
-        };
-        let elapsed = began.elapsed();
-        let read = |name: &str| {
-            let bytes = fs::read(outputs.join(name)).unwrap_or_default();
-            String::from_utf8_lossy(&bytes).into_owned()
-        };
-        let run = Run {
+        Running {
             args: args.iter().map(|a| (*a).to_owned()).collect(),
-            code: status.and_then(|s| s.code()),
-            stdout: read("stdout"),
-            stderr: read("stderr"),
-            elapsed,
-        };
-        drop(fs::remove_dir_all(&outputs));
-        run
+            child,
+            outputs,
+            began,
+        }
     }
 
     /// Runs `vm <args>` on this machine with its standard output or error
@@ -576,6 +564,76 @@ pub fn platform_tables_holding(platform: &Platform, needle: &str) -> Vec<String>
             count.as_deref() != Some("0")
         })
         .collect()
+}
+
+/// A run of the tool started by [`Machine::spawn_into_files`].
+pub struct Running {
+    args: Vec<String>,
+    child: std::process::Child,
+    outputs: PathBuf,
+    began: Instant,
+}
+
+impl Running {
+    /// The process id of `vm`.
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// Sends `signal` (`INT`, `TERM`, `HUP`, ...) to `vm` alone, with the
+    /// `kill` program.
+    pub fn signal(&self, signal: &str) {
+        let mut command = Command::new("kill");
+        command
+            .arg(format!("-{signal}"))
+            .arg(self.pid().to_string());
+        let sent = run_to_exit(command, Duration::from_secs(5))
+            .unwrap_or_else(|problem| panic!("cannot run kill: {problem}"));
+        assert!(
+            sent.status.is_some_and(|s| s.success()),
+            "kill -{signal} {} failed: {}",
+            self.pid(),
+            sent.stderr
+        );
+    }
+
+    /// Waits for `vm` to end, at most `timeout` (then kills it), and
+    /// returns what it printed and how it ended.
+    pub fn wait(mut self, timeout: Duration) -> Run {
+        let deadline = Instant::now() + timeout;
+        let status = loop {
+            if let Ok(Some(status)) = self.child.try_wait() {
+                break Some(status);
+            }
+            if Instant::now() >= deadline {
+                drop(self.child.kill());
+                drop(self.child.wait());
+                break None;
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+        let read = |name: &str| {
+            let bytes = fs::read(self.outputs.join(name)).unwrap_or_default();
+            String::from_utf8_lossy(&bytes).into_owned()
+        };
+        Run {
+            args: std::mem::take(&mut self.args),
+            code: status.and_then(|s| s.code()),
+            stdout: read("stdout"),
+            stderr: read("stderr"),
+            elapsed: self.began.elapsed(),
+        }
+    }
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        if let Ok(None) = self.child.try_wait() {
+            drop(self.child.kill());
+            drop(self.child.wait());
+        }
+        drop(fs::remove_dir_all(&self.outputs));
+    }
 }
 
 /// What one run of the tool printed and how it ended.

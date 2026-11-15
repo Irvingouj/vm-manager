@@ -285,3 +285,36 @@ fn harness_a_stand_in_node_says_it_is_node_20() {
         );
     }
 }
+
+#[test]
+fn harness_a_running_tool_is_signalled_and_waited_for() {
+    use blackbox::tool::{Machine, NotAnInstallation, Pretender};
+    // `vm sign-in` to a listener that never answers waits up to 30 s.
+    let silent = NotAnInstallation::pretending(Pretender::Silent);
+    let machine = Machine::new();
+    let address = silent.address().to_string();
+    let running = machine.spawn_into_files(
+        &machine.cwd(),
+        &[
+            "sign-in",
+            "--domain",
+            "vm.test",
+            "--connect",
+            &address,
+            "--stand-in-user",
+            "alice",
+        ],
+        &[],
+    );
+    std::thread::sleep(Duration::from_millis(500));
+    let pid = running.pid();
+    assert!(is_running(pid));
+    running.signal("TERM");
+    let run = running.wait(Duration::from_secs(10));
+    assert!(
+        run.elapsed < Duration::from_secs(10),
+        "expected the signal to end it, got\n{}",
+        run.describe()
+    );
+    assert!(!is_running(pid));
+}

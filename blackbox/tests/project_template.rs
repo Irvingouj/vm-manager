@@ -130,12 +130,14 @@ fn tsconfig_is_strict_with_the_own_structure_path_and_the_three_includes() {
 
 #[test]
 fn gitignore_ignores_node_modules_and_the_tools_folder_but_its_packages() {
-    let (machine, dir) = made();
+    let (_machine, dir) = made();
+    // The machine's own git, in the test's own environment (its `HOME`
+    // left alone: the git on the `PATH` may be a wrapper that finds the
+    // real one through it), with no configuration but the repository's.
     let git = |args: &[&str]| {
         let mut command = Command::new("git");
         command
             .current_dir(&dir)
-            .env("HOME", machine.home())
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .args(args);
@@ -413,15 +415,6 @@ fn a_new_project_passes_the_check_untouched() {
     );
 }
 
-/// The npm cache of the user running the tests, so that `npm install
-/// --prefer-offline` on a machine of the test's own need not fetch what is
-/// cached already. None when there is none.
-fn users_npm_cache() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    let cache = PathBuf::from(home).join(".npm");
-    cache.is_dir().then_some(cache)
-}
-
 #[test]
 fn a_new_project_installed_by_npm_outside_the_repository_passes_the_check() {
     let vm = Vm::start(&VmOptions::new().stand_in_sign_in());
@@ -435,16 +428,13 @@ fn a_new_project_installed_by_npm_outside_the_repository_passes_the_check() {
             .is_some_and(|c| c.starts_with("npm install")),
         "{printed}"
     );
+    // The machine's own npm, in the test's own environment (its `HOME`,
+    // and so the user's npm configuration and cache, left alone: npm on
+    // the `PATH` may need them, and `--prefer-offline` uses the cache).
     let mut command = Command::new("npm");
     command
         .current_dir(&dir)
-        .env_clear()
-        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-        .env("HOME", machine.home())
         .args(["install", "--prefer-offline", "--no-audit", "--no-fund"]);
-    if let Some(cache) = users_npm_cache() {
-        command.env("npm_config_cache", cache);
-    }
     let installed = run_to_exit(command, Duration::from_secs(600)).unwrap();
     assert!(
         installed.status.is_some_and(|s| s.success()),
