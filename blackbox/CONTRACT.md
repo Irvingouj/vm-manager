@@ -1439,6 +1439,11 @@ A Contributor sees an Application's Versions and which one serves, goes back to 
 - The program's log gets one record: `event` `went-back`, with `application`, `user`, `from`, `to`.
 - Any other method on the path is `405`.
 
+### The latest Version, and the list of Versions
+
+- The Application's object (`POST /v1/applications`, `GET /v1/applications/<name>`) gains `"latest_version": <number or null>`: the highest-numbered Version, null when there is none. After a go-back it is above `serving_version`.
+- `GET /v1/applications/<name>/versions` takes `?limit=<n>` (1 to 1000; any other value, or the parameter given twice, is `400` `malformed`): the newest `n` Versions, still oldest first. Without it: the newest 1,000. An answer never holds more.
+
 ### Logs, on the platform's API
 
 The platform keeps, for each request an Application was given, what its code printed and the errors it did not catch, and gives them to the Application's Contributors and to Platform administrators.
@@ -1449,24 +1454,25 @@ The platform keeps, for each request an Application was given, what its code pri
 { "entries": [
     { "id": "<cursor>", "time": "<RFC 3339>", "request": "<the request's x-vm-request-id>",
       "version": 3, "user": "<user id>", "method": "GET", "path": "/notes", "status": 500,
-      "printed": [ { "level": "log", "message": "loading notes" } ],
+      "printed": [ { "level": "log", "message": "loading notes", "loading": false } ],
       "uncaught": [ "<the error's message and stack>" ],
       "truncated": false, "dropped_before": 0 } ],
   "next": "<cursor>" }
 ```
 
-- **One entry for each request the Application's code was given**: the requests whose `request` record in the program's log names the Application. `version` is the Version that served it; `user` the signed-in User's id; `path` is without the query; `status` is what was answered. `printed` are the `printed` records of the request, in order, `level` the console method's name; `uncaught` are its `uncaught` records' `error`, each the message and the stack as the program's log has it.
-- **What is printed outside a request** (while a script loads, or by code that goes on after its request ended) has an entry of its own: `request`, `user`, `method`, `path` and `status` are null, `version` is the Version whose code printed, `printed` holds the one record.
+- **One entry for each request the Application's code was given.** A request answered before that (the platform was busy, the body was too large or came too slowly, a method the platform does not hand on) has none. `version` is the Version that served it; `user` the signed-in User's id; `path` is without the query; `status` is what was answered. `printed` is what its code printed, in order, `level` the console method's name: the lines the script printed while it was loaded for this request first, with `"loading": true` (the program's log has those records with a null `request`, as before), then the lines of the request itself, with `"loading": false`. `uncaught` are its `uncaught` records' `error`, each the message and the stack as the program's log has it.
+- **What code prints after its request ended** (work it left unawaited, when it runs at all) has an entry of its own for each line: `request`, `user`, `method`, `path` and `status` are null, `version` is the Version whose code printed, `printed` holds the one record (`loading` false). At most 20 such entries for one request's code: the twentieth has `truncated` true, and what is printed after it is only in the program's log.
 - **Order.** Entries are oldest first, in the order the requests ended. `id` is a cursor: text, not promised to be a number.
   - Without `after`: the newest `limit` entries (`?limit=<n>`, 1 to 1000, default 100).
   - `?after=<cursor>`: the entries after that one, the oldest `limit` of them. `next` is the cursor of the last entry answered; with no entry answered it is `after` as given, or, without `after`, a cursor after which only entries made later come. So reading with `after=<next>` again and again gives every entry once: this is how logs are followed.
   - `?request=<id>`: only the entry of that request (none when there is none, or when it is another Application's). It goes with `after` and `limit`.
-  - A `limit` outside 1 to 1000, an `after` that is not a cursor the API gave, a parameter given twice: `400` `malformed`. Unknown parameters are ignored.
+  - A `limit` outside 1 to 1000, an `after` that has not the form of a cursor, a parameter given twice: `400` `malformed`. (A cursor is opaque: one the caller made up may be taken, and then answers as a place in the log.) Unknown parameters are ignored.
 - **When it can be read.** An entry can be read within 2 seconds of its response, when the platform database answers. It is written after the request and never in its way: no request waits for it, and a request is answered the same when it cannot be written.
 - **Bounds.** Each has a stated end, and `truncated` is true in an entry any of them cut:
   - a `message` longer than 8,192 bytes is cut to that (at a character boundary); an `uncaught` error longer than 16,384 bytes likewise;
   - at most 200 `printed` records and 64 KiB of messages for one request (the record whose message would pass 64 KiB is not kept, nor any after it), and at most 10 `uncaught`; what comes after is not kept in the entry (the program's log still has every record).
-  - The platform keeps the newest 5,000 entries of an Application; older ones are deleted.
+  - A NUL character in a message or an error is kept as U+FFFD (the platform database cannot hold it); the program's log has it as it was.
+  - The platform keeps the newest 5,000 entries of an Application; older ones are deleted as new ones are written, at the latest when 100 more have been: an Application never has more than 5,100.
   - When entries are made faster than the platform database takes them (more than 1,024 waiting), entries are dropped, not requests held: the next entry kept has in `dropped_before` how many were dropped before it.
 - Logs hold what the Application chose to print. They are not the Operation log: a Platform administrator's record of every operation is that one, and nothing here replaces or feeds it.
 - Entries of an Application stay when a Version is gone back from. Any other method on the path is `405`.
@@ -1475,7 +1481,7 @@ The platform keeps, for each request an Application was given, what its code pri
 ### The commands
 
 ```
-vm versions <application> [--json]
+vm versions <application> [--limit <n>] [--json]
 vm go-back <application> [--to <number>] [--json]
 vm logs <application> [--request <id>] [--after <cursor>] [--limit <n>] [--follow] [--json]
 ```
@@ -1485,12 +1491,12 @@ All three need a sign-in (`4`) and name the Application on the command line; an 
 **`vm versions`** prints the Application's Versions, oldest first, exit code `0`:
 
 ```json
-{ "application": "incident-board", "address": "incident-board.<domain>", "serving_version": 2,
+{ "application": "incident-board", "address": "incident-board.<domain>", "serving_version": 2, "latest_version": 2,
   "versions": [ { "number": 1, "git_commit": "<40 hex>", "deployed_at": "<RFC 3339>", "deployed_by": "<user id>", "serving": false },
                 { "number": 2, "git_commit": "...", "deployed_at": "...", "deployed_by": "...", "serving": true } ] }
 ```
 
-- `deployed_at` and `deployed_by` are the Version's `created_at` and `created_by`. Exactly one Version has `serving` true, or none when the Application has no Version (`serving_version` null, `versions` empty).
+- `deployed_at` and `deployed_by` are the Version's `created_at` and `created_by`. `latest_version` is beside `serving_version`. It prints the newest 100 Versions, or the newest `--limit <n>` (1 to 1000; else exit code `2`); when there are older ones, in words it says how many are not shown and that `--limit` shows more. The serving Version has `serving` true when it is among those printed; `serving_version` names it always (null, and `versions` empty, when the Application has no Version).
 - In words: one line for each Version with its number, its commit, when and by whom, and the serving one marked with the word `serving` (no other line has that word); with none, that the Application has no Version yet and that `vm deploy` sends the first.
 
 **`vm go-back`** asks which Version serves, then goes back from it: to the one before it, or to `--to <number>`. Exit code `0`:
@@ -1514,11 +1520,11 @@ All three need a sign-in (`4`) and name the Application on the command line; an 
 - In words, for each entry: a first line with the time (RFC 3339, UTC), the request's id, the User, the Version, the method, the path and the status; then each printed line with its level; then each uncaught error with its stack, indented. An entry printed outside a request says `outside a request` in place of the request's facts. A cut entry says it was `cut`, and dropped entries are said where they are missing. With no entry: `no entries` (yet).
 - Everything of an entry is text of the Application's or of a User's: in words it is escaped as any text of the installation's is (a control character never reaches the terminal raw; a line end inside a message begins a new, indented line).
 - **`--follow`** prints the newest entries as without it, then goes on printing each new entry as it is made, until it is interrupted (`SIGINT`, `SIGTERM`, `SIGHUP`): exit code `0`. It asks the installation again about once a second. With `--json` it prints one JSON object on a line for each entry (the entry, with `"application"` beside its fields) and no enclosing object: the one command whose `--json` output is more than one object. When the installation stops answering it ends with `unreachable`, exit code `1`, after what it has printed; when the sign-in ends, with exit code `4`. With `--json` such an ending is one last line, the usual `{ "error": ... }` object.
-- A closed standard output ends `--follow` without a crash.
+- A closed standard output ends `--follow` without a crash: exit code `1`, reason `output-closed`, whether it was closed before the command started or while it ran (it is noticed when the next entry is printed).
 
 ### Deploying after going back
 
-`vm deploy` compares the project with the Application's **latest** Version, not the serving one: its migrations are the ones applied. So after a go-back, `migrations_applied` names only what the new Version adds to the latest Version's, the data-loss question is asked about those alone, and `migrations-diverged` is told against the latest Version's. (In "Deploying", "the serving Version" and "a Version is already serving" read so from this ticket on: the Application's latest Version, and an Application that has a Version.)
+`vm deploy` compares the project with the Application's **latest** Version (`latest_version`, read by itself: a deploy never reads the list of Versions), not the serving one: its migrations are the ones applied. So after a go-back, `migrations_applied` names only what the new Version adds to the latest Version's, the data-loss question is asked about those alone, and `migrations-diverged` is told against the latest Version's. (In "Deploying", "the serving Version" and "a Version is already serving" read so from this ticket on: the Application's latest Version, and an Application that has a Version.)
 
 ### The instruction file
 
@@ -1528,5 +1534,7 @@ From this ticket on the template's `AGENTS.md` names `vm versions`, `vm go-back`
 
 - An entry is made when its request ends: a request that never ends within the platform's limits has none until then, and what was printed by a request in flight when the program stops is only in the program's log.
 - Who went back and when is in the program's log only; the API does not list it.
+- Entries still waiting to be written when the process is ended are lost (at most the last 2 seconds' when the platform database answers); the program's log has their records.
+- The queue of entries waiting is one for all Applications: when one Application makes entries faster than the platform database takes them, other Applications' entries are dropped with its own, each told by `dropped_before`. No request is slowed.
 - Logs are kept by count (5,000 entries an Application), not by age; an installation cannot set another number yet.
 - A Contributor reads everything the Application printed, whatever User's request printed it.
