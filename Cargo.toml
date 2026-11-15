@@ -45,7 +45,7 @@ pg_query = "18.1.0"
 postgres-protocol = "0.6"
 # How postgres-protocol hands over the fields of a message.
 fallible-iterator = "0.2"
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "sync", "macros", "time", "io-util", "process"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "sync", "macros", "time", "io-util", "process", "signal"] }
 # Stopping a whole process group (`vm check` runs each of the project's
 # tools in a group of its own), behind a safe interface.
 rustix = { version = "1", default-features = false, features = ["std", "process"] }

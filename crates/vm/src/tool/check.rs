@@ -7,26 +7,47 @@
 //! packages (`not-installed`). Then the four checks, one after the other,
 //! each reporting every problem it finds: `manifest` (the SDK's tooling),
 //! `resources` (left out when the Manifest cannot be read), `migrations`
-//! (`drizzle-kit generate` against a copy of `migrations/`) and `types`
+//! (`drizzle-kit generate` against a copy of `migrations/`, which the
+//! check also reads itself: see [`migrations`]) and `types`
 //! (`tsc`). Warnings and notes come from the `resources` check.
 //!
-//! **Nothing in the project is made, changed or removed.** `drizzle-kit`
-//! writes its journal even when it writes no migration, so it is given a
-//! copy of `migrations/` in a private folder (mode `0700`) of the system's
-//! temporary folder, outside the project; [`Scratch`] removes it in every
-//! ending, the timeout included. `tsc` runs with `--noEmit`.
+//! **Nothing in the project is made, changed or removed.** What the check
+//! and its tools write goes in the check's own folder ([`Scratch`]):
+//! private (mode `0700`), in `TMPDIR`, made before the first tool runs,
+//! every tool's `TMPDIR`, and removed in every ending (passed, failed, out
+//! of time, interrupted). `drizzle-kit` writes its journal even when it
+//! writes no migration, so it is given a copy of `migrations/` there; `tsc`
+//! runs with `--noEmit`, and with `--incremental --tsBuildInfoFile` into
+//! the folder, so that a tsconfig's `incremental` or `composite` writes no
+//! build information beside it.
 //!
-//! **Bounds.** The whole check is held to `--timeout` (300 s without it);
-//! past it the check's future is dropped, which stops every tool's process
-//! group ([`child`]) and removes the copy. What is kept of each tool's
-//! output: [`TEXT_BYTES`] of each pipe (the Manifest's JSON:
-//! [`MANIFEST_BYTES`]), past which the rest is read and dropped; of `tsc`,
-//! the first [`MAX_TYPE_ERRORS`] errors, each line to [`LINE_BYTES`], the
-//! rest counted. Of the project's files: the first line of a generated
-//! file, a `package.json` to [`PACKAGE_JSON_BYTES`], the first
-//! [`MAX_PULLED`] folders of `resources/`, and a `migrations/` of at most
-//! [`MAX_MIGRATION_ENTRIES`] entries and [`MAX_MIGRATION_BYTES`] (past
-//! either the check ends with `project-file`).
+//! **Endings.** The whole check is held to `--timeout` (300 s without it),
+//! and `SIGINT`, `SIGTERM` and `SIGHUP` end it (`interrupted`): their
+//! handlers are in place before the first tool starts. Either way the
+//! check's future is dropped, which stops every tool's process group
+//! ([`child`]), and then the own folder is removed.
+//!
+//! **Bounds.** What is kept of each tool's output: [`TEXT_BYTES`] of each
+//! pipe (the Manifest's JSON: [`MANIFEST_BYTES`]), past which the rest is
+//! read and dropped; of `tsc`, the first [`MAX_TYPE_ERRORS`] errors, each
+//! line to [`LINE_BYTES`], the rest counted. Of the project's files: the
+//! first line of a generated file, a `package.json` to
+//! [`PACKAGE_JSON_BYTES`], the first [`MAX_PULLED`] folders of
+//! `resources/`, a journal to [`MAX_JOURNAL_BYTES`], and a `migrations/` of
+//! at most [`MAX_MIGRATION_ENTRIES`] entries and [`MAX_MIGRATION_BYTES`]
+//! (past either the check ends with `project-file`). A tool's words in a
+//! message: its first [`WORDS_LINES`] lines, [`WORDS_CHARS`] characters,
+//! without its stack and without the own folder's path.
+//!
+//! **Blocking file operations.** The check's own reading and copying of
+//! the project's files are blocking calls on the tool's one thread, and the
+//! timeout does not cut them off: a file system that hangs (a network
+//! mount gone) hangs the check. That is accepted here because these are a
+//! small project's files on the Builder's own machine, read once each and
+//! bounded as above; and moving them to `tokio::fs` would gain nothing,
+//! since it runs them on blocking threads that the runtime still waits for
+//! when the command ends. Everything that can run long (the tools, the
+//! installation) is inside the timeout.
 //!
 //! Every message is written for a Coding agent to act on, and names the
 //! fix. Messages hold text of the project's and of the installation's (a
@@ -45,6 +66,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
+use tokio::signal::unix::{Signal, SignalKind, signal};
 
 use super::child::{self, Kept, Lines, Sink};
 use super::credential_file::Place;
@@ -152,20 +174,69 @@ pub(super) async fn check(args: &CheckArgs) -> Result<Done, Ending> {
             ),
         )
     })?;
+    // In place before the first tool starts: from here on these signals end
+    // the check (below), not the program, so what it started is stopped.
+    let mut interrupt = listen(SignalKind::interrupt())?;
+    let mut terminate = listen(SignalKind::terminate())?;
+    let mut hangup = listen(SignalKind::hangup())?;
+    let own = Scratch::make().map_err(|e| own_folder_failed(&e))?;
     let limit = args.timeout.map_or(DEFAULT_TIMEOUT, Duration::from_secs);
     let stage = Cell::new(Stage::SignIn);
-    match tokio::time::timeout(limit, checked(&project, &stage)).await {
-        Ok(ended) => ended,
-        Err(_) => Err(Ending::new(
+    // When a signal comes or the time is up, the check's future is dropped
+    // inside `select!`: every tool's process group is stopped then. The own
+    // folder outlives it and is removed after, when nothing writes in it.
+    let ended = tokio::select! {
+        ended = tokio::time::timeout(limit, checked(&project, &own.path, &stage)) => match ended {
+            Ok(ended) => ended,
+            Err(_) => Err(Ending::new(
+                1,
+                "check-timed-out",
+                format!(
+                    "the check did not end within {} s and was stopped, with everything it started; it was in {}. Look at what that runs (src/db/schema.ts and what it imports are run by drizzle-kit), or give more time with --timeout <seconds>, then run vm check again",
+                    limit.as_secs(),
+                    stage.get().words()
+                ),
+            )),
+        },
+        _ = interrupt.recv() => Err(interrupted("SIGINT", stage.get())),
+        _ = terminate.recv() => Err(interrupted("SIGTERM", stage.get())),
+        _ = hangup.recv() => Err(interrupted("SIGHUP", stage.get())),
+    };
+    drop(own);
+    ended
+}
+
+/// A handler of `kind`, which from now on ends the check rather than the
+/// program.
+fn listen(kind: SignalKind) -> Result<Signal, Ending> {
+    signal(kind).map_err(|error| {
+        Ending::new(
             1,
-            "check-timed-out",
-            format!(
-                "the check did not end within {} s and was stopped, with everything it started; it was in {}. Look at what that runs (src/db/schema.ts and what it imports are run by drizzle-kit), or give more time with --timeout <seconds>, then run vm check again",
-                limit.as_secs(),
-                stage.get().words()
-            ),
-        )),
-    }
+            "failed",
+            format!("vm check cannot take its signals ({error}): run it again"),
+        )
+    })
+}
+
+fn interrupted(signal: &str, stage: Stage) -> Ending {
+    Ending::new(
+        1,
+        "interrupted",
+        format!(
+            "the check was interrupted ({signal}) in {}, and stopped everything it had started; nothing was decided: run vm check again",
+            stage.words()
+        ),
+    )
+}
+
+fn own_folder_failed(error: &io::Error) -> Ending {
+    Ending::new(
+        1,
+        "failed",
+        format!(
+            "vm check cannot make or use its own folder in the system's temporary folder ({error}): make room there, or set TMPDIR to a folder you can write, then run vm check again"
+        ),
+    )
 }
 
 /// A Resource as the check reads it from `GET /v1/resources`. Its texts are
@@ -189,6 +260,102 @@ struct Packages {
     drizzle_kit: PathBuf,
 }
 
+/// Where the check runs: the project, the check's own folder (every tool's
+/// `TMPDIR`; the copy of `migrations/` and `tsc`'s build information are
+/// in it), and how a tool's words are cleaned of it.
+struct Cx<'a> {
+    project: &'a Path,
+    own: &'a Path,
+    /// What the own folder is written as in a tool's words, and what it is
+    /// written as instead, longest first.
+    masks: Vec<(String, &'static str)>,
+    /// The own folder's name: a line of a tool's words that still holds it
+    /// is left out.
+    own_name: String,
+}
+
+/// What a tool's words say instead of a path of the own folder.
+const OWN_FOLDER: &str = "(the check's own folder)";
+
+impl<'a> Cx<'a> {
+    fn new(project: &'a Path, own: &'a Path) -> Self {
+        let canonical = fs::canonicalize(own).unwrap_or_else(|_| own.to_path_buf());
+        let relative = from_to(project, &canonical);
+        let text = |path: &Path| path.to_string_lossy().into_owned();
+        let mut masks = Vec::new();
+        for base in [text(&canonical), text(own), text(&relative)] {
+            masks.push((format!("./{base}/migrations"), "migrations"));
+            masks.push((format!("{base}/migrations"), "migrations"));
+            masks.push((format!("./{base}"), OWN_FOLDER));
+            masks.push((base, OWN_FOLDER));
+        }
+        masks.sort_by_key(|(from, _)| std::cmp::Reverse(from.len()));
+        Self {
+            project,
+            own,
+            masks,
+            own_name: own
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+        }
+    }
+
+    /// The copy of `migrations/`.
+    fn copy(&self) -> PathBuf {
+        self.own.join("migrations")
+    }
+
+    /// The first lines of a tool's own words: standard error, then standard
+    /// output; without the empty lines, the lines of a stack trace (`at
+    /// ...`), and the own folder (a file of the copy of `migrations/` named
+    /// as the project's).
+    fn words(&self, err: &str, out: &str) -> String {
+        let mut lines = Vec::new();
+        for line in err.lines().chain(out.lines()) {
+            if lines.len() >= WORDS_LINES {
+                break;
+            }
+            let line = line.trim();
+            if line.is_empty() || line.starts_with("at ") {
+                continue;
+            }
+            let line = self
+                .masks
+                .iter()
+                .fold(line.to_owned(), |line, (from, to)| line.replace(from, to));
+            if !self.own_name.is_empty() && line.contains(&self.own_name) {
+                continue;
+            }
+            lines.push(line);
+        }
+        let joined = lines.join(" / ");
+        if joined.chars().count() > WORDS_CHARS {
+            let cut: String = joined.chars().take(WORDS_CHARS).collect();
+            format!("{cut} ...")
+        } else {
+            joined
+        }
+    }
+
+    /// Whether a tool's words name a file of the copy of `migrations/`.
+    fn names_the_copy(&self, text: &str) -> bool {
+        self.masks
+            .iter()
+            .any(|(from, to)| *to == "migrations" && text.contains(from.as_str()))
+    }
+
+    /// Runs `node <args>` in the project with the own folder as `TMPDIR`.
+    async fn run<O: Sink, E: Sink>(
+        &self,
+        args: &[&OsStr],
+        out: O,
+        err: E,
+    ) -> io::Result<child::Ran<O, E>> {
+        child::run(self.project, self.own, args, out, err).await
+    }
+}
+
 /// What the four checks found.
 #[derive(Default)]
 struct Found {
@@ -197,27 +364,28 @@ struct Found {
     notes: Vec<Value>,
 }
 
-async fn checked(project: &Path, stage: &Cell<Stage>) -> Result<Done, Ending> {
+async fn checked(project: &Path, own: &Path, stage: &Cell<Stage>) -> Result<Done, Ending> {
     let place = Place::from_environment().map_err(Ending::credential_file)?;
     let kept = read_kept(&place)?;
     let registry: Registry = shaped(kept.connect, get_signed_in(&kept, "/v1/resources").await?)?;
+    let cx = Cx::new(project, own);
 
     stage.set(Stage::Node);
-    node_is_there(project).await?;
+    node_is_there(&cx).await?;
     stage.set(Stage::Packages);
     let packages = packages(project)?;
 
     let mut found = Found::default();
     stage.set(Stage::Manifest);
-    let declared = manifest(project, &packages, &mut found).await?;
+    let declared = manifest(&cx, &packages, &mut found).await?;
     if let Some(declared) = &declared {
         stage.set(Stage::Resources);
         resources(project, declared, &registry, &mut found);
     }
     stage.set(Stage::Migrations);
-    migrations(project, &packages, &mut found).await?;
+    migrations(&cx, &packages, &mut found).await?;
     stage.set(Stage::Types);
-    types(project, &packages, &mut found).await?;
+    types(&cx, &packages, &mut found).await?;
     report(found)
 }
 
@@ -300,7 +468,7 @@ fn tool_failed(tool: &str, what: &str) -> Ending {
 }
 
 /// That `node` is on the `PATH` and is 22 or later.
-async fn node_is_there(project: &Path) -> Result<(), Ending> {
+async fn node_is_there(cx: &Cx<'_>) -> Result<(), Ending> {
     let missing = |found: &str| {
         Ending::new(
             1,
@@ -310,13 +478,13 @@ async fn node_is_there(project: &Path) -> Result<(), Ending> {
             ),
         )
     };
-    let ran = match child::run(
-        project,
-        &[OsStr::new("--version")],
-        Kept::up_to(TEXT_BYTES),
-        Kept::up_to(TEXT_BYTES),
-    )
-    .await
+    let ran = match cx
+        .run(
+            &[OsStr::new("--version")],
+            Kept::up_to(TEXT_BYTES),
+            Kept::up_to(TEXT_BYTES),
+        )
+        .await
     {
         Ok(ran) => ran,
         Err(error) if error.kind() == ErrorKind::NotFound => {
@@ -404,44 +572,25 @@ fn ended(status: std::process::ExitStatus) -> String {
     )
 }
 
-/// The first lines of a tool's own words: standard error, then standard
-/// output, the empty lines left out.
-fn tool_words(err: &str, out: &str) -> String {
-    let mut lines = Vec::new();
-    for line in err.lines().chain(out.lines()) {
-        let line = line.trim();
-        if !line.is_empty() && lines.len() < WORDS_LINES {
-            lines.push(line);
-        }
-    }
-    let joined = lines.join(" / ");
-    if joined.chars().count() > WORDS_CHARS {
-        let cut: String = joined.chars().take(WORDS_CHARS).collect();
-        format!("{cut} ...")
-    } else {
-        joined
-    }
-}
-
 /// The `manifest` check: the Resources the Manifest declares, by name, with
 /// the Access level of each; none when it cannot be read.
 async fn manifest(
-    project: &Path,
+    cx: &Cx<'_>,
     packages: &Packages,
     found: &mut Found,
 ) -> Result<Option<BTreeMap<String, String>>, Ending> {
-    let ran = child::run(
-        project,
-        &[
-            packages.tooling.as_os_str(),
-            OsStr::new("manifest"),
-            project.as_os_str(),
-        ],
-        Kept::up_to(MANIFEST_BYTES),
-        Kept::up_to(TEXT_BYTES),
-    )
-    .await
-    .map_err(|error| tool_failed("node", &format!("cannot be started ({error})")))?;
+    let ran = cx
+        .run(
+            &[
+                packages.tooling.as_os_str(),
+                OsStr::new("manifest"),
+                cx.project.as_os_str(),
+            ],
+            Kept::up_to(MANIFEST_BYTES),
+            Kept::up_to(TEXT_BYTES),
+        )
+        .await
+        .map_err(|error| tool_failed("node", &format!("cannot be started ({error})")))?;
     let answer: Option<Value> = if ran.out.over {
         None
     } else {
@@ -498,7 +647,7 @@ async fn manifest(
             &format!(
                 "{} without an answer it understands ({})",
                 ended(ran.status),
-                tool_words(&ran.err.text(), "")
+                cx.words(&ran.err.text(), "")
             ),
         )),
     }
@@ -667,7 +816,8 @@ fn pulled(project: &Path, name: &str, found: &mut Found) {
     }));
 }
 
-/// A private folder outside the project, removed when this is dropped.
+/// The check's own folder: private (mode `0700`), in the system's
+/// temporary folder (`TMPDIR`), removed when this is dropped.
 struct Scratch {
     path: PathBuf,
 }
@@ -758,21 +908,155 @@ fn sql_files(dir: &Path) -> BTreeSet<String> {
         .unwrap_or_default()
 }
 
-/// The `migrations` check: `drizzle-kit generate` against a copy of
-/// `migrations/`, outside the project.
-async fn migrations(project: &Path, packages: &Packages, found: &mut Found) -> Result<(), Ending> {
-    let scratch_failed = |error: io::Error| {
-        Ending::new(
-            1,
-            "failed",
-            format!(
-                "vm check cannot make its private folder in the system's temporary folder ({error}): make room there or set TMPDIR to a folder you can write, then run vm check again"
-            ),
-        )
+/// What the check finds wrong in `migrations/` by reading it itself: a
+/// file (named as the project's) and what is wrong with it.
+struct Unreadable {
+    file: String,
+    why: String,
+}
+
+/// The journal `drizzle-kit` keeps: the migrations, in order, by tag.
+#[derive(Deserialize)]
+struct Journal {
+    entries: Vec<JournalEntry>,
+}
+
+#[derive(Deserialize)]
+struct JournalEntry {
+    tag: String,
+}
+
+/// The largest journal read.
+const MAX_JOURNAL_BYTES: u64 = 4 * 1024 * 1024;
+
+/// The disagreements between the journal and the `.sql` files named in one
+/// message.
+const MAX_NAMED: usize = 10;
+
+/// Reads the copy of `migrations/` as `drizzle-kit` wrote it: the journal
+/// and every snapshot parse as JSON, and the journal and the `.sql` files
+/// agree (each migration the journal names has its `.sql` file, each `.sql`
+/// file is named). A folder with no journal and no `.sql` file holds no
+/// migration and is as it should be.
+fn read_migrations(copy: &Path, sql: &BTreeSet<String>) -> Result<(), Unreadable> {
+    let journal_path = copy.join("meta").join("_journal.json");
+    let journal_file = "migrations/meta/_journal.json".to_owned();
+    let file = match File::open(&journal_path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            return match sql.first() {
+                None => Ok(()),
+                Some(first) => Err(Unreadable {
+                    file: journal_file,
+                    why: format!("is not there, and migrations/{first} is"),
+                }),
+            };
+        }
+        Err(error) => {
+            return Err(Unreadable {
+                file: journal_file,
+                why: format!("cannot be read ({error})"),
+            });
+        }
     };
-    let scratch = Scratch::make().map_err(scratch_failed)?;
-    let out = scratch.path.join("migrations");
-    let own = project.join("migrations");
+    let mut text = Vec::new();
+    file.take(MAX_JOURNAL_BYTES.saturating_add(1))
+        .read_to_end(&mut text)
+        .map_err(|error| Unreadable {
+            file: journal_file.clone(),
+            why: format!("cannot be read ({error})"),
+        })?;
+    if u64::try_from(text.len()).map_or(true, |n| n > MAX_JOURNAL_BYTES) {
+        return Err(Unreadable {
+            file: journal_file,
+            why: format!("is larger than {} MiB", MAX_JOURNAL_BYTES / (1024 * 1024)),
+        });
+    }
+    let journal: Journal = serde_json::from_slice(&text).map_err(|error| Unreadable {
+        file: journal_file.clone(),
+        why: format!("is not the journal drizzle-kit writes ({error})"),
+    })?;
+
+    // Every snapshot, without keeping it: the copy is bounded already.
+    let mut snapshots: Vec<String> = fs::read_dir(copy.join("meta"))
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter_map(|e| e.file_name().into_string().ok())
+                .filter(|n| n.ends_with("_snapshot.json"))
+                .collect()
+        })
+        .unwrap_or_default();
+    snapshots.sort();
+    for name in snapshots {
+        let file = format!("migrations/meta/{name}");
+        let opened = File::open(copy.join("meta").join(&name)).map_err(|error| Unreadable {
+            file: file.clone(),
+            why: format!("cannot be read ({error})"),
+        })?;
+        serde_json::from_reader::<_, serde::de::IgnoredAny>(io::BufReader::new(opened)).map_err(
+            |error| Unreadable {
+                file,
+                why: format!("is not a snapshot drizzle-kit writes ({error})"),
+            },
+        )?;
+    }
+
+    let tags: BTreeSet<String> = journal
+        .entries
+        .into_iter()
+        .map(|e| format!("{}.sql", e.tag))
+        .collect();
+    let mut wrong = Vec::new();
+    for gone in tags.difference(sql) {
+        wrong.push(format!(
+            "migrations/{gone} is named in migrations/meta/_journal.json and is not there"
+        ));
+    }
+    for stray in sql.difference(&tags) {
+        wrong.push(format!(
+            "migrations/{stray} is not named in migrations/meta/_journal.json"
+        ));
+    }
+    if wrong.is_empty() {
+        return Ok(());
+    }
+    let more = wrong.len().saturating_sub(MAX_NAMED);
+    wrong.truncate(MAX_NAMED);
+    let mut why = wrong.join("; ");
+    if more > 0 {
+        why.push_str(&format!("; and {more} more"));
+    }
+    Err(Unreadable {
+        file: "migrations/".to_owned(),
+        why: format!("does not agree with its journal: {why}"),
+    })
+}
+
+/// The fix said with every `migrations-unreadable`.
+const BRING_BACK: &str = "Migrations are never edited by hand: bring migrations/ back as it was last committed (git checkout -- migrations, or git restore migrations), then generate the migrations the schema needs with drizzle-kit and run vm check again";
+
+/// The `migrations` check: `drizzle-kit generate` against a copy of
+/// `migrations/` in the check's own folder, and the copy read by the check
+/// itself.
+///
+/// How it is decided, from what can be observed reliably:
+/// 1. The check reads the copy itself ([`read_migrations`]). When the
+///    journal or a snapshot does not parse, or the journal and the `.sql`
+///    files disagree, it is `migrations-unreadable`, naming the file; with
+///    `drizzle-kit`'s words too when it did not end in step.
+/// 2. Else a new `.sql` file in the copy is `migrations-behind`.
+/// 3. Else `drizzle-kit`'s sentence "No schema changes" on its standard
+///    output (where it writes it, and not where the schema's own output
+///    lands with an error) is in step.
+/// 4. Else its error "Interactive prompts require a TTY" on standard error
+///    (a question about a rename) is `migrations-behind`.
+/// 5. Else, when its words name a file of the copy, it could not read
+///    `migrations/`: `migrations-unreadable`.
+/// 6. Else it could not load `src/db/schema.ts`: `own-schema-failed`.
+async fn migrations(cx: &Cx<'_>, packages: &Packages, found: &mut Found) -> Result<(), Ending> {
+    let out = cx.copy();
+    let own = cx.project.join("migrations");
     if own.is_dir() {
         let mut budget = Budget {
             entries: MAX_MIGRATION_ENTRIES,
@@ -788,57 +1072,79 @@ async fn migrations(project: &Path, packages: &Packages, found: &mut Found) -> R
             )
         })?;
     } else {
-        fs::create_dir(&out).map_err(scratch_failed)?;
+        fs::create_dir(&out).map_err(|e| own_folder_failed(&e))?;
     }
     let before = sql_files(&out);
+    let read = read_migrations(&out, &before);
     // drizzle-kit puts `./` in front of the folder it is given, so it is
     // given the copy's path relative to the project.
     let out_from_project = fs::canonicalize(&out)
-        .map(|out| from_to(project, &out))
-        .map_err(scratch_failed)?;
-    let ran = child::run(
-        project,
-        &[
-            packages.drizzle_kit.as_os_str(),
-            OsStr::new("generate"),
-            OsStr::new("--dialect"),
-            OsStr::new("postgresql"),
-            OsStr::new("--schema"),
-            OsStr::new("src/db/schema.ts"),
-            OsStr::new("--out"),
-            out_from_project.as_os_str(),
-        ],
-        Kept::up_to(TEXT_BYTES),
-        Kept::up_to(TEXT_BYTES),
-    )
-    .await
-    .map_err(|error| tool_failed("node", &format!("cannot be started ({error})")))?;
+        .map(|out| from_to(cx.project, &out))
+        .map_err(|e| own_folder_failed(&e))?;
+    let ran = cx
+        .run(
+            &[
+                packages.drizzle_kit.as_os_str(),
+                OsStr::new("generate"),
+                OsStr::new("--dialect"),
+                OsStr::new("postgresql"),
+                OsStr::new("--schema"),
+                OsStr::new("src/db/schema.ts"),
+                OsStr::new("--out"),
+                out_from_project.as_os_str(),
+            ],
+            Kept::up_to(TEXT_BYTES),
+            Kept::up_to(TEXT_BYTES),
+        )
+        .await
+        .map_err(|error| tool_failed("node", &format!("cannot be started ({error})")))?;
     let written = sql_files(&out).difference(&before).count();
     let (out_text, err_text) = (ran.out.text(), ran.err.text());
-    let said = |words: &str| out_text.contains(words) || err_text.contains(words);
+    let in_step = out_text.lines().any(|l| l.contains("No schema changes"));
+    let asked = err_text.lines().any(|l| {
+        l.trim_start()
+            .starts_with("Error: Interactive prompts require a TTY")
+    });
+    let tool_said = cx.words(&err_text, &out_text);
+    let unreadable = |what: String| {
+        json!({
+            "check": "migrations",
+            "reason": "migrations-unreadable",
+            "message": format!("{what}. {BRING_BACK}"),
+        })
+    };
     let behind = |message: String| json!({ "check": "migrations", "reason": "migrations-behind", "message": message });
-    if written > 0 {
+    if let Err(Unreadable { file, why }) = read {
+        let mut what = format!("{file} {why}");
+        if written == 0 && !in_step && !asked && !tool_said.is_empty() {
+            what.push_str(&format!("; drizzle-kit says: {tool_said}"));
+        }
+        found.problems.push(unreadable(what));
+    } else if written > 0 {
         found.problems.push(behind(format!(
             "src/db/schema.ts changed since the last migration in migrations/: generating migrations now would write one. Generate it with `{GENERATE}`, read the SQL it wrote (ask the Builder before one that destroys data), then run vm check again"
         )));
-    } else if said("No schema changes") {
+    } else if in_step {
         // In step.
-    } else if said("Interactive prompts require a TTY") {
+    } else if asked {
         found.problems.push(behind(format!(
             "src/db/schema.ts changed since the last migration in migrations/, and drizzle-kit has a question about the change (a table or column renamed, or created anew?) that only a terminal can answer: run `{GENERATE}` in a terminal and answer it, or make the change in steps (add the new column, copy the values, remove the old one), then run vm check again"
+        )));
+    } else if cx.names_the_copy(&err_text) || cx.names_the_copy(&out_text) {
+        found.problems.push(unreadable(format!(
+            "drizzle-kit cannot read migrations/ (it {}: {tool_said})",
+            ended(ran.status)
         )));
     } else {
         found.problems.push(json!({
             "check": "migrations",
             "reason": "own-schema-failed",
             "message": format!(
-                "drizzle-kit cannot load src/db/schema.ts (it {}: {}): correct src/db/schema.ts (it must be there, load without throwing, and import only what is there), then run vm check again",
+                "drizzle-kit cannot load src/db/schema.ts (it {}: {tool_said}): correct src/db/schema.ts (it must be there, load without throwing, and import only what is there), then run vm check again",
                 ended(ran.status),
-                tool_words(&err_text, &out_text)
             ),
         }));
     }
-    drop(scratch);
     Ok(())
 }
 
@@ -955,22 +1261,30 @@ impl Sink for TypeErrors {
 
 /// The `types` check: `tsc --noEmit` with the project's own
 /// `tsconfig.json`.
-async fn types(project: &Path, packages: &Packages, found: &mut Found) -> Result<(), Ending> {
-    let ran = child::run(
-        project,
-        &[
-            packages.tsc.as_os_str(),
-            OsStr::new("--noEmit"),
-            OsStr::new("-p"),
-            OsStr::new("tsconfig.json"),
-            OsStr::new("--pretty"),
-            OsStr::new("false"),
-        ],
-        TypeErrors::new(),
-        Kept::up_to(TEXT_BYTES),
-    )
-    .await
-    .map_err(|error| tool_failed("node", &format!("cannot be started ({error})")))?;
+async fn types(cx: &Cx<'_>, packages: &Packages, found: &mut Found) -> Result<(), Ending> {
+    // Build information, which `incremental` or `composite` in the
+    // project's tsconfig.json would have tsc write beside it, goes to the
+    // check's own folder: these two flags are taken whatever the tsconfig
+    // says.
+    let build_information = cx.own.join("tsc.tsbuildinfo");
+    let ran = cx
+        .run(
+            &[
+                packages.tsc.as_os_str(),
+                OsStr::new("--noEmit"),
+                OsStr::new("-p"),
+                OsStr::new("tsconfig.json"),
+                OsStr::new("--pretty"),
+                OsStr::new("false"),
+                OsStr::new("--incremental"),
+                OsStr::new("--tsBuildInfoFile"),
+                build_information.as_os_str(),
+            ],
+            TypeErrors::new(),
+            Kept::up_to(TEXT_BYTES),
+        )
+        .await
+        .map_err(|error| tool_failed("node", &format!("cannot be started ({error})")))?;
     let errors = ran.out.read;
     for error in &errors.kept {
         let message = match (&error.file, error.line, error.column) {
@@ -1011,7 +1325,7 @@ async fn types(project: &Path, packages: &Packages, found: &mut Found) -> Result
             json!(format!(
                 "tsc {} and gave no error it could place ({}): correct what it names, then run vm check again",
                 ended(ran.status),
-                tool_words(&ran.err.text(), &errors.other.text())
+                cx.words(&ran.err.text(), &errors.other.text())
             )),
         );
         for field in ["file", "line", "column"] {

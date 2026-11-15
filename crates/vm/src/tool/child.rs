@@ -1,10 +1,11 @@
 //! A tool of the project's, run by `vm check` (blackbox/CONTRACT.md,
 //! "Checking a project"): `node` from the `PATH` with the arguments given,
-//! in the project's folder, with nothing on its standard input.
+//! in the project's folder, with the check's own folder as its `TMPDIR`
+//! and nothing on its standard input.
 //!
 //! - **Its own process group.** The tool is started as the leader of a new
 //!   group, and the whole group is sent `SIGKILL` as soon as the tool has
-//!   ended, and again (through [`Group`]'s `Drop`) if the run is given up
+//!   ended (before its leader is reaped: see `Group::stop`), and again (through [`Group`]'s `Drop`) if the run is given up
 //!   before that, as when the check's time is up and its future is dropped.
 //!   So nothing it started is left running, whichever way the check ends.
 //!   (A process that leaves the group on purpose is not followed.)
@@ -21,7 +22,9 @@ use std::io;
 use std::path::Path;
 use std::process::{ExitStatus, Stdio};
 
-use rustix::process::{Pid, Signal, kill_process_group};
+use std::time::Duration;
+
+use rustix::process::{Pid, Signal, WaitId, WaitIdOptions, kill_process_group, waitid};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 /// How much of a pipe is read at a time.
@@ -133,6 +136,18 @@ impl Group {
 
     /// Sends `SIGKILL` to every process of the group, once. A group with
     /// no process left is no error.
+    ///
+    /// Why the id is still the group's: a group's id is its leader's process
+    /// id, and the kernel gives that number to no other process while any
+    /// process of the group lives, the leader's zombie included. So `stop`
+    /// is safe while the leader runs or has exited and is not yet reaped:
+    /// that is when [`run`] calls it (it learns of the exit with a `waitid`
+    /// that does not reap, then signals, then reaps), and when a run given
+    /// up is dropped (the leader is reaped only after, by tokio, as the
+    /// child is dropped). Only when `waitid` itself fails is the leader
+    /// reaped first; then, if no process of the group is left either, the
+    /// number is free and could in principle be given to a new process in
+    /// the moment before the signal, which would reach that process's group.
     fn stop(&mut self) {
         if !self.stopped {
             self.stopped = true;
@@ -149,11 +164,35 @@ impl Drop for Group {
     }
 }
 
-/// Runs `node <args>` in `cwd` and reads its pipes into `out` and `err`.
-/// The error is the one of starting it (`NotFound`: no `node` on the
-/// `PATH`).
+/// How often a running tool is asked whether it has exited.
+const EXIT_POLL: Duration = Duration::from_millis(10);
+
+/// Waits until the process `leader` has exited, without reaping it: asked
+/// every [`EXIT_POLL`] with `waitid(WEXITED | WNOWAIT | WNOHANG)`, which
+/// leaves it waitable for tokio's `wait`, and never blocks the thread.
+/// `false` when that cannot be asked; the caller then waits otherwise.
+async fn exited(leader: Option<Pid>) -> bool {
+    let Some(leader) = leader else {
+        return false;
+    };
+    loop {
+        match waitid(
+            WaitId::Pid(leader),
+            WaitIdOptions::EXITED | WaitIdOptions::NOWAIT | WaitIdOptions::NOHANG,
+        ) {
+            Ok(Some(_)) => return true,
+            Ok(None) => tokio::time::sleep(EXIT_POLL).await,
+            Err(_) => return false,
+        }
+    }
+}
+
+/// Runs `node <args>` in `cwd`, with `tmpdir` as its `TMPDIR`, and reads
+/// its pipes into `out` and `err`. The error is the one of starting it
+/// (`NotFound`: no `node` on the `PATH`).
 pub async fn run<O: Sink, E: Sink>(
     cwd: &Path,
+    tmpdir: &Path,
     args: &[&OsStr],
     out: O,
     err: E,
@@ -162,6 +201,7 @@ pub async fn run<O: Sink, E: Sink>(
     command
         .args(args)
         .current_dir(cwd)
+        .env("TMPDIR", tmpdir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -173,12 +213,19 @@ pub async fn run<O: Sink, E: Sink>(
     let mut group = Group::led_by(child.id());
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
+    let leader = group.leader;
     let waited = async {
-        let status = child.wait().await;
         // The tool has ended: what it started ends too, and the pipes
-        // that those held close.
-        group.stop();
-        status
+        // that those held close. Before the leader is reaped where that
+        // can be known (see `Group::stop`), else just after.
+        if exited(leader).await {
+            group.stop();
+            child.wait().await
+        } else {
+            let status = child.wait().await;
+            group.stop();
+            status
+        }
     };
     let (status, out, err) = tokio::join!(waited, drain(stdout, out), drain(stderr, err));
     Ok(Ran {

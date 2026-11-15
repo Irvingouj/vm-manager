@@ -4,6 +4,8 @@
 //! `crates/vm/build.rs` from `sdk/`. The versions come from the root's
 //! `package-lock.json` and `sdk/package.json` at build time (`versions`).
 
+use std::borrow::Cow;
+
 /// The versions `build.rs` read.
 mod versions {
     include!(concat!(env!("OUT_DIR"), "/versions.rs"));
@@ -45,7 +47,8 @@ pub fn tarball_path() -> String {
 pub struct File {
     /// Relative to the project, with `/` between names.
     pub path: String,
-    pub bytes: Vec<u8>,
+    /// Borrowed from the program when there is nothing to fill in.
+    pub bytes: Cow<'static, [u8]>,
 }
 
 /// Every file of a new project named `name` (an Application's name, so
@@ -55,12 +58,16 @@ pub fn files(name: &str) -> Vec<File> {
         .iter()
         .map(|(path, text)| File {
             path: (*path).to_owned(),
-            bytes: filled(text, name).into_bytes(),
+            bytes: if text.contains("{{") {
+                Cow::Owned(filled(text, name).into_bytes())
+            } else {
+                Cow::Borrowed(text.as_bytes())
+            },
         })
         .collect();
     files.push(File {
         path: tarball_path(),
-        bytes: SDK_TARBALL.to_vec(),
+        bytes: Cow::Borrowed(SDK_TARBALL),
     });
     files.sort_by(|a, b| a.path.cmp(&b.path));
     files
