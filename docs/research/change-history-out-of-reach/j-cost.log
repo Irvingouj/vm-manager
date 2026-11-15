@@ -137,3 +137,93 @@ J rows=1000000, varchar(50) to text (no rewrite): a Version median 40 ms [40]
 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 170.92s
 # whole run: 259 s
 exit 0
+
+######## after the second review: J_STAGES=partitions, after b1910d3 (the first step), middle 65ac231
+# building: before 9643cb1, after b1910d3, middle 65ac231
+# built in 33 s
+# 2026-11-15T00:03:03Z on Linux 6.8.0-1070-azure x86_64, 12 CPUs
+######## before: vm at before, parts partitions, J_ROWS 100000, J_ROUNDS 3
+J partitions (a), none before: 100 `SELECT 1` median 54 ms [54 53 55]; 100 partitions made median 147 ms [136 147 160]; a partition 0.93 ms more than a `SELECT 1`
+J partitions (a), none before: 200 `SELECT 1` median 109 ms [112 109 108]; 200 partitions made median 388 ms [311 388 388]; a partition 1.40 ms more than a `SELECT 1`
+J partitions (b), 1000 before: a Version of one `SELECT 1` median 211.5 ms [214 211 213 208 211]; of 301 median 269.4 ms [269 271 269 267 272]; a statement 0.193 ms
+J partitions (b), 1000 before: 100 `SELECT 1` median 229 ms [229 228 231]; 100 partitions made median 425 ms [425 425 426]; a partition 1.96 ms more than a `SELECT 1`
+J partitions (b), 1000 before: 200 `SELECT 1` median 252 ms [251 253 252]; 200 partitions made median 669 ms [678 669 668]; a partition 2.09 ms more than a `SELECT 1`
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 13.37s
+######## middle: vm at middle, parts partitions, J_ROWS 100000, J_ROUNDS 3
+J partitions (a), none before: 100 `SELECT 1` median 57 ms [58 57 57]; 100 partitions made median 250 ms [214 250 294]; a partition 1.93 ms more than a `SELECT 1`
+J partitions (a), none before: 200 `SELECT 1` median 130 ms [129 130 131]; 200 partitions made median 837 ms [669 837 960]; a partition 3.54 ms more than a `SELECT 1`
+J partitions (b), 1000 before: a Version of one `SELECT 1` median 214.0 ms [218 214 213 213 217]; of 301 median 340.4 ms [343 340 337 347 340]; a statement 0.421 ms
+J partitions (b), 1000 before: 100 `SELECT 1` median 257 ms [254 257 263]; 100 partitions made median 776 ms [764 776 824]; a partition 5.19 ms more than a `SELECT 1`
+J partitions (b), 1000 before: 200 `SELECT 1` median 307 ms [307 305 312]; 200 partitions made median 1435 ms [1435 1436 1431]; a partition 5.64 ms more than a `SELECT 1`
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 19.20s
+######## after: vm at after, parts partitions, J_ROWS 100000, J_ROUNDS 3
+J partitions (a), none before: 100 `SELECT 1` median 59 ms [58 59 59]; 100 partitions made median 262 ms [220 262 309]; a partition 2.03 ms more than a `SELECT 1`
+J partitions (a), none before: 200 `SELECT 1` median 123 ms [122 124 123]; 200 partitions made median 781 ms [667 781 891]; a partition 3.29 ms more than a `SELECT 1`
+J partitions (b), 1000 before: a Version of one `SELECT 1` median 212.4 ms [216 212 212 213 210]; of 301 median 308.9 ms [309 310 308 308 309]; a statement 0.322 ms
+J partitions (b), 1000 before: 100 `SELECT 1` median 245 ms [245 246 245]; 100 partitions made median 774 ms [763 774 776]; a partition 5.29 ms more than a `SELECT 1`
+J partitions (b), 1000 before: 200 `SELECT 1` median 287 ms [291 287 285]; 200 partitions made median 1428 ms [1409 1428 1443]; a partition 5.71 ms more than a `SELECT 1`
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 18.75s
+# whole run: 84 s
+exit 0
+
+######## after the second review: J_STAGES="partitions 1", after dff5414, middle 65ac231
+# building: before 9643cb1, after dff5414, middle 65ac231
+# built in 32 s
+# 2026-11-15T00:10:35Z on Linux 6.8.0-1070-azure x86_64, 12 CPUs
+######## before: vm at before, parts partitions, J_ROWS 100000, J_ROUNDS 3
+J partitions (a), none before: 100 `SELECT 1` median 52 ms [53 52 52]; 100 partitions made median 149 ms [136 149 165]; a partition 0.97 ms more than a `SELECT 1`
+J partitions (a), none before: 200 `SELECT 1` median 110 ms [110 111 108]; 200 partitions made median 362 ms [307 362 390]; a partition 1.26 ms more than a `SELECT 1`
+J partitions (b), 1000 before: a Version of one `SELECT 1` median 264.9 ms [261 265 266 265 260]; of 301 median 322.0 ms [322 319 328 321 325]; a statement 0.191 ms
+J partitions (b), 1000 before: 100 `SELECT 1` median 282 ms [281 282 286]; 100 partitions made median 432 ms [430 433 432]; a partition 1.50 ms more than a `SELECT 1`
+J partitions (b), 1000 before: 200 `SELECT 1` median 252 ms [252 251 254]; 200 partitions made median 673 ms [669 680 673]; a partition 2.10 ms more than a `SELECT 1`
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 13.96s
+######## middle: vm at middle, parts partitions, J_ROWS 100000, J_ROUNDS 3
+J partitions (a), none before: 100 `SELECT 1` median 57 ms [57 57 56]; 100 partitions made median 245 ms [214 245 291]; a partition 1.88 ms more than a `SELECT 1`
+J partitions (a), none before: 200 `SELECT 1` median 130 ms [130 130 134]; 200 partitions made median 844 ms [667 844 967]; a partition 3.57 ms more than a `SELECT 1`
+J partitions (b), 1000 before: a Version of one `SELECT 1` median 216.1 ms [214 214 218 216 216]; of 301 median 343.6 ms [339 344 340 352 344]; a statement 0.425 ms
+J partitions (b), 1000 before: 100 `SELECT 1` median 259 ms [259 262 258]; 100 partitions made median 771 ms [753 771 783]; a partition 5.13 ms more than a `SELECT 1`
+J partitions (b), 1000 before: 200 `SELECT 1` median 306 ms [306 306 309]; 200 partitions made median 1409 ms [1409 1392 1434]; a partition 5.51 ms more than a `SELECT 1`
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 19.11s
+######## after: vm at after, parts partitions, J_ROWS 100000, J_ROUNDS 3
+J partitions (a), none before: 100 `SELECT 1` median 58 ms [60 58 57]; 100 partitions made median 215 ms [199 215 243]; a partition 1.57 ms more than a `SELECT 1`
+J partitions (a), none before: 200 `SELECT 1` median 121 ms [121 121 123]; 200 partitions made median 541 ms [484 541 601]; a partition 2.10 ms more than a `SELECT 1`
+J partitions (b), 1000 before: a Version of one `SELECT 1` median 213.0 ms [213 213 211 214 213]; of 301 median 307.1 ms [307 308 307 307 310]; a statement 0.314 ms
+J partitions (b), 1000 before: 100 `SELECT 1` median 249 ms [249 248 249]; 100 partitions made median 559 ms [556 559 570]; a partition 3.11 ms more than a `SELECT 1`
+J partitions (b), 1000 before: 200 `SELECT 1` median 286 ms [288 286 286]; 200 partitions made median 972 ms [967 972 986]; a partition 3.43 ms more than a `SELECT 1`
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 15.88s
+#### round 1
+######## before: vm at before, parts statements,rewrite, J_ROWS 100000, J_ROUNDS 3
+J tables=10: a Version with one migration of one `SELECT 1` median 35.4 ms [34 35 35 36 36]; of 301 median 93.2 ms [92 92 93 96 96]; a statement 0.193 ms
+J tables=10: a Version with 21 migrations of one `SELECT 1` median 152.0 ms [151 151 153 153 152]; a migration 5.828 ms
+J tables=500: a Version with one migration of one `SELECT 1` median 129.2 ms [131 127 129 129 129]; of 301 median 187.5 ms [189 185 187 187 194]; a statement 0.194 ms
+J tables=500: a Version with 21 migrations of one `SELECT 1` median 1597.1 ms [1598 1584 1596 1605 1597]; a migration 73.396 ms
+J rows=100000: the table filled by a migration in 848 ms
+J rows=100000, every row changes (ALTER ... TYPE ... USING amount + 1): a Version median 187 ms [187 187 188]
+J rows=100000, no row changes (ALTER ... TYPE): a Version median 186 ms [186 186 180]
+J rows=100000, every row changes, the statement in a DO block: a Version median 186 ms [187 184 186]
+J rows=100000, varchar(50) to text (no rewrite): a Version median 131 ms [131 131 130]
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 47.82s
+######## middle: vm at middle, parts statements,rewrite, J_ROWS 100000, J_ROUNDS 3
+J tables=10: a Version with one migration of one `SELECT 1` median 38.5 ms [37 39 37 39 38]; of 301 median 103.4 ms [103 104 103 103 107]; a statement 0.216 ms
+J tables=10: a Version with 21 migrations of one `SELECT 1` median 168.0 ms [172 168 167 168 169]; a migration 6.474 ms
+J tables=500: a Version with one migration of one `SELECT 1` median 132.8 ms [134 131 129 133 133]; of 301 median 210.8 ms [211 210 210 215 216]; a statement 0.260 ms
+J tables=500: a Version with 21 migrations of one `SELECT 1` median 1636.6 ms [1637 1627 1616 1676 1667]; a migration 75.192 ms
+J rows=100000: the table filled by a migration in 844 ms
+J rows=100000, every row changes (ALTER ... TYPE ... USING amount + 1): a Version median 2401 ms [2401 2381 2451]
+J rows=100000, no row changes (ALTER ... TYPE): a Version median 1675 ms [1642 1689 1675]
+J rows=100000, every row changes, the statement in a DO block: a Version median 2407 ms [2406 2407 2430]
+J rows=100000, varchar(50) to text (no rewrite): a Version median 137 ms [141 136 137]
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 85.25s
+######## after: vm at after, parts statements,rewrite, J_ROWS 100000, J_ROUNDS 3
+J tables=10: a Version with one migration of one `SELECT 1` median 37.6 ms [37 37 38 38 39]; of 301 median 105.1 ms [105 105 106 105 106]; a statement 0.225 ms
+J tables=10: a Version with 21 migrations of one `SELECT 1` median 169.8 ms [174 171 169 168 170]; a migration 6.614 ms
+J tables=500: a Version with one migration of one `SELECT 1` median 131.8 ms [132 130 131 132 133]; of 301 median 212.8 ms [213 211 212 259 218]; a statement 0.270 ms
+J tables=500: a Version with 21 migrations of one `SELECT 1` median 1632.7 ms [1674 1622 1616 1633 1671]; a migration 75.044 ms
+J rows=100000: the table filled by a migration in 854 ms
+J rows=100000, every row changes (ALTER ... TYPE ... USING amount + 1): a Version median 2410 ms [2376 2410 2434]
+J rows=100000, no row changes (ALTER ... TYPE): a Version median 1665 ms [1665 1653 1667]
+J rows=100000, every row changes, the statement in a DO block: a Version median 2391 ms [2391 2409 2382]
+J rows=100000, varchar(50) to text (no rewrite): a Version median 137 ms [141 137 137]
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 85.35s
+# whole run: 300 s
+exit 0
