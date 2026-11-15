@@ -1850,26 +1850,48 @@ fn parted_entries(rows: &[Value], kind: &str) -> Vec<(Value, Value, Value)> {
     found
 }
 
-/// CONTRACT.md: "A partition the migration itself made under a partitioned
-/// table with history is part of that table: when a statement writes it
-/// anew, also the statement that made it, the partitioned table's rows are
-/// recorded as above." `parted` has no partition when the migration
-/// begins; the migration makes one, inserts two rows through `parted`
-/// (recorded as inserts, as always), then retypes `v` through `parted`
-/// with `USING`: each row is an `update` under `parted`.
-#[test]
-fn a_partition_the_migration_made_written_anew_is_recorded_under_the_partitioned_table() {
+/// Sets `track_counts` off for every new session of `r`'s own database
+/// (`ALTER DATABASE ... SET`, as the harness's superuser): the session the
+/// platform applies the next Version's migrations on among them. Only this
+/// test's own database is touched; it is dropped with the test's program.
+fn track_counts_off(r: &Rewrite) {
+    r.db.superuser().batch(&format!(
+        "ALTER DATABASE {} SET track_counts = off",
+        ident(&r.db.name)
+    ));
+}
+
+/// A first statement for a migration that fails it (`migration-failed`,
+/// `P0001`, the message saying what it found) unless the migration's own
+/// session has `track_counts` off: so that a Version that applies shows the
+/// setting took where the migration ran.
+const COUNTS_OFF_OR_FAIL: &str = r#"DO $d$
+BEGIN
+  IF current_setting('track_counts') <> 'off' THEN
+    RAISE EXCEPTION 'track_counts is % in the migration''s session', current_setting('track_counts');
+  END IF;
+END
+$d$;"#;
+
+/// `parted` without partitions; a migration that makes one, inserts two
+/// rows through `parted`, then retypes `v` through `parted` with `USING`
+/// (with [`COUNTS_OFF_OR_FAIL`] first when `counts_off`); each row an
+/// insert and then an `update` under `parted`.
+fn partition_made_then_written_anew(counts_off: bool) {
     let mut r = Rewrite::start();
     let last = parted_without_partitions(&mut r);
+    let mut statements = Vec::new();
+    if counts_off {
+        track_counts_off(&r);
+        statements.push(COUNTS_OFF_OR_FAIL);
+    }
+    statements.extend([
+        r#"CREATE TABLE "parted_new" PARTITION OF "parted" FOR VALUES FROM ('2026-01-01') TO ('2030-01-01');"#,
+        r#"INSERT INTO "parted" ("id", "day", "v") VALUES (5, '2026-05-01', 1), (6, '2026-06-01', 2);"#,
+        r#"ALTER TABLE "parted" ALTER COLUMN "v" SET DATA TYPE bigint USING "v" + 10;"#,
+    ]);
     let migration = "0005_new_partition";
-    r.send_ok(&[Migration::new(
-        migration,
-        &[
-            r#"CREATE TABLE "parted_new" PARTITION OF "parted" FOR VALUES FROM ('2026-01-01') TO ('2030-01-01');"#,
-            r#"INSERT INTO "parted" ("id", "day", "v") VALUES (5, '2026-05-01', 1), (6, '2026-06-01', 2);"#,
-            r#"ALTER TABLE "parted" ALTER COLUMN "v" SET DATA TYPE bigint USING "v" + 10;"#,
-        ],
-    )]);
+    r.send_ok(&[Migration::new(migration, &statements)]);
     let rows = row_entries(&r.db, last);
     let key = |id: i64, day: &str| json!({ "id": id, "day": day });
     let row = |id: i64, day: &str, v: i64| json!({ "id": id, "day": day, "v": v });
@@ -1892,8 +1914,98 @@ fn a_partition_the_migration_made_written_anew_is_recorded_under_the_partitioned
                 json!(["v"]),
             ),
         ],
-        "the inserts through parted, then each row rewritten in the partition the migration made, under parted",
+        &format!(
+            "the inserts through parted, then each row rewritten in the partition the migration made, under parted (track_counts off: {counts_off})"
+        ),
     );
+}
+
+/// Fails unless `rows` are, under `parted` and by `migration`, exactly the
+/// capture's inserts of rows 5 and 6 (`v` 1 and 2) and the rewrite's inserts
+/// of them as they are after the statement (`v` 11 and 12), and `more`
+/// (key, `v` old, `v` new) updates.
+fn assert_made_filled_and_rewritten(
+    rows: &[Value],
+    migration: &str,
+    more: &[(Value, Value, Value)],
+    context: &str,
+) {
+    let k5 = json!({ "id": 5, "day": "2026-05-01" });
+    let k6 = json!({ "id": 6, "day": "2026-06-01" });
+    let mut want = vec![
+        (k5.clone(), Value::Null, json!(1)),
+        (k5, Value::Null, json!(11)),
+        (k6.clone(), Value::Null, json!(2)),
+        (k6, Value::Null, json!(12)),
+    ];
+    let mut got = parted_entries(rows, "insert");
+    got.sort_by_key(|f| format!("{} {}", f.0, f.2));
+    want.sort_by_key(|f| format!("{} {}", f.0, f.2));
+    assert_eq!(
+        got,
+        want,
+        "{context}: under parted, the capture's inserts (v 1 and 2) and the rewrite's (v 11 and 12); got\n{}",
+        lines(rows)
+    );
+    let mut more = more.to_vec();
+    more.sort_by_key(|f| f.0.to_string());
+    assert_eq!(
+        parted_entries(rows, "update"),
+        more,
+        "{context}: the updates under parted; got\n{}",
+        lines(rows)
+    );
+    assert_eq!(
+        rows.len(),
+        4 + more.len(),
+        "{context}: nothing else, and nothing under a partition: {}",
+        lines(rows)
+    );
+    for e in rows {
+        assert_eq!(e["migration"], migration, "{context}: {e}");
+        assert_eq!(e["actor"], "migration", "{context}: {e}");
+    }
+}
+
+/// The same as [`partition_made_then_written_anew`], in one `DO` block
+/// that makes the partition, fills it and rewrites it.
+fn partition_made_filled_and_written_anew_in_one(counts_off: bool) {
+    let mut r = Rewrite::start();
+    let last = parted_without_partitions(&mut r);
+    let mut statements = Vec::new();
+    if counts_off {
+        track_counts_off(&r);
+        statements.push(COUNTS_OFF_OR_FAIL);
+    }
+    statements.push(
+        r#"DO $d$
+BEGIN
+  CREATE TABLE "parted_new" PARTITION OF "parted" FOR VALUES FROM ('2026-01-01') TO ('2030-01-01');
+  INSERT INTO "parted" ("id", "day", "v") VALUES (5, '2026-05-01', 1), (6, '2026-06-01', 2);
+  ALTER TABLE "parted" ALTER COLUMN "v" SET DATA TYPE bigint USING "v" + 10;
+END
+$d$;"#,
+    );
+    let migration = "0005_new_partition_in_one";
+    r.send_ok(&[Migration::new(migration, &statements)]);
+    assert_made_filled_and_rewritten(
+        &row_entries(&r.db, last),
+        migration,
+        &[],
+        &format!("made, filled and written anew in one statement (track_counts off: {counts_off})"),
+    );
+}
+
+/// CONTRACT.md: "A partition the migration itself made under a partitioned
+/// table with history is part of that table: when a statement writes it
+/// anew, also the statement that made it, the partitioned table's rows are
+/// recorded as above." `parted` has no partition when the migration
+/// begins; the migration makes one, inserts two rows through `parted`
+/// (recorded as inserts, as always), then retypes `v` through `parted`
+/// with `USING`: each row is an `update` under `parted`.
+#[test]
+fn a_partition_the_migration_made_written_anew_is_recorded_under_the_partitioned_table() {
+    partition_made_then_written_anew(false);
 }
 
 /// The same, in one `DO` block that makes the partition, fills it and
@@ -1905,48 +2017,280 @@ fn a_partition_the_migration_made_written_anew_is_recorded_under_the_partitioned
 #[test]
 fn a_partition_made_filled_and_rewritten_in_one_statement_is_recorded_under_the_partitioned_table()
 {
+    partition_made_filled_and_written_anew_in_one(false);
+}
+
+/// CONTRACT.md: "... and so it is whatever the own database's server has
+/// `track_counts` set to." The two cases above with `track_counts` off in
+/// the migration's session: set for the own database by the harness's
+/// superuser (`ALTER DATABASE ... SET track_counts = off`); the migration's
+/// first statement fails the Version unless its session has it off, so the
+/// Version applying shows it took.
+#[test]
+fn with_track_counts_off_a_partition_the_migration_made_written_anew_is_recorded_the_same() {
+    partition_made_then_written_anew(true);
+}
+
+/// As above, made, filled and written anew in one `DO` block.
+#[test]
+fn with_track_counts_off_a_partition_made_filled_and_rewritten_in_one_statement_is_recorded_the_same()
+ {
+    partition_made_filled_and_written_anew_in_one(true);
+}
+
+/// The statements that put, under `parted` (with history, rows 1 in
+/// `parted_2026` and 2 in `parted_2027_low`), the partitioned partition
+/// `parted_2029` and under it the leaf `parted_2029_low`, and two rows
+/// through `parted` into the leaf.
+const DEEP_PARTITION: [&str; 3] = [
+    r#"CREATE TABLE "parted_2029" PARTITION OF "parted" FOR VALUES FROM ('2029-01-01') TO ('2030-01-01') PARTITION BY RANGE ("id");"#,
+    r#"CREATE TABLE "parted_2029_low" PARTITION OF "parted_2029" FOR VALUES FROM (0) TO (1000);"#,
+    r#"INSERT INTO "parted" ("id", "day", "v") VALUES (7, '2029-02-01', 1), (8, '2029-03-01', 2);"#,
+];
+
+/// CONTRACT.md: "So is one made at any depth under it (a partition of a
+/// partitioned table the migration made under the table with history)".
+/// The migration makes [`DEEP_PARTITION`], then a later statement retypes
+/// `v` through `parted` with `USING`: the rows of the new leaf, and those
+/// of `parted`'s earlier partitions, are updates under `parted`, none under
+/// a partition. Then the same with the leaf made, filled and written anew
+/// in one `DO` block.
+#[test]
+fn a_partition_made_at_any_depth_written_anew_is_recorded_under_the_partitioned_table() {
     let mut r = Rewrite::start();
-    let last = parted_without_partitions(&mut r);
-    let migration = "0005_new_partition_in_one";
-    r.send_ok(&[Migration::new(
-        migration,
-        &[r#"DO $d$
-BEGIN
-  CREATE TABLE "parted_new" PARTITION OF "parted" FOR VALUES FROM ('2026-01-01') TO ('2030-01-01');
-  INSERT INTO "parted" ("id", "day", "v") VALUES (5, '2026-05-01', 1), (6, '2026-06-01', 2);
-  ALTER TABLE "parted" ALTER COLUMN "v" SET DATA TYPE bigint USING "v" + 10;
-END
-$d$;"#],
-    )]);
+    let last = last_history_id(&r.db);
+    let migration = "0004_deep_partition";
+    let mut statements = DEEP_PARTITION.to_vec();
+    statements
+        .push(r#"ALTER TABLE "parted" ALTER COLUMN "v" SET DATA TYPE bigint USING "v" + 10;"#);
+    r.send_ok(&[Migration::new(migration, &statements)]);
+    let key = |id: i64, day: &str| json!({ "id": id, "day": day });
+    let row = |id: i64, day: &str, v: i64| json!({ "id": id, "day": day, "v": v });
+    let by = || Change::by_migration(INSTALLER, migration).on("public", "parted");
+    let update = |id: i64, day: &str, from: i64| {
+        by().update(
+            key(id, day),
+            row(id, day, from),
+            row(id, day, from + 10),
+            json!(["v"]),
+        )
+    };
+    assert_row_entries(
+        &row_entries(&r.db, last),
+        &[
+            by().insert(key(7, "2029-02-01"), row(7, "2029-02-01", 1)),
+            by().insert(key(8, "2029-03-01"), row(8, "2029-03-01", 2)),
+            update(1, "2026-03-01", 5),
+            update(2, "2027-03-01", 7),
+            update(7, "2029-02-01", 1),
+            update(8, "2029-03-01", 2),
+        ],
+        "a leaf two levels under parted, made by the migration and written anew by a later statement: under parted",
+    );
+
+    let mut r = Rewrite::start();
+    let last = last_history_id(&r.db);
+    let migration = "0004_deep_partition_in_one";
+    let block = format!(
+        "DO $d$\nBEGIN\n  {}\n  {}\n  {}\n  ALTER TABLE \"parted\" ALTER COLUMN \"v\" SET DATA TYPE bigint USING \"v\" + 10;\nEND\n$d$;",
+        DEEP_PARTITION[0], DEEP_PARTITION[1], DEEP_PARTITION[2]
+    );
+    r.send_ok(&[Migration::new(migration, &[block.as_str()])]);
     let rows = row_entries(&r.db, last);
-    let k5 = json!({ "id": 5, "day": "2026-05-01" });
-    let k6 = json!({ "id": 6, "day": "2026-06-01" });
-    let mut want = vec![
-        (k5.clone(), Value::Null, json!(1)),
-        (k5, Value::Null, json!(11)),
-        (k6.clone(), Value::Null, json!(2)),
-        (k6, Value::Null, json!(12)),
+    let k7 = key(7, "2029-02-01");
+    let k8 = key(8, "2029-03-01");
+    let mut inserts = vec![
+        (k7.clone(), Value::Null, json!(1)),
+        (k7, Value::Null, json!(11)),
+        (k8.clone(), Value::Null, json!(2)),
+        (k8, Value::Null, json!(12)),
     ];
-    want.sort_by_key(|f| f.0.to_string());
+    inserts.sort_by_key(|f| format!("{} {}", f.0, f.2));
     let mut got = parted_entries(&rows, "insert");
     got.sort_by_key(|f| format!("{} {}", f.0, f.2));
-    want.sort_by_key(|f| format!("{} {}", f.0, f.2));
     assert_eq!(
         got,
-        want,
-        "under parted: the capture's inserts (v 1 and 2) and the rewrite's (v 11 and 12); got\n{}",
+        inserts,
+        "made, filled and written anew in one statement: the capture's inserts (v 1 and 2) and the rewrite's (v 11 and 12) under parted; got\n{}",
+        lines(&rows)
+    );
+    let mut updates = vec![
+        (key(1, "2026-03-01"), json!(5), json!(15)),
+        (key(2, "2027-03-01"), json!(7), json!(17)),
+    ];
+    updates.sort_by_key(|f| f.0.to_string());
+    assert_eq!(
+        parted_entries(&rows, "update"),
+        updates,
+        "the earlier partitions' rows, updates under parted; got\n{}",
         lines(&rows)
     );
     assert_eq!(
         rows.len(),
-        4,
-        "nothing else, and nothing under parted_new: {}",
+        6,
+        "nothing else, and nothing under a partition: {}",
         lines(&rows)
     );
-    for e in &rows {
-        assert_eq!(e["migration"], migration, "{e}");
-        assert_eq!(e["actor"], "migration", "{e}");
-    }
+}
+
+/// A later Version that makes `loose (id, day, v)`, keyed on `(id, day)`,
+/// the shape of `parted`, and a User's insert of `(9, '2029-02-01', 3)`
+/// into it: a table with history holding a row. Returns the last history
+/// id after it.
+fn loose_with_history(r: &mut Rewrite) -> i64 {
+    r.send_ok(&[Migration::new(
+        "0004_loose",
+        &[r#"CREATE TABLE "loose" (
+	"id" integer NOT NULL,
+	"day" date NOT NULL,
+	"v" integer,
+	CONSTRAINT "loose_id_day_pk" PRIMARY KEY("id","day")
+);"#],
+    )]);
+    let (_, answer) = r.own.one(
+        &User::new("alice"),
+        "board",
+        &own_execute(
+            "user",
+            "insert into loose (id, day, v) values (9, '2029-02-01', 3)",
+        ),
+    );
+    assert_ok(&answer, "the harness's own check: a row of loose");
+    last_history_id(&r.db)
+}
+
+/// CONTRACT.md: "A partition the migration only makes or attaches records
+/// no row: only a statement that writes rows anew does." And
+/// `partition-attached`: "A table that was there when the migration began
+/// was attached to the table as a partition (one the migration makes with
+/// `CREATE TABLE ... PARTITION OF` brings no rows and has no entry)". One
+/// Version makes an empty partition of `parted` (which holds rows in its
+/// other partitions); another attaches `loose`, with history and a row.
+/// Each also takes one value of the sequence `turns`, which no rollback
+/// gives back: one value taken shows the statements ran once.
+#[test]
+fn a_partition_only_made_or_only_attached_records_no_row() {
+    let mut r = Rewrite::start();
+    let last = loose_with_history(&mut r);
+    r.send_ok(&[Migration::new(
+        "0005_only_made",
+        &[
+            r#"CREATE TABLE "parted_2030" PARTITION OF "parted" FOR VALUES FROM ('2030-01-01') TO ('2031-01-01');"#,
+            r#"SELECT nextval('"turns"');"#,
+        ],
+    )]);
+    let made = blackbox::history::history_after(&r.db, last);
+    assert!(
+        made.is_empty(),
+        "an empty partition made: no row entry, no structure entry; got\n{}",
+        lines(&made)
+    );
+    let last = last_history_id(&r.db);
+    let migration = "0006_only_attached";
+    r.send_ok(&[Migration::new(
+        migration,
+        &[
+            r#"ALTER TABLE "parted" ATTACH PARTITION "loose" FOR VALUES FROM ('2029-01-01') TO ('2030-01-01');"#,
+            r#"SELECT nextval('"turns"');"#,
+        ],
+    )]);
+    let rows = row_entries(&r.db, last);
+    assert!(
+        rows.is_empty(),
+        "loose, with history and a row, attached: no row entry; got\n{}",
+        lines(&rows)
+    );
+    let mut structure: Vec<Value> = structure_after(&r.db, last)
+        .iter()
+        .map(|e| json!([e["table_name"], e["structure"], e["migration"]]))
+        .collect();
+    structure.sort_by_key(Value::to_string);
+    assert_eq!(
+        structure,
+        vec![json!([
+            "parted",
+            { "change": "partition-attached", "partition": "public.loose" },
+            migration
+        ])],
+        "the partition-attached entry on parted, and nothing else (parted_2030, which 0005 made, brought no rows and has none)"
+    );
+    assert_eq!(
+        r.db.column("SELECT last_value::text FROM turns"),
+        vec!["2".to_owned()],
+        "one value of turns taken by each Version: each statement ran once"
+    );
+}
+
+/// CONTRACT.md: "A table with history that the migration attaches under a
+/// partitioned table with history is part of that table from then on: when
+/// a later statement writes it anew, its rows are recorded under the
+/// partitioned table's name." `loose` is attached under `parted`, then `v`
+/// is retyped through `parted`: every row, `loose`'s among them, is an
+/// update under `parted`, none under `loose`.
+#[test]
+fn a_table_with_history_attached_then_written_anew_is_recorded_under_the_partitioned_table() {
+    let mut r = Rewrite::start();
+    let last = loose_with_history(&mut r);
+    let migration = "0005_attach_then_rewrite";
+    r.send_ok(&[Migration::new(
+        migration,
+        &[
+            r#"ALTER TABLE "parted" ATTACH PARTITION "loose" FOR VALUES FROM ('2029-01-01') TO ('2030-01-01');"#,
+            r#"ALTER TABLE "parted" ALTER COLUMN "v" SET DATA TYPE bigint USING "v" + 10;"#,
+        ],
+    )]);
+    let key = |id: i64, day: &str| json!({ "id": id, "day": day });
+    let row = |id: i64, day: &str, v: i64| json!({ "id": id, "day": day, "v": v });
+    let update = |id: i64, day: &str, from: i64| {
+        migration_update(
+            migration,
+            "parted",
+            key(id, day),
+            row(id, day, from),
+            row(id, day, from + 10),
+            json!(["v"]),
+        )
+    };
+    assert_row_entries(
+        &row_entries(&r.db, last),
+        &[
+            update(1, "2026-03-01", 5),
+            update(2, "2027-03-01", 7),
+            update(9, "2029-02-01", 3),
+        ],
+        "loose's row under parted once attached, none under loose",
+    );
+}
+
+/// CONTRACT.md: "A partition the migration detaches is a table of its own
+/// from then on: when a later statement writes it anew, its rows are
+/// recorded under its own name." `parted_2026` is detached, then retyped
+/// by itself: its row is an update under `parted_2026`, none under
+/// `parted`.
+#[test]
+fn a_partition_detached_then_written_anew_is_recorded_under_its_own_name() {
+    let mut r = Rewrite::start();
+    let last = last_history_id(&r.db);
+    let migration = "0004_detach_then_rewrite";
+    r.send_ok(&[Migration::new(
+        migration,
+        &[
+            r#"ALTER TABLE "parted" DETACH PARTITION "parted_2026";"#,
+            r#"ALTER TABLE "parted_2026" ALTER COLUMN "v" SET DATA TYPE bigint USING "v" + 10;"#,
+        ],
+    )]);
+    assert_row_entries(
+        &row_entries(&r.db, last),
+        &[migration_update(
+            migration,
+            "parted_2026",
+            json!({ "id": 1, "day": "2026-03-01" }),
+            json!({ "id": 1, "day": "2026-03-01", "v": 5 }),
+            json!({ "id": 1, "day": "2026-03-01", "v": 15 }),
+            json!(["v"]),
+        )],
+        "the detached partition's row under its own name, none under parted",
+    );
 }
 
 /// CONTRACT.md: "\"At the top\" among the tables that had history when the
