@@ -227,6 +227,8 @@ pub enum Sent {
         migration: String,
         code: String,
         message: String,
+        /// The Version that was serving when it was sent, if one was.
+        serving: Option<u64>,
     },
     /// A migration broke a rule of the platform's; nothing was applied or
     /// recorded.
@@ -234,6 +236,8 @@ pub enum Sent {
         migration: String,
         rule: &'static str,
         message: String,
+        /// The Version that was serving when it was sent, if one was.
+        serving: Option<u64>,
     },
     /// Too many Versions are being sent at once in the program: nothing of
     /// this one was begun.
@@ -497,7 +501,8 @@ impl Registry {
                         "SELECT a.id, EXISTS (SELECT 1 FROM contributors c
                                               WHERE c.application_id = a.id AND c.user_id = $2),
                                 (SELECT v.migrations FROM versions v WHERE v.application_id = a.id
-                                 ORDER BY v.number DESC LIMIT 1)
+                                 ORDER BY v.number DESC LIMIT 1),
+                                a.serving_version
                          FROM applications a WHERE a.name = $1",
                         &[&name, &sender],
                     )
@@ -513,6 +518,8 @@ impl Registry {
             return Ok(Sent::NotAContributor);
         }
         let previous = recorded_of(get::<Option<Value>>(&found, 2)?.as_ref());
+        // For the words of a refusal: the Version serving when it was sent.
+        let serving = get::<Option<i32>>(&found, 3)?.map(number_of).transpose()?;
         if !continues(&previous, &version.migrations) {
             return Ok(Sent::Diverged);
         }
@@ -535,6 +542,7 @@ impl Registry {
                     migration,
                     code,
                     message,
+                    serving,
                 });
             }
             Err(Problem::Refused {
@@ -546,6 +554,7 @@ impl Registry {
                     migration,
                     rule,
                     message,
+                    serving,
                 });
             }
             Err(Problem::Unavailable { step, code }) => {

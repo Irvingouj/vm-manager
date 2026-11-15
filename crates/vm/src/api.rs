@@ -741,11 +741,12 @@ impl Api {
                     migration,
                     code,
                     message,
+                    serving,
                 } => Answer::json(
                     StatusCode::UNPROCESSABLE_ENTITY,
                     &json!({ "error": {
                         "reason": "migration-failed",
-                        "message": format!("the migration {migration:?} failed in the database ({code}): nothing was applied and the previous Version still serves; correct it and send the Version again"),
+                        "message": format!("the migration {migration:?} failed in the database ({code}): nothing was applied{}; correct it and send the Version again", still_serves(serving)),
                         "migration": migration,
                         "code": code,
                         "database_message": message,
@@ -755,12 +756,13 @@ impl Api {
                     migration,
                     rule,
                     message,
+                    serving,
                 } => Answer::json(
                     StatusCode::UNPROCESSABLE_ENTITY,
                     &json!({ "error": {
                         "reason": "migration-refused",
                         "rule": rule,
-                        "message": format!("the migration {migration:?} breaks the platform's rule {rule}: {message}. Nothing was applied and the previous Version still serves"),
+                        "message": format!("the migration {migration:?} breaks the platform's rule {rule}: {message}. Nothing was applied{}", still_serves(serving)),
                         "migration": migration,
                     } }),
                 ),
@@ -1344,6 +1346,14 @@ struct EntriesView {
 
 fn no_resource() -> Answer {
     Answer::not_found("no such Resource: list them at /v1/resources")
+}
+
+/// What a refused Version's message says of the one serving: that it
+/// still serves when one does, nothing when none does.
+fn still_serves(serving: Option<u64>) -> String {
+    serving
+        .map(|n| format!(" and Version {n} still serves"))
+        .unwrap_or_default()
 }
 
 fn no_application() -> Answer {
