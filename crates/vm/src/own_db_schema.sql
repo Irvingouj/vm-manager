@@ -1188,10 +1188,19 @@ SET search_path = pg_catalog, pg_temp
 AS $f$
 DECLARE
     v_made integer;
+    v_table oid;
 BEGIN
     PERFORM vm.rewrite_who(p_token);
+    -- The tables gone: a table with storage by its file node, which
+    -- Postgres has in its cache and has none of a table gone; a
+    -- partitioned table, which has none ever, one by one (a few).
     DELETE FROM vm.rewrite_nodes r
-     WHERE NOT EXISTS (SELECT FROM pg_catalog.pg_class c WHERE c.oid = r.relid);
+     WHERE r.kids IS NULL AND pg_catalog.pg_relation_filenode(r.relid) IS NULL;
+    FOR v_table IN SELECT p.relid FROM vm.rewrite_nodes p WHERE p.kids IS NOT NULL LOOP
+        IF NOT EXISTS (SELECT FROM pg_catalog.pg_class c WHERE c.oid = v_table) THEN
+            DELETE FROM vm.rewrite_nodes r WHERE r.relid = v_table;
+        END IF;
+    END LOOP;
     UPDATE vm.rewrite_nodes r SET s = ns.nspname::text, n = c.relname::text, history = true
       FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace ns ON ns.oid = c.relnamespace
      WHERE c.oid = r.relid
@@ -1269,10 +1278,12 @@ $f$;
 -- another: part I of docs/research/change-history-out-of-reach.md; what
 -- else changes it, such as `SET UNLOGGED`, makes the table read when it
 -- need not be, never missed). The partitions found are watched from now
--- on, the new file nodes and partitions noted, the tables gone forgotten;
--- a row is written again only for a table whose file node or partitions
--- changed, and only under a partitioned table whose partitions changed
--- are partitions looked for.
+-- on, the new file nodes and partitions noted, the tables gone forgotten.
+-- A row is written again only for a table whose file node or partitions
+-- changed, and only the partitions not there before, and what is under
+-- them, are looked up: the cost grows with the watched partitioned tables'
+-- partitions (their lists compared) and with the tables made, not with a
+-- scan of the catalog.
 CREATE OR REPLACE FUNCTION vm.rewrite_after(p_token text)
 RETURNS TABLE (relid oid, s text, n text, read boolean)
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER PARALLEL UNSAFE
@@ -1280,49 +1291,71 @@ SET search_path = pg_catalog, pg_temp
 AS $f$
 DECLARE
     v_moved oid[];
-    v_made oid[];
+    v_made oid[] := '{}';
     v_tops oid[] := '{}';
     v_table oid;
     v_up oid;
     v_best oid;
+    v_was oid[];
+    v_now oid[];
+    v_todo oid[] := '{}';
+    v_next oid[];
+    v_node oid;
+    v_kids oid[];
 BEGIN
     PERFORM vm.rewrite_who(p_token);
+    -- The tables with storage gone, as in `vm.rewrite_begin`; the
+    -- partitioned ones below.
     DELETE FROM vm.rewrite_nodes r
-     WHERE NOT EXISTS (SELECT FROM pg_catalog.pg_class c WHERE c.oid = r.relid);
+     WHERE r.kids IS NULL AND pg_catalog.pg_relation_filenode(r.relid) IS NULL;
     WITH moved AS (
         UPDATE vm.rewrite_nodes r SET node = pg_catalog.pg_relation_filenode(r.relid)
          WHERE r.kids IS NULL
            AND pg_catalog.pg_relation_filenode(r.relid) IS DISTINCT FROM r.node
         RETURNING r.relid)
     SELECT coalesce(pg_catalog.array_agg(m.relid), '{}') INTO v_moved FROM moved m;
-    WITH RECURSIVE changed AS (
-        UPDATE vm.rewrite_nodes r SET kids = k.now
-          FROM (SELECT p.relid,
-                       ARRAY(SELECT i.inhrelid FROM pg_catalog.pg_inherits i
-                              WHERE i.inhparent = p.relid ORDER BY i.inhrelid) AS now
-                  FROM vm.rewrite_nodes p
-                 WHERE p.kids IS NOT NULL) k
-         WHERE r.relid = k.relid AND r.kids IS DISTINCT FROM k.now
-        RETURNING r.relid),
-    under (relid) AS (
-        SELECT i.inhrelid FROM changed p
-          JOIN pg_catalog.pg_inherits i ON i.inhparent = p.relid
-        UNION
-        SELECT i.inhrelid FROM under u JOIN pg_catalog.pg_inherits i ON i.inhparent = u.relid),
-    made AS (
-        INSERT INTO vm.rewrite_nodes (relid, node, s, n, history, kids)
-        SELECT c.oid, pg_catalog.pg_relation_filenode(c.oid), ns.nspname::text, c.relname::text, false,
-               CASE WHEN c.relkind = 'p'
-                    THEN ARRAY(SELECT i.inhrelid FROM pg_catalog.pg_inherits i
-                                WHERE i.inhparent = c.oid ORDER BY i.inhrelid) END
-          FROM under u
-          JOIN pg_catalog.pg_class c ON c.oid = u.relid
-          JOIN pg_catalog.pg_namespace ns ON ns.oid = c.relnamespace
-         WHERE c.relispartition AND c.relkind IN ('r', 'p')
-           AND NOT EXISTS (SELECT FROM vm.rewrite_nodes x WHERE x.relid = c.oid)
-        RETURNING vm.rewrite_nodes.relid, vm.rewrite_nodes.node)
-    SELECT coalesce(pg_catalog.array_agg(m.relid) FILTER (WHERE m.node <> m.relid), '{}')
-      INTO v_made FROM made m;
+    -- Each watched partitioned table (a few): gone, or its partitions
+    -- noted again if they changed, and those not there before kept.
+    FOR v_table, v_was IN SELECT p.relid, p.kids FROM vm.rewrite_nodes p WHERE p.kids IS NOT NULL LOOP
+        IF NOT EXISTS (SELECT FROM pg_catalog.pg_class c WHERE c.oid = v_table) THEN
+            DELETE FROM vm.rewrite_nodes r WHERE r.relid = v_table;
+            CONTINUE;
+        END IF;
+        v_now := ARRAY(SELECT i.inhrelid FROM pg_catalog.pg_inherits i
+                        WHERE i.inhparent = v_table ORDER BY i.inhrelid);
+        IF v_now IS DISTINCT FROM v_was THEN
+            UPDATE vm.rewrite_nodes r SET kids = v_now WHERE r.relid = v_table;
+            v_todo := v_todo || ARRAY(SELECT k FROM pg_catalog.unnest(v_now) k
+                                      EXCEPT SELECT k FROM pg_catalog.unnest(v_was) k);
+        END IF;
+    END LOOP;
+    -- The partitions not there before, and all under those of them that
+    -- are partitioned, that are not watched yet: watched from now on, one
+    -- by one (as many as were made or attached).
+    WHILE pg_catalog.cardinality(v_todo) > 0 LOOP
+        v_next := '{}';
+        FOREACH v_table IN ARRAY v_todo LOOP
+            CONTINUE WHEN EXISTS (SELECT FROM vm.rewrite_nodes x WHERE x.relid = v_table);
+            INSERT INTO vm.rewrite_nodes (relid, node, s, n, history, kids)
+            SELECT c.oid, pg_catalog.pg_relation_filenode(c.oid), ns.nspname::text, c.relname::text, false,
+                   CASE WHEN c.relkind = 'p'
+                        THEN ARRAY(SELECT i.inhrelid FROM pg_catalog.pg_inherits i
+                                    WHERE i.inhparent = c.oid ORDER BY i.inhrelid) END
+              FROM pg_catalog.pg_class c
+              JOIN pg_catalog.pg_namespace ns ON ns.oid = c.relnamespace
+             WHERE c.oid = v_table AND c.relispartition AND c.relkind IN ('r', 'p')
+            RETURNING vm.rewrite_nodes.node, vm.rewrite_nodes.kids INTO v_node, v_kids;
+            IF FOUND THEN
+                IF v_node <> v_table THEN
+                    v_made := v_made || v_table;
+                END IF;
+                IF v_kids IS NOT NULL THEN
+                    v_next := v_next || v_kids;
+                END IF;
+            END IF;
+        END LOOP;
+        v_todo := v_next;
+    END LOOP;
     UPDATE vm.rewrite_mark m SET inherits = vm.rewrite_inherits()
      WHERE m.inherits IS DISTINCT FROM vm.rewrite_inherits();
     FOREACH v_table IN ARRAY v_moved || v_made LOOP
