@@ -784,3 +784,38 @@ fn an_application_this_deploy_created_stays_when_its_version_is_not_taken() {
     assert_eq!(deployed.version, 1);
     assert_eq!(api.application("stays-board")["serving_version"], json!(1));
 }
+
+#[test]
+fn a_first_deploy_whose_migration_is_refused_names_no_serving_version_and_says_created() {
+    let vm = vm();
+    let machine = signed_in(&vm);
+    let project = blackbox::project::checked_project("deploy-first-refused");
+    project.write("manifest.ts", &manifest_ts("first-refused-board", "{}"));
+    let committing = hand_written(&machine, &project, "commit_early", "COMMIT;\n");
+    init_repository(&project.dir);
+    commit_all(&project.dir, "a migration the platform refuses");
+    let run = deploy(&machine, &project.dir, &[]);
+    let message = run.json_error(1, "migration-refused");
+    let error = run.json()["error"].clone();
+    assert_eq!(
+        error["rule"],
+        json!("transaction-control"),
+        "{}",
+        run.describe()
+    );
+    assert_eq!(error["migration"], json!(committing));
+    assert_eq!(error["created"], json!(true), "{}", run.describe());
+    let lower = squashed(&message).to_lowercase();
+    for never in ["serves", "serving", "previous version"] {
+        assert!(
+            !lower.contains(never),
+            "expected no word that a Version serves at a first deploy ({never:?}), got {message:?}"
+        );
+    }
+    let api = vm.api_as(&dana());
+    assert_eq!(
+        api.application("first-refused-board")["serving_version"],
+        Value::Null
+    );
+    assert_eq!(api.versions("first-refused-board"), Vec::<Value>::new());
+}
