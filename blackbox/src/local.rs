@@ -790,6 +790,10 @@ pub fn archive_path() -> String {
             std::env::consts::ARCH
         )
     });
+    assert_eq!(
+        archive.version, "18.6.0",
+        "the harness's own check: CONTRACT.md has 18.6.0 downloaded"
+    );
     format!("/maven2/{}", archive.maven_path)
 }
 
@@ -1197,28 +1201,73 @@ pub fn statements_in_text(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// The statements of `standin_sql` as the API answers it: an array of
-/// statements, or one text of them ([`statements_in_text`]). CONTRACT.md
-/// says "the statements" and "one a statement" without saying which; the
-/// harness reads either. Fails the test when it is neither.
+/// The statements of `standin_sql` as the API answers it (CONTRACT.md:
+/// "an array of texts, one a statement, each ending with `;`"), as they
+/// were answered. Fails the test unless the value has exactly that shape:
+/// an array of texts, each one statement (one piece once split on its
+/// semicolons outside quotes and comments) ending with `;`.
 pub fn standin_statements(value: &Value) -> Vec<String> {
-    match value {
-        Value::String(text) => statements_in_text(text),
-        Value::Array(items) => items
-            .iter()
-            .map(|s| {
-                let text = s
-                    .as_str()
-                    .unwrap_or_else(|| panic!("expected each of `standin_sql` a string, got {s}"));
-                statements_in_text(text).join(";\n")
-            })
-            .filter(|s| !s.is_empty())
-            .collect(),
-        other => {
-            panic!("expected `standin_sql` as SQL text or an array of statements, got {other}")
-        }
-    }
+    let items = value
+        .as_array()
+        .unwrap_or_else(|| panic!("expected `standin_sql` an array of statements, got {value}"));
+    items
+        .iter()
+        .map(|item| {
+            let text = item
+                .as_str()
+                .unwrap_or_else(|| panic!("expected each of `standin_sql` a text, got {item}"));
+            assert!(
+                text.ends_with(';'),
+                "expected each statement of `standin_sql` to end with `;`, got {text:?}"
+            );
+            assert_eq!(
+                statements_in_text(text).len(),
+                1,
+                "expected one statement in each text of `standin_sql`, got {text:?}"
+            );
+            text.to_owned()
+        })
+        .collect()
 }
+
+/// What `standin.sql` holds after its three first lines: an empty line,
+/// then each statement in order with an empty line after it.
+pub fn standin_body(statements: &[String]) -> String {
+    let mut body = String::from("\n");
+    for statement in statements {
+        body.push_str(statement);
+        body.push_str("\n\n");
+    }
+    body
+}
+
+/// The whole of a `standin.sql` the tool writes for a Resource whose
+/// contact is on one line already.
+pub fn standin_file(
+    resource: &str,
+    fingerprint: &str,
+    contact: &str,
+    statements: &[String],
+) -> String {
+    format!(
+        "{STANDIN_FIRST_LINE}\n-- Resource: {resource}  Fingerprint: {fingerprint}\n-- Contact: {contact}\n{}",
+        standin_body(statements)
+    )
+}
+
+/// The statements of a `standin.sql` the tool wrote, as written (each with
+/// its `;`): what follows the three first lines and the empty line, cut at
+/// the empty line after each statement.
+pub fn statements_of_standin_file(text: &str) -> Vec<String> {
+    let body: String = text.split_inclusive('\n').skip(3).collect();
+    body.split("\n\n")
+        .map(|piece| piece.trim_matches('\n').to_owned())
+        .filter(|piece| !piece.is_empty())
+        .collect()
+}
+
+/// The `stand-in-incomplete` warning's exact keys, sorted.
+pub const INCOMPLETE_KEYS: [&str; 5] = ["error", "message", "reason", "resource", "statement"];
 
 /// Whether a file named `postgres`, `initdb` or `pg_ctl` is anywhere under
 /// `dir`: what looks like a complete Postgres.
@@ -1267,5 +1316,19 @@ mod tests {
             assert!(ts.contains(&format!("case \"{route}\"")), "{route}");
         }
         assert!(!handler(false, false).contains("resources/devops"));
+    }
+
+    #[test]
+    fn a_standin_file_is_read_back_into_its_statements() {
+        let statements = vec![
+            "CREATE TABLE t (\n  a text\n);".to_owned(),
+            "ALTER TABLE t ALTER COLUMN a SET DEFAULT 'x';".to_owned(),
+        ];
+        let text = standin_file("x", "sha256:00", "a; b", &statements);
+        assert_eq!(statements_of_standin_file(&text), statements);
+        assert_eq!(
+            standin_statements(&serde_json::json!(statements)),
+            statements
+        );
     }
 }

@@ -16,7 +16,10 @@
 
 use std::fs;
 
-use blackbox::local::{BUILDER, Board, DEVOPS, OUTSIDER, Requested, declaring, dev_json};
+use blackbox::local::{
+    BUILDER, Board, DEVOPS, INCOMPLETE_KEYS, OUTSIDER, Requested, declaring, dev_json,
+    statements_of_standin_file,
+};
 use blackbox::scenario::CONTACT;
 use serde_json::{Value, json};
 
@@ -91,11 +94,86 @@ fn a_statement_the_local_postgres_cannot_run_is_left_out_with_a_warning() {
         requested.describe()
     );
     let warning = &warnings[0];
+    assert_incomplete_keys(warning);
     assert_eq!(warning["resource"], json!(DEVOPS), "{warning}");
-    let text = warning.to_string();
+    let written = fs::read_to_string(board.dir().join("resources/devops/standin.sql")).unwrap();
+    let default = statements_of_standin_file(&written)
+        .into_iter()
+        .find(|s| s.contains("next_ticket_code"))
+        .unwrap_or_else(|| panic!("expected the default's statement in standin.sql\n{written}"));
     assert!(
-        text.contains("next_ticket_code"),
-        "expected the warning to hold the statement's first line and the database's error, got {warning}"
+        default.to_ascii_uppercase().starts_with("ALTER TABLE")
+            && default.to_ascii_uppercase().contains("SET DEFAULT"),
+        "the harness's own check: the default is an ALTER ... SET DEFAULT, got {default:?}"
+    );
+    assert_eq!(
+        warning["statement"],
+        json!(default.lines().next().unwrap()),
+        "expected `statement` the first line of the statement left out"
+    );
+    assert!(
+        warning["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("next_ticket_code")),
+        "expected `error` the database's message, naming the function, got {warning}"
+    );
+}
+
+/// Fails unless a `stand-in-incomplete` warning has exactly the contract's
+/// keys, each text.
+fn assert_incomplete_keys(warning: &Value) {
+    let mut keys: Vec<&str> = warning
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys, INCOMPLETE_KEYS,
+        "expected exactly these keys: {warning}"
+    );
+    for key in INCOMPLETE_KEYS {
+        assert!(
+            warning[key].is_string(),
+            "expected `{key}` a text: {warning}"
+        );
+    }
+    assert_eq!(warning["reason"], json!("stand-in-incomplete"));
+}
+
+#[test]
+fn the_standins_statements_run_as_a_role_that_is_not_a_superuser() {
+    let board = Board::start("read", "read");
+    // A statement only a superuser may run, added to the tool's own file
+    // (its three first lines kept): writing a file on the server.
+    let target = board.local.machine.root().join("written-by-the-standin");
+    let file = board.dir().join("resources/devops/standin.sql");
+    let mut text = fs::read_to_string(&file)
+        .expect("expected the pull to have written resources/devops/standin.sql");
+    text.push_str(&format!("COPY (SELECT 1) TO '{}';\n\n", target.display()));
+    fs::write(&file, text).unwrap();
+    let requested = board.request_ok("/incidents", BUILDER, &[]);
+    assert_eq!(
+        requested.json(),
+        json!({ "user": BUILDER, "incidents": [] }),
+        "expected the run to go on without the statement\n{}",
+        requested.describe()
+    );
+    let warnings = requested.warnings_for("stand-in-incomplete");
+    assert_eq!(warnings.len(), 1, "{}", requested.describe());
+    assert_incomplete_keys(&warnings[0]);
+    assert!(
+        warnings[0]["statement"]
+            .as_str()
+            .unwrap()
+            .starts_with("COPY (SELECT 1) TO"),
+        "expected the warning to be the COPY's, got {}",
+        warnings[0]
+    );
+    assert!(
+        !target.exists(),
+        "expected no file written by a statement of the stand-in: they run as a role that is not a superuser"
     );
 }
 

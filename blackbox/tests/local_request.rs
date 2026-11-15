@@ -25,8 +25,8 @@
 use blackbox::User;
 use blackbox::deploy::{commit_all, deploy, init_repository};
 use blackbox::local::{
-    APP, BUILDER, Board, DEVOPS, FAILURE, LOADING_LINE, OUTSIDER, Requested, TEXT_BODY, dev_json,
-    write_dev_json,
+    APP, BUILDER, Board, DEVOPS, FAILURE, LOADING_LINE, Local, OUTSIDER, Requested, TEXT_BODY,
+    dev_json, local_project, write_dev_json,
 };
 use blackbox::scenario::{CONTACT, Expected, Scenario, assert_entry};
 use serde_json::{Value, json};
@@ -415,5 +415,25 @@ fn what_the_application_answers_reaches_the_terminal_escaped_with_its_line_ends(
         Requested::of(&json).text(),
         TEXT_BODY,
         "expected the JSON to parse to the body as it was"
+    );
+}
+
+#[test]
+fn path_is_the_path_as_it_was_given_with_its_query() {
+    let local = Local::new();
+    let project = local_project(&local.machine, "query-board", &[]);
+    let given = "/echo?a=1&b=two%20words&a=3";
+    let requested = local.request_ok(&project.dir, given, OUTSIDER, &[]);
+    assert_eq!(
+        requested.body["path"],
+        json!(given),
+        "expected `path` as given, with its query\n{}",
+        requested.describe()
+    );
+    assert_eq!(
+        requested.json()["search"],
+        json!("?a=1&b=two%20words&a=3"),
+        "expected the Application given the query as it was\n{}",
+        requested.describe()
     );
 }

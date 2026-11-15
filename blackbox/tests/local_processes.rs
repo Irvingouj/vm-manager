@@ -213,21 +213,40 @@ fn a_second_local_command_in_the_same_project_waits_for_the_first_and_both_succe
     let local = Local::new();
     let project = local_project(&local.machine, "shared-board", &[]);
     warm(&local, &project.dir);
-    let mut running = local.spawn_request(&project.dir, "/slow?ms=6000", OUTSIDER, &[]);
-    wait_for_postmaster(&project.dir, &mut running, POSTMASTER_WAIT)
+    // How long a run of `/` takes here once the project is warm: the
+    // first run is held three times as long and ten seconds more, so that
+    // a second run that did not wait would end well before the first.
+    let timed = Instant::now();
+    warm(&local, &project.dir);
+    let alone = timed.elapsed();
+    let hold = alone * 3 + Duration::from_secs(10);
+    let mut first = local.spawn_request(
+        &project.dir,
+        &format!("/slow?ms={}", hold.as_millis()),
+        OUTSIDER,
+        &[],
+    );
+    wait_for_postmaster(&project.dir, &mut first, POSTMASTER_WAIT)
         .unwrap_or_else(|| panic!("expected the first run's Postgres to listen"));
-    thread::sleep(Duration::from_millis(500));
-    let second = local.request_ok(&project.dir, "/", OUTSIDER, &[]);
-    assert_eq!(second.status(), 200, "{}", second.describe());
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while !running.has_ended() && Instant::now() < deadline {
+    let mut second = local.spawn_request(&project.dir, "/", OUTSIDER, &[]);
+    let deadline = Instant::now() + hold + Duration::from_secs(120);
+    let mut first_ended_first = None;
+    while Instant::now() < deadline {
+        let first_done = first.has_ended();
+        if second.has_ended() {
+            first_ended_first = Some(first_done);
+            break;
+        }
         thread::sleep(Duration::from_millis(20));
     }
-    assert!(
-        running.has_ended(),
-        "expected the second command to have waited for the first to end"
+    assert_eq!(
+        first_ended_first,
+        Some(true),
+        "expected the second command (alone {alone:?}) to end only after the first (held {hold:?}) had ended"
     );
-    let first = Requested::of(&running.wait(Duration::from_secs(10)));
+    let second = Requested::of(&second.wait(Duration::from_secs(10)));
+    assert_eq!(second.status(), 200, "{}", second.describe());
+    let first = Requested::of(&first.wait(Duration::from_secs(10)));
     assert_eq!(first.text(), "slow");
     assert_nothing_left(&local, None, "two runs, one after the other");
 }

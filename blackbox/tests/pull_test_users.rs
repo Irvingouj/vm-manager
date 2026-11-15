@@ -134,17 +134,11 @@ fn a_new_projects_file_keeps_what_it_had_and_gains_the_builder_and_the_grant() {
         after["about"], before["about"],
         "expected `about` kept as it was"
     );
-    let users = users_of(&after);
     assert_eq!(
-        users.first(),
-        Some(&outsider_user()),
-        "expected outsider kept, as it was and where it was, got {after}"
+        users_of(&after),
+        vec![outsider_user(), builder_user()],
+        "expected outsider kept, as it was and where it was, and the builder added after it, got {after}"
     );
-    assert!(
-        users.contains(&builder_user()),
-        "expected the builder added, got {after}"
-    );
-    assert_eq!(users.len(), 2, "{after}");
     assert_eq!(grants_of(&after), vec![builder_grant("read")], "{after}");
     assert_two_spaces_a_level(&fs::read_to_string(dir.join("vm.dev.json")).unwrap());
 }
@@ -262,6 +256,11 @@ fn a_file_that_cannot_be_read_ends_the_pull_before_anything_is_written() {
             Some("users"),
         ),
         (
+            "users left out",
+            "{ \"about\": \"no users\", \"grants\": [] }\n".to_owned(),
+            Some("users"),
+        ),
+        (
             "a Grant at an unknown level",
             serde_json::to_string(&json!({
                 "users": [],
@@ -291,6 +290,127 @@ fn a_file_that_cannot_be_read_ends_the_pull_before_anything_is_written() {
             "{case}: expected nothing written: no resources/, vm.dev.json as it was"
         );
     }
+}
+
+#[test]
+fn a_new_user_and_a_new_grant_are_added_after_the_others() {
+    let stock = Stock::ready();
+    let machine = Machine::new();
+    machine.sign_in(&stock.scenario.vm, &rita());
+    let dir = bare_project(&machine, "board");
+    let carol = json!({ "id": "carol", "groups": ["ops"] });
+    let ops_grant = json!({ "group": "ops", "resource": STOCK, "access": "read" });
+    let elsewhere = json!({ "group": "builder", "resource": "other_db", "access": "read" });
+    write_dev_json(
+        &dir,
+        &json!({
+            "users": [carol, outsider_user()],
+            "grants": [ops_grant, elsewhere]
+        }),
+    );
+    pull(&machine, &dir).ok_json();
+    let after = dev_json(&dir);
+    assert_eq!(
+        users_of(&after),
+        vec![carol, outsider_user(), builder_user()],
+        "expected the builder added after the others, which keep their order"
+    );
+    assert_eq!(
+        grants_of(&after),
+        vec![ops_grant, elsewhere, builder_grant("read")],
+        "expected the new Grant added after the others, which keep their order"
+    );
+}
+
+#[test]
+fn a_builder_already_in_the_builder_group_is_kept_as_it_is() {
+    let stock = Stock::ready();
+    let machine = Machine::new();
+    machine.sign_in(&stock.scenario.vm, &rita());
+    let dir = bare_project(&machine, "board");
+    let mine = json!({
+        "id": "builder",
+        "displayName": "Me, as I named myself",
+        "email": "me@example.org",
+        "groups": ["ops", "builder"],
+        "desk": "four"
+    });
+    write_dev_json(
+        &dir,
+        &json!({ "users": [mine, outsider_user()], "grants": [] }),
+    );
+    let printed = pull(&machine, &dir).ok_json();
+    assert_eq!(printed["test_users"]["changed"], json!(true), "{printed}");
+    let after = dev_json(&dir);
+    assert_eq!(
+        users_of(&after),
+        vec![mine, outsider_user()],
+        "expected the User builder untouched, where it was, and no second builder"
+    );
+    assert_eq!(grants_of(&after), vec![builder_grant("read")], "{after}");
+}
+
+#[test]
+fn a_builder_not_in_the_builder_group_gains_it_and_nothing_else_changes() {
+    let stock = Stock::ready();
+    let machine = Machine::new();
+    machine.sign_in(&stock.scenario.vm, &rita());
+    let dir = bare_project(&machine, "board");
+    let mine = json!({
+        "id": "builder",
+        "displayName": "Me, as I named myself",
+        "email": "me@example.org",
+        "groups": ["ops"],
+        "desk": "four"
+    });
+    write_dev_json(
+        &dir,
+        &json!({ "users": [outsider_user(), mine], "grants": [] }),
+    );
+    pull(&machine, &dir).ok_json();
+    let after = dev_json(&dir);
+    let users = users_of(&after);
+    assert_eq!(users.len(), 2, "expected no second builder: {after}");
+    assert_eq!(users[0], outsider_user(), "{after}");
+    let kept = &users[1];
+    let mut groups: Vec<&str> = kept["groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|g| g.as_str().unwrap())
+        .collect();
+    groups.sort_unstable();
+    assert_eq!(
+        groups,
+        ["builder", "ops"],
+        "expected builder added to its groups, ops kept, got {kept}"
+    );
+    let mut rest = kept.clone();
+    rest.as_object_mut().unwrap().remove("groups");
+    let mut mine_rest = mine;
+    mine_rest.as_object_mut().unwrap().remove("groups");
+    assert_eq!(
+        rest, mine_rest,
+        "expected every other key of the User builder as it was"
+    );
+}
+
+#[test]
+fn a_file_with_users_only_is_taken_and_gains_the_grant() {
+    let stock = Stock::ready();
+    let machine = Machine::new();
+    machine.sign_in(&stock.scenario.vm, &rita());
+    let dir = bare_project(&machine, "board");
+    write_dev_json(&dir, &json!({ "users": [outsider_user()] }));
+    let printed = pull(&machine, &dir).ok_json();
+    assert_eq!(printed["test_users"]["changed"], json!(true), "{printed}");
+    let after = dev_json(&dir);
+    assert_eq!(
+        users_of(&after),
+        vec![outsider_user(), builder_user()],
+        "{after}"
+    );
+    assert_eq!(grants_of(&after), vec![builder_grant("read")], "{after}");
 }
 
 #[test]

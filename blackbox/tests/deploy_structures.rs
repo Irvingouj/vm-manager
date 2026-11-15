@@ -101,6 +101,50 @@ fn fingerprint_now(scenario: &Scenario, user: &User, resource: &str) -> String {
     answer.json()["fingerprint"].as_str().unwrap().to_owned()
 }
 
+/// The paths of a `files` list, sorted: the contract gives no order.
+fn sorted_files(files: &Value) -> Vec<String> {
+    let mut paths: Vec<String> = files
+        .as_array()
+        .unwrap_or_else(|| panic!("expected `files` a list, got {files}"))
+        .iter()
+        .map(|f| f.as_str().unwrap().to_owned())
+        .collect();
+    paths.sort();
+    paths
+}
+
+#[test]
+fn a_standin_sql_missing_while_the_structure_is_unchanged_stays_missing_after_a_deploy() {
+    let (_scenario, machine) = ready();
+    let project = reading_devops(
+        &machine,
+        "deploy-no-standin",
+        "no-standin-board",
+        &[("devops", "read")],
+    );
+    let standin = project.dir.join("resources/devops/standin.sql");
+    fs::remove_file(&standin)
+        .expect("expected the pull to have written resources/devops/standin.sql, to remove it");
+    commit_all(&project.dir, "as pulled before the stand-ins");
+    let before = project_tree(&project.dir);
+    let deployed = Deployed::of(&deploy(&machine, &project.dir, &[]));
+    assert_eq!(
+        deployed.pulled,
+        vec![json!({ "resource": "devops", "changed": false, "files": [] })],
+        "{}",
+        deployed.run.describe()
+    );
+    assert!(
+        !standin.exists(),
+        "expected a missing standin.sql left missing by a deploy's pull of an unchanged structure (`vm pull` writes it)"
+    );
+    assert_eq!(
+        before.differences(&project_tree(&project.dir)),
+        Vec::<String>::new(),
+        "expected nothing written"
+    );
+}
+
 fn schema_of(dir: &Path, resource: &str) -> String {
     fs::read_to_string(dir.join(format!("resources/{resource}/schema.ts"))).unwrap()
 }
@@ -185,16 +229,47 @@ fn a_structure_changed_so_the_code_still_type_checks_is_written_and_built_agains
         .batch("ALTER TABLE incidents ADD COLUMN region text");
     let new = fingerprint_now(&scenario, &dana(), "devops");
     assert_ne!(new, old, "the harness's own check");
+    // vm.dev.json says other than a pull would write (the Builder's Grant
+    // at `write`, dana holding `read`): a deploy never touches it.
+    let mut test_users = blackbox::local::dev_json(&project.dir);
+    test_users["grants"] = json!([{ "group": "builder", "resource": "devops", "access": "write" }]);
+    blackbox::local::write_dev_json(&project.dir, &test_users);
+    commit_all(&project.dir, "the Builder's Grant at write");
+    let dev_json_before = fs::read(project.dir.join("vm.dev.json")).unwrap();
+    let dev_json_written = fs::metadata(project.dir.join("vm.dev.json"))
+        .unwrap()
+        .modified()
+        .unwrap();
     let before = project_tree(&project.dir);
     let deployed = Deployed::of(&deploy(&machine, &project.dir, &[]));
     assert_eq!(deployed.version, 2);
+    assert_eq!(deployed.pulled.len(), 1, "{}", deployed.run.describe());
+    assert_eq!(deployed.pulled[0]["resource"], json!("devops"));
+    assert_eq!(deployed.pulled[0]["changed"], json!(true));
     assert_eq!(
-        deployed.pulled,
-        vec![
-            json!({ "resource": "devops", "changed": true, "files": ["resources/devops/schema.ts"] })
-        ],
-        "{}",
+        sorted_files(&deployed.pulled[0]["files"]),
+        ["resources/devops/schema.ts", "resources/devops/standin.sql"],
+        "expected a deploy's pull of a changed structure to write the definition and the stand-in\n{}",
         deployed.run.describe()
+    );
+    assert!(
+        fs::read_to_string(project.dir.join("resources/devops/standin.sql"))
+            .unwrap()
+            .contains("region"),
+        "expected the stand-in rewritten with the new column"
+    );
+    assert_eq!(
+        fs::read(project.dir.join("vm.dev.json")).unwrap(),
+        dev_json_before,
+        "expected vm.dev.json byte for byte as it was: a deploy's pull never touches it"
+    );
+    assert_eq!(
+        fs::metadata(project.dir.join("vm.dev.json"))
+            .unwrap()
+            .modified()
+            .unwrap(),
+        dev_json_written,
+        "expected vm.dev.json not written again"
     );
     assert_eq!(
         deployed.structures,
@@ -210,7 +285,11 @@ fn a_structure_changed_so_the_code_still_type_checks_is_written_and_built_agains
     let note = deployed.notes_for("structure-updated");
     assert_eq!(note.len(), 1, "{}", deployed.run.describe());
     assert_eq!(note[0]["resource"], json!("devops"));
-    assert_eq!(note[0]["files"], json!(["resources/devops/schema.ts"]));
+    assert_eq!(
+        sorted_files(&note[0]["files"]),
+        ["resources/devops/schema.ts", "resources/devops/standin.sql"],
+        "expected the note to name both files to commit"
+    );
     let message = note[0]["message"].as_str().unwrap().to_lowercase();
     assert!(
         message.contains("commit"),
@@ -231,9 +310,15 @@ fn a_structure_changed_so_the_code_still_type_checks_is_written_and_built_agains
         &["resources/devops"],
         "a changed structure",
     );
+    let left = status(&project.dir);
     assert!(
-        status(&project.dir).contains("resources/devops/schema.ts"),
-        "expected the updated definition left for the Contributor to commit"
+        left.contains("resources/devops/schema.ts")
+            && left.contains("resources/devops/standin.sql"),
+        "expected the updated definition and stand-in left for the Contributor to commit\n{left}"
+    );
+    assert!(
+        !left.contains("vm.dev.json"),
+        "expected vm.dev.json not among the changes\n{left}"
     );
 
     // In words: the definition updated, the Version built against it, to

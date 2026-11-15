@@ -202,6 +202,32 @@ fn a_command_line_the_tool_refuses_is_exit_code_2_and_nothing_is_made() {
             ],
         ),
         (
+            "any header whose name begins with x-vm-",
+            vec![
+                "request",
+                "/echo",
+                "--as",
+                OUTSIDER,
+                "--project",
+                dir,
+                "--header",
+                "X-VM-Anything: 1",
+            ],
+        ),
+        (
+            "an x-vm- header in mixed letter case",
+            vec![
+                "request",
+                "/echo",
+                "--as",
+                OUTSIDER,
+                "--project",
+                dir,
+                "--header",
+                "x-Vm-Request-Id: 2",
+            ],
+        ),
+        (
             "both --data and --data-file",
             vec![
                 "request",
@@ -470,6 +496,18 @@ fn each_malformed_test_users_file_is_test_users_file_naming_what_is_wrong() {
     write_dev_json(&project.dir, &taken);
     let ran = local.request_ok(&project.dir, "/", "carol", &[]);
     assert_eq!(ran.json(), json!({ "user": "carol" }), "{}", ran.describe());
+    // `users` alone is a whole file: `grants` left out is no Grant, `about`
+    // may be left out.
+    let mut only_users = json!({ "users": good_file()["users"].clone() });
+    only_users["users"][1]["team"] = json!("night");
+    write_dev_json(&project.dir, &only_users);
+    let ran = local.request_ok(&project.dir, "/", "carol", &[]);
+    assert_eq!(
+        ran.json(),
+        json!({ "user": "carol" }),
+        "expected a file with `users` only taken\n{}",
+        ran.describe()
+    );
 
     for (case, text, word) in cases {
         fs::write(project.dir.join("vm.dev.json"), &text).unwrap();
