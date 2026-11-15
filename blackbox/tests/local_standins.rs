@@ -1,0 +1,208 @@
+//! The stand-ins of the pulled Resources, and the Resources and Grants of a
+//! local run (CONTRACT.md, "The local loop: one request as a test User:
+//! What a run does", steps 4 and 5, and "A refusal is the same as
+//! deployed"; ticket "Local loop: run the Application on the Builder's
+//! machine and send a request as a test User": no real row and no
+//! credential of a real Resource reaches the Builder's machine; a request
+//! as the test User with no access gets the same refusal a deployed
+//! Application would give).
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    reason = "test code: a failed expectation is a failing test"
+)]
+
+use std::fs;
+
+use blackbox::local::{BUILDER, Board, DEVOPS, OUTSIDER, Requested, declaring, dev_json};
+use blackbox::scenario::CONTACT;
+use serde_json::{Value, json};
+
+fn refusal_of(requested: &Requested) -> Value {
+    assert_eq!(
+        requested.status(),
+        403,
+        "expected the handler's 403 for a refusal\n{}",
+        requested.describe()
+    );
+    requested.json()["refusal"].clone()
+}
+
+#[test]
+fn the_standin_is_made_again_when_the_pulled_structure_changes() {
+    let board = Board::start("read", "read");
+    let first = board.request_ok("/columns", BUILDER, &[]);
+    assert_eq!(first.json(), json!({ "rows": [] }), "{}", first.describe());
+    assert_eq!(
+        first.body["standins"],
+        json!([{ "resource": DEVOPS, "made": true }])
+    );
+    board
+        .scenario
+        .db
+        .superuser()
+        .batch("ALTER TABLE incidents ADD COLUMN region text");
+    board.local.pull_ok(board.dir(), DEVOPS);
+    let second = board.request_ok("/columns", BUILDER, &[]);
+    assert_eq!(
+        second.body["standins"],
+        json!([{ "resource": DEVOPS, "made": true }]),
+        "expected the stand-in made again for the new fingerprint\n{}",
+        second.describe()
+    );
+    assert_eq!(
+        second.json(),
+        json!({ "rows": [] }),
+        "expected the stand-in to have the new column the code now reads\n{}",
+        second.describe()
+    );
+    let third = board.request_ok("/columns", BUILDER, &[]);
+    assert_eq!(
+        third.body["standins"],
+        json!([{ "resource": DEVOPS, "made": false }]),
+        "expected it kept while the fingerprint is the same"
+    );
+}
+
+#[test]
+fn a_statement_the_local_postgres_cannot_run_is_left_out_with_a_warning() {
+    let board = Board::start("read", "read");
+    // A default that calls a function the shared database has and the
+    // stand-in has not.
+    board.scenario.db.superuser().batch(
+        "CREATE FUNCTION next_ticket_code() RETURNS text LANGUAGE sql AS $f$ SELECT 'T-1' $f$;
+         ALTER TABLE incidents ADD COLUMN code text DEFAULT next_ticket_code()",
+    );
+    board.local.pull_ok(board.dir(), DEVOPS);
+    let requested = board.request_ok("/incidents", BUILDER, &[]);
+    assert_eq!(
+        requested.json(),
+        json!({ "user": BUILDER, "incidents": [] }),
+        "expected the run to go on without the statement\n{}",
+        requested.describe()
+    );
+    let warnings = requested.warnings_for("stand-in-incomplete");
+    assert_eq!(
+        warnings.len(),
+        1,
+        "expected one warning for the statement left out\n{}",
+        requested.describe()
+    );
+    let warning = &warnings[0];
+    assert_eq!(warning["resource"], json!(DEVOPS), "{warning}");
+    let text = warning.to_string();
+    assert!(
+        text.contains("next_ticket_code"),
+        "expected the warning to hold the statement's first line and the database's error, got {warning}"
+    );
+}
+
+#[test]
+fn a_resource_pulled_before_this_ticket_has_no_standin_and_its_operations_are_not_registered() {
+    let board = Board::start("read", "read");
+    fs::remove_file(board.dir().join("resources/devops/standin.sql"))
+        .expect("expected the pull to have written resources/devops/standin.sql, to remove it");
+    let requested = board.request_ok("/incidents", BUILDER, &[]);
+    let warnings = requested.warnings_for("stand-in-not-pulled");
+    assert_eq!(warnings.len(), 1, "{}", requested.describe());
+    assert!(
+        warnings[0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("vm pull devops"),
+        "expected the warning to say to run `vm pull devops` again, got {}",
+        warnings[0]
+    );
+    assert_eq!(
+        refusal_of(&requested),
+        json!({ "reason": "not-registered", "resource": DEVOPS }),
+        "expected a declared Resource with no stand-in refused as an installation refuses one not registered"
+    );
+}
+
+#[test]
+fn a_declared_resource_that_was_never_pulled_is_not_registered() {
+    let board = Board::start("read", "read");
+    board.project.write(
+        "manifest.ts",
+        &declaring(
+            blackbox::local::APP,
+            &[(DEVOPS, "read"), ("payroll", "read")],
+        ),
+    );
+    board.project.write(
+        "src/index.ts",
+        &blackbox::local::handler(true, false).replace(
+            "case \"/columns\": {",
+            "case \"/payroll\": {\n        const rows = await (ctx.user() as any).db(\"payroll\").select().from(incidents);\n        return Response.json({ rows });\n      }\n      case \"/columns\": {",
+        ),
+    );
+    let requested = board.request_ok("/payroll", BUILDER, &[]);
+    assert_eq!(
+        refusal_of(&requested),
+        json!({ "reason": "not-registered", "resource": "payroll" }),
+        "{}",
+        requested.describe()
+    );
+}
+
+#[test]
+fn writing_through_a_read_declaration_or_a_read_grant_is_refused_as_deployed() {
+    // Declared at read: declared-lower, whatever the Grant.
+    let read = Board::start("read", "write");
+    let lower = read.request_ok("/add-incident", BUILDER, &["--data", "a title"]);
+    assert_eq!(
+        refusal_of(&lower),
+        json!({ "reason": "declared-lower", "resource": DEVOPS, "declared": "read", "needed": "write" }),
+        "{}",
+        lower.describe()
+    );
+    // Declared at write, the Builder granted read: no-grant.
+    let write = Board::start("write", "read");
+    let refused = write.request_ok("/add-incident", BUILDER, &["--data", "a title"]);
+    assert_eq!(
+        refusal_of(&refused),
+        json!({
+            "reason": "no-grant", "resource": DEVOPS, "user": BUILDER,
+            "needed": "write", "held": "read", "contact": CONTACT
+        }),
+        "{}",
+        refused.describe()
+    );
+}
+
+#[test]
+fn with_a_write_grant_a_write_lands_in_the_standin_and_never_in_the_shared_database() {
+    let board = Board::start("write", "write");
+    assert_eq!(
+        dev_json(board.dir())["grants"],
+        json!([{ "group": "builder", "resource": DEVOPS, "access": "write" }])
+    );
+    let title = format!("written locally {}", blackbox::shared_database::token());
+    let requested = board.request_ok("/add-incident", BUILDER, &["--data", &title]);
+    assert_eq!(
+        requested.json(),
+        json!({ "incidents": [{ "id": 1000, "title": title }] }),
+        "expected the row written into the stand-in and read back\n{}",
+        requested.describe()
+    );
+    let real = board.scenario.db.superuser();
+    assert_eq!(
+        real.value("SELECT count(*) FROM incidents").as_deref(),
+        Some("3"),
+        "expected the shared database's rows as they were"
+    );
+    assert_eq!(
+        real.value(&format!(
+            "SELECT count(*) FROM incidents WHERE title = '{title}'"
+        ))
+        .as_deref(),
+        Some("0"),
+        "expected nothing written into the shared database"
+    );
+    // As outsider, with no Grant, the write is refused.
+    let outsider = board.request_ok("/add-incident", OUTSIDER, &["--data", "x"]);
+    assert_eq!(refusal_of(&outsider)["reason"], json!("no-grant"));
+}
