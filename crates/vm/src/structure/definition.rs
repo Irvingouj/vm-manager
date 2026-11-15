@@ -17,6 +17,8 @@
 
 use std::collections::BTreeMap;
 
+use tokio::time::Instant;
+
 /// Appends a formatted line to a `String`.
 macro_rules! say {
     ($text:expr, $($arg:tt)*) => {{
@@ -65,12 +67,15 @@ mod oid {
 
 /// Writes the definition of `structure` under `resource`'s name, with its
 /// `fingerprint`, and lists the columns it cannot express. Past `limit`
-/// bytes it stops: too large.
+/// bytes it stops: too large; past `deadline`, looked at after each
+/// relation, it stops too, so that it ends by itself even when nobody waits
+/// for it any more.
 pub(super) fn write(
     structure: &Structure,
     resource: &str,
     fingerprint: &str,
     limit: usize,
+    deadline: Instant,
 ) -> Result<(String, Vec<Unsupported>), Failed> {
     let names = Names::of(structure);
     let mut unsupported = Vec::new();
@@ -117,6 +122,9 @@ pub(super) fn write(
         body.push('\n');
         if body.len() > limit {
             return Err(Failed::TooLarge);
+        }
+        if Instant::now() > deadline {
+            return Err(Failed::Time);
         }
     }
 

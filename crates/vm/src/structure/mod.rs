@@ -24,7 +24,8 @@
 //!   the shared database's enters only as a string or template literal
 //!   ([`ts_text`]), and whose identifiers are made by [`naming`].
 //! - **Bounds**: [`PULL_TIME`] in all (checkout, connecting, every
-//!   statement, building the answer); [`MAX_BYTES`] on the rows read from
+//!   statement, building the answer, which is done off the async
+//!   workers); [`MAX_BYTES`] on the rows read from
 //!   the catalogs, counted as they arrive, and on the definition as it is
 //!   written.
 
@@ -102,14 +103,31 @@ pub async fn pull(pool: &Pool, resource: &str) -> Result<Pulled, Failed> {
     let structure = tokio::time::timeout_at(deadline, catalogs::read(pool, resource, deadline))
         .await
         .map_err(|_| Failed::Time)??;
-    let fingerprint = structure.fingerprint();
-    let (schema_ts, unsupported) =
-        definition::write(&structure, resource, &fingerprint, MAX_BYTES)?;
-    // Building is a few milliseconds of work that cannot be interrupted;
-    // past the end it is not answered all the same.
+    // Building is work that does not wait (at the largest structure the
+    // bounds let through, tens of milliseconds in a release build, some
+    // hundreds in a debug one), so it is done off the async workers, and
+    // the pull waits for it within its deadline. The thread is not given
+    // up when the wait is (a pull past its time, or its request's future
+    // dropped): it stops by itself at the deadline. The name is copied for
+    // the thread: a few bytes, once a pull.
+    let resource = resource.to_owned();
+    let building = tokio::task::spawn_blocking(move || build(&structure, &resource, deadline));
+    let built = tokio::time::timeout_at(deadline, building)
+        .await
+        .map_err(|_| Failed::Time)?
+        .map_err(|_| Failed::Unavailable)?;
+    // Past the end it is not answered all the same.
     if Instant::now() > deadline {
         return Err(Failed::Time);
     }
+    built
+}
+
+/// The fingerprint and the definition of `structure`.
+fn build(structure: &Structure, resource: &str, deadline: Instant) -> Result<Pulled, Failed> {
+    let fingerprint = structure.fingerprint();
+    let (schema_ts, unsupported) =
+        definition::write(structure, resource, &fingerprint, MAX_BYTES, deadline)?;
     Ok(Pulled {
         fingerprint,
         schema_ts,
