@@ -323,8 +323,8 @@ fn a_schema_changed_without_a_migration_fails_and_says_how_to_generate_one() {
     let problem = report.problem("migrations", "migrations-behind");
     let message = problem["message"].as_str().unwrap();
     assert!(
-        message.contains("src/db/schema.ts") && message.contains("drizzle-kit generate"),
-        "expected the message to say src/db/schema.ts changed since the last migration and to generate one with drizzle-kit generate, got {message:?}"
+        message.contains("src/db/schema.ts") && message.contains("vm generate"),
+        "expected the message to say src/db/schema.ts changed since the last migration and to generate one with the command `vm generate`, got {message:?}"
     );
 }
 
