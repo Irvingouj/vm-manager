@@ -1,7 +1,8 @@
-//! A tool of the project's, run by `vm check` (blackbox/CONTRACT.md,
-//! "Checking a project"): `node` from the `PATH` with the arguments given,
-//! in the project's folder, with the check's own folder as its `TMPDIR`
-//! and nothing on its standard input.
+//! A tool run by the commands that work on a project (`vm check`, `vm
+//! generate`, `vm deploy`; blackbox/CONTRACT.md, "Checking a project",
+//! "Deploying"): a program from the `PATH` (`node`, `git`) with the
+//! arguments given, in the project's folder, with the command's own folder
+//! as its `TMPDIR` and nothing on its standard input.
 //!
 //! - **Its own process group.** The tool is started as the leader of a new
 //!   group, and the whole group is sent `SIGKILL` as soon as the tool has
@@ -62,6 +63,11 @@ impl Kept {
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
     }
+
+    /// What was kept, handed over.
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
 }
 
 impl Sink for Kept {
@@ -75,11 +81,14 @@ impl Sink for Kept {
     }
 }
 
-/// Bytes cut into lines at each line end; a line longer than `max` bytes is
-/// kept to its first `max` (the rest of it dropped).
+/// Bytes cut into lines at each line end (or into records at each NUL); a
+/// line longer than `max` bytes is kept to its first `max` (the rest of it
+/// dropped).
 pub struct Lines {
     line: Vec<u8>,
     max: usize,
+    /// What ends a line: `\n` (a `\r` before it is dropped too), or NUL.
+    end: u8,
 }
 
 impl Lines {
@@ -87,14 +96,35 @@ impl Lines {
         Self {
             line: Vec::new(),
             max,
+            end: b'\n',
+        }
+    }
+
+    /// Records ended by NUL (as `git ... -z` writes them), each kept as it
+    /// is, to its first `max` bytes.
+    pub fn records_of_at_most(max: usize) -> Self {
+        Self {
+            line: Vec::new(),
+            max,
+            end: 0,
+        }
+    }
+
+    /// The line kept so far, as text.
+    fn text(&self) -> std::borrow::Cow<'_, str> {
+        let text = String::from_utf8_lossy(&self.line);
+        if self.end == b'\n' && text.ends_with('\r') {
+            std::borrow::Cow::Owned(text.trim_end_matches('\r').to_owned())
+        } else {
+            text
         }
     }
 
     /// Feeds `bytes`, handing each line that ends in them to `each`.
     pub fn feed(&mut self, bytes: &[u8], mut each: impl FnMut(&str)) {
         for &byte in bytes {
-            if byte == b'\n' {
-                each(String::from_utf8_lossy(&self.line).trim_end_matches('\r'));
+            if byte == self.end {
+                each(&self.text());
                 self.line.clear();
             } else if self.line.len() < self.max {
                 self.line.push(byte);
@@ -105,7 +135,7 @@ impl Lines {
     /// Hands the last line, if it had no line end, to `each`.
     pub fn finish(&mut self, mut each: impl FnMut(&str)) {
         if !self.line.is_empty() {
-            each(String::from_utf8_lossy(&self.line).trim_end_matches('\r'));
+            each(&self.text());
             self.line.clear();
         }
     }
@@ -187,17 +217,19 @@ async fn exited(leader: Option<Pid>) -> bool {
     }
 }
 
-/// Runs `node <args>` in `cwd`, with `tmpdir` as its `TMPDIR`, and reads
-/// its pipes into `out` and `err`. The error is the one of starting it
-/// (`NotFound`: no `node` on the `PATH`).
+/// Runs `<program> <args>` (`program` found on the `PATH`) in `cwd`, with
+/// `tmpdir` as its `TMPDIR`, and reads its pipes into `out` and `err`. The
+/// error is the one of starting it (`NotFound`: no such program on the
+/// `PATH`).
 pub async fn run<O: Sink, E: Sink>(
+    program: &str,
     cwd: &Path,
     tmpdir: &Path,
     args: &[&OsStr],
     out: O,
     err: E,
 ) -> io::Result<Ran<O, E>> {
-    let mut command = tokio::process::Command::new("node");
+    let mut command = tokio::process::Command::new(program);
     command
         .args(args)
         .current_dir(cwd)

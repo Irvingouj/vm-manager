@@ -51,13 +51,13 @@
 use std::cell::Cell;
 use std::ffi::OsStr;
 use std::fs::{self, DirBuilder, File};
-use std::io::{ErrorKind, Read};
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde_json::{Value, json};
 
-use super::data_loss::{self, Destroyed, Found};
+use super::data_loss::{self, Destroyed, lost, push_statement};
 use super::drizzle::{self, Journal, Outcome};
 use super::project_tools::{
     Bounded, Cx, DEFAULT_TIMEOUT, Scratch, Signals, Who, drizzle_kit, node_is_there,
@@ -103,10 +103,6 @@ const WHO: Who = Who {
 
 /// The longest migration read from what `drizzle-kit` wrote.
 const MAX_SQL_BYTES: u64 = 16 * 1024 * 1024;
-
-/// The longest snapshot read from what `drizzle-kit` wrote, or from the
-/// last migration's.
-const MAX_SNAPSHOT_BYTES: u64 = 32 * 1024 * 1024;
 
 /// The longest `--name`.
 const MAX_NAME: usize = 100;
@@ -333,23 +329,6 @@ fn rename_not_generated() -> Ending {
     )
 }
 
-/// Reads at most `max` bytes of `path`: `None` when there are more.
-fn read_bounded(path: &Path, max: u64) -> std::io::Result<Option<Vec<u8>>> {
-    let mut bytes = Vec::new();
-    File::open(path)?
-        .take(max.saturating_add(1))
-        .read_to_end(&mut bytes)?;
-    Ok(u64::try_from(bytes.len())
-        .is_ok_and(|n| n <= max)
-        .then_some(bytes))
-}
-
-/// The number of a tag `<number>_<name>`.
-fn number_of(tag: &str) -> Option<&str> {
-    let (number, _) = tag.split_once('_')?;
-    (!number.is_empty() && number.bytes().all(|b| b.is_ascii_digit())).then_some(number)
-}
-
 /// What `drizzle-kit` wrote in the copy for the migration `file` (a `.sql`
 /// file's name), read and decided on.
 fn read_generated(cx: &Cx<'_>, file: &str, allow_data_loss: bool) -> Result<Migration, Ending> {
@@ -370,13 +349,13 @@ fn read_generated(cx: &Cx<'_>, file: &str, allow_data_loss: bool) -> Result<Migr
         return Err(unread("is not the last one its journal names"));
     }
     let previous = tags.next();
-    let number = number_of(&tag).ok_or_else(|| unread("has a name without its number"))?;
+    let number = drizzle::number_of(&tag).ok_or_else(|| unread("has a name without its number"))?;
     let snapshot_name = format!("{number}_snapshot.json");
-    let snapshot = read_bounded(&meta.join(&snapshot_name), MAX_SNAPSHOT_BYTES)
+    let snapshot = drizzle::read_bounded(&meta.join(&snapshot_name), drizzle::MAX_SNAPSHOT_BYTES)
         .ok()
         .flatten()
         .ok_or_else(|| unread("has a snapshot that cannot be read"))?;
-    let sql = read_bounded(&copy.join(file), MAX_SQL_BYTES)
+    let sql = drizzle::read_bounded(&copy.join(file), MAX_SQL_BYTES)
         .ok()
         .flatten()
         .ok_or_else(|| unread("cannot be read"))?;
@@ -394,36 +373,21 @@ fn read_generated(cx: &Cx<'_>, file: &str, allow_data_loss: bool) -> Result<Migr
             ),
         })
     })?;
-    let found = data_loss::found(text, &statements);
-    let wanted: Vec<(&str, &str, &str)> = found
-        .iter()
-        .filter_map(|(_, f)| match f {
-            Found::Type {
-                schema,
-                table,
-                column,
-                ..
-            } => Some((schema.as_str(), table.as_str(), column.as_str())),
-            _ => None,
-        })
-        .collect();
-    // The last snapshot before this migration: the types it had.
-    let from = match previous.and_then(number_of) {
-        Some(previous) if !wanted.is_empty() => read_bounded(
-            &meta.join(format!("{previous}_snapshot.json")),
-            MAX_SNAPSHOT_BYTES,
-        )
-        .ok()
-        .flatten()
-        .map(|bytes| data_loss::snapshot_types(&bytes, wanted.iter().copied()))
-        .unwrap_or_default(),
-        _ => Default::default(),
-    };
-    let destroyed = data_loss::destroyed(found, &from);
-    let texts: Vec<String> = statements
-        .iter()
-        .map(|s| data_loss::statement_text(text, s))
-        .collect();
+    let decision = data_loss::decide(
+        text,
+        &statements,
+        || {
+            let previous = previous.and_then(drizzle::number_of)?;
+            drizzle::read_bounded(
+                &meta.join(format!("{previous}_snapshot.json")),
+                drizzle::MAX_SNAPSHOT_BYTES,
+            )
+            .ok()
+            .flatten()
+        },
+        false,
+    );
+    let (destroyed, texts) = (decision.destroyed, decision.statements);
     if !destroyed.is_empty() && !allow_data_loss {
         return Err(data_loss_ending(&destroyed, &texts));
     }
@@ -448,28 +412,14 @@ fn unparseable(what: &str) -> Ending {
     )
 }
 
-/// What would be lost, in words: each thing, joined.
-fn lost(destroyed: &[&Destroyed]) -> String {
-    destroyed
-        .iter()
-        .map(|d| d.words.as_str())
-        .collect::<Vec<_>>()
-        .join("; ")
-}
-
 /// The stop for data that would be lost: `destroys` (every one, in the
 /// order of the statements) and the destroying statements.
 fn data_loss_ending(destroyed: &[(usize, Destroyed)], texts: &[String]) -> Ending {
-    let mut indexes: Vec<usize> = destroyed.iter().map(|(i, _)| *i).collect();
-    indexes.dedup();
-    let statements: Vec<&str> = indexes
-        .iter()
-        .filter_map(|i| texts.get(*i).map(String::as_str))
-        .collect();
+    let statements = data_loss::destroying(destroyed, texts);
     let all: Vec<&Destroyed> = destroyed.iter().map(|(_, d)| d).collect();
     let message = format!(
-        "The migration that src/db/schema.ts now needs destroys data, so nothing was written. Applied, it would lose: {}. Deploying an older Version later does not bring it back. Ask the Builder, telling them exactly what would be lost, unless the Builder has already clearly said that this data may be lost; then run the command again with --allow-data-loss (vm generate --allow-data-loss)",
-        lost(&all)
+        "The migration that src/db/schema.ts now needs destroys data, so nothing was written. {}",
+        data_loss::ask_the_builder(&lost(&all), "vm generate")
     );
     let destroys: Vec<&Value> = all.iter().map(|d| &d.json).collect();
     let mut text = format!("{}\n", Theirs::from(message.as_str()));
@@ -491,16 +441,6 @@ fn data_loss_ending(destroyed: &[(usize, Destroyed)], texts: &[String]) -> Endin
             text,
         },
     )
-}
-
-/// A statement in words: each of its lines indented, escaped as any text
-/// of the project's.
-fn push_statement(text: &mut String, statement: &str) {
-    for line in statement.lines() {
-        text.push_str("    ");
-        text.push_str(&Theirs::from(line.replace('\t', "  ").as_str()).to_string());
-        text.push('\n');
-    }
 }
 
 /// That `path` of the project (shown as `shown`) is no symbolic link (one

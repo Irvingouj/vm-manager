@@ -1,6 +1,11 @@
 //! `vm check [--project <directory>] [--timeout <seconds>] [--json]`
 //! (blackbox/CONTRACT.md, "Checking a project").
 //!
+//! Its pieces (the registry, the packages, each of the four checks and the
+//! report) are also `vm deploy`'s, which runs them in its own order: their
+//! problems are worded as the check's whichever command runs them, and
+//! their endings name the command that runs them.
+//!
 //! What is looked at first, in order: the command line (clap: `2`), the
 //! project (`not-a-project`), the sign-in (the kept credential, then the
 //! installation's list of Resources: `4`), `node` (`node-missing`) and the
@@ -113,7 +118,7 @@ const MAX_PULLED: usize = 1000;
 
 /// Where the check is, for the message of a check that ran out of time.
 #[derive(Clone, Copy)]
-enum Stage {
+pub(super) enum Stage {
     SignIn,
     Node,
     Packages,
@@ -124,7 +129,7 @@ enum Stage {
 }
 
 impl Stage {
-    fn words(self) -> &'static str {
+    pub(super) fn words(self) -> &'static str {
         match self {
             Self::SignIn => "asking the installation which Resources are registered",
             Self::Node => "asking node its version",
@@ -195,55 +200,83 @@ fn interrupted(signal: &str, stage: Stage) -> Ending {
 /// A Resource as the check reads it from `GET /v1/resources`. Its texts are
 /// only ever put in a message or in JSON (see the module's comment).
 #[derive(Deserialize)]
-struct Registered {
+pub(super) struct Registered {
     name: String,
     contact: String,
     your_access: Option<String>,
 }
 
 #[derive(Deserialize)]
-struct Registry {
+pub(super) struct Registry {
     resources: Vec<Registered>,
 }
 
+impl Registry {
+    /// The Builder's Access level on the registered Resource `name`: `None`
+    /// for one not registered, `Some(None)` for no Grant.
+    pub(super) fn access_of(&self, name: &str) -> Option<Option<&str>> {
+        self.resources
+            .iter()
+            .find(|r| r.name == name)
+            .map(|r| r.your_access.as_deref())
+    }
+}
+
+/// The registered Resources and what the signed-in Builder holds:
+/// `GET /v1/resources`.
+pub(super) async fn registry(kept: &super::credential_file::Kept) -> Result<Registry, Ending> {
+    shaped(kept.connect, get_signed_in(kept, "/v1/resources").await?)
+}
+
 /// The project's packages, as Node resolves them.
-struct Packages {
-    tooling: PathBuf,
+pub(super) struct Packages {
+    pub tooling: PathBuf,
     tsc: PathBuf,
     drizzle_kit: PathBuf,
 }
 
 /// What the four checks found.
 #[derive(Default)]
-struct Found {
-    problems: Vec<Value>,
-    warnings: Vec<Value>,
-    notes: Vec<Value>,
+pub(super) struct Found {
+    pub problems: Vec<Value>,
+    pub warnings: Vec<Value>,
+    pub notes: Vec<Value>,
+}
+
+/// The Manifest as the SDK's tooling reads it.
+pub(super) struct Manifest {
+    /// The Application's name, as the tooling took it.
+    pub name: String,
+    pub description: Option<String>,
+    /// The Resources it declares, by name, with the Access level of each.
+    pub declared: BTreeMap<String, String>,
+    /// `{ "resources": { ... } }`, as the tooling answered it.
+    pub declared_access: Value,
 }
 
 async fn checked(project: &Path, own: &Path, stage: &Cell<Stage>) -> Result<Done, Ending> {
     let place = Place::from_environment().map_err(Ending::credential_file)?;
     let kept = read_kept(&place)?;
-    let registry: Registry = shaped(kept.connect, get_signed_in(&kept, "/v1/resources").await?)?;
+    let registry = registry(&kept).await?;
     let cx = Cx::new(project, own, &WHO);
 
     stage.set(Stage::Node);
     node_is_there(&cx, &WHO).await?;
     stage.set(Stage::Packages);
-    let packages = packages(project)?;
+    let packages = packages(project, &WHO)?;
 
     let mut found = Found::default();
     stage.set(Stage::Manifest);
-    let declared = manifest(&cx, &packages, &mut found).await?;
-    if let Some(declared) = &declared {
+    let manifest = manifest(&cx, &packages, &mut found, &WHO).await?;
+    if let Some(manifest) = &manifest {
         stage.set(Stage::Resources);
-        resources(project, declared, &registry, &mut found);
+        resources(project, &manifest.declared, &registry, &mut found);
     }
     stage.set(Stage::Migrations);
-    migrations(&cx, &packages, &mut found).await?;
+    migrations(&cx, &packages, &mut found, &WHO).await?;
     stage.set(Stage::Types);
-    types(&cx, &packages, &mut found).await?;
-    report(found)
+    types(&cx, &packages, &mut found, &WHO).await?;
+    report(found, "")
 }
 
 /// `message` as words: the tool's own, with the project's and the
@@ -256,7 +289,10 @@ fn message_of(item: &Value) -> &str {
     item.get("message").and_then(Value::as_str).unwrap_or("")
 }
 
-fn report(found: Found) -> Result<Done, Ending> {
+/// The check's report: `Ok` when there is no problem, else the ending
+/// `check-failed`, whose message begins with `preface` (empty, or a
+/// sentence of the command's own and a space).
+pub(super) fn report(found: Found, preface: &str) -> Result<Done, Ending> {
     let Found {
         problems,
         warnings,
@@ -302,9 +338,12 @@ fn report(found: Found) -> Result<Done, Ending> {
     };
     let s = if count == 1 { "" } else { "s" };
     let message = format!(
-        "the check found {count} problem{s}; the first: {}",
+        "{preface}the check found {count} problem{s}; the first: {}",
         message_of(first)
     );
+    if !preface.is_empty() {
+        text = format!("{}\n{text}", words(preface.trim_end()));
+    }
     if let Some(object) = body.as_object_mut() {
         object.insert(
             "error".into(),
@@ -314,21 +353,23 @@ fn report(found: Found) -> Result<Done, Ending> {
     Err(Ending::check_failed(&message, Done { json: body, text }))
 }
 
-fn packages(project: &Path) -> Result<Packages, Ending> {
+pub(super) fn packages(project: &Path, who: &Who) -> Result<Packages, Ending> {
     Ok(Packages {
-        tooling: super::project_tools::sdk_tooling(project, &WHO)?,
-        tsc: super::project_tools::tsc(project, &WHO)?,
-        drizzle_kit: super::project_tools::drizzle_kit(project, &WHO)?,
+        tooling: super::project_tools::sdk_tooling(project, who)?,
+        tsc: super::project_tools::tsc(project, who)?,
+        drizzle_kit: super::project_tools::drizzle_kit(project, who)?,
     })
 }
 
-/// The `manifest` check: the Resources the Manifest declares, by name, with
-/// the Access level of each; none when it cannot be read.
-async fn manifest(
+/// The `manifest` check: the Manifest as the tooling reads it; none when it
+/// cannot be read (and then a problem is in `found`). `who` names the
+/// command in its endings.
+pub(super) async fn manifest(
     cx: &Cx<'_>,
     packages: &Packages,
     found: &mut Found,
-) -> Result<Option<BTreeMap<String, String>>, Ending> {
+    who: &Who,
+) -> Result<Option<Manifest>, Ending> {
     let ran = cx
         .run(
             &[
@@ -340,7 +381,7 @@ async fn manifest(
             Kept::up_to(TEXT_BYTES),
         )
         .await
-        .map_err(|error| tool_failed("node", &format!("cannot be started ({error})"), &WHO))?;
+        .map_err(|error| tool_failed("node", &format!("cannot be started ({error})"), who))?;
     let answer: Option<Value> = if ran.out.over {
         None
     } else {
@@ -349,20 +390,31 @@ async fn manifest(
     match (ran.status.code(), answer) {
         (Some(0), Some(mut answer)) => {
             let mut declared = BTreeMap::new();
-            if let Some(Value::Object(resources)) = answer
-                .pointer_mut("/declared_access/resources")
-                .map(Value::take)
-            {
+            if let Some(Value::Object(resources)) = answer.pointer("/declared_access/resources") {
                 for (name, resource) in resources {
                     let access = match resource.get("access") {
                         Some(Value::String(access)) => access.as_str(),
                         _ => "read",
                     };
-                    let access = access.to_owned();
-                    declared.insert(name, access);
+                    declared.insert(name.clone(), access.to_owned());
                 }
             }
-            Ok(Some(declared))
+            let mut text = |key: &str| match answer.get_mut(key).map(Value::take) {
+                Some(Value::String(text)) => Some(text),
+                _ => None,
+            };
+            let name = text("name").unwrap_or_default();
+            let description = text("description");
+            let declared_access = answer
+                .get_mut("declared_access")
+                .map(Value::take)
+                .unwrap_or_else(|| json!({ "resources": {} }));
+            Ok(Some(Manifest {
+                name,
+                description,
+                declared,
+                declared_access,
+            }))
         }
         (Some(2), Some(mut answer)) if answer.get("error").is_some_and(Value::is_object) => {
             let mut error = answer.get_mut("error").map(Value::take).unwrap_or_default();
@@ -399,7 +451,7 @@ async fn manifest(
                 ended(ran.status),
                 cx.words(&ran.err.text(), "")
             ),
-            &WHO,
+            who,
         )),
     }
 }
@@ -414,6 +466,19 @@ enum FirstLine {
 
 /// Whether the file at `path` begins with `line` (followed by a line end,
 /// or nothing): only that much of it is read.
+/// Whether the declared Resource `name` is pulled: both its files there,
+/// each beginning with the first line `vm pull` gives it.
+pub(super) fn is_pulled(project: &Path, name: &str) -> bool {
+    let folder = project.join("resources").join(name);
+    matches!(
+        first_line(&folder.join("schema.ts"), SCHEMA_FIRST_LINE),
+        FirstLine::Generated
+    ) && matches!(
+        first_line(&folder.join("index.ts"), INDEX_FIRST_LINE),
+        FirstLine::Generated
+    )
+}
+
 fn first_line(path: &Path, line: &str) -> FirstLine {
     let file = match File::open(path) {
         Ok(file) => file,
@@ -455,7 +520,7 @@ fn rank(level: Option<&str>) -> u8 {
 }
 
 /// The `resources` check, its warnings, and its notes.
-fn resources(
+pub(super) fn resources(
     project: &Path,
     declared: &BTreeMap<String, String>,
     registry: &Registry,
@@ -569,9 +634,16 @@ fn pulled(project: &Path, name: &str, found: &mut Found) {
 /// The `migrations` check: `drizzle-kit generate` against a copy of
 /// `migrations/` in the check's own folder, and the copy read by the check
 /// itself ([`drizzle::generate`], which says how it is decided).
-async fn migrations(cx: &Cx<'_>, packages: &Packages, found: &mut Found) -> Result<(), Ending> {
-    drizzle::copy_migrations(cx, &WHO)?;
-    let outcome = drizzle::generate(cx, &packages.drizzle_kit, &[], &WHO).await?;
+/// Its problems are worded as the check's, whichever command runs it; `who`
+/// names the command in its endings.
+pub(super) async fn migrations(
+    cx: &Cx<'_>,
+    packages: &Packages,
+    found: &mut Found,
+    who: &Who,
+) -> Result<(), Ending> {
+    drizzle::copy_migrations(cx, who)?;
+    let outcome = drizzle::generate(cx, &packages.drizzle_kit, &[], who).await?;
     let behind = |message: &str| json!({ "check": "migrations", "reason": "migrations-behind", "message": message });
     match outcome {
         Outcome::Unreadable { what, stray } => found.problems.push(json!({
@@ -706,8 +778,13 @@ impl Sink for TypeErrors {
 }
 
 /// The `types` check: `tsc --noEmit` with the project's own
-/// `tsconfig.json`.
-async fn types(cx: &Cx<'_>, packages: &Packages, found: &mut Found) -> Result<(), Ending> {
+/// `tsconfig.json`. `who` names the command in its endings.
+pub(super) async fn types(
+    cx: &Cx<'_>,
+    packages: &Packages,
+    found: &mut Found,
+    who: &Who,
+) -> Result<(), Ending> {
     // Build information, which `incremental` or `composite` in the
     // project's tsconfig.json would have tsc write beside it, goes to the
     // check's own folder: these two flags are taken whatever the tsconfig
@@ -730,7 +807,7 @@ async fn types(cx: &Cx<'_>, packages: &Packages, found: &mut Found) -> Result<()
             Kept::up_to(TEXT_BYTES),
         )
         .await
-        .map_err(|error| tool_failed("node", &format!("cannot be started ({error})"), &WHO))?;
+        .map_err(|error| tool_failed("node", &format!("cannot be started ({error})"), who))?;
     let errors = ran.out.read;
     for error in &errors.kept {
         let message = match (&error.file, error.line, error.column) {

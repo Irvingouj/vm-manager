@@ -6,8 +6,10 @@
 //! serving, driven on the tool's own thread: the connection's future is
 //! polled beside the request's, never spawned, so nothing outlives the
 //! call. Every wait has an end: [`CONNECT_TIMEOUT`] to be let in,
-//! [`ANSWER_TIMEOUT`] for the whole answer after that; and the answer's body
-//! is read up to [`MAX_ANSWER_BYTES`] (hyper bounds its head).
+//! [`ANSWER_TIMEOUT`] for the whole answer after that (or the end the
+//! caller gives, with [`send_waiting`]); and the answer's body is read up
+//! to [`MAX_ANSWER_BYTES`] (hyper bounds its head). The body sent is the
+//! caller's, which bounds it.
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -67,13 +69,27 @@ pub enum Failure {
     Unexpected(String),
 }
 
-/// Sends one request and reads its whole answer.
+/// Sends one request and reads its whole answer, waiting for it
+/// [`ANSWER_TIMEOUT`] at most.
 pub async fn send(
     installation: &Installation<'_>,
     method: Method,
     path: &str,
     sign: Sign<'_>,
-    body: Option<&'static [u8]>,
+    body: Option<Bytes>,
+) -> Result<Reply, Failure> {
+    send_waiting(installation, method, path, sign, body, ANSWER_TIMEOUT).await
+}
+
+/// As [`send`], waiting for the whole answer `answer_timeout` at most once
+/// connected.
+pub async fn send_waiting(
+    installation: &Installation<'_>,
+    method: Method,
+    path: &str,
+    sign: Sign<'_>,
+    body: Option<Bytes>,
+    answer_timeout: Duration,
 ) -> Result<Reply, Failure> {
     let request = request(installation, method, path, sign, body)
         .map_err(|()| Failure::Unexpected("the request could not be written".into()))?;
@@ -89,11 +105,11 @@ pub async fn send(
                 )));
             }
         };
-    match tokio::time::timeout(ANSWER_TIMEOUT, exchange(stream, request)).await {
+    match tokio::time::timeout(answer_timeout, exchange(stream, request)).await {
         Ok(answered) => answered,
         Err(_) => Err(Failure::Unreachable(format!(
             "it did not answer within {} s",
-            ANSWER_TIMEOUT.as_secs()
+            answer_timeout.as_secs()
         ))),
     }
 }
@@ -103,7 +119,7 @@ fn request(
     method: Method,
     path: &str,
     sign: Sign<'_>,
-    body: Option<&'static [u8]>,
+    body: Option<Bytes>,
 ) -> Result<Request<Full<Bytes>>, ()> {
     let host = HeaderValue::try_from(format!("api.{}", installation.domain)).map_err(|_| ())?;
     let mut builder = Request::builder()
@@ -133,7 +149,7 @@ fn request(
     let body = match body {
         Some(bytes) => {
             builder = builder.header(CONTENT_TYPE, "application/json");
-            Full::new(Bytes::from_static(bytes))
+            Full::new(bytes)
         }
         None => Full::new(Bytes::new()),
     };

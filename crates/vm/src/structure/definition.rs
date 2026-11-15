@@ -130,7 +130,7 @@ pub(super) fn write(
 
     let mut text = String::with_capacity(body.len() + 512);
     say!(text, "{FIRST_LINE}");
-    say!(text, "// Resource: {resource}  Fingerprint: {fingerprint}");
+    say!(text, "{}", super::second_line(resource, fingerprint));
     if uses_sql {
         text.push_str("import { sql } from \"drizzle-orm\";\n");
     }

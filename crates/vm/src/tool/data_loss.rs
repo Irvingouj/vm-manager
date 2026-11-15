@@ -16,7 +16,10 @@
 //! - `DROP SCHEMA` (a `DropStmt` of schemas): each schema named.
 //!
 //! Nothing else: a `DISABLE ROW LEVEL SECURITY`, a view dropped, a default
-//! dropped or a constraint tightened is in no list.
+//! dropped or a constraint tightened is in no list. At deploy ([`decide`]
+//! with `rows`), besides, what only a migration written by hand has: a
+//! `DELETE` (a `DeleteStmt`, its table) and a `TRUNCATE` (a `TruncateStmt`,
+//! each table), as rows lost; an `UPDATE` is not.
 //!
 //! The last snapshot is read for the types of the columns whose type
 //! changes and no more ([`snapshot_types`]): its tables one at a time, each
@@ -193,6 +196,8 @@ pub(super) enum Found {
     },
     /// A schema dropped.
     Schema(String),
+    /// Rows deleted or truncated: `<schema>.<table>`.
+    Rows(String),
 }
 
 /// What the statements of a migration may destroy, each with the index of
@@ -260,6 +265,132 @@ pub(super) fn found(sql: &str, statements: &[Parsed]) -> Vec<(usize, Found)> {
         }
     }
     found
+}
+
+/// What the statements of a migration delete or truncate, each with the
+/// index of its statement, in the order of the statements: a `DELETE` or a
+/// `TRUNCATE` at the top of a statement.
+fn rows_found(statements: &[Parsed]) -> Vec<(usize, Found)> {
+    let mut found = Vec::new();
+    let table = |relation: &pg_query::protobuf::RangeVar| {
+        format!(
+            "{}.{}",
+            schema_or_public(&relation.schemaname),
+            relation.relname
+        )
+    };
+    for (index, statement) in statements.iter().enumerate() {
+        match &statement.node {
+            Some(NodeEnum::DeleteStmt(delete)) => {
+                if let Some(relation) = &delete.relation {
+                    found.push((index, Found::Rows(table(relation))));
+                }
+            }
+            Some(NodeEnum::TruncateStmt(truncate)) => {
+                for relation in &truncate.relations {
+                    if let Some(N::RangeVar(relation)) = &relation.node {
+                        found.push((index, Found::Rows(table(relation))));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    found
+}
+
+/// What one migration destroys, decided on its text.
+pub(super) struct Decision {
+    /// Its statements, as the migration has them.
+    pub statements: Vec<String>,
+    /// What each statement destroys, by the statement's index, in order.
+    pub destroyed: Vec<(usize, Destroyed)>,
+}
+
+/// What the migration `text`, whose statements are `statements`, destroys:
+/// [`found`], and with `rows` also what it deletes or truncates; a change
+/// of type compared with the types of the snapshot before it, which
+/// `previous_snapshot` reads (only when a type changes; none when there is
+/// none).
+pub(super) fn decide(
+    text: &str,
+    statements: &[Parsed],
+    previous_snapshot: impl FnOnce() -> Option<Vec<u8>>,
+    rows: bool,
+) -> Decision {
+    let mut all = found(text, statements);
+    if rows {
+        all.extend(rows_found(statements));
+        // Stable: the order of the statements, and within one its own.
+        all.sort_by_key(|(index, _)| *index);
+    }
+    let wanted: Vec<(&str, &str, &str)> = all
+        .iter()
+        .filter_map(|(_, f)| match f {
+            Found::Type {
+                schema,
+                table,
+                column,
+                ..
+            } => Some((schema.as_str(), table.as_str(), column.as_str())),
+            _ => None,
+        })
+        .collect();
+    // The last snapshot before this migration: the types it had.
+    let from = if wanted.is_empty() {
+        BTreeMap::new()
+    } else {
+        previous_snapshot()
+            .map(|bytes| snapshot_types(&bytes, wanted.iter().copied()))
+            .unwrap_or_default()
+    };
+    let destroyed = destroyed(all, &from);
+    let statements = statements.iter().map(|s| statement_text(text, s)).collect();
+    Decision {
+        statements,
+        destroyed,
+    }
+}
+
+/// What would be lost, in words: each thing, joined.
+pub(super) fn lost(destroyed: &[&Destroyed]) -> String {
+    destroyed
+        .iter()
+        .map(|d| d.words.as_str())
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// What to do about data that would be lost (`lost`, in words): the words
+/// `vm generate` and `vm deploy` stop with, `command` being the one to run
+/// again.
+pub(super) fn ask_the_builder(lost: &str, command: &str) -> String {
+    format!(
+        "Applied, it would lose: {lost}. Deploying an older Version later does not bring it back. Ask the Builder, telling them exactly what would be lost, unless the Builder has already clearly said that this data may be lost; then run the command again with --allow-data-loss ({command} --allow-data-loss)"
+    )
+}
+
+/// The destroying statements among `statements`, each once, in order.
+pub(super) fn destroying<'a>(
+    destroyed: &[(usize, Destroyed)],
+    statements: &'a [String],
+) -> Vec<&'a str> {
+    let mut indexes: Vec<usize> = destroyed.iter().map(|(i, _)| *i).collect();
+    indexes.dedup();
+    indexes
+        .iter()
+        .filter_map(|i| statements.get(*i).map(String::as_str))
+        .collect()
+}
+
+/// A statement in words: each of its lines indented, escaped as any text
+/// of the project's.
+pub(super) fn push_statement(text: &mut String, statement: &str) {
+    for line in statement.lines() {
+        text.push_str("    ");
+        text.push_str(&super::theirs::Theirs::from(line.replace('\t', "  ").as_str()).to_string());
+        text.push('\n');
+    }
 }
 
 /// `public` for a name given without its schema.
@@ -526,6 +657,10 @@ pub(super) fn destroyed(
             Found::Schema(schema) => Destroyed {
                 words: format!("the schema {schema} and everything in it"),
                 json: json!({ "what": "schema", "schema": schema }),
+            },
+            Found::Rows(table) => Destroyed {
+                words: format!("rows of the table {table} (it deletes or truncates them)"),
+                json: json!({ "what": "rows", "table": table }),
             },
         };
         destroyed.push((index, one));

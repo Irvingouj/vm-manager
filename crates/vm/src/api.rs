@@ -270,17 +270,6 @@ fn read_migrations(object: &Object<'_>) -> Result<Vec<Migration>, String> {
     Ok(migrations)
 }
 
-/// Whether `text` is a structure's fingerprint: `sha256:` and 64 lower-case
-/// hex digits.
-fn is_fingerprint(text: &str) -> bool {
-    text.strip_prefix("sha256:").is_some_and(|hex| {
-        hex.len() == 64
-            && hex
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-    })
-}
-
 /// A Version's `structures`: absent or `null`, none; otherwise an object,
 /// each key once, each key a Resource the Version declares and each value a
 /// fingerprint.
@@ -303,7 +292,7 @@ fn read_structures(
         }
         let fingerprint: String = serde_json::from_str(value.get())
             .map_err(|_| "a value of structures is not a string".to_owned())?;
-        if !is_fingerprint(&fingerprint) {
+        if !structure::is_fingerprint(&fingerprint) {
             return Err("a value of structures is not sha256: and 64 lower-case hex digits".into());
         }
         structures.insert(name, fingerprint);

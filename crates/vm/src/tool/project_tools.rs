@@ -1,9 +1,9 @@
 //! What the commands that run the project's own tools share (`vm check`,
-//! `vm generate`; blackbox/CONTRACT.md, "Checking a project", "Generating
-//! migrations"): the command's own folder in `TMPDIR` ([`Scratch`]), its
-//! end and its signals ([`Signals`]), `node` and the project's packages as
-//! Node resolves them, and where and how a tool is run and its words
-//! quoted ([`Cx`]).
+//! `vm generate`, `vm deploy`; blackbox/CONTRACT.md, "Checking a project",
+//! "Generating migrations", "Deploying"): the command's own folder in
+//! `TMPDIR` ([`Scratch`]), its end and its signals ([`Signals`]), `node`
+//! and the project's packages as Node resolves them, and where and how a
+//! tool (`node`, `git`) is run and its words quoted ([`Cx`]).
 //!
 //! **Endings.** A command's whole run is held to its time, and `SIGINT`,
 //! `SIGTERM` and `SIGHUP` end it: their handlers are in place (with
@@ -249,7 +249,19 @@ impl<'a> Cx<'a> {
         out: O,
         err: E,
     ) -> io::Result<child::Ran<O, E>> {
-        child::run(self.project, self.own, args, out, err).await
+        child::run("node", self.project, self.own, args, out, err).await
+    }
+
+    /// Runs `git <args>` in the project with the own folder as `TMPDIR`, as
+    /// a tool of the project's is run (its own process group, its pipes
+    /// bounded by `out` and `err`, inside the command's time).
+    pub(super) async fn git<O: Sink, E: Sink>(
+        &self,
+        args: &[&OsStr],
+        out: O,
+        err: E,
+    ) -> io::Result<child::Ran<O, E>> {
+        child::run("git", self.project, self.own, args, out, err).await
     }
 }
 

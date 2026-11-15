@@ -39,6 +39,27 @@ const MAX_MIGRATION_DEPTH: usize = 16;
 /// The largest journal read.
 pub(super) const MAX_JOURNAL_BYTES: u64 = 4 * 1024 * 1024;
 
+/// The longest snapshot read, from what `drizzle-kit` wrote or from the
+/// project's `migrations/meta/`.
+pub(super) const MAX_SNAPSHOT_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Reads at most `max` bytes of `path`: `None` when there are more.
+pub(super) fn read_bounded(path: &Path, max: u64) -> io::Result<Option<Vec<u8>>> {
+    let mut bytes = Vec::new();
+    File::open(path)?
+        .take(max.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    Ok(u64::try_from(bytes.len())
+        .is_ok_and(|n| n <= max)
+        .then_some(bytes))
+}
+
+/// The number of a journal's tag `<number>_<name>`.
+pub(super) fn number_of(tag: &str) -> Option<&str> {
+    let (number, _) = tag.split_once('_')?;
+    (!number.is_empty() && number.bytes().all(|b| b.is_ascii_digit())).then_some(number)
+}
+
 /// The disagreements between the journal and the `.sql` files named in one
 /// message.
 const MAX_NAMED: usize = 10;

@@ -625,7 +625,7 @@ async fn sign_in(args: &SignInArgs) -> Result<Done, Ending> {
             user: &args.stand_in_user,
             groups: args.stand_in_groups.as_deref(),
         },
-        Some(b"{}"),
+        Some(bytes::Bytes::from_static(b"{}")),
     )
     .await
     .map_err(|f| failed(args.connect, f))?;

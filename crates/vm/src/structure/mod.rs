@@ -44,6 +44,31 @@ use crate::executor::Pool;
 
 pub use definition::FIRST_LINE;
 
+/// Whether `text` is a fingerprint as a pull gives one: `sha256:` and 64
+/// lower-case hex digits.
+pub fn is_fingerprint(text: &str) -> bool {
+    text.strip_prefix("sha256:").is_some_and(|hex| {
+        hex.len() == 64
+            && hex
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
+}
+
+/// The second line of the definition of `resource`'s structure, whose
+/// fingerprint is `fingerprint` (without its line end).
+pub fn second_line(resource: &str, fingerprint: &str) -> String {
+    format!("// Resource: {resource}  Fingerprint: {fingerprint}")
+}
+
+/// The fingerprint the second line of a definition of `resource` gives
+/// ([`second_line`]), when it gives one.
+pub fn fingerprint_in<'a>(definition: &'a str, resource: &str) -> Option<&'a str> {
+    let line = definition.lines().nth(1)?;
+    let fingerprint = line.strip_prefix(second_line(resource, "").as_str())?;
+    is_fingerprint(fingerprint).then_some(fingerprint)
+}
+
 /// A pull is held to this in all.
 pub const PULL_TIME: Duration = Duration::from_secs(10);
 
