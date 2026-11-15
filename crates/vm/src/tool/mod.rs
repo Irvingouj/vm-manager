@@ -217,15 +217,16 @@ pub fn run(command: Command) -> ExitCode {
     }
 }
 
-/// `value` as one line of JSON in which no control character is raw.
-/// serde_json escapes C0 on its own but leaves DEL and C1 as they are,
-/// which JSON allows; a terminal does not, so they are escaped here too.
+/// `value` as one line of JSON in which nothing [`theirs::is_escaped`] is
+/// raw. serde_json escapes C0 on its own but leaves DEL, C1 and the
+/// bidirectional marks as they are, which JSON allows; a terminal does not,
+/// so they are escaped here too (all are in the BMP: four hex digits).
 /// Outside strings the compact form holds no control character, so this
 /// changes only strings, and only how they are written.
 fn json_line(value: &Value) -> String {
     let mut line = String::new();
     for c in value.to_string().chars() {
-        if c.is_control() {
+        if theirs::is_escaped(c) {
             put!(line, "\\u{:04x}", u32::from(c));
         } else {
             line.push(c);
