@@ -256,7 +256,9 @@ fn a_method_a_path_does_not_have_is_405_method_not_allowed() {
     let api = vm.api_as(&alice());
     let body = version_body(&marked_bundle("two")).to_string();
     let cases: [(&str, &[&str]); 4] = [
-        ("/v1/applications", &["GET", "PUT", "DELETE", "PATCH"]),
+        // `GET /v1/applications` lists them (ticket: The tool signs in, and
+        // lists Resources and Applications).
+        ("/v1/applications", &["PUT", "DELETE", "PATCH"]),
         (
             "/v1/applications/board",
             &["POST", "PUT", "DELETE", "PATCH"],
@@ -405,7 +407,7 @@ fn method_not_allowed_comes_before_not_a_contributor_and_malformed() {
         ("DELETE", "/v1/applications/board/versions", &b""[..]),
         ("PUT", "/v1/applications/board/versions", b"{ not json"),
         ("PATCH", "/v1/applications/board", br#"{"name":5}"#),
-        ("GET", "/v1/applications", b"{ not json"),
+        ("PUT", "/v1/applications", b"{ not json"),
     ] {
         let response = send(&bob, method, path, body);
         assert!(

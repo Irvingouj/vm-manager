@@ -91,7 +91,7 @@ fn each_resource_says_the_highest_access_the_user_holds_through_their_groups() {
     let cases = [
         (
             User::new("wren").in_groups(&["readers", "writers"]),
-            [json!("write"), Value::Null, Value::Null],
+            [json!("write"), json!("structure"), Value::Null],
         ),
         (
             User::new("rita").in_groups(&["readers"]),
