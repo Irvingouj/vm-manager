@@ -1,9 +1,13 @@
 //! Names that try to break out of the generated TypeScript (CONTRACT.md,
 //! "Pulling a Resource's structure: The definition"): tables, columns and
 //! enum labels whose names hold a quote, an apostrophe, a backtick, `${`,
-//! `*/`, a backslash, a line end or `</script>`. The definition still
+//! `*/`, a backslash, a line end, `</script>`, JavaScript's line and
+//! paragraph separators (U+2028, U+2029) or a bidirectional override
+//! (U+202E), also in a default's expression. The definition still
 //! type-checks, and each name is intact as data: Node, importing the
-//! pulled module, finds every table, column and label under its exact name.
+//! pulled module, finds every table, column and label under its exact name
+//! and the default as Postgres prints it; and no raw U+2028, U+2029 or
+//! U+202E is in the definition.
 //! (A Resource name that would write outside `resources/` is in
 //! `pull_tool.rs`.)
 #![allow(
@@ -19,7 +23,8 @@ use blackbox::program::manifest_dir;
 use blackbox::scenario::{READERS, Scenario};
 use blackbox::sdk::{TSCONFIG, TempProject, node};
 use blackbox::structure::{
-    HOSTILE_ENUM, HOSTILE_NAMES, body_with_structure, hostile_setup, structure_login, type_check,
+    HOSTILE_ENUM, HOSTILE_NAMES, NEVER_RAW, body_with_structure, hostile_setup, structure_login,
+    type_check,
 };
 use blackbox::tool::Machine;
 use serde_json::Value;
@@ -96,7 +101,26 @@ fn hostile_names_do_not_break_out_of_the_definition_and_stay_intact_as_data() {
         std::fs::read_to_string(&schema).unwrap_or_default()
     );
 
+    let text = std::fs::read_to_string(&schema).unwrap();
+    for c in NEVER_RAW {
+        assert!(
+            !text.contains(c),
+            "expected U+{:04X} never raw in the definition (escaped instead), but it is",
+            u32::from(c)
+        );
+    }
     let found = listed(&schema);
+    // The default's expression intact as data: as Postgres prints it.
+    let printed = scenario
+        .db
+        .superuser()
+        .value(&format!(
+            "SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attrdef d JOIN pg_attribute a
+               ON a.attrelid = d.adrelid AND a.attnum = d.adnum
+              WHERE d.adrelid = {}::regclass AND a.attname = 'note'",
+            blackbox::structure::literal(&blackbox::structure::ident(HOSTILE_NAMES[0]))
+        ))
+        .unwrap();
     let tables = found["tables"].as_array().unwrap();
     let mut wrong = Vec::new();
     for table in HOSTILE_NAMES {
@@ -110,9 +134,16 @@ fn hostile_names_do_not_break_out_of_the_definition_and_stay_intact_as_data() {
             .iter()
             .filter_map(Value::as_str)
             .collect();
+        if t["defaults"]["note"].as_str() != Some(printed.as_str()) {
+            wrong.push(format!(
+                "  the default of {table:?}.note is {}, expected the expression as Postgres prints it, {printed:?}",
+                t["defaults"]["note"]
+            ));
+        }
         let mut want: Vec<&str> = vec!["id"];
         want.extend(HOSTILE_NAMES);
         want.push("mood");
+        want.push("note");
         if columns != want {
             wrong.push(format!(
                 "  the table {table:?} has the columns {columns:?}, expected {want:?}"

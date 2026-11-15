@@ -106,11 +106,18 @@ fn the_pulled_definition_compiles_and_typed_queries_type_check_against_it() {
             "--json",
         ])
         .ok_json();
+    let pulled = fs::read_to_string(project.path("resources/stock/schema.ts")).unwrap();
+    for table in ["bins", "crews", "members"] {
+        assert!(
+            pulled.contains(&format!("pgTable(\"{table}\"")),
+            "the harness's own check: expected the tables that refer to themselves and to each other in what was pulled"
+        );
+    }
     let checked = type_check(&project.dir);
     assert_eq!(
         checked.code,
         Some(0),
-        "expected the project, with the pulled definition, to type-check under its tsconfig.json (application code and src/typed.ts included)\n{}\nthe pulled definition:\n{}",
+        "expected the project, with the pulled definition (tables that refer to themselves and to each other included), to type-check under its tsconfig.json (application code and src/typed.ts included)\n{}\nthe pulled definition:\n{}",
         checked.describe(),
         fs::read_to_string(project.path("resources/stock/schema.ts")).unwrap_or_default()
     );
@@ -188,4 +195,64 @@ fn harness_the_hand_written_definition_type_checks_and_reads_the_fixture_databas
         run_routes(&stock, &fixture_project(PROJECT)),
         expected_rows()
     );
+}
+
+#[test]
+fn a_foreign_key_to_a_partition_is_in_the_fingerprint_not_the_definition_and_an_enum_with_no_label_is_unsupported()
+ {
+    let stock = Stock::ready();
+    stock.db().superuser().batch(
+        "CREATE TYPE no_labels AS ENUM ();
+         CREATE TABLE reading_notes (id integer PRIMARY KEY, site_id integer, taken_on date, kind no_labels);",
+    );
+    let before = stock.pull_ok(&rita(), STOCK);
+    let listed = before["unsupported"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["table"] == json!("reading_notes"))
+        .cloned();
+    assert_eq!(
+        listed,
+        Some(
+            json!({ "schema": "public", "table": "reading_notes", "column": "kind", "type": "public.no_labels" })
+        ),
+        "expected the column of an enum with no label listed as unsupported, got {}",
+        before["unsupported"]
+    );
+    stock.db().superuser().batch(
+        "ALTER TABLE reading_notes ADD CONSTRAINT reading_notes_partition_fkey
+           FOREIGN KEY (site_id, taken_on) REFERENCES readings_2025 (site_id, taken_on)",
+    );
+    let after = stock.pull_ok(&rita(), STOCK);
+    assert_ne!(
+        after["fingerprint"], before["fingerprint"],
+        "expected a foreign key to a partition to change the fingerprint"
+    );
+    let ts = after["schema_ts"].as_str().unwrap();
+    assert!(
+        !ts.contains("readings_2025") && !ts.contains("reading_notes_partition_fkey"),
+        "expected the foreign key to a partition not in the definition, got\n{ts}"
+    );
+    assert_eq!(
+        blackbox::structure::without_second_line(ts),
+        blackbox::structure::without_second_line(before["schema_ts"].as_str().unwrap()),
+        "expected the definition unchanged but for its second line"
+    );
+    // And the project with it type-checks.
+    let project = copy_project(PROJECT);
+    fs::remove_dir_all(project.path("resources/stock")).unwrap();
+    let machine = Machine::new();
+    machine.sign_in(&stock.scenario.vm, &rita());
+    machine
+        .run(&[
+            "pull",
+            STOCK,
+            "--project",
+            project.dir.to_str().unwrap(),
+            "--json",
+        ])
+        .ok_json();
+    let checked = type_check(&project.dir);
+    assert_eq!(checked.code, Some(0), "{}", checked.describe());
 }

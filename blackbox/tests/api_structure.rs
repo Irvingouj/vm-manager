@@ -169,10 +169,8 @@ fn the_answer_holds_the_resource_its_fingerprint_the_users_access_the_definition
             .find(|c| c["table"] == json!(table) && c["column"] == json!(column))
             .unwrap();
         assert!(
-            listed["type"]
-                .as_str()
-                .is_some_and(|t| t.contains(type_word)),
-            "expected the type of {table}.{column} to be named ({type_word}), got {listed}"
+            listed["type"].as_str() == Some(type_word),
+            "expected the type of {table}.{column} as Postgres prints it with nothing on the search path ({type_word}), got {listed}"
         );
         assert!(
             schema_ts.contains(&format!("\"{column}\"")),
@@ -607,4 +605,145 @@ fn a_resource_registered_with_a_structure_login_of_its_own_answers_its_registrat
         ],
         "{created}"
     );
+}
+
+/// The sessions of `role` connected to `database` as (all, waiting on a
+/// lock), seen from a connection to the instance's `postgres` database
+/// (opened before the lock: a new connection to the locked database would
+/// wait on it too).
+fn sessions(observer: &Sql, database: &str, role: &str) -> (usize, usize) {
+    let row = observer.batch(&format!(
+        "SELECT count(*), count(*) FILTER (WHERE wait_event_type = 'Lock') FROM pg_stat_activity
+          WHERE datname = '{database}' AND usename = '{role}'"
+    ));
+    let n = |i: usize| {
+        row.first()
+            .and_then(|r| r.get(i).cloned().flatten())
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    };
+    (n(0), n(1))
+}
+
+#[test]
+fn at_most_two_pulls_of_one_resource_run_at_once_and_its_applications_are_served_meanwhile() {
+    // The Resource has no structure login: pulls share the read login
+    // with the Application's operations.
+    let stock = Stock::start();
+    stock.register_without_structure(STOCK);
+    stock.scenario.grant(STOCK, READERS, "read");
+    stock
+        .scenario
+        .install("board", "query.js", &[(STOCK, "read")]);
+    // Another Resource, over another database: its pulls are not counted.
+    let other = blackbox::shared_database::SharedDatabase::create();
+    stock.scenario.register_body(
+        "elsewhere",
+        &resource_body("elsewhere", &other, &other.reader),
+    );
+    stock.scenario.grant("elsewhere", READERS, "structure");
+    let db = stock.db();
+    let reader = db.reader.role.clone();
+
+    let query = || {
+        stock.scenario.query(
+            &rita(),
+            "board",
+            &blackbox::scenario::sql_on(STOCK, "select 'served-while-pulling' as probe"),
+        )
+    };
+    // The Application has queried once already, as it would have.
+    let (_, warm) = query();
+    blackbox::scenario::assert_rows(
+        &warm,
+        &["probe"],
+        &json!([["served-while-pulling"]]),
+        "before",
+    );
+    let observer = Sql::connect(&db.server().url("postgres")).unwrap();
+    let holder = Sql::connect(&db.server().url(db.name())).unwrap();
+    holder.batch("BEGIN; LOCK TABLE pg_catalog.pg_constraint IN ACCESS EXCLUSIVE MODE");
+    let api = stock.scenario.vm.api_as(&rita());
+    std::thread::scope(|scope| {
+        let first = scope.spawn(|| pull(&api, STOCK));
+        let second = scope.spawn(|| pull(&api, STOCK));
+        // Both waiting on the lock, well within their 10 seconds.
+        let deadline = Instant::now() + Duration::from_secs(6);
+        while sessions(&observer, db.name(), &reader).1 < 2 {
+            assert!(
+                Instant::now() < deadline,
+                "the harness's own check: expected two pulls waiting on the lock, got (sessions, waiting) {:?}",
+                sessions(&observer, db.name(), &reader)
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let (sessions_before, _) = sessions(&observer, db.name(), &reader);
+
+        // A third: answered at once, busy, and nothing sent.
+        let began = Instant::now();
+        let third = pull(&api, STOCK);
+        let took = began.elapsed();
+        assert_api_error(&third, 503, "structure-unavailable");
+        assert!(
+            took < Duration::from_millis(900),
+            "expected the third pull answered at once, it took {took:?}"
+        );
+        let message = third.json()["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .to_lowercase();
+        assert!(
+            message.contains("again"),
+            "expected the message to say to try again shortly, got {message:?}"
+        );
+        let entries = entries_of(&stock.scenario, &third);
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_pull_entry(
+            &entries[0],
+            &third,
+            &rita(),
+            STOCK,
+            "failed",
+            None,
+            Some("busy"),
+        );
+        std::thread::sleep(Duration::from_millis(300));
+        let (sessions_after, waiting_after) = sessions(&observer, db.name(), &reader);
+        assert_eq!(
+            (sessions_after, waiting_after),
+            (sessions_before, 2),
+            "expected no third session of the read login for the refused pull"
+        );
+
+        // A pull of another Resource is not counted.
+        let elsewhere = pull(&api, "elsewhere");
+        assert_eq!(
+            elsewhere.status,
+            200,
+            "expected a pull of another Resource allowed while two of this one run, got\n{}",
+            elsewhere.describe()
+        );
+
+        // The Application's operations on the Resource are served.
+        let (_, answer) = query();
+        blackbox::scenario::assert_rows(
+            &answer,
+            &["probe"],
+            &json!([["served-while-pulling"]]),
+            "a query of the Application while two pulls run",
+        );
+
+        holder.batch("ROLLBACK");
+        for (which, handle) in [("first", first), ("second", second)] {
+            let answer = handle.join().unwrap();
+            assert_eq!(
+                answer.status,
+                200,
+                "expected the {which} pull to finish as usual once the lock is gone, got\n{}",
+                answer.describe()
+            );
+        }
+    });
+    // And a new pull is allowed.
+    stock.pull_ok(&rita(), STOCK);
 }

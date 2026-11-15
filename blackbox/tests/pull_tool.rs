@@ -323,16 +323,11 @@ fn a_file_the_tool_did_not_write_is_not_overwritten() {
             hand_written,
             "expected the hand-written {file} not overwritten"
         );
-        let after = snapshot(&dir);
-        let kept = after
-            .iter()
-            .find(|(p, ..)| p.ends_with(file))
-            .map(|(_, bytes, time)| (bytes.clone(), *time));
-        let was = before
-            .iter()
-            .find(|(p, ..)| p.ends_with(file))
-            .map(|(_, bytes, time)| (bytes.clone(), *time));
-        assert_eq!(kept, was);
+        assert_eq!(
+            before,
+            snapshot(&dir),
+            "expected neither file written when {file} was not written by the tool"
+        );
     }
 }
 
@@ -483,4 +478,67 @@ fn without_json_each_unsupported_column_is_one_line_saying_it_is_typed_unknown()
         words.contains("resources/stock/schema.ts"),
         "expected the words to name the files written, got\n{words}"
     );
+}
+
+#[test]
+fn the_tool_writes_through_no_symbolic_link() {
+    use std::os::unix::fs::symlink;
+    let stock = Stock::ready();
+    let machine = Machine::new();
+    machine.sign_in(&stock.scenario.vm, &rita());
+    let generated = |file: &str| {
+        if file == "schema.ts" {
+            format!("{FIRST_LINE}\n// outside the project\n")
+        } else {
+            "// Generated. Do not edit.\n// outside the project\n".to_owned()
+        }
+    };
+    for (case, link_path) in [
+        ("resources", "resources"),
+        ("the resource's folder", "resources/stock"),
+        ("schema.ts", "resources/stock/schema.ts"),
+        ("index.ts", "resources/stock/index.ts"),
+    ] {
+        let dir = project(
+            &machine,
+            &format!("linked-{}", case.replace([' ', '\''], "-")),
+        );
+        let outside = machine
+            .root()
+            .join(format!("outside-{}", case.replace([' ', '\''], "-")));
+        fs::create_dir_all(&outside).unwrap();
+        match link_path {
+            "resources" => symlink(&outside, dir.join("resources")).unwrap(),
+            "resources/stock" => {
+                fs::create_dir_all(dir.join("resources")).unwrap();
+                symlink(&outside, dir.join("resources/stock")).unwrap();
+            }
+            file => {
+                let name = file.rsplit('/').next().unwrap();
+                let target = outside.join(name);
+                fs::write(&target, generated(name)).unwrap();
+                fs::create_dir_all(dir.join("resources/stock")).unwrap();
+                symlink(&target, dir.join(file)).unwrap();
+            }
+        }
+        let before = snapshot(machine.root());
+        let message = machine
+            .run(&pull_args(STOCK, dir.to_str().unwrap(), true))
+            .json_error(1, "not-a-project");
+        assert!(
+            message.contains(link_path),
+            "{case}: expected the message to name the link {link_path:?}, got {message:?}"
+        );
+        assert_eq!(
+            before,
+            snapshot(machine.root()),
+            "{case}: expected nothing written or changed, inside the project or outside"
+        );
+        let outside_files = snapshot(&outside);
+        assert!(
+            outside_files.iter().all(|(_, bytes, _)| String::from_utf8_lossy(bytes).contains("outside the project")),
+            "{case}: expected nothing written outside the project: {:?}",
+            names(&outside_files)
+        );
+    }
 }

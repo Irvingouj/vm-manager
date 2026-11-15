@@ -20,9 +20,7 @@
 
 use blackbox::User;
 use blackbox::scenario::READERS;
-use blackbox::structure::{
-    FIRST_LINE, STOCK, Stock, UNSUPPORTED, export_of, is_identifier, key_of, second_line,
-};
+use blackbox::structure::{FIRST_LINE, STOCK, Stock, UNSUPPORTED, export_of, key_of, second_line};
 
 fn rita() -> User {
     User::new("rita").in_groups(&[READERS])
@@ -32,18 +30,6 @@ fn pulled() -> String {
     let stock = Stock::ready();
     let answer = stock.pull_ok(&rita(), STOCK);
     answer["schema_ts"].as_str().unwrap().to_owned()
-}
-
-/// Fails unless `name` is a `_` and a number added to `base`.
-fn assert_numbered(name: &str, base: &str, context: &str) {
-    let digits = name
-        .strip_prefix(base)
-        .and_then(|rest| rest.strip_prefix('_'))
-        .unwrap_or_default();
-    assert!(
-        !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()),
-        "{context}: expected {base:?} with a `_` and a number added, got {name:?}"
-    );
 }
 
 #[test]
@@ -102,39 +88,90 @@ fn tables_views_and_enums_are_exported_in_camel_case_under_their_schemas() {
 }
 
 #[test]
-fn names_that_meet_are_no_identifier_or_are_reserved_get_a_number() {
+fn names_that_meet_are_no_identifier_or_are_reserved_get_the_first_free_number() {
     let ts = pulled();
-    // Two tables whose names meet in camel case.
-    let snake = export_of(&ts, "pgTable(\"stock_levels\"").unwrap_or_default();
-    let camel = export_of(&ts, "pgTable(\"stockLevels\"").unwrap_or_default();
-    assert_ne!(snake, camel, "expected two exports, got\n{ts}");
-    // `stockLevels` sorts before `stock_levels` in the `C` collation.
+    for (call, export) in [
+        // `stockLevels` sorts before `stock_levels` in the `C` collation:
+        // it keeps its name, the other gets the first free number.
+        ("pgTable(\"stockLevels\"", "stockLevels"),
+        ("pgTable(\"stock_levels\"", "stockLevels_2"),
+        // A reserved word.
+        ("pgTable(\"case\"", "case_2"),
+        // What begins with a digit gets a `_` in front.
+        ("pgTable(\"2fa codes\"", "_2faCodes"),
+        // The names the module itself uses are taken first.
+        ("pgTable(\"sql\"", "sql_2"),
+        // Then the schemas' exports, before any table.
+        ("pgSchema(\"crm\")", "crmSchema"),
+        ("pgTable(\"crm_schema\"", "crmSchema_2"),
+    ] {
+        assert_eq!(
+            export_of(&ts, call).as_deref(),
+            Some(export),
+            "expected `export const {export} = {call}...`, got\n{ts}"
+        );
+    }
+    for (export, column, key) in [
+        // Three columns that meet, taken in the order of their names:
+        // `user id` < `userId` < `user_id`.
+        ("stockLevels_2", "user id", "userId"),
+        ("stockLevels_2", "userId", "userId_2"),
+        ("stockLevels_2", "user_id", "userId_3"),
+        ("stockLevels_2", "site_id", "siteId"),
+        ("case_2", "default", "default_2"),
+        ("_2faCodes", "per-user code", "perUserCode"),
+    ] {
+        assert_eq!(
+            key_of(&ts, export, column).as_deref(),
+            Some(key),
+            "expected the column {column:?} of {export} under the key {key:?}, got\n{ts}"
+        );
+    }
+    // A camel-case name stays as it is.
     assert_eq!(
-        camel, "stockLevels",
-        "expected the first of the two by the `C` collation to keep its name"
+        key_of(&ts, "stockLevels_2", "level").as_deref(),
+        Some("level")
     );
-    assert_numbered(&snake, "stockLevels", "the second of two tables that meet");
-    // Two columns of `stock_levels` whose names meet.
-    let first = key_of(&ts, &snake, "userId").unwrap_or_default();
-    let second = key_of(&ts, &snake, "user_id").unwrap_or_default();
-    assert_eq!(first, "userId", "{ts}");
-    assert_numbered(&second, "userId", "the second of two columns that meet");
-    // A reserved word, as a table and as a column.
-    let case = export_of(&ts, "pgTable(\"case\"").unwrap_or_default();
-    assert_numbered(&case, "case", "a table named by a reserved word");
-    let default = key_of(&ts, &case, "default").unwrap_or_default();
-    assert_numbered(&default, "default", "a column named by a reserved word");
-    // A name that is no identifier.
-    let two_fa = export_of(&ts, "pgTable(\"2fa codes\"").unwrap_or_default();
-    assert!(
-        is_identifier(&two_fa),
-        "expected the table \"2fa codes\" exported under an identifier, got {two_fa:?} in\n{ts}"
-    );
-    let code = key_of(&ts, &two_fa, "per-user code").unwrap_or_default();
-    assert!(
-        is_identifier(&code),
-        "expected the column \"per-user code\" under an identifier, got {code:?} in\n{ts}"
-    );
+}
+
+#[test]
+fn views_of_another_schema_hang_off_the_schema() {
+    let ts = pulled();
+    for (call, export) in [
+        ("crmSchema.view(\"big_accounts\"", "crmBigAccounts"),
+        (
+            "crmSchema.materializedView(\"tier_counts\"",
+            "crmTierCounts",
+        ),
+    ] {
+        assert_eq!(
+            export_of(&ts, call).as_deref(),
+            Some(export),
+            "expected `export const {export} = {call}...`, got\n{ts}"
+        );
+    }
+}
+
+#[test]
+fn tables_that_refer_to_themselves_and_to_each_other_are_written_with_their_foreign_keys() {
+    let ts = pulled();
+    for (call, export) in [
+        ("pgTable(\"bins\"", "bins"),
+        ("pgTable(\"crews\"", "crews"),
+        ("pgTable(\"members\"", "members"),
+    ] {
+        assert_eq!(export_of(&ts, call).as_deref(), Some(export), "{ts}");
+    }
+    for name in [
+        "bins_parent_id_fkey",
+        "crews_lead_id_fkey",
+        "members_crew_id_fkey",
+    ] {
+        assert!(
+            ts.contains(&format!("\"{name}\"")),
+            "expected the foreign key {name:?}, with its name, in the definition, got\n{ts}"
+        );
+    }
 }
 
 #[test]
@@ -233,7 +270,7 @@ fn a_column_of_a_type_it_cannot_express_is_in_the_definition_as_a_custom_type() 
             "expected the unsupported column {table}.{column} in the definition, not dropped, got\n{ts}"
         );
         assert!(
-            ts.contains(type_word),
+            ts.contains(type_word.rsplit('.').next().unwrap_or(type_word)),
             "expected the custom type's database type to be the type's name ({type_word}), got\n{ts}"
         );
     }
