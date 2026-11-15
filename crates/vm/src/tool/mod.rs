@@ -22,7 +22,9 @@ mod check;
 mod child;
 mod client;
 mod credential_file;
+mod drizzle;
 mod new;
+mod project_tools;
 mod pull;
 mod template;
 mod theirs;
@@ -31,7 +33,8 @@ pub use check::CheckArgs;
 pub use new::NewArgs;
 pub use pull::PullArgs;
 
-use std::io::{self, Write};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, ErrorKind, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -360,6 +363,40 @@ fn file_problem(what: &str, how: &str, error: &io::Error, command: &str) -> Endi
         "project-file",
         format!("{what} {how} ({error}): make it writable by you, then run {command} again"),
     )
+}
+
+/// Writes `content` to `path` whole or not at all: to a file of its own
+/// beside it (`.<name>.<tag>`), synced, then renamed over it.
+fn write_whole(path: &Path, content: &[u8], tag: &str) -> io::Result<()> {
+    let folder = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let temporary = folder.join(format!(".{file_name}.{tag}"));
+    // What a crash between writing and renaming left.
+    match fs::remove_file(&temporary) {
+        Ok(()) => {}
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let written = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .and_then(|mut file| {
+            file.write_all(content)?;
+            file.sync_all()
+        })
+        .and_then(|()| fs::rename(&temporary, path));
+    if let Err(error) = written {
+        drop(fs::remove_file(&temporary));
+        return Err(error);
+    }
+    if let Ok(folder) = File::open(folder) {
+        drop(folder.sync_all());
+    }
+    Ok(())
 }
 
 /// The installation of what is kept.

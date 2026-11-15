@@ -15,8 +15,8 @@
 //! installation's (the fingerprint, the Access level, the unsupported
 //! columns) reaches words only through [`Theirs`].
 
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, ErrorKind, Read, Write};
+use std::fs::{self, File};
+use std::io::{self, ErrorKind, Read};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -26,7 +26,7 @@ use super::credential_file::Place;
 use super::theirs::Theirs;
 use super::{
     Done, Ending, Output, file_problem as project_file, get_signed_in, project_of, read_kept,
-    shaped, unexpected,
+    shaped, unexpected, write_whole,
 };
 use crate::resources::is_resource_name;
 use crate::structure::FIRST_LINE as SCHEMA_FIRST_LINE;
@@ -160,7 +160,7 @@ pub(super) async fn pull(args: &PullArgs) -> Result<Done, Ending> {
         if was.as_deref() == Some(content) {
             continue;
         }
-        write_whole(&file.path, content)
+        write_whole(&file.path, content, "vm-pull")
             .map_err(|error| file_problem(&file.shown, "cannot be written", &error))?;
         *flag = true;
     }
@@ -283,40 +283,6 @@ fn generated_or_none(file: &Generated) -> Result<Option<Vec<u8>>, Ending> {
     let whole = u64::try_from(bytes.len()).is_ok_and(|n| n <= MAX_FILE_BYTES);
     // A file too large to compare is rewritten: it differs from any answer.
     Ok(Some(if whole { bytes } else { Vec::new() }))
-}
-
-/// Writes `content` to `path` whole or not at all: to a file of its own
-/// beside it, synced, then renamed over it.
-fn write_whole(path: &Path, content: &[u8]) -> io::Result<()> {
-    let folder = path.parent().unwrap_or_else(|| Path::new("."));
-    let file_name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let temporary = folder.join(format!(".{file_name}.vm-pull"));
-    // What a crash between writing and renaming left.
-    match fs::remove_file(&temporary) {
-        Ok(()) => {}
-        Err(error) if error.kind() == ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
-    }
-    let written = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temporary)
-        .and_then(|mut file| {
-            file.write_all(content)?;
-            file.sync_all()
-        })
-        .and_then(|()| fs::rename(&temporary, path));
-    if let Err(error) = written {
-        drop(fs::remove_file(&temporary));
-        return Err(error);
-    }
-    if let Ok(folder) = File::open(folder) {
-        drop(folder.sync_all());
-    }
-    Ok(())
 }
 
 fn file_problem(what: &str, how: &str, error: &io::Error) -> Ending {
