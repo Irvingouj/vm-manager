@@ -1038,7 +1038,7 @@ The platform reads the rows on the migration's own session, as the migration rol
 
 ### A statement may run more than once
 
-To have the rows before, the platform must know that a statement rewrites before it runs it. It may therefore run a Version's migrations, or some of their statements, more than once, each earlier run undone before the next.
+To have the rows before, the platform must know that a statement rewrites before it runs it. It may therefore run a Version's migrations, or some of their statements, more than once, each earlier run undone before the next. A Version none of whose statements rewrites a table with history is run once.
 
 - What stays of a Version is one run's work: a row a migration inserts before its rewrite is there once, and once in the history. What Postgres does not undo (a sequence's values) may show the earlier runs.
 - At most 5 runs. The platform remembers every table a statement was seen to rewrite, in whichever run, and takes the rows of all of them before it: a statement that rewrites one of two tables in turn settles by the third run and is recorded as the run that stayed. A Version with a statement that in its fifth run still rewrites a table with history it had rewritten in none before (so that the platform has not that table's rows before) is refused: `migration-refused`, rule `rewrite-unsteady`, the message names the migration and the tables that statement was seen to rewrite.
