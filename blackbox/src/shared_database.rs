@@ -46,6 +46,14 @@ pub struct Login {
 }
 
 impl Login {
+    /// A login of this role with this password (a role the test made).
+    pub fn new(role: &str, password: &str) -> Self {
+        Self {
+            role: role.to_owned(),
+            password: password.to_owned(),
+        }
+    }
+
     pub fn password(&self) -> &str {
         &self.password
     }
@@ -396,6 +404,11 @@ impl SharedDatabase {
             .replace("%ROW_MARKER%", &database.row_marker);
         database.superuser().batch(&setup);
         database
+    }
+
+    /// The instance it lives on.
+    pub fn server(&self) -> &'static PrivatePostgres {
+        self.server
     }
 
     /// The database's name.

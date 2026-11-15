@@ -40,7 +40,11 @@
 //!   what those of what a migration leaves behind share, and
 //!   [`changed_outside`] what those of what something else changed share;
 //! - [`tool`] runs the program as the Builder's command-line tool, on a
-//!   temporary directory standing for the Builder's machine.
+//!   temporary directory standing for the Builder's machine;
+//! - [`structure`] is what the tests of pulling a Resource's structure
+//!   share: a fixture shared database with the common shapes, the
+//!   generated link, and a reading of the server log that says whether a
+//!   login read only the catalogs.
 //!
 //! Every wait has a timeout, so a failing test fails within seconds and
 //! never hangs. Each test starts its own program on its own port, so tests
@@ -78,6 +82,7 @@ pub mod sdk_history;
 pub mod server_log;
 pub mod shared_database;
 pub mod sql;
+pub mod structure;
 pub mod tool;
 pub mod transactions;
 pub mod vm;

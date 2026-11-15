@@ -150,6 +150,23 @@ impl Sql {
             .collect())
     }
 
+    /// Runs one statement with these text parameters through the extended
+    /// protocol (parse, bind, execute), as a program's driver sends one;
+    /// returns how many rows it answered.
+    pub fn try_with_params(&self, sql: &str, params: &[&str]) -> Result<usize, String> {
+        let client = self.client();
+        let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
+            .iter()
+            .map(|p| p as &(dyn tokio_postgres::types::ToSql + Sync))
+            .collect();
+        let rows = self
+            .runtime
+            .block_on(async { tokio::time::timeout(SQL_TIMEOUT, client.query(sql, &params)).await })
+            .map_err(|_| format!("`{sql}` took longer than {SQL_TIMEOUT:?}"))?
+            .map_err(|e| format!("`{sql}` failed: {e}"))?;
+        Ok(rows.len())
+    }
+
     /// Runs one or more statements, failing the test if any fails. Returns
     /// the rows, each value as Postgres prints it (`None` for null).
     pub fn batch(&self, sql: &str) -> Vec<Vec<Option<String>>> {
