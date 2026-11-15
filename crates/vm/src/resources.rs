@@ -30,6 +30,7 @@ use std::sync::{Arc, PoisonError, RwLock};
 
 use authz::AccessLevel;
 use serde::{Deserialize, Serialize};
+use tokio::sync::{Semaphore, SemaphorePermit};
 use tokio_postgres::types::FromSql;
 use tokio_postgres::{Client, Row};
 
@@ -220,7 +221,15 @@ pub struct Resource {
     pools: Pools,
     /// By Group. Held only for a lookup or a change, never across an await.
     grants: RwLock<BTreeMap<String, Granted>>,
+    /// The pulls of its structure running now: at most [`PULLS_AT_ONCE`].
+    pulls: Semaphore,
 }
+
+/// At most this many pulls of one Resource's structure run at once
+/// (blackbox/CONTRACT.md, "What a pull reads"), so that pulls, which may
+/// share the read login's pool with Applications, never hold more of its
+/// connections than this.
+pub const PULLS_AT_ONCE: usize = 2;
 
 impl Resource {
     /// The pool of the read login.
@@ -238,6 +247,13 @@ impl Resource {
     /// write login's.
     pub fn structure_pool(&self) -> &executor::Pool {
         self.pools.structure.as_ref().unwrap_or(&self.pools.read)
+    }
+
+    /// A place among the pulls of this Resource running now, held until it
+    /// is dropped (however the pull ends, its request's future dropped
+    /// included); `None` when [`PULLS_AT_ONCE`] are running. Never waits.
+    pub fn pulling(&self) -> Option<SemaphorePermit<'_>> {
+        self.pulls.try_acquire().ok()
     }
 
     /// Runs `decide` with the Grants on this Resource, as the Authorization
@@ -369,6 +385,7 @@ impl Resources {
             created_by: get(row, 6)?,
             created_at: get(row, 7)?,
             grants: RwLock::new(BTreeMap::new()),
+            pulls: Semaphore::new(PULLS_AT_ONCE),
         })
     }
 
@@ -443,6 +460,7 @@ impl Resources {
             contact: new.contact,
             created_by: by.to_owned(),
             grants: RwLock::new(BTreeMap::new()),
+            pulls: Semaphore::new(PULLS_AT_ONCE),
         });
         self.all
             .write()

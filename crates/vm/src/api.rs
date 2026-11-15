@@ -916,9 +916,35 @@ impl Api {
                 } }),
             );
         }
+        // Taken before the entry is written and anything is sent; held to the
+        // end of this function, or given back as its future is dropped.
+        let pulling = resource.pulling();
         let id = match self.log.begin_structure(request, &user.id, name).await {
             Ok(id) => id,
             Err(error) => return Answer::unavailable(&error),
+        };
+        let Some(_pulling) = pulling else {
+            let ending = Ending {
+                outcome: "failed",
+                error: Some("busy"),
+                rows: None,
+                duration_ms: None,
+                began_nothing: false,
+            };
+            if let Err(error) = self.log.finish(id, &ending).await {
+                log::record(
+                    "operation-log-unwritten",
+                    json!({ "resource": name, "error": error.to_string() }),
+                );
+            }
+            return Answer::error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "structure-unavailable",
+                &format!(
+                    "{} pulls of the structure of {name} are running now: try again shortly",
+                    resources::PULLS_AT_ONCE
+                ),
+            );
         };
         let started = tokio::time::Instant::now();
         let pulled = structure::pull(resource.structure_pool(), name).await;
