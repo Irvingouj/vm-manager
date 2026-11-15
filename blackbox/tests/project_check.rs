@@ -23,6 +23,9 @@
 
 use std::path::Path;
 
+use blackbox::generate::{
+    assert_says_remove_if_never_committed, assert_unreadable_fix_names_vm_generate,
+};
 use blackbox::project::{
     NOTES_AND_TAGS_SCHEMA_TS, NOTES_RENAMED_SCHEMA_TS, NOTES_SCHEMA_TS, Report, SCHEMA_FIRST_LINE,
     Tree, check, check_in_words, checked_project, generate_migrations, holds_number, manifest_ts,
@@ -761,6 +764,7 @@ fn assert_migrations_unreadable(report: &Report, words: &str) {
         "expected the message to say migrations are never edited by hand and to bring the folder back as it was last committed, got {message:?}"
     );
     assert_words_not_stack(message);
+    assert_unreadable_fix_names_vm_generate(message);
     assert!(
         report.problems_for("type-error").iter().any(|p| p["file"]
             .as_str()
@@ -849,6 +853,8 @@ fn a_sql_file_the_journal_does_not_name_is_migrations_unreadable() {
     });
     let report = Report::failed(&check(&machine, &project.dir));
     assert_migrations_unreadable(&report, "migrations/0001_stray.sql");
+    let problem = report.problem("migrations", "migrations-unreadable");
+    assert_says_remove_if_never_committed(problem["message"].as_str().unwrap());
 }
 
 /// A new project's `migrations/`: only `.gitkeep`, no journal, no

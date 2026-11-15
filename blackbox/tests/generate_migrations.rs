@@ -24,7 +24,8 @@ use blackbox::generate::{
 };
 use blackbox::own_database::Own;
 use blackbox::project::{
-    NOTES_AND_TAGS_SCHEMA_TS, NOTES_SCHEMA_TS, Report, Tree, check, checked_project,
+    NOTES_AND_TAGS_SCHEMA_TS, NOTES_RENAMED_SCHEMA_TS, NOTES_SCHEMA_TS, Report, Tree, check,
+    checked_project,
 };
 use blackbox::tool::{Machine, Run};
 use blackbox::{User, Vm, VmOptions};
@@ -376,4 +377,19 @@ fn an_empty_migration_is_not_generated_while_the_schema_is_behind() {
     assert_unchanged(&before, &project.dir, "--empty while behind");
     // The control: the pending change generates.
     Generated::made(&generate(&machine, &project.dir, &[]), &project.dir);
+}
+
+/// The pending change is one `drizzle-kit` asks about (a column dropped and
+/// another added): the schema is not in step, so `migrations-behind`.
+#[test]
+fn an_empty_migration_is_not_generated_while_a_change_drizzle_kit_asks_about_is_pending() {
+    let machine = Machine::new();
+    let project = project_with("generate-empty-asked", NOTES_SCHEMA_TS);
+    project.write("src/db/schema.ts", NOTES_RENAMED_SCHEMA_TS);
+    std::thread::sleep(Duration::from_millis(50));
+    let before = Tree::of(&project.dir);
+    generate(&machine, &project.dir, &["--empty", "--name", "copy"])
+        .json_error(1, "migrations-behind");
+    generate_in_words(&machine, &project.dir, &["--empty"]).text_error(1);
+    assert_unchanged(&before, &project.dir, "--empty while a rename is pending");
 }

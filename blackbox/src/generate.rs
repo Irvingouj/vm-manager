@@ -674,6 +674,87 @@ pub fn assert_unchanged(before: &Tree, dir: &Path, context: &str) {
     );
 }
 
+/// Every file under `dir` (not folders, not links) with its bytes: what a
+/// test compares when folders' modification times may change (a file
+/// written and removed again).
+pub fn files_and_bytes(dir: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+    Tree::of(dir)
+        .0
+        .into_iter()
+        .filter_map(|(path, entry)| match entry {
+            crate::project::Entry::File { bytes, .. } => Some((path, bytes)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Fails unless a message of `migrations-unreadable` gives, as its fix,
+/// the command `vm generate` for the migrations the schema then needs, and
+/// never `drizzle-kit` run by hand.
+pub fn assert_unreadable_fix_names_vm_generate(message: &str) {
+    assert!(
+        message.contains("vm generate"),
+        "expected the fix of migrations-unreadable to name `vm generate`, got {message:?}"
+    );
+    for by_hand in [
+        "drizzle-kit generate",
+        "npx drizzle-kit",
+        "with drizzle-kit",
+    ] {
+        assert!(
+            !message.contains(by_hand),
+            "expected the fix of migrations-unreadable not to tell the agent to run drizzle-kit by hand ({by_hand:?}), got {message:?}"
+        );
+    }
+}
+
+/// Fails unless a message of `migrations-unreadable` for a `.sql` file the
+/// journal does not name says to remove the file if it was never
+/// committed.
+pub fn assert_says_remove_if_never_committed(message: &str) {
+    let lower = crate::project::squashed(message).to_lowercase();
+    assert!(
+        lower.contains("remove")
+            && (lower.contains("never committed")
+                || lower.contains("not committed")
+                || lower.contains("never been committed")),
+        "expected the message to say to remove the file if it was never committed, got {message:?}"
+    );
+}
+
+/// Sets a folder's mode, and gives it back its earlier mode when dropped
+/// (so that the test's folders can be removed, failing or not).
+pub struct ModeFor {
+    path: PathBuf,
+    earlier: u32,
+}
+
+impl ModeFor {
+    pub fn set(path: &Path, mode: u32) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        let earlier = fs::metadata(path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
+            .permissions()
+            .mode();
+        fs::set_permissions(path, fs::Permissions::from_mode(mode))
+            .unwrap_or_else(|e| panic!("cannot set the mode of {}: {e}", path.display()));
+        Self {
+            path: path.to_path_buf(),
+            earlier,
+        }
+    }
+}
+
+impl Drop for ModeFor {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        drop(fs::set_permissions(
+            &self.path,
+            fs::Permissions::from_mode(self.earlier),
+        ));
+    }
+}
+
 /// A `TMPDIR` of the machine's own, made empty.
 pub fn own_tmpdir(machine: &Machine) -> PathBuf {
     let tmp = machine.root().join("tmp");

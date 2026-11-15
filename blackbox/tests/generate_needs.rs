@@ -21,9 +21,10 @@ use std::path::Path;
 use std::time::Duration;
 
 use blackbox::generate::{
-    GENERATE_TIMEOUT, Generated, NOTES_WITH_TITLE_SCHEMA_TS, assert_unchanged, generate,
-    generate_args, generate_in_words, generate_with_env, listed, own_tmpdir, project_with,
-    wait_for_pids,
+    GENERATE_TIMEOUT, Generated, ModeFor, NOTES_WITH_TITLE_SCHEMA_TS,
+    assert_says_remove_if_never_committed, assert_unchanged,
+    assert_unreadable_fix_names_vm_generate, files_and_bytes, generate, generate_args,
+    generate_in_words, generate_with_env, listed, own_tmpdir, project_with, wait_for_pids,
 };
 use blackbox::project::{
     KillOnDrop, NODE_20, NOTES_AND_TAGS_SCHEMA_TS, NOTES_RENAMED_SCHEMA_TS, NOTES_SCHEMA_TS,
@@ -182,6 +183,7 @@ fn a_journal_that_is_not_json_is_migrations_unreadable_and_nothing_written() {
         "expected the message to say migrations are never edited by hand and to bring the folder back as it was last committed, got {message:?}"
     );
     assert_words_not_stack(&message, &tmp);
+    assert_unreadable_fix_names_vm_generate(&message);
     generate_in_words(&machine, &project.dir, &[]).text_error(1);
     assert_unchanged(&before, &project.dir, "migrations-unreadable");
 }
@@ -202,7 +204,108 @@ fn a_migration_whose_sql_file_is_gone_is_migrations_unreadable() {
         message.contains(&format!("migrations/{gone}")),
         "expected the message to name migrations/{gone}, got {message:?}"
     );
+    assert_unreadable_fix_names_vm_generate(&message);
     assert_unchanged(&before, &project.dir, "migrations-unreadable");
+}
+
+/// A `.sql` file the journal does not name: the message names it, says to
+/// remove it if it was never committed, and gives `vm generate`.
+#[test]
+fn a_sql_file_the_journal_does_not_name_is_migrations_unreadable_and_to_be_removed() {
+    let machine = Machine::new();
+    let project = project_with("needs-sql-stray", NOTES_SCHEMA_TS);
+    project.write(
+        "migrations/0001_stray.sql",
+        "ALTER TABLE \"notes\" ADD COLUMN \"extra\" text;\n",
+    );
+    project.write("src/db/schema.ts", NOTES_WITH_TITLE_SCHEMA_TS);
+    std::thread::sleep(Duration::from_millis(50));
+    let before = Tree::of(&project.dir);
+    let message = generate(&machine, &project.dir, &[]).json_error(1, "migrations-unreadable");
+    assert!(
+        message.contains("migrations/0001_stray.sql"),
+        "expected the message to name migrations/0001_stray.sql, got {message:?}"
+    );
+    assert_says_remove_if_never_committed(&message);
+    assert_unreadable_fix_names_vm_generate(&message);
+    assert_unchanged(&before, &project.dir, "migrations-unreadable");
+}
+
+/// All three files or none: `migrations/meta/` not writable, so the
+/// migration is written and its snapshot is not. The migration is removed
+/// again; the project's files and their bytes are as they were (folders'
+/// modification times may change).
+#[test]
+fn when_a_file_cannot_be_written_none_of_the_three_is_left() {
+    let machine = Machine::new();
+    let project = project_with("needs-project-file", NOTES_SCHEMA_TS);
+    project.write("src/db/schema.ts", NOTES_WITH_TITLE_SCHEMA_TS);
+    let meta = project.path("migrations/meta");
+    let before = files_and_bytes(&project.dir);
+    let locked = ModeFor::set(&meta, 0o555);
+    // The harness's own check: a mode must stop a write here (it does not
+    // for root, where this test cannot be made).
+    let probe = meta.join("probe");
+    assert!(
+        fs::write(&probe, "x").is_err(),
+        "a folder of mode 0555 can be written by this user (root?): the test cannot be made here"
+    );
+    for words in [false, true] {
+        let run = if words {
+            generate_in_words(&machine, &project.dir, &[])
+        } else {
+            generate(&machine, &project.dir, &[])
+        };
+        let message = if words {
+            run.text_error(1)
+        } else {
+            run.json_error(1, "project-file")
+        };
+        assert!(
+            message.contains("0001_snapshot.json"),
+            "expected the message to name the file that cannot be written (migrations/meta/0001_snapshot.json), got {message:?}"
+        );
+        let after = files_and_bytes(&project.dir);
+        let differing: Vec<&String> = before
+            .keys()
+            .chain(after.keys())
+            .filter(|path| before.get(*path) != after.get(*path))
+            .collect();
+        assert!(
+            differing.is_empty(),
+            "expected the files written before it removed again, and every file as it was; these differ: {differing:?}\n{}",
+            run.describe()
+        );
+    }
+    drop(locked);
+    // The control: writable again, it generates.
+    Generated::made(&generate(&machine, &project.dir, &[]), &project.dir);
+}
+
+/// `migrations/` or `migrations/meta/` that is a symbolic link to a folder
+/// elsewhere is not written through: `not-a-project`, nothing written in
+/// the project or in the folder the link points to.
+#[test]
+fn a_migrations_folder_or_meta_that_is_a_link_is_not_written_through() {
+    let machine = Machine::new();
+    for (case, linked) in [("migrations", "migrations"), ("meta", "migrations/meta")] {
+        let project = project_with(&format!("needs-link-{case}"), NOTES_SCHEMA_TS);
+        let elsewhere = machine.root().join(format!("elsewhere-{case}"));
+        fs::rename(project.path(linked), &elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, project.path(linked)).unwrap();
+        project.write("src/db/schema.ts", NOTES_WITH_TITLE_SCHEMA_TS);
+        std::thread::sleep(Duration::from_millis(50));
+        let before = Tree::of(&project.dir);
+        let outside = Tree::of(&elsewhere);
+        generate(&machine, &project.dir, &[]).json_error(1, "not-a-project");
+        generate_in_words(&machine, &project.dir, &[]).text_error(1);
+        assert_unchanged(&before, &project.dir, case);
+        assert_eq!(
+            outside.differences(&Tree::of(&elsewhere)),
+            Vec::<String>::new(),
+            "{case}: expected nothing written in the folder the link points to"
+        );
+    }
 }
 
 /// Fails unless a message with a tool's words holds its error and not its

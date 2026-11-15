@@ -249,3 +249,27 @@ fn the_destroying_migration_generated_with_the_flag_is_applied_by_the_platform()
         "expected the column gone"
     );
 }
+
+#[test]
+fn with_allow_data_loss_a_dropped_schema_is_generated_its_table_then_the_schema() {
+    let machine = Machine::new();
+    let project = project_with("loss-schema-allowed", NOTES_AND_ARCHIVE_SCHEMA_TS);
+    project.write("src/db/schema.ts", NOTES_SCHEMA_TS);
+    let generated = Generated::made(
+        &generate(&machine, &project.dir, &["--allow-data-loss"]),
+        &project.dir,
+    );
+    assert_destroys(
+        &generated.destroys,
+        &[table("archive.old"), schema("archive")],
+        "--allow-data-loss on a dropped schema",
+    );
+    assert_eq!(generated.statements, 2, "{}", generated.run.describe());
+    assert!(
+        generated
+            .sql(&project.dir)
+            .contains("DROP SCHEMA \"archive\""),
+        "{}",
+        generated.sql(&project.dir)
+    );
+}
