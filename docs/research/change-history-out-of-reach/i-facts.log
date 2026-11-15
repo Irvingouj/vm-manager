@@ -30,6 +30,19 @@ a partition made, filled and its column retyped through the partitioned table in
 a table made and written anew by SET UNLOGGED in one statement: file node is the table's oid: f
 a table made earlier, attached as a partition: file node is the table's oid: t
 the partitioned table's file node, and its partitions after the partition made: ok [(None, '{q1,q2,q3,m4}')]
+track_counts, and whether the role is a superuser: ok [('on', 'f')]
+in a transaction, a SELECT 1: ok; this transaction's count of pg_inherits rows written, before and after: 10 10
+a partition made: ok; this transaction's count of pg_inherits rows written, before and after: 10 12
+a partition made in a DO block: ok; this transaction's count of pg_inherits rows written, before and after: 12 14
+a table attached: ok; this transaction's count of pg_inherits rows written, before and after: 14 16
+a partition detached: ok; this transaction's count of pg_inherits rows written, before and after: 16 18
+a partition dropped: ok; this transaction's count of pg_inherits rows written, before and after: 18 20
+a partition made in a block that fails and is caught: ok; this transaction's count of pg_inherits rows written, before and after: 20 22
+a partition made after a savepoint: ok; this transaction's count of pg_inherits rows written, before and after: 22 24
+rolled back to the savepoint: ok; this transaction's count of pg_inherits rows written, before and after: 24 24
+a detach and an attach in one DO block: ok; this transaction's count of pg_inherits rows written, before and after: 24 28
+a table made, not a partition: ok; this transaction's count of pg_inherits rows written, before and after: 28 28
+the partitions at the end: ok [('{w9}',)]
 ######## Postgres 16 (16.15.0)
 version [('16.15',)]
 integer to bigint: ok; new file node: True
@@ -59,6 +72,19 @@ a partition made, filled and its column retyped through the partitioned table in
 a table made and written anew by SET UNLOGGED in one statement: file node is the table's oid: f
 a table made earlier, attached as a partition: file node is the table's oid: t
 the partitioned table's file node, and its partitions after the partition made: ok [(None, '{q1,q2,q3,m4}')]
+track_counts, and whether the role is a superuser: ok [('on', 'f')]
+in a transaction, a SELECT 1: ok; this transaction's count of pg_inherits rows written, before and after: 10 10
+a partition made: ok; this transaction's count of pg_inherits rows written, before and after: 10 12
+a partition made in a DO block: ok; this transaction's count of pg_inherits rows written, before and after: 12 14
+a table attached: ok; this transaction's count of pg_inherits rows written, before and after: 14 16
+a partition detached: ok; this transaction's count of pg_inherits rows written, before and after: 16 18
+a partition dropped: ok; this transaction's count of pg_inherits rows written, before and after: 18 20
+a partition made in a block that fails and is caught: ok; this transaction's count of pg_inherits rows written, before and after: 20 22
+a partition made after a savepoint: ok; this transaction's count of pg_inherits rows written, before and after: 22 24
+rolled back to the savepoint: ok; this transaction's count of pg_inherits rows written, before and after: 24 24
+a detach and an attach in one DO block: ok; this transaction's count of pg_inherits rows written, before and after: 24 28
+a table made, not a partition: ok; this transaction's count of pg_inherits rows written, before and after: 28 28
+the partitions at the end: ok [('{w9}',)]
 ######## Postgres 17 (17.11.0)
 version [('17.11',)]
 integer to bigint: ok; new file node: True
@@ -88,3 +114,16 @@ a partition made, filled and its column retyped through the partitioned table in
 a table made and written anew by SET UNLOGGED in one statement: file node is the table's oid: f
 a table made earlier, attached as a partition: file node is the table's oid: t
 the partitioned table's file node, and its partitions after the partition made: ok [(None, '{q1,q2,q3,m4}')]
+track_counts, and whether the role is a superuser: ok [('on', 'f')]
+in a transaction, a SELECT 1: ok; this transaction's count of pg_inherits rows written, before and after: 10 10
+a partition made: ok; this transaction's count of pg_inherits rows written, before and after: 10 12
+a partition made in a DO block: ok; this transaction's count of pg_inherits rows written, before and after: 12 14
+a table attached: ok; this transaction's count of pg_inherits rows written, before and after: 14 16
+a partition detached: ok; this transaction's count of pg_inherits rows written, before and after: 16 18
+a partition dropped: ok; this transaction's count of pg_inherits rows written, before and after: 18 20
+a partition made in a block that fails and is caught: ok; this transaction's count of pg_inherits rows written, before and after: 20 22
+a partition made after a savepoint: ok; this transaction's count of pg_inherits rows written, before and after: 22 24
+rolled back to the savepoint: ok; this transaction's count of pg_inherits rows written, before and after: 24 24
+a detach and an attach in one DO block: ok; this transaction's count of pg_inherits rows written, before and after: 24 28
+a table made, not a partition: ok; this transaction's count of pg_inherits rows written, before and after: 28 28
+the partitions at the end: ok [('{w9}',)]

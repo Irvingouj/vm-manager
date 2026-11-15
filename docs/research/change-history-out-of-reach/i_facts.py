@@ -78,3 +78,29 @@ c.one("CREATE TABLE m4 (id int NOT NULL, a bigint)")
 made("a table made earlier, attached as a partition", "m4", "ALTER TABLE q ATTACH PARTITION m4 FOR VALUES FROM (300) TO (400)")
 show("the partitioned table's file node, and its partitions after the partition made",
      "SELECT pg_relation_filenode('q'), (SELECT array_agg(inhrelid::regclass::text ORDER BY inhrelid) FROM pg_inherits WHERE inhparent = 'q'::regclass)")
+# Added by the implementation agent of ticket 63, second round, after review:
+# whether this transaction's own count of rows written in pg_inherits tells
+# every change of a table's partitions, without reading them.
+def count():
+    return c.one("SELECT pg_stat_get_xact_tuples_inserted('pg_inherits'::regclass) + pg_stat_get_xact_tuples_deleted('pg_inherits'::regclass) + pg_stat_get_xact_tuples_updated('pg_inherits'::regclass)").rows[0][0]
+def counted(label, sql):
+    a = count(); r = c.one(sql); b = count()
+    print(f"{label}: {'ok' if r.ok else 'ERROR ' + str(r.sqlstate) + ' ' + str(r.message)}; this transaction's count of pg_inherits rows written, before and after: {a} {b}")
+show("track_counts, and whether the role is a superuser", "SELECT current_setting('track_counts'), rolsuper FROM pg_roles WHERE rolname = current_user")
+c.one("CREATE TABLE w (id int, a int, PRIMARY KEY (id)) PARTITION BY RANGE (id)")
+c.one("CREATE TABLE w9 (id int NOT NULL, a int)")
+c.one("BEGIN")
+counted("in a transaction, a SELECT 1", "SELECT 1")
+counted("a partition made", "CREATE TABLE w1 PARTITION OF w FOR VALUES FROM (0) TO (10)")
+counted("a partition made in a DO block", "DO $$ BEGIN CREATE TABLE w2 PARTITION OF w FOR VALUES FROM (10) TO (20); END $$")
+counted("a table attached", "ALTER TABLE w ATTACH PARTITION w9 FOR VALUES FROM (90) TO (100)")
+counted("a partition detached", "ALTER TABLE w DETACH PARTITION w9")
+counted("a partition dropped", "DROP TABLE w2")
+counted("a partition made in a block that fails and is caught", "DO $$ BEGIN BEGIN CREATE TABLE w3 PARTITION OF w FOR VALUES FROM (20) TO (30); RAISE EXCEPTION 'x'; EXCEPTION WHEN OTHERS THEN NULL; END; END $$")
+c.one("SAVEPOINT s")
+counted("a partition made after a savepoint", "CREATE TABLE w4 PARTITION OF w FOR VALUES FROM (40) TO (50)")
+counted("rolled back to the savepoint", "ROLLBACK TO SAVEPOINT s")
+counted("a detach and an attach in one DO block", "DO $$ BEGIN ALTER TABLE w DETACH PARTITION w1; ALTER TABLE w ATTACH PARTITION w9 FOR VALUES FROM (0) TO (10); END $$")
+counted("a table made, not a partition", "CREATE TABLE w5 (id int)")
+show("the partitions at the end", "SELECT array_agg(inhrelid::regclass::text ORDER BY inhrelid::regclass::text) FROM pg_inherits WHERE inhparent = 'w'::regclass")
+c.one("ROLLBACK")
