@@ -113,10 +113,14 @@ fn the_second_version_takes_over_the_first_is_unchanged_and_both_are_listed() {
 
     let mut application_after = api.application("board");
     assert_eq!(application_after["serving_version"], 2);
-    application_after["serving_version"] = application_before["serving_version"].clone();
+    assert_eq!(application_before["latest_version"], 1);
+    assert_eq!(application_after["latest_version"], 2);
+    for field in ["serving_version", "latest_version"] {
+        application_after[field] = application_before[field].clone();
+    }
     assert_eq!(
         application_after, application_before,
-        "expected only serving_version to change in the Application's record"
+        "expected only serving_version and latest_version to change in the Application's record"
     );
     assert_served_by(&vm, &vm.get_as(&bob(), "board", "/"), "board", "second", 2);
 }
