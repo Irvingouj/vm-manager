@@ -63,6 +63,7 @@ pub struct VmOptions {
     applications: Vec<(String, PathBuf)>,
     stand_in_sign_in: bool,
     administrators_group: Option<String>,
+    tool_credential_lifetime: Option<u64>,
     platform: Option<Platform>,
 }
 
@@ -73,6 +74,7 @@ impl Default for VmOptions {
             applications: Vec::new(),
             stand_in_sign_in: false,
             administrators_group: None,
+            tool_credential_lifetime: None,
             platform: None,
         }
     }
@@ -107,6 +109,14 @@ impl VmOptions {
         self
     }
 
+    /// Starts the program with `--tool-credential-lifetime <seconds>`: tool
+    /// credentials made by it end this long after they were made.
+    #[must_use]
+    pub fn tool_credential_lifetime(mut self, seconds: u64) -> Self {
+        self.tool_credential_lifetime = Some(seconds);
+        self
+    }
+
     /// Starts the program against this platform database rather than a
     /// fresh one: to start it again on what an earlier program left.
     #[must_use]
@@ -131,6 +141,10 @@ impl VmOptions {
         if let Some(group) = &self.administrators_group {
             args.push("--administrators-group".to_owned());
             args.push(group.clone());
+        }
+        if let Some(seconds) = self.tool_credential_lifetime {
+            args.push("--tool-credential-lifetime".to_owned());
+            args.push(seconds.to_string());
         }
         args
     }

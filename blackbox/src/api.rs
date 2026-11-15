@@ -143,6 +143,37 @@ impl<'a> Api<'a> {
         self.get(&format!("/v1/resources/{resource}/grants"))
     }
 
+    /// `POST /v1/tool-credentials` with `{}`: a tool credential for this
+    /// User (CONTRACT.md, "The tool: On the platform's API").
+    pub fn create_tool_credential(&self) -> Response {
+        self.post("/v1/tool-credentials", &json!({}))
+    }
+
+    /// A tool credential for this User, which must be made (`201`): the
+    /// credential's text and the whole answer.
+    pub fn tool_credential(&self) -> (String, Value) {
+        let answer = self.create_tool_credential();
+        answer.expect_status(201);
+        let body = answer.json();
+        let credential = body["credential"]
+            .as_str()
+            .unwrap_or_else(|| {
+                panic!("expected a `credential` string in the answer to POST /v1/tool-credentials")
+            })
+            .to_owned();
+        (credential, body)
+    }
+
+    /// `GET /v1/me`.
+    pub fn me(&self) -> Response {
+        self.get("/v1/me")
+    }
+
+    /// `GET /v1/applications`.
+    pub fn list_applications(&self) -> Response {
+        self.get("/v1/applications")
+    }
+
     /// `GET /v1/operation-log`, with `?limit=<limit>` when given.
     pub fn operation_log(&self, limit: Option<&str>) -> Response {
         match limit {

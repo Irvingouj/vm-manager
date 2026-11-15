@@ -107,6 +107,13 @@ impl Request {
         }
     }
 
+    /// Sends `Authorization: Bearer <credential>`: a sign-in with a tool
+    /// credential (CONTRACT.md, "The tool: On the platform's API").
+    #[must_use]
+    pub fn bearer(self, credential: &str) -> Self {
+        self.header("authorization", format!("Bearer {credential}"))
+    }
+
     /// Adds a header, verbatim. Adding the same name twice sends it twice.
     #[must_use]
     pub fn header(mut self, name: &str, value: impl AsRef<[u8]>) -> Self {
