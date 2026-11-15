@@ -32,6 +32,7 @@
 mod catalogs;
 mod definition;
 mod naming;
+mod standin;
 mod ts_text;
 
 use std::time::Duration;
@@ -43,6 +44,7 @@ use tokio::time::Instant;
 use crate::executor::Pool;
 
 pub use definition::FIRST_LINE;
+pub use standin::{ident as quoted_ident, literal as quoted_literal};
 
 /// Whether `text` is a fingerprint as a pull gives one: `sha256:` and 64
 /// lower-case hex digits.
@@ -85,6 +87,9 @@ pub struct Pulled {
     pub schema_ts: String,
     /// The columns of a type the definition cannot express.
     pub unsupported: Vec<Unsupported>,
+    /// The statements that make an empty stand-in of the structure, each
+    /// ending with `;` ([`standin`]).
+    pub standin_sql: Vec<String>,
 }
 
 /// A column of a type the definition cannot express: there as a custom
@@ -153,10 +158,12 @@ fn build(structure: &Structure, resource: &str, deadline: Instant) -> Result<Pul
     let fingerprint = structure.fingerprint();
     let (schema_ts, unsupported) =
         definition::write(structure, resource, &fingerprint, MAX_BYTES, deadline)?;
+    let standin_sql = standin::statements(structure);
     Ok(Pulled {
         fingerprint,
         schema_ts,
         unsupported,
+        standin_sql,
     })
 }
 

@@ -533,7 +533,7 @@ async fn pull_again(
     {
         return Ok(Again::Left);
     }
-    let pull = Pull::prepare(project, name, "vm deploy")?;
+    let pull = Pull::prepare(project, name, "vm deploy", true)?;
     match pull.fetch(kept).await {
         Ok(pulled) => Ok(Again::Pulled(
             pulled.fingerprint,

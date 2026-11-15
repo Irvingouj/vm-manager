@@ -35,8 +35,11 @@ const TEXT_FILES: [(&str, &str); 10] = [
         "tsconfig.json",
         include_str!("../../template/tsconfig.json"),
     ),
-    ("vm.dev.json", include_str!("../../template/vm.dev.json")),
+    ("vm.dev.json", NEW_TEST_USERS),
 ];
+
+/// The test Users file of a new project.
+pub const NEW_TEST_USERS: &str = include_str!("../../template/vm.dev.json");
 
 /// The path of the SDK's tarball in a project.
 pub fn tarball_path() -> String {

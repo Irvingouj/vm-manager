@@ -33,6 +33,7 @@ mod new;
 mod project_tools;
 mod pull;
 mod template;
+mod test_users;
 mod theirs;
 mod versions;
 

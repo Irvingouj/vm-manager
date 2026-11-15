@@ -1245,6 +1245,8 @@ impl Api {
                     your_access: held.map(resources::level_name),
                     schema_ts: &pulled.schema_ts,
                     unsupported: &pulled.unsupported,
+                    standin_sql: &pulled.standin_sql,
+                    contact: &resource.contact,
                 },
             );
             if answer.body.len() > structure::MAX_BYTES {
@@ -1592,6 +1594,8 @@ struct StructureView<'a> {
     your_access: Option<&'static str>,
     schema_ts: &'a str,
     unsupported: &'a [structure::Unsupported],
+    standin_sql: &'a [String],
+    contact: &'a str,
 }
 
 #[derive(Serialize)]
