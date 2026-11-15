@@ -11,7 +11,7 @@ This folder is one Application for the company's internal platform. The person y
   - `ctx.app().ownDb()`: the own database, acting as the Application itself. It acts as itself only in its own database, never in a shared one.
 - Every database handle is a Drizzle database (`drizzle-orm`), typed with that database's tables. Query with Drizzle (`db.select().from(t).where(eq(t.id, 1))`, `db.insert(t).values(...)`), not raw SQL. Each query is one operation the platform checks and records.
 - `manifest.ts` gives the Application's `name` (it becomes the address), a one-sentence `description`, and every Resource it uses, at `"read"` or `"write"`. The Application reaches only what the Manifest declares. Keep it a plain literal: no variables, imports, calls or spreads, because the platform reads it without running it.
-- `src/db/schema.ts` defines the own database's tables in Drizzle. `migrations/` is generated from it; never write or edit a migration by hand.
+- `src/db/schema.ts` defines the own database's tables in Drizzle. `migrations/` is generated from it by `vm generate`; never write or edit a migration by hand (the one exception is below).
 - `resources/<name>/` is written by `vm pull <name>`. Read it, import its tables from `resources/<name>/schema.ts`, never edit it. You may add `resources/<name>/relations.ts` with Drizzle relations of your own; pull again after adding it.
 
 ## Commands
@@ -24,6 +24,7 @@ Run them from this folder. Each has `--help` and `--json` (one JSON object on st
 | `vm applications` | the Applications the Builder contributes to |
 | `vm resources` | every company Resource, the Builder's access to it, and whom to ask |
 | `vm pull <name>` | writes `resources/<name>/` with that Resource's tables |
+| `vm generate` | writes the next migration from `src/db/schema.ts` into `migrations/`; stops before one that destroys data |
 | `vm check` | checks the Manifest, the Resources, the migrations and the types |
 
 If a command says you are not signed in, ask the Builder to run `vm sign-in` (it needs their details), then run yours again.
@@ -32,7 +33,7 @@ If a command says you are not signed in, ask the Builder to run `vm sign-in` (it
 
 1. **Look for an existing Application first.** Run `vm applications`. If one already does what the Builder asks, tell them its name and address and ask whether they still want a new one. If one comes close, say so before building.
 2. **Find the data.** Run `vm resources` and choose Resources by their description. Pull each one you need with `vm pull <name>` and read its `resources/<name>/schema.ts` to learn the tables. Declare it in `manifest.ts`, at `"read"` unless the Application must change rows there.
-3. **Keep the Application's own data in its own database.** Anything the Application records itself (notes, acknowledgements, preferences) goes in `src/db/schema.ts`, with a migration generated for it. You cannot add tables or columns to a shared Resource; store the extra data in the own database and relate it in code (there are no joins across databases).
+3. **Keep the Application's own data in its own database.** Anything the Application records itself (notes, acknowledgements, preferences) goes in `src/db/schema.ts`; after each change to it, run `vm generate`. You cannot add tables or columns to a shared Resource; store the extra data in the own database and relate it in code (there are no joins across databases).
 4. **Write the handlers**, run `vm check` until it ends with `0`, and commit. `vm check` reports every problem at once, each with its fix; it also warns about access and mentions pulled Resources the Manifest does not declare. Read the warnings out to the Builder.
 5. **Deploy** only a project that passes `vm check` and is committed. This version of the tool has no deploy command yet: when the project is ready, tell the Builder so.
 
@@ -49,11 +50,13 @@ A refused operation throws `Refused` (import it from `@vm/sdk`), with `refusal.r
 
 If the Builder holds only `structure` on a Resource, you can build against it, but the Builder and everyone else without a `read` Grant will be refused its rows; `vm check` warns about this. Tell the Builder who will be able to use that part before building it.
 
-## Migrations that destroy data: ask the Builder
+## Migrations: `vm generate`, and asking before data is lost
 
-A migration destroys data when it drops a table or a column, or changes a column's type. Never make or deploy one on your own: tell the Builder exactly what would be lost and ask, unless the Builder has already clearly said that this data may be lost; then go on, and tell them what was lost. Deploying an older Version later does not bring the data back. To rename a column or table, add the new one, copy the values, then remove the old one.
+After each change to `src/db/schema.ts`, run `vm generate`. Read the SQL it wrote before going on, and commit the three files it names together. `vm check` says when `migrations/` is behind the schema.
 
-Until the tool generates migrations itself, generate one after each change to `src/db/schema.ts` with `npx drizzle-kit generate --dialect postgresql --schema src/db/schema.ts --out migrations`, and read the SQL it wrote before going on. `vm check` says when `migrations/` is behind the schema.
+A migration destroys data when it drops a table, a column or a schema, or changes a column's type to one that is not wider. `vm generate` stops before writing one (exit code `3`, reason `data-loss`) and says exactly what would be lost. Never confirm it on your own: tell the Builder exactly what would be lost and ask, unless the Builder has already clearly said that this data may be lost; then run `vm generate --allow-data-loss`, and tell them what was lost. `--allow-data-loss` is only for that: never add it on your own otherwise. Deploying an older Version later does not bring the data back.
+
+`vm generate` cannot tell a rename from a removal and an addition (it stops with `rename-not-generated`). To rename a column or table: add the new one beside the old and run `vm generate`; run `vm generate --empty --name <name>` and put in that empty migration the one statement that copies the values (`UPDATE ... SET <new> = <old>;`), the only migration you ever edit, and only before it is committed; then remove the old one and run `vm generate`, which stops for the old one's data as above.
 
 ## Trying it as people with and without access
 

@@ -256,7 +256,6 @@ pub(super) enum Outcome {
     /// (the message's beginning, before [`BRING_BACK`]).
     Unreadable(String),
     /// It wrote these `.sql` files (by name), which were not there before.
-    #[expect(dead_code, reason = "read by vm generate, which comes next")]
     Written(BTreeSet<String>),
     /// Nothing to generate: the schema is in step with the migrations.
     InStep,

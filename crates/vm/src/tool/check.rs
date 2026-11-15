@@ -566,10 +566,6 @@ fn pulled(project: &Path, name: &str, found: &mut Found) {
         "message": format!("manifest.ts declares {name}, and it is not pulled: {}. To pull it, {fix}, then run vm check again", wrong.join("; ")),
     }));
 }
-/// How `drizzle-kit generate` is run by hand, for the messages.
-const GENERATE: &str =
-    "npx drizzle-kit generate --dialect postgresql --schema src/db/schema.ts --out migrations";
-
 /// The fix said with every `migrations-unreadable` of the check.
 const BRING_BACK_THEN: &str =
     "then generate the migrations the schema needs with drizzle-kit and run vm check again";
@@ -587,13 +583,13 @@ async fn migrations(cx: &Cx<'_>, packages: &Packages, found: &mut Found) -> Resu
             "reason": "migrations-unreadable",
             "message": format!("{what}. {BRING_BACK}, {BRING_BACK_THEN}"),
         })),
-        Outcome::Written(_) => found.problems.push(behind(&format!(
-            "src/db/schema.ts changed since the last migration in migrations/: generating migrations now would write one. Generate it with `{GENERATE}`, read the SQL it wrote (ask the Builder before one that destroys data), then run vm check again"
-        ))),
+        Outcome::Written(_) => found.problems.push(behind(
+            "src/db/schema.ts changed since the last migration in migrations/: generating migrations now would write one. Generate it with `vm generate`, which writes it into migrations/ and stops before one that destroys data (then ask the Builder, as it says), read the SQL it wrote, then run vm check again",
+        )),
         Outcome::InStep => {}
-        Outcome::Asked => found.problems.push(behind(&format!(
-            "src/db/schema.ts changed since the last migration in migrations/, and drizzle-kit has a question about the change (a table or column renamed, or created anew?) that only a terminal can answer: run `{GENERATE}` in a terminal and answer it, or make the change in steps (add the new column, copy the values, remove the old one), then run vm check again"
-        ))),
+        Outcome::Asked => found.problems.push(behind(
+            "src/db/schema.ts changed since the last migration in migrations/, and drizzle-kit has a question about the change (a table or column renamed, or removed and made anew?) that it cannot ask without a terminal, so `vm generate` writes nothing for it: make the change in steps, each followed by `vm generate` (add the new column or table, keeping the old one; copy the values in an empty migration made with `vm generate --empty`; then remove the old one), then run vm check again",
+        )),
         Outcome::SchemaFailed(how) => found.problems.push(json!({
             "check": "migrations",
             "reason": "own-schema-failed",

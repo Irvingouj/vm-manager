@@ -2,8 +2,8 @@
 //! agent (ADR 0006, ADR 0015; blackbox/CONTRACT.md, "The tool").
 //!
 //! `vm sign-in`, `vm sign-out`, `vm whoami`, `vm resources`, `vm
-//! applications`, `vm pull` ([`pull`]), `vm new` ([`new`]) and `vm check`
-//! ([`check`]), each with `--json`. Each command is one short run on one
+//! applications`, `vm pull` ([`pull`]), `vm new` ([`new`]), `vm check`
+//! ([`check`]) and `vm generate` ([`generate`]), each with `--json`. Each command is one short run on one
 //! thread: a current-thread runtime, at most a few requests to the
 //! installation ([`client`]), the credential file ([`credential_file`]), and
 //! an [`Ending`] whose exit code says what kind of ending it was:
@@ -22,7 +22,9 @@ mod check;
 mod child;
 mod client;
 mod credential_file;
+mod data_loss;
 mod drizzle;
+mod generate;
 mod new;
 mod project_tools;
 mod pull;
@@ -30,6 +32,7 @@ mod template;
 mod theirs;
 
 pub use check::CheckArgs;
+pub use generate::GenerateArgs;
 pub use new::NewArgs;
 pub use pull::PullArgs;
 
@@ -116,6 +119,7 @@ pub enum Command {
     Pull(PullArgs),
     New(NewArgs),
     Check(CheckArgs),
+    Generate(GenerateArgs),
 }
 
 /// A message: the tool's own words, or the installation's (a refusal's
@@ -165,11 +169,18 @@ impl Ending {
     /// A check that found problems: `message` holds text of the project's
     /// and the installation's, and `report` is what is printed.
     fn check_failed(message: &str, report: Done) -> Self {
+        Self::detailed(1, "check-failed", message, report)
+    }
+
+    /// An ending that prints more than its error: `detail` (whose JSON
+    /// holds the `error`, with `reason` and `message`). `message` may hold
+    /// text of the project's.
+    fn detailed(code: u8, reason: &str, message: &str, detail: Done) -> Self {
         Self {
-            code: 1,
-            reason: json!("check-failed"),
+            code,
+            reason: json!(reason),
             message: Said::Theirs(Theirs::from(message)),
-            detail: Some(Box::new(report)),
+            detail: Some(Box::new(detail)),
         }
     }
 
@@ -191,6 +202,7 @@ pub fn run(command: Command) -> ExitCode {
         Command::Pull(args) => args.output.json,
         Command::New(args) => args.output.json,
         Command::Check(args) => args.output.json,
+        Command::Generate(args) => args.output.json,
         Command::SignOut(o)
         | Command::Whoami(o)
         | Command::Resources(o)
@@ -211,6 +223,7 @@ pub fn run(command: Command) -> ExitCode {
                 Command::Pull(args) => pull::pull(&args).await,
                 Command::New(args) => new::new(&args),
                 Command::Check(args) => check::check(&args).await,
+                Command::Generate(args) => generate::generate(&args).await,
             }
         }),
         Err(error) => Err(Ending::new(

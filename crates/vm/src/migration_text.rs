@@ -5,7 +5,9 @@
 //!
 //! Interface: [`statements`], a migration's text in, where its single
 //! statements are in it (byte ranges), in order, or the rule it breaks
-//! ([`Refusal`]).
+//! ([`Refusal`]); and [`parsed`], the same statements with what the parser
+//! made of each (for `vm generate`, which decides on them what a migration
+//! destroys), or where it could not read the text ([`Unparseable`]).
 //!
 //! The text is split at `drizzle-kit`'s breakpoint lines, then each part
 //! into single statements by Postgres's own parser (`pg_query`, the one the
@@ -51,10 +53,108 @@ pub struct Refusal {
     pub message: String,
 }
 
+/// A single statement of a migration, as Postgres's parser read it.
+pub struct Parsed {
+    /// Where it is in the migration's text (a valid `str` boundary pair).
+    pub range: Range<usize>,
+    /// Where the part of the text it is in begins (the parts are cut at
+    /// breakpoint lines): the locations in `node` count from there.
+    pub part_start: usize,
+    /// What the parser made of it.
+    pub node: Option<NodeEnum>,
+}
+
+/// Text of a migration the parser cannot read.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Unparseable {
+    /// The line, counted from 1, of the statement it stopped in.
+    pub line: usize,
+    /// Postgres's words; `None` when it read the text but could not say
+    /// where one of its statements is.
+    pub words: Option<String>,
+}
+
+impl From<Unparseable> for Refusal {
+    fn from(unparseable: Unparseable) -> Self {
+        let Unparseable { line, words } = unparseable;
+        let message = match words {
+            Some(words) => format!(
+                "Postgres's parser cannot read the migration's text at the statement beginning on line {line}: {words}. Correct its syntax; nothing of the Version was sent to the database"
+            ),
+            None => format!(
+                "Postgres's parser read the migration's text from line {line} but could not say where one of its statements is: write each statement plainly, ended by a semicolon"
+            ),
+        };
+        Self {
+            rule: "unparseable",
+            message,
+        }
+    }
+}
+
+/// The single statements of the migration `sql`, in order, each with what
+/// the parser made of it; or where the parser could not read it.
+pub fn parsed(sql: &str) -> Result<Vec<Parsed>, Unparseable> {
+    let mut found = Vec::new();
+    walk(sql, |statement, _| {
+        found.push(statement);
+        Ok::<(), Unparseable>(())
+    })?;
+    Ok(found)
+}
+
 /// Where the single statements of the migration `sql` are in it, in order,
 /// as byte ranges (each a valid `str` boundary pair).
 pub fn statements(sql: &str) -> Result<Vec<Range<usize>>, Refusal> {
     let mut found = Vec::new();
+    walk(sql, |statement, text| {
+        let here = statement.range.start.saturating_add(leading(text));
+        if let Some(NodeEnum::CopyStmt(copy)) = &statement.node
+            && copy.filename.is_empty()
+            && !copy.is_program
+        {
+            let (direction, instead) = if copy.is_from {
+                ("COPY ... FROM STDIN", "put the rows in with INSERT")
+            } else {
+                (
+                    "COPY ... TO STDOUT",
+                    "remove it: a migration has nobody to give rows to",
+                )
+            };
+            return Err(Refusal {
+                rule: "copy-stream",
+                message: format!(
+                    "the statement on line {} ({}) is {direction}: the platform sends a migration statement by statement and has no stream of rows to give or take; {instead}",
+                    line_of(sql, here),
+                    excerpt(text),
+                ),
+            });
+        }
+        if let Some(NodeEnum::TransactionStmt(control)) = &statement.node {
+            return Err(Refusal {
+                rule: "transaction-control",
+                message: format!(
+                    "the statement on line {} ({}) is {}: it controls the transaction. The platform applies all of a Version's migrations in one transaction that it begins and commits itself, so that the Version applies whole or not at all; remove the statement (a migration that fails is undone with everything else of the Version)",
+                    line_of(sql, here),
+                    excerpt(text),
+                    control_words(control.kind(), control.chain),
+                ),
+            });
+        }
+        found.push(statement.range);
+        Ok(())
+    })?;
+    Ok(found)
+}
+
+/// Splits `sql` at breakpoint lines and each part into single statements
+/// with the parser, handing each statement and its text to `each` in
+/// order; stops at the first part the parser cannot read, or at the first
+/// error of `each`.
+fn walk<E: From<Unparseable>>(
+    sql: &str,
+    mut each: impl FnMut(Parsed, &str) -> Result<(), E>,
+) -> Result<(), E> {
     let mut offset = 0_usize;
     for part in sql.split(BREAKPOINT) {
         let start = offset;
@@ -66,9 +166,9 @@ pub fn statements(sql: &str) -> Result<Vec<Range<usize>>, Refusal> {
         }
         let parsed = match pg_query::parse(part, 0) {
             Ok(parsed) => parsed,
-            Err(error) => return Err(unparseable(sql, start, part, &error)),
+            Err(error) => return Err(unparseable(sql, start, part, &error).into()),
         };
-        for raw in &parsed.protobuf.stmts {
+        for raw in parsed.protobuf.stmts {
             let at = usize::try_from(raw.stmt_location).ok();
             let length = usize::try_from(raw.stmt_len).ok();
             let text = match (at, length) {
@@ -79,65 +179,29 @@ pub fn statements(sql: &str) -> Result<Vec<Range<usize>>, Refusal> {
                 _ => None,
             };
             let Some(text) = text else {
-                return Err(Refusal {
-                    rule: "unparseable",
-                    message: format!(
-                        "Postgres's parser read the migration's text from line {} but could not say where one of its statements is: write each statement plainly, ended by a semicolon",
-                        line_of(sql, start)
-                    ),
-                });
+                return Err(Unparseable {
+                    line: line_of(sql, start),
+                    words: None,
+                }
+                .into());
             };
-            let node = raw.stmt.as_ref().and_then(|s| s.node.as_ref());
-            if let Some(NodeEnum::CopyStmt(copy)) = node
-                && copy.filename.is_empty()
-                && !copy.is_program
-            {
-                let here = start
-                    .saturating_add(at.unwrap_or(0))
-                    .saturating_add(leading(text));
-                let (direction, instead) = if copy.is_from {
-                    ("COPY ... FROM STDIN", "put the rows in with INSERT")
-                } else {
-                    (
-                        "COPY ... TO STDOUT",
-                        "remove it: a migration has nobody to give rows to",
-                    )
-                };
-                return Err(Refusal {
-                    rule: "copy-stream",
-                    message: format!(
-                        "the statement on line {} ({}) is {direction}: the platform sends a migration statement by statement and has no stream of rows to give or take; {instead}",
-                        line_of(sql, here),
-                        excerpt(text),
-                    ),
-                });
-            }
-            if let Some(NodeEnum::TransactionStmt(control)) = node {
-                let here = start
-                    .saturating_add(at.unwrap_or(0))
-                    .saturating_add(leading(text));
-                return Err(Refusal {
-                    rule: "transaction-control",
-                    message: format!(
-                        "the statement on line {} ({}) is {}: it controls the transaction. The platform applies all of a Version's migrations in one transaction that it begins and commits itself, so that the Version applies whole or not at all; remove the statement (a migration that fails is undone with everything else of the Version)",
-                        line_of(sql, here),
-                        excerpt(text),
-                        control_words(control.kind(), control.chain),
-                    ),
-                });
-            }
             let from = start.saturating_add(at.unwrap_or(0));
-            found.push(from..from.saturating_add(text.len()));
+            let statement = Parsed {
+                range: from..from.saturating_add(text.len()),
+                part_start: start,
+                node: raw.stmt.and_then(|s| s.node),
+            };
+            each(statement, text)?;
         }
     }
-    Ok(found)
+    Ok(())
 }
 
-/// The refusal of a part the parser cannot read: Postgres's words, and the
-/// line of the first statement of the part that fails alone with the same
-/// words (found by cutting the part at its semicolons as Postgres's
-/// scanner sees them), or of the part when none does.
-fn unparseable(sql: &str, start: usize, part: &str, error: &pg_query::Error) -> Refusal {
+/// Where the parser could not read a part: Postgres's words, and the line
+/// of the first statement of the part that fails alone with the same words
+/// (found by cutting the part at its semicolons as Postgres's scanner sees
+/// them), or of the part when none does.
+fn unparseable(sql: &str, start: usize, part: &str, error: &pg_query::Error) -> Unparseable {
     let words = match error {
         pg_query::Error::Parse(words) | pg_query::Error::Scan(words) => words.clone(),
         pg_query::Error::Conversion(_) => "the text holds a NUL character".to_owned(),
@@ -174,11 +238,9 @@ fn unparseable(sql: &str, start: usize, part: &str, error: &pg_query::Error) -> 
             );
         }
     }
-    Refusal {
-        rule: "unparseable",
-        message: format!(
-            "Postgres's parser cannot read the migration's text at the statement beginning on line {line}: {words}. Correct its syntax; nothing of the Version was sent to the database"
-        ),
+    Unparseable {
+        line,
+        words: Some(words),
     }
 }
 

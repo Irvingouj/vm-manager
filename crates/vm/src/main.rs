@@ -4,7 +4,8 @@
 //! <ip:port> [--stand-in-sign-in] [--administrators-group <Group>]` serves the Applications kept in the
 //! platform database, and the platform's API (blackbox/CONTRACT.md).
 //! `vm sign-in`, `vm sign-out`, `vm whoami`, `vm resources`, `vm
-//! applications`, `vm pull`, `vm new` and `vm check` are the Builder's tool
+//! applications`, `vm pull`, `vm new`, `vm check` and `vm generate` are the
+//! Builder's tool
 //! (vm::tool). `vm --version` names the execution core.
 
 use std::io::Write;
@@ -79,6 +80,9 @@ enum Command {
     /// Check whether the project will deploy: its Manifest, its Resources,
     /// its migrations and its types, every problem with its fix.
     Check(tool::CheckArgs),
+    /// Generate the next migration from src/db/schema.ts into migrations/,
+    /// stopping before one that destroys data.
+    Generate(tool::GenerateArgs),
 }
 
 #[derive(clap::Args)]
@@ -138,6 +142,7 @@ fn main() -> ExitCode {
         Some(Command::Pull(args)) => tool::run(tool::Command::Pull(args)),
         Some(Command::New(args)) => tool::run(tool::Command::New(args)),
         Some(Command::Check(args)) => tool::run(tool::Command::Check(args)),
+        Some(Command::Generate(args)) => tool::run(tool::Command::Generate(args)),
         None => {
             say_on_stderr(
                 "vm: name a command (see vm --help): vm sign-in ..., vm serve ..., or vm --version",
