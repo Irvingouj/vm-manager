@@ -116,11 +116,13 @@ pub const STOCK_CHECKS: &str = "CREATE TABLE stock_checks (
   CONSTRAINT stock_checks_item_fkey FOREIGN KEY (site_id, sku) REFERENCES items (site_id, sku) ON DELETE SET NULL ON UPDATE NO ACTION
 )";
 
-/// Snake case, and two columns whose names meet in camel case.
+/// Snake case, and three columns whose names meet in camel case
+/// (`user id` < `userId` < `user_id` in the `C` collation).
 pub const STOCK_LEVELS: &str = r#"CREATE TABLE stock_levels (
   site_id integer NOT NULL,
   user_id integer,
   "userId" integer,
+  "user id" integer,
   level integer NOT NULL
 )"#;
 
@@ -163,6 +165,32 @@ pub const READINGS_2026: &str = "CREATE TABLE readings_2026 PARTITION OF reading
 /// the same.
 pub const RESTRICTED: &str = "CREATE TABLE restricted (id integer PRIMARY KEY, secret text)";
 
+/// A table whose foreign key refers to itself.
+pub const SELF_REF: &str = "CREATE TABLE bins (
+  id integer PRIMARY KEY,
+  parent_id integer,
+  CONSTRAINT bins_parent_id_fkey FOREIGN KEY (parent_id) REFERENCES bins (id)
+)";
+
+/// Two tables whose foreign keys refer to each other.
+pub const MUTUAL_REFS: &str = "CREATE TABLE crews (id integer PRIMARY KEY, lead_id integer);
+CREATE TABLE members (
+  id integer PRIMARY KEY,
+  crew_id integer NOT NULL,
+  CONSTRAINT members_crew_id_fkey FOREIGN KEY (crew_id) REFERENCES crews (id)
+);
+ALTER TABLE crews ADD CONSTRAINT crews_lead_id_fkey FOREIGN KEY (lead_id) REFERENCES members (id)";
+
+/// A table named as a name the module itself uses (`sql`, exported as
+/// `sql_2`), and one in `public` whose camel case meets the schema `crm`'s
+/// export (`crm_schema`, exported as `crmSchema_2`).
+pub const SQL_TABLE: &str = "CREATE TABLE sql (id integer PRIMARY KEY)";
+pub const CRM_SCHEMA_TABLE: &str = "CREATE TABLE crm_schema (id integer PRIMARY KEY)";
+
+/// A view and a materialized view of another schema.
+pub const CRM_VIEWS: &str = "CREATE VIEW crm.big_accounts AS SELECT id, name FROM crm.accounts WHERE tier = 'gold';
+CREATE MATERIALIZED VIEW crm.tier_counts AS SELECT tier, count(*)::bigint AS n FROM crm.accounts GROUP BY tier";
+
 /// Made and dropped first in [`IN_ANOTHER_ORDER`], so that every object id
 /// differs from [`IN_ORDER`]'s.
 pub const THROWAWAY: &str = "CREATE TABLE throwaway (x integer); DROP TABLE throwaway; \
@@ -170,7 +198,7 @@ pub const THROWAWAY: &str = "CREATE TABLE throwaway (x integer); DROP TABLE thro
      CREATE SCHEMA throwaway_schema; DROP SCHEMA throwaway_schema";
 
 /// The fixture's statements, in the order they are first written.
-pub const IN_ORDER: [&str; 19] = [
+pub const IN_ORDER: [&str; 24] = [
     ENUM_STATUS,
     DOMAIN_POSITIVE,
     SITES,
@@ -190,13 +218,21 @@ pub const IN_ORDER: [&str; 19] = [
     READINGS_2025,
     READINGS_2026,
     RESTRICTED,
+    SELF_REF,
+    MUTUAL_REFS,
+    SQL_TABLE,
+    CRM_SCHEMA_TABLE,
+    CRM_VIEWS,
 ];
 
 /// The same statements in another order that still builds, after
 /// [`THROWAWAY`].
-pub const IN_ANOTHER_ORDER: [&str; 20] = [
+pub const IN_ANOTHER_ORDER: [&str; 25] = [
     THROWAWAY,
+    CRM_SCHEMA_TABLE,
+    MUTUAL_REFS,
     RESTRICTED,
+    SQL_TABLE,
     CRM_SCHEMA,
     CRM_TIER,
     READINGS,
@@ -210,6 +246,8 @@ pub const IN_ANOTHER_ORDER: [&str; 20] = [
     ENUM_STATUS,
     SITES,
     CRM_ACCOUNTS,
+    CRM_VIEWS,
+    SELF_REF,
     ITEMS,
     STOCK_CHECKS,
     MOVEMENTS,
@@ -244,10 +282,10 @@ GRANT INSERT, UPDATE, DELETE ON sites, items, movements, crm.accounts TO %WRITER
 ";
 
 /// The columns of the fixture the puller cannot express, as (schema, table,
-/// column, a word the type's name holds).
+/// column, the type as Postgres prints it with nothing on the search path).
 pub const UNSUPPORTED: [(&str, &str, &str, &str); 4] = [
     ("public", "items", "photo", "bytea"),
-    ("public", "items", "quantity", "positive_int"),
+    ("public", "items", "quantity", "public.positive_int"),
     ("public", "items", "stocked", "int4range"),
     ("public", "sites", "area", "polygon"),
 ];
@@ -285,7 +323,7 @@ pub const PROBE_AGAIN: &str =
 /// or a comment: a quote, an apostrophe, a backtick, `${`, `*/`, a
 /// backslash, a line end and `</script>`. Each is a table, a column and an
 /// enum label.
-pub const HOSTILE_NAMES: [&str; 8] = [
+pub const HOSTILE_NAMES: [&str; 11] = [
     "q\"uote",
     "it's",
     "back`tick",
@@ -294,7 +332,19 @@ pub const HOSTILE_NAMES: [&str; 8] = [
     "back\\slash",
     "line\nend",
     "</script>",
+    "line\u{2028}separator",
+    "paragraph\u{2029}separator",
+    "over\u{202e}ride",
 ];
+
+/// The characters that must never be raw in a definition: JavaScript's
+/// line and paragraph separators, and the bidirectional override.
+pub const NEVER_RAW: [char; 3] = ['\u{2028}', '\u{2029}', '\u{202e}'];
+
+/// A default's expression: a string constant holding every hostile name.
+pub fn hostile_default() -> String {
+    HOSTILE_NAMES.join(" | ")
+}
 
 /// The enum whose labels are [`HOSTILE_NAMES`].
 pub const HOSTILE_ENUM: &str = "odd \"mood\"";
@@ -320,8 +370,8 @@ pub fn literal(text: &str) -> String {
 }
 
 /// The statements that make the hostile structure: the enum, and one table
-/// per hostile name whose columns are every hostile name, the last of them
-/// of the enum's type.
+/// per hostile name whose columns are every hostile name, then `mood` of
+/// the enum's type, then `note` whose default is [`hostile_default`].
 pub fn hostile_setup() -> String {
     let labels: Vec<String> = HOSTILE_NAMES.iter().map(|n| literal(n)).collect();
     let mut sql = format!(
@@ -335,6 +385,7 @@ pub fn hostile_setup() -> String {
             .map(|c| format!("{} text", ident(c)))
             .collect();
         columns.push(format!("\"mood\" {}", ident(HOSTILE_ENUM)));
+        columns.push(format!("note text DEFAULT {}", literal(&hostile_default())));
         sql.push_str(&format!(
             "CREATE TABLE {} (id integer PRIMARY KEY, {});\n",
             ident(table),
