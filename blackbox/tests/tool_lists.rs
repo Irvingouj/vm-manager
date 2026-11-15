@@ -1,0 +1,319 @@
+//! `vm resources` and `vm applications` (CONTRACT.md, "The tool: Listing
+//! Resources", "Listing Applications"; ticket "The tool signs in, and lists
+//! Resources and Applications": every registered Resource, also those the
+//! Builder holds no Grant on, with the description, the Builder's Access
+//! level and whom to ask, and no structure; the Applications the Builder
+//! contributes to, with name, description and address).
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    reason = "test code: a failed expectation is a failing test"
+)]
+
+use blackbox::scenario::{Scenario, administrator, assert_none_holds, resource_body};
+use blackbox::shared_database::find_port;
+use blackbox::tool::{Machine, Run};
+use blackbox::{DOMAIN, User, Vm, VmOptions};
+use serde_json::{Value, json};
+
+fn keys(value: &Value) -> Vec<String> {
+    let mut keys: Vec<String> = value
+        .as_object()
+        .map(|o| o.keys().cloned().collect())
+        .unwrap_or_default();
+    keys.sort();
+    keys
+}
+
+/// The User most of these tests list as.
+fn wren() -> User {
+    User::new("wren").in_groups(&["readers", "analysts", "warehouse-team"])
+}
+
+/// A Grant: (Group, Access level).
+type Grant = Option<(&'static str, &'static str)>;
+
+/// (name, description, owner, contact, the Grant).
+const RESOURCES: [(&str, &str, &str, &str, Grant); 4] = [
+    (
+        "billing",
+        "Invoices and payments ledger",
+        "The Finance team",
+        "Fiona Ledger, #billing-access",
+        None,
+    ),
+    (
+        "devops",
+        "Incident tracking store",
+        "The DevOps team",
+        "Dana Ops, #devops-access",
+        Some(("readers", "read")),
+    ),
+    (
+        "metrics",
+        "Service measurements over time",
+        "The SRE team",
+        "Sam Gauge, #metrics-access",
+        Some(("analysts", "structure")),
+    ),
+    (
+        "warehouse",
+        "Stock levels per site",
+        "The Logistics team",
+        "Wanda Crate, #warehouse-access",
+        Some(("warehouse-team", "write")),
+    ),
+];
+
+/// A program with the four [`RESOURCES`] registered and granted; also a
+/// Grant of `read` on `warehouse` to `readers`, below the `write` [`wren`]
+/// holds through another Group.
+fn four_resources() -> Scenario {
+    let s = Scenario::start();
+    for (name, description, owner, contact, grant) in RESOURCES {
+        let mut body = resource_body(name, &s.db, &s.db.reader);
+        body["description"] = json!(description);
+        body["owner"] = json!(owner);
+        body["contact"] = json!(contact);
+        s.register_body(name, &body);
+        if let Some((group, access)) = grant {
+            s.grant(name, group, access);
+        }
+    }
+    s.grant("warehouse", "readers", "read");
+    s
+}
+
+#[test]
+fn vm_resources_lists_every_resource_with_the_users_access_and_whom_to_ask() {
+    let s = four_resources();
+    let machine = Machine::new();
+    machine.sign_in(&s.vm, &wren());
+    let listed = machine.run(&["resources", "--json"]).ok_json();
+    let want: Vec<Value> = RESOURCES
+        .iter()
+        .map(|(name, description, owner, contact, grant)| {
+            json!({
+                "name": name, "kind": "postgres", "description": description, "owner": owner,
+                "contact": contact, "your_access": grant.map(|(_, access)| access),
+            })
+        })
+        .collect();
+    assert_eq!(
+        listed,
+        json!({ "resources": want }),
+        "expected every registered Resource, by name, with wren's highest Access level"
+    );
+    for r in listed["resources"].as_array().unwrap() {
+        assert_eq!(
+            keys(r),
+            [
+                "contact",
+                "description",
+                "kind",
+                "name",
+                "owner",
+                "your_access"
+            ],
+            "{r}"
+        );
+    }
+
+    // In words: one block per Resource, in order; each block from its name
+    // to the next one's.
+    let text = machine.run(&["resources"]).ok_text();
+    let mut starts: Vec<usize> = Vec::new();
+    for (name, ..) in RESOURCES {
+        let at = text
+            .find(name)
+            .unwrap_or_else(|| panic!("expected {name:?} in the words, got\n{text}"));
+        starts.push(at);
+    }
+    assert!(
+        starts.windows(2).all(|w| w[0] < w[1]),
+        "expected the Resources by name in the words, got\n{text}"
+    );
+    for (i, (name, description, owner, contact, grant)) in RESOURCES.iter().enumerate() {
+        let end = starts.get(i + 1).copied().unwrap_or(text.len());
+        let block = text.get(starts[i]..end).unwrap();
+        for fact in [description, owner, contact] {
+            assert!(
+                block.contains(fact),
+                "expected {fact:?} in {name:?}'s block, got\n{block}"
+            );
+        }
+        let lower = block.to_lowercase();
+        match grant {
+            None => assert!(
+                block.contains(&format!("no access: ask {contact}")),
+                "expected {name:?}'s block to say `no access: ask {contact}`, got\n{block}"
+            ),
+            Some((_, access)) => {
+                assert!(
+                    !lower.contains("no access"),
+                    "expected {name:?}'s block not to say there is no access, got\n{block}"
+                );
+                assert!(
+                    lower.contains(access),
+                    "expected {name:?}'s block to say the level {access:?}, got\n{block}"
+                );
+            }
+        }
+        if grant.is_some_and(|(_, access)| access == "structure") {
+            assert!(
+                lower.contains("rows"),
+                "expected {name:?}'s block, held at structure, to say that rows cannot be read at that level, got\n{block}"
+            );
+        }
+    }
+}
+
+#[test]
+fn vm_resources_shows_nothing_of_a_resources_connection_or_structure() {
+    let s = Scenario::start();
+    s.register_writable("devops");
+    s.grant("devops", "readers", "write");
+    let mut runs: Vec<Run> = Vec::new();
+    for user in [
+        User::new("rita").in_groups(&["readers"]),
+        User::new("nobody"),
+        administrator(),
+    ] {
+        let machine = Machine::new();
+        machine.sign_in(&s.vm, &user);
+        for args in [vec!["resources", "--json"], vec!["resources"]] {
+            let run = machine.run(&args);
+            run.expect_code(0);
+            runs.push(run);
+        }
+    }
+    let texts: Vec<(String, String)> = runs.iter().flat_map(Run::texts).collect();
+    let mut markers = s.db.credential_markers();
+    for inside in [
+        "incidents",
+        "staff_only",
+        "reported_at",
+        "severity",
+        "ticket_numbers",
+    ] {
+        markers.push(("a name of what is inside the Resource", inside.to_owned()));
+    }
+    markers.push(("a value from a row", s.db.row_marker.clone()));
+    assert_none_holds(
+        &texts,
+        &markers,
+        "`vm resources` shows no structure and nothing of a Resource's connection",
+    );
+    for (whence, text) in &texts {
+        assert!(
+            !find_port(text, s.db.port()),
+            "expected the shared database's port in no output, found it in {whence}:\n{text}"
+        );
+    }
+}
+
+#[test]
+fn vm_resources_with_none_registered() {
+    let s = Scenario::start();
+    let machine = Machine::new();
+    machine.sign_in(&s.vm, &wren());
+    assert_eq!(
+        machine.run(&["resources", "--json"]).ok_json(),
+        json!({ "resources": [] })
+    );
+    let text = machine.run(&["resources"]).ok_text().to_lowercase();
+    assert!(
+        text.contains("administrator") && text.contains("regist"),
+        "expected the words to say that none is registered and that a Platform administrator registers them, got\n{text}"
+    );
+}
+
+#[test]
+fn vm_applications_lists_those_the_user_contributes_to() {
+    let vm = Vm::start(&VmOptions::new().stand_in_sign_in());
+    let alice = User::new("alice").in_groups(&["staff"]);
+    let as_alice = vm.api_as(&alice);
+    as_alice
+        .create_application_with(
+            &json!({ "name": "zeta-board", "description": "Where incidents are triaged" }),
+        )
+        .expect_status(201);
+    as_alice
+        .create_application_with(
+            &json!({ "name": "alpha-tool", "description": "Rota of who is on call" }),
+        )
+        .expect_status(201);
+    as_alice
+        .send_bundle("zeta-board", "globalThis.default = {};")
+        .expect_status(201);
+    vm.api_as(&User::new("bob"))
+        .create_application_with(&json!({ "name": "bobs-app", "description": "Bob's own" }))
+        .expect_status(201);
+
+    let machine = Machine::new();
+    machine.sign_in(&vm, &alice);
+    let listed = machine.run(&["applications", "--json"]).ok_json();
+    assert_eq!(
+        listed,
+        json!({ "applications": [
+            { "name": "alpha-tool", "description": "Rota of who is on call",
+              "address": format!("alpha-tool.{DOMAIN}"), "contributor": true, "serving_version": null },
+            { "name": "zeta-board", "description": "Where incidents are triaged",
+              "address": format!("zeta-board.{DOMAIN}"), "contributor": true, "serving_version": 1 },
+        ] }),
+        "expected alice's Applications by name, and not bob's"
+    );
+    assert_eq!(
+        listed,
+        as_alice.list_applications().json(),
+        "expected the tool to print what GET /v1/applications answers"
+    );
+
+    let text = machine.run(&["applications"]).ok_text();
+    let alpha = text
+        .find("alpha-tool")
+        .unwrap_or_else(|| panic!("expected alpha-tool in the words, got\n{text}"));
+    let zeta = text
+        .find("zeta-board")
+        .unwrap_or_else(|| panic!("expected zeta-board in the words, got\n{text}"));
+    assert!(
+        alpha < zeta,
+        "expected the Applications by name, got\n{text}"
+    );
+    for fact in [
+        "Rota of who is on call",
+        "Where incidents are triaged",
+        &format!("alpha-tool.{DOMAIN}"),
+        &format!("zeta-board.{DOMAIN}"),
+    ] {
+        assert!(
+            text.contains(fact),
+            "expected {fact:?} in the words, got\n{text}"
+        );
+    }
+    assert!(
+        !text.contains("bobs-app") && !text.contains("Bob's own"),
+        "expected bob's Application not listed, got\n{text}"
+    );
+}
+
+#[test]
+fn vm_applications_with_none() {
+    let vm = Vm::start(&VmOptions::new().stand_in_sign_in());
+    vm.api_as(&User::new("bob"))
+        .create_application("bobs-app")
+        .expect_status(201);
+    let machine = Machine::new();
+    machine.sign_in(&vm, &User::new("carol").in_groups(&["staff"]));
+    assert_eq!(
+        machine.run(&["applications", "--json"]).ok_json(),
+        json!({ "applications": [] })
+    );
+    let text = machine.run(&["applications"]).ok_text();
+    assert!(
+        text.to_lowercase().contains("application") && !text.contains("bobs-app"),
+        "expected the words to say carol contributes to no Application yet, got\n{text}"
+    );
+}
