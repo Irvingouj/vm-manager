@@ -317,3 +317,67 @@ fn vm_applications_with_none() {
         "expected the words to say carol contributes to no Application yet, got\n{text}"
     );
 }
+
+/// Fails unless `text` holds no control character but its own line ends.
+fn assert_no_raw_control(text: &str, context: &str) {
+    let raw: Vec<String> = text
+        .chars()
+        .filter(|c| c.is_control() && *c != '\n')
+        .map(|c| format!("U+{:04X}", u32::from(c)))
+        .collect();
+    assert!(
+        raw.is_empty(),
+        "{context}: expected no raw control character but line ends, found {raw:?} in\n{}",
+        text.escape_debug()
+    );
+}
+
+#[test]
+fn without_json_no_control_character_of_the_installations_reaches_the_terminal() {
+    let s = Scenario::start();
+    let escape = "\u{1b}[2J\u{1b}[31mred\u{7}";
+    let description = format!("Invoices{escape}\nfake line\r\tend");
+    let owner = "Finance\u{1b}]0;title\u{7}team";
+    let contact = "Ask\u{8}\u{8}\u{8}Fiona\u{7f}\u{9b}31m";
+    let mut body = resource_body("billing", &s.db, &s.db.reader);
+    body["description"] = json!(description);
+    body["owner"] = json!(owner);
+    body["contact"] = json!(contact);
+    s.register_body("billing", &body);
+    let alice = User::new("alice");
+    let app_description = format!("Board{escape}\nsecond line");
+    s.vm.api_as(&alice)
+        .create_application_with(&json!({ "name": "board", "description": app_description }))
+        .expect_status(201);
+    let machine = Machine::new();
+    machine.sign_in(&s.vm, &alice);
+
+    let words = machine.run(&["resources"]).ok_text();
+    assert_no_raw_control(&words, "`vm resources`");
+    assert!(
+        words.contains("\\u{1b}"),
+        "expected the escape character printed as \\u{{1b}}, got\n{}",
+        words.escape_debug()
+    );
+    assert!(
+        words.contains("\\u{a}") || words.contains("\\u{0a}"),
+        "expected the description's line end printed as \\u{{a}}, got\n{}",
+        words.escape_debug()
+    );
+    let words = machine.run(&["applications"]).ok_text();
+    assert_no_raw_control(&words, "`vm applications`");
+    assert!(words.contains("\\u{1b}"), "{}", words.escape_debug());
+
+    let listed = machine.run(&["resources", "--json"]).ok_json();
+    let r = &listed["resources"][0];
+    assert_eq!(r["description"], json!(description));
+    assert_eq!(r["owner"], json!(owner));
+    assert_eq!(r["contact"], json!(contact));
+    let run = machine.run(&["resources", "--json"]);
+    assert_no_raw_control(&run.stdout, "`vm resources --json`");
+    let listed = machine.run(&["applications", "--json"]).ok_json();
+    assert_eq!(
+        listed["applications"][0]["description"],
+        json!(app_description)
+    );
+}

@@ -19,6 +19,7 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use blackbox::api::{assert_json_content_type, parse_rfc3339, version_body};
+use blackbox::postgres::{Platform, PrivatePostgres};
 use blackbox::records::event;
 use blackbox::scenario::{ADMINISTRATORS, Scenario, administrator, resource_body};
 use blackbox::shared_database::token;
@@ -160,8 +161,12 @@ fn a_user_signed_in_with_the_stand_in_is_given_a_tool_credential() {
         );
         let credential = body["credential"].as_str().unwrap_or_default();
         assert!(
-            credential.len() >= 43,
-            "expected a credential of 32 random bytes or more (43 characters or more as text), got one of {} characters",
+            credential.starts_with("vmtc_"),
+            "expected the credential's text to begin with `vmtc_`"
+        );
+        assert!(
+            credential.len() >= "vmtc_".len() + 43,
+            "expected a credential of 32 random bytes or more (43 characters or more as text after `vmtc_`), got one of {} characters",
             credential.len()
         );
         assert!(
@@ -613,4 +618,130 @@ fn the_tool_credentials_path_has_only_its_methods() {
         405,
         "method-not-allowed",
     );
+}
+
+#[test]
+fn a_user_holds_at_most_sixteen_live_credentials() {
+    let vm = vm();
+    let as_bob = vm.api_as(&bob());
+    let bobs: Vec<String> = (0..16).map(|_| as_bob.tool_credential().0).collect();
+    let as_alice = vm.api_as(&alice());
+    let mut alices: Vec<String> = (0..16).map(|_| as_alice.tool_credential().0).collect();
+    for credential in alices.iter().chain(&bobs) {
+        bearer(&vm, "/v1/me", credential).send().expect_status(200);
+    }
+    // The seventeenth ends the one made longest ago, and only that one.
+    alices.push(as_alice.tool_credential().0);
+    let reference = not_signed_in(&vm);
+    assert_same_401(
+        &bearer(&vm, "/v1/me", &alices[0]).send(),
+        &reference,
+        "alice's first credential after her seventeenth was made",
+    );
+    for (n, credential) in alices.iter().enumerate().skip(1) {
+        let me = bearer(&vm, "/v1/me", credential).send();
+        assert_eq!(
+            me.status, 200,
+            "expected alice's credential {n} (of 0 to 16) to sign in still, got status {}",
+            me.status
+        );
+    }
+    for (n, credential) in bobs.iter().enumerate() {
+        let me = bearer(&vm, "/v1/me", credential).send();
+        assert_eq!(
+            me.status, 200,
+            "expected bob's credential {n} untouched by alice's, got status {}",
+            me.status
+        );
+        assert_eq!(me.json()["user"], "bob");
+    }
+    // An eighteenth ends the next oldest.
+    alices.push(as_alice.tool_credential().0);
+    assert_same_401(
+        &bearer(&vm, "/v1/me", &alices[1]).send(),
+        &reference,
+        "alice's second credential after her eighteenth was made",
+    );
+    bearer(&vm, "/v1/me", &alices[2]).send().expect_status(200);
+}
+
+/// The headers `fixtures/honest.js` says it was handed, by lower-case name.
+fn headers_handed(answer: &Response) -> serde_json::Map<String, Value> {
+    answer.expect_status(200);
+    let body = answer.json();
+    body["headers"]
+        .as_object()
+        .unwrap_or_else(|| {
+            panic!("expected the fixture to answer the headers it was handed, got {body}")
+        })
+        .iter()
+        .map(|(k, v)| (k.to_ascii_lowercase(), v.clone()))
+        .collect()
+}
+
+#[test]
+fn an_authorization_header_holding_a_tool_credential_is_never_handed_to_an_application() {
+    let vm = Vm::start(
+        &VmOptions::new()
+            .stand_in_sign_in()
+            .application("board", "honest.js"),
+    );
+    let (credential, _) = vm.api_as(&alice()).tool_credential();
+    for scheme in ["Bearer", "bearer", "BEARER", "bEaReR"] {
+        let answer = vm
+            .request("board", "/")
+            .as_user(&bob())
+            .header("authorization", format!("{scheme} {credential}"))
+            .send();
+        let headers = headers_handed(&answer);
+        assert!(
+            !headers.contains_key("authorization"),
+            "expected `Authorization: {scheme} <a tool credential>` not handed to the Application; it was handed {:?}",
+            headers.keys().collect::<Vec<_>>()
+        );
+        let text = answer.text();
+        assert!(
+            windows_in(
+                &[("the Application's answer".to_owned(), text)],
+                &credential
+            )
+            .is_empty(),
+            "expected no part of the credential to reach the Application"
+        );
+        assert_eq!(answer.json()["user"]["id"], "bob");
+    }
+    // Any other `Authorization` header is handed on as before.
+    for other in [
+        "Basic YWxpY2U6c2VjcmV0".to_owned(),
+        "Bearer something-else-entirely".to_owned(),
+        format!("Token {}", token()),
+    ] {
+        let headers = headers_handed(
+            &vm.request("board", "/")
+                .as_user(&bob())
+                .header("authorization", &other)
+                .send(),
+        );
+        assert_eq!(
+            headers.get("authorization").and_then(Value::as_str),
+            Some(other.as_str()),
+            "expected `Authorization: {other}` handed on to the Application, got {headers:?}"
+        );
+    }
+}
+
+#[test]
+fn a_credential_while_the_platform_database_cannot_be_reached_is_503_not_401() {
+    let mut postgres = PrivatePostgres::start().unwrap();
+    let platform = Platform::on(&postgres, "vm_platform_tool_unavailable");
+    let vm = Vm::start(&VmOptions::new().stand_in_sign_in().platform(&platform));
+    let (credential, _) = vm.api_as(&alice()).tool_credential();
+    bearer(&vm, "/v1/me", &credential).send().expect_status(200);
+    postgres.stop();
+    for target in ["/v1/me", "/v1/resources", "/v1/applications"] {
+        let answer = bearer(&vm, target, &credential)
+            .timeout(Duration::from_secs(40))
+            .send();
+        assert_api_error(&answer, 503, "unavailable");
+    }
 }

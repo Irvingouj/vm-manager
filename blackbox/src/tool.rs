@@ -23,8 +23,9 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -42,7 +43,7 @@ use crate::vm::{DOMAIN, Vm};
 /// The longest one run of the tool may take before it is killed. Above the
 /// tool's own 30 s wait for an answer, so that a test sees the tool's own
 /// ending rather than the harness's.
-pub const TOOL_TIMEOUT: Duration = Duration::from_secs(40);
+pub const TOOL_TIMEOUT: Duration = Duration::from_secs(50);
 
 /// The shortest run of text in the credential file taken to be a
 /// credential: 32 random bytes are at least 43 characters of base64.
@@ -51,6 +52,15 @@ const SHORTEST_CREDENTIAL: usize = 32;
 /// The width of the windows of a credential searched for in what was
 /// printed.
 pub const WINDOW: usize = 16;
+
+/// How a run's standard output is broken before the program writes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BrokenStdout {
+    /// File descriptor 1 is closed.
+    Closed,
+    /// A pipe whose reading end is already closed.
+    ReaderGone,
+}
 
 /// Where the Builder's configuration home is, as the tool is told.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -217,21 +227,107 @@ impl Machine {
     /// Runs `vm <args>` on this machine with these environment variables
     /// added.
     pub fn run_with_env(&self, args: &[&str], env: &[(&str, &str)]) -> Run {
-        let mut command = match &self.umask {
-            None => {
-                let mut command = Command::new(vm_binary());
-                command.args(args);
-                command
+        let command = self.command(args, env, None);
+        let began = Instant::now();
+        let finished = run_to_exit(command, TOOL_TIMEOUT)
+            .unwrap_or_else(|problem| panic!("cannot run the tool: {problem}"));
+        Run {
+            args: args.iter().map(|a| (*a).to_owned()).collect(),
+            code: finished.status.and_then(|s| s.code()),
+            stdout: finished.stdout,
+            stderr: finished.stderr,
+            elapsed: began.elapsed(),
+        }
+    }
+
+    /// Runs `vm <args>` on this machine with its standard output broken
+    /// before it can write anything; `stdout` of the [`Run`] is empty.
+    pub fn run_with_broken_stdout(&self, args: &[&str], broken: BrokenStdout) -> Run {
+        let mut command = self.command(args, &[], Some(broken));
+        let began = Instant::now();
+        let (reader, writer) =
+            std::io::pipe().unwrap_or_else(|e| panic!("cannot make a pipe: {e}"));
+        match broken {
+            BrokenStdout::Closed => {
+                // `sh` closes it before `exec`; nothing to hand over.
+                command.stdout(Stdio::null());
+                drop(writer);
             }
-            Some(umask) => {
-                let mut command = Command::new("/bin/sh");
-                command
-                    .arg("-c")
-                    .arg(format!("umask {umask} && exec \"$0\" \"$@\""))
-                    .arg(vm_binary())
-                    .args(args);
-                command
+            BrokenStdout::ReaderGone => {
+                command.stdout(writer);
             }
+        }
+        // The reading end goes before the program starts: every write it
+        // makes finds no reader.
+        drop(reader);
+        command.stdin(Stdio::null()).stderr(Stdio::piped());
+        let mut child = command
+            .spawn()
+            .unwrap_or_else(|e| panic!("cannot run the tool: {e}"));
+        // The parent's copy of the writing end (inside `command`) goes too.
+        drop(command);
+        let stderr = child.stderr.take().map(|mut stream| {
+            thread::spawn(move || {
+                let mut kept = Vec::new();
+                drop(stream.by_ref().take(1024 * 1024).read_to_end(&mut kept));
+                String::from_utf8_lossy(&kept).into_owned()
+            })
+        });
+        let deadline = began + TOOL_TIMEOUT;
+        let status = loop {
+            if let Ok(Some(status)) = child.try_wait() {
+                break Some(status);
+            }
+            if Instant::now() >= deadline {
+                drop(child.kill());
+                drop(child.wait());
+                break None;
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+        let signal = status.and_then(|s| s.signal());
+        let mut stderr = stderr
+            .map(|t| t.join().unwrap_or_default())
+            .unwrap_or_default();
+        if let Some(signal) = signal {
+            stderr.push_str(&format!("\n[the harness: ended by signal {signal}]"));
+        }
+        Run {
+            args: args.iter().map(|a| (*a).to_owned()).collect(),
+            code: status.and_then(|s| s.code()),
+            stdout: String::new(),
+            stderr,
+            elapsed: began.elapsed(),
+        }
+    }
+
+    fn command(
+        &self,
+        args: &[&str],
+        env: &[(&str, &str)],
+        broken: Option<BrokenStdout>,
+    ) -> Command {
+        let close = if broken == Some(BrokenStdout::Closed) {
+            " >&-"
+        } else {
+            ""
+        };
+        let mut command = if self.umask.is_none() && close.is_empty() {
+            let mut command = Command::new(vm_binary());
+            command.args(args);
+            command
+        } else {
+            let umask = self
+                .umask
+                .as_ref()
+                .map_or_else(String::new, |u| format!("umask {u} && "));
+            let mut command = Command::new("/bin/sh");
+            command
+                .arg("-c")
+                .arg(format!("{umask}exec \"$0\" \"$@\"{close}"))
+                .arg(vm_binary())
+                .args(args);
+            command
         };
         command
             .env_clear()
@@ -250,16 +346,7 @@ impl Machine {
         for (name, value) in env {
             command.env(name, value);
         }
-        let began = Instant::now();
-        let finished = run_to_exit(command, TOOL_TIMEOUT)
-            .unwrap_or_else(|problem| panic!("cannot run the tool: {problem}"));
-        Run {
-            args: args.iter().map(|a| (*a).to_owned()).collect(),
-            code: finished.status.and_then(|s| s.code()),
-            stdout: finished.stdout,
-            stderr: finished.stderr,
-            elapsed: began.elapsed(),
-        }
+        command
     }
 
     /// `vm sign-in` to `vm` as this User, with `--json`, which must end
@@ -543,9 +630,27 @@ impl Run {
     }
 }
 
-/// A listener on 127.0.0.1 that answers every request with a `200` whose
-/// body is not JSON: something that is not an installation. Stopped and
-/// joined when dropped.
+/// What a [`NotAnInstallation`] does with each connection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Pretender {
+    /// Answers `200` with a plain-text body: not JSON.
+    Nonsense,
+    /// Answers `200`, `application/json`, with a well-formed JSON object
+    /// of [`HUGE_ANSWER_BYTES`].
+    Huge,
+    /// Accepts the connection, reads, and never answers.
+    Silent,
+}
+
+/// The size of [`Pretender::Huge`]'s body: over the tool's 8 MiB.
+pub const HUGE_ANSWER_BYTES: usize = 8 * 1024 * 1024 + 4096;
+
+/// The most connections [`Pretender::Silent`] holds open at once; later
+/// ones are closed at once.
+const SILENT_CONNECTIONS: usize = 16;
+
+/// A listener on 127.0.0.1 that is not an installation (see
+/// [`Pretender`]). Stopped and joined when dropped.
 pub struct NotAnInstallation {
     address: SocketAddr,
     stop: Arc<AtomicBool>,
@@ -553,7 +658,12 @@ pub struct NotAnInstallation {
 }
 
 impl NotAnInstallation {
+    /// One that answers [`Pretender::Nonsense`].
     pub fn start() -> Self {
+        Self::pretending(Pretender::Nonsense)
+    }
+
+    pub fn pretending(how: Pretender) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("cannot bind 127.0.0.1:0");
         listener
             .set_nonblocking(true)
@@ -562,9 +672,23 @@ impl NotAnInstallation {
         let stop = Arc::new(AtomicBool::new(false));
         let stopping = Arc::clone(&stop);
         let thread = thread::spawn(move || {
+            let mut held: Vec<TcpStream> = Vec::new();
             while !stopping.load(Ordering::Relaxed) {
                 match listener.accept() {
-                    Ok((stream, _)) => answer_nonsense(stream),
+                    Ok((stream, _)) => match how {
+                        Pretender::Nonsense => {
+                            answer(stream, "text/plain", "this is not an installation")
+                        }
+                        Pretender::Huge => {
+                            let body = format!("{{\"x\":\"{}\"}}", "a".repeat(HUGE_ANSWER_BYTES));
+                            answer(stream, "application/json", &body);
+                        }
+                        Pretender::Silent => {
+                            if held.len() < SILENT_CONNECTIONS {
+                                held.push(stream);
+                            }
+                        }
+                    },
                     Err(_) => thread::sleep(Duration::from_millis(10)),
                 }
             }
@@ -581,9 +705,10 @@ impl NotAnInstallation {
     }
 }
 
-fn answer_nonsense(mut stream: TcpStream) {
+fn answer(mut stream: TcpStream, content_type: &str, body: &str) {
     drop(stream.set_nonblocking(false));
     drop(stream.set_read_timeout(Some(Duration::from_secs(2))));
+    drop(stream.set_write_timeout(Some(Duration::from_secs(10))));
     let mut head = Vec::new();
     let mut chunk = [0_u8; 1024];
     while !head.windows(4).any(|w| w == b"\r\n\r\n") && head.len() < 64 * 1024 {
@@ -592,14 +717,12 @@ fn answer_nonsense(mut stream: TcpStream) {
             Ok(n) => head.extend_from_slice(chunk.get(..n).unwrap_or_default()),
         }
     }
-    let body = "this is not an installation";
-    drop(stream.write_all(
-        format!(
-            "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-            body.len()
-        )
-        .as_bytes(),
-    ));
+    let head = format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+        body.len()
+    );
+    drop(stream.write_all(head.as_bytes()));
+    drop(stream.write_all(body.as_bytes()));
 }
 
 impl Drop for NotAnInstallation {

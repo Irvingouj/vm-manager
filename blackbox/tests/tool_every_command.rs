@@ -10,9 +10,10 @@
     reason = "test code: a failed expectation is a failing test"
 )]
 
+use blackbox::postgres::{Platform, PrivatePostgres};
 use blackbox::scenario::Scenario;
-use blackbox::tool::{Machine, Run, closed_address, sign_in_args};
-use blackbox::{DOMAIN, User};
+use blackbox::tool::{BrokenStdout, Machine, Run, closed_address, sign_in_args};
+use blackbox::{DOMAIN, User, VmOptions};
 
 fn alice() -> User {
     User::new("alice").in_groups(&["readers"])
@@ -216,5 +217,58 @@ fn a_loopback_address_is_a_right_command_line() {
             "--json",
         ]);
         run.json_error(1, "unreachable");
+    }
+}
+
+#[test]
+fn a_command_whose_standard_output_is_closed_ends_without_a_crash() {
+    let s = Scenario::start();
+    s.register("devops");
+    let machine = Machine::new();
+    machine.sign_in(&s.vm, &alice());
+    for broken in [BrokenStdout::Closed, BrokenStdout::ReaderGone] {
+        for args in [
+            vec!["resources"],
+            vec!["resources", "--json"],
+            vec!["whoami"],
+            vec!["whoami", "--json"],
+        ] {
+            let run = machine.run_with_broken_stdout(&args, broken);
+            assert!(
+                matches!(run.code, Some(0 | 1)),
+                "expected exit code 0 or 1 with standard output {broken:?}, got\n{}",
+                run.describe()
+            );
+            for crash in ["panicked", "RUST_BACKTRACE", "stack backtrace"] {
+                assert!(
+                    !run.stderr.contains(crash),
+                    "expected no crash with standard output {broken:?}, but standard error holds {crash:?}:\n{}",
+                    run.describe()
+                );
+            }
+        }
+    }
+    // The control: the credential is still there and works.
+    machine.run(&["whoami", "--json"]).ok_json();
+}
+
+#[test]
+fn an_answer_of_5xx_keeps_the_apis_reason_and_ends_with_1() {
+    let mut postgres = PrivatePostgres::start().unwrap();
+    let platform = Platform::on(&postgres, "vm_platform_tool_5xx");
+    let s = Scenario::start_with(&VmOptions::new().platform(&platform));
+    let machine = Machine::new();
+    machine.sign_in(&s.vm, &alice());
+    machine.run(&["applications", "--json"]).ok_json();
+    postgres.stop();
+    for command in SIGNED_IN_COMMANDS {
+        let message = machine
+            .run(&[command, "--json"])
+            .json_error(1, "unavailable");
+        assert!(
+            !message.contains("vm sign-in"),
+            "expected a signed-in Builder not to be told to sign in again while the platform database is down, got {message:?}"
+        );
+        machine.run(&[command]).text_error(1);
     }
 }

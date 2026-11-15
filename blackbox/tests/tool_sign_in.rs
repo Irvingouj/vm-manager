@@ -18,7 +18,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use blackbox::api::parse_rfc3339;
 use blackbox::records::event;
 use blackbox::scenario::{ADMINISTRATORS, Scenario, administrator};
-use blackbox::tool::{Machine, NotAnInstallation, bearer, closed_address, sign_in_args};
+use blackbox::tool::{Machine, NotAnInstallation, Pretender, bearer, closed_address, sign_in_args};
 use blackbox::{DOMAIN, User, Vm, VmOptions};
 use serde_json::Value;
 
@@ -348,6 +348,14 @@ fn an_expired_credential_says_to_sign_in_again_to_the_same_installation() {
         let words = machine.run(&[command]).text_error(4);
         assert_says_sign_in_again_to(&words, &address);
     }
+    // Signing out of an expired credential: it has ended at the
+    // installation already.
+    let out = machine.run(&["sign-out", "--json"]).ok_json();
+    assert_eq!(out["signed_out"], true, "{out}");
+    assert_eq!(
+        out["ended_at_installation"], true,
+        "expected an expired credential to count as ended at the installation, got {out}"
+    );
     // Signing in again mends it.
     machine.sign_in(&s.vm, &alice());
     machine.run(&["whoami", "--json"]).ok_json();
@@ -372,6 +380,10 @@ fn a_credential_signed_out_elsewhere_is_expired_to_the_tool() {
     }
     let out = machine.run(&["sign-out", "--json"]).ok_json();
     assert_eq!(out["signed_out"], true, "{out}");
+    assert_eq!(
+        out["ended_at_installation"], true,
+        "expected a credential the installation says has ended already to count as ended there, got {out}"
+    );
     machine
         .run(&["whoami", "--json"])
         .json_error(4, "not-signed-in");
@@ -408,6 +420,41 @@ fn something_that_is_not_an_installation_is_an_unexpected_answer() {
     let other = NotAnInstallation::start();
     let machine = Machine::new();
     let owned = sign_in_args(other.address(), &alice());
+    machine
+        .run(&args(&owned, true))
+        .json_error(1, "unexpected-answer");
+    machine.run(&args(&owned, false)).text_error(1);
+    assert!(
+        machine.all_files().is_empty(),
+        "expected nothing kept, found {:?}",
+        machine.all_files()
+    );
+}
+
+#[test]
+fn an_installation_that_accepts_the_connection_and_never_answers_is_unreachable_after_30_s() {
+    let silent = NotAnInstallation::pretending(Pretender::Silent);
+    let machine = Machine::new();
+    let owned = sign_in_args(silent.address(), &alice());
+    let run = machine.run(&args(&owned, true));
+    run.json_error(1, "unreachable");
+    assert!(
+        run.elapsed >= Duration::from_secs(28) && run.elapsed < Duration::from_secs(40),
+        "expected the tool to wait about 30 s for an answer, then give up; it took {:?}",
+        run.elapsed
+    );
+    assert!(
+        machine.all_files().is_empty(),
+        "expected nothing kept, found {:?}",
+        machine.all_files()
+    );
+}
+
+#[test]
+fn an_answer_larger_than_8_mib_is_an_unexpected_answer() {
+    let huge = NotAnInstallation::pretending(Pretender::Huge);
+    let machine = Machine::new();
+    let owned = sign_in_args(huge.address(), &alice());
     machine
         .run(&args(&owned, true))
         .json_error(1, "unexpected-answer");

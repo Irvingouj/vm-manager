@@ -344,3 +344,69 @@ fn the_credential_is_not_taken_from_the_environment_or_the_command_line() {
     let kept = machine.kept_credential(&s.vm);
     assert_ne!(kept, bobs);
 }
+
+#[test]
+fn a_sign_in_whose_credential_cannot_be_kept_leaves_no_credential_alive() {
+    let vm = vm();
+    let machine = Machine::new();
+    let dir = machine.credential_dir();
+    fs::create_dir(&dir).unwrap_or_else(|e| panic!("cannot make {}: {e}", dir.display()));
+    set_mode(&dir, 0o500);
+    if fs::write(dir.join("probe"), b"x").is_ok() {
+        drop(fs::remove_file(dir.join("probe")));
+        eprintln!(
+            "this test runs with the power to write into a folder of mode 0500 (as root?): not checked"
+        );
+        return;
+    }
+    let owned = sign_in_args(vm.address(), &alice());
+    let mut args: Vec<&str> = owned.iter().map(String::as_str).collect();
+    args.push("--json");
+    let message = machine.run(&args).json_error(1, "credential-file");
+    let path = dir.display().to_string();
+    assert!(
+        message.contains(&path),
+        "expected the message to name the path under {path:?}, got {message:?}"
+    );
+    args.pop();
+    machine.run(&args).text_error(1);
+    set_mode(&dir, 0o700);
+    assert!(
+        machine.credential_files().is_empty(),
+        "expected nothing kept, found {:?}",
+        machine.credential_files()
+    );
+
+    // What an outsider sees of it: every credential made for alice was
+    // ended at the installation (each `POST /v1/tool-credentials` answered
+    // `201` is followed by a `DELETE /v1/tool-credentials/current` of hers
+    // answered `204`).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let records = vm.records();
+        let of_alice = |method: &str, path: &str, status: u64| {
+            records
+                .iter()
+                .filter(|r| {
+                    blackbox::records::event(r) == "request"
+                        && r["user"] == "alice"
+                        && r["method"] == method
+                        && r["path"] == path
+                        && r["status"].as_u64() == Some(status)
+                })
+                .count()
+        };
+        let made = of_alice("POST", "/v1/tool-credentials", 201);
+        let ended = of_alice("DELETE", "/v1/tool-credentials/current", 204);
+        if made == ended {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "expected every credential made for alice ended at the installation: {made} made, {ended} ended"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    // And the machine can sign in once the folder can be written.
+    machine.sign_in(&vm, &alice());
+}
