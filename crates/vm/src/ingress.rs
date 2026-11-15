@@ -128,6 +128,7 @@ impl Ingress {
                 .handle(
                     &user,
                     with,
+                    &id,
                     &parts.method,
                     parts.uri.path(),
                     parts.uri.query(),

@@ -33,7 +33,7 @@ use serde_json::value::RawValue;
 use serde_json::{Value, json};
 
 use crate::log;
-use crate::oplog::{self, OperationLog};
+use crate::oplog::{self, Ending, OperationLog};
 use crate::own_db::Migration;
 use crate::platform_db::DbError;
 use crate::registry::{
@@ -44,6 +44,7 @@ use crate::resources::{
     self, Connection, GrantWritten, Login, NewResource, Registered, Resources, is_resource_name,
     level_of,
 };
+use crate::structure;
 use crate::tool_credentials::{Digest, MakeError, ToolCredentials};
 use crate::user::User;
 
@@ -144,6 +145,8 @@ enum Route<'a> {
     Resource(&'a str),
     /// `/v1/resources/<name>/grants`
     Grants(&'a str),
+    /// `/v1/resources/<name>/structure`
+    Structure(&'a str),
     /// `/v1/operation-log`
     OperationLog,
     /// `/v1/me`
@@ -182,6 +185,7 @@ impl<'a> Route<'a> {
             ["resources"] => Some(Self::Resources),
             ["resources", name] => Some(Self::Resource(name)),
             ["resources", name, "grants"] => Some(Self::Grants(name)),
+            ["resources", name, "structure"] => Some(Self::Structure(name)),
             ["operation-log"] => Some(Self::OperationLog),
             ["me"] => Some(Self::Me),
             ["tool-credentials"] => Some(Self::ToolCredentials),
@@ -292,7 +296,7 @@ fn read_version(body: &[u8]) -> Result<NewVersion, String> {
 }
 
 /// `POST /v1/resources`
-const RESOURCE_FORM: &str = r#"{ "name": "<name>", "kind": "postgres", "description": "<text>", "owner": "<text>", "contact": "<whom to ask for access>", "connection": { "host": "<host>", "port": <1 to 65535>, "database": "<database>", "read": { "role": "<role>", "password": "<password>" }, "write": { "role": "<role>", "password": "<password>" } (optional) } }"#;
+const RESOURCE_FORM: &str = r#"{ "name": "<name>", "kind": "postgres", "description": "<text>", "owner": "<text>", "contact": "<whom to ask for access>", "connection": { "host": "<host>", "port": <1 to 65535>, "database": "<database>", "read": { "role": "<role>", "password": "<password>" }, "write": { "role": "<role>", "password": "<password>" } (optional), "structure": { "role": "<role>", "password": "<password>" } (optional) } }"#;
 
 /// Reads a Resource to register. Its problems are told in fixed words that
 /// name a field, never anything the body holds.
@@ -333,6 +337,19 @@ fn read_resource(body: &[u8]) -> Result<NewResource, &'static str> {
             ))
         }
     };
+    // Optional too; `null` is the same as none.
+    let structure = match connection.0.get("structure") {
+        None => None,
+        Some(value) if value.get() == "null" => None,
+        Some(value) => {
+            const STRUCTURE: &str = "connection.structure is not an object with each key once, holding role and password as strings";
+            let structure = Object::read_value(value).map_err(|_| STRUCTURE)?;
+            Some(Login::new(
+                structure.fixed("role", STRUCTURE)?,
+                structure.fixed("password", STRUCTURE)?,
+            ))
+        }
+    };
     if port == 0 {
         return Err(PORT);
     }
@@ -344,7 +361,14 @@ fn read_resource(body: &[u8]) -> Result<NewResource, &'static str> {
         description,
         owner,
         contact,
-        connection: Connection::new(host, port, database, Login::new(role, password), write),
+        connection: Connection::new(
+            host,
+            port,
+            database,
+            Login::new(role, password),
+            write,
+            structure,
+        ),
     })
 }
 
@@ -493,11 +517,16 @@ impl Api {
     }
 
     /// Answers one request of a signed-in `user`, signed in `with` a tool
-    /// credential or otherwise.
+    /// credential or otherwise; `request` is its id.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the parts of one request, each named"
+    )]
     pub async fn handle(
         &self,
         user: &User,
         with: SignedInWith,
+        request: &str,
         method: &Method,
         path: &str,
         query: Option<&str>,
@@ -523,7 +552,7 @@ impl Api {
         };
         let Some(route) = Route::of(path) else {
             return Answer::not_found(
-                "the API has no such path: its paths are /v1/me, /v1/tool-credentials, /v1/tool-credentials/current, /v1/applications, /v1/applications/<name>, /v1/applications/<name>/versions, /v1/applications/<name>/versions/<number>, /v1/resources, /v1/resources/<name>, /v1/resources/<name>/grants and /v1/operation-log",
+                "the API has no such path: its paths are /v1/me, /v1/tool-credentials, /v1/tool-credentials/current, /v1/applications, /v1/applications/<name>, /v1/applications/<name>/versions, /v1/applications/<name>/versions/<number>, /v1/resources, /v1/resources/<name>, /v1/resources/<name>/grants, /v1/resources/<name>/structure and /v1/operation-log",
             );
         };
         if route.for_administrators(method) && !self.is_administrator(user) {
@@ -540,6 +569,7 @@ impl Api {
             Route::ToolCredentials => Ok(self.make_credential(user, with, method, &body).await),
             Route::CurrentToolCredential => self.end_credential(with, method).await,
             Route::Grants(name) => self.grants(method, name, &body).await,
+            Route::Structure(name) => Ok(self.structure(user, request, method, name).await),
             Route::OperationLog => self.operation_log(method, query).await,
             Route::Applications => self.applications(user, method, &body).await,
             Route::Application(name) => self.application(method, name).await,
@@ -837,6 +867,126 @@ impl Api {
         })
     }
 
+    /// `GET /v1/resources/<name>/structure` (blackbox/CONTRACT.md, "Pulling
+    /// a Resource's structure"): the Authorization decision with
+    /// `structure` needed; the Operation log entry written before anything
+    /// is sent to the shared database, and completed after; the pull
+    /// (crate::structure) within its time and bytes.
+    async fn structure(&self, user: &User, request: &str, method: &Method, name: &str) -> Answer {
+        let Some(resource) = self.resources.get(name) else {
+            return no_resource();
+        };
+        if method != Method::GET {
+            return Answer::method_not_allowed(method, "GET");
+        }
+        let groups = groups_of(user);
+        let (decision, held) = resource.with_grants(|grants| {
+            let decision = authz::decide(&authz::Question {
+                request_in_flight: true,
+                actor: authz::Actor::User,
+                own_database: false,
+                groups: &groups,
+                // No Application declares a pull: the Builder asks for the
+                // structure, which is what the pull needs.
+                declared: Some(authz::AccessLevel::Structure),
+                registered: true,
+                grants,
+                needed: authz::AccessLevel::Structure,
+            });
+            (decision, authz::held(&groups, grants))
+        });
+        if let authz::Decision::Refuse(_) = decision {
+            if let Err(error) = self
+                .log
+                .refused_structure(request, &user.id, name, "no-grant")
+                .await
+            {
+                return Answer::unavailable(&error);
+            }
+            return Answer::json(
+                StatusCode::FORBIDDEN,
+                &json!({ "error": {
+                    "reason": "no-grant",
+                    "message": format!(
+                        "you hold no Grant on the Resource {name}: ask {} for one, and do not build against {name} until you have it",
+                        resource.contact
+                    ),
+                    "resource": name,
+                    "contact": &resource.contact,
+                } }),
+            );
+        }
+        let id = match self.log.begin_structure(request, &user.id, name).await {
+            Ok(id) => id,
+            Err(error) => return Answer::unavailable(&error),
+        };
+        let started = tokio::time::Instant::now();
+        let pulled = structure::pull(resource.structure_pool(), name).await;
+        let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let answer = pulled.and_then(|pulled| {
+            let answer = Answer::json(
+                StatusCode::OK,
+                &StructureView {
+                    resource: name,
+                    fingerprint: &pulled.fingerprint,
+                    your_access: held.map(resources::level_name),
+                    schema_ts: &pulled.schema_ts,
+                    unsupported: &pulled.unsupported,
+                },
+            );
+            if answer.body.len() > structure::MAX_BYTES {
+                Err(structure::Failed::TooLarge)
+            } else {
+                Ok(answer)
+            }
+        });
+        let ending = match &answer {
+            Ok(_) => Ending {
+                outcome: "allowed",
+                error: None,
+                rows: None,
+                duration_ms: Some(duration_ms),
+                began_nothing: false,
+            },
+            Err(failed) => Ending {
+                outcome: "failed",
+                error: Some(failed.error()),
+                rows: None,
+                duration_ms: (*failed != structure::Failed::Unavailable).then_some(duration_ms),
+                began_nothing: false,
+            },
+        };
+        if let Err(error) = self.log.finish(id, &ending).await {
+            log::record(
+                "operation-log-unwritten",
+                json!({ "resource": name, "error": error.to_string() }),
+            );
+        }
+        answer.unwrap_or_else(|failed| match failed {
+            structure::Failed::TooLarge => Answer::error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "structure-too-large",
+                &format!(
+                    "the structure of {name} is larger than the 4 MiB a pull answers: ask its owner whether part of it can be kept in another database, or another Resource registered for the part you build against"
+                ),
+            ),
+            structure::Failed::Time => Answer::error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "structure-unavailable",
+                &format!(
+                    "reading the structure of {name} took longer than the 10 seconds a pull has: try again shortly; if it goes on, tell its owner"
+                ),
+            ),
+            structure::Failed::Unavailable => Answer::error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "structure-unavailable",
+                &format!(
+                    "the shared database of {name} cannot be reached or does not take the platform's login now: try again shortly; if it goes on, tell its owner"
+                ),
+            ),
+        })
+    }
+
     /// `GET /v1/me`: who is signed in.
     fn me(&self, user: &User, method: &Method) -> Answer {
         if method != Method::GET {
@@ -1115,6 +1265,16 @@ struct GrantSet<'a> {
     resource: &'a str,
     group: &'a str,
     access: &'static str,
+}
+
+/// `GET /v1/resources/<name>/structure`.
+#[derive(Serialize)]
+struct StructureView<'a> {
+    resource: &'a str,
+    fingerprint: &'a str,
+    your_access: Option<&'static str>,
+    schema_ts: &'a str,
+    unsupported: &'a [structure::Unsupported],
 }
 
 #[derive(Serialize)]

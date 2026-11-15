@@ -22,6 +22,8 @@
 //! - [`check`]: the statement check, Application SQL's hygiene before it
 //!   is sent.
 //! - [`oplog`]: the Operation log, in the platform database.
+//! - [`structure`]: the Structure puller: a shared database's catalogs,
+//!   read as a Drizzle definition and a fingerprint.
 //! - [`own_db`]: the Own-database provisioner and migrator: each
 //!   Application's own database, its three roles, its migrations, and the
 //!   runtime role's pool.
@@ -55,6 +57,7 @@ pub mod runner;
 pub mod server;
 pub mod sign_in;
 pub mod statement;
+pub mod structure;
 pub mod tool;
 pub mod tool_credentials;
 pub mod user;
