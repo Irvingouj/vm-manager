@@ -264,6 +264,17 @@ pub const STEPS: &[Step] = &[
         CREATE INDEX contributors_user ON contributors (user_id);
     ",
     },
+    Step {
+        number: 9,
+        name: "at most 16 live tool credentials a User",
+        sql: "
+        -- The order credentials were made in, so that a User's seventeenth
+        -- ends the one made longest ago (crate::tool_credentials), and the
+        -- lookup of a User's live ones.
+        ALTER TABLE tool_credentials ADD COLUMN made bigint GENERATED ALWAYS AS IDENTITY;
+        CREATE INDEX tool_credentials_user ON tool_credentials (user_id, made);
+    ",
+    },
 ];
 
 /// The advisory lock every step's transaction takes first: "vm steps".

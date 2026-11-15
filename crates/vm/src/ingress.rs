@@ -202,6 +202,7 @@ impl Ingress {
             }
         };
         remove_reserved_headers(&mut parts.headers);
+        tool_credentials::remove_credentials(&mut parts.headers);
         let path_and_query = parts.uri.path_and_query().map_or("/", |p| p.as_str());
         let request = HttpRequest {
             method: http_method,
