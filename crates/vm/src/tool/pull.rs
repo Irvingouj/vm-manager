@@ -118,6 +118,7 @@ pub(super) async fn pull(args: &PullArgs) -> Result<Done, Ending> {
             first_line: INDEX_FIRST_LINE,
         },
     ];
+    no_link(&project, name)?;
     let mut present: Vec<Option<Vec<u8>>> = Vec::with_capacity(files.len());
     for file in &files {
         present.push(generated_or_none(file)?);
@@ -153,7 +154,9 @@ pub(super) async fn pull(args: &PullArgs) -> Result<Done, Ending> {
     let link = link(name, relations);
     let contents = [answered.schema_ts.as_bytes(), link.as_bytes()];
     // Checked again just before writing: a file made meanwhile by someone
-    // else is not overwritten either.
+    // else is not overwritten either, nor a link made meanwhile written
+    // through.
+    no_link(&project, name)?;
     for (file, was) in files.iter().zip(present.iter_mut()) {
         *was = generated_or_none(file)?;
     }
@@ -228,6 +231,35 @@ fn link(name: &str, relations: bool) -> String {
         "\ndeclare module \"@vm/sdk\" {{\n  interface SharedStructures {{\n    \"{name}\": {structure};\n  }}\n}}\n"
     ));
     text
+}
+
+/// That none of `resources`, `resources/<name>` and the two files in it is
+/// a symbolic link (each looked at itself, never followed), so that the
+/// tool writes inside the project only. What is not there is not a link.
+fn no_link(project: &Path, name: &str) -> Result<(), Ending> {
+    let shown = [
+        "resources".to_owned(),
+        format!("resources/{name}"),
+        format!("resources/{name}/schema.ts"),
+        format!("resources/{name}/index.ts"),
+    ];
+    for path in &shown {
+        match fs::symlink_metadata(project.join(path)) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(Ending::new(
+                    1,
+                    "not-a-project",
+                    format!(
+                        "{path} is a symbolic link: vm pull writes inside the project only. Replace it with a folder or file of the project's own, then run vm pull again; nothing was written"
+                    ),
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(file_problem(path, "cannot be read", &error)),
+        }
+    }
+    Ok(())
 }
 
 /// What is at `file`'s path: nothing, or a file the tool wrote (its bytes,
