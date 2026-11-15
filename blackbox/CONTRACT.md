@@ -1344,6 +1344,7 @@ One explicit command that never waits for an approval (ADR 0009, ADR 0016). The 
 ### On the platform's API
 
 - `POST /v1/applications/<name>/versions` takes one more field, optional: `"structures": { "<resource>": "sha256:<64 hex>" }`, the fingerprint of each shared structure the Version was built against. Every key must be a Resource the Version declares and every value a fingerprint in that form; otherwise `400 malformed`. Left out or `null`, it is an empty object. The hex digits are lower-case. The Version's record gains `"structures"`, as sent, for ever.
+- The messages of `migration-failed` and `migration-refused` say that a Version still serves only when one does: for an Application with no Version serving they say that nothing was applied and name no Version. `vm deploy` gives the words of `migration-refused` as the API has them.
 - Nothing else of the API changes: the tool creates the Application with `POST /v1/applications` when there is none of the Manifest's name, with the Manifest's `description`.
 
 ### The command
