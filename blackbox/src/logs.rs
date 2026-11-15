@@ -190,8 +190,8 @@ pub struct Page {
 }
 
 impl Page {
-    /// The `request` of each entry (null for an entry printed outside a
-    /// request).
+    /// The `request` of each entry (`None` only if an entry wrongly had
+    /// none).
     pub fn requests(&self) -> Vec<Option<String>> {
         self.entries
             .iter()
@@ -248,8 +248,9 @@ pub fn page(api: &Api<'_>, application: &str, query: &str) -> Page {
 }
 
 /// Fails unless `entry` has exactly the contract's fields, each of its type:
-/// `id` text, `time` RFC 3339, `request`, `user`, `method`, `path` text or
-/// null, `version` a number, `status` a number or null, `printed` a list of
+/// `id` text, `time` RFC 3339, `request`, `user`, `method`, `path` text
+/// (never null: every entry is a request's), `version` and `status`
+/// numbers, `printed` a list of
 /// `{ level, message }`, `uncaught` a list of text, `truncated` a boolean,
 /// `dropped_before` a number.
 pub fn assert_entry_shape(entry: &Value) {
@@ -272,13 +273,13 @@ pub fn assert_entry_shape(entry: &Value) {
     );
     for field in ["request", "user", "method", "path"] {
         assert!(
-            entry[field].is_string() || entry[field].is_null(),
-            "expected `{field}` text or null in {entry}"
+            entry[field].is_string(),
+            "expected `{field}` text, never null: every entry is a request's, in {entry}"
         );
     }
     assert!(
-        entry["status"].is_u64() || entry["status"].is_null(),
-        "expected `status` a number or null in {entry}"
+        entry["status"].is_u64(),
+        "expected `status` a number, never null, in {entry}"
     );
     assert!(
         entry["version"].is_u64(),

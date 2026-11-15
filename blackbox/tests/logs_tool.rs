@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use blackbox::api::parse_rfc3339;
 use blackbox::logs::{
-    ENTRY_KEYS, Print, encode, page, post_to, printing, prints_bundle, wait_for_entries,
+    ENTRY_KEYS, Print, encode, page, post_to, printing, prints_bundle, record, wait_for_entries,
     wait_for_entry,
 };
 use blackbox::own_database::Own;
@@ -352,7 +352,7 @@ fn vm_logs_in_words_lets_no_control_character_reach_the_terminal_and_indents_a_m
     );
     assert_eq!(
         printed["entries"][0]["printed"],
-        json!([{ "level": "log", "message": coloured }, { "level": "log", "message": lines }]),
+        json!([record("log", coloured, false), record("log", lines, false)]),
         "expected --json to parse to the original text"
     );
 }
