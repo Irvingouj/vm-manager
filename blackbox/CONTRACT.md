@@ -1049,3 +1049,70 @@ To have the rows before, the platform must know that a statement rewrites before
 - A change of type that Postgres makes without writing the rows anew records no row: the stored values are the same. For `timestamp` to `timestamptz` while the session's time zone is UTC, the JSON form of the same instant gains its offset from then on; the `column-type` entry is what says so.
 - A column or a table dropped, a table replaced under its name, an enum's value renamed and a partition detached are one `structure` entry each, not an entry per row: the rows' last values are in the history already.
 - Every changed row of a rewrite is a row of `change_history`: a rewrite of ten million rows that changes each writes ten million, and nothing bounds an Application's share of the platform database yet.
+
+
+## The tool (ticket: The tool signs in, and lists Resources and Applications)
+
+The same program, run on a Builder's machine by their Coding agent (ADR 0006, ADR 0015). Its first reader is an agent: every command has a machine-readable form, exit codes that say what kind of ending it was, and messages that say what to do next.
+
+### Every command
+
+- **Exit codes.** `0`: done. `1`: failed (the installation cannot be reached, it answered something unexpected, a file cannot be read or written). `2`: the command line is wrong. `3`: refused, or waiting for the Builder (the platform said no, or the next step is a person's: the message says whose and what). `4`: not signed in (no credential, or one that has expired or was revoked): sign in and run the command again. `vm --help` lists these five, each with its number and meaning.
+- **`--json`**, on every command: standard output is exactly one JSON object and a line end, nothing else. A command that does not end with `0` prints `{ "error": { "reason": "<kebab-case>", "message": "<a sentence a Coding agent can act on>" } }` there (for exit code `2` the usual usage text on standard error is enough). Without `--json`, the result is text on standard output and an error is its message on standard error.
+- Reasons the tool itself gives: `not-signed-in` (4), `sign-in-expired` (4), `sign-in-refused` (3), `unreachable` (1), `unexpected-answer` (1), `credential-file` (1: the credential file cannot be read or written; the message names the path). A refusal of the platform's API keeps the API's own `reason` and `message` and ends with `3`.
+- Every wait has an end: an installation that does not accept the connection within 5 seconds, or does not answer within 30, is `unreachable`.
+- The messages for `not-signed-in` and `sign-in-expired` say to run `vm sign-in`, and `sign-in-expired` gives the whole command with the installation it was signed in to.
+
+### Signing in
+
+```
+vm sign-in --domain <domain> --connect <ip:port> --stand-in-user <id> [--stand-in-groups g1,g2] [--json]
+vm sign-out [--json]
+vm whoami [--json]
+```
+
+- `vm sign-in` asks the installation for a **tool credential** for that User and keeps it on the Builder's machine. While sign-in is the stand-in, the User and their Groups are stated on the command line (`--stand-in-user` is required); the ticket on signing the tool in through the browser replaces those two options and nothing else here.
+- Until the ticket on installing brings HTTPS, the tool speaks plain HTTP and only to the address given with `--connect`, which must be a loopback address (`127.0.0.1:<port>`, `[::1]:<port>`); another address is exit code `2`. It sends `Host: api.<domain>`.
+- It prints the User, their Groups and the installation: `{ "user": "<id>", "groups": [...], "platform_administrator": <bool>, "domain": "<domain>", "expires_at": "<RFC 3339 time>" }`. An installation that does not accept the sign-in (the stand-in is off) is `sign-in-refused`, exit code `3`, and nothing is kept.
+- Signing in again replaces the credential kept; the earlier one is ended at the installation if it can be reached.
+- `vm whoami` asks the installation who the credential is: `{ "user", "groups", "platform_administrator", "domain" }`. The Groups are those of the sign-in.
+- `vm sign-out` ends the credential at the installation and removes it from the machine: `{ "signed_out": true, "ended_at_installation": <bool> }`, exit code `0`. If the installation cannot be reached the credential is removed from the machine all the same (`ended_at_installation` false). With nothing to sign out of: `{ "signed_out": false, ... }`, exit code `0`.
+
+### The credential
+
+- It is kept in the user's own configuration folder: `$XDG_CONFIG_HOME/vm/` when that variable holds an absolute path, else `$HOME/.config/vm/` (Linux and macOS; Windows comes with the ticket on the three systems). The tool makes the folder with mode `0700` if it is not there, and writes the file with mode `0600` whatever mode it had. Nothing else of the tool's is promised about that folder.
+- **It is never printed**: not on standard output or standard error of any command, with or without `--json`, not in an error message, and it is not taken from the command line or the environment. It is not in the program's log on the installation's side, and the platform database does not hold it in a form that can be used (it keeps a digest).
+- It is 32 random bytes or more, made by the installation, and cannot be guessed.
+- It ends when its time is up, when it is signed out, and never otherwise in this ticket. Its lifetime is 30 days from the sign-in; `vm serve --tool-credential-lifetime <seconds>` sets another (tests use a short one).
+
+### On the platform's API
+
+- `POST /v1/tool-credentials`, by a signed-in User who signed in otherwise than with a tool credential (for now: the stand-in), with an empty body or `{}`: `201` with `{ "credential": "<the credential>", "user": "<id>", "groups": [...], "platform_administrator": <bool>, "expires_at": "<RFC 3339 time>" }`. This is the only answer that ever holds a credential. Asked with a tool credential it is `403` with reason `not-with-a-tool-credential`: a credential cannot renew itself.
+- `Authorization: Bearer <credential>` on a request to `api.<domain>` is a sign-in like any other, as the User and the Groups of the moment the credential was made: every request of the API may be made with it. A request with an `Authorization` header is decided by it alone: a credential that is unknown, expired or signed out is the usual `401` (the same plain body as for anyone not signed in), whatever stand-in headers come with it; malformed stand-in headers are still `400` first.
+- A tool credential is not a sign-in on an Application's address: there the header counts for nothing, and the request is `401` unless signed in otherwise.
+- `DELETE /v1/tool-credentials/current`, with the credential: `204`, and the credential is ended at once. Without one, or signed in otherwise: `404`.
+- `GET /v1/me`, by any signed-in User: `{ "user": "<id>", "groups": [...], "platform_administrator": <bool> }`.
+- The `401` for a credential that has ended does not say whether it expired, was signed out or never existed. The tool calls all three `sign-in-expired`.
+
+### Listing Resources
+
+```
+vm resources [--json]
+```
+
+- `GET /v1/resources` and `GET /v1/resources/<name>` gain, in each Resource, `"your_access": "structure" | "read" | "write" | null`: the highest Access level the User holds on it through their Groups, null when they hold no Grant.
+- `vm resources --json` prints `{ "resources": [ { "name", "kind", "description", "owner", "contact", "your_access" } ] }`, by name: **every** registered Resource, also those the User holds no Grant on.
+- Without `--json`, one block per Resource with the same facts in words. For a Resource with no Grant it says so and says whom to ask, with the Resource's `contact` (`no access: ask <contact>`); for one held at `structure` it says that rows cannot be read at that level.
+- It shows no structure: no table, no column, nothing of what is inside a Resource, and nothing of its connection.
+- With no Resource registered: `{ "resources": [] }`, and in words that none is registered and that a Platform administrator registers them.
+
+### Listing Applications
+
+```
+vm applications [--json]
+```
+
+- `GET /v1/applications`, by any signed-in User: `{ "applications": [ { "name", "description", "address", "contributor": <bool>, "serving_version": <number or null> } ] }`, by name: the Applications the User contributes to or can open. `address` is `<name>.<domain>`.
+- **Until the ticket on Contributors and sharing says who can open an Application, the list holds the Applications the User is a Contributor of** (`contributor` true), and no other. That ticket adds the ones shared with them.
+- `vm applications --json` prints the same object. Without `--json`, one block per Application: name, description, address, and whether a Version is serving.
+- With none: `{ "applications": [] }`, and in words that the User contributes to no Application yet.
