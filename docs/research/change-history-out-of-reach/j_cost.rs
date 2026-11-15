@@ -95,6 +95,137 @@ fn shipped(db: &OwnDatabase, limit: Duration) {
     }
 }
 
+/// A migration of `count` statements, each making one partition of
+/// `table` (ten values each, from `from` on).
+fn making(table: &str, from: usize, count: usize) -> Vec<String> {
+    (from..from + count)
+        .map(|i| {
+            format!(
+                r#"CREATE TABLE "{table}_{i}" PARTITION OF "{table}" FOR VALUES FROM ({}) TO ({});"#,
+                i * 10,
+                i * 10 + 10
+            )
+        })
+        .collect()
+}
+
+/// A Version whose migration makes partitions, one a statement, under a
+/// partitioned table with history (a) that had none, (b) that had 1,000;
+/// beside it a Version of as many `SELECT 1`; and in (b) what one
+/// `SELECT 1` costs. Medians of `J_ROUNDS`.
+fn partitions(own: &Own, base: &[Migration]) {
+    let mut next = 4;
+    let mut list = base.to_vec();
+    let mut push = |list: &mut Vec<Migration>, statements: &[String]| {
+        let refs: Vec<&str> = statements.iter().map(String::as_str).collect();
+        list.push(Migration::new(&format!("{next:04}_p"), &refs));
+        next += 1;
+    };
+    let times = |list: &mut Vec<Migration>, push: &mut dyn FnMut(&mut Vec<Migration>, &[String]), app: &str, before: &dyn Fn(usize) -> Vec<String>, statements: &dyn Fn(usize) -> Vec<String>| {
+        let mut taken = Vec::new();
+        for round in 0..rounds() {
+            let ready = before(round);
+            if !ready.is_empty() {
+                push(list, &ready);
+                send_ok(own, app, list);
+            }
+            push(list, &statements(round));
+            taken.push(send_ok(own, app, list));
+        }
+        taken
+    };
+    let ddl = |t: &str| format!(r#"CREATE TABLE "{t}" ("id" integer NOT NULL, "v" text, PRIMARY KEY ("id")) PARTITION BY RANGE ("id");"#);
+
+    // (a): each round a partitioned table of its own, made empty by the
+    // Version before.
+    let app = "parts-a";
+    let _db = own.install(app, &list);
+    for count in [100_usize, 200] {
+        let ones = times(&mut list, &mut push, app, &|_| Vec::new(), &|_| vec!["SELECT 1;".to_owned(); count]);
+        let made = times(
+            &mut list,
+            &mut push,
+            app,
+            &|round| vec![ddl(&format!("a{count}_{round}"))],
+            &|round| making(&format!("a{count}_{round}"), 0, count),
+        );
+        println!(
+            "J partitions (a), none before: {count} `SELECT 1` median {:.0} ms [{}]; {count} partitions made median {:.0} ms [{}]; a partition {:.2} ms more than a `SELECT 1`",
+            ms(median(&ones)),
+            list_ms(&ones),
+            ms(median(&made)),
+            list_ms(&made),
+            (ms(median(&made)) - ms(median(&ones))) / count as f64
+        );
+    }
+
+    // (b): one partitioned table with 1,000 partitions; each round makes
+    // `count` more, and the Version after drops them again.
+    let app = "parts-b";
+    list = base.to_vec();
+    let _db = own.install(app, &list);
+    push(&mut list, &[ddl("b")]);
+    push(
+        &mut list,
+        &[format!(
+            r#"DO $p$ BEGIN FOR i IN 0..999 LOOP EXECUTE format('CREATE TABLE %I PARTITION OF "b" FOR VALUES FROM (%s) TO (%s)', 'b_' || i, i * 10, i * 10 + 10); END LOOP; END $p$;"#
+        )],
+    );
+    send_ok(own, app, &list);
+    let mut one = Vec::new();
+    let mut more = Vec::new();
+    for _ in 0..rounds().max(5) {
+        push(&mut list, &["SELECT 1;".to_owned()]);
+        one.push(send_ok(own, app, &list));
+        push(&mut list, &vec!["SELECT 1;".to_owned(); 301]);
+        more.push(send_ok(own, app, &list));
+    }
+    println!(
+        "J partitions (b), 1000 before: a Version of one `SELECT 1` median {:.1} ms [{}]; of 301 median {:.1} ms [{}]; a statement {:.3} ms",
+        ms(median(&one)),
+        list_ms(&one),
+        ms(median(&more)),
+        list_ms(&more),
+        (ms(median(&more)) - ms(median(&one))) / 300.0
+    );
+    for count in [100_usize, 200] {
+        let ones = times(&mut list, &mut push, app, &|_| Vec::new(), &|_| vec!["SELECT 1;".to_owned(); count]);
+        let made = times(
+            &mut list,
+            &mut push,
+            app,
+            &|round| {
+                if round == 0 {
+                    Vec::new()
+                } else {
+                    vec![format!(
+                        r#"DO $p$ BEGIN FOR i IN 1000..{} LOOP EXECUTE format('DROP TABLE %I', 'b_' || i); END LOOP; END $p$;"#,
+                        999 + count
+                    )]
+                }
+            },
+            &|_| making("b", 1000, count),
+        );
+        println!(
+            "J partitions (b), 1000 before: {count} `SELECT 1` median {:.0} ms [{}]; {count} partitions made median {:.0} ms [{}]; a partition {:.2} ms more than a `SELECT 1`",
+            ms(median(&ones)),
+            list_ms(&ones),
+            ms(median(&made)),
+            list_ms(&made),
+            (ms(median(&made)) - ms(median(&ones))) / count as f64
+        );
+        // Back to 1,000 for what follows.
+        push(
+            &mut list,
+            &[format!(
+                r#"DO $p$ BEGIN FOR i IN 1000..{} LOOP EXECUTE format('DROP TABLE %I', 'b_' || i); END LOOP; END $p$;"#,
+                999 + count
+            )],
+        );
+        send_ok(own, app, &list);
+    }
+}
+
 #[test]
 fn j_cost() {
     let parts = parts();
@@ -156,6 +287,10 @@ fn j_cost() {
                 list_ms(&migrations)
             );
         }
+    }
+
+    if parts.contains("partitions") {
+        partitions(&own, &list);
     }
 
     if parts.contains("rewrite") || parts.contains("breakdown") {

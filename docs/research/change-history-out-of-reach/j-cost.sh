@@ -29,6 +29,11 @@
 #               changed to `text`, which Postgres makes without a rewrite
 #   breakdown   (AFTER only) the same three once more, with Postgres's
 #               function statistics: where the time went, and how many runs
+#   partitions  (not in the default stages) a Version whose migration makes
+#               100, then 200 partitions, one a statement, under a
+#               partitioned table with history that had none, then one that
+#               had 1,000, each beside a Version of as many `SELECT 1`; and
+#               one `SELECT 1`'s cost beside the table of 1,000
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(git -C "$HERE" rev-parse --show-toplevel)"
@@ -84,6 +89,13 @@ for stage in ${J_STAGES:-1 2 breakdown big}; do
       run after "$AFTER" statements,rewrite
       ;;
     breakdown) run after "$AFTER" breakdown ;;
+    partitions)
+      run before "$BEFORE" partitions
+      if [ -n "$MIDDLE" ]; then
+        run middle "$MIDDLE" partitions
+      fi
+      run after "$AFTER" partitions
+      ;;
     big)
       run before "$BEFORE" rewrite 1000000 1
       run after "$AFTER" rewrite 1000000 1
