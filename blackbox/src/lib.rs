@@ -47,7 +47,11 @@
 //! - [`structure`] is what the tests of pulling a Resource's structure
 //!   share: a fixture shared database with the common shapes, the
 //!   generated link, and a reading of the server log that says whether a
-//!   login read only the catalogs.
+//!   login read only the catalogs;
+//! - [`generate`] is what the tests of generating migrations share: `vm
+//!   generate` and what it printed, the entries of `destroys`, a project's
+//!   migrations in its journal's order as a Version carries them, and the
+//!   own schemas the tests change.
 //!
 //! Every wait has a timeout, so a failing test fails within seconds and
 //! never hangs. Each test starts its own program on its own port, so tests
@@ -63,6 +67,7 @@
 pub mod api;
 pub mod changed_outside;
 pub mod expect;
+pub mod generate;
 pub mod history;
 pub mod history_earlier;
 pub mod history_kept;
