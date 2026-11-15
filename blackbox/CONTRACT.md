@@ -1407,3 +1407,126 @@ From this ticket on the template's `AGENTS.md` names `vm deploy` in its table of
 - The confirmation for data loss is the tool's: the API takes a Version whose migrations destroy data from whoever is a Contributor.
 - A structure that changes between the pull and the answer is not noticed until the next deploy.
 - The data-loss question reads the statements of a migration, not what they run: SQL inside a `DO` block or a function is not looked at, and an `UPDATE` that overwrites values is not counted.
+
+## Versions, going back, and logs (ticket: Versions: list them, go back to the previous one, read logs)
+
+A Contributor sees an Application's Versions and which one serves, goes back to an earlier one with one command, and reads what the Application printed and the errors it raised, request by request.
+
+### Going back, on the platform's API
+
+`POST /v1/applications/<name>/go-back`, by a Contributor, with `{ "from": <number>, "to": <number, optional> }`.
+
+- `from` is the Version the caller saw serving; `to` is the Version to serve instead, `from - 1` when it is left out or `null`. Answers `200`:
+
+  ```json
+  { "application": "incident-board", "serving_version": 2, "was": 3,
+    "migrations_not_undone": [ "0002_add_notes" ] }
+  ```
+
+- **At once.** Once the `200` has been received, every new request to the Application is served by Version `to`, with its bundle and its Declared access. Requests already in flight finish on the Version they started on. `GET /v1/applications/<name>` has `serving_version` `to`.
+- **Migrations are not undone.** The Application's own database stays as the latest Version's migrations left it. `migrations_not_undone` names the migrations the Application's latest Version has and Version `to` has not, in their order: Version `to`'s code now runs against a database that has them.
+- **Versions are not removed or renumbered.** The Version gone back from is still a Version; the next one sent is numbered after the latest, and its migrations must continue the latest Version's, as before (they are the ones applied).
+- **Only backwards.** `to` must be a Version of the Application numbered below `from`. To serve a later Version again, send it again.
+- Refusals, after the ones every request of the API has (`not-found` for no such Application, then `not-a-contributor`, then `malformed`):
+
+  | Status | When | `reason` |
+  |---|---|---|
+  | 400 | `from` is missing or not a positive integer; `to` is given and is not a positive integer below `from` | `malformed` |
+  | 409 | The Application's serving Version is not `from` (someone deployed or went back meanwhile; also when it has no Version); the message names the one that serves | `serving-changed` |
+  | 409 | `from` serves and is Version 1: there is none before it | `no-previous-version` |
+
+  A refused go-back changes nothing. Two go-backs with the same `from` sent at once: one answers `200`, the other `serving-changed`.
+- The program's log gets one record: `event` `went-back`, with `application`, `user`, `from`, `to`.
+- Any other method on the path is `405`.
+
+### Logs, on the platform's API
+
+The platform keeps, for each request an Application was given, what its code printed and the errors it did not catch, and gives them to the Application's Contributors and to Platform administrators.
+
+`GET /v1/applications/<name>/logs`, by a Contributor of the Application or a Platform administrator; anyone else is `403` `not-a-contributor` (after `not-found`). Answers `200`:
+
+```json
+{ "entries": [
+    { "id": "<cursor>", "time": "<RFC 3339>", "request": "<the request's x-vm-request-id>",
+      "version": 3, "user": "<user id>", "method": "GET", "path": "/notes", "status": 500,
+      "printed": [ { "level": "log", "message": "loading notes" } ],
+      "uncaught": [ "<the error's message and stack>" ],
+      "truncated": false, "dropped_before": 0 } ],
+  "next": "<cursor>" }
+```
+
+- **One entry for each request the Application's code was given**: the requests whose `request` record in the program's log names the Application. `version` is the Version that served it; `user` the signed-in User's id; `path` is without the query; `status` is what was answered. `printed` are the `printed` records of the request, in order, `level` the console method's name; `uncaught` are its `uncaught` records' `error`, each the message and the stack as the program's log has it.
+- **What is printed outside a request** (while a script loads, or by code that goes on after its request ended) has an entry of its own: `request`, `user`, `method`, `path` and `status` are null, `version` is the Version whose code printed, `printed` holds the one record.
+- **Order.** Entries are oldest first, in the order the requests ended. `id` is a cursor: text, not promised to be a number.
+  - Without `after`: the newest `limit` entries (`?limit=<n>`, 1 to 1000, default 100).
+  - `?after=<cursor>`: the entries after that one, the oldest `limit` of them. `next` is the cursor of the last entry answered; with no entry answered it is `after` as given, or, without `after`, a cursor after which only entries made later come. So reading with `after=<next>` again and again gives every entry once: this is how logs are followed.
+  - `?request=<id>`: only the entry of that request (none when there is none, or when it is another Application's). It goes with `after` and `limit`.
+  - A `limit` outside 1 to 1000, an `after` that is not a cursor the API gave, a parameter given twice: `400` `malformed`. Unknown parameters are ignored.
+- **When it can be read.** An entry can be read within 2 seconds of its response, when the platform database answers. It is written after the request and never in its way: no request waits for it, and a request is answered the same when it cannot be written.
+- **Bounds.** Each has a stated end, and `truncated` is true in an entry any of them cut:
+  - a `message` longer than 8,192 bytes is cut to that (at a character boundary); an `uncaught` error longer than 16,384 bytes likewise;
+  - at most 200 `printed` records and 64 KiB of messages for one request, and at most 10 `uncaught`; what comes after is not kept in the entry (the program's log still has every record).
+  - The platform keeps the newest 5,000 entries of an Application; older ones are deleted.
+  - When entries are made faster than the platform database takes them (more than 1,024 waiting), entries are dropped, not requests held: the next entry kept has in `dropped_before` how many were dropped before it.
+- Logs hold what the Application chose to print. They are not the Operation log: a Platform administrator's record of every operation is that one, and nothing here replaces or feeds it.
+- Entries of an Application stay when a Version is gone back from. Any other method on the path is `405`.
+- The program's own log (standard error) is as before: every record, unchanged.
+
+### The commands
+
+```
+vm versions <application> [--json]
+vm go-back <application> [--to <number>] [--json]
+vm logs <application> [--request <id>] [--after <cursor>] [--limit <n>] [--follow] [--json]
+```
+
+All three need a sign-in (`4`) and name the Application on the command line; an Application the installation does not have is the API's `not-found`, exit code `3`.
+
+**`vm versions`** prints the Application's Versions, oldest first, exit code `0`:
+
+```json
+{ "application": "incident-board", "address": "incident-board.<domain>", "serving_version": 2,
+  "versions": [ { "number": 1, "git_commit": "<40 hex>", "deployed_at": "<RFC 3339>", "deployed_by": "<user id>", "serving": false },
+                { "number": 2, "git_commit": "...", "deployed_at": "...", "deployed_by": "...", "serving": true } ] }
+```
+
+- `deployed_at` and `deployed_by` are the Version's `created_at` and `created_by`. Exactly one Version has `serving` true, or none when the Application has no Version (`serving_version` null, `versions` empty).
+- In words: one line for each Version with its number, its commit, when and by whom, and the serving one marked; with none, that the Application has no Version yet and that `vm deploy` sends the first.
+
+**`vm go-back`** asks which Version serves, then goes back from it: to the one before it, or to `--to <number>`. Exit code `0`:
+
+```json
+{ "application": "incident-board", "address": "incident-board.<domain>",
+  "serving_version": 2, "was": 3, "migrations_not_undone": [ "0002_add_notes" ] }
+```
+
+- In words: that Version 2 serves now at the address, in place of Version 3; **that migrations are not undone**, always, and when `migrations_not_undone` names some, which they are, that the own database keeps what they made, that Version 2's code now runs against it, and that the next deploy must still carry them in `migrations/` (a deployed migration is never removed).
+- `--to` must be a positive integer (else exit code `2`). An Application with no Version, or whose serving Version is its first: reason `no-previous-version`, exit code `3`, and the message says there is nothing to go back to. `--to` that is not an earlier Version of the Application: reason `no-such-version`, exit code `3`, naming the Versions there are. The API's `serving-changed` (someone deployed or went back between the tool's two requests): exit code `3`, with the API's message; run the command again after looking with `vm versions`. `not-a-contributor`: exit code `3`.
+- It asks nobody: going back destroys nothing and is undone by deploying.
+
+**`vm logs`** prints the Application's log entries, oldest first, exit code `0`:
+
+```json
+{ "application": "incident-board", "entries": [ ... as the API gives them ... ], "next": "<cursor>" }
+```
+
+- `--request`, `--after` and `--limit` are the API's (`--limit` outside 1 to 1000 is exit code `2`; an `--after` the API does not take is its `malformed`, exit code `3`). Without `--after` it prints the newest; `--after <next>` of an earlier run prints what came since.
+- In words, for each entry: a first line with the time, the request's id, the User, the Version, the method, the path and the status; then each printed line with its level; then each uncaught error with its stack, indented. An entry printed outside a request says so in place of the request's facts. A cut entry says it was cut, and dropped entries are said where they are missing. With no entry: that there is none (yet).
+- Everything of an entry is text of the Application's or of a User's: in words it is escaped as any text of the installation's is (a control character never reaches the terminal raw; a line end inside a message begins a new, indented line).
+- **`--follow`** prints the newest entries as without it, then goes on printing each new entry as it is made, until it is interrupted (`SIGINT`, `SIGTERM`, `SIGHUP`): exit code `0`. It asks the installation again about once a second. With `--json` it prints one JSON object on a line for each entry (the entry, with `"application"` beside its fields) and no enclosing object: the one command whose `--json` output is more than one object. When the installation stops answering it ends with `unreachable`, exit code `1`, after what it has printed; when the sign-in ends, with exit code `4`.
+- A closed standard output ends `--follow` without a crash.
+
+### Deploying after going back
+
+`vm deploy` compares the project with the Application's **latest** Version, not the serving one: its migrations are the ones applied. So after a go-back, `migrations_applied` names only what the new Version adds to the latest Version's, the data-loss question is asked about those alone, and `migrations-diverged` is told against the latest Version's. (In "Deploying", "the serving Version" and "a Version is already serving" read so from this ticket on: the Application's latest Version, and an Application that has a Version.)
+
+### The instruction file
+
+From this ticket on the template's `AGENTS.md` names `vm versions`, `vm go-back` and `vm logs` in its table of commands, and says: to debug, read `vm logs <name>` (a response's `x-vm-request-id` is what `--request` takes; `--after` with the `next` of the last run reads what came since; `--follow` does not end by itself); that `vm go-back` is the quick way out of a bad deploy and does not undo migrations, so `migrations/` keeps them.
+
+### What this does not close
+
+- An entry is made when its request ends: a request that never ends within the platform's limits has none until then, and what was printed by a request in flight when the program stops is only in the program's log.
+- Who went back and when is in the program's log only; the API does not list it.
+- Logs are kept by count (5,000 entries an Application), not by age; an installation cannot set another number yet.
+- A Contributor reads everything the Application printed, whatever User's request printed it.
