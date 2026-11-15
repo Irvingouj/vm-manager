@@ -123,6 +123,9 @@ pub struct VersionRecord {
     pub bundle_sha256: String,
     /// `[ { name, sha256 } ]`, in order.
     pub migrations: Value,
+    /// `{ "<resource>": "sha256:<hex>" }`: the fingerprint of each shared
+    /// structure it was built against; `{}` for a Version sent without.
+    pub structures: Value,
     pub created_by: String,
     /// RFC 3339, UTC.
     pub created_at: String,
@@ -136,6 +139,9 @@ pub struct NewVersion {
     pub git_commit: String,
     /// The Application's whole history of migrations, in order.
     pub migrations: Vec<Migration>,
+    /// The fingerprint of each shared structure it was built against, by
+    /// Resource (each one it declares, as the API checked).
+    pub structures: BTreeMap<String, String>,
 }
 
 /// The Resources a Version declares it uses, and how. Read by the API,
@@ -573,6 +579,8 @@ impl Registry {
         // running this Version will use.
         let bundle: Arc<str> = Arc::from(version.bundle);
         let git_commit = version.git_commit;
+        let structures = serde_json::to_value(&version.structures)
+            .map_err(|_| DbError::unexpected("the structures cannot be written as JSON"))?;
         let list = version.migrations;
         let sent = self
             .database
@@ -599,13 +607,13 @@ impl Registry {
                             "WITH sent AS (
                                 INSERT INTO versions (application_id, number, bundle, bundle_sha256,
                                                       declared_access, git_commit, created_by,
-                                                      migrations)
+                                                      migrations, structures)
                                 VALUES ($1,
                                         (SELECT coalesce(max(number), 0) + 1 FROM versions
                                          WHERE application_id = $1),
-                                        $2, $3, $4, $5, $6, $7)
+                                        $2, $3, $4, $5, $6, $7, $8)
                                 RETURNING number, declared_access, git_commit, bundle_sha256,
-                                          created_by, created_at, migrations
+                                          created_by, created_at, migrations, structures
                             ), serving AS (
                                 UPDATE applications SET serving_version = (SELECT number FROM sent)
                                 WHERE id = $1
@@ -613,7 +621,7 @@ impl Registry {
                             SELECT number, declared_access, git_commit, bundle_sha256, migrations,
                                    created_by, ",
                             rfc3339!("created_at"),
-                            " FROM sent"
+                            ", structures FROM sent"
                         ),
                         &[
                             &id,
@@ -623,6 +631,7 @@ impl Registry {
                             &git_commit,
                             &sender,
                             &migrations,
+                            &structures,
                         ],
                     )
                     .await
@@ -637,6 +646,7 @@ impl Registry {
                     migrations: get(&row, 4)?,
                     created_by: get(&row, 5)?,
                     created_at: get(&row, 6)?,
+                    structures: get(&row, 7)?,
                 }))
             })
             .await;
@@ -704,7 +714,7 @@ impl Registry {
                             "SELECT a.name, v.number, v.declared_access, v.git_commit,
                                     v.bundle_sha256, v.created_by, ",
                             rfc3339!("v.created_at"),
-                            ", v.migrations FROM applications a
+                            ", v.migrations, v.structures FROM applications a
                               LEFT JOIN versions v ON v.application_id = a.id
                               WHERE a.name = $1
                               ORDER BY v.number"
@@ -742,7 +752,7 @@ impl Registry {
                             "SELECT a.name, v.number, v.declared_access, v.git_commit,
                                     v.bundle_sha256, v.created_by, ",
                             rfc3339!("v.created_at"),
-                            ", v.migrations FROM applications a
+                            ", v.migrations, v.structures FROM applications a
                               JOIN versions v ON v.application_id = a.id
                               WHERE a.name = $1 AND v.number = $2"
                         ),
@@ -766,6 +776,7 @@ fn version_of(row: &Row) -> Result<VersionRecord, DbError> {
         created_by: get(row, 5)?,
         created_at: get(row, 6)?,
         migrations: get(row, 7)?,
+        structures: get(row, 8)?,
     })
 }
 

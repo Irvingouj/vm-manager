@@ -222,7 +222,7 @@ impl CreateApplication {
 }
 
 /// `POST /v1/applications/<name>/versions`
-const VERSION_FORM: &str = r#"{ "bundle": "<the classic script>", "declared_access": { "resources": { "<name>": { "kind": "postgres", "access": "structure|read|write" } } }, "git_commit": "<40 hex characters>", "migrations": [ { "name": "<1 to 200 letters, digits, _ and ->", "sql": "<the file drizzle-kit generated>" } ] (optional) }"#;
+const VERSION_FORM: &str = r#"{ "bundle": "<the classic script>", "declared_access": { "resources": { "<name>": { "kind": "postgres", "access": "structure|read|write" } } }, "git_commit": "<40 hex characters>", "migrations": [ { "name": "<1 to 200 letters, digits, _ and ->", "sql": "<the file drizzle-kit generated>" } ] (optional), "structures": { "<a declared Resource>": "sha256:<64 lower-case hex>" } (optional) }"#;
 
 /// The most characters a migration's name has.
 const MAX_MIGRATION_NAME: usize = 200;
@@ -270,6 +270,47 @@ fn read_migrations(object: &Object<'_>) -> Result<Vec<Migration>, String> {
     Ok(migrations)
 }
 
+/// Whether `text` is a structure's fingerprint: `sha256:` and 64 lower-case
+/// hex digits.
+fn is_fingerprint(text: &str) -> bool {
+    text.strip_prefix("sha256:").is_some_and(|hex| {
+        hex.len() == 64
+            && hex
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
+}
+
+/// A Version's `structures`: absent or `null`, none; otherwise an object,
+/// each key once, each key a Resource the Version declares and each value a
+/// fingerprint.
+fn read_structures(
+    object: &Object<'_>,
+    declared: &BTreeMap<String, Resource>,
+) -> Result<BTreeMap<String, String>, String> {
+    let Some(value) = object.0.get("structures") else {
+        return Ok(BTreeMap::new());
+    };
+    if value.get() == "null" {
+        return Ok(BTreeMap::new());
+    }
+    let entries =
+        Object::read_value(value).map_err(|e| format!("structures is not an object: {e}"))?;
+    let mut structures = BTreeMap::new();
+    for (name, value) in entries.0 {
+        if !declared.contains_key(&name) {
+            return Err("structures names a Resource the Version does not declare".into());
+        }
+        let fingerprint: String = serde_json::from_str(value.get())
+            .map_err(|_| "a value of structures is not a string".to_owned())?;
+        if !is_fingerprint(&fingerprint) {
+            return Err("a value of structures is not sha256: and 64 lower-case hex digits".into());
+        }
+        structures.insert(name, fingerprint);
+    }
+    Ok(structures)
+}
+
 fn read_version(body: &[u8]) -> Result<NewVersion, String> {
     let object = Object::read(body)?;
     let git_commit: String = object.required("git_commit")?;
@@ -287,11 +328,13 @@ fn read_version(body: &[u8]) -> Result<NewVersion, String> {
         };
         resources.insert(name, resource);
     }
+    let structures = read_structures(&object, &resources)?;
     Ok(NewVersion {
         bundle: object.required("bundle")?,
         declared_access: DeclaredAccess { resources },
         git_commit,
         migrations: read_migrations(&object)?,
+        structures,
     })
 }
 
@@ -1161,6 +1204,7 @@ struct VersionView<'a> {
     git_commit: &'a str,
     bundle_sha256: &'a str,
     migrations: &'a Value,
+    structures: &'a Value,
     created_by: &'a str,
     created_at: &'a str,
 }
@@ -1174,6 +1218,7 @@ impl<'a> VersionView<'a> {
             git_commit: &version.git_commit,
             bundle_sha256: &version.bundle_sha256,
             migrations: &version.migrations,
+            structures: &version.structures,
             created_by: &version.created_by,
             created_at: &version.created_at,
         }

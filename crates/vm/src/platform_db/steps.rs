@@ -289,6 +289,17 @@ pub const STEPS: &[Step] = &[
             ALTER COLUMN statement DROP NOT NULL;
     ",
     },
+    Step {
+        number: 11,
+        name: "the structures a version was built against",
+        sql: "
+        -- The fingerprint of each shared structure a Version was built
+        -- against, as sent (blackbox/CONTRACT.md, \"Deploying: On the
+        -- platform's API\"): {\"<resource>\": \"sha256:<hex>\"}. A Version
+        -- sent before this step has none.
+        ALTER TABLE versions ADD COLUMN structures jsonb NOT NULL DEFAULT '{}';
+    ",
+    },
 ];
 
 /// The advisory lock every step's transaction takes first: "vm steps".
