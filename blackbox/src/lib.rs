@@ -51,7 +51,10 @@
 //! - [`generate`] is what the tests of generating migrations share: `vm
 //!   generate` and what it printed, the entries of `destroys`, a project's
 //!   migrations in its journal's order as a Version carries them, and the
-//!   own schemas the tests change.
+//!   own schemas the tests change;
+//! - [`deploy`] is what the tests of deploying share: a `git` that works
+//!   under a machine's own `HOME`, a project's repository of its own made
+//!   and committed, `vm deploy` and what it printed.
 //!
 //! Every wait has a timeout, so a failing test fails within seconds and
 //! never hangs. Each test starts its own program on its own port, so tests
@@ -66,6 +69,7 @@
 
 pub mod api;
 pub mod changed_outside;
+pub mod deploy;
 pub mod expect;
 pub mod generate;
 pub mod history;
