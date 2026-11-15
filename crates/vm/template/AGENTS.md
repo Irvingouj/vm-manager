@@ -26,6 +26,7 @@ Run them from this folder. Each has `--help` and `--json` (one JSON object on st
 | `vm pull <name>` | writes `resources/<name>/` with that Resource's tables |
 | `vm generate` | writes the next migration from `src/db/schema.ts` into `migrations/`; stops before one that destroys data |
 | `vm check` | checks the Manifest, the Resources, the migrations and the types |
+| `vm deploy` | checks the committed project again, builds it and puts it live as the Application's next Version |
 
 If a command says you are not signed in, ask the Builder to run `vm sign-in` (it needs their details), then run yours again.
 
@@ -35,7 +36,7 @@ If a command says you are not signed in, ask the Builder to run `vm sign-in` (it
 2. **Find the data.** Run `vm resources` and choose Resources by their description. Pull each one you need with `vm pull <name>` and read its `resources/<name>/schema.ts` to learn the tables. Declare it in `manifest.ts`, at `"read"` unless the Application must change rows there.
 3. **Keep the Application's own data in its own database.** Anything the Application records itself (notes, acknowledgements, preferences) goes in `src/db/schema.ts`; after each change to it, run `vm generate`. You cannot add tables or columns to a shared Resource; store the extra data in the own database and relate it in code (there are no joins across databases).
 4. **Write the handlers**, run `vm check` until it ends with `0`, and commit. `vm check` reports every problem at once, each with its fix; it also warns about access and mentions pulled Resources the Manifest does not declare. Read the warnings out to the Builder.
-5. **Deploy** only a project that passes `vm check` and is committed. This version of the tool has no deploy command yet: when the project is ready, tell the Builder so.
+5. **Deploy** with `vm deploy`, once `vm check` passes and everything is committed. The first deploy creates the Application; each deploy puts it live at its address as a new Version, at once (see "Deploying" below).
 
 ## Access belongs to people: a refusal for a missing Grant is not a bug
 
@@ -62,6 +63,12 @@ A migration destroys data when it drops a table, a column or a schema, or change
 
 `vm.dev.json` holds the test Users of this project. It has one already, `outsider`, who is in no Group and so holds no Grant. Before you call the work done, check what `outsider` gets as well as what the Builder gets: every operation on a Resource is refused for `outsider`, and the page must say so plainly rather than break. Add test Users of your own there for the other Groups the Application serves. The rules are the same on this machine as after deploying.
 
+## Deploying
+
+`vm deploy` sends the project as it is in its last commit, so a deploy needs everything committed: it refuses uncommitted changes and names the files; commit them (or add what is not part of the Application to `.gitignore`) and deploy again. It pulls every declared Resource again: when a shared structure changed, it updates `resources/<name>/` and builds against it (commit those files after), and it fails only if the code no longer type-checks against it. It then makes the checks of `vm check`, and stops on any problem as the check does.
+
+A migration that destroys data is asked about again at deploy when a Version is already serving, because the rows are there now, even if `vm generate --allow-data-loss` wrote it (it also counts a `DELETE` or `TRUNCATE` you wrote by hand). `vm deploy --allow-data-loss` has the same rule as for `vm generate`: tell the Builder exactly what would be lost and ask, unless the Builder has already clearly said that this data may be lost. If a migration fails in the database, the previous Version goes on serving: read the database's error in the output.
+
 ## Telling the Builder who can see the Application
 
-A new Application is visible only to its Contributors until it is shared. When you tell the Builder who can see it, say it from the tool's own output, naming the people or Groups the tool named, never from your own guess. If the tool did not say, tell the Builder you do not know yet rather than assume their team can see it.
+A new Application is visible only to its Contributors until it is shared. When you tell the Builder who can see it after a deploy, say it from the deploy's own output (it names the Contributors who can see it), from the tool's own output and never from your own guess, naming the people or Groups the tool named. If the tool did not say, tell the Builder you do not know yet rather than assume their team can see it.
