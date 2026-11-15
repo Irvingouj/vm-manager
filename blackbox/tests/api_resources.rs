@@ -43,6 +43,20 @@ const PUBLIC_FACE: [&str; 7] = [
     "owner",
 ];
 
+/// What a Resource is when read (ticket: The tool signs in, and lists
+/// Resources and Applications): its public face and the reader's own
+/// `your_access`.
+const AS_READ: [&str; 8] = [
+    "contact",
+    "created_at",
+    "created_by",
+    "description",
+    "kind",
+    "name",
+    "owner",
+    "your_access",
+];
+
 #[test]
 fn an_administrator_registers_a_resource_and_every_signed_in_user_reads_its_public_face() {
     let s = Scenario::start();
@@ -73,9 +87,18 @@ fn an_administrator_registers_a_resource_and_every_signed_in_user_reads_its_publ
         let got = s.vm.api_as(&reader).get_resource("devops");
         got.expect_status(200);
         assert_json_content_type(&got);
+        let mut got = got.json();
+        assert_eq!(keys(&got), AS_READ, "{got}");
+        // Nobody holds a Grant on it yet.
         assert_eq!(
-            got.json(),
-            resource,
+            got["your_access"],
+            Value::Null,
+            "expected `your_access` null for {:?}, who holds no Grant, got {got}",
+            reader.id
+        );
+        got.as_object_mut().unwrap().remove("your_access");
+        assert_eq!(
+            got, resource,
             "expected {:?} to read the same Resource as was answered when it was registered",
             reader.id
         );
@@ -106,8 +129,8 @@ fn the_list_of_resources_is_by_name_and_visible_to_every_signed_in_user() {
         for r in body["resources"].as_array().unwrap() {
             assert_eq!(
                 keys(r),
-                PUBLIC_FACE,
-                "expected each listed Resource to show its public face only, got {r}"
+                AS_READ,
+                "expected each listed Resource to show its public face and `your_access` only, got {r}"
             );
             assert_eq!(
                 *r,
