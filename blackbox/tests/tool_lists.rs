@@ -318,11 +318,29 @@ fn vm_applications_with_none() {
     );
 }
 
-/// Fails unless `text` holds no control character but its own line ends.
+/// The code points written as `\u{<hex>}` in `text`, in any letter case
+/// and with or without leading zeros.
+fn escapes_in(text: &str) -> Vec<u32> {
+    text.split("\\u{")
+        .skip(1)
+        .filter_map(|rest| {
+            let hex = rest.split('}').next()?;
+            u32::from_str_radix(hex, 16).ok()
+        })
+        .collect()
+}
+
+/// The bidirectional marks and overrides the contract names.
+fn is_bidi(c: char) -> bool {
+    matches!(u32::from(c), 0x061C | 0x200E | 0x200F | 0x202A..=0x202E | 0x2066..=0x2069)
+}
+
+/// Fails unless `text` holds no control character but its own line ends,
+/// and no bidirectional mark or override.
 fn assert_no_raw_control(text: &str, context: &str) {
     let raw: Vec<String> = text
         .chars()
-        .filter(|c| c.is_control() && *c != '\n')
+        .filter(|c| (c.is_control() && *c != '\n') || is_bidi(*c))
         .map(|c| format!("U+{:04X}", u32::from(c)))
         .collect();
     assert!(
@@ -380,4 +398,71 @@ fn without_json_no_control_character_of_the_installations_reaches_the_terminal()
         listed["applications"][0]["description"],
         json!(app_description)
     );
+}
+
+#[test]
+fn bidirectional_marks_and_overrides_are_escaped_too() {
+    let s = Scenario::start();
+    let marks: Vec<char> = [0x061C_u32, 0x200E, 0x200F]
+        .into_iter()
+        .chain(0x202A..=0x202E)
+        .chain(0x2066..=0x2069)
+        .map(|c| char::from_u32(c).unwrap())
+        .collect();
+    let all: String = marks.iter().collect();
+    let description = format!("Ledger \u{202e}gnp.exe{all} end");
+    let owner = "Finance \u{2067}team\u{2069}";
+    let contact = "Fiona \u{200f}\u{061c}#billing";
+    let mut body = resource_body("billing", &s.db, &s.db.reader);
+    body["description"] = json!(description);
+    body["owner"] = json!(owner);
+    body["contact"] = json!(contact);
+    s.register_body("billing", &body);
+    let alice = User::new("alice");
+    let app_description = format!("Board \u{202d}{all}");
+    s.vm.api_as(&alice)
+        .create_application_with(&json!({ "name": "board", "description": app_description }))
+        .expect_status(201);
+    let machine = Machine::new();
+    machine.sign_in(&s.vm, &alice);
+
+    for command in ["resources", "applications"] {
+        let words = machine.run(&[command]).ok_text();
+        assert_no_raw_control(&words, &format!("`vm {command}`"));
+        let escaped = escapes_in(&words);
+        assert!(
+            escaped.contains(&0x202e) || escaped.contains(&0x202d),
+            "expected an override printed as \\u{{<hex>}} by `vm {command}`, got\n{}",
+            words.escape_debug()
+        );
+        let run = machine.run(&[command, "--json"]);
+        let listed = run.ok_json();
+        assert_no_raw_control(&run.stdout, &format!("`vm {command} --json`"));
+        assert!(
+            run.stdout.to_lowercase().contains("\\u202"),
+            "expected the overrides written as JSON escapes (\\u202e) by `vm {command} --json`, got\n{}",
+            run.stdout.escape_debug()
+        );
+        if command == "resources" {
+            let r = &listed["resources"][0];
+            assert_eq!(r["description"], json!(description));
+            assert_eq!(r["owner"], json!(owner));
+            assert_eq!(r["contact"], json!(contact));
+        } else {
+            assert_eq!(
+                listed["applications"][0]["description"],
+                json!(app_description)
+            );
+        }
+    }
+    let words = machine.run(&["resources"]).ok_text();
+    let escaped = escapes_in(&words);
+    for mark in &marks {
+        assert!(
+            escaped.contains(&u32::from(*mark)),
+            "expected U+{:04X} printed as \\u{{<hex>}} in the words of `vm resources`, got\n{}",
+            u32::from(*mark),
+            words.escape_debug()
+        );
+    }
 }

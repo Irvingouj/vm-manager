@@ -745,3 +745,124 @@ fn a_credential_while_the_platform_database_cannot_be_reached_is_503_not_401() {
         assert_api_error(&answer, 503, "unavailable");
     }
 }
+
+#[test]
+fn no_shape_of_authorization_header_hands_a_credential_to_an_application() {
+    let vm = Vm::start(
+        &VmOptions::new()
+            .stand_in_sign_in()
+            .application("board", "honest.js"),
+    );
+    let (credential, _) = vm.api_as(&alice()).tool_credential();
+    let (other, _) = vm.api_as(&alice()).tool_credential();
+    let basic = "Basic YWxpY2U6c2VjcmV0";
+    let ended = format!("vmtc_{}{}{}", token(), token(), token());
+    // (what is sent, a value holding no credential that must be handed on)
+    let cases: Vec<(Vec<String>, Option<&str>)> = vec![
+        (
+            vec![basic.to_owned(), format!("Bearer {credential}")],
+            Some(basic),
+        ),
+        (
+            vec![format!("Bearer {credential}"), basic.to_owned()],
+            Some(basic),
+        ),
+        (
+            vec![format!("Bearer {credential}"), format!("bearer {other}")],
+            None,
+        ),
+        (vec![format!("Bearer  {credential}")], None),
+        (vec![format!("Bearer\t{credential}")], None),
+        (vec![format!("Bearer \t  {credential}")], None),
+        (vec![format!("{basic}, Bearer {credential}")], None),
+        (vec![format!("Bearer {credential}, {basic}")], None),
+        (vec![format!("Bearer {ended}")], None),
+    ];
+    for (n, (values, kept)) in cases.iter().enumerate() {
+        let mut request = vm.request("board", "/").as_user(&bob());
+        for value in values {
+            request = request.header("authorization", value);
+        }
+        let answer = request.send();
+        answer.expect_status(200);
+        let text = answer.text();
+        assert!(
+            !text.contains("vmtc_"),
+            "case {n} ({} header(s)): expected the Application handed no value holding `vmtc_`; its answer holds one",
+            values.len()
+        );
+        let headers = headers_handed(&answer);
+        if let Some(kept) = kept {
+            let handed = headers
+                .get("authorization")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            assert!(
+                handed.contains(kept),
+                "case {n}: expected the header that held no credential ({kept:?}) still handed on, got {handed:?}"
+            );
+        }
+        assert_eq!(answer.json()["user"]["id"], "bob", "case {n}");
+    }
+}
+
+#[test]
+fn sixteen_live_credentials_hold_also_under_sign_ins_at_once() {
+    let vm = vm();
+    let (bobs, _) = vm.api_as(&bob()).tool_credential();
+    let at_once = 24;
+    let barrier = std::sync::Barrier::new(at_once);
+    let made: Vec<Response> = thread::scope(|scope| {
+        let handles: Vec<_> = (0..at_once)
+            .map(|_| {
+                let vm = &vm;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    let request = vm
+                        .api_request("/v1/tool-credentials")
+                        .as_user(&alice())
+                        .method("POST")
+                        .json(&json!({}))
+                        .timeout(Duration::from_secs(30));
+                    barrier.wait();
+                    request.send()
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    let credentials: Vec<String> = made
+        .iter()
+        .map(|answer| {
+            assert_eq!(
+                answer.status, 201,
+                "expected every sign-in at once answered `201`, got status {}",
+                answer.status
+            );
+            answer.json()["credential"].as_str().unwrap().to_owned()
+        })
+        .collect();
+    let distinct: BTreeSet<&String> = credentials.iter().collect();
+    assert_eq!(
+        distinct.len(),
+        at_once,
+        "expected {at_once} different credentials"
+    );
+    let reference = not_signed_in(&vm);
+    let mut live = 0;
+    for credential in &credentials {
+        let me = bearer(&vm, "/v1/me", credential).send();
+        if me.status == 200 {
+            live += 1;
+        } else {
+            assert_same_401(&me, &reference, "a credential ended by the cap");
+        }
+    }
+    assert_eq!(
+        live, 16,
+        "expected exactly 16 of alice's {at_once} credentials made at once to sign in, found {live}"
+    );
+    let me = bearer(&vm, "/v1/me", &bobs).send();
+    me.expect_status(200);
+    assert_eq!(me.json()["user"], "bob");
+}

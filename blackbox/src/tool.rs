@@ -53,13 +53,34 @@ const SHORTEST_CREDENTIAL: usize = 32;
 /// printed.
 pub const WINDOW: usize = 16;
 
-/// How a run's standard output is broken before the program writes.
+/// How a run's standard output or error is broken before the program
+/// writes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BrokenStdout {
-    /// File descriptor 1 is closed.
-    Closed,
-    /// A pipe whose reading end is already closed.
-    ReaderGone,
+pub enum Broken {
+    /// Standard output (file descriptor 1) is closed.
+    StdoutClosed,
+    /// Standard output is a pipe whose reading end is already closed.
+    StdoutReaderGone,
+    /// Standard error (file descriptor 2) is closed; nothing of it is kept.
+    StderrClosed,
+    /// Both are closed.
+    BothClosed,
+}
+
+impl Broken {
+    /// The redirections `sh` makes before it runs the program.
+    fn redirections(self) -> &'static str {
+        match self {
+            Self::StdoutClosed => " >&-",
+            Self::StdoutReaderGone => "",
+            Self::StderrClosed => " 2>&-",
+            Self::BothClosed => " >&- 2>&-",
+        }
+    }
+
+    fn keeps_stderr(self) -> bool {
+        matches!(self, Self::StdoutClosed | Self::StdoutReaderGone)
+    }
 }
 
 /// Where the Builder's configuration home is, as the tool is told.
@@ -240,27 +261,31 @@ impl Machine {
         }
     }
 
-    /// Runs `vm <args>` on this machine with its standard output broken
-    /// before it can write anything; `stdout` of the [`Run`] is empty.
-    pub fn run_with_broken_stdout(&self, args: &[&str], broken: BrokenStdout) -> Run {
+    /// Runs `vm <args>` on this machine with its standard output or error
+    /// broken before it can write anything; `stdout` of the [`Run`] is
+    /// empty, and so is `stderr` when standard error is closed.
+    pub fn run_broken(&self, args: &[&str], broken: Broken) -> Run {
         let mut command = self.command(args, &[], Some(broken));
         let began = Instant::now();
         let (reader, writer) =
             std::io::pipe().unwrap_or_else(|e| panic!("cannot make a pipe: {e}"));
-        match broken {
-            BrokenStdout::Closed => {
-                // `sh` closes it before `exec`; nothing to hand over.
-                command.stdout(Stdio::null());
-                drop(writer);
-            }
-            BrokenStdout::ReaderGone => {
-                command.stdout(writer);
-            }
+        if broken == Broken::StdoutReaderGone {
+            command.stdout(writer);
+        } else {
+            // `sh` closes it before `exec`, or it is not what is broken.
+            command.stdout(Stdio::null());
+            drop(writer);
         }
         // The reading end goes before the program starts: every write it
         // makes finds no reader.
         drop(reader);
-        command.stdin(Stdio::null()).stderr(Stdio::piped());
+        command
+            .stdin(Stdio::null())
+            .stderr(if broken.keeps_stderr() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            });
         let mut child = command
             .spawn()
             .unwrap_or_else(|e| panic!("cannot run the tool: {e}"));
@@ -301,17 +326,8 @@ impl Machine {
         }
     }
 
-    fn command(
-        &self,
-        args: &[&str],
-        env: &[(&str, &str)],
-        broken: Option<BrokenStdout>,
-    ) -> Command {
-        let close = if broken == Some(BrokenStdout::Closed) {
-            " >&-"
-        } else {
-            ""
-        };
+    fn command(&self, args: &[&str], env: &[(&str, &str)], broken: Option<Broken>) -> Command {
+        let close = broken.map_or("", Broken::redirections);
         let mut command = if self.umask.is_none() && close.is_empty() {
             let mut command = Command::new(vm_binary());
             command.args(args);

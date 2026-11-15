@@ -12,7 +12,7 @@
 
 use blackbox::postgres::{Platform, PrivatePostgres};
 use blackbox::scenario::Scenario;
-use blackbox::tool::{BrokenStdout, Machine, Run, closed_address, sign_in_args};
+use blackbox::tool::{Broken, Machine, Run, closed_address, sign_in_args};
 use blackbox::{DOMAIN, User, VmOptions};
 
 fn alice() -> User {
@@ -220,36 +220,71 @@ fn a_loopback_address_is_a_right_command_line() {
     }
 }
 
+/// Fails unless the run with a broken stream ended as it would have
+/// (`want`) or with `1`, and without a crash.
+fn assert_no_crash(run: &Run, want: i32, broken: Broken) {
+    assert!(
+        run.code == Some(want) || run.code == Some(1),
+        "expected exit code {want} (what the command ends with) or 1 with {broken:?}, got\n{}",
+        run.describe()
+    );
+    for crash in ["panicked", "RUST_BACKTRACE", "stack backtrace"] {
+        assert!(
+            !run.stderr.contains(crash),
+            "expected no crash with {broken:?}, but standard error holds {crash:?}:\n{}",
+            run.describe()
+        );
+    }
+}
+
 #[test]
 fn a_command_whose_standard_output_is_closed_ends_without_a_crash() {
     let s = Scenario::start();
     s.register("devops");
     let machine = Machine::new();
     machine.sign_in(&s.vm, &alice());
-    for broken in [BrokenStdout::Closed, BrokenStdout::ReaderGone] {
-        for args in [
-            vec!["resources"],
-            vec!["resources", "--json"],
-            vec!["whoami"],
-            vec!["whoami", "--json"],
-        ] {
-            let run = machine.run_with_broken_stdout(&args, broken);
-            assert!(
-                matches!(run.code, Some(0 | 1)),
-                "expected exit code 0 or 1 with standard output {broken:?}, got\n{}",
-                run.describe()
-            );
-            for crash in ["panicked", "RUST_BACKTRACE", "stack backtrace"] {
-                assert!(
-                    !run.stderr.contains(crash),
-                    "expected no crash with standard output {broken:?}, but standard error holds {crash:?}:\n{}",
-                    run.describe()
-                );
-            }
+    let commands = [
+        vec!["resources"],
+        vec!["resources", "--json"],
+        vec!["whoami"],
+        vec!["whoami", "--json"],
+    ];
+    for broken in [Broken::StdoutClosed, Broken::StdoutReaderGone] {
+        for args in &commands {
+            assert_no_crash(&machine.run_broken(args, broken), 0, broken);
         }
     }
     // The control: the credential is still there and works.
     machine.run(&["whoami", "--json"]).ok_json();
+
+    // A command that ends with 4 keeps its 4, or 1.
+    let nobody = Machine::new();
+    for broken in [Broken::StdoutClosed, Broken::StdoutReaderGone] {
+        for args in &commands {
+            assert_no_crash(&nobody.run_broken(args, broken), 4, broken);
+        }
+    }
+}
+
+#[test]
+fn a_command_whose_standard_error_is_closed_ends_without_a_crash() {
+    let nobody = Machine::new();
+    let unreachable = Machine::new();
+    let owned = sign_in_args(closed_address(), &alice());
+    let sign_in: Vec<&str> = owned.iter().map(String::as_str).collect();
+    for broken in [Broken::StderrClosed, Broken::BothClosed] {
+        // Not signed in: the message goes to standard error.
+        for args in [vec!["whoami"], vec!["resources"], vec!["whoami", "--json"]] {
+            assert_no_crash(&nobody.run_broken(&args, broken), 4, broken);
+        }
+        // Unreachable.
+        assert_no_crash(&unreachable.run_broken(&sign_in, broken), 1, broken);
+        // A wrong command line writes its usage there.
+        assert_no_crash(&nobody.run_broken(&["no-such-command"], broken), 2, broken);
+    }
+    // The control: with nothing broken these end as said.
+    nobody.run(&["whoami"]).text_error(4);
+    unreachable.run(&sign_in).text_error(1);
 }
 
 #[test]
