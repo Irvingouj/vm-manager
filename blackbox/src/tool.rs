@@ -597,6 +597,17 @@ impl Running {
         );
     }
 
+    /// What `vm` has written on its standard output so far, while it runs.
+    pub fn stdout_so_far(&self) -> String {
+        let bytes = fs::read(self.outputs.join("stdout")).unwrap_or_default();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    /// Whether `vm` has ended.
+    pub fn has_ended(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(Some(_)))
+    }
+
     /// Waits for `vm` to end, at most `timeout` (then kills it), and
     /// returns what it printed and how it ended.
     pub fn wait(mut self, timeout: Duration) -> Run {

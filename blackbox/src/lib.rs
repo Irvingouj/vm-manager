@@ -54,7 +54,10 @@
 //!   own schemas the tests change;
 //! - [`deploy`] is what the tests of deploying share: a `git` that works
 //!   under a machine's own `HOME`, a project's repository of its own made
-//!   and committed, `vm deploy` and what it printed.
+//!   and committed, `vm deploy` and what it printed;
+//! - [`logs`] is what the tests of Versions, going back and logs share:
+//!   the fixture that prints what it is asked, going back, and reading an
+//!   Application's log entries.
 //!
 //! Every wait has a timeout, so a failing test fails within seconds and
 //! never hangs. Each test starts its own program on its own port, so tests
@@ -83,6 +86,7 @@ pub mod history_structure;
 pub mod http;
 pub mod left_behind;
 pub mod log;
+pub mod logs;
 pub mod out_of_reach;
 pub mod own_database;
 pub mod postgres;
