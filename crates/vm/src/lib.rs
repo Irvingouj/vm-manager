@@ -38,10 +38,14 @@
 //! - [`tool_credentials`]: the credentials the Builder's tool signs in to
 //!   the API with, kept in the platform database as digests.
 //! - [`tool`]: the same program run as the Builder's command-line tool.
+//! - [`app_logs`]: Logs: what Applications printed and did not catch,
+//!   request by request, written to the platform database off the
+//!   requests' path, and read through the API.
 //! - [`log`]: the program's log, one JSON record per line.
 //! - [`server`]: the listening socket and the connections.
 
 pub mod api;
+pub mod app_logs;
 pub mod check;
 pub mod executor;
 pub mod gateway;

@@ -19,6 +19,7 @@ use serde_json::json;
 use tokio::net::TcpListener;
 
 use vm::api::Api;
+use vm::app_logs;
 use vm::executor;
 use vm::gateway::{Gateway, PlatformGateway};
 use vm::ingress::Ingress;
@@ -246,6 +247,10 @@ fn run(serve: &Serve) -> Result<(), String> {
             Arc::clone(&database),
             Duration::from_secs(serve.tool_credential_lifetime),
         ));
+        // The writer of Logs is owned here, for as long as the program
+        // serves; dropping it ends its task.
+        let (logs, writer) = app_logs::start(Arc::clone(&database));
+        let logs = Arc::new(logs);
         let log = Arc::new(OperationLog::new(database));
         let gateway: Arc<dyn Gateway> = Arc::new(PlatformGateway::new(
             Arc::clone(&resources),
@@ -253,7 +258,7 @@ fn run(serve: &Serve) -> Result<(), String> {
             Arc::clone(&log),
             tokio::runtime::Handle::current(),
         ));
-        let runner = RequestRunner::start(&runner::Limits::default(), &gateway)
+        let runner = RequestRunner::start(&runner::Limits::default(), &gateway, &logs)
             .map_err(|e| format!("cannot start the engine threads: {e}"))?;
         let domain: Arc<str> = Arc::from(domain);
         let listener = TcpListener::bind(serve.listen)
@@ -278,6 +283,7 @@ fn run(serve: &Serve) -> Result<(), String> {
                 Arc::clone(&registry),
                 resources,
                 log,
+                Arc::clone(&logs),
                 Arc::clone(&credentials),
                 Arc::clone(&domain),
                 administrators,
@@ -287,9 +293,11 @@ fn run(serve: &Serve) -> Result<(), String> {
             sign_in,
             credentials,
             runner,
+            logs,
             max_request_body_bytes: 1024 * 1024,
         });
         server::serve(listener, ingress, server::Limits::default()).await;
+        drop(writer);
         Ok(())
     })
 }

@@ -27,6 +27,7 @@ use openworkers_core::{HttpMethod, HttpRequest, RequestBody};
 use serde_json::json;
 
 use crate::api::{Answer, Api, SignedInWith};
+use crate::app_logs::{Collected, Logs};
 use crate::gateway::Transactions;
 use crate::log;
 use crate::registry::Registry;
@@ -52,6 +53,9 @@ pub struct Ingress {
     /// Tool credentials: a sign-in on the API only.
     pub credentials: Arc<ToolCredentials>,
     pub runner: RequestRunner,
+    /// Where each request the Application's code was given gets its log
+    /// entry, handed over without waiting.
+    pub logs: Arc<Logs>,
     /// The largest request body read; past it the answer is 413.
     pub max_request_body_bytes: usize,
 }
@@ -166,6 +170,7 @@ impl Ingress {
             version: serving.version,
             declared: Arc::clone(&serving.declared),
             transactions: Transactions::default(),
+            collected: Collected::default(),
         });
         let known = Known {
             user: Some(&in_flight.user.id),
@@ -223,6 +228,7 @@ impl Ingress {
             .runner
             .run(Arc::clone(&in_flight), serving, request)
             .await;
+        let ran = !matches!(outcome, Outcome::Busy);
         let response = match outcome {
             Outcome::Answered(answer) => {
                 let mut response = Response::new(Full::new(answer.body));
@@ -252,6 +258,17 @@ impl Ingress {
                 "Busy: try again shortly.\n",
             ),
         };
+        // The Application's code was given the request: its log entry,
+        // made now and handed over without waiting, before the request
+        // record.
+        if ran {
+            self.logs.request_ended(
+                &in_flight,
+                &parts.method,
+                parts.uri.path(),
+                response.status(),
+            );
+        }
         finish(&known, response)
     }
 }

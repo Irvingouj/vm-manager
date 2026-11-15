@@ -12,9 +12,16 @@
 //! So once the `201` has been received every new request finds the new
 //! Version, without a round trip to Postgres per request. A request
 //! already running holds an `Arc` of the Version it started on and finishes
-//! on it. Memory only ever moves to a higher Version number, so two Versions
-//! sent at once leave the newest serving whatever order their transactions
-//! report back in.
+//! on it. Every change of what serves (a Version sent, a go-back) adds one
+//! to the Application's `serving_generation` in the same statement, under
+//! the row's lock; memory only ever moves to a higher generation, so two
+//! changes at once leave memory as the database's last one whatever order
+//! they report back in.
+//!
+//! Going back ([`Registry::go_back`]) is one `UPDATE` that changes the
+//! serving Version only where it is still the one the caller saw: two
+//! go-backs from the same Version at once are serialised by the row's lock,
+//! and the second finds it changed and changes nothing.
 //!
 //! Sending a Version (blackbox/CONTRACT.md, "What happens when a Version is
 //! sent"): its migrations must continue the previous Version's (else
@@ -90,6 +97,9 @@ pub struct Serving {
     pub bundle: Arc<str>,
     /// Its Declared access.
     pub declared: Arc<Declared>,
+    /// The Application's `serving_generation` when this Version was made
+    /// the serving one: memory keeps the highest.
+    pub generation: i64,
 }
 
 /// An Application as the registry reports it.
@@ -214,6 +224,20 @@ pub enum Created {
     NameTaken,
 }
 
+/// What going back came to.
+#[derive(Debug)]
+pub enum WentBack {
+    /// Version `to` serves now, in place of `from`.
+    WentBack {
+        /// The migrations the latest Version has and `to` has not, in order.
+        migrations_not_undone: Vec<String>,
+    },
+    /// The serving Version is not `from`: this one serves (or none).
+    ServingChanged(Option<u64>),
+    /// `from` serves and there is no Version before it.
+    NoPreviousVersion,
+}
+
 /// What sending a Version came to.
 #[derive(Debug)]
 pub enum Sent {
@@ -269,7 +293,7 @@ impl Registry {
             .run(async |client: &mut Client| {
                 client
                     .query(
-                        "SELECT a.name, v.number, v.bundle, v.declared_access
+                        "SELECT a.name, v.number, v.bundle, v.declared_access, a.serving_generation
                          FROM applications a
                          JOIN versions v ON v.application_id = a.id AND v.number = a.serving_version",
                         &[],
@@ -313,12 +337,12 @@ impl Registry {
     }
 
     /// Makes `version` the serving one in memory, unless memory already
-    /// has a newer one.
+    /// holds a later change of what serves (a higher generation).
     fn install(&self, version: Serving) {
         let mut serving = self.serving.write().unwrap_or_else(PoisonError::into_inner);
         let newer = serving
             .get(&*version.application)
-            .is_none_or(|current| current.version < version.version);
+            .is_none_or(|current| current.generation < version.generation);
         if newer {
             serving.insert(Arc::clone(&version.application), Arc::new(version));
         }
@@ -608,7 +632,7 @@ impl Registry {
                     .map_err(DbError::from)?;
                 let previous = recorded_of(get::<Option<Value>>(&found, 0)?.as_ref());
                 if !continues(&previous, &list) {
-                    return Ok(Sent::Diverged);
+                    return Ok(None);
                 }
                 let row = transaction
                     .query_one(
@@ -624,13 +648,15 @@ impl Registry {
                                 RETURNING number, declared_access, git_commit, bundle_sha256,
                                           created_by, created_at, migrations, structures
                             ), serving AS (
-                                UPDATE applications SET serving_version = (SELECT number FROM sent)
+                                UPDATE applications SET serving_version = (SELECT number FROM sent),
+                                    serving_generation = serving_generation + 1
                                 WHERE id = $1
+                                RETURNING serving_generation
                             )
                             SELECT number, declared_access, git_commit, bundle_sha256, migrations,
                                    created_by, ",
                             rfc3339!("created_at"),
-                            ", structures FROM sent"
+                            ", structures, (SELECT serving_generation FROM serving) FROM sent"
                         ),
                         &[
                             &id,
@@ -645,31 +671,36 @@ impl Registry {
                     )
                     .await
                     .map_err(DbError::from)?;
+                let generation: i64 = get(&row, 8)?;
                 transaction.commit().await.map_err(DbError::from)?;
-                Ok(Sent::Sent(VersionRecord {
-                    application: name.to_owned(),
-                    number: number_of(get(&row, 0)?)?,
-                    declared_access: get(&row, 1)?,
-                    git_commit: get(&row, 2)?,
-                    bundle_sha256: get(&row, 3)?,
-                    migrations: get(&row, 4)?,
-                    created_by: get(&row, 5)?,
-                    created_at: get(&row, 6)?,
-                    structures: get(&row, 7)?,
-                }))
+                Ok(Some((
+                    generation,
+                    VersionRecord {
+                        application: name.to_owned(),
+                        number: number_of(get(&row, 0)?)?,
+                        declared_access: get(&row, 1)?,
+                        git_commit: get(&row, 2)?,
+                        bundle_sha256: get(&row, 3)?,
+                        migrations: get(&row, 4)?,
+                        created_by: get(&row, 5)?,
+                        created_at: get(&row, 6)?,
+                        structures: get(&row, 7)?,
+                    },
+                )))
             })
             .await;
         match sent {
-            Ok(Sent::Sent(record)) => {
+            Ok(Some((generation, record))) => {
                 self.install(Serving {
                     application: Arc::from(name),
                     version: record.number,
                     bundle,
                     declared,
+                    generation,
                 });
                 Ok(Sent::Sent(record))
             }
-            Ok(other) => Ok(other),
+            Ok(None) => Ok(Sent::Diverged),
             Err(error) => {
                 // The commit may have happened without its answer arriving:
                 // read again what serves, so memory follows the database.
@@ -687,7 +718,7 @@ impl Registry {
             .run(async |client: &mut Client| {
                 client
                     .query_opt(
-                        "SELECT a.name, v.number, v.bundle, v.declared_access
+                        "SELECT a.name, v.number, v.bundle, v.declared_access, a.serving_generation
                          FROM applications a
                          JOIN versions v ON v.application_id = a.id AND v.number = a.serving_version
                          WHERE a.name = $1",
@@ -708,6 +739,104 @@ impl Registry {
                 }),
             ),
         }
+    }
+
+    /// Makes Version `to` of `name` the serving one in place of `from`, if
+    /// `from` still serves and `to` is a Version of it (`to` 0 is none). In
+    /// the database and then in memory, before this returns: once it has
+    /// returned every new request finds `to`.
+    ///
+    /// The switch is one statement: it changes the row only where
+    /// `serving_version` is still `from`. Two at once with the same `from`
+    /// take the row's lock in turn, and the second, re-reading the row,
+    /// finds `from` no longer serving and changes nothing.
+    pub async fn go_back(&self, name: &str, from: u64, to: u64) -> Result<WentBack, DbError> {
+        // A number no Version can have (Version numbers are `integer`): no
+        // row matches, and the answer is what serves.
+        let from_stored = i32::try_from(from).unwrap_or(0);
+        let to_stored = i32::try_from(to).unwrap_or(0);
+        let switched = self
+            .database
+            .pool()
+            .run(async |client: &mut Client| {
+                client
+                    .query_opt(
+                        "WITH switched AS (
+                            UPDATE applications a
+                            SET serving_version = $3,
+                                serving_generation = a.serving_generation + 1
+                            WHERE a.name = $1 AND a.serving_version = $2
+                              AND EXISTS (SELECT 1 FROM versions v
+                                          WHERE v.application_id = a.id AND v.number = $3)
+                            RETURNING a.id, a.serving_generation
+                        )
+                        SELECT s.serving_generation, v.bundle, v.declared_access, v.migrations,
+                               (SELECT l.migrations FROM versions l WHERE l.application_id = s.id
+                                ORDER BY l.number DESC LIMIT 1)
+                        FROM switched s
+                        JOIN versions v ON v.application_id = s.id AND v.number = $3",
+                        &[&name, &from_stored, &to_stored],
+                    )
+                    .await
+                    .map_err(DbError::from)
+            })
+            .await;
+        let row = match switched {
+            Ok(row) => row,
+            Err(error) => {
+                // The statement may have committed without its answer
+                // arriving: read again what serves, so memory follows.
+                self.refresh(name).await;
+                return Err(error);
+            }
+        };
+        let Some(row) = row else {
+            return self.not_gone_back(name, from).await;
+        };
+        let to_list = recorded_of(get::<Option<Value>>(&row, 3)?.as_ref());
+        let latest = recorded_of(get::<Option<Value>>(&row, 4)?.as_ref());
+        let migrations_not_undone = latest
+            .into_iter()
+            .filter(|m| !to_list.iter().any(|t| t.name == m.name))
+            .map(|m| m.name)
+            .collect();
+        self.install(Serving {
+            application: Arc::from(name),
+            version: to,
+            bundle: Arc::from(get::<&str>(&row, 1)?),
+            declared: Arc::new(declared_of(&get::<Value>(&row, 2)?)),
+            generation: get(&row, 0)?,
+        });
+        Ok(WentBack::WentBack {
+            migrations_not_undone,
+        })
+    }
+
+    /// Why a go-back from `from` changed nothing: `from` serves (so there
+    /// was no Version to go back to), or another does.
+    async fn not_gone_back(&self, name: &str, from: u64) -> Result<WentBack, DbError> {
+        let row = self
+            .database
+            .pool()
+            .run(async |client: &mut Client| {
+                client
+                    .query_opt(
+                        "SELECT serving_version FROM applications WHERE name = $1",
+                        &[&name],
+                    )
+                    .await
+                    .map_err(DbError::from)
+            })
+            .await?;
+        let serving = match row {
+            Some(row) => get::<Option<i32>>(&row, 0)?.map(number_of).transpose()?,
+            None => None,
+        };
+        Ok(if serving == Some(from) {
+            WentBack::NoPreviousVersion
+        } else {
+            WentBack::ServingChanged(serving)
+        })
     }
 
     /// The Versions of `name`, oldest first; `None` when there is no such
@@ -812,6 +941,7 @@ fn serving_of(row: &Row) -> Result<Serving, DbError> {
         version: number_of(get(row, 1)?)?,
         bundle: Arc::from(get::<&str>(row, 2)?),
         declared: Arc::new(declared_of(&get::<Value>(row, 3)?)),
+        generation: get(row, 4)?,
     })
 }
 

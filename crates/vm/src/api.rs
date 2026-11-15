@@ -32,13 +32,14 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::value::RawValue;
 use serde_json::{Value, json};
 
+use crate::app_logs::{self, Logs};
 use crate::log;
 use crate::oplog::{self, Ending, OperationLog};
 use crate::own_db::Migration;
 use crate::platform_db::DbError;
 use crate::registry::{
     ApplicationRecord, Created, DeclaredAccess, NameProblem, NewVersion, Registry, Resource, Sent,
-    VersionRecord, check_name,
+    VersionRecord, WentBack, check_name,
 };
 use crate::resources::{
     self, Connection, GrantWritten, Login, NewResource, Registered, Resources, is_resource_name,
@@ -139,6 +140,10 @@ enum Route<'a> {
     /// `/v1/applications/<name>/versions/<number>`; `None` when the number
     /// cannot name a Version.
     Version(&'a str, Option<u64>),
+    /// `/v1/applications/<name>/go-back`
+    GoBack(&'a str),
+    /// `/v1/applications/<name>/logs`
+    Logs(&'a str),
     /// `/v1/resources`
     Resources,
     /// `/v1/resources/<name>`
@@ -182,6 +187,8 @@ impl<'a> Route<'a> {
             ["applications", name, "versions", number] => {
                 Some(Self::Version(name, version_number(number)))
             }
+            ["applications", name, "go-back"] => Some(Self::GoBack(name)),
+            ["applications", name, "logs"] => Some(Self::Logs(name)),
             ["resources"] => Some(Self::Resources),
             ["resources", name] => Some(Self::Resource(name)),
             ["resources", name, "grants"] => Some(Self::Grants(name)),
@@ -446,6 +453,103 @@ fn log_limit(query: Option<&str>) -> Option<u16> {
     (1..=oplog::MAX_READ).contains(&limit).then_some(limit)
 }
 
+/// `POST /v1/applications/<name>/go-back`
+const GO_BACK_FORM: &str =
+    r#"{ "from": <the serving Version's number>, "to": <a Version below it, optional> }"#;
+
+/// The body of a go-back: `from`, a positive integer, and `to`, a positive
+/// integer below it or `from - 1` when absent or `null` (0 when `from` is
+/// 1: there is none).
+fn read_go_back(body: &[u8]) -> Result<(u64, u64), String> {
+    let object = Object::read(body)?;
+    let from: u64 = object.required("from")?;
+    if from == 0 {
+        return Err("from is not a positive integer".into());
+    }
+    match object.optional::<u64>("to")? {
+        None => Ok((from, from - 1)),
+        Some(to) if to == 0 || to >= from => Err(
+            "to is not a positive integer below from: only an earlier Version can be gone back to"
+                .into(),
+        ),
+        Some(to) => Ok((from, to)),
+    }
+}
+
+/// The parameters of `GET /v1/applications/<name>/logs`: `limit` (1 to
+/// 1000, written plainly; 100 without it), `after` (a cursor) and `request`,
+/// each at most once and percent-decoded; others are ignored. `None` for
+/// anything else.
+fn logs_query(query: Option<&str>) -> Option<app_logs::Query> {
+    let mut limit = None;
+    let mut after = None;
+    let mut request = None;
+    for pair in query.unwrap_or("").split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        let slot = match key {
+            "limit" => &mut limit,
+            "after" => &mut after,
+            "request" => &mut request,
+            _ => continue,
+        };
+        if slot.is_some() {
+            return None;
+        }
+        *slot = Some(percent_decoded(value)?);
+    }
+    let limit = match limit {
+        None => 100,
+        Some(text) => plain_limit(&text)?,
+    };
+    let after = match after {
+        None => None,
+        Some(text) => Some((app_logs::cursor(&text)?, text)),
+    };
+    Some(app_logs::Query {
+        limit,
+        after,
+        request,
+    })
+}
+
+/// A limit written plainly: digits, no sign, no leading zero, 1 to 1000.
+fn plain_limit(text: &str) -> Option<u16> {
+    let canonical = !text.is_empty()
+        && !text.starts_with('0')
+        && text.len() <= 4
+        && text.bytes().all(|b| b.is_ascii_digit());
+    let limit: u16 = canonical.then(|| text.parse().ok()).flatten()?;
+    (1..=app_logs::MAX_READ).contains(&limit).then_some(limit)
+}
+
+/// A query value with its `%XX` decoded; `None` when an escape is broken
+/// or the result is not UTF-8.
+fn percent_decoded(text: &str) -> Option<String> {
+    fn hex(byte: u8) -> Option<u8> {
+        char::from(byte)
+            .to_digit(16)
+            .and_then(|d| u8::try_from(d).ok())
+    }
+    let bytes = text.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while let Some(&byte) = bytes.get(at) {
+        if byte == b'%' {
+            let high = bytes.get(at + 1).copied().and_then(hex)?;
+            let low = bytes.get(at + 2).copied().and_then(hex)?;
+            decoded.push((high << 4) | low);
+            at += 3;
+        } else {
+            decoded.push(byte);
+            at += 1;
+        }
+    }
+    String::from_utf8(decoded).ok()
+}
+
 /// A JSON object read strictly: an object (never an array standing in for
 /// one), each key at most once, and its values kept as text until asked
 /// for by type. Keys the request does not have are ignored.
@@ -517,6 +621,8 @@ pub struct Api {
     registry: Arc<Registry>,
     resources: Arc<Resources>,
     log: Arc<OperationLog>,
+    /// Applications' log entries, read here.
+    logs: Arc<Logs>,
     credentials: Arc<ToolCredentials>,
     domain: Arc<str>,
     /// The Group whose members are Platform administrators, if any.
@@ -528,6 +634,7 @@ impl Api {
         registry: Arc<Registry>,
         resources: Arc<Resources>,
         log: Arc<OperationLog>,
+        logs: Arc<Logs>,
         credentials: Arc<ToolCredentials>,
         domain: Arc<str>,
         administrators: Option<Arc<str>>,
@@ -536,6 +643,7 @@ impl Api {
             registry,
             resources,
             log,
+            logs,
             credentials,
             domain,
             administrators,
@@ -584,7 +692,7 @@ impl Api {
         };
         let Some(route) = Route::of(path) else {
             return Answer::not_found(
-                "the API has no such path: its paths are /v1/me, /v1/tool-credentials, /v1/tool-credentials/current, /v1/applications, /v1/applications/<name>, /v1/applications/<name>/versions, /v1/applications/<name>/versions/<number>, /v1/resources, /v1/resources/<name>, /v1/resources/<name>/grants, /v1/resources/<name>/structure and /v1/operation-log",
+                "the API has no such path: its paths are /v1/me, /v1/tool-credentials, /v1/tool-credentials/current, /v1/applications, /v1/applications/<name>, /v1/applications/<name>/versions, /v1/applications/<name>/versions/<number>, /v1/applications/<name>/go-back, /v1/applications/<name>/logs, /v1/resources, /v1/resources/<name>, /v1/resources/<name>/grants, /v1/resources/<name>/structure and /v1/operation-log",
             );
         };
         if route.for_administrators(method) && !self.is_administrator(user) {
@@ -607,6 +715,8 @@ impl Api {
             Route::Application(name) => self.application(method, name).await,
             Route::Versions(name) => self.versions(user, method, name, &body).await,
             Route::Version(name, number) => self.version(method, name, number).await,
+            Route::GoBack(name) => self.go_back(user, method, name, &body).await,
+            Route::Logs(name) => self.logs(user, method, name, query).await,
         };
         answer.unwrap_or_else(|error| Answer::unavailable(&error))
     }
@@ -806,6 +916,114 @@ impl Api {
         } else {
             Answer::method_not_allowed(method, "GET")
         })
+    }
+
+    /// `POST /v1/applications/<name>/go-back` (blackbox/CONTRACT.md,
+    /// "Going back, on the platform's API"): by a Contributor only; a
+    /// Platform administrator who is not one is refused as anyone else.
+    async fn go_back(
+        &self,
+        user: &User,
+        method: &Method,
+        name: &str,
+        body: &[u8],
+    ) -> Result<Answer, DbError> {
+        let contributor = if check_name(name).is_ok() {
+            self.registry.is_contributor(name, &user.id).await?
+        } else {
+            None
+        };
+        let Some(contributor) = contributor else {
+            return Ok(no_application());
+        };
+        if method != Method::POST {
+            return Ok(Answer::method_not_allowed(method, "POST"));
+        }
+        if !contributor {
+            return Ok(Answer::error(
+                StatusCode::FORBIDDEN,
+                "not-a-contributor",
+                "you are not a Contributor of this Application, and only its Contributors may change which Version serves: ask one of them",
+            ));
+        }
+        let (from, to) = match read_go_back(body) {
+            Ok(asked) => asked,
+            Err(problem) => return Ok(Answer::malformed(&problem, GO_BACK_FORM)),
+        };
+        Ok(match self.registry.go_back(name, from, to).await? {
+            WentBack::WentBack {
+                migrations_not_undone,
+            } => {
+                log::record(
+                    "went-back",
+                    json!({ "application": name, "user": &user.id, "from": from, "to": to }),
+                );
+                Answer::json(
+                    StatusCode::OK,
+                    &json!({
+                        "application": name,
+                        "serving_version": to,
+                        "was": from,
+                        "migrations_not_undone": migrations_not_undone,
+                    }),
+                )
+            }
+            WentBack::ServingChanged(serving) => Answer::error(
+                StatusCode::CONFLICT,
+                "serving-changed",
+                &match serving {
+                    Some(serving) => format!(
+                        "Version {from} is not the serving Version: Version {serving} serves now (someone deployed or went back meanwhile). Look at the Application's Versions, then go back from Version {serving} if that is still what you want; nothing was changed"
+                    ),
+                    None => "the Application has no Version, so none serves and there is nothing to go back from; nothing was changed".to_owned(),
+                },
+            ),
+            WentBack::NoPreviousVersion => Answer::error(
+                StatusCode::CONFLICT,
+                "no-previous-version",
+                &format!(
+                    "Version {from} serves and it is the Application's first: there is no Version before it, so nothing to go back to; nothing was changed"
+                ),
+            ),
+        })
+    }
+
+    /// `GET /v1/applications/<name>/logs` (blackbox/CONTRACT.md, "Logs, on
+    /// the platform's API"): by a Contributor or a Platform administrator.
+    async fn logs(
+        &self,
+        user: &User,
+        method: &Method,
+        name: &str,
+        query: Option<&str>,
+    ) -> Result<Answer, DbError> {
+        let contributor = if check_name(name).is_ok() {
+            self.registry.is_contributor(name, &user.id).await?
+        } else {
+            None
+        };
+        let Some(contributor) = contributor else {
+            return Ok(no_application());
+        };
+        if method != Method::GET {
+            return Ok(Answer::method_not_allowed(method, "GET"));
+        }
+        if !contributor && !self.is_administrator(user) {
+            return Ok(Answer::error(
+                StatusCode::FORBIDDEN,
+                "not-a-contributor",
+                "you are not a Contributor of this Application, and only its Contributors and Platform administrators may read its logs: ask one of its Contributors",
+            ));
+        }
+        let Some(query) = logs_query(query) else {
+            return Ok(Answer::error(
+                StatusCode::BAD_REQUEST,
+                "malformed",
+                "the parameters are not the ones asked for: ?limit is a whole number from 1 to 1000, ?after a cursor the API gave (an entry's id, or next), ?request a request's x-vm-request-id; each at most once",
+            ));
+        };
+        let page = self.logs.read(name, &query).await?;
+        Ok(Answer::json(StatusCode::OK, &page))
     }
 
     async fn resources_route(

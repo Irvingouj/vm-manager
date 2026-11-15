@@ -37,6 +37,7 @@ use openworkers_runtime_v8::Worker;
 use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio::task::JoinSet;
 
+use crate::app_logs::{Collected, Logs};
 use crate::gateway::{Gateway, Transactions};
 use crate::registry::{Declared, Serving};
 use crate::user::User;
@@ -57,6 +58,9 @@ pub struct InFlight {
     /// The transactions it holds open (blackbox/CONTRACT.md,
     /// "Transactions"): they belong to it, and are rolled back when it ends.
     pub transactions: Transactions,
+    /// What its context printed and did not catch, for its log entry
+    /// (crate::app_logs).
+    pub collected: Collected,
 }
 
 /// What the Application answered.
@@ -138,7 +142,11 @@ pub struct RequestRunner {
 
 impl RequestRunner {
     /// Starts the engine threads.
-    pub fn start(limits: &Limits, gateway: &Arc<dyn Gateway>) -> std::io::Result<Self> {
+    pub fn start(
+        limits: &Limits,
+        gateway: &Arc<dyn Gateway>,
+        logs: &Arc<Logs>,
+    ) -> std::io::Result<Self> {
         let mut lanes = Vec::with_capacity(limits.threads.get());
         let mut threads = Vec::with_capacity(limits.threads.get());
         for index in 0..limits.threads.get() {
@@ -149,6 +157,7 @@ impl RequestRunner {
             let engine = Engine {
                 limits: limits.clone(),
                 gateway: Arc::clone(gateway),
+                logs: Arc::clone(logs),
             };
             let thread = std::thread::Builder::new()
                 .name(format!("vm-engine-{index}"))
@@ -213,6 +222,8 @@ impl RequestRunner {
 struct Engine {
     limits: Limits,
     gateway: Arc<dyn Gateway>,
+    /// Where a line printed outside a request goes.
+    logs: Arc<Logs>,
 }
 
 impl Engine {
@@ -269,6 +280,7 @@ impl Engine {
         let host = Arc::new(HostOps::new(
             Arc::clone(&in_flight),
             Arc::clone(&self.gateway),
+            Arc::clone(&self.logs),
         ));
         let deadline = self.limits.deadline;
         match tokio::time::timeout(deadline, self.serve_in(&host, serving, request)).await {

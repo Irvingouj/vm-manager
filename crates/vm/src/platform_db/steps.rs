@@ -300,6 +300,41 @@ pub const STEPS: &[Step] = &[
         ALTER TABLE versions ADD COLUMN structures jsonb NOT NULL DEFAULT '{}';
     ",
     },
+    Step {
+        number: 12,
+        name: "going back, and the applications' logs",
+        sql: "
+        -- Which Version serves can now go down as well as up (going back,
+        -- blackbox/CONTRACT.md \"Versions, going back, and logs\"): every
+        -- change of serving_version adds one to serving_generation, under
+        -- the row's lock, so the program's memory follows the latest change
+        -- whatever order changes report back in (crate::registry).
+        ALTER TABLE applications ADD COLUMN serving_generation bigint NOT NULL DEFAULT 0;
+        -- One entry for each request an Application's code was given, and
+        -- one for each line printed outside a request (crate::app_logs).
+        -- Written by one writer, so `id` grows in the order entries became
+        -- readable: it is the cursor. The newest 5,000 of an Application
+        -- are kept.
+        CREATE TABLE log_entries (
+            id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+            application text NOT NULL,
+            version integer NOT NULL,
+            made_at timestamptz NOT NULL,
+            request text,
+            user_id text,
+            method text,
+            path text,
+            status integer,
+            -- [ { level, message } ], in order.
+            printed jsonb NOT NULL,
+            -- [ \"<message and stack>\" ], in order.
+            uncaught jsonb NOT NULL,
+            truncated boolean NOT NULL,
+            dropped_before bigint NOT NULL
+        );
+        CREATE INDEX log_entries_application ON log_entries (application, id);
+    ",
+    },
 ];
 
 /// The advisory lock every step's transaction takes first: "vm steps".

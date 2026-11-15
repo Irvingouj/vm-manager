@@ -21,6 +21,7 @@ use openworkers_core::{
 use serde_json::{Value, json};
 
 use super::InFlight;
+use crate::app_logs::Logs;
 use crate::gateway::{Decision, Gateway, Refusal, ok_to_wire};
 use crate::log;
 
@@ -34,6 +35,10 @@ pub const PLATFORM_BINDING: &str = "__vm_platform";
 pub struct HostOps {
     in_flight: Arc<InFlight>,
     gateway: Arc<dyn Gateway>,
+    /// Where a line printed with no request in flight goes, as an entry
+    /// of its own; what the request printed goes into
+    /// `in_flight.collected`.
+    logs: Arc<Logs>,
     /// The request is in flight: its event has started and not ended.
     active: AtomicBool,
     /// The glue has asked whose request this is.
@@ -44,10 +49,11 @@ pub struct HostOps {
 }
 
 impl HostOps {
-    pub fn new(in_flight: Arc<InFlight>, gateway: Arc<dyn Gateway>) -> Self {
+    pub fn new(in_flight: Arc<InFlight>, gateway: Arc<dyn Gateway>, logs: Arc<Logs>) -> Self {
         Self {
             in_flight,
             gateway,
+            logs,
             active: AtomicBool::new(false),
             begun: AtomicBool::new(false),
             failed: AtomicBool::new(false),
@@ -74,7 +80,8 @@ impl HostOps {
         self.active.load(Ordering::SeqCst)
     }
 
-    /// Writes an `uncaught` record for this request and marks it failed.
+    /// Writes an `uncaught` record for this request and marks it failed;
+    /// the error goes into the request's log entry too.
     pub fn uncaught(&self, error: &str) {
         self.failed.store(true, Ordering::SeqCst);
         log::record(
@@ -86,6 +93,7 @@ impl HostOps {
                 "error": error,
             }),
         );
+        self.in_flight.collected.uncaught(error);
     }
 
     fn host_call(&self, operation: &str, refused: Option<&str>) {
@@ -185,15 +193,27 @@ impl OperationsHandler for HostOps {
 
     fn handle_log(&self, level: LogLevel, message: String) {
         let in_flight = self.is_active().then_some(&*self.in_flight);
+        let level = level_name(&level);
         log::record(
             "printed",
             json!({
                 "request": in_flight.map(|f| &*f.request),
                 "application": &*self.in_flight.application,
                 "user": in_flight.map(|f| f.user.id.as_str()),
-                "level": level_name(&level),
-                "message": message,
+                "level": level,
+                "message": &message,
             }),
         );
+        // Then the message itself, moved, into the log entry: the
+        // request's, or one of its own when no request is in flight.
+        match in_flight {
+            Some(in_flight) => in_flight.collected.printed(level, message),
+            None => self.logs.printed_outside(
+                &self.in_flight.application,
+                self.in_flight.version,
+                level,
+                message,
+            ),
+        }
     }
 }
