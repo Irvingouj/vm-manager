@@ -83,6 +83,10 @@ enum Command {
     /// Generate the next migration from src/db/schema.ts into migrations/,
     /// stopping before one that destroys data.
     Generate(tool::GenerateArgs),
+    /// Deploy the project: build it on this machine from its last commit,
+    /// check it, and send it as the Application's new Version, which goes
+    /// live at its address.
+    Deploy(tool::DeployArgs),
 }
 
 #[derive(clap::Args)]
@@ -143,6 +147,7 @@ fn main() -> ExitCode {
         Some(Command::New(args)) => tool::run(tool::Command::New(args)),
         Some(Command::Check(args)) => tool::run(tool::Command::Check(args)),
         Some(Command::Generate(args)) => tool::run(tool::Command::Generate(args)),
+        Some(Command::Deploy(args)) => tool::run(tool::Command::Deploy(args)),
         None => {
             say_on_stderr(
                 "vm: name a command (see vm --help): vm sign-in ..., vm serve ..., or vm --version",

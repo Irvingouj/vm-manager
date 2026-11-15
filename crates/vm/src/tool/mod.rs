@@ -3,7 +3,8 @@
 //!
 //! `vm sign-in`, `vm sign-out`, `vm whoami`, `vm resources`, `vm
 //! applications`, `vm pull` ([`pull`]), `vm new` ([`new`]), `vm check`
-//! ([`check`]) and `vm generate` ([`generate`]), each with `--json`. Each command is one short run on one
+//! ([`check`]), `vm generate` ([`generate`]) and `vm deploy` ([`deploy`]),
+//! each with `--json`. Each command is one short run on one
 //! thread: a current-thread runtime, at most a few requests to the
 //! installation ([`client`]), the credential file ([`credential_file`]), and
 //! an [`Ending`] whose exit code says what kind of ending it was:
@@ -23,6 +24,7 @@ mod child;
 mod client;
 mod credential_file;
 mod data_loss;
+mod deploy;
 mod drizzle;
 mod generate;
 mod new;
@@ -32,6 +34,7 @@ mod template;
 mod theirs;
 
 pub use check::CheckArgs;
+pub use deploy::DeployArgs;
 pub use generate::GenerateArgs;
 pub use new::NewArgs;
 pub use pull::PullArgs;
@@ -120,6 +123,7 @@ pub enum Command {
     New(NewArgs),
     Check(CheckArgs),
     Generate(GenerateArgs),
+    Deploy(DeployArgs),
 }
 
 /// A message: the tool's own words, or the installation's (a refusal's
@@ -184,6 +188,17 @@ impl Ending {
         }
     }
 
+    /// An ending whose `message` holds text of the installation's or of
+    /// the project's: escaped when printed as words, as it is in JSON.
+    fn theirs(code: u8, reason: &str, message: &str) -> Self {
+        Self {
+            code,
+            reason: json!(reason),
+            message: Said::Theirs(Theirs::from(message)),
+            detail: None,
+        }
+    }
+
     fn credential_file(message: String) -> Self {
         Self::new(1, "credential-file", message)
     }
@@ -203,6 +218,7 @@ pub fn run(command: Command) -> ExitCode {
         Command::New(args) => args.output.json,
         Command::Check(args) => args.output.json,
         Command::Generate(args) => args.output.json,
+        Command::Deploy(args) => args.output.json,
         Command::SignOut(o)
         | Command::Whoami(o)
         | Command::Resources(o)
@@ -224,6 +240,7 @@ pub fn run(command: Command) -> ExitCode {
                 Command::New(args) => new::new(&args),
                 Command::Check(args) => check::check(&args).await,
                 Command::Generate(args) => generate::generate(&args).await,
+                Command::Deploy(args) => deploy::deploy(&args).await,
             }
         }),
         Err(error) => Err(Ending::new(
