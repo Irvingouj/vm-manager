@@ -199,6 +199,46 @@ impl Ending {
         }
     }
 
+    /// The same ending with `sentence` (the tool's own words) after its
+    /// message, and `field: value` beside its reason in the JSON error.
+    fn amended(self, sentence: &str, field: &str, value: Value) -> Self {
+        let join = |message: &str| {
+            let message = message.trim_end();
+            let ended = if message.is_empty() || message.ends_with('.') {
+                ""
+            } else {
+                "."
+            };
+            format!("{message}{ended} {sentence}")
+        };
+        let (mut json, text) = match self.detail {
+            Some(detail) => {
+                let Done { json, text } = *detail;
+                (json, join(&text))
+            }
+            None => (
+                json!({ "error": { "reason": &self.reason, "message": self.message.json() } }),
+                join(&self.message.words()),
+            ),
+        };
+        if let Some(error) = json.get_mut("error").and_then(Value::as_object_mut) {
+            if let Some(Value::String(message)) = error.get_mut("message") {
+                *message = join(message);
+            }
+            error.insert(field.into(), value);
+        }
+        Self {
+            code: self.code,
+            reason: self.reason,
+            // Not printed: the detail is.
+            message: self.message,
+            detail: Some(Box::new(Done {
+                json,
+                text: format!("{text}\n"),
+            })),
+        }
+    }
+
     fn credential_file(message: String) -> Self {
         Self::new(1, "credential-file", message)
     }

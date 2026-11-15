@@ -203,7 +203,10 @@ pub(super) async fn deploy(args: &DeployArgs) -> Result<Done, Ending> {
         .saturating_add(client::ANSWER_TIMEOUT)
         .saturating_add(client::CONNECT_TIMEOUT.saturating_mul(2))
         .saturating_add(Duration::from_secs(5));
-    match signals.within(sending, send(&ready)).await {
+    // Whether this deploy created the Application and it has no Version
+    // that the tool knows of: set by `send`.
+    let created = Cell::new(false);
+    let sent = match signals.within(sending, send(&ready, &created)).await {
         Bounded::Ended(sent) => sent,
         Bounded::TimedOut => Err(maybe_live(
             "unreachable",
@@ -213,7 +216,31 @@ pub(super) async fn deploy(args: &DeployArgs) -> Result<Done, Ending> {
             "interrupted",
             &format!("vm deploy was interrupted ({signal}) while sending the Version"),
         )),
-    }
+    };
+    sent.map_err(|ending| {
+        if created.get() {
+            created_stays(ending, &ready.name)
+        } else {
+            ending
+        }
+    })
+}
+
+/// An ending after this deploy created the Application and before a
+/// Version of it was taken: the Application stays, and the error says so
+/// (`"created": true` beside its reason, and a sentence after its message).
+fn created_stays(ending: Ending, name: &str) -> Ending {
+    let unsure = ending.reason == json!("unreachable") || ending.reason == json!("interrupted");
+    let sentence = if unsure {
+        format!(
+            "This deploy created the Application {name}, which stays: unless the Version went live, {name} now exists with no Version (nothing is at its address), and the next vm deploy will send its first Version."
+        )
+    } else {
+        format!(
+            "This deploy created the Application {name}, which stays: it now exists with no Version (nothing is at its address), and the next vm deploy will send its first Version."
+        )
+    };
+    ending.amended(&sentence, "created", json!(true))
 }
 
 /// An ending while the Version was being sent: it may or may not have gone
@@ -1106,12 +1133,13 @@ struct SentVersion {
 }
 
 /// The Application created when there is none, then the Version sent.
-async fn send(ready: &Ready) -> Result<Done, Ending> {
+async fn send(ready: &Ready, creating: &Cell<bool>) -> Result<Done, Ending> {
     let kept = &ready.kept;
     let (application, created) = match &ready.existing {
         Some(_) => (None, false),
         None => (Some(create(ready).await?), true),
     };
+    creating.set(created);
     let application = match (&application, &ready.existing) {
         (Some(made), _) => made,
         (None, Some(existing)) => &existing.application,
@@ -1130,22 +1158,33 @@ async fn send(ready: &Ready) -> Result<Done, Ending> {
     .map_err(|failure| match failure {
         Failure::Unreachable(why) | Failure::Unexpected(why) => maybe_live("unreachable", &why),
     })?;
+    let serving = ready
+        .existing
+        .as_ref()
+        .and_then(|existing| existing.application.serving_version);
     match reply.status {
-        StatusCode::CREATED => {}
+        StatusCode::CREATED => creating.set(false),
         StatusCode::UNAUTHORIZED => return Err(sign_in_expired(kept)),
-        _ => return Err(refused(kept, &reply)),
+        _ => return Err(refused(kept, &reply, serving)),
     }
-    let sent: SentVersion = shaped(
-        kept.connect,
-        reply
-            .json
-            .ok_or_else(|| unexpected(kept.connect, "its answer is not JSON"))?,
-    )?;
+    let Some(sent) = reply
+        .json
+        .and_then(|body| serde_json::from_value::<SentVersion>(body).ok())
+    else {
+        return Err(Ending::new(
+            1,
+            "unexpected",
+            format!(
+                "the Version was taken and went live, but the installation's answer could not be read for its number: look with vm applications ({}), and tell the Builder",
+                ready.name
+            ),
+        ));
+    };
     Ok(deployed(ready, application, created, sent.number))
 }
 
 /// What the installation answered instead of the Version.
-fn refused(kept: &Kept, reply: &client::Reply) -> Ending {
+fn refused(kept: &Kept, reply: &client::Reply, serving: Option<u64>) -> Ending {
     let error = reply.json.as_ref().and_then(|body| body.get("error"));
     let field = |name: &str| error.and_then(|e| e.get(name)).and_then(Value::as_str);
     match (reply.status, field("reason")) {
@@ -1153,8 +1192,11 @@ fn refused(kept: &Kept, reply: &client::Reply) -> Ending {
             let migration = field("migration").unwrap_or_default();
             let code = field("code").unwrap_or_default();
             let database = field("database_message").unwrap_or_default();
+            let serving = serving
+                .map(|n| format!(" Version {n} goes on serving."))
+                .unwrap_or_default();
             let message = format!(
-                "The migration {migration} failed in the Application's own database: {database} (SQLSTATE {code}). Nothing was changed: the previous Version goes on serving, and its own database is as it was. The rows already there may not fit what the migration does (a column made NOT NULL over rows without a value, say): tell the Builder, correct src/db/schema.ts or the migration while it is not deployed, commit, then run vm deploy again"
+                "The migration {migration} failed in the Application's own database: {database} (SQLSTATE {code}). Nothing was changed: the Application's own database is as it was.{serving} The rows already there may not fit what the migration does (a column made NOT NULL over rows without a value, say): tell the Builder, correct src/db/schema.ts or the migration while it is not deployed, commit, then run vm deploy again"
             );
             detailed_refusal(
                 "migration-failed",
@@ -1170,8 +1212,9 @@ fn refused(kept: &Kept, reply: &client::Reply) -> Ending {
             let migration = field("migration").unwrap_or_default();
             let rule = field("rule").unwrap_or_default();
             let said = field("message").unwrap_or_default();
+            let ended = if said.ends_with('.') { "" } else { "." };
             let message = format!(
-                "The installation refused the migration {migration} (rule {rule}): {said} Nothing was changed: the previous Version, if any, goes on serving. Correct the migration while it is not deployed, commit, then run vm deploy again"
+                "The installation refused the Version: {said}{ended} Correct the migration while it is not deployed, commit, then run vm deploy again"
             );
             detailed_refusal(
                 "migration-refused",

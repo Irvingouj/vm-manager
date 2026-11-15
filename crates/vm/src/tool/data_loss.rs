@@ -18,8 +18,10 @@
 //! Nothing else: a `DISABLE ROW LEVEL SECURITY`, a view dropped, a default
 //! dropped or a constraint tightened is in no list. At deploy ([`decide`]
 //! with `rows`), besides, what only a migration written by hand has: a
-//! `DELETE` (a `DeleteStmt`, its table) and a `TRUNCATE` (a `TruncateStmt`,
-//! each table), as rows lost; an `UPDATE` is not.
+//! `DELETE` (a `DeleteStmt`, its table), at the top of a statement or in
+//! its `WITH`, and a `TRUNCATE` (a `TruncateStmt`, each table), as rows
+//! lost; an `UPDATE` is not, nor what runs inside a `DO` block or a
+//! function.
 //!
 //! The last snapshot is read for the types of the columns whose type
 //! changes and no more ([`snapshot_types`]): its tables one at a time, each
@@ -268,33 +270,58 @@ pub(super) fn found(sql: &str, statements: &[Parsed]) -> Vec<(usize, Found)> {
 }
 
 /// What the statements of a migration delete or truncate, each with the
-/// index of its statement, in the order of the statements: a `DELETE` or a
-/// `TRUNCATE` at the top of a statement.
+/// index of its statement, in the order of the statements and within one
+/// in the order of its text: a `TRUNCATE` at the top of a statement, and a
+/// `DELETE` at its top or in its `WITH` (nested `WITH`s too), found on the
+/// parsed nodes.
 fn rows_found(statements: &[Parsed]) -> Vec<(usize, Found)> {
     let mut found = Vec::new();
     let table = |relation: &pg_query::protobuf::RangeVar| {
-        format!(
-            "{}.{}",
-            schema_or_public(&relation.schemaname),
-            relation.relname
+        (
+            relation.location,
+            Found::Rows(format!(
+                "{}.{}",
+                schema_or_public(&relation.schemaname),
+                relation.relname
+            )),
         )
     };
     for (index, statement) in statements.iter().enumerate() {
-        match &statement.node {
-            Some(NodeEnum::DeleteStmt(delete)) => {
-                if let Some(relation) = &delete.relation {
-                    found.push((index, Found::Rows(table(relation))));
+        let mut here = Vec::new();
+        if let Some(NodeEnum::TruncateStmt(truncate)) = &statement.node {
+            for relation in &truncate.relations {
+                if let Some(N::RangeVar(relation)) = &relation.node {
+                    here.push(table(relation));
                 }
             }
-            Some(NodeEnum::TruncateStmt(truncate)) => {
-                for relation in &truncate.relations {
-                    if let Some(N::RangeVar(relation)) = &relation.node {
-                        found.push((index, Found::Rows(table(relation))));
-                    }
-                }
-            }
-            _ => {}
         }
+        // The statement and the queries of its `WITH`s. Bounded by the
+        // statement's tree, which the parser bounds.
+        let mut pending: Vec<&NodeEnum> = statement.node.iter().collect();
+        while let Some(node) = pending.pop() {
+            let with = match node {
+                NodeEnum::DeleteStmt(delete) => {
+                    if let Some(relation) = &delete.relation {
+                        here.push(table(relation));
+                    }
+                    delete.with_clause.as_ref()
+                }
+                NodeEnum::SelectStmt(select) => select.with_clause.as_ref(),
+                NodeEnum::InsertStmt(insert) => insert.with_clause.as_ref(),
+                NodeEnum::UpdateStmt(update) => update.with_clause.as_ref(),
+                NodeEnum::MergeStmt(merge) => merge.with_clause.as_ref(),
+                _ => None,
+            };
+            for cte in with.iter().flat_map(|with| &with.ctes) {
+                if let Some(N::CommonTableExpr(cte)) = &cte.node
+                    && let Some(query) = cte.ctequery.as_ref().and_then(|q| q.node.as_ref())
+                {
+                    pending.push(query);
+                }
+            }
+        }
+        here.sort_by_key(|(at, _)| *at);
+        found.extend(here.into_iter().map(|(_, rows)| (index, rows)));
     }
     found
 }
