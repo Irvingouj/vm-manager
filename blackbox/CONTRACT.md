@@ -1414,7 +1414,7 @@ A Contributor sees an Application's Versions and which one serves, goes back to 
 
 ### Going back, on the platform's API
 
-`POST /v1/applications/<name>/go-back`, by a Contributor, with `{ "from": <number>, "to": <number, optional> }`.
+`POST /v1/applications/<name>/go-back`, by a Contributor, with `{ "from": <number>, "to": <number, optional> }`. A Platform administrator who is not a Contributor is `not-a-contributor` here, as anyone else: reading logs is all this ticket gives them.
 
 - `from` is the Version the caller saw serving; `to` is the Version to serve instead, `from - 1` when it is left out or `null`. Answers `200`:
 
@@ -1465,7 +1465,7 @@ The platform keeps, for each request an Application was given, what its code pri
 - **When it can be read.** An entry can be read within 2 seconds of its response, when the platform database answers. It is written after the request and never in its way: no request waits for it, and a request is answered the same when it cannot be written.
 - **Bounds.** Each has a stated end, and `truncated` is true in an entry any of them cut:
   - a `message` longer than 8,192 bytes is cut to that (at a character boundary); an `uncaught` error longer than 16,384 bytes likewise;
-  - at most 200 `printed` records and 64 KiB of messages for one request, and at most 10 `uncaught`; what comes after is not kept in the entry (the program's log still has every record).
+  - at most 200 `printed` records and 64 KiB of messages for one request (the record whose message would pass 64 KiB is not kept, nor any after it), and at most 10 `uncaught`; what comes after is not kept in the entry (the program's log still has every record).
   - The platform keeps the newest 5,000 entries of an Application; older ones are deleted.
   - When entries are made faster than the platform database takes them (more than 1,024 waiting), entries are dropped, not requests held: the next entry kept has in `dropped_before` how many were dropped before it.
 - Logs hold what the Application chose to print. They are not the Operation log: a Platform administrator's record of every operation is that one, and nothing here replaces or feeds it.
@@ -1491,7 +1491,7 @@ All three need a sign-in (`4`) and name the Application on the command line; an 
 ```
 
 - `deployed_at` and `deployed_by` are the Version's `created_at` and `created_by`. Exactly one Version has `serving` true, or none when the Application has no Version (`serving_version` null, `versions` empty).
-- In words: one line for each Version with its number, its commit, when and by whom, and the serving one marked; with none, that the Application has no Version yet and that `vm deploy` sends the first.
+- In words: one line for each Version with its number, its commit, when and by whom, and the serving one marked with the word `serving` (no other line has that word); with none, that the Application has no Version yet and that `vm deploy` sends the first.
 
 **`vm go-back`** asks which Version serves, then goes back from it: to the one before it, or to `--to <number>`. Exit code `0`:
 
@@ -1511,9 +1511,9 @@ All three need a sign-in (`4`) and name the Application on the command line; an 
 ```
 
 - `--request`, `--after` and `--limit` are the API's (`--limit` outside 1 to 1000 is exit code `2`; an `--after` the API does not take is its `malformed`, exit code `3`). Without `--after` it prints the newest; `--after <next>` of an earlier run prints what came since.
-- In words, for each entry: a first line with the time, the request's id, the User, the Version, the method, the path and the status; then each printed line with its level; then each uncaught error with its stack, indented. An entry printed outside a request says so in place of the request's facts. A cut entry says it was cut, and dropped entries are said where they are missing. With no entry: that there is none (yet).
+- In words, for each entry: a first line with the time (RFC 3339, UTC), the request's id, the User, the Version, the method, the path and the status; then each printed line with its level; then each uncaught error with its stack, indented. An entry printed outside a request says `outside a request` in place of the request's facts. A cut entry says it was `cut`, and dropped entries are said where they are missing. With no entry: `no entries` (yet).
 - Everything of an entry is text of the Application's or of a User's: in words it is escaped as any text of the installation's is (a control character never reaches the terminal raw; a line end inside a message begins a new, indented line).
-- **`--follow`** prints the newest entries as without it, then goes on printing each new entry as it is made, until it is interrupted (`SIGINT`, `SIGTERM`, `SIGHUP`): exit code `0`. It asks the installation again about once a second. With `--json` it prints one JSON object on a line for each entry (the entry, with `"application"` beside its fields) and no enclosing object: the one command whose `--json` output is more than one object. When the installation stops answering it ends with `unreachable`, exit code `1`, after what it has printed; when the sign-in ends, with exit code `4`.
+- **`--follow`** prints the newest entries as without it, then goes on printing each new entry as it is made, until it is interrupted (`SIGINT`, `SIGTERM`, `SIGHUP`): exit code `0`. It asks the installation again about once a second. With `--json` it prints one JSON object on a line for each entry (the entry, with `"application"` beside its fields) and no enclosing object: the one command whose `--json` output is more than one object. When the installation stops answering it ends with `unreachable`, exit code `1`, after what it has printed; when the sign-in ends, with exit code `4`. With `--json` such an ending is one last line, the usual `{ "error": ... }` object.
 - A closed standard output ends `--follow` without a crash.
 
 ### Deploying after going back
