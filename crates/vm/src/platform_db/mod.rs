@@ -25,7 +25,8 @@ use tokio_postgres::error::SqlState;
 
 pub use address::{DatabaseAddress, FORM, Password, VARIABLE};
 pub(crate) use pool::Connection;
-pub use pool::{Pool, PoolLimits};
+pub(crate) use pool::Live;
+pub use pool::{Pool, PoolLimits, wait_for_no_connection};
 
 use crate::log;
 
