@@ -72,6 +72,8 @@ pub const ID_TOKEN_SECONDS: i64 = 300;
 
 /// The most connections served at once; one more is closed unanswered.
 pub const MAX_CONNECTIONS: usize = 64;
+/// The most connections kept in [`Outage::Park`]; one more is closed.
+pub const MAX_PARKED: usize = 4096;
 /// The most requests recorded; later ones are counted.
 pub const MAX_RECORDED: usize = 10_000;
 /// The most codes and tokens kept; later ones are counted.
@@ -210,6 +212,8 @@ pub enum ConfigFault {
     LacksTokenEndpoint,
     /// More than 1 MiB.
     Oversize,
+    /// Answered with this status (and a JSON error) instead of `200`.
+    Status(u16),
 }
 
 /// Whether the provider answers.
@@ -222,6 +226,11 @@ pub enum Outage {
     Hang,
     /// Connections are accepted and closed at once, unanswered.
     Close,
+    /// Connections are accepted and kept without being read or answered,
+    /// at no thread each (at most [`MAX_PARKED`]; more are closed), until
+    /// the outage ends: then they are closed unanswered. For holding many
+    /// calls at once.
+    Park,
 }
 
 /// One request the provider answered.
@@ -308,8 +317,11 @@ struct State {
     token_answer: TokenAnswer,
     token_status: Option<TokenStatus>,
     config_fault: Option<ConfigFault>,
+    config_delay: Duration,
+    keys_status: Option<u16>,
     unreadable_jwks: bool,
     other_secrets: Vec<String>,
+    parked: usize,
 }
 
 struct Keys {
@@ -413,8 +425,11 @@ impl Provider {
             token_answer: TokenAnswer::Normal,
             token_status: None,
             config_fault: None,
+            config_delay: Duration::ZERO,
+            keys_status: None,
             unreadable_jwks: false,
             other_secrets: Vec::new(),
+            parked: 0,
         };
         let shared = Arc::new(Shared {
             state: Mutex::new(state),
@@ -564,6 +579,22 @@ impl Provider {
         self.shared.lock().config_fault = fault;
     }
 
+    /// How long the configuration waits before answering.
+    pub fn config_delay(&self, delay: Duration) {
+        self.shared.lock().config_delay = delay;
+    }
+
+    /// The JWKS is answered with this status (and a JSON error) instead of
+    /// `200` while it is set.
+    pub fn keys_status(&self, status: Option<u16>) {
+        self.shared.lock().keys_status = status;
+    }
+
+    /// How many connections [`Outage::Park`] holds now.
+    pub fn parked(&self) -> usize {
+        self.shared.lock().parked
+    }
+
     /// Whether the JWKS is JSON that is no JWKS (`keys` not a list).
     pub fn unreadable_jwks(&self, unreadable: bool) {
         self.shared.lock().unreadable_jwks = unreadable;
@@ -683,8 +714,24 @@ fn now_secs() -> i64 {
 
 fn accept_loop(listener: &TcpListener, shared: &Arc<Shared>) {
     let mut connections: Vec<JoinHandle<()>> = Vec::new();
+    let mut parked: Vec<TcpStream> = Vec::new();
     while !shared.stop.load(Ordering::SeqCst) {
+        let parking = shared.lock().outage == Outage::Park;
+        if !parking && !parked.is_empty() {
+            for stream in parked.drain(..) {
+                drop(stream.shutdown(Shutdown::Both));
+            }
+            shared.lock().parked = 0;
+        }
         match listener.accept() {
+            Ok((stream, _)) if parking => {
+                if parked.len() < MAX_PARKED {
+                    parked.push(stream);
+                    shared.lock().parked = parked.len();
+                } else {
+                    drop(stream.shutdown(Shutdown::Both));
+                }
+            }
             Ok((stream, _)) => {
                 connections.retain(|c| !c.is_finished());
                 if connections.len() >= MAX_CONNECTIONS {
@@ -780,7 +827,7 @@ fn serve_connection(mut stream: TcpStream, shared: &Shared) {
             drop(stream.shutdown(Shutdown::Both));
             return;
         }
-        Outage::None => {}
+        Outage::None | Outage::Park => {}
     }
     drop(stream.set_read_timeout(Some(IO_TIMEOUT)));
     drop(stream.set_write_timeout(Some(IO_TIMEOUT)));
@@ -955,10 +1002,20 @@ fn answer(incoming: &Incoming, shared: &Shared) -> Answer {
 
 fn configuration(shared: &Shared) -> Answer {
     let issuer = &shared.issuer;
-    let (methods, fault) = {
+    let (methods, fault, delay) = {
         let state = shared.lock();
-        (state.auth_methods.clone(), state.config_fault)
+        (
+            state.auth_methods.clone(),
+            state.config_fault,
+            state.config_delay,
+        )
     };
+    if !delay.is_zero() {
+        thread::sleep(delay);
+    }
+    if let Some(ConfigFault::Status(status)) = fault {
+        return Answer::json(status, &json!({ "error": "harness_status" }));
+    }
     let mut body = json!({
             "issuer": issuer,
             "authorization_endpoint": format!("{issuer}/authorize"),
@@ -985,7 +1042,7 @@ fn configuration(shared: &Shared) -> Answer {
         Some(ConfigFault::Oversize) => {
             body["padding"] = Value::String("x".repeat(OVERSIZE_BYTES));
         }
-        None => {}
+        Some(ConfigFault::Status(_)) | None => {}
     }
     Answer::json(200, &body)
 }
@@ -1019,14 +1076,18 @@ fn ec_jwk(key: &EcdsaKeyPair) -> Value {
 }
 
 fn jwks(shared: &Shared) -> Answer {
-    let (publish_other, oversize, unreadable) = {
+    let (publish_other, oversize, unreadable, status) = {
         let state = shared.lock();
         (
             state.publish_other,
             state.oversize_jwks,
             state.unreadable_jwks,
+            state.keys_status,
         )
     };
+    if let Some(status) = status {
+        return Answer::json(status, &json!({ "error": "harness_status" }));
+    }
     if unreadable {
         return Answer::json(200, &json!({ "keys": "these are not keys" }));
     }

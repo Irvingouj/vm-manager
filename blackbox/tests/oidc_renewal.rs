@@ -19,9 +19,9 @@ use std::sync::Barrier;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use blackbox::Response;
 use blackbox::oidc::{Outage, TokenAnswer, TokenFault, TokenStatus};
 use blackbox::sessions::{ADA, GRACE, Installation, ada, grace};
+use blackbox::{Request, Response};
 use serde_json::json;
 
 fn renewing_every(seconds: u64) -> Installation {
@@ -501,5 +501,252 @@ fn after_the_client_secret_changes_a_session_ends_at_its_next_renewal() {
     at.assert_logged(
         "session-ended",
         &[("reason", json!("unreadable-refresh-token"))],
+    );
+}
+
+/// Signs Ada in, then starts the program again on the same platform
+/// database with the same secret, with `before_start` done to the provider
+/// first (so that the program, which holds no configuration after the
+/// start, meets it at its first call), and waits until the session's
+/// renewal is due. Returns the installation and Ada's browser.
+fn renewal_due_after_a_start(
+    seconds: u64,
+    before_start: impl FnOnce(&Installation),
+) -> (Installation, blackbox::browser::Browser) {
+    let at = renewing_every(seconds);
+    let mut browser = at.browser_as(ADA);
+    let signed_in = Instant::now();
+    at.sign_in(&mut browser, "honest", "/");
+    at.provider.set_groups(ADA, &["devops"]);
+    before_start(&at);
+    let at = at.restarted();
+    browser.reach(at.vm.address());
+    wait_past(signed_in, Duration::from_secs(seconds));
+    (at, browser)
+}
+
+/// Fails unless `answer` is `503` with `Retry-After`, `took` under 12 s.
+fn assert_503_in_time(answer: &Response, took: Duration, context: &str) {
+    assert_eq!(answer.status, 503, "{context}\n{}", answer.describe());
+    assert!(
+        answer.header("retry-after").is_some(),
+        "{context}: expected Retry-After\n{}",
+        answer.describe()
+    );
+    assert!(
+        took < Duration::from_secs(12),
+        "{context}: a renewal ends within 10 s, all its calls together; the answer took {took:?}"
+    );
+}
+
+#[test]
+fn a_renewal_that_must_first_fetch_a_configuration_that_is_held_ends_within_10_seconds() {
+    let (at, mut browser) = renewal_due_after_a_start(3, |at| {
+        at.provider.set_outage(Outage::Hang);
+    });
+    let began = Instant::now();
+    let answer = at.get_json(&mut browser, "honest", "/");
+    assert_503_in_time(&answer, began.elapsed(), "the configuration held");
+    at.vm.records_of(&answer).assert_no_application_code_ran();
+    assert!(
+        !at.provider
+            .requests_to("/.well-known/openid-configuration")
+            .is_empty(),
+        "the program, started again, asked for the configuration"
+    );
+    at.provider.set_outage(Outage::None);
+    assert_eq!(
+        at.user_seen(&mut browser, "honest")["groups"],
+        json!(["devops"]),
+        "once the provider answers, the session (which stayed) is renewed"
+    );
+}
+
+#[test]
+fn a_renewal_whose_configuration_is_slow_and_token_endpoint_held_ends_within_10_seconds_in_all() {
+    // 6 s for the configuration and a token endpoint that does not answer
+    // within 10 s: 10 s for each call would be 16 s.
+    let (at, mut browser) = renewal_due_after_a_start(3, |at| {
+        at.provider.config_delay(Duration::from_secs(6));
+        at.provider.token_delay(Duration::from_secs(20));
+    });
+    let began = Instant::now();
+    let answer = at.get_json(&mut browser, "honest", "/");
+    assert_503_in_time(
+        &answer,
+        began.elapsed(),
+        "a slow configuration, then a held token endpoint",
+    );
+    at.provider.config_delay(Duration::ZERO);
+    at.provider.token_delay(Duration::ZERO);
+    assert_eq!(
+        at.user_seen(&mut browser, "honest")["groups"],
+        json!(["devops"]),
+        "once the provider answers, the session (which stayed) is renewed"
+    );
+}
+
+#[test]
+fn at_most_1024_sessions_are_renewed_at_once_and_one_more_is_503_at_once() {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+
+    const PEOPLE: usize = 53;
+    const EACH: usize = 20;
+    const RENEWING: usize = 1024;
+    const RENEWAL: u64 = 20;
+    let test_began = Instant::now();
+    let people: Vec<blackbox::oidc::Person> = (0..PEOPLE)
+        .map(|i| blackbox::oidc::Person::new(&format!("00u-many-{i:02}")))
+        .collect();
+    let at = Installation::start_with(
+        &[("honest", "honest.js")],
+        &people,
+        &["--session-renewal", &RENEWAL.to_string()],
+    );
+    // 1,060 sessions, 20 for each of 53 people, each in a browser of its
+    // own; kept as the Cookie header honest is sent with.
+    let first_sign_in = Instant::now();
+    let cookies: Vec<String> = thread::scope(|scope| {
+        let handles: Vec<_> = (0..10)
+            .map(|t| {
+                let at = &at;
+                scope.spawn(move || {
+                    let mut cookies = Vec::new();
+                    for n in (t..PEOPLE * EACH).step_by(10) {
+                        let mut browser = at.browser_as(&format!("00u-many-{:02}", n % PEOPLE));
+                        at.sign_in(&mut browser, "honest", "/");
+                        cookies.push(browser.jar.header_for(&at.app_url("honest", "/")).unwrap());
+                    }
+                    cookies
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap())
+            .collect()
+    });
+    let signed_in = first_sign_in.elapsed();
+    assert!(
+        signed_in < Duration::from_secs(RENEWAL - 2),
+        "the sign-ins took {signed_in:?}, too long to make them all before the first renewal"
+    );
+    let host = format!("honest.{}:{}", blackbox::DOMAIN, at.port());
+    let raw = |cookie: &str| {
+        format!(
+            "GET / HTTP/1.1\r\nHost: {host}\r\nAccept: application/json\r\nCookie: {cookie}\r\nConnection: close\r\n\r\n"
+        )
+    };
+    // Every session due; the token endpoint held, many calls at once.
+    wait_past(first_sign_in, Duration::from_secs(RENEWAL) + signed_in);
+    at.provider.set_outage(Outage::Park);
+    let fired = Instant::now();
+    let held: Vec<TcpStream> = cookies[..RENEWING]
+        .iter()
+        .map(|cookie| {
+            let mut stream = TcpStream::connect(at.vm.address()).unwrap();
+            stream.write_all(raw(cookie).as_bytes()).unwrap();
+            stream
+        })
+        .collect();
+    let sent_in = fired.elapsed();
+    // Each of them, as a client would, takes its answer when it comes and
+    // leaves.
+    let (statuses, one_more) = thread::scope(|scope| {
+        let reader = scope.spawn(move || {
+            let mut statuses = std::collections::BTreeMap::new();
+            for mut stream in held {
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(25)))
+                    .unwrap();
+                let mut head = Vec::new();
+                drop(stream.read_to_end(&mut head));
+                let line = String::from_utf8_lossy(&head)
+                    .lines()
+                    .next()
+                    .unwrap_or("no answer")
+                    .to_owned();
+                *statuses.entry(line).or_insert(0_usize) += 1;
+            }
+            statuses
+        });
+        while at.provider.parked() < RENEWING && fired.elapsed() < Duration::from_secs(4) {
+            thread::sleep(Duration::from_millis(20));
+        }
+        let parked = at.provider.parked();
+        assert!(
+            fired.elapsed() < Duration::from_secs(8),
+            "the 1,024 renewals must still be under way (sent in {sent_in:?})"
+        );
+        // A request with no session meanwhile, which no renewal concerns:
+        // how long it takes tells a bound on connections from the bound on
+        // renewals.
+        let began = Instant::now();
+        let without = Request::new(at.vm.address(), "/", &host)
+            .header("accept", "application/json")
+            .timeout(Duration::from_secs(25))
+            .try_send()
+            .map(|a| a.status);
+        let without = (without, began.elapsed());
+        // One more session.
+        let began = Instant::now();
+        let answer = Request::new(at.vm.address(), "/", &host)
+            .header("accept", "application/json")
+            .header("cookie", &cookies[RENEWING + 10])
+            .timeout(Duration::from_secs(25))
+            .try_send();
+        let took = began.elapsed();
+        // The provider answers again: the held calls are closed unanswered.
+        at.provider.set_outage(Outage::None);
+        (reader.join().unwrap(), (answer, took, parked, without))
+    });
+    let (answer, took, parked, without) = one_more;
+    let answer = answer.unwrap_or_else(|e| {
+        at.vm.fail(&format!(
+            "one more session while {RENEWING} are being renewed ({parked} calls held at the provider, the requests sent in {sent_in:?}): {e}"
+        ))
+    });
+    assert_eq!(
+        answer.status,
+        503,
+        "one more session while {RENEWING} are being renewed ({parked} calls held at the provider)\n{}",
+        answer.describe()
+    );
+    assert!(
+        took < Duration::from_secs(1),
+        "one more session is answered 503 at once, not after a renewal's time: it took {took:?} ({parked} calls held at the provider; the held requests got {statuses:?}; a request without a session just before got {:?} in {:?})",
+        without.0,
+        without.1
+    );
+    at.vm.records_of(&answer).assert_no_application_code_ran();
+    assert_eq!(
+        statuses.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["HTTP/1.1 503 Service Unavailable"],
+        "each held request of a session whose provider does not answer is 503: {statuses:?}"
+    );
+    let released = Instant::now();
+    for (n, cookie) in cookies[..20].iter().chain(&cookies[RENEWING..]).enumerate() {
+        let answer = Request::new(at.vm.address(), "/", &host)
+            .header("accept", "application/json")
+            .header("cookie", cookie)
+            .timeout(Duration::from_secs(15))
+            .try_send()
+            .unwrap_or_else(|e| {
+                at.vm.fail(&format!(
+                    "the session {n} after the provider answers again ({:?} after the release): {e}",
+                    released.elapsed()
+                ))
+            });
+        assert_eq!(
+            answer.status,
+            200,
+            "once the provider answers, the session is served\n{}",
+            answer.describe()
+        );
+    }
+    eprintln!(
+        "1,060 sign-ins in {signed_in:?}; 1,024 requests sent in {sent_in:?}; {parked} calls held at the provider; one more answered in {took:?}; the test took {:?}",
+        test_began.elapsed()
     );
 }

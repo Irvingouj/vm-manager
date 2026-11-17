@@ -248,3 +248,33 @@ fn an_id_token_with_times_in_fractions_of_a_second_is_taken() {
     at.sign_in(&mut browser, "honest", "/");
     assert_eq!(at.user_seen(&mut browser, "honest")["id"], ADA);
 }
+
+#[test]
+fn a_configuration_answered_with_a_status_other_than_200_is_a_502_page_at_step_two() {
+    let at = installation();
+    at.provider.config_fault(Some(ConfigFault::Status(500)));
+    assert_step_two_fails(&at, "a configuration answered 500");
+    at.assert_logged(
+        "identity-provider-unanswered",
+        &[
+            ("call", json!("configuration")),
+            ("problem", json!("status")),
+            ("status", json!(500)),
+        ],
+    );
+}
+
+#[test]
+fn keys_answered_with_a_status_other_than_200_are_a_502_page_at_the_callback() {
+    let at = installation();
+    at.provider.keys_status(Some(404));
+    assert_callback_fails(&at, 502, "keys answered 404");
+    at.assert_logged(
+        "identity-provider-unanswered",
+        &[
+            ("call", json!("keys")),
+            ("problem", json!("status")),
+            ("status", json!(404)),
+        ],
+    );
+}

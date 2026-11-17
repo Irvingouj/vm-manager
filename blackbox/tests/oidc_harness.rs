@@ -526,3 +526,59 @@ fn a_request_left_unanswered_is_still_recorded() {
     assert_eq!(provider.grants("refresh_token").len(), 1);
     provider.set_outage(Outage::None);
 }
+
+#[test]
+fn the_configuration_and_keys_can_answer_a_status_and_the_configuration_can_wait() {
+    let provider = Provider::start(&[ada()]);
+    provider.config_fault(Some(ConfigFault::Status(500)));
+    assert_eq!(
+        get(&provider, "/.well-known/openid-configuration").status,
+        500
+    );
+    provider.config_fault(None);
+    provider.keys_status(Some(404));
+    assert_eq!(get(&provider, "/jwks").status, 404);
+    provider.keys_status(None);
+    assert_eq!(get(&provider, "/jwks").status, 200);
+    provider.config_delay(Duration::from_millis(600));
+    let began = std::time::Instant::now();
+    assert_eq!(
+        get(&provider, "/.well-known/openid-configuration").status,
+        200
+    );
+    assert!(began.elapsed() >= Duration::from_millis(600));
+}
+
+#[test]
+fn parked_connections_are_held_unanswered_and_closed_when_the_outage_ends() {
+    let provider = Provider::start(&[ada()]);
+    provider.set_outage(Outage::Park);
+    let held: Vec<std::net::TcpStream> = (0..200)
+        .map(|_| std::net::TcpStream::connect(provider.address()).unwrap())
+        .collect();
+    let began = std::time::Instant::now();
+    while provider.parked() < 200 && began.elapsed() < Duration::from_secs(5) {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(provider.parked(), 200);
+    let unanswered = Request::new(provider.address(), "/jwks", "127.0.0.1")
+        .timeout(Duration::from_millis(500))
+        .try_send();
+    assert!(unanswered.is_err());
+    provider.set_outage(Outage::None);
+    let began = std::time::Instant::now();
+    while provider.parked() > 0 && began.elapsed() < Duration::from_secs(5) {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(provider.parked(), 0);
+    let mut closed = held.into_iter().next().unwrap();
+    closed
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut byte = [0_u8; 1];
+    assert!(matches!(
+        std::io::Read::read(&mut closed, &mut byte),
+        Ok(0) | Err(_)
+    ));
+    assert_eq!(get(&provider, "/jwks").status, 200);
+}
