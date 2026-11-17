@@ -1799,3 +1799,4 @@ The black-box harness has an identity provider of its own (`blackbox`, no produc
 - The Dashboard at `dashboard.<domain>`: its ticket; it signs in by the same way through.
 - Signing out at the identity provider, and being signed out by it (back-channel logout).
 - TLS: the program listens in plain HTTP behind what ends TLS (the ticket on installing).
+- An identity provider whose certificate is signed by a company's own certificate authority: the program trusts the public roots compiled into it and no other (the ticket on installing).
