@@ -111,9 +111,35 @@ const CASES: &[Case] = &[
             ("sec-fetch-dest", "empty"),
         ],
     ),
+    // A GET or HEAD with an Origin that is not the Application's address,
+    // whatever Sec-Fetch-Site says, a navigation included.
+    refused("GET", &[("origin", "{other}")]),
+    refused(
+        "GET",
+        &[("origin", "{other}"), ("sec-fetch-site", "same-origin")],
+    ),
+    refused(
+        "GET",
+        &[
+            ("origin", "{other}"),
+            ("sec-fetch-site", "cross-site"),
+            ("sec-fetch-mode", "navigate"),
+            ("sec-fetch-dest", "document"),
+        ],
+    ),
+    refused("HEAD", &[("origin", "{other}")]),
+    refused("HEAD", &[("origin", "{other}"), ("sec-fetch-site", "none")]),
     // An OPTIONS with an Origin that is not the Application's address.
     refused("OPTIONS", &[("origin", "{other}")]),
-    // What is taken.
+    // What is taken. With both headers, Origin decides.
+    allowed(
+        "POST",
+        &[("origin", "{app}"), ("sec-fetch-site", "cross-site")],
+    ),
+    allowed(
+        "GET",
+        &[("origin", "{app}"), ("sec-fetch-site", "same-origin")],
+    ),
     allowed("POST", &[("origin", "{app}")]),
     allowed(
         "POST",

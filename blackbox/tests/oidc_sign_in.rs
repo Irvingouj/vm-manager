@@ -93,6 +93,7 @@ fn a_browser_without_a_session_goes_through_the_identity_provider_and_lands_sign
     let sign_in_cookie = the_set_cookie(&first.response, SIGN_IN_COOKIE, "step 1");
     assert_platform_cookie(&sign_in_cookie, SIGN_IN_COOKIE, "step 1's cookie");
     assert_ten_minutes(&sign_in_cookie, "step 1's cookie");
+    assert_256_bits(&sign_in_cookie.value, "step 1's cookie");
     assert_eq!(
         sign_in_cookie.value, state,
         "step 1's cookie holds the state"
@@ -314,38 +315,82 @@ fn only_a_page_is_sent_to_sign_in_and_anything_else_is_401_without_running_code(
 }
 
 #[test]
-fn an_unknown_application_is_404_and_the_sign_in_address_takes_only_a_known_one() {
+fn someone_not_signed_in_learns_of_no_application_and_someone_signed_in_gets_404() {
     let at = two_applications();
     let mut browser = at.browser_as(ADA);
+    // Not signed in: an address that is no Application's is answered as
+    // any other.
     let page = browser.open(&at.app_url("nowhere", "/"));
     assert_eq!(
         page.response.status,
-        404,
-        "a page of an unknown Application, no session\n{}",
+        302,
+        "a page of an address that is no Application's, no session\n{}",
         page.response.describe()
     );
-    for query in [
-        "application=nowhere&next=%2F&state=s",
+    let to_sign_in = page.location();
+    assert_eq!(to_sign_in.host_str(), Some(at.auth_host().as_str()));
+    assert_eq!(to_sign_in.path(), "/sign-in");
+    assert_eq!(
+        query_param(&to_sign_in, "application").as_deref(),
+        Some("nowhere")
+    );
+    let not_a_page = at.get_json(&mut browser, "nowhere", "/");
+    assert_eq!(not_a_page.status, 401, "{}", not_a_page.describe());
+    // /sign-in without a platform session does not look the Application up.
+    let step = browser.open(&at.auth_url("/sign-in?application=nowhere&next=%2F&state=s"));
+    assert_eq!(step.response.status, 302, "{}", step.response.describe());
+    assert!(
+        step.location()
+            .as_str()
+            .starts_with(&format!("{}/authorize?", at.provider.issuer())),
+        "an unknown name without a platform session goes to the provider: {}",
+        step.location()
+    );
+    // A name no Application could have is 400, signed in or not.
+    let impossible = [
         "application=evil.example&next=%2F&state=s",
         "application=honest.evil.example&next=%2F&state=s",
+        "application=Honest&next=%2F&state=s",
+        "application=-honest&next=%2F&state=s",
+        "application=xn--honest&next=%2F&state=s",
+        "application=&next=%2F&state=s",
         "next=%2F&state=s",
-    ] {
+    ];
+    for query in impossible {
         let step = browser.open(&at.auth_url(&format!("/sign-in?{query}")));
         assert_eq!(
             step.response.status,
-            404,
+            400,
             "/sign-in?{query} without a platform session\n{}",
             step.response.describe()
         );
     }
-    at.sign_in(&mut browser, "honest", "/");
-    let step = browser.open(&at.auth_url("/sign-in?application=nowhere&next=%2F&state=s"));
-    assert_eq!(
-        step.response.status,
-        404,
-        "an unknown Application with a platform session\n{}",
-        step.response.describe()
+    // Going on from the first page: signed in, the unknown Application is a
+    // 404 page at the sign-in address.
+    let steps = browser.navigate(&to_sign_in);
+    let last = steps.last().unwrap();
+    assert_eq!(last.response.status, 404, "{}", describe_steps(&steps));
+    assert_eq!(last.url.host_str(), Some(at.auth_host().as_str()));
+    assert!(
+        last.response
+            .header("content-type")
+            .is_some_and(|c| c.starts_with("text/html")),
+        "a page of the platform's own\n{}",
+        last.response.describe()
     );
+    let step = browser.open(&at.auth_url("/sign-in?application=nowhere&next=%2F&state=s"));
+    assert_eq!(step.response.status, 404, "{}", step.response.describe());
+    for query in impossible {
+        let step = browser.open(&at.auth_url(&format!("/sign-in?{query}")));
+        assert_eq!(
+            step.response.status,
+            400,
+            "/sign-in?{query} with a platform session\n{}",
+            step.response.describe()
+        );
+    }
+    // And the known one still signs in.
+    at.sign_in(&mut browser, "honest", "/");
 }
 
 #[test]
@@ -542,6 +587,32 @@ fn the_one_time_code_is_for_its_application_only() {
 }
 
 #[test]
+fn a_code_shown_at_the_wrong_application_is_used_up() {
+    let at = two_applications();
+    let mut browser = at.browser_as(ADA);
+    let session = at.walk_to_session_code(&mut browser, "honest", "/");
+    let state = query_param(&session, "state").unwrap();
+    let mut elsewhere = at.app_url("ledger", "/_vm/session");
+    elsewhere.set_query(session.query());
+    let mut thief = at.browser();
+    thief
+        .jar
+        .insert(&format!("ledger.{DOMAIN}"), SIGN_IN_COOKIE, &state);
+    assert_refused_code(&thief.open(&elsewhere).response, "honest's code at ledger");
+    let late = browser.open(&session);
+    assert_refused_code(
+        &late.response,
+        "the code at its own Application after it was shown elsewhere",
+    );
+    assert!(
+        browser
+            .jar
+            .get(&format!("honest.{DOMAIN}"), SESSION_COOKIE)
+            .is_none()
+    );
+}
+
+#[test]
 fn the_one_time_code_needs_the_cookie_of_step_one_and_its_state() {
     let at = two_applications();
     let mut browser = at.browser_as(ADA);
@@ -645,10 +716,11 @@ fn a_provider_unreachable_at_first_is_used_once_it_answers() {
     let first = browser.open(&at.app_url("honest", "/"));
     assert_eq!(first.response.status, 302, "step 1 needs no provider");
     let second = browser.follow(&first);
-    assert!(
-        [502, 503].contains(&second.response.status),
-        "expected the sign-in address to say the sign-in cannot be started while the provider does not answer, got\n{}",
-        second.response.describe()
+    assert_failure_page(
+        &second.response,
+        &[502],
+        &[],
+        "the sign-in address while the provider cannot be reached",
     );
     at.provider.set_outage(Outage::None);
     let mut fresh = at.browser_as(ADA);

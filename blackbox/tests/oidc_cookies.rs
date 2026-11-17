@@ -109,7 +109,7 @@ fn every_cookie_value_is_256_random_bits_and_no_two_are_alike() {
         ] {
             assert_256_bits(&cookie.value, which);
         }
-        assert!(!sign_in.value.is_empty());
+        assert_256_bits(&sign_in.value, "step 1's cookie");
         values.extend([sign_in.value, platform.value, application.value]);
     }
     let mut distinct = values.clone();
@@ -129,7 +129,7 @@ fn application_code_never_sees_the_platforms_cookies_and_sees_its_own_byte_for_b
     at.sign_in(&mut browser, "cookies", "/");
     let session = at.cookie_value(&browser, &format!("cookies.{DOMAIN}"), SESSION_COOKIE);
     let header = format!(
-        "theme=dark; {SESSION_COOKIE}={session}; lang=\"en GB\"; __Host-vm-session=x1; {SIGN_IN_COOKIE}=x2; __Host-vm-sign-in=x3; odd=a%20b=c; last=1"
+        "theme=dark; {SESSION_COOKIE}={session}; lang=\"en GB\"; __Host-vm-session=x1; {SIGN_IN_COOKIE}=x2; __Host-vm-sign-in=x3; VM-Session=mine; Vm-Sign-In=too; __host-vm-session=lower; odd=a%20b=c; last=1"
     );
     let answer = with_cookie_header(&at, "cookies", &header);
     assert_eq!(answer.status, 200, "{}", answer.describe());
@@ -141,13 +141,21 @@ fn application_code_never_sees_the_platforms_cookies_and_sees_its_own_byte_for_b
     let pairs: Vec<&str> = seen.split(';').map(str::trim).collect();
     assert_eq!(
         pairs,
-        vec!["theme=dark", "lang=\"en GB\"", "odd=a%20b=c", "last=1"],
-        "expected the code to see its own cookies byte for byte and none of the platform's; it saw {seen:?}"
+        vec![
+            "theme=dark",
+            "lang=\"en GB\"",
+            "VM-Session=mine",
+            "Vm-Sign-In=too",
+            "__host-vm-session=lower",
+            "odd=a%20b=c",
+            "last=1"
+        ],
+        "expected the code to see its own cookies byte for byte (names matched exactly, letter case included) and none of the platform's; it saw {seen:?}"
     );
-    for name in ["vm-session", "vm-sign-in"] {
+    for value in [session.as_str(), "x1", "x2", "x3"] {
         assert!(
-            !body.to_string().contains(name),
-            "expected no trace of {name} in what the code saw: {body}"
+            !seen.contains(&format!("={value}")),
+            "expected no platform cookie's value in what the code saw: {seen:?}"
         );
     }
     let only_platform = with_cookie_header(

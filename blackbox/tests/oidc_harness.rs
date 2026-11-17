@@ -17,8 +17,8 @@ use blackbox::Request;
 use blackbox::browser::{Browser, query_param, url};
 use blackbox::http::Response;
 use blackbox::oidc::{
-    CLIENT_ID, KID_EC, KID_MAIN, KID_OTHER, Key, Outage, Person, Provider, TokenFault, claims_of,
-    es256_verifies, header_of, rs256_verifies, s256,
+    CLIENT_ID, KID_EC, KID_MAIN, KID_OTHER, Key, Outage, Person, Provider, TokenAnswer, TokenFault,
+    claims_of, es256_verifies, header_of, rs256_verifies, s256,
 };
 use serde_json::{Value, json};
 use url::Url;
@@ -253,6 +253,10 @@ fn refresh_reads_the_groups_again_and_a_disabled_person_is_refused() {
     again.expect_status(200);
     let claims = claims_of(again.json()["id_token"].as_str().unwrap()).unwrap();
     assert_eq!(claims["groups"], json!(["devops"]));
+    assert!(
+        claims.get("nonce").is_none(),
+        "a renewal's token has no nonce: {claims}"
+    );
     provider.disable("ada-sub");
     let refused = token(
         &provider,
@@ -393,4 +397,21 @@ fn an_oversize_jwks_is_larger_than_a_mebibyte() {
     let provider = Provider::start(&[ada()]);
     provider.oversize_jwks(true);
     assert!(get(&provider, "/jwks").body().len() > 1024 * 1024);
+}
+
+#[test]
+fn the_token_answer_can_lack_an_id_token_or_not_be_json() {
+    let provider = Provider::start(&[ada()]);
+    provider.token_answer(TokenAnswer::WithoutIdToken);
+    let code = code_for(&provider, "ada-sub", "n");
+    let body = exchange(&provider, &code).json();
+    assert!(
+        body.get("id_token").is_none() && body["access_token"].is_string(),
+        "{body}"
+    );
+    provider.token_answer(TokenAnswer::NotJson);
+    let code = code_for(&provider, "ada-sub", "n");
+    let answer = exchange(&provider, &code);
+    assert_eq!(answer.status, 200);
+    assert!(serde_json::from_slice::<Value>(answer.body()).is_err());
 }

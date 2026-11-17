@@ -93,7 +93,7 @@ fn more_than_a_thousand_groups_or_one_longer_than_256_bytes_fails_the_sign_in() 
         let mut browser = at.browser_as(sub);
         let steps = at.walk_to_callback(&mut browser, "honest", "/");
         let callback = browser.follow(steps.last().unwrap());
-        assert_failure_page(&callback.response, &[400, 502], &at.provider.issued(), sub);
+        assert_failure_page(&callback.response, &[400], &at.provider.issued(), sub);
         assert!(browser.jar.get(&at.auth_host(), SESSION_COOKIE).is_none());
         at.assert_no_session(&mut browser, "honest", sub);
     }
@@ -124,4 +124,24 @@ fn groups_under_another_claim_than_the_one_read_are_no_groups() {
     let mut browser = at.browser_as("ada");
     at.sign_in(&mut browser, "honest", "/");
     assert_eq!(at.user_seen(&mut browser, "honest")["groups"], json!([]));
+}
+
+#[test]
+fn the_thousand_are_counted_once_repeats_are_dropped() {
+    let mut groups = many(1000, 32);
+    if let Value::Array(entries) = &mut groups {
+        let repeat = entries[0].clone();
+        entries.push(repeat);
+    }
+    let at = Installation::start_with(
+        &[("honest", "honest.js")],
+        &[person("repeats", Some(groups))],
+        &[],
+    );
+    let mut browser = at.browser_as("repeats");
+    at.sign_in(&mut browser, "honest", "/");
+    assert_eq!(
+        at.user_seen(&mut browser, "honest")["groups"],
+        many(1000, 32)
+    );
 }

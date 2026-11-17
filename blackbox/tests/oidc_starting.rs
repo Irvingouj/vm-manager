@@ -82,7 +82,7 @@ fn with_listen<'a>(args: &[&'a str]) -> Vec<&'a str> {
 #[test]
 fn the_three_oidc_settings_are_needed_together_and_the_missing_ones_are_named() {
     let issuer = "http://127.0.0.1:9";
-    let cases: [Case<'_>; 6] = [
+    let cases: [Case<'_>; 5] = [
         (
             "no secret",
             vec!["--oidc-issuer", issuer, "--oidc-client-id", CLIENT_ID],
@@ -112,12 +112,6 @@ fn the_three_oidc_settings_are_needed_together_and_the_missing_ones_are_named() 
             vec!["--oidc-client-id", CLIENT_ID],
             None,
             vec!["--oidc-issuer", "VM_OIDC_CLIENT_SECRET"],
-        ),
-        (
-            "the secret alone",
-            vec![],
-            Some(SECRET),
-            vec!["--oidc-issuer", "--oidc-client-id"],
         ),
     ];
     for (case, args, secret, named) in &cases {
@@ -320,4 +314,18 @@ fn the_client_secret_is_in_no_line_of_the_log_after_a_sign_in() {
     let mut hidden = installation.provider.issued();
     hidden.push(secret.expose().to_owned());
     installation.assert_none_in_log(&hidden, "after a sign-in");
+}
+
+#[test]
+fn the_secret_alone_in_the_environment_is_not_looked_at() {
+    let vm = Vm::start(
+        &VmOptions::new()
+            .stand_in_sign_in()
+            .env("VM_OIDC_CLIENT_SECRET", SECRET),
+    );
+    assert_eq!(vm.listening()["sign_in"], "stand-in", "{}", vm.listening());
+    assert!(
+        vm.lines().iter().all(|l| !l.raw.contains(SECRET)),
+        "expected the secret in no line of the log"
+    );
 }

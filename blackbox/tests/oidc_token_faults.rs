@@ -13,7 +13,7 @@
 
 use std::time::Duration;
 
-use blackbox::oidc::{Key, Outage, TokenFault};
+use blackbox::oidc::{Key, Outage, TokenAnswer, TokenFault};
 use blackbox::sessions::{ADA, Installation, SESSION_COOKIE, assert_failure_page};
 
 fn installation() -> Installation {
@@ -61,9 +61,8 @@ fn an_id_token_that_does_not_hold_begins_no_session_and_shows_nothing_of_it() {
     ];
     for (fault, context) in faults {
         at.provider.set_fault(Some(fault));
-        // A token that does not hold: `400`, or `502` if the platform counts
-        // it as the provider answering what it should not.
-        assert_sign_in_fails(&at, &[400, 502], context);
+        // A token that does not hold: `400`.
+        assert_sign_in_fails(&at, &[400], context);
     }
     at.provider.set_fault(None);
     let mut hidden = at.provider.issued();
@@ -78,7 +77,7 @@ fn an_id_token_that_does_not_hold_begins_no_session_and_shows_nothing_of_it() {
 fn an_id_token_signed_with_a_key_not_in_the_jwks_begins_no_session() {
     let at = installation();
     at.provider.sign_with(Key::Other);
-    assert_sign_in_fails(&at, &[400, 502], "a key the provider does not publish");
+    assert_sign_in_fails(&at, &[400], "a key the provider does not publish");
 }
 
 #[test]
@@ -88,7 +87,7 @@ fn an_unknown_key_fetches_the_keys_again_at_most_once_a_minute() {
     at.sign_in(&mut browser, "honest", "/");
     at.provider.sign_with(Key::Other);
     for round in 0..3 {
-        assert_sign_in_fails(&at, &[400, 502], &format!("an unknown key, try {round}"));
+        assert_sign_in_fails(&at, &[400], &format!("an unknown key, try {round}"));
     }
     let fetched = at.provider.requests_to("/jwks").len();
     assert!(
@@ -136,6 +135,39 @@ fn a_provider_that_closes_the_connection_at_the_callback_is_a_502_page() {
         &[502],
         &at.provider.issued(),
         "a provider that closes the connection",
+    );
+    assert!(browser.jar.get(&at.auth_host(), SESSION_COOKIE).is_none());
+}
+
+#[test]
+fn a_token_answer_without_an_id_token_or_not_json_is_a_502_page() {
+    let at = installation();
+    for (answer, context) in [
+        (
+            TokenAnswer::WithoutIdToken,
+            "a token answer without an ID token",
+        ),
+        (TokenAnswer::NotJson, "a token answer that is not JSON"),
+    ] {
+        at.provider.token_answer(answer);
+        assert_sign_in_fails(&at, &[502], context);
+    }
+}
+
+#[test]
+fn a_code_the_provider_refuses_is_a_400_page() {
+    let at = installation();
+    let mut browser = at.browser_as(ADA);
+    let steps = at.walk_to_callback(&mut browser, "honest", "/");
+    // Disabled between the authorization and the exchange: the provider
+    // answers `invalid_grant` to the code.
+    at.provider.disable(ADA);
+    let callback = browser.follow(steps.last().unwrap());
+    assert_failure_page(
+        &callback.response,
+        &[400],
+        &at.provider.issued(),
+        "a code the provider refuses",
     );
     assert!(browser.jar.get(&at.auth_host(), SESSION_COOKIE).is_none());
 }

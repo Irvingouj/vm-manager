@@ -16,6 +16,7 @@
 
 use std::time::{Duration, Instant};
 
+use blackbox::api::assert_recent_rfc3339;
 use blackbox::browser::{Browser, set_cookies};
 use blackbox::oidc::Person;
 use blackbox::sessions::{ADA, Installation, SESSION_COOKIE, ada, grace};
@@ -184,9 +185,11 @@ fn me_gives_the_users_record_for_this_browsers_session_and_401_without_one() {
     assert_eq!(record["email"], "ada@example.test");
     assert_eq!(record["groups"], json!(["finance"]));
     for field in ["first_sign_in", "session_started", "session_renewed"] {
+        assert_recent_rfc3339(&record[field], 120, &format!("/me's `{field}`"));
+        let text = record[field].as_str().unwrap_or_default();
         assert!(
-            !record[field].is_null(),
-            "expected `{field}` in the record: {record}"
+            text.ends_with('Z') || text.ends_with("+00:00"),
+            "expected `{field}` in UTC: {record}"
         );
     }
     // A second sign-in in another browser: the same first sign-in, another
@@ -225,8 +228,9 @@ fn name_and_email_are_brought_up_to_date_at_renewal_and_at_sign_in() {
     );
 }
 
-fn absent_or_null(record: &Value, field: &str) -> bool {
-    record.get(field).is_none_or(Value::is_null)
+/// `/me` gives `name` and `email` as null when there is none.
+fn null(record: &Value, field: &str) -> bool {
+    record.get(field) == Some(&Value::Null)
 }
 
 #[test]
@@ -235,16 +239,24 @@ fn a_name_or_email_longer_than_256_bytes_is_left_out() {
         .named(&"n".repeat(257))
         .email(&format!("{}@example.test", "e".repeat(250)));
     let exact = Person::new("exact-sub").named(&"n".repeat(256));
-    let at = Installation::start_with(&[("honest", "honest.js")], &[long, exact], &[]);
+    let nameless = Person::new("nameless-sub");
+    let at = Installation::start_with(&[("honest", "honest.js")], &[long, exact, nameless], &[]);
     let mut browser = at.browser_as("long-sub");
     at.sign_in(&mut browser, "honest", "/");
     let record = at.me(&mut browser).json();
     assert_eq!(record["id"], "long-sub");
-    assert!(absent_or_null(&record, "name"), "{record}");
-    assert!(absent_or_null(&record, "email"), "{record}");
+    assert!(null(&record, "name"), "{record}");
+    assert!(null(&record, "email"), "{record}");
     let mut browser = at.browser_as("exact-sub");
     at.sign_in(&mut browser, "honest", "/");
     assert_eq!(at.me(&mut browser).json()["name"], "n".repeat(256));
+    let mut browser = at.browser_as("nameless-sub");
+    at.sign_in(&mut browser, "honest", "/");
+    let record = at.me(&mut browser).json();
+    assert!(
+        null(&record, "name") && null(&record, "email"),
+        "no name or email: {record}"
+    );
 }
 
 #[test]

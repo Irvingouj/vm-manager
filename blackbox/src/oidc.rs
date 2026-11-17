@@ -176,6 +176,17 @@ pub enum TokenFault {
     OtherSubject,
 }
 
+/// What the token endpoint's successful answer looks like.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TokenAnswer {
+    /// JSON with an `id_token`: the default.
+    Normal,
+    /// JSON without an `id_token`.
+    WithoutIdToken,
+    /// `200` with a body that is not JSON.
+    NotJson,
+}
+
 /// Whether the provider answers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Outage {
@@ -269,6 +280,7 @@ struct State {
     deny: bool,
     token_delay: Duration,
     oversize_jwks: bool,
+    token_answer: TokenAnswer,
 }
 
 struct Keys {
@@ -369,6 +381,7 @@ impl Provider {
             deny: false,
             token_delay: Duration::ZERO,
             oversize_jwks: false,
+            token_answer: TokenAnswer::Normal,
         };
         let shared = Arc::new(Shared {
             state: Mutex::new(state),
@@ -505,6 +518,11 @@ impl Provider {
     /// Whether the JWKS is padded to more than 1 MiB.
     pub fn oversize_jwks(&self, oversize: bool) {
         self.shared.lock().oversize_jwks = oversize;
+    }
+
+    /// What the token endpoint's successful answers look like from now on.
+    pub fn token_answer(&self, answer: TokenAnswer) {
+        self.shared.lock().token_answer = answer;
     }
 
     /// Every request answered so far, in order. Fails if more were made
@@ -1098,7 +1116,14 @@ fn token(recorded: &mut Recorded, shared: &Shared) -> Answer {
     if person.disabled {
         return token_error(400, "invalid_grant");
     }
-    let id_token = id_token(shared, &state, &person, grant.nonce.as_deref());
+    // A renewal's ID token carries no `nonce` (OIDC Core 12.2 allows
+    // either; the platform must not ask for one).
+    let nonce = if recorded.form_param("grant_type") == Some("refresh_token") {
+        None
+    } else {
+        grant.nonce.as_deref()
+    };
+    let id_token = id_token(shared, &state, &person, nonce);
     let access_token = shared.random();
     keep_issued(&mut state, &id_token);
     keep_issued(&mut state, &access_token);
@@ -1115,7 +1140,21 @@ fn token(recorded: &mut Recorded, shared: &Shared) -> Answer {
         state.refresh_tokens.insert(refresh_token.clone(), grant);
         body["refresh_token"] = Value::String(refresh_token);
     }
-    Answer::json(200, &body)
+    match state.token_answer {
+        TokenAnswer::Normal => Answer::json(200, &body),
+        TokenAnswer::WithoutIdToken => {
+            if let Some(fields) = body.as_object_mut() {
+                fields.remove("id_token");
+            }
+            Answer::json(200, &body)
+        }
+        TokenAnswer::NotJson => Answer {
+            status: 200,
+            content_type: "application/json",
+            headers: Vec::new(),
+            body: b"<html>this is not JSON</html>".to_vec(),
+        },
+    }
 }
 
 fn id_token(shared: &Shared, state: &State, person: &Person, nonce: Option<&str>) -> String {

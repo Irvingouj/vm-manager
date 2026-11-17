@@ -20,7 +20,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use blackbox::Response;
-use blackbox::oidc::{Outage, TokenFault};
+use blackbox::oidc::{Outage, TokenAnswer, TokenFault};
 use blackbox::sessions::{ADA, GRACE, Installation, ada, grace};
 use serde_json::json;
 
@@ -251,5 +251,41 @@ fn a_user_holds_at_most_twenty_sessions_and_the_oldest_ends_first() {
             ADA,
             "session {i} of 21 still holds"
         );
+    }
+}
+
+#[test]
+fn a_renewal_answered_without_an_id_token_ends_the_session() {
+    let at = renewing_every(2);
+    let mut browser = at.browser_as(ADA);
+    let signed_in = Instant::now();
+    at.sign_in(&mut browser, "honest", "/");
+    at.sign_in(&mut browser, "ledger", "/");
+    at.provider.token_answer(TokenAnswer::WithoutIdToken);
+    wait_past(signed_in, Duration::from_secs(2));
+    at.assert_no_session(&mut browser, "honest", "a renewal without an ID token");
+    at.assert_no_session(&mut browser, "ledger", "a renewal without an ID token");
+    assert_eq!(at.provider.grants("refresh_token").len(), 1);
+}
+
+#[test]
+fn a_renewal_whose_id_token_does_not_hold_ends_the_session() {
+    for fault in [
+        TokenFault::BadSignature,
+        TokenFault::WrongAudience,
+        TokenFault::ExpiresIn(-120),
+    ] {
+        let at = renewing_every(2);
+        let mut browser = at.browser_as(ADA);
+        let signed_in = Instant::now();
+        at.sign_in(&mut browser, "honest", "/");
+        at.provider.set_fault(Some(fault));
+        wait_past(signed_in, Duration::from_secs(2));
+        at.assert_no_session(
+            &mut browser,
+            "honest",
+            &format!("a renewal whose ID token does not hold ({fault:?})"),
+        );
+        assert_eq!(at.provider.grants("refresh_token").len(), 1, "{fault:?}");
     }
 }
