@@ -1,8 +1,11 @@
 //! The platform program (ADR 0015).
 //!
 //! `VM_DATABASE_URL=postgres://... vm serve --domain <domain> --listen
-//! <ip:port> [--stand-in-sign-in] [--administrators-group <Group>]` serves the Applications kept in the
-//! platform database, and the platform's API (blackbox/CONTRACT.md).
+//! <ip:port> [--stand-in-sign-in] [--administrators-group <Group>]
+//! [--oidc-issuer <URL> --oidc-client-id <id> ...]` serves the
+//! Applications kept in the platform database, and the platform's API
+//! (blackbox/CONTRACT.md); with OIDC, `VM_OIDC_CLIENT_SECRET` in the
+//! environment.
 //! `vm sign-in`, `vm sign-out`, `vm whoami`, `vm resources`, `vm
 //! applications`, `vm pull`, `vm new`, `vm check`, `vm generate`, `vm
 //! deploy`, `vm versions`, `vm go-back` and `vm logs` are the Builder's tool
@@ -21,6 +24,10 @@ use tokio::net::TcpListener;
 use vm::api::Api;
 use vm::executor;
 use vm::ingress::Ingress;
+use vm::oidc::Oidc;
+use vm::oidc::secret::ClientSecret;
+use vm::oidc::settings::{self as oidc_settings, DEFAULT_GROUPS_CLAIM, Settings};
+use vm::origin::{Public, Scheme};
 use vm::platform::{Limits, Platform};
 use vm::platform_db::{self, DatabaseAddress, PoolLimits};
 use vm::registry::is_dns_label;
@@ -125,6 +132,89 @@ struct Serve {
     #[arg(long, default_value_t = DEFAULT_LIFETIME.as_secs(),
           value_parser = clap::value_parser!(u64).range(1..=MAX_TOOL_CREDENTIAL_LIFETIME))]
     tool_credential_lifetime: u64,
+    /// OIDC sign-in: the identity provider's issuer, https://... (http://
+    /// only on a loopback host). Needs --oidc-client-id and
+    /// VM_OIDC_CLIENT_SECRET in the environment.
+    #[arg(long)]
+    oidc_issuer: Option<String>,
+    /// OIDC sign-in: the platform's client id at the identity provider.
+    #[arg(long)]
+    oidc_client_id: Option<String>,
+    /// The ID token's claim that holds the person's Groups.
+    #[arg(long, default_value = DEFAULT_GROUPS_CLAIM)]
+    oidc_groups_claim: String,
+    /// The scopes asked for, separated by spaces; openid is always asked.
+    #[arg(long)]
+    oidc_scopes: Option<String>,
+    /// How a browser reaches the installation: https (the default) or http.
+    #[arg(long, value_enum, default_value_t = Scheme::Https)]
+    public_scheme: Scheme,
+    /// The port a browser reaches the installation at: 443 with https, the
+    /// listening port with http, without it.
+    #[arg(long, value_parser = clap::value_parser!(u16).range(1..))]
+    public_port: Option<u16>,
+    /// How long the Groups read at sign-in are used before the identity
+    /// provider is asked again, in seconds.
+    #[arg(long, default_value_t = 600, value_parser = clap::value_parser!(u64).range(1..=86_400))]
+    session_renewal: u64,
+    /// How long a session lives from its sign-in, in seconds.
+    #[arg(long, default_value_t = 43_200, value_parser = clap::value_parser!(u64).range(60..=2_592_000))]
+    session_lifetime: u64,
+}
+
+/// The variable that holds the OIDC client secret.
+const CLIENT_SECRET_VARIABLE: &str = "VM_OIDC_CLIENT_SECRET";
+
+/// The OIDC settings, when the program is started with OIDC: the issuer,
+/// the client id and the secret together, each checked. The message names
+/// each thing missing, and never the secret.
+fn oidc(serve: &Serve) -> Result<Option<Settings>, String> {
+    if serve.oidc_issuer.is_none() && serve.oidc_client_id.is_none() {
+        // The secret alone in the environment is not looked at.
+        return Ok(None);
+    }
+    let secret = std::env::var_os(CLIENT_SECRET_VARIABLE)
+        .and_then(|value| value.into_string().ok())
+        .filter(|value| !value.is_empty())
+        .map(ClientSecret::new);
+    let mut missing = Vec::new();
+    if serve.oidc_issuer.is_none() {
+        missing.push("--oidc-issuer");
+    }
+    if serve.oidc_client_id.is_none() {
+        missing.push("--oidc-client-id");
+    }
+    if secret.is_none() {
+        missing.push("VM_OIDC_CLIENT_SECRET (in the environment, as UTF-8)");
+    }
+    let (Some(issuer), Some(client_id), Some(client_secret)) =
+        (&serve.oidc_issuer, &serve.oidc_client_id, secret)
+    else {
+        return Err(format!(
+            "OIDC sign-in needs --oidc-issuer, --oidc-client-id and {CLIENT_SECRET_VARIABLE} together; missing: {}",
+            missing.join(", ")
+        ));
+    };
+    oidc_settings::check_issuer(issuer)
+        .map_err(|why| format!("--oidc-issuer {issuer:?} cannot be used: {why}"))?;
+    if client_id.is_empty() || client_id.len() > 256 || client_id.chars().any(char::is_control) {
+        return Err(
+            "--oidc-client-id must be 1 to 256 bytes without control characters".to_owned(),
+        );
+    }
+    let groups_claim = serve.oidc_groups_claim.trim();
+    if groups_claim.is_empty() {
+        return Err("--oidc-groups-claim names no claim".to_owned());
+    }
+    Ok(Some(Settings {
+        issuer: issuer.clone(),
+        client_id: client_id.clone(),
+        client_secret,
+        groups_claim: groups_claim.to_owned(),
+        scopes: oidc_settings::scopes(serve.oidc_scopes.as_deref()),
+        renewal: Duration::from_secs(serve.session_renewal),
+        lifetime: Duration::from_secs(serve.session_lifetime),
+    }))
 }
 
 /// The longest lifetime `--tool-credential-lifetime` takes: ten years.
@@ -212,6 +302,19 @@ fn run(serve: &Serve) -> Result<(), String> {
             serve.domain
         ));
     }
+    if serve.stand_in_sign_in && (serve.oidc_issuer.is_some() || serve.oidc_client_id.is_some()) {
+        return Err(
+            "--stand-in-sign-in cannot be switched on together with OIDC (--oidc-issuer): the stand-in is for tests and the local run only"
+                .to_owned(),
+        );
+    }
+    if serve.stand_in_sign_in && !serve.listen.ip().is_loopback() {
+        return Err(format!(
+            "--stand-in-sign-in is for tests and the local run only: it needs a loopback --listen address, not {}",
+            serve.listen
+        ));
+    }
+    let oidc = oidc(serve)?;
     let address = database_address()?;
     let sign_in: Box<dyn SignIn> = if serve.stand_in_sign_in {
         Box::new(StandInSignIn)
@@ -241,7 +344,7 @@ fn run(serve: &Serve) -> Result<(), String> {
             ..
         } = Platform::open(&address, limits).await?;
         let credentials = Arc::new(ToolCredentials::new(
-            database,
+            Arc::clone(&database),
             Duration::from_secs(serve.tool_credential_lifetime),
         ));
         let domain: Arc<str> = Arc::from(domain);
@@ -251,6 +354,28 @@ fn run(serve: &Serve) -> Result<(), String> {
         let address = listener
             .local_addr()
             .map_err(|e| format!("cannot read the listening address: {e}"))?;
+        let public = Public::new(
+            serve.public_scheme,
+            serve.public_port.unwrap_or(match serve.public_scheme {
+                Scheme::Https => 443,
+                Scheme::Http => address.port(),
+            }),
+        );
+        let oidc = match oidc {
+            Some(settings) => Some(Arc::new(Oidc::new(
+                settings,
+                Arc::clone(&database),
+                Arc::clone(&registry),
+                Arc::clone(&domain),
+                public,
+            )?)),
+            None => None,
+        };
+        let sign_in_name = match (&oidc, sign_in.is_stand_in()) {
+            (Some(_), _) => "oidc",
+            (None, true) => "stand-in",
+            (None, false) => "none",
+        };
         let serving = registry.serving_names();
         let serving: Vec<&str> = serving.iter().map(AsRef::as_ref).collect();
         log::record(
@@ -260,6 +385,7 @@ fn run(serve: &Serve) -> Result<(), String> {
                 "domain": &*domain,
                 "applications": serving,
                 "stand_in_sign_in": sign_in.is_stand_in(),
+                "sign_in": sign_in_name,
             }),
         );
         let ingress = Arc::new(Ingress {
@@ -275,6 +401,8 @@ fn run(serve: &Serve) -> Result<(), String> {
             domain,
             registry,
             sign_in,
+            oidc,
+            public,
             credentials,
             runner,
             logs,

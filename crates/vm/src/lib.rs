@@ -7,8 +7,13 @@
 //!
 //! - [`ingress`]: from an HTTP request to an Application and a User, and
 //!   from the Application's answer back to an HTTP response.
-//! - [`sign_in`]: who is this request's User. For now only a development
-//!   stand-in; real sessions fill the same seam later.
+//! - [`sign_in`]: who is this request's User, by the development
+//!   stand-in or the local run's choice.
+//! - [`oidc`]: OIDC sign-in and per-subdomain sessions: the sign-in
+//!   address, the sessions in the platform database, their renewal.
+//! - [`origin`]: the addresses a browser reaches, and the rule that
+//!   refuses a request from another origin.
+//! - [`cookies`]: the platform's cookies, kept from Application code.
 //! - [`runner`]: the Request runner. Runs an Application's
 //!   `fetch(request, ctx)` in a fresh context, with the request in flight
 //!   held by the host.
@@ -49,12 +54,15 @@
 pub mod api;
 pub mod app_logs;
 pub mod check;
+pub mod cookies;
 pub mod executor;
 pub mod gateway;
 pub mod ingress;
 pub mod log;
 pub mod migration_text;
+pub mod oidc;
 pub mod oplog;
+pub mod origin;
 pub mod own_db;
 pub mod platform;
 pub mod platform_db;

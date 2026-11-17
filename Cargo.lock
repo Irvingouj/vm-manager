@@ -2412,6 +2412,7 @@ name = "vm"
 version = "0.0.0"
 dependencies = [
  "authz",
+ "base64 0.22.1",
  "blackbox",
  "bytes",
  "clap",
@@ -2426,6 +2427,7 @@ dependencies = [
  "openworkers-runtime-v8",
  "pg_query",
  "postgres-protocol",
+ "ring",
  "rustix 1.1.6",
  "rustls",
  "serde",
@@ -2435,6 +2437,7 @@ dependencies = [
  "tokio",
  "tokio-postgres",
  "tokio-rustls",
+ "url",
  "uuid",
  "webpki-roots",
  "zip",

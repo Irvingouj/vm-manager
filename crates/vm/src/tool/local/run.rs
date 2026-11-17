@@ -54,6 +54,7 @@ use crate::executor;
 use crate::gateway::PlatformGateway;
 use crate::ingress::{GivenToCode, Ingress, REQUEST_ID_HEADER};
 use crate::oplog::OperationLog;
+use crate::origin::Public;
 use crate::own_db::OwnDatabases;
 use crate::platform::{Limits, Platform};
 use crate::platform_db::{Connection, DatabaseAddress, DbError, PlatformDatabase, PoolLimits};
@@ -342,6 +343,8 @@ impl Live {
                 None,
             ),
             sign_in: Box::new(LocalSignIn),
+            oidc: None,
+            public: Public::local(),
             credentials: Arc::new(ToolCredentials::new(
                 Arc::clone(&database),
                 DEFAULT_LIFETIME,

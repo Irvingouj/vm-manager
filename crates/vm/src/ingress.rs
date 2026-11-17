@@ -6,10 +6,15 @@
 //! `Authorization` header, when there is one, decides alone: a tool
 //! credential ([`ToolCredentials`]) that is alive signs its User in, and
 //! anything else is the `401` of anyone not signed in, whatever stand-in
-//! headers come with it. On an Application's address
-//! (`<application>.<domain>`) only the [`SignIn`] counts; its serving
-//! Version, which the Application registry holds in memory, is run by the
-//! Request runner. Its own
+//! headers come with it. With OIDC ([`Oidc`]) the sign-in address
+//! (`auth.<domain>`) and every Application's `/_vm/session` are its, and
+//! on an Application's address (`<application>.<domain>`) only that
+//! Application's session cookie signs a request in; without, only the
+//! [`SignIn`] counts. Then a request from another origin than the
+//! Application's own is refused ([`from_another_origin`]), whatever the
+//! sign-in; then the serving Version, which the Application registry holds
+//! in memory, is run by the Request runner, the platform's cookies taken
+//! out of the request and kept out of the answer ([`cookies`]). Its own
 //! refusals are short plain text. Every answer carries `x-vm-request-id`,
 //! and the request's `request` record is written just before the answer
 //! goes, after everything the Application did with it.
@@ -21,16 +26,20 @@ use std::time::Duration;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Body;
-use hyper::header::{CONTENT_TYPE, HOST, HeaderName, HeaderValue};
+use hyper::header::{CONTENT_TYPE, HOST, HeaderName, HeaderValue, RETRY_AFTER, SET_COOKIE};
 use hyper::{HeaderMap, Request, Response, StatusCode};
 use openworkers_core::{HttpMethod, HttpRequest, RequestBody};
 use serde_json::json;
 
 use crate::api::{Answer, Api, SignedInWith};
 use crate::app_logs::{Collected, Logs};
+use crate::cookies;
 use crate::gateway::Transactions;
 use crate::log;
-use crate::registry::Registry;
+use crate::oidc::sessions::Current;
+use crate::oidc::{AUTH_NAME, Oidc, SESSION_PATH};
+use crate::origin::{Public, from_another_origin};
+use crate::registry::{Registry, check_name};
 use crate::runner::{InFlight, Outcome, RequestRunner};
 use crate::sign_in::{RESERVED_HEADER_PREFIX, SignIn, SignedIn, remove_reserved_headers};
 use crate::tool_credentials::{self, Presented, ToolCredentials};
@@ -56,6 +65,13 @@ pub struct Ingress {
     pub registry: Arc<Registry>,
     pub api: Api,
     pub sign_in: Box<dyn SignIn>,
+    /// OIDC sign-in and sessions, when the program was started with it:
+    /// then it alone signs a request to an Application in, and the sign-in
+    /// address (`auth.<domain>`) is its.
+    pub oidc: Option<Arc<Oidc>>,
+    /// How a browser reaches the installation: the origin a request to an
+    /// Application must come from.
+    pub public: Public,
     /// Tool credentials: a sign-in on the API only.
     pub credentials: Arc<ToolCredentials>,
     pub runner: RequestRunner,
@@ -96,7 +112,7 @@ impl Ingress {
             path: parts.uri.path(),
         };
 
-        let Some(host) = parts.headers.get(HOST).and_then(host_name) else {
+        let Some((host, port)) = parts.headers.get(HOST).and_then(host_name) else {
             return finish(
                 &known,
                 own(StatusCode::BAD_REQUEST, "Bad request: no Host header.\n"),
@@ -154,13 +170,60 @@ impl Ingress {
                 .await;
             return finish(&known, api_response(answer));
         }
-        // On an Application's address a tool credential is no sign-in.
-        let user = match stated {
-            SignedIn::User(user) => user,
-            SignedIn::NotSignedIn | SignedIn::Malformed(_) => {
-                return finish(&known, not_signed_in());
+        let user = match &self.oidc {
+            Some(oidc) => {
+                if name == Some(AUTH_NAME) {
+                    return finish(&known, oidc.sign_in_address(&parts, port).await);
+                }
+                if let Some(name) = name
+                    && parts.uri.path() == SESSION_PATH
+                {
+                    return finish(&known, oidc.session_step(&parts, name, port).await);
+                }
+                // Only the Application's own cookie, and only on its own
+                // address, signs a request in.
+                let current = match name.filter(|n| check_name(n).is_ok()) {
+                    Some(name) => oidc.user_of(&parts, name).await,
+                    None => Current::None,
+                };
+                match current {
+                    Current::User { user, .. } => user,
+                    Current::None => {
+                        let answer = oidc
+                            .not_signed_in(&parts, name, port)
+                            .unwrap_or_else(not_signed_in);
+                        return finish(&known, answer);
+                    }
+                    Current::Unavailable => return finish(&known, unavailable()),
+                }
             }
+            // On an Application's address a tool credential is no sign-in.
+            None => match stated {
+                SignedIn::User(user) => user,
+                SignedIn::NotSignedIn | SignedIn::Malformed(_) => {
+                    return finish(&known, not_signed_in());
+                }
+            },
         };
+        // After the sign-in: a request from another origin than the
+        // Application's own is refused, its code not run.
+        if from_another_origin(
+            &parts.method,
+            &parts.headers,
+            &self.public.origin(&host, port),
+        ) {
+            let known = Known {
+                user: Some(&user.id),
+                ..known
+            };
+            return finish(
+                &known,
+                own(
+                    StatusCode::FORBIDDEN,
+                    "Refused: this request comes from another origin than the Application's own.\n",
+                ),
+            );
+        }
         // From memory: no round trip to the platform database. The request
         // holds this Version until it ends, whatever is sent meanwhile.
         let Some(serving) = name.and_then(|name| self.registry.serving(name)) else {
@@ -222,6 +285,7 @@ impl Ingress {
         };
         remove_reserved_headers(&mut parts.headers);
         tool_credentials::remove_credentials(&mut parts.headers);
+        cookies::remove_platform_cookies(&mut parts.headers);
         let path_and_query = parts.uri.path_and_query().map_or("/", |p| p.as_str());
         let request = HttpRequest {
             method: http_method,
@@ -258,6 +322,20 @@ impl Ingress {
                     if name.as_str().starts_with(RESERVED_HEADER_PREFIX) {
                         continue;
                     }
+                    // Nor can the code set the platform's cookies, or a
+                    // cookie the other Applications would be sent.
+                    if name == SET_COOKIE
+                        && let Some(dropped) = cookies::judge_set_cookie(value.as_bytes())
+                    {
+                        log::record(
+                            "set-cookie-dropped",
+                            json!({
+                                "application": &*in_flight.application,
+                                "reason": dropped.reason(),
+                            }),
+                        );
+                        continue;
+                    }
                     headers.append(name, value);
                 }
                 response
@@ -288,14 +366,15 @@ impl Ingress {
     }
 }
 
-/// The `Host` without its port, in lower case; `None` when there is none.
-fn host_name(value: &HeaderValue) -> Option<String> {
+/// The `Host` without its port, in lower case, and its port; `None` when
+/// there is none.
+fn host_name(value: &HeaderValue) -> Option<(String, Option<u16>)> {
     let text = value.to_str().ok()?.trim();
-    let name = match text.rsplit_once(':') {
-        Some((name, port)) if port.bytes().all(|b| b.is_ascii_digit()) => name,
-        _ => text,
+    let (name, port) = match text.rsplit_once(':') {
+        Some((name, port)) if port.bytes().all(|b| b.is_ascii_digit()) => (name, port.parse().ok()),
+        _ => (text, None),
     };
-    (!name.is_empty()).then(|| name.to_ascii_lowercase())
+    (!name.is_empty()).then(|| (name.to_ascii_lowercase(), port))
 }
 
 /// The headers as the runtime takes them: one value per name, repeated
@@ -321,6 +400,19 @@ fn not_signed_in() -> Response<Full<Bytes>> {
     own(StatusCode::UNAUTHORIZED, "Not signed in.\n")
 }
 
+/// `503`: whether the request is signed in cannot be known now.
+fn unavailable() -> Response<Full<Bytes>> {
+    let mut response = own(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Unavailable: the sign-in cannot be checked just now. Try again shortly.\n",
+    );
+    response.headers_mut().insert(
+        RETRY_AFTER,
+        HeaderValue::from_static(crate::oidc::pages::RETRY_AFTER_SECONDS),
+    );
+    response
+}
+
 /// An answer of the API as an HTTP response.
 fn api_response(answer: Answer) -> Response<Full<Bytes>> {
     let mut response = Response::new(Full::new(answer.body));
@@ -341,6 +433,7 @@ fn own(status: StatusCode, text: &'static str) -> Response<Full<Bytes>> {
         CONTENT_TYPE,
         HeaderValue::from_static("text/plain; charset=utf-8"),
     );
+    crate::oidc::pages::own_headers(response.headers_mut());
     response
 }
 

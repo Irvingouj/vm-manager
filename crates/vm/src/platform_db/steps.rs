@@ -337,6 +337,59 @@ pub const STEPS: &[Step] = &[
         CREATE INDEX log_entries_application ON log_entries (application_id, id);
     ",
     },
+    Step {
+        number: 13,
+        name: "users, sessions and one-time codes",
+        sql: "
+        -- OIDC sign-in (crate::oidc; blackbox/CONTRACT.md, \"Sign-in and
+        -- sessions\"). A User's record, made at their first sign-in: the
+        -- `sub` as `id`; `name` and `email` brought up to date at each
+        -- sign-in and renewal.
+        CREATE TABLE users (
+            id text PRIMARY KEY,
+            name text,
+            email text,
+            first_sign_in timestamptz NOT NULL DEFAULT now(),
+            updated_at timestamptz NOT NULL DEFAULT now()
+        );
+        -- A platform session, kept only as the SHA-256 of its cookie's
+        -- value; its Groups as last read; its refresh token sealed
+        -- (crate::oidc::seal), null when the sign-in brought none. At most
+        -- 20 a User (crate::oidc::sessions).
+        CREATE TABLE sessions (
+            id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+            digest bytea NOT NULL UNIQUE CHECK (length(digest) = 32),
+            user_id text NOT NULL REFERENCES users (id),
+            groups text[] NOT NULL,
+            refresh_token bytea,
+            started_at timestamptz NOT NULL DEFAULT now(),
+            renewed_at timestamptz NOT NULL DEFAULT now(),
+            ends_at timestamptz NOT NULL
+        );
+        CREATE INDEX sessions_user ON sessions (user_id, id);
+        -- An Application's session, made from a platform session and ended
+        -- with it: the SHA-256 of its cookie's value, valid on that
+        -- Application only.
+        CREATE TABLE application_sessions (
+            digest bytea PRIMARY KEY CHECK (length(digest) = 32),
+            session_id bigint NOT NULL REFERENCES sessions (id) ON DELETE CASCADE,
+            application text NOT NULL
+        );
+        CREATE INDEX application_sessions_session
+            ON application_sessions (session_id, application);
+        -- A one-time code of step 4: the SHA-256 of the code and of the
+        -- step-1 cookie's value it is bound to. Deleted by the first
+        -- request that shows it.
+        CREATE TABLE session_codes (
+            digest bytea PRIMARY KEY CHECK (length(digest) = 32),
+            session_id bigint NOT NULL REFERENCES sessions (id) ON DELETE CASCADE,
+            application text NOT NULL,
+            state_digest bytea NOT NULL CHECK (length(state_digest) = 32),
+            made_at timestamptz NOT NULL DEFAULT now()
+        );
+        CREATE INDEX session_codes_made ON session_codes (made_at);
+    ",
+    },
 ];
 
 /// The advisory lock every step's transaction takes first: "vm steps".

@@ -38,6 +38,13 @@ rustix.workspace = true
 rustls.workspace = true
 tokio-rustls.workspace = true
 webpki-roots.workspace = true
+# OIDC sign-in (src/oidc): ID tokens' RS256 and ES256 signatures, the
+# refresh token sealed at rest (AES-256-GCM, HKDF), randomness; base64url
+# for JWS and JWKS; the issuer's and the endpoints' URLs and their query
+# strings. All three already in the tree through rustls and the harness.
+ring.workspace = true
+base64.workspace = true
+url.workspace = true
 zip.workspace = true
 liblzma.workspace = true
 tar.workspace = true
