@@ -11,6 +11,7 @@
 
 use std::fmt;
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
@@ -318,11 +319,19 @@ pub fn connect_with_setup(
     )
 }
 
+/// How long a request that connects OIDC is waited for: the platform gives
+/// the provider 10 seconds, and answers after that.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+
 /// `PUT /v1/oidc` on the program's API with this body, signed in with
 /// `Authorization: Bearer <bearer>` (a setup credential or a tool
 /// credential), or not signed in.
 pub fn put_oidc(vm: &Vm, bearer: Option<&str>, body: &Value) -> Response {
-    let request = vm.api_request("/v1/oidc").method("PUT").json(body);
+    let request = vm
+        .api_request("/v1/oidc")
+        .method("PUT")
+        .timeout(CONNECT_TIMEOUT)
+        .json(body);
     match bearer {
         Some(credential) => request.bearer(credential),
         None => request,

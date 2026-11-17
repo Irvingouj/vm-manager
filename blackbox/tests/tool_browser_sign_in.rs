@@ -28,6 +28,8 @@
 )]
 
 use std::collections::BTreeSet;
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpStream};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -39,8 +41,8 @@ use blackbox::project::new_project;
 use blackbox::sessions::{ADA, GRACE, Installation, ada, grace, masked_steps, oidc_options};
 use blackbox::tool::{Machine, Run, Running, bearer, windows_in};
 use blackbox::tool_sign_ins::{
-    BrowserCommand, Challenge, Decision, OPEN_TIMEOUT, check_code_in, machine_name, strip_tags,
-    tool_address_in,
+    BrowserCommand, Challenge, Decision, OPEN_TIMEOUT, check_code_in, check_code_of, machine_name,
+    strip_tags, tool_address_in,
 };
 use blackbox::{DOMAIN, Response, Vm, VmOptions, assert_api_error};
 use serde_json::{Value, json};
@@ -351,6 +353,12 @@ fn without_a_browser_the_tool_shows_an_address_to_open_elsewhere_and_a_check_cod
         Some(machine_name().as_str())
     );
     assert_check_code_alphabet(&code);
+    let challenge = query_param(&address, "challenge").unwrap();
+    assert_eq!(
+        check_code_of(&challenge).as_deref(),
+        Some(code.as_str()),
+        "the check code is made from the challenge as the contract says"
+    );
     // On another device: a browser of its own.
     let mut browser = at.browser_as(ADA);
     let steps = at.walk_tool_to_page(&mut browser, &address);
@@ -1451,4 +1459,296 @@ fn the_harness_s_browser_command_writes_the_address_it_is_given_last() {
         opener.opened(),
         vec!["http://auth.vm.test:1/tool?challenge=x".to_owned()]
     );
+    assert_eq!(
+        opener.wait_opened(Duration::ZERO).as_deref(),
+        Some("http://auth.vm.test:1/tool?challenge=x")
+    );
+    assert_eq!(
+        opener.wait_opened(Duration::ZERO),
+        None,
+        "each address is returned once"
+    );
+    // A second sign-in on the same machine: its own address, not the first.
+    let status = std::process::Command::new(&script)
+        .arg("http://auth.vm.test:1/tool?challenge=y")
+        .status()
+        .unwrap();
+    assert!(status.success());
+    assert_eq!(
+        opener.wait_opened(Duration::ZERO).as_deref(),
+        Some("http://auth.vm.test:1/tool?challenge=y")
+    );
+    // A command made for a later sign-in never returns what was opened
+    // before it.
+    let later = BrowserCommand::on(&machine);
+    assert_eq!(later.wait_opened(Duration::ZERO), None);
+}
+
+#[test]
+fn the_harness_s_lingering_browser_command_runs_until_it_is_dropped() {
+    let machine = Machine::new();
+    let opener = BrowserCommand::lingering(&machine);
+    let (_, script) = opener.env();
+    let mut child = std::process::Command::new(&script)
+        .arg("http://auth.vm.test:1/tool?challenge=z")
+        .spawn()
+        .unwrap();
+    assert_eq!(
+        opener.wait_opened(Duration::from_secs(5)).as_deref(),
+        Some("http://auth.vm.test:1/tool?challenge=z")
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while opener.running().is_empty() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        opener.running(),
+        vec![child.id()],
+        "it runs, by its own pid"
+    );
+    assert!(child.try_wait().unwrap().is_none(), "it has not ended");
+    drop(opener);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut ended = None;
+    while ended.is_none() && Instant::now() < deadline {
+        ended = child.try_wait().unwrap();
+        thread::sleep(Duration::from_millis(20));
+    }
+    if ended.is_none() {
+        drop(child.kill());
+        drop(child.wait());
+        panic!("dropping the command ends it");
+    }
+}
+
+#[test]
+fn the_harness_makes_the_check_code_from_the_challenge() {
+    let challenge = Challenge::fresh().challenge;
+    let code = check_code_of(&challenge).unwrap();
+    assert_check_code_alphabet(&code);
+    assert_eq!(check_code_of(&challenge), Some(code), "the same each time");
+    assert_eq!(check_code_of("not-a-challenge"), None);
+}
+
+#[test]
+fn the_tool_does_not_wait_for_the_browser_command_to_end() {
+    let at = installation();
+    let machine = Machine::new();
+    let opener = BrowserCommand::lingering(&machine);
+    let (name, value) = opener.env();
+    let mut running = at.spawn_sign_in(
+        &machine,
+        &["--json", "--timeout", "30"],
+        &[(name, value.as_str())],
+    );
+    let address = opened(&opener, &running);
+    let port = port_of(&address);
+    let mut browser = at.browser_as(ADA);
+    let steps = at.walk_tool_to_page(&mut browser, &address);
+    let confirmed =
+        at.answer_tool_page(&mut browser, steps.last().unwrap(), Decision::Confirm, None);
+    let confirmed_at = Instant::now();
+    at.grant_of(&confirmed, port);
+    let at_tool = browser.follow(&confirmed);
+    let answered = confirmed_at.elapsed();
+    assert_eq!(
+        at_tool.response.status,
+        200,
+        "the tool answers the browser at its port\n{}",
+        shown(&at_tool.response, &[])
+    );
+    assert!(
+        answered < Duration::from_secs(2),
+        "expected the tool's port to answer the browser within 2 s of the confirm while the BROWSER command runs on; it took {answered:?}"
+    );
+    while !running.has_ended() && confirmed_at.elapsed() < Duration::from_secs(5) {
+        thread::sleep(Duration::from_millis(20));
+    }
+    let took = confirmed_at.elapsed();
+    let ended_in_time = running.has_ended();
+    let run = ended(running);
+    assert!(
+        ended_in_time,
+        "expected the tool to end within 5 s of the confirm while the BROWSER command runs on; it had not after {took:?}\n{}",
+        run.describe()
+    );
+    let printed = run.ok_json();
+    assert_eq!(printed["user"], ADA, "{printed}");
+    assert!(
+        !run.stderr.contains("has not ended"),
+        "the tool does not wait for the command, nor say it has not ended:\n{}",
+        run.stderr
+    );
+    assert!(
+        !opener.running().is_empty(),
+        "a command still running when the sign-in ends is left running"
+    );
+}
+
+#[test]
+fn with_a_port_a_sign_in_confirmed_elsewhere_without_a_port_does_not_sign_the_tool_in() {
+    // Grace has seen the address: she opens it without the port and types
+    // the check code anyone can make from the challenge.
+    let at = installation();
+    let machine = Machine::new();
+    let opener = BrowserCommand::on(&machine);
+    let (name, value) = opener.env();
+    let running = at.spawn_sign_in(
+        &machine,
+        &["--json", "--timeout", "12"],
+        &[(name, value.as_str())],
+    );
+    let address = opened(&opener, &running);
+    let challenge = query_param(&address, "challenge").unwrap();
+    let code = check_code_of(&challenge).unwrap();
+    let mut browser = at.browser_as(GRACE);
+    let elsewhere = at.auth_url(&format!("/tool?challenge={challenge}&machine=elsewhere"));
+    let steps = at.walk_tool_to_page(&mut browser, &elsewhere);
+    let confirmed = at.answer_tool_page(
+        &mut browser,
+        steps.last().unwrap(),
+        Decision::Confirm,
+        Some(&code),
+    );
+    assert_eq!(
+        confirmed.response.status,
+        200,
+        "{}",
+        shown(&confirmed.response, &[])
+    );
+    assert!(
+        at.tool_form(&confirmed).is_none(),
+        "the code made from the challenge is taken (not the page again for a wrong code)\n{}",
+        shown(&confirmed.response, &[])
+    );
+    let run = ended(running);
+    assert!(
+        !run.stdout.contains(GRACE),
+        "the tool waiting with a port is not signed in as Grace:\n{}",
+        run.describe()
+    );
+    run.json_error(3, "sign-in-not-finished");
+    assert_nothing_kept(
+        &machine,
+        "after a sign-in confirmed elsewhere without a port",
+    );
+}
+
+/// What a plain socket gets from the tool's port for this request head:
+/// the status and the body. Every wait is bounded.
+fn raw_to_tool(port: u16, head: &str) -> (u16, String) {
+    let address = SocketAddr::from(([127, 0, 0, 1], port));
+    let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(5)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    stream
+        .set_write_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    // The tool may answer before it has read the whole head: what it did
+    // not read is no failure of the test.
+    drop(stream.write_all(head.as_bytes()));
+    let mut answer = Vec::new();
+    drop(stream.read_to_end(&mut answer));
+    let text = String::from_utf8_lossy(&answer).into_owned();
+    let status = text
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let body = text
+        .split_once("\r\n\r\n")
+        .map(|(_, b)| b.to_owned())
+        .unwrap_or_default();
+    (status, body)
+}
+
+/// A request head to the tool's port with a `Cookie` of `cookie` bytes.
+fn head_with_cookie(target: &str, port: u16, cookie: usize) -> String {
+    format!(
+        "GET {target} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nUser-Agent: harness\r\nCookie: c={}\r\nConnection: close\r\n\r\n",
+        "x".repeat(cookie)
+    )
+}
+
+/// The tool waiting with a port, confirmed in Ada's browser, which has not
+/// gone to the port yet: the run, the port and the grant.
+fn confirmed_not_yet_at_the_port(at: &Installation, machine: &Machine) -> (Running, u16, String) {
+    let opener = BrowserCommand::on(machine);
+    let (name, value) = opener.env();
+    let running = at.spawn_sign_in(
+        machine,
+        &["--json", "--timeout", "30"],
+        &[(name, value.as_str())],
+    );
+    let address = opened(&opener, &running);
+    let port = port_of(&address);
+    let mut browser = at.browser_as(ADA);
+    let steps = at.walk_tool_to_page(&mut browser, &address);
+    let confirmed =
+        at.answer_tool_page(&mut browser, steps.last().unwrap(), Decision::Confirm, None);
+    let grant = at.grant_of(&confirmed, port);
+    (running, port, grant)
+}
+
+#[test]
+fn the_tool_s_port_reads_a_request_head_of_up_to_64_kib() {
+    // A browser sends there the cookies other programs on 127.0.0.1 set.
+    let at = installation();
+    for kib in [12, 60] {
+        let machine = Machine::new();
+        let (running, port, grant) = confirmed_not_yet_at_the_port(&at, &machine);
+        let head = head_with_cookie(&format!("/?grant={grant}"), port, kib * 1024);
+        let (status, body) = raw_to_tool(port, &head);
+        let run = ended(running);
+        assert_eq!(
+            status,
+            200,
+            "a head with a Cookie of {kib} KiB: expected 200 with the page\n{}\n{}",
+            masked(&body, &[&grant]),
+            run.describe()
+        );
+        let printed = run.ok_json();
+        assert_eq!(printed["user"], ADA, "{kib} KiB: {printed}");
+    }
+}
+
+#[test]
+fn the_tool_s_port_answers_404_to_anything_but_get_with_a_grant_and_goes_on_waiting() {
+    let at = installation();
+    let machine = Machine::new();
+    let (mut running, port, grant) = confirmed_not_yet_at_the_port(&at, &machine);
+    for (case, head) in [
+        (
+            "GET /other",
+            format!(
+                "GET /other?grant={grant} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+            ),
+        ),
+        (
+            "POST /?grant=",
+            format!(
+                "POST /?grant={grant} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            ),
+        ),
+    ] {
+        let (status, body) = raw_to_tool(port, &head);
+        assert_eq!(status, 404, "{case}\n{}", masked(&body, &[&grant]));
+        thread::sleep(Duration::from_millis(300));
+        assert!(
+            !running.has_ended(),
+            "{case}: the tool goes on waiting\n{}",
+            masked(&running.stderr_so_far(), &[&grant])
+        );
+    }
+    let head = head_with_cookie(&format!("/?grant={grant}"), port, 0);
+    let (status, body) = raw_to_tool(port, &head);
+    assert_eq!(
+        status,
+        200,
+        "the real grant after them still signs in\n{}",
+        masked(&body, &[&grant])
+    );
+    let printed = ended(running).ok_json();
+    assert_eq!(printed["user"], ADA, "{printed}");
 }

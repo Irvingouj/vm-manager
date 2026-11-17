@@ -17,17 +17,21 @@
     reason = "test code: a failed expectation is a failing test"
 )]
 
+use std::net::SocketAddr;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use blackbox::connection::{Connection, SecretKey, installation_of};
+use blackbox::connection::{
+    Connection, SecretKey, installation_of, put_oidc, setup_credential, shown,
+};
 use blackbox::oidc::{Outage, Provider};
-use blackbox::postgres::Platform;
+use blackbox::postgres::{Platform, free_port};
 use blackbox::program::{EXIT_TIMEOUT, Finished, run_to_exit, vm_binary};
 use blackbox::sessions::{ADA, Installation, ada, oidc_options};
-use blackbox::{DOMAIN, Vm, VmOptions};
+use blackbox::tool::{Machine, bearer};
+use blackbox::{DOMAIN, User, Vm, VmOptions};
 use serde_json::json;
 
 /// A client secret no other test uses, to look for where it must not be.
@@ -427,4 +431,103 @@ fn the_client_secret_and_the_key_are_in_no_line_of_the_log_after_a_sign_in() {
     hidden.push(secret.expose().to_owned());
     hidden.push(installation.key().unwrap().expose().to_owned());
     installation.assert_none_in_log(&hidden, "after a sign-in");
+}
+
+/// An address on 127.0.0.1 nothing listens on now: to start the program
+/// again where the tool's credential file says it is.
+fn fixed_address() -> SocketAddr {
+    SocketAddr::from(([127, 0, 0, 1], free_port().unwrap()))
+}
+
+/// A program with the stand-in and `--administrators-group admins` at
+/// `address`, on a fresh platform database or this one.
+fn stand_in_at(address: SocketAddr, platform: Option<&Platform>) -> Vm {
+    let options = VmOptions::new()
+        .stand_in_sign_in()
+        .administrators_group("admins")
+        .listen(address);
+    Vm::start(&match platform {
+        Some(platform) => options.platform(platform),
+        None => options,
+    })
+}
+
+/// The tool on a new machine signed in with the stand-in as someone in the
+/// Group `admins`, a Platform administrator there; returns the machine and
+/// the credential it keeps (never printed).
+fn administrator_signed_in_with_the_stand_in(vm: &Vm) -> (Machine, String) {
+    let machine = Machine::new();
+    let signed = machine.sign_in(vm, &User::new("boss").in_groups(&["admins"]));
+    assert_eq!(
+        signed["platform_administrator"], true,
+        "the control: with the stand-in the credential is a Platform administrator's: {signed}"
+    );
+    let credential = machine.kept_credential(vm);
+    (machine, credential)
+}
+
+fn assert_signs_nobody_in(vm: &Vm, machine: &Machine, credential: &str, context: &str) {
+    let me = bearer(vm, "/v1/me", credential).send();
+    assert_eq!(
+        me.status,
+        401,
+        "{context}: GET /v1/me with a tool credential made with the stand-in\n{}",
+        shown(&me, &[credential])
+    );
+    machine
+        .run(&["whoami", "--json"])
+        .json_error(4, "sign-in-expired");
+}
+
+#[test]
+fn a_tool_credential_made_with_the_stand_in_signs_nobody_in_without_the_stand_in() {
+    let address = fixed_address();
+    let stand_in = stand_in_at(address, None);
+    let (machine, credential) = administrator_signed_in_with_the_stand_in(&stand_in);
+    let platform = stand_in.platform().clone();
+    drop(stand_in);
+    let vm = Vm::start(&oidc_options().platform(&platform).listen(address));
+    assert_signs_nobody_in(&vm, &machine, &credential, "started without the stand-in");
+    // Connected with the administrators' Group the credential stated: it
+    // does not become a Platform administrator's.
+    let provider = Provider::start(&[ada()]);
+    let setup = setup_credential(vm.platform());
+    let connection = Connection::to(&provider).administrators_group("admins");
+    let connected = put_oidc(&vm, Some(setup.expose()), &connection.body());
+    assert_eq!(
+        connected.status,
+        200,
+        "{}",
+        shown(&connected, &[setup.expose(), connection.secret().expose()])
+    );
+    assert_signs_nobody_in(&vm, &machine, &credential, "with OIDC connected");
+    let oidc = bearer(&vm, "/v1/oidc", &credential).send();
+    assert_eq!(
+        oidc.status,
+        401,
+        "GET /v1/oidc with a tool credential made with the stand-in\n{}",
+        shown(&oidc, &[&credential])
+    );
+}
+
+#[test]
+fn a_tool_credential_made_with_the_stand_in_is_good_again_at_a_start_with_the_stand_in() {
+    let address = fixed_address();
+    let stand_in = stand_in_at(address, None);
+    let (machine, credential) = administrator_signed_in_with_the_stand_in(&stand_in);
+    let platform = stand_in.platform().clone();
+    drop(stand_in);
+    let vm = Vm::start(&oidc_options().platform(&platform).listen(address));
+    assert_signs_nobody_in(&vm, &machine, &credential, "started without the stand-in");
+    drop(vm);
+    let again = stand_in_at(address, Some(&platform));
+    let me = bearer(&again, "/v1/me", &credential).send();
+    assert_eq!(
+        me.status,
+        200,
+        "started with the stand-in again, before any connection\n{}",
+        shown(&me, &[&credential])
+    );
+    let who = machine.run(&["whoami", "--json"]).ok_json();
+    assert_eq!(who["user"], "boss", "{who}");
 }

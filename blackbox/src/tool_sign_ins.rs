@@ -11,8 +11,10 @@
 //!   tool: a script that writes the address it is asked to open into a
 //!   file of the machine's, for the test to open in its own browser;
 //! - [`check_code_in`] and [`tool_address_in`] read what the tool wrote on
-//!   standard error.
+//!   standard error, and [`check_code_of`] makes a challenge's check code
+//!   as the contract says.
 
+use std::cell::Cell;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
@@ -22,6 +24,7 @@ use std::time::{Duration, Instant};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ring::rand::{SecureRandom, SystemRandom};
+use sha2::{Digest, Sha256};
 use url::Url;
 
 use crate::oidc::s256;
@@ -325,26 +328,60 @@ fn attribute(tag: &str, name: &str) -> Option<String> {
 
 /// The `BROWSER` command the harness gives the tool: a script on the
 /// machine that appends its last argument (the address to open) to a file
-/// and ends at once.
+/// and ends at once, or, made with [`BrowserCommand::lingering`], then goes
+/// on running as a browser does (ended when this is dropped, by the pid it
+/// wrote).
 pub struct BrowserCommand {
     script: PathBuf,
     opened: PathBuf,
+    /// Where a lingering command writes its pid.
+    pid: Option<PathBuf>,
+    /// How many of the addresses opened a wait has returned.
+    taken: Cell<usize>,
 }
 
 impl BrowserCommand {
     /// Writes the script into this machine's directory.
     pub fn on(machine: &Machine) -> Self {
+        Self::write(machine, false)
+    }
+
+    /// As [`BrowserCommand::on`], a command that writes the address, then
+    /// does not end: it sleeps (its standard streams on `/dev/null`) until
+    /// this is dropped.
+    pub fn lingering(machine: &Machine) -> Self {
+        Self::write(machine, true)
+    }
+
+    fn write(machine: &Machine, lingering: bool) -> Self {
         let script = machine.root().join("harness-browser");
         let opened = machine.root().join("harness-browser-opened");
-        let text = format!(
+        let pid = lingering.then(|| machine.root().join("harness-browser-pids"));
+        let mut text = format!(
             "#!/bin/sh\nfor last in \"$@\"; do :; done\nprintf '%s\\n' \"$last\" >> '{}'\n",
             opened.display()
         );
+        if let Some(pid) = &pid {
+            text.push_str(&format!(
+                "printf '%s\\n' \"$$\" >> '{}'\nexec sleep 600 </dev/null >/dev/null 2>&1\n",
+                pid.display()
+            ));
+        }
         fs::write(&script, text)
             .unwrap_or_else(|e| panic!("cannot write {}: {e}", script.display()));
         fs::set_permissions(&script, fs::Permissions::from_mode(0o755))
             .unwrap_or_else(|e| panic!("cannot make {} runnable: {e}", script.display()));
-        Self { script, opened }
+        // What was opened before this command was made (an earlier
+        // sign-in on the machine) is never a wait's to return.
+        let before = fs::read_to_string(&opened)
+            .map(|t| t.lines().count())
+            .unwrap_or(0);
+        Self {
+            script,
+            opened,
+            pid,
+            taken: Cell::new(before),
+        }
     }
 
     /// `BROWSER=<the script>`, for the tool's environment.
@@ -361,13 +398,30 @@ impl BrowserCommand {
             .collect()
     }
 
-    /// Waits at most `timeout` for the tool to open an address; returns
-    /// the first, or `None`.
+    /// The pids of the lingering commands still running.
+    pub fn running(&self) -> Vec<u32> {
+        let Some(pid) = &self.pid else {
+            return Vec::new();
+        };
+        fs::read_to_string(pid)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| l.trim().parse().ok())
+            .filter(|p: &u32| PathBuf::from(format!("/proc/{p}")).exists())
+            .collect()
+    }
+
+    /// Waits at most `timeout` for the tool to open an address that no
+    /// earlier wait returned and that was not opened before this command
+    /// was made; returns the newest of those, or `None`. So each sign-in on
+    /// the machine is answered with its own address.
     pub fn wait_opened(&self, timeout: Duration) -> Option<String> {
         let deadline = Instant::now() + timeout;
         loop {
-            if let Some(first) = self.opened().into_iter().next() {
-                return Some(first);
+            let opened = self.opened();
+            if opened.len() > self.taken.get() {
+                self.taken.set(opened.len());
+                return opened.last().cloned();
             }
             if Instant::now() >= deadline {
                 return None;
@@ -375,6 +429,52 @@ impl BrowserCommand {
             thread::sleep(Duration::from_millis(50));
         }
     }
+}
+
+impl Drop for BrowserCommand {
+    fn drop(&mut self) {
+        for pid in self.running() {
+            // Only the pids this command wrote, one by one.
+            drop(
+                std::process::Command::new("kill")
+                    .arg(pid.to_string())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status(),
+            );
+        }
+    }
+}
+
+/// The check code of a sign-in begun with this challenge, made as the
+/// contract says: the first 40 bits of SHA-256 of `vm: the check code of a
+/// sign-in of the tool`, a zero byte and the challenge's 32 bytes, five
+/// bits a character in `0123456789ABCDEFGHJKMNPQRSTVWXYZ`, as `XXXX-XXXX`.
+/// `None` when the challenge is not 32 bytes in base64url.
+pub fn check_code_of(challenge: &str) -> Option<String> {
+    const ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+    let bytes = URL_SAFE_NO_PAD.decode(challenge).ok()?;
+    if bytes.len() != 32 {
+        return None;
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(b"vm: the check code of a sign-in of the tool");
+    hasher.update([0_u8]);
+    hasher.update(&bytes);
+    let digest = hasher.finalize();
+    let mut bits: u64 = 0;
+    for byte in digest.iter().take(5) {
+        bits = (bits << 8) | u64::from(*byte);
+    }
+    let mut code = String::new();
+    for i in 0..8_u32 {
+        let index = usize::try_from((bits >> (35 - 5 * i)) & 0x1f).ok()?;
+        if i == 4 {
+            code.push('-');
+        }
+        code.push(char::from(*ALPHABET.get(index)?));
+    }
+    Some(code)
 }
 
 /// The check code (`XXXX-XXXX`: four letters or digits, a hyphen, four

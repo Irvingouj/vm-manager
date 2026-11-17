@@ -65,6 +65,8 @@ pub struct VmOptions {
     administrators_group: Option<String>,
     tool_credential_lifetime: Option<u64>,
     platform: Option<Platform>,
+    /// The address to listen on; `127.0.0.1:0` when none is given.
+    listen: Option<SocketAddr>,
     /// More arguments, after the others (the OIDC settings, say).
     extra_args: Vec<String>,
     /// Environment variables the program is started with.
@@ -94,6 +96,7 @@ impl Default for VmOptions {
             administrators_group: None,
             tool_credential_lifetime: None,
             platform: None,
+            listen: None,
             extra_args: Vec::new(),
             env: Vec::new(),
         }
@@ -142,6 +145,14 @@ impl VmOptions {
     #[must_use]
     pub fn platform(mut self, platform: &Platform) -> Self {
         self.platform = Some(platform.clone());
+        self
+    }
+
+    /// Starts the program listening on this address: to start it again
+    /// where the tool's credential file says it is.
+    #[must_use]
+    pub fn listen(mut self, address: SocketAddr) -> Self {
+        self.listen = Some(address);
         self
     }
 
@@ -209,7 +220,8 @@ impl VmOptions {
             "--domain".to_owned(),
             self.domain.clone(),
             "--listen".to_owned(),
-            "127.0.0.1:0".to_owned(),
+            self.listen
+                .map_or_else(|| "127.0.0.1:0".to_owned(), |a| a.to_string()),
         ];
         if self.stand_in_sign_in {
             args.push("--stand-in-sign-in".to_owned());
