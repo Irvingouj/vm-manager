@@ -367,6 +367,8 @@ pub const STEPS: &[Step] = &[
             ends_at timestamptz NOT NULL
         );
         CREATE INDEX sessions_user ON sessions (user_id, id);
+        -- Every ended session is deleted whenever anyone signs in.
+        CREATE INDEX sessions_ends ON sessions (ends_at);
         -- An Application's session, made from a platform session and ended
         -- with it: the SHA-256 of its cookie's value, valid on that
         -- Application only.

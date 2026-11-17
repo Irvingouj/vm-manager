@@ -174,18 +174,31 @@ fn now_seconds() -> i64 {
 }
 
 /// A time claim in whole seconds; `None` when absent, `Err` when it is not
-/// a whole number (a time past `i64` is read as the farthest one).
+/// a number. A time with a fraction of a second is read as its whole
+/// seconds (RFC 7519, NumericDate); one past `i64` as the farthest one.
 fn seconds(claims: &Map<String, Value>, name: &str) -> Result<Option<i64>, Refused> {
-    match claims.get(name) {
-        None => Ok(None),
-        Some(value) => value
-            .as_i64()
-            .or_else(|| value.as_u64().map(|_| i64::MAX))
-            .map(Some)
-            .ok_or(Refused::Invalid(
-                "a time claim is not a whole number of seconds",
-            )),
+    let Some(value) = claims.get(name) else {
+        return Ok(None);
+    };
+    if let Some(whole) = value.as_i64() {
+        return Ok(Some(whole));
     }
+    if value.as_u64().is_some() {
+        return Ok(Some(i64::MAX));
+    }
+    let fraction = value
+        .as_f64()
+        .filter(|f| f.is_finite())
+        .ok_or(Refused::Invalid("a time claim is not a number of seconds"))?;
+    // Its whole seconds, written out (a float's text never has an
+    // exponent) and read back: no cast. Past `i64`: the farthest time.
+    let floor = fraction.floor();
+    Ok(Some(
+        floor
+            .to_string()
+            .parse::<i64>()
+            .unwrap_or(if floor < 0.0 { i64::MIN } else { i64::MAX }),
+    ))
 }
 
 /// Checks `token` against `keys` and `expected`.

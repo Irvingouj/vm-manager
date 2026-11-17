@@ -13,10 +13,20 @@
 //! to read or replace them, never across a call; two requests that both
 //! find nothing kept may both fetch, which is harmless.
 //!
-//! Every call ends within [`http::CALL_TIMEOUT`].
+//! Every call ends within [`http::CALL_TIMEOUT`]; a renewal's calls end
+//! by its deadline too, all of them together ([`Provider::refresh`]).
+//!
+//! **What is no answer.** Not reached, late, larger than the bound, not
+//! JSON; `408`, `429` and `5xx`; a configuration that names another issuer
+//! or lacks an endpoint; keys that cannot be read. Each is logged as
+//! `identity-provider-unanswered` with its `call` and `problem`. Every other
+//! `4xx` of the token endpoint is a refusal, logged as
+//! `identity-provider-refused` with its `error` code only.
 
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use tokio::time::Instant;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
@@ -57,6 +67,17 @@ pub enum Problem {
     NoIdToken,
     /// The ID token does not hold.
     Invalid(&'static str),
+}
+
+impl Problem {
+    /// What went wrong, as a page may say it: the platform's own words.
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::Unanswered(why) | Self::Invalid(why) => why,
+            Self::Refused => "it refused",
+            Self::NoIdToken => "it answered without an ID token",
+        }
+    }
 }
 
 /// The provider's configuration, as far as the platform uses it.
@@ -105,8 +126,11 @@ impl Provider {
         })
     }
 
-    /// The configuration, kept or fetched.
-    pub async fn configuration(&self) -> Result<Arc<Configuration>, Problem> {
+    /// The configuration, kept or fetched (by `deadline`, when given).
+    pub async fn configuration(
+        &self,
+        deadline: Option<Instant>,
+    ) -> Result<Arc<Configuration>, Problem> {
         {
             let kept = self
                 .configuration
@@ -122,7 +146,7 @@ impl Provider {
             .ok_or(Problem::Unanswered(
                 "the configuration's address cannot be made",
             ))?;
-        let json = self.get_json(&address, "configuration").await?;
+        let json = self.get_json(&address, "configuration", deadline).await?;
         let configuration = Arc::new(self.read_configuration(&json)?);
         *self
             .configuration
@@ -135,10 +159,10 @@ impl Provider {
     }
 
     fn read_configuration(&self, json: &Value) -> Result<Configuration, Problem> {
-        let unreadable = Problem::Unanswered("its configuration lacks what is needed");
         if json.get("issuer").and_then(Value::as_str) != Some(self.settings.issuer.as_str()) {
+            log_problem("configuration", "another-issuer", None);
             return Err(Problem::Unanswered(
-                "its configuration names another issuer",
+                "its configuration names another issuer than the one the platform was started with (--oidc-issuer)",
             ));
         }
         let plain = self.settings.plain_http_allowed();
@@ -158,20 +182,39 @@ impl Provider {
             .unwrap_or_default();
         let post_secret =
             methods.contains(&"client_secret_post") && !methods.contains(&"client_secret_basic");
+        let (Some(authorization_endpoint), Some(token_endpoint), Some(jwks_uri)) = (
+            endpoint("authorization_endpoint"),
+            endpoint("token_endpoint"),
+            endpoint("jwks_uri"),
+        ) else {
+            log_problem("configuration", "lacks-endpoint", None);
+            return Err(Problem::Unanswered(
+                "its configuration lacks an endpoint the platform needs (authorization, token or keys), or names one that cannot be used",
+            ));
+        };
         Ok(Configuration {
-            authorization_endpoint: endpoint("authorization_endpoint").ok_or(unreadable)?,
-            token_endpoint: endpoint("token_endpoint").ok_or(unreadable)?,
-            jwks_uri: endpoint("jwks_uri").ok_or(unreadable)?,
+            authorization_endpoint,
+            token_endpoint,
+            jwks_uri,
             post_secret,
         })
     }
 
     /// `GET` an address that answers JSON.
-    async fn get_json(&self, address: &Url, what: &'static str) -> Result<Value, Problem> {
-        let answer = self.http.get(address).await.map_err(|f| failed(what, f))?;
+    async fn get_json(
+        &self,
+        address: &Url,
+        what: &'static str,
+        deadline: Option<Instant>,
+    ) -> Result<Value, Problem> {
+        let answer = self
+            .http
+            .get(address, deadline)
+            .await
+            .map_err(|f| failed(what, f))?;
         if answer.status != 200 {
             log_problem(what, "status", Some(answer.status));
-            return Err(Problem::Unanswered("it answered with an error"));
+            return Err(Problem::Unanswered("it answered with an error status"));
         }
         serde_json::from_slice(&answer.body).map_err(|_| {
             log_problem(what, "not-json", None);
@@ -180,7 +223,12 @@ impl Provider {
     }
 
     /// The keys: those kept, unless `again`, else fetched.
-    async fn keys(&self, configuration: &Configuration, again: bool) -> Result<Arc<Keys>, Problem> {
+    async fn keys(
+        &self,
+        configuration: &Configuration,
+        again: bool,
+        deadline: Option<Instant>,
+    ) -> Result<Arc<Keys>, Problem> {
         {
             let mut state = self.keys.lock().unwrap_or_else(PoisonError::into_inner);
             if !again && let Some(kept) = state.kept.as_ref().filter(|k| k.at.elapsed() < KEPT_FOR)
@@ -189,9 +237,14 @@ impl Provider {
             }
             state.asked = Some(Instant::now());
         }
-        let json = self.get_json(&configuration.jwks_uri, "keys").await?;
-        let keys =
-            Arc::new(Keys::from_jwks(&json).ok_or(Problem::Unanswered("its keys cannot be read"))?);
+        let json = self
+            .get_json(&configuration.jwks_uri, "keys", deadline)
+            .await?;
+        let Some(keys) = Keys::from_jwks(&json) else {
+            log_problem("keys", "unreadable-keys", None);
+            return Err(Problem::Unanswered("its keys cannot be read"));
+        };
+        let keys = Arc::new(keys);
         self.keys
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -220,6 +273,7 @@ impl Provider {
         configuration: &Configuration,
         id_token: &Secret,
         nonce: Option<&Secret>,
+        deadline: Option<Instant>,
     ) -> Result<Claims, Problem> {
         let expected = Expected {
             issuer: &self.settings.issuer,
@@ -227,10 +281,10 @@ impl Provider {
             groups_claim: &self.settings.groups_claim,
             nonce,
         };
-        let keys = self.keys(configuration, false).await?;
+        let keys = self.keys(configuration, false, deadline).await?;
         match token::verify(id_token.expose(), &keys, &expected) {
             Err(Refused::UnknownKey) if self.may_ask_again() => {
-                let keys = self.keys(configuration, true).await?;
+                let keys = self.keys(configuration, true, deadline).await?;
                 token::verify(id_token.expose(), &keys, &expected).map_err(refused)
             }
             other => other.map_err(refused),
@@ -245,25 +299,32 @@ impl Provider {
         redirect_uri: &str,
         nonce: &Secret,
     ) -> Result<Tokens, Problem> {
-        let configuration = self.configuration().await?;
+        let configuration = self.configuration(None).await?;
         let form = [
             ("grant_type", "authorization_code"),
             ("code", code.expose()),
             ("redirect_uri", redirect_uri),
             ("code_verifier", verifier.expose()),
         ];
-        self.token_call(&configuration, &form, Some(nonce)).await
+        self.token_call(&configuration, &form, Some(nonce), None)
+            .await
     }
 
     /// A renewal with the session's refresh token; the ID token checked
-    /// without a `nonce`.
-    pub async fn refresh(&self, refresh_token: &Secret) -> Result<Tokens, Problem> {
-        let configuration = self.configuration().await?;
+    /// without a `nonce`. Every call it makes (the configuration, the token
+    /// endpoint, the keys) ends by `deadline`.
+    pub async fn refresh(
+        &self,
+        refresh_token: &Secret,
+        deadline: Instant,
+    ) -> Result<Tokens, Problem> {
+        let configuration = self.configuration(Some(deadline)).await?;
         let form = [
             ("grant_type", "refresh_token"),
             ("refresh_token", refresh_token.expose()),
         ];
-        self.token_call(&configuration, &form, None).await
+        self.token_call(&configuration, &form, None, Some(deadline))
+            .await
     }
 
     /// The body of a call to the token endpoint, and its `Authorization`:
@@ -298,14 +359,17 @@ impl Provider {
         configuration: &Configuration,
         fields: &[(&str, &str)],
         nonce: Option<&Secret>,
+        deadline: Option<Instant>,
     ) -> Result<Tokens, Problem> {
         let (form, authorization) = self.token_request(configuration, fields)?;
         let answer = self
             .http
-            .post_form(&configuration.token_endpoint, form, authorization)
+            .post_form(&configuration.token_endpoint, form, authorization, deadline)
             .await
             .map_err(|f| failed("token", f))?;
-        if (400..500).contains(&answer.status) {
+        // 408 and 429 are a provider that cannot answer now, as 5xx are;
+        // every other 4xx is a refusal.
+        if (400..500).contains(&answer.status) && answer.status != 408 && answer.status != 429 {
             // The provider's `error` code only, never its description.
             let error = serde_json::from_slice::<Value>(&answer.body)
                 .ok()
@@ -318,7 +382,9 @@ impl Provider {
         }
         if answer.status != 200 {
             log_problem("token", "status", Some(answer.status));
-            return Err(Problem::Unanswered("it answered with an error"));
+            return Err(Problem::Unanswered(
+                "it answered that it cannot answer now (408, 429 or 5xx), or with another status that is no answer",
+            ));
         }
         let json: Value = serde_json::from_slice(&answer.body).map_err(|_| {
             log_problem("token", "not-json", None);
@@ -335,7 +401,9 @@ impl Provider {
             .and_then(Value::as_str)
             .filter(|t| !t.is_empty() && t.len() <= MAX_REFRESH_TOKEN_BYTES)
             .map(|t| Secret::from_text(t.to_owned()));
-        let claims = self.verified(configuration, &id_token, nonce).await?;
+        let claims = self
+            .verified(configuration, &id_token, nonce, deadline)
+            .await?;
         Ok(Tokens {
             claims,
             refresh_token,

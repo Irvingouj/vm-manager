@@ -76,28 +76,34 @@ fn page(status: StatusCode, title: &str, body: &str) -> Response<Full<Bytes>> {
     )
 }
 
-/// A sign-in that failed: what failed, and a link to try again.
-pub fn failed(status: StatusCode, what: &str, again: &str) -> Response<Full<Bytes>> {
+/// The way on from a page: a link to the Application's address when it is
+/// known which Application the sign-in was for; else words saying to open
+/// it again, and no link.
+fn way_on(again: Option<&str>) -> String {
+    match again {
+        Some(again) => format!("<p><a href=\"{}\">Try again</a></p>", escape(again)),
+        None => "<p>To try again, open the Application's address again.</p>".to_owned(),
+    }
+}
+
+/// A sign-in that failed: what failed, and the way on ([`way_on`]).
+pub fn failed(status: StatusCode, what: &str, again: Option<&str>) -> Response<Full<Bytes>> {
     page(
         status,
         "Sign-in failed",
-        &format!(
-            "<p>{}</p><p><a href=\"{}\">Try again</a></p>",
-            escape(what),
-            escape(again)
-        ),
+        &format!("<p>{}</p>{}", escape(what), way_on(again)),
     )
 }
 
-/// `404`: no Application by this name, for someone signed in.
-pub fn no_application(name: &str, again: &str) -> Response<Full<Bytes>> {
+/// `404`: no Application by this name, for someone signed in. No link:
+/// there is no Dashboard yet to go back to.
+pub fn no_application(name: &str) -> Response<Full<Bytes>> {
     page(
         StatusCode::NOT_FOUND,
         "No such Application",
         &format!(
-            "<p>There is no Application named <code>{}</code>.</p><p><a href=\"{}\">Back</a></p>",
-            escape(name),
-            escape(again)
+            "<p>There is no Application named <code>{}</code>.</p>",
+            escape(name)
         ),
     )
 }
@@ -151,16 +157,13 @@ pub fn plain(status: StatusCode, text: &'static str) -> Response<Full<Bytes>> {
     )
 }
 
-/// `503` as a page: the platform database or the provider could not be
-/// used.
-pub fn unavailable(again: &str) -> Response<Full<Bytes>> {
+/// `503` as a page: the platform database could not be used, or no
+/// randomness was to be had.
+pub fn unavailable(again: Option<&str>) -> Response<Full<Bytes>> {
     page(
         StatusCode::SERVICE_UNAVAILABLE,
         "Try again shortly",
-        &format!(
-            "<p>The sign-in cannot go on just now.</p><p><a href=\"{}\">Try again</a></p>",
-            escape(again)
-        ),
+        &format!("<p>The sign-in cannot go on just now.</p>{}", way_on(again)),
     )
 }
 
@@ -181,7 +184,7 @@ pub fn redirect(location: &str, cookies: Vec<HeaderValue>) -> Response<Full<Byte
             return failed(
                 StatusCode::BAD_REQUEST,
                 "The address to go on to cannot be written.",
-                "/",
+                None,
             );
         }
     }

@@ -12,7 +12,8 @@
 //! 2. [`Oidc::sign_in_address`], `/sign-in`: with a platform session, a
 //!    one-time code for the Application; without, the provider's
 //!    authorization endpoint (code flow, PKCE `S256`, `state`, `nonce`),
-//!    the sign-in under way remembered in memory ([`pending`]).
+//!    the sign-in under way sealed into the `state` ([`under_way`]): the
+//!    platform keeps nothing of it.
 //! 3. `/callback`: the code exchanged, the ID token checked ([`token`]),
 //!    the User's record and a platform session made ([`sessions`]), then
 //!    on as in 2.
@@ -25,20 +26,19 @@
 //! The parts: [`settings`] (what it was started with), [`secret`] (values
 //! that never print), [`http`] and [`provider`] (the calls to the identity
 //! provider, bounded), [`token`], [`seal`] (the refresh token at rest),
-//! [`pending`], [`sessions`], [`pages`].
+//! [`under_way`], [`sessions`], [`pages`].
 
 pub mod http;
 pub mod pages;
-pub mod pending;
 pub mod provider;
 pub mod seal;
 pub mod secret;
 pub mod sessions;
 pub mod settings;
 pub mod token;
+pub mod under_way;
 
 use std::sync::Arc;
-use std::time::Instant;
 
 use bytes::Bytes;
 use http_body_util::Full;
@@ -51,21 +51,18 @@ use crate::cookies;
 use crate::origin::{Public, from_another_origin};
 use crate::platform_db::PlatformDatabase;
 use crate::registry::{Registry, check_name};
-use pending::{NotTaken, Pending, UnderWay};
 use provider::{Problem, Provider};
-use seal::Sealer;
+use seal::{Sealer, Use};
 use secret::{Secret, digest, looks_random, s256, same};
 use sessions::{Current, Sessions, log_database};
 use settings::Settings;
+use under_way::{MAX_NEXT, MAX_STEP_ONE_STATE, NotTaken, States};
 
 /// How long the cookie of a sign-in under way lives, in seconds.
 pub const SIGN_IN_COOKIE_SECONDS: u64 = 600;
 
 /// The longest `next`, `state` or `application` taken, in bytes.
 const MAX_PARAMETER_BYTES: usize = 4096;
-
-/// The longest `state` of step 1 taken, in bytes.
-const MAX_STATE_BYTES: usize = 512;
 
 /// The name of the sign-in address under the domain.
 pub const AUTH_NAME: &str = "auth";
@@ -80,7 +77,7 @@ pub struct Oidc {
     settings: Arc<Settings>,
     provider: Arc<Provider>,
     sessions: Sessions,
-    under_way: UnderWay,
+    states: States,
     registry: Arc<Registry>,
     domain: Arc<str>,
     public: Public,
@@ -158,7 +155,8 @@ impl Oidc {
     ) -> Result<Self, String> {
         let settings = Arc::new(settings);
         let provider = Arc::new(Provider::new(Arc::clone(&settings))?);
-        let sealer = Sealer::new(&settings.client_secret)?;
+        let sealer = Sealer::new(&settings.client_secret, Use::RefreshTokens)?;
+        let states = States::new(&settings.client_secret)?;
         let sessions = Sessions::new(
             database,
             Arc::clone(&provider),
@@ -170,7 +168,7 @@ impl Oidc {
             settings,
             provider,
             sessions,
-            under_way: UnderWay::default(),
+            states,
             registry,
             domain,
             public,
@@ -193,16 +191,6 @@ impl Oidc {
 
     fn callback(&self, port: Option<u16>) -> String {
         format!("{}/callback", self.auth_origin(port))
-    }
-
-    /// The Dashboard's address: where a failure without an Application
-    /// sends the person to try again.
-    fn dashboard(&self, port: Option<u16>) -> String {
-        format!(
-            "{}/",
-            self.public
-                .origin(&format!("dashboard.{}", self.domain), port)
-        )
     }
 
     fn session_cookie(&self, value: &Secret) -> Option<HeaderValue> {
@@ -257,7 +245,7 @@ impl Oidc {
             Some(state) => state,
             None => match Secret::random() {
                 Some(state) => state.expose().to_owned(),
-                None => return Some(pages::unavailable(&self.dashboard(port))),
+                None => return Some(pages::unavailable(None)),
             },
         };
         let next = parts.uri.path_and_query().map_or("/", |p| p.as_str());
@@ -304,23 +292,23 @@ impl Oidc {
     /// Step 2.
     async fn sign_in(&self, parts: &Parts, port: Option<u16>) -> Answer {
         let query = Query::of(parts);
-        let dashboard = self.dashboard(port);
         let Some(application) = query.get("application").filter(|a| check_name(a).is_ok()) else {
             return pages::failed(
                 StatusCode::BAD_REQUEST,
                 "The address names no Application that could exist.",
-                &dashboard,
+                None,
             );
         };
         let next = path_only(query.get("next"));
         let again = format!("{}{next}", self.app_origin(application, port));
+        let again = Some(again.as_str());
         let Some(state) = query.get("state").filter(|s| {
-            !s.is_empty() && s.len() <= MAX_STATE_BYTES && !s.chars().any(char::is_control)
+            !s.is_empty() && s.len() <= MAX_STEP_ONE_STATE && !s.chars().any(char::is_control)
         }) else {
             return pages::failed(
                 StatusCode::BAD_REQUEST,
-                "The address does not say which sign-in this is.",
-                &again,
+                "The address does not say which sign-in this is, or says it in more than 128 bytes.",
+                again,
             );
         };
         match self.platform_session(parts).await {
@@ -329,16 +317,19 @@ impl Oidc {
                     .to_application(session, application, &next, state, port, Vec::new())
                     .await;
             }
-            Current::Unavailable => return pages::unavailable(&again),
+            Current::Unavailable => return pages::unavailable(again),
             Current::None => {}
         }
-        let configuration = match self.provider.configuration().await {
+        let configuration = match self.provider.configuration(None).await {
             Ok(configuration) => configuration,
-            Err(_) => {
+            Err(problem) => {
                 return pages::failed(
                     StatusCode::BAD_GATEWAY,
-                    "The company's sign-in could not be reached, or did not answer in time.",
-                    &again,
+                    &format!(
+                        "The company's sign-in could not be used: {}.",
+                        problem.reason()
+                    ),
+                    again,
                 );
             }
         };
@@ -350,13 +341,21 @@ impl Oidc {
             Some(browser) => browser,
             None => match Secret::random() {
                 Some(browser) => browser.expose().to_owned(),
-                None => return pages::unavailable(&again),
+                None => return pages::unavailable(again),
             },
         };
-        let (Some(provider_state), Some(nonce), Some(verifier)) =
-            (Secret::random(), Secret::random(), Secret::random())
+        // Through the provider, a long `next` is `/`: the `state` carries
+        // it, and some providers cut a long `state`.
+        let next = if next.len() > MAX_NEXT {
+            "/".to_owned()
+        } else {
+            next
+        };
+        let Some(begun) = self
+            .states
+            .begin(&digest(&browser), state, application, &next)
         else {
-            return pages::unavailable(&again);
+            return pages::unavailable(again);
         };
         // Copied: the kept configuration's address, with this sign-in's
         // query added; once a sign-in.
@@ -367,27 +366,10 @@ impl Oidc {
             .append_pair("client_id", &self.settings.client_id)
             .append_pair("redirect_uri", &self.callback(port))
             .append_pair("scope", &self.settings.scope())
-            .append_pair("state", provider_state.expose())
-            .append_pair("nonce", nonce.expose())
-            .append_pair("code_challenge", &s256(&verifier))
+            .append_pair("state", begun.state.expose())
+            .append_pair("nonce", begun.nonce.expose())
+            .append_pair("code_challenge", &s256(&begun.verifier))
             .append_pair("code_challenge_method", "S256");
-        // What the callback needs is kept until it comes: copied once a
-        // sign-in, each bounded (MAX_PARAMETER_BYTES).
-        let begun = self.under_way.begin(
-            &provider_state,
-            Pending {
-                browser: digest(&browser),
-                nonce,
-                verifier,
-                application: application.to_owned(),
-                next,
-                state: state.to_owned(),
-                began: Instant::now(),
-            },
-        );
-        if !begun {
-            return pages::unavailable(&again);
-        }
         let cookie = self.sign_in_cookie(&browser, SIGN_IN_COOKIE_SECONDS);
         pages::redirect(authorization.as_str(), cookie.into_iter().collect())
     }
@@ -404,8 +386,9 @@ impl Oidc {
         cookies: Vec<HeaderValue>,
     ) -> Answer {
         let again = format!("{}{next}", self.app_origin(application, port));
+        let again = Some(again.as_str());
         if self.registry.serving(application).is_none() {
-            let mut answer = pages::no_application(application, &self.dashboard(port));
+            let mut answer = pages::no_application(application);
             for cookie in cookies {
                 answer
                     .headers_mut()
@@ -414,7 +397,7 @@ impl Oidc {
             return answer;
         }
         let Some(code) = Secret::random() else {
-            return pages::unavailable(&again);
+            return pages::unavailable(again);
         };
         if let Err(error) = self
             .sessions
@@ -422,7 +405,7 @@ impl Oidc {
             .await
         {
             log_database(&error);
-            return pages::unavailable(&again);
+            return pages::unavailable(again);
         }
         let query = form_urlencoded::Serializer::new(String::new())
             .append_pair("code", code.expose())
@@ -439,30 +422,31 @@ impl Oidc {
     /// Step 3.
     async fn callback_step(&self, parts: &Parts, port: Option<u16>) -> Answer {
         let query = Query::of(parts);
-        let dashboard = self.dashboard(port);
+        // Until the `state` opens, it is not known which Application the
+        // sign-in was for: these pages link nowhere.
         let Some(state) = query.get("state") else {
             return pages::failed(
                 StatusCode::BAD_REQUEST,
                 "The sign-in came back without saying which sign-in it was.",
-                &dashboard,
+                None,
             );
         };
         let browser =
             cookies::find(&parts.headers, cookies::sign_in_name(self.secure())).map(digest);
-        let pending = match self.under_way.take(&digest(state), browser.as_ref()) {
+        let pending = match self.states.open(state, browser.as_ref()) {
             Ok(pending) => pending,
-            Err(NotTaken::Unknown) => {
+            Err(NotTaken::Unreadable) => {
                 return pages::failed(
                     StatusCode::BAD_REQUEST,
-                    "This browser did not start this sign-in, or it was already used.",
-                    &dashboard,
+                    "This browser did not start this sign-in.",
+                    None,
                 );
             }
             Err(NotTaken::TooOld) => {
                 return pages::failed(
                     StatusCode::BAD_REQUEST,
                     "The sign-in took more than 10 minutes.",
-                    &dashboard,
+                    None,
                 );
             }
         };
@@ -471,6 +455,7 @@ impl Oidc {
             self.app_origin(&pending.application, port),
             pending.next
         );
+        let again = Some(again.as_str());
         if query
             .get("iss")
             .is_some_and(|iss| iss != self.settings.issuer)
@@ -478,7 +463,7 @@ impl Oidc {
             return pages::failed(
                 StatusCode::BAD_REQUEST,
                 "The sign-in came back from another identity provider.",
-                &again,
+                again,
             );
         }
         if let Some(error) = query.get("error") {
@@ -486,14 +471,14 @@ impl Oidc {
             return pages::failed(
                 StatusCode::BAD_REQUEST,
                 &format!("The company's sign-in did not sign you in ({shown})."),
-                &again,
+                again,
             );
         }
         let Some(code) = query.get("code").filter(|c| !c.is_empty()) else {
             return pages::failed(
                 StatusCode::BAD_REQUEST,
                 "The sign-in came back without a code.",
-                &again,
+                again,
             );
         };
         // Held as a secret from here; once a sign-in.
@@ -502,9 +487,9 @@ impl Oidc {
             .provider
             .exchange(
                 &code,
-                &pending.verifier,
+                &pending.verifier(),
                 &self.callback(port),
-                &pending.nonce,
+                &pending.nonce(),
             )
             .await;
         let tokens = match exchanged {
@@ -513,33 +498,33 @@ impl Oidc {
                 return pages::failed(
                     StatusCode::BAD_GATEWAY,
                     &format!("The company's sign-in could not be used: {why}."),
-                    &again,
+                    again,
                 );
             }
             Err(Problem::NoIdToken) => {
                 return pages::failed(
                     StatusCode::BAD_GATEWAY,
                     "The company's sign-in answered without an ID token.",
-                    &again,
+                    again,
                 );
             }
             Err(Problem::Refused) => {
                 return pages::failed(
                     StatusCode::BAD_REQUEST,
                     "The company's sign-in refused the code it gave.",
-                    &again,
+                    again,
                 );
             }
             Err(Problem::Invalid(why)) => {
                 return pages::failed(
                     StatusCode::BAD_REQUEST,
                     &format!("The ID token does not hold: {why}."),
-                    &again,
+                    again,
                 );
             }
         };
         let Some(value) = Secret::random() else {
-            return pages::unavailable(&again);
+            return pages::unavailable(again);
         };
         let session = match self
             .sessions
@@ -553,7 +538,7 @@ impl Oidc {
             Ok(session) => session,
             Err(error) => {
                 log_database(&error);
-                return pages::unavailable(&again);
+                return pages::unavailable(again);
             }
         };
         let cookies: Vec<HeaderValue> = self.session_cookie(&value).into_iter().collect();
@@ -600,7 +585,7 @@ impl Oidc {
             && let Err(error) = self.sessions.end_by_cookie(&digest(value)).await
         {
             log_database(&error);
-            return pages::unavailable("/sign-out");
+            return pages::unavailable(Some("/sign-out"));
         }
         let clear = cookies::set_cookie(cookies::session_name(self.secure()), "", 0, self.secure());
         pages::signed_out(clear)
@@ -615,7 +600,8 @@ impl Oidc {
     ) -> Answer {
         let query = Query::of(parts);
         let again = format!("{}/", self.app_origin(application, port));
-        let refused = |what: &str| pages::failed(StatusCode::BAD_REQUEST, what, &again);
+        let again = Some(again.as_str());
+        let refused = |what: &str| pages::failed(StatusCode::BAD_REQUEST, what, again);
         if parts.method != Method::GET && parts.method != Method::HEAD {
             return refused("This address takes only a GET.");
         }
@@ -627,7 +613,7 @@ impl Oidc {
             Ok(None) => return refused("The sign-in code is unknown, or was already used."),
             Err(error) => {
                 log_database(&error);
-                return pages::unavailable(&again);
+                return pages::unavailable(again);
             }
         };
         let cookie = cookies::find(&parts.headers, cookies::sign_in_name(self.secure()));
@@ -645,7 +631,7 @@ impl Oidc {
             );
         }
         let Some(value) = Secret::random() else {
-            return pages::unavailable(&again);
+            return pages::unavailable(again);
         };
         match self
             .sessions
@@ -656,13 +642,15 @@ impl Oidc {
             Ok(false) => return refused("The session this code was made from has ended."),
             Err(error) => {
                 log_database(&error);
-                return pages::unavailable(&again);
+                return pages::unavailable(again);
             }
         }
         let next = path_only(query.get("next"));
         let location = format!("{}{next}", self.app_origin(application, port));
-        let set = [self.session_cookie(&value), self.sign_in_cookie("", 0)];
-        pages::redirect(&location, set.into_iter().flatten().collect())
+        // The cookie of step 1 is left to run out: another page of this
+        // Application signing in at once in this browser holds the same
+        // value, and lands with it.
+        pages::redirect(&location, self.session_cookie(&value).into_iter().collect())
     }
 }
 

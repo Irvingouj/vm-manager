@@ -9,26 +9,50 @@
 //! (`now()`), so a session ends at its time whatever the program holds.
 //!
 //! **What bounds the tables.** A User holds at most [`MAX_SESSIONS`]
-//! sessions: the oldest ends when one more begins, and that User's ended
-//! ones are deleted then. An Application session is deleted with its
+//! sessions: the oldest ends when one more begins. Every ended session,
+//! anyone's, is deleted whenever anyone signs in (by the index on
+//! `ends_at`), its sealed refresh token with it. An Application session is deleted with its
 //! session (`ON DELETE CASCADE`), and a new one of the same session for
 //! the same Application replaces the one before. A code is deleted when it
 //! is shown, and those older than a minute whenever a code is made.
 //!
 //! **Renewal.** A session last renewed more than `--session-renewal` ago
-//! is renewed by the first request that finds it so, with its refresh
-//! token, before that request goes on; the other requests of the same
-//! session wait for that one renewal ([`Turns`]), then read the session
-//! again. The Groups read before are never used past their time: a
-//! provider that does not answer is [`Current::Unavailable`] for every one
-//! of them.
+//! is renewed before the request that finds it so goes on, with its
+//! refresh token. The renewal is a task of the platform's, not the
+//! request's ([`Sessions::renew`]):
+//!
+//! - **One per session.** The first request to find its session due
+//!   starts the task; every request of that session that comes before it
+//!   ends waits for it and takes its outcome (the User, no session, or
+//!   unavailable). The provider is asked once, also when it fails.
+//! - **Bounded.** At most [`MAX_RENEWALS`] sessions are being renewed at
+//!   once; a request whose session's renewal cannot begin is
+//!   [`Current::Unavailable`] (`503`). Every call to the provider ends by
+//!   the renewal's deadline, [`RENEWAL_LIMIT`] after it began; a request
+//!   waits at most [`RENEWAL_WAIT`], which is that and a second for the
+//!   platform database's two calls.
+//! - **Owned.** The tasks are held in a `JoinSet` of the [`Sessions`],
+//!   reaped as new ones start. A request that goes away does not end its
+//!   renewal: the new refresh token is written whatever became of the
+//!   request. When the program stops, the [`Sessions`] go with the
+//!   Ingress that holds them once every connection has ended, and the set
+//!   ends every renewal still running then.
+//! - **No lock across an await.** The map of renewals under way is behind
+//!   a `std` mutex held only to look up, insert or remove; the outcome
+//!   goes to the waiters through a `watch` channel.
+//!
+//! The Groups read before are never used past their time: a provider that
+//! does not answer is [`Current::Unavailable`] for every request, and the
+//! session stays.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use tokio::sync::OwnedMutexGuard;
+use tokio::sync::watch;
+use tokio::task::JoinSet;
+use tokio::time::Instant;
 use tokio_postgres::{Client, Row};
 
 use super::provider::{Problem, Provider};
@@ -45,14 +69,17 @@ pub const MAX_SESSIONS: i64 = 20;
 /// How long a one-time code is good for, in seconds.
 pub const CODE_SECONDS: i64 = 60;
 
-/// The longest a request waits for its session's renewal under way.
-pub const RENEWAL_WAIT: Duration = Duration::from_secs(25);
+/// The longest a renewal may take with the provider, from its start: the
+/// configuration, the token endpoint and the keys together.
+pub const RENEWAL_LIMIT: Duration = Duration::from_secs(10);
 
-/// The longest a renewal may take with the provider, all its calls
-/// together (each ends within 10 seconds).
-pub const RENEWAL_LIMIT: Duration = Duration::from_secs(20);
+/// The longest a request waits for its session's renewal: the renewal's
+/// limit, and a second for its reads and writes in the platform database
+/// (each of which has its own limit besides). Past it the request is
+/// [`Current::Unavailable`]; the renewal goes on to its end.
+pub const RENEWAL_WAIT: Duration = Duration::from_secs(11);
 
-/// The most sessions being renewed, or waited for, at once.
+/// The most sessions being renewed at once.
 pub const MAX_RENEWALS: usize = 1024;
 
 /// A session found by a cookie.
@@ -83,82 +110,50 @@ pub struct TakenCode {
     pub fresh: bool,
 }
 
-/// The waits of the requests of each session being renewed: one turn per
-/// session, held by the request that renews it. Behind a `std` mutex held
-/// only to look up, insert or remove, never across an await. At most
-/// [`MAX_RENEWALS`] entries: one more is refused (the request is `503`).
-#[derive(Default)]
-struct Turns {
-    by_session: Mutex<HashMap<i64, Arc<tokio::sync::Mutex<()>>>>,
+/// What a renewal came to, for every request that waited for it.
+#[derive(Clone)]
+enum Outcome {
+    User(User),
+    None,
+    Unavailable,
 }
 
-/// A request's turn at its session; let go when dropped, however the
-/// request ended.
-struct Turn<'a> {
-    turns: &'a Turns,
+/// The renewal's work, shared with its tasks.
+struct Renewal {
+    database: Arc<PlatformDatabase>,
+    provider: Arc<Provider>,
+    sealer: Sealer,
+    renewal_seconds: i64,
+    /// The renewals under way, by session: where each one's outcome comes.
+    /// At most [`MAX_RENEWALS`]; an entry goes when its task ends, however
+    /// it ends ([`Entry`]).
+    under_way: Mutex<HashMap<i64, watch::Receiver<Option<Outcome>>>>,
+}
+
+/// A task's entry in [`Renewal::under_way`], removed when the task ends
+/// (after its outcome is sent) or is ended.
+struct Entry {
+    renewal: Arc<Renewal>,
     session: i64,
-    guard: Option<OwnedMutexGuard<()>>,
 }
 
-impl Drop for Turn<'_> {
+impl Drop for Entry {
     fn drop(&mut self) {
-        let mut map = self
-            .turns
-            .by_session
+        self.renewal
+            .under_way
             .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        drop(self.guard.take());
-        // Each waiter holds its own handle (taken under this lock); none
-        // left but the map's: no one waits, the entry goes.
-        if map
-            .get(&self.session)
-            .is_some_and(|gate| Arc::strong_count(gate) == 1)
-        {
-            map.remove(&self.session);
-        }
-    }
-}
-
-impl Turns {
-    /// Waits for the turn at `session`, at most [`RENEWAL_WAIT`]; `None`
-    /// when it did not come in time or there is no room.
-    async fn wait(&self, session: i64) -> Option<Turn<'_>> {
-        let gate = {
-            let mut map = self
-                .by_session
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            if map.len() >= MAX_RENEWALS && !map.contains_key(&session) {
-                // Entries left by requests that ended while waiting.
-                map.retain(|_, gate| Arc::strong_count(gate) > 1);
-            }
-            if map.len() >= MAX_RENEWALS && !map.contains_key(&session) {
-                return None;
-            }
-            Arc::clone(map.entry(session).or_default())
-        };
-        let mut turn = Turn {
-            turns: self,
-            session,
-            guard: None,
-        };
-        turn.guard = Some(
-            tokio::time::timeout(RENEWAL_WAIT, gate.lock_owned())
-                .await
-                .ok()?,
-        );
-        Some(turn)
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&self.session);
     }
 }
 
 /// The sessions.
 pub struct Sessions {
     database: Arc<PlatformDatabase>,
-    provider: Arc<Provider>,
-    sealer: Sealer,
-    renewal_seconds: i64,
+    renewal: Arc<Renewal>,
     lifetime_seconds: i64,
-    turns: Turns,
+    /// The renewals' tasks, owned here (see the module's text).
+    tasks: Mutex<JoinSet<()>>,
 }
 
 fn unexpected(what: &'static str) -> impl Fn(tokio_postgres::Error) -> DbError {
@@ -187,19 +182,23 @@ impl Sessions {
     ) -> Self {
         let seconds = |d: Duration| i64::try_from(d.as_secs()).unwrap_or(i64::MAX).max(1);
         Self {
+            renewal: Arc::new(Renewal {
+                database: Arc::clone(&database),
+                provider,
+                sealer,
+                renewal_seconds: seconds(renewal),
+                under_way: Mutex::new(HashMap::new()),
+            }),
             database,
-            provider,
-            sealer,
-            renewal_seconds: seconds(renewal),
             lifetime_seconds: seconds(lifetime),
-            turns: Turns::default(),
+            tasks: Mutex::new(JoinSet::new()),
         }
     }
 
     /// Begins a platform session for the person of `claims`, under the
     /// cookie whose SHA-256 is `digest`: their record made or brought up to
-    /// date, their ended sessions deleted, and those past the newest
-    /// [`MAX_SESSIONS`] ended. Answers the session's id.
+    /// date, every ended session (anyone's) deleted, and theirs past the
+    /// newest [`MAX_SESSIONS`] ended. Answers the session's id.
     pub async fn begin(
         &self,
         digest: &[u8; 32],
@@ -208,7 +207,8 @@ impl Sessions {
     ) -> Result<i64, DbError> {
         let sealed = match refresh_token {
             Some(token) => Some(
-                self.sealer
+                self.renewal
+                    .sealer
                     .seal(token, digest)
                     .ok_or_else(|| DbError::unexpected("no randomness to seal a refresh token"))?,
             ),
@@ -231,10 +231,7 @@ impl Sessions {
                     .await
                     .map_err(DbError::from)?;
                 transaction
-                    .execute(
-                        "DELETE FROM sessions WHERE user_id = $1 AND ends_at <= now()",
-                        &[&claims.sub],
-                    )
+                    .execute("DELETE FROM sessions WHERE ends_at <= now()", &[])
                     .await
                     .map_err(DbError::from)?;
                 let row = transaction
@@ -270,7 +267,7 @@ impl Sessions {
 
     /// The platform session of a cookie, if it has not ended.
     pub async fn platform(&self, digest: &[u8; 32]) -> Result<Option<Found>, DbError> {
-        let renewal = self.renewal_seconds;
+        let renewal = self.renewal.renewal_seconds;
         let row = self
             .database
             .pool()
@@ -296,7 +293,7 @@ impl Sessions {
         digest: &[u8; 32],
         application: &str,
     ) -> Result<Option<Found>, DbError> {
-        let renewal = self.renewal_seconds;
+        let renewal = self.renewal.renewal_seconds;
         let row = self
             .database
             .pool()
@@ -332,162 +329,59 @@ impl Sessions {
         }
     }
 
-    /// Renews a session due for it, the requests of one session taking
-    /// turns: whoever comes after a renewal finds it done.
+    /// The outcome of the session's renewal: the one under way, or one
+    /// begun now (see the module's text).
     async fn renew(&self, session: i64) -> Current {
-        let Some(_turn) = self.turns.wait(session).await else {
+        let (mut outcome, start) = {
+            let mut under_way = self
+                .renewal
+                .under_way
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if let Some(outcome) = under_way.get(&session) {
+                (outcome.clone(), None)
+            } else if under_way.len() >= MAX_RENEWALS {
+                return Current::Unavailable;
+            } else {
+                let (sender, outcome) = watch::channel(None);
+                under_way.insert(session, outcome.clone());
+                (outcome, Some(sender))
+            }
+        };
+        if let Some(sender) = start {
+            let entry = Entry {
+                renewal: Arc::clone(&self.renewal),
+                session,
+            };
+            let mut tasks = self.tasks.lock().unwrap_or_else(PoisonError::into_inner);
+            while tasks.try_join_next().is_some() {}
+            tasks.spawn(async move {
+                let came = entry.renewal.run(session).await;
+                sender.send_replace(Some(came));
+                // The entry goes after the outcome is sent: a request that
+                // comes later reads the session anew.
+                drop(entry);
+            });
+        }
+        let waited = tokio::time::timeout(RENEWAL_WAIT, outcome.wait_for(Option::is_some)).await;
+        let Ok(Ok(came)) = waited else {
             return Current::Unavailable;
         };
-        let state = match self.renewal_state(session).await {
-            Ok(Some(state)) => state,
-            Ok(None) => return Current::None,
-            Err(error) => {
-                log_database(&error);
-                return Current::Unavailable;
-            }
-        };
-        if !state.due {
-            return Current::User {
+        match came.as_ref() {
+            // Copied: each request that waited takes its own User; once a
+            // renewal per request, a name and the Groups.
+            Some(Outcome::User(user)) => Current::User {
                 session,
-                user: state.user,
-            };
-        }
-        let token = state
-            .refresh_token
-            .as_deref()
-            .and_then(|sealed| self.sealer.open(sealed, &state.digest));
-        let Some(token) = token else {
-            return self.end_at_renewal(session, "no-refresh-token").await;
-        };
-        let renewed = tokio::time::timeout(RENEWAL_LIMIT, self.provider.refresh(&token))
-            .await
-            .unwrap_or(Err(Problem::Unanswered("the renewal took too long")));
-        let tokens = match renewed {
-            Ok(tokens) if tokens.claims.sub == state.user.id => tokens,
-            Ok(_) => return self.end_at_renewal(session, "another-sub").await,
-            Err(Problem::Unanswered(_)) => return Current::Unavailable,
-            Err(Problem::Refused) => return self.end_at_renewal(session, "refused").await,
-            Err(Problem::NoIdToken) => return self.end_at_renewal(session, "no-id-token").await,
-            Err(Problem::Invalid(_)) => {
-                return self.end_at_renewal(session, "invalid-id-token").await;
-            }
-        };
-        let sealed = match &tokens.refresh_token {
-            Some(token) => match self.sealer.seal(token, &state.digest) {
-                Some(sealed) => Some(sealed),
-                None => return Current::Unavailable,
+                user: user.clone(),
             },
-            None => None,
-        };
-        match self.renewed(session, &tokens.claims, sealed).await {
-            Ok(true) => Current::User {
-                session,
-                user: User {
-                    id: tokens.claims.sub,
-                    groups: tokens.claims.groups,
-                },
-            },
-            Ok(false) => Current::None,
-            Err(error) => {
-                log_database(&error);
-                Current::Unavailable
-            }
+            Some(Outcome::None) => Current::None,
+            Some(Outcome::Unavailable) | None => Current::Unavailable,
         }
-    }
-
-    async fn end_at_renewal(&self, session: i64, why: &'static str) -> Current {
-        log::record(
-            "session-ended",
-            json!({ "session": session, "reason": why }),
-        );
-        match self.end(session).await {
-            Ok(()) => Current::None,
-            Err(error) => {
-                log_database(&error);
-                Current::Unavailable
-            }
-        }
-    }
-
-    async fn renewal_state(&self, session: i64) -> Result<Option<RenewalState>, DbError> {
-        let renewal = self.renewal_seconds;
-        let row = self
-            .database
-            .pool()
-            .run(async |client: &mut Client| {
-                client
-                    .query_opt(
-                        "SELECT user_id, groups,
-                                renewed_at + $2::bigint * interval '1 second' <= now(),
-                                refresh_token, digest
-                         FROM sessions WHERE id = $1 AND ends_at > now()",
-                        &[&session, &renewal],
-                    )
-                    .await
-                    .map_err(DbError::from)
-            })
-            .await?;
-        let Some(row) = row else { return Ok(None) };
-        let bad = unexpected("a session");
-        let digest: Vec<u8> = row.try_get(4).map_err(&bad)?;
-        Ok(Some(RenewalState {
-            user: User {
-                id: row.try_get(0).map_err(&bad)?,
-                groups: row.try_get(1).map_err(&bad)?,
-            },
-            due: row.try_get(2).map_err(&bad)?,
-            refresh_token: row.try_get(3).map_err(&bad)?,
-            digest: <[u8; 32]>::try_from(digest.as_slice())
-                .map_err(|_| DbError::unexpected("a session's digest"))?,
-        }))
-    }
-
-    /// Records a renewal; `false` when the session ended meanwhile.
-    async fn renewed(
-        &self,
-        session: i64,
-        claims: &Claims,
-        refresh_token: Option<Vec<u8>>,
-    ) -> Result<bool, DbError> {
-        self.database
-            .pool()
-            .run(async |client: &mut Client| {
-                let transaction = client.transaction().await.map_err(DbError::from)?;
-                let updated = transaction
-                    .execute(
-                        "UPDATE sessions
-                         SET groups = $2, renewed_at = now(),
-                             refresh_token = coalesce($3, refresh_token)
-                         WHERE id = $1 AND ends_at > now()",
-                        &[&session, &claims.groups, &refresh_token],
-                    )
-                    .await
-                    .map_err(DbError::from)?;
-                transaction
-                    .execute(
-                        "UPDATE users SET name = $2, email = $3, updated_at = now() WHERE id = $1",
-                        &[&claims.sub, &claims.name, &claims.email],
-                    )
-                    .await
-                    .map_err(DbError::from)?;
-                transaction.commit().await.map_err(DbError::from)?;
-                Ok(updated == 1)
-            })
-            .await
     }
 
     /// Ends a session, and every Application session made from it.
     pub async fn end(&self, session: i64) -> Result<(), DbError> {
-        self.database
-            .pool()
-            .run(async |client: &mut Client| {
-                client
-                    .execute("DELETE FROM sessions WHERE id = $1", &[&session])
-                    .await
-                    .map_err(DbError::from)
-            })
-            .await?;
-        Ok(())
+        end_session(&self.database, session).await
     }
 
     /// Ends the platform session of a cookie, if there is one.
@@ -638,6 +532,157 @@ impl Sessions {
             "session_renewed": row.try_get::<_, String>(6).map_err(&bad)?,
         })))
     }
+}
+
+impl Renewal {
+    /// One renewal, to its end: the provider asked at most once, every call
+    /// ended by [`RENEWAL_LIMIT`] from now.
+    async fn run(&self, session: i64) -> Outcome {
+        let deadline = Instant::now() + RENEWAL_LIMIT;
+        let state = match self.renewal_state(session).await {
+            Ok(Some(state)) => state,
+            Ok(None) => return Outcome::None,
+            Err(error) => {
+                log_database(&error);
+                return Outcome::Unavailable;
+            }
+        };
+        if !state.due {
+            // Renewed meanwhile, by a renewal that ended before this began.
+            return Outcome::User(state.user);
+        }
+        let Some(sealed) = state.refresh_token.as_deref() else {
+            return self.end_at_renewal(session, "no-refresh-token").await;
+        };
+        let Some(token) = self.sealer.open(sealed, &state.digest) else {
+            return self
+                .end_at_renewal(session, "unreadable-refresh-token")
+                .await;
+        };
+        let tokens = match self.provider.refresh(&token, deadline).await {
+            Ok(tokens) if tokens.claims.sub == state.user.id => tokens,
+            Ok(_) => return self.end_at_renewal(session, "another-sub").await,
+            Err(Problem::Unanswered(_)) => return Outcome::Unavailable,
+            Err(Problem::Refused) => return self.end_at_renewal(session, "refused").await,
+            Err(Problem::NoIdToken) => return self.end_at_renewal(session, "no-id-token").await,
+            Err(Problem::Invalid(_)) => {
+                return self.end_at_renewal(session, "invalid-id-token").await;
+            }
+        };
+        let sealed = match &tokens.refresh_token {
+            Some(token) => match self.sealer.seal(token, &state.digest) {
+                Some(sealed) => Some(sealed),
+                None => return Outcome::Unavailable,
+            },
+            None => None,
+        };
+        match self.renewed(session, &tokens.claims, sealed).await {
+            Ok(true) => Outcome::User(User {
+                id: tokens.claims.sub,
+                groups: tokens.claims.groups,
+            }),
+            Ok(false) => Outcome::None,
+            Err(error) => {
+                log_database(&error);
+                Outcome::Unavailable
+            }
+        }
+    }
+
+    async fn end_at_renewal(&self, session: i64, why: &'static str) -> Outcome {
+        log::record(
+            "session-ended",
+            json!({ "session": session, "reason": why }),
+        );
+        match end_session(&self.database, session).await {
+            Ok(()) => Outcome::None,
+            Err(error) => {
+                log_database(&error);
+                Outcome::Unavailable
+            }
+        }
+    }
+
+    async fn renewal_state(&self, session: i64) -> Result<Option<RenewalState>, DbError> {
+        let renewal = self.renewal_seconds;
+        let row = self
+            .database
+            .pool()
+            .run(async |client: &mut Client| {
+                client
+                    .query_opt(
+                        "SELECT user_id, groups,
+                                renewed_at + $2::bigint * interval '1 second' <= now(),
+                                refresh_token, digest
+                         FROM sessions WHERE id = $1 AND ends_at > now()",
+                        &[&session, &renewal],
+                    )
+                    .await
+                    .map_err(DbError::from)
+            })
+            .await?;
+        let Some(row) = row else { return Ok(None) };
+        let bad = unexpected("a session");
+        let digest: Vec<u8> = row.try_get(4).map_err(&bad)?;
+        Ok(Some(RenewalState {
+            user: User {
+                id: row.try_get(0).map_err(&bad)?,
+                groups: row.try_get(1).map_err(&bad)?,
+            },
+            due: row.try_get(2).map_err(&bad)?,
+            refresh_token: row.try_get(3).map_err(&bad)?,
+            digest: <[u8; 32]>::try_from(digest.as_slice())
+                .map_err(|_| DbError::unexpected("a session's digest"))?,
+        }))
+    }
+
+    /// Records a renewal; `false` when the session ended meanwhile.
+    async fn renewed(
+        &self,
+        session: i64,
+        claims: &Claims,
+        refresh_token: Option<Vec<u8>>,
+    ) -> Result<bool, DbError> {
+        self.database
+            .pool()
+            .run(async |client: &mut Client| {
+                let transaction = client.transaction().await.map_err(DbError::from)?;
+                let updated = transaction
+                    .execute(
+                        "UPDATE sessions
+                         SET groups = $2, renewed_at = now(),
+                             refresh_token = coalesce($3, refresh_token)
+                         WHERE id = $1 AND ends_at > now()",
+                        &[&session, &claims.groups, &refresh_token],
+                    )
+                    .await
+                    .map_err(DbError::from)?;
+                transaction
+                    .execute(
+                        "UPDATE users SET name = $2, email = $3, updated_at = now() WHERE id = $1",
+                        &[&claims.sub, &claims.name, &claims.email],
+                    )
+                    .await
+                    .map_err(DbError::from)?;
+                transaction.commit().await.map_err(DbError::from)?;
+                Ok(updated == 1)
+            })
+            .await
+    }
+}
+
+/// Ends a session, and every Application session made from it.
+async fn end_session(database: &PlatformDatabase, session: i64) -> Result<(), DbError> {
+    database
+        .pool()
+        .run(async |client: &mut Client| {
+            client
+                .execute("DELETE FROM sessions WHERE id = $1", &[&session])
+                .await
+                .map_err(DbError::from)
+        })
+        .await?;
+    Ok(())
 }
 
 struct RenewalState {

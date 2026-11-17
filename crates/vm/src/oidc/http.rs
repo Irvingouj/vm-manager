@@ -3,7 +3,9 @@
 //! `https`, plain for a loopback `http` issuer (crate::oidc::settings).
 //!
 //! **Bounds.** Every call, from resolving the name to the last byte of the
-//! answer, ends within [`CALL_TIMEOUT`]; the answer's body is read up to
+//! answer, ends within [`CALL_TIMEOUT`], and by the caller's deadline when
+//! it gives one (a renewal's 10 seconds, all its calls together); the
+//! answer's body is read up to
 //! [`MAX_BODY_BYTES`], and one that is larger is no answer. No redirect is
 //! followed. The connection is driven inside the call's own future, so
 //! nothing is left running when the call ends, however it ends.
@@ -21,6 +23,7 @@ use hyper::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HOST, HeaderValue, USER
 use hyper::{Method, Request};
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpStream;
+use tokio::time::Instant;
 use url::Url;
 
 /// The longest one call to the identity provider may take, all of it.
@@ -78,19 +81,21 @@ impl Client {
         })
     }
 
-    /// `GET url`, asking for JSON.
-    pub async fn get(&self, url: &Url) -> Result<Answer, Failure> {
-        self.call(Method::GET, url, None, None).await
+    /// `GET url`, asking for JSON; ended by `deadline` too when given.
+    pub async fn get(&self, url: &Url, deadline: Option<Instant>) -> Result<Answer, Failure> {
+        self.call(Method::GET, url, None, None, deadline).await
     }
 
-    /// `POST url` with a form body, and `authorization` when given.
+    /// `POST url` with a form body, and `authorization` when given; ended
+    /// by `deadline` too when given.
     pub async fn post_form(
         &self,
         url: &Url,
         form: String,
         authorization: Option<HeaderValue>,
+        deadline: Option<Instant>,
     ) -> Result<Answer, Failure> {
-        self.call(Method::POST, url, Some(form), authorization)
+        self.call(Method::POST, url, Some(form), authorization, deadline)
             .await
     }
 
@@ -100,13 +105,13 @@ impl Client {
         url: &Url,
         form: Option<String>,
         authorization: Option<HeaderValue>,
+        deadline: Option<Instant>,
     ) -> Result<Answer, Failure> {
-        tokio::time::timeout(
-            CALL_TIMEOUT,
-            self.exchange(method, url, form, authorization),
-        )
-        .await
-        .map_err(|_| Failure::TimedOut)?
+        let own = Instant::now() + CALL_TIMEOUT;
+        let ends = deadline.map_or(own, |deadline| deadline.min(own));
+        tokio::time::timeout_at(ends, self.exchange(method, url, form, authorization))
+            .await
+            .map_err(|_| Failure::TimedOut)?
     }
 
     async fn exchange(
