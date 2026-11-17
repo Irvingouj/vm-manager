@@ -12,7 +12,7 @@
 )]
 
 use blackbox::oidc::{Person, Provider};
-use blackbox::sessions::{Installation, SESSION_COOKIE, assert_failure_page, oidc_options};
+use blackbox::sessions::{Installation, Link, SESSION_COOKIE, assert_failure_page, oidc_options};
 use serde_json::{Value, json};
 
 fn person(sub: &str, claim: Option<Value>) -> Person {
@@ -93,7 +93,13 @@ fn more_than_a_thousand_groups_or_one_longer_than_256_bytes_fails_the_sign_in() 
         let mut browser = at.browser_as(sub);
         let steps = at.walk_to_callback(&mut browser, "honest", "/");
         let callback = browser.follow(steps.last().unwrap());
-        assert_failure_page(&callback.response, &[400], &at.provider.issued(), sub);
+        assert_failure_page(
+            &callback.response,
+            &[400],
+            Link::To(&at.app_origin("honest")),
+            &at.provider.issued(),
+            sub,
+        );
         assert!(browser.jar.get(&at.auth_host(), SESSION_COOKIE).is_none());
         at.assert_no_session(&mut browser, "honest", sub);
     }

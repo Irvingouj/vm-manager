@@ -17,8 +17,9 @@ use blackbox::Request;
 use blackbox::browser::{Browser, query_param, url};
 use blackbox::http::Response;
 use blackbox::oidc::{
-    CLIENT_ID, KID_EC, KID_MAIN, KID_OTHER, Key, Outage, Person, Provider, TokenAnswer, TokenFault,
-    claims_of, es256_verifies, header_of, rs256_verifies, s256,
+    CLIENT_ID, ConfigFault, KID_EC, KID_MAIN, KID_OTHER, Key, Outage, Person, Provider,
+    TokenAnswer, TokenFault, TokenStatus, claims_of, es256_verifies, header_of, rs256_verifies,
+    s256,
 };
 use serde_json::{Value, json};
 use url::Url;
@@ -257,10 +258,19 @@ fn refresh_reads_the_groups_again_and_a_disabled_person_is_refused() {
         claims.get("nonce").is_none(),
         "a renewal's token has no nonce: {claims}"
     );
+    let rotated = again.json()["refresh_token"].as_str().unwrap().to_owned();
+    assert_ne!(rotated, refresh, "a renewal brings a new refresh token");
+    let reused = token(
+        &provider,
+        &[("grant_type", "refresh_token"), ("refresh_token", &refresh)],
+        true,
+    );
+    assert_eq!(reused.status, 400, "a used refresh token is refused");
+    assert_eq!(reused.json()["error"], "invalid_grant");
     provider.disable("ada-sub");
     let refused = token(
         &provider,
-        &[("grant_type", "refresh_token"), ("refresh_token", &refresh)],
+        &[("grant_type", "refresh_token"), ("refresh_token", &rotated)],
         true,
     );
     assert_eq!(refused.status, 400);
@@ -414,4 +424,105 @@ fn the_token_answer_can_lack_an_id_token_or_not_be_json() {
     let answer = exchange(&provider, &code);
     assert_eq!(answer.status, 200);
     assert!(serde_json::from_slice::<Value>(answer.body()).is_err());
+}
+
+#[test]
+fn the_token_endpoint_answers_a_status_of_the_tests_choosing() {
+    let provider = Provider::start(&[ada()]);
+    provider.token_status(Some(TokenStatus {
+        status: 429,
+        error: "slow_down".to_owned(),
+        description: "too many".to_owned(),
+    }));
+    let code = code_for(&provider, "ada-sub", "n");
+    let answer = exchange(&provider, &code);
+    assert_eq!(answer.status, 429);
+    assert_eq!(answer.json()["error"], "slow_down");
+    assert_eq!(answer.json()["error_description"], "too many");
+    provider.token_status(None);
+    let code = code_for(&provider, "ada-sub", "n");
+    exchange(&provider, &code).expect_status(200);
+}
+
+#[test]
+fn the_configuration_and_keys_can_be_made_unusable() {
+    let provider = Provider::start(&[ada()]);
+    let configuration = || get(&provider, "/.well-known/openid-configuration");
+    provider.config_fault(Some(ConfigFault::AnotherIssuer));
+    assert_ne!(configuration().json()["issuer"], provider.issuer());
+    provider.config_fault(Some(ConfigFault::LacksTokenEndpoint));
+    assert!(configuration().json().get("token_endpoint").is_none());
+    provider.config_fault(Some(ConfigFault::Oversize));
+    assert!(configuration().body().len() > 1024 * 1024);
+    provider.config_fault(None);
+    provider.unreadable_jwks(true);
+    assert!(get(&provider, "/jwks").json()["keys"].is_string());
+    provider.unreadable_jwks(false);
+    provider.token_answer(TokenAnswer::Oversize);
+    let code = code_for(&provider, "ada-sub", "n");
+    assert!(exchange(&provider, &code).body().len() > 1024 * 1024);
+}
+
+#[test]
+fn fractional_times_are_halves_of_a_second() {
+    let provider = Provider::start(&[ada()]);
+    provider.set_fault(Some(TokenFault::FractionalTimes));
+    let code = code_for(&provider, "ada-sub", "n");
+    let id_token = exchange(&provider, &code).json()["id_token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(rs256_verifies(
+        &id_token,
+        &jwk(&provider, KID_MAIN).unwrap()
+    ));
+    let claims = claims_of(&id_token).unwrap();
+    for field in ["iat", "exp"] {
+        let value = claims[field].as_f64().unwrap();
+        assert!(
+            (value.fract() - 0.5).abs() < f64::EPSILON,
+            "{field}: {value}"
+        );
+    }
+}
+
+#[test]
+fn another_secret_is_taken_when_told() {
+    let provider = Provider::start(&[ada()]);
+    let other = "the-other-secret-0123456789";
+    let try_with = |secret: &str| {
+        let code = code_for(&provider, "ada-sub", "n");
+        Request::new(provider.address(), "/token", "127.0.0.1")
+            .method("POST")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("authorization", basic(secret))
+            .body(form(&[
+                ("grant_type", "authorization_code"),
+                ("code", &code),
+                ("redirect_uri", REDIRECT),
+                ("code_verifier", VERIFIER),
+            ]))
+            .send()
+    };
+    assert_eq!(try_with(other).status, 401);
+    provider.also_take_secret(other);
+    try_with(other).expect_status(200);
+}
+
+#[test]
+fn a_request_left_unanswered_is_still_recorded() {
+    let provider = Provider::start(&[ada()]);
+    provider.set_outage(Outage::Hang);
+    let hung = Request::new(provider.address(), "/token", "127.0.0.1")
+        .method("POST")
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(form(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", "x"),
+        ]))
+        .timeout(Duration::from_secs(1))
+        .try_send();
+    assert!(hung.is_err());
+    assert_eq!(provider.grants("refresh_token").len(), 1);
+    provider.set_outage(Outage::None);
 }

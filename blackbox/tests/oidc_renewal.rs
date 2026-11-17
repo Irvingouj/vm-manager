@@ -20,7 +20,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use blackbox::Response;
-use blackbox::oidc::{Outage, TokenAnswer, TokenFault};
+use blackbox::oidc::{Outage, TokenAnswer, TokenFault, TokenStatus};
 use blackbox::sessions::{ADA, GRACE, Installation, ada, grace};
 use serde_json::json;
 
@@ -96,6 +96,11 @@ fn a_person_disabled_at_the_provider_loses_the_session_at_renewal_everywhere() {
     wait_past(signed_in, Duration::from_secs(2));
     at.assert_no_session(&mut browser, "honest", "a disabled person, honest");
     at.assert_no_session(&mut browser, "ledger", "a disabled person, ledger");
+    at.assert_logged("session-ended", &[("reason", json!("refused"))]);
+    at.assert_logged(
+        "identity-provider-refused",
+        &[("status", json!(400)), ("error", json!("invalid_grant"))],
+    );
     assert_eq!(at.me(&mut browser).status, 401);
     // Grace, not disabled, is untouched.
     let mut other = at.browser_as(GRACE);
@@ -112,6 +117,7 @@ fn a_renewal_that_brings_another_sub_ends_the_session() {
     at.provider.set_fault(Some(TokenFault::OtherSubject));
     wait_past(signed_in, Duration::from_secs(2));
     at.assert_no_session(&mut browser, "honest", "a renewal with another sub");
+    at.assert_logged("session-ended", &[("reason", json!("another-sub"))]);
 }
 
 #[test]
@@ -139,6 +145,10 @@ fn a_provider_that_does_not_answer_at_renewal_is_503_with_retry_after_and_the_co
             "{outage:?}: expected the answer within {within} s (the provider is asked within 10 s), it took {took:?}"
         );
     }
+    at.assert_logged(
+        "identity-provider-unanswered",
+        &[("call", json!("token")), ("problem", json!("timed-out"))],
+    );
     at.provider.set_outage(Outage::None);
     assert_eq!(
         at.user_seen(&mut browser, "honest")["groups"],
@@ -157,6 +167,7 @@ fn without_a_refresh_token_the_session_ends_at_its_first_renewal_and_a_page_sign
     assert_eq!(at.user_seen(&mut browser, "honest")["id"], ADA);
     wait_past(signed_in, Duration::from_secs(2));
     at.assert_no_session(&mut browser, "honest", "no refresh token");
+    at.assert_logged("session-ended", &[("reason", json!("no-refresh-token"))]);
     assert!(at.provider.grants("refresh_token").is_empty());
     // A page goes through sign-in again; the provider answers without
     // asking (the browser is still signed in there).
@@ -201,7 +212,7 @@ fn requests_of_one_session_at_once_wait_for_one_renewal() {
     at.sign_in(&mut browser, "honest", "/");
     at.sign_in(&mut browser, "ledger", "/");
     at.provider.set_groups(ADA, &["devops"]);
-    at.provider.token_delay(Duration::from_secs(1));
+    at.provider.token_delay(Duration::from_secs(2));
     wait_past(signed_in, Duration::from_secs(2));
     let requests: Vec<blackbox::Request> = (0..8)
         .map(|i| {
@@ -265,6 +276,7 @@ fn a_renewal_answered_without_an_id_token_ends_the_session() {
     wait_past(signed_in, Duration::from_secs(2));
     at.assert_no_session(&mut browser, "honest", "a renewal without an ID token");
     at.assert_no_session(&mut browser, "ledger", "a renewal without an ID token");
+    at.assert_logged("session-ended", &[("reason", json!("no-id-token"))]);
     assert_eq!(at.provider.grants("refresh_token").len(), 1);
 }
 
@@ -287,5 +299,207 @@ fn a_renewal_whose_id_token_does_not_hold_ends_the_session() {
             &format!("a renewal whose ID token does not hold ({fault:?})"),
         );
         assert_eq!(at.provider.grants("refresh_token").len(), 1, "{fault:?}");
+        at.assert_logged("session-ended", &[("reason", json!("invalid-id-token"))]);
     }
+}
+
+#[test]
+fn requests_that_come_while_the_provider_does_not_answer_share_one_renewal_and_are_each_503() {
+    let at = renewing_every(2);
+    let mut browser = at.browser_as(ADA);
+    let signed_in = Instant::now();
+    at.sign_in(&mut browser, "honest", "/");
+    at.sign_in(&mut browser, "ledger", "/");
+    wait_past(signed_in, Duration::from_secs(2));
+    at.provider.set_outage(Outage::Hang);
+    let requests: Vec<blackbox::Request> = (0..5)
+        .map(|i| {
+            let application = if i % 2 == 0 { "honest" } else { "ledger" };
+            browser
+                .request("GET", &at.app_url(application, "/"))
+                .header("accept", "application/json")
+        })
+        .collect();
+    let answers: Vec<(Response, Duration)> = thread::scope(|scope| {
+        let handles: Vec<_> = requests
+            .iter()
+            .enumerate()
+            .map(|(i, request)| {
+                scope.spawn(move || {
+                    // A little apart: each comes while the first's renewal
+                    // is under way.
+                    thread::sleep(Duration::from_millis(300) * u32::try_from(i).unwrap());
+                    let began = Instant::now();
+                    let answer = request.send();
+                    (answer, began.elapsed())
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    for (i, (answer, took)) in answers.iter().enumerate() {
+        assert_eq!(answer.status, 503, "request {i}\n{}", answer.describe());
+        assert!(
+            answer.header("retry-after").is_some(),
+            "request {i}: expected Retry-After\n{}",
+            answer.describe()
+        );
+        assert!(
+            *took < Duration::from_secs(12),
+            "request {i}: expected an answer within about 12 s of its own start (one renewal of at most 10 s), it took {took:?}"
+        );
+        at.vm.records_of(answer).assert_no_application_code_ran();
+    }
+    assert_eq!(
+        at.provider.grants("refresh_token").len(),
+        1,
+        "expected the provider to be asked once for the one renewal of five requests"
+    );
+    at.provider.set_outage(Outage::None);
+    at.provider.set_groups(ADA, &["devops"]);
+    assert_eq!(
+        at.user_seen(&mut browser, "ledger")["groups"],
+        json!(["devops"]),
+        "the session stayed and is renewed once the provider answers"
+    );
+}
+
+#[test]
+fn a_renewal_goes_on_when_the_request_that_began_it_goes_away() {
+    let at = renewing_every(3);
+    let mut browser = at.browser_as(ADA);
+    let signed_in = Instant::now();
+    at.sign_in(&mut browser, "honest", "/");
+    at.provider.set_groups(ADA, &["devops"]);
+    at.provider.token_delay(Duration::from_secs(2));
+    wait_past(signed_in, Duration::from_secs(3));
+    let gone = browser
+        .request("GET", &at.app_url("honest", "/"))
+        .header("accept", "application/json")
+        .timeout(Duration::from_millis(300))
+        .try_send();
+    assert!(
+        gone.is_err(),
+        "expected no answer within 300 ms while the provider takes 2 s, got {gone:?}"
+    );
+    thread::sleep(Duration::from_millis(2500));
+    at.provider.token_delay(Duration::ZERO);
+    assert_eq!(
+        at.user_seen(&mut browser, "honest"),
+        json!({ "id": ADA, "groups": ["devops"] }),
+        "the renewal went on to its end: the session holds, with the new Groups"
+    );
+    assert_eq!(
+        at.provider.grants("refresh_token").len(),
+        1,
+        "one refresh grant for that renewal"
+    );
+    // The refresh token the provider replaced was kept: the next renewal
+    // works too (the provider refuses a used one).
+    let renewed = Instant::now();
+    at.provider.set_groups(ADA, &["audit"]);
+    wait_past(renewed, Duration::from_secs(3));
+    assert_eq!(
+        at.user_seen(&mut browser, "honest")["groups"],
+        json!(["audit"]),
+        "the renewal after it works"
+    );
+    assert_eq!(at.provider.grants("refresh_token").len(), 2);
+    assert!(
+        at.logged("session-ended").is_empty(),
+        "no session ended: {:?}",
+        at.logged("session-ended")
+    );
+}
+
+fn status(code: u16, error: &str, description: &str) -> TokenStatus {
+    TokenStatus {
+        status: code,
+        error: error.to_owned(),
+        description: description.to_owned(),
+    }
+}
+
+#[test]
+fn a_408_429_or_5xx_at_a_renewal_is_503_and_the_session_stays() {
+    for code in [408, 429, 500, 503] {
+        let at = renewing_every(2);
+        let mut browser = at.browser_as(ADA);
+        let signed_in = Instant::now();
+        at.sign_in(&mut browser, "honest", "/");
+        at.provider.set_groups(ADA, &["devops"]);
+        wait_past(signed_in, Duration::from_secs(2));
+        at.provider
+            .token_status(Some(status(code, "temporarily_unavailable", "try later")));
+        let answer = at.get_json(&mut browser, "honest", "/");
+        assert_eq!(answer.status, 503, "{code}\n{}", answer.describe());
+        assert!(
+            answer.header("retry-after").is_some(),
+            "{code}\n{}",
+            answer.describe()
+        );
+        at.vm.records_of(&answer).assert_no_application_code_ran();
+        at.assert_logged(
+            "identity-provider-unanswered",
+            &[
+                ("call", json!("token")),
+                ("problem", json!("status")),
+                ("status", json!(code)),
+            ],
+        );
+        at.provider.token_status(None);
+        assert_eq!(
+            at.user_seen(&mut browser, "honest")["groups"],
+            json!(["devops"]),
+            "{code}: the session stayed, and is renewed once the provider answers"
+        );
+        assert!(at.logged("session-ended").is_empty(), "{code}");
+    }
+}
+
+#[test]
+fn another_4xx_at_a_renewal_ends_the_session_and_its_description_is_never_logged() {
+    let at = renewing_every(2);
+    let mut browser = at.browser_as(ADA);
+    let signed_in = Instant::now();
+    at.sign_in(&mut browser, "honest", "/");
+    wait_past(signed_in, Duration::from_secs(2));
+    let description = "harness-description-Zq81vB-never-logged";
+    at.provider
+        .token_status(Some(status(400, "invalid_request", description)));
+    at.assert_no_session(
+        &mut browser,
+        "honest",
+        "a 400 invalid_request at the renewal",
+    );
+    at.assert_logged("session-ended", &[("reason", json!("refused"))]);
+    at.assert_logged(
+        "identity-provider-refused",
+        &[("status", json!(400)), ("error", json!("invalid_request"))],
+    );
+    at.assert_none_in_log(
+        &[description.to_owned()],
+        "the provider's error_description",
+    );
+}
+
+#[test]
+fn after_the_client_secret_changes_a_session_ends_at_its_next_renewal() {
+    let at = renewing_every(8);
+    let mut browser = at.browser_as(ADA);
+    let signed_in = Instant::now();
+    at.sign_in(&mut browser, "honest", "/");
+    let at = at.restarted_with_secret("harness-second-secret-Hk3d9Qw7");
+    browser.reach(at.vm.address());
+    assert_eq!(
+        at.user_seen(&mut browser, "honest")["id"],
+        ADA,
+        "the session holds until its renewal"
+    );
+    wait_past(signed_in, Duration::from_secs(8));
+    at.assert_no_session(&mut browser, "honest", "after the client secret changed");
+    at.assert_logged(
+        "session-ended",
+        &[("reason", json!("unreadable-refresh-token"))],
+    );
 }

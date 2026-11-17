@@ -59,6 +59,8 @@ pub struct Installation {
     // The program first, so that it ends before the provider does.
     pub vm: Vm,
     pub provider: Provider,
+    /// `--public-port`, when it was given.
+    public_port: Option<u16>,
 }
 
 impl Installation {
@@ -82,14 +84,77 @@ impl Installation {
 
     /// The program started with these options beside this provider.
     pub fn from(provider: Provider, options: &VmOptions) -> Self {
+        let public_port = options
+            .extra_arg_value("--public-port")
+            .and_then(|p| p.parse().ok());
         let vm = Vm::start(options);
-        Self { vm, provider }
+        Self {
+            vm,
+            provider,
+            public_port,
+        }
     }
 
-    /// The port browsers use: the listening one (`--public-scheme http`
-    /// without `--public-port`).
+    /// Ends the program and starts it again with the same options on the
+    /// same platform database, beside the same provider.
+    #[must_use]
+    pub fn restarted(self) -> Self {
+        let options = self.vm.options().clone();
+        self.restarted_with(&options)
+    }
+
+    /// Ends the program and starts it again with `VM_OIDC_CLIENT_SECRET`
+    /// set to `secret` (the provider told to take it too), the rest as
+    /// before.
+    #[must_use]
+    pub fn restarted_with_secret(self, secret: &str) -> Self {
+        self.provider.also_take_secret(secret);
+        let options = self
+            .vm
+            .options()
+            .clone()
+            .env("VM_OIDC_CLIENT_SECRET", secret);
+        self.restarted_with(&options)
+    }
+
+    fn restarted_with(self, options: &VmOptions) -> Self {
+        let Self {
+            vm,
+            provider,
+            public_port,
+        } = self;
+        let platform = vm.platform().clone();
+        drop(vm);
+        let vm = Vm::start(&options.clone().platform(&platform));
+        Self {
+            vm,
+            provider,
+            public_port,
+        }
+    }
+
+    /// The port browsers use: `--public-port` when given, else the
+    /// listening one (`--public-scheme http`).
     pub fn port(&self) -> u16 {
-        self.vm.address().port()
+        self.public_port.unwrap_or_else(|| self.vm.address().port())
+    }
+
+    /// Fails unless the log has a record of this `event` whose fields hold
+    /// these values; returns it.
+    pub fn assert_logged(&self, event: &str, fields: &[(&str, Value)]) -> Value {
+        let what = format!("a `{event}` record with {fields:?}");
+        self.vm.wait_for_record(&what, |r| {
+            r["event"] == event && fields.iter().all(|(name, value)| &r[*name] == value)
+        })
+    }
+
+    /// Every record of this `event` so far.
+    pub fn logged(&self, event: &str) -> Vec<Value> {
+        self.vm
+            .records()
+            .into_iter()
+            .filter(|r| r["event"] == event)
+            .collect()
     }
 
     pub fn auth_host(&self) -> String {
@@ -394,9 +459,65 @@ pub fn the_set_cookie(response: &Response, name: &str, context: &str) -> SetCook
 /// status: `text/html`, a link (`href`), and none of these values (codes,
 /// tokens, the secret) in its headers or body, nor anything shaped like a
 /// JWT.
+/// Where a failure page's link goes (CONTRACT.md, step 3).
+#[derive(Clone, Copy, Debug)]
+pub enum Link<'a> {
+    /// The Application is not known: no link at all.
+    Nowhere,
+    /// The Application is known: every link goes to its address (this
+    /// origin).
+    To(&'a str),
+    /// The contract does not say which: either of the two.
+    NowhereOrTo(&'a str),
+}
+
+/// The `href` values of a page.
+pub fn hrefs(html: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    let lower = html.to_ascii_lowercase();
+    let mut from = 0;
+    while let Some(at) = lower.get(from..).and_then(|rest| rest.find("href=")) {
+        let start = from + at + 5;
+        let rest = html.get(start..).unwrap_or_default();
+        let value = match rest.chars().next() {
+            Some(q @ ('"' | '\'')) => rest.get(1..).unwrap_or_default().split(q).next(),
+            _ => rest.split(|c: char| c.is_whitespace() || c == '>').next(),
+        };
+        found.push(value.unwrap_or_default().to_owned());
+        from = start;
+    }
+    found
+}
+
+/// Fails unless the page's links are as `link` says.
+pub fn assert_link(response: &Response, link: Link<'_>, context: &str) {
+    let html = response.text();
+    let links = hrefs(&html);
+    let to = |origin: &str| {
+        !links.is_empty()
+            && links.iter().all(|h| {
+                h.strip_prefix(origin).is_some_and(|rest| {
+                    rest.is_empty() || rest.starts_with('/') || rest.starts_with('?')
+                })
+            })
+    };
+    let nowhere = links.is_empty() && !html.to_ascii_lowercase().contains("<a ");
+    let ok = match link {
+        Link::Nowhere => nowhere,
+        Link::To(origin) => to(origin),
+        Link::NowhereOrTo(origin) => nowhere || to(origin),
+    };
+    assert!(
+        ok,
+        "{context}: expected the page's link to be {link:?}, it has {links:?}\n{}",
+        response.describe()
+    );
+}
+
 pub fn assert_failure_page(
     response: &Response,
     statuses: &[u16],
+    link: Link<'_>,
     hidden: &[String],
     context: &str,
 ) {
@@ -413,10 +534,7 @@ pub fn assert_failure_page(
         response.describe()
     );
     let text = response.describe();
-    assert!(
-        response.text().to_ascii_lowercase().contains("href"),
-        "{context}: expected the page to give a link to try again, got\n{text}"
-    );
+    assert_link(response, link, context);
     for value in hidden.iter().filter(|v| v.len() >= 8) {
         assert!(
             !text.contains(value.as_str()),

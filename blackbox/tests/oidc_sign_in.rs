@@ -24,7 +24,7 @@ use blackbox::Request;
 use blackbox::browser::{describe_steps, query_param, set_cookies, url};
 use blackbox::oidc::{CLIENT_ID, Key, Outage, Provider};
 use blackbox::sessions::{
-    ADA, GRACE, Installation, SESSION_COOKIE, SIGN_IN_COOKIE, ada, assert_256_bits,
+    ADA, GRACE, Installation, Link, SESSION_COOKIE, SIGN_IN_COOKIE, ada, assert_256_bits,
     assert_failure_page, assert_platform_cookie, assert_ten_minutes, grace, oidc_options,
     the_set_cookie,
 };
@@ -483,6 +483,9 @@ fn a_callback_with_a_state_this_browser_did_not_start_begins_no_session() {
     assert_failure_page(
         &answer.response,
         &[400],
+        // The state opens, but not in this browser: the contract does not
+        // say whether the Application then counts as known.
+        Link::NowhereOrTo(&at.app_origin("honest")),
         &hidden,
         "another browser's callback",
     );
@@ -498,9 +501,21 @@ fn a_callback_with_a_state_this_browser_did_not_start_begins_no_session() {
         query_param(&callback, "code").unwrap()
     )));
     let answer = ada_browser.open(&forged);
-    assert_failure_page(&answer.response, &[400], &hidden, "a forged state");
+    assert_failure_page(
+        &answer.response,
+        &[400],
+        Link::Nowhere,
+        &hidden,
+        "a forged state",
+    );
     let bare = ada_browser.open(&at.auth_url("/callback"));
-    assert_failure_page(&bare.response, &[400], &hidden, "a callback with nothing");
+    assert_failure_page(
+        &bare.response,
+        &[400],
+        Link::Nowhere,
+        &hidden,
+        "a callback with nothing",
+    );
     assert!(
         ada_browser
             .jar
@@ -519,6 +534,7 @@ fn an_error_from_the_identity_provider_is_a_page_with_a_way_to_try_again() {
     assert_failure_page(
         &answer.response,
         &[400],
+        Link::To(&at.app_origin("honest")),
         &[],
         "access_denied from the provider",
     );
@@ -719,6 +735,7 @@ fn a_provider_unreachable_at_first_is_used_once_it_answers() {
     assert_failure_page(
         &second.response,
         &[502],
+        Link::To(&at.app_origin("honest")),
         &[],
         "the sign-in address while the provider cannot be reached",
     );
@@ -739,6 +756,7 @@ fn a_token_endpoint_that_does_not_answer_within_ten_seconds_is_a_502_page() {
     assert_failure_page(
         &answer.response,
         &[502],
+        Link::To(&at.app_origin("honest")),
         &at.provider.issued(),
         "a token endpoint that does not answer",
     );

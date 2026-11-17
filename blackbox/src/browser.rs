@@ -545,6 +545,12 @@ impl Browser {
         }
     }
 
+    /// Reaches names at this address from now on: the program started
+    /// again, the cookies kept.
+    pub fn reach(&mut self, program: SocketAddr) {
+        self.program = program;
+    }
+
     /// Signs this browser in at the provider as the person with this `sub`
     /// (the provider's own session, [`PERSON_COOKIE`]).
     pub fn sign_in_at_provider(&mut self, provider: &Provider, sub: &str) {

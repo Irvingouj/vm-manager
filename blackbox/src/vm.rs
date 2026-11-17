@@ -152,6 +152,15 @@ impl VmOptions {
         self
     }
 
+    /// The value after this argument among the extra ones, if given.
+    pub fn extra_arg_value(&self, name: &str) -> Option<&str> {
+        self.extra_args
+            .iter()
+            .position(|a| a == name)
+            .and_then(|at| self.extra_args.get(at + 1))
+            .map(String::as_str)
+    }
+
     /// Starts the program with this environment variable set.
     #[must_use]
     pub fn env(mut self, name: &str, value: &str) -> Self {

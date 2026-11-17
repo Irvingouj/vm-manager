@@ -14,7 +14,7 @@
 use std::time::Duration;
 
 use blackbox::oidc::{Key, Outage, TokenAnswer, TokenFault};
-use blackbox::sessions::{ADA, Installation, SESSION_COOKIE, assert_failure_page};
+use blackbox::sessions::{ADA, Installation, Link, SESSION_COOKIE, assert_failure_page};
 
 fn installation() -> Installation {
     Installation::start(&[("honest", "honest.js")])
@@ -29,7 +29,13 @@ fn assert_sign_in_fails(at: &Installation, statuses: &[u16], context: &str) {
     let callback = browser.follow(steps.last().unwrap());
     let mut hidden = at.provider.issued();
     hidden.push(at.provider.client_secret().expose().to_owned());
-    assert_failure_page(&callback.response, statuses, &hidden, context);
+    assert_failure_page(
+        &callback.response,
+        statuses,
+        Link::To(&at.app_origin("honest")),
+        &hidden,
+        context,
+    );
     assert!(
         browser.jar.get(&at.auth_host(), SESSION_COOKIE).is_none(),
         "{context}: expected no platform session"
@@ -133,6 +139,7 @@ fn a_provider_that_closes_the_connection_at_the_callback_is_a_502_page() {
     assert_failure_page(
         &callback.response,
         &[502],
+        Link::To(&at.app_origin("honest")),
         &at.provider.issued(),
         "a provider that closes the connection",
     );
@@ -166,6 +173,7 @@ fn a_code_the_provider_refuses_is_a_400_page() {
     assert_failure_page(
         &callback.response,
         &[400],
+        Link::To(&at.app_origin("honest")),
         &at.provider.issued(),
         "a code the provider refuses",
     );

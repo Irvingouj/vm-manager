@@ -174,6 +174,9 @@ pub enum TokenFault {
     Hs256WithSecret,
     /// A `sub` other than the person's (`<sub>-someone-else`).
     OtherSubject,
+    /// `iat` and `exp` given with a fraction of a second (`...5`): a token
+    /// that holds.
+    FractionalTimes,
 }
 
 /// What the token endpoint's successful answer looks like.
@@ -185,6 +188,28 @@ pub enum TokenAnswer {
     WithoutIdToken,
     /// `200` with a body that is not JSON.
     NotJson,
+    /// JSON of more than 1 MiB.
+    Oversize,
+}
+
+/// An answer of the token endpoint other than its own: this status, with
+/// `{ "error", "error_description" }`, to every token request while set.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TokenStatus {
+    pub status: u16,
+    pub error: String,
+    pub description: String,
+}
+
+/// What is wrong with the configuration while it is set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConfigFault {
+    /// An `issuer` other than the one the program was given.
+    AnotherIssuer,
+    /// No `token_endpoint`.
+    LacksTokenEndpoint,
+    /// More than 1 MiB.
+    Oversize,
 }
 
 /// Whether the provider answers.
@@ -281,6 +306,10 @@ struct State {
     token_delay: Duration,
     oversize_jwks: bool,
     token_answer: TokenAnswer,
+    token_status: Option<TokenStatus>,
+    config_fault: Option<ConfigFault>,
+    unreadable_jwks: bool,
+    other_secrets: Vec<String>,
 }
 
 struct Keys {
@@ -382,6 +411,10 @@ impl Provider {
             token_delay: Duration::ZERO,
             oversize_jwks: false,
             token_answer: TokenAnswer::Normal,
+            token_status: None,
+            config_fault: None,
+            unreadable_jwks: false,
+            other_secrets: Vec::new(),
         };
         let shared = Arc::new(Shared {
             state: Mutex::new(state),
@@ -518,6 +551,28 @@ impl Provider {
     /// Whether the JWKS is padded to more than 1 MiB.
     pub fn oversize_jwks(&self, oversize: bool) {
         self.shared.lock().oversize_jwks = oversize;
+    }
+
+    /// Every token request is answered with this status (and error) while
+    /// it is set.
+    pub fn token_status(&self, status: Option<TokenStatus>) {
+        self.shared.lock().token_status = status;
+    }
+
+    /// What is wrong with the configuration while it is set.
+    pub fn config_fault(&self, fault: Option<ConfigFault>) {
+        self.shared.lock().config_fault = fault;
+    }
+
+    /// Whether the JWKS is JSON that is no JWKS (`keys` not a list).
+    pub fn unreadable_jwks(&self, unreadable: bool) {
+        self.shared.lock().unreadable_jwks = unreadable;
+    }
+
+    /// Takes this client secret too, beside its own: a client secret
+    /// changed at the provider while the old one still works.
+    pub fn also_take_secret(&self, secret: &str) {
+        self.shared.lock().other_secrets.push(secret.to_owned());
     }
 
     /// What the token endpoint's successful answers look like from now on.
@@ -708,6 +763,13 @@ fn serve_connection(mut stream: TcpStream, shared: &Shared) {
             return;
         }
         Outage::Hang => {
+            // The request is read and recorded, so that a test can count
+            // the calls it got no answer to; then nothing is answered.
+            drop(stream.set_read_timeout(Some(IO_TIMEOUT)));
+            if let Some(incoming) = read_request(&mut stream) {
+                let recorded = record_of(&incoming);
+                keep_recorded(shared, recorded);
+            }
             let began = Instant::now();
             while !shared.stop.load(Ordering::SeqCst)
                 && shared.lock().outage == Outage::Hang
@@ -837,7 +899,7 @@ fn write_answer(stream: &mut TcpStream, answer: &Answer) {
     drop(stream.shutdown(Shutdown::Write));
 }
 
-fn answer(incoming: &Incoming, shared: &Shared) -> Answer {
+fn record_of(incoming: &Incoming) -> Recorded {
     let parsed = Url::parse(&format!("http://provider{}", incoming.target)).ok();
     let path = parsed
         .as_ref()
@@ -856,16 +918,30 @@ fn answer(incoming: &Incoming, shared: &Shared) -> Answer {
     } else {
         Vec::new()
     };
-    let mut recorded = Recorded {
+    Recorded {
         method: incoming.method.clone(),
-        path: path.clone(),
+        path,
         query,
         headers: incoming.headers.clone(),
         form,
         client_auth: None,
         pkce_ok: None,
         at: Instant::now(),
-    };
+    }
+}
+
+fn keep_recorded(shared: &Shared, recorded: Recorded) {
+    let mut state = shared.lock();
+    if state.recorded.len() < MAX_RECORDED {
+        state.recorded.push(recorded);
+    } else {
+        state.recorded_dropped += 1;
+    }
+}
+
+fn answer(incoming: &Incoming, shared: &Shared) -> Answer {
+    let mut recorded = record_of(incoming);
+    let path = recorded.path.clone();
     let answer = match (incoming.method.as_str(), path.as_str()) {
         ("GET", "/.well-known/openid-configuration") => configuration(shared),
         ("GET", "/jwks") => jwks(shared),
@@ -873,21 +949,17 @@ fn answer(incoming: &Incoming, shared: &Shared) -> Answer {
         ("POST", "/token") => token(&mut recorded, shared),
         _ => Answer::json(404, &json!({ "error": "not_found" })),
     };
-    let mut state = shared.lock();
-    if state.recorded.len() < MAX_RECORDED {
-        state.recorded.push(recorded);
-    } else {
-        state.recorded_dropped += 1;
-    }
+    keep_recorded(shared, recorded);
     answer
 }
 
 fn configuration(shared: &Shared) -> Answer {
     let issuer = &shared.issuer;
-    let methods = shared.lock().auth_methods.clone();
-    Answer::json(
-        200,
-        &json!({
+    let (methods, fault) = {
+        let state = shared.lock();
+        (state.auth_methods.clone(), state.config_fault)
+    };
+    let mut body = json!({
             "issuer": issuer,
             "authorization_endpoint": format!("{issuer}/authorize"),
             "token_endpoint": format!("{issuer}/token"),
@@ -900,8 +972,22 @@ fn configuration(shared: &Shared) -> Answer {
             "grant_types_supported": ["authorization_code", "refresh_token"],
             "scopes_supported": ["openid", "profile", "email", "offline_access"],
             "claims_supported": ["sub", "iss", "aud", "exp", "iat", "nonce", "name", "email", "groups"],
-        }),
-    )
+    });
+    match fault {
+        Some(ConfigFault::AnotherIssuer) => {
+            body["issuer"] = json!(format!("{issuer}/someone-else"));
+        }
+        Some(ConfigFault::LacksTokenEndpoint) => {
+            if let Some(fields) = body.as_object_mut() {
+                fields.remove("token_endpoint");
+            }
+        }
+        Some(ConfigFault::Oversize) => {
+            body["padding"] = Value::String("x".repeat(OVERSIZE_BYTES));
+        }
+        None => {}
+    }
+    Answer::json(200, &body)
 }
 
 fn rsa_jwk(key: &RsaKeyPair, kid: &str) -> Value {
@@ -933,10 +1019,17 @@ fn ec_jwk(key: &EcdsaKeyPair) -> Value {
 }
 
 fn jwks(shared: &Shared) -> Answer {
-    let (publish_other, oversize) = {
+    let (publish_other, oversize, unreadable) = {
         let state = shared.lock();
-        (state.publish_other, state.oversize_jwks)
+        (
+            state.publish_other,
+            state.oversize_jwks,
+            state.unreadable_jwks,
+        )
     };
+    if unreadable {
+        return Answer::json(200, &json!({ "keys": "these are not keys" }));
+    }
     let mut keys = vec![
         rsa_jwk(&shared.keys.main, KID_MAIN),
         ec_jwk(&shared.keys.ec),
@@ -1069,9 +1162,17 @@ fn token(recorded: &mut Recorded, shared: &Shared) -> Answer {
     let (method, id, secret) = client_auth(recorded);
     recorded.client_auth = Some(method.clone());
     let mut state = shared.lock();
-    let authenticated = state.auth_methods.contains(&method)
-        && id.as_deref() == Some(CLIENT_ID)
-        && secret.as_deref() == Some(shared.secret.as_str());
+    if let Some(status) = &state.token_status {
+        return Answer::json(
+            status.status,
+            &json!({ "error": status.error, "error_description": status.description }),
+        );
+    }
+    let secret_taken = secret
+        .as_deref()
+        .is_some_and(|s| s == shared.secret || state.other_secrets.iter().any(|o| o == s));
+    let authenticated =
+        state.auth_methods.contains(&method) && id.as_deref() == Some(CLIENT_ID) && secret_taken;
     if !authenticated {
         return token_error(401, "invalid_client");
     }
@@ -1103,10 +1204,15 @@ fn token(recorded: &mut Recorded, shared: &Shared) -> Answer {
         }
         Some("refresh_token") => {
             let presented = recorded.form_param("refresh_token").unwrap_or_default();
-            let Some(grant) = state.refresh_tokens.get(presented) else {
+            // Refresh tokens are one use each: a renewal that brings a new
+            // one uses up the one presented, and a used one is refused.
+            let Some(grant) = state.refresh_tokens.get(presented).cloned() else {
                 return token_error(400, "invalid_grant");
             };
-            grant.clone()
+            if state.issue_refresh_tokens {
+                state.refresh_tokens.remove(presented);
+            }
+            grant
         }
         _ => return token_error(400, "unsupported_grant_type"),
     };
@@ -1148,6 +1254,10 @@ fn token(recorded: &mut Recorded, shared: &Shared) -> Answer {
             }
             Answer::json(200, &body)
         }
+        TokenAnswer::Oversize => {
+            body["padding"] = Value::String("x".repeat(OVERSIZE_BYTES));
+            Answer::json(200, &body)
+        }
         TokenAnswer::NotJson => Answer {
             status: 200,
             content_type: "application/json",
@@ -1187,6 +1297,14 @@ fn id_token(shared: &Shared, state: &State, person: &Person, nonce: Option<&str>
     claims.insert("iat".to_owned(), json!(now.min(now + expires_in - 1)));
     claims.insert("auth_time".to_owned(), json!(now));
     claims.insert("exp".to_owned(), json!(now + expires_in));
+    if fault == Some(TokenFault::FractionalTimes) {
+        // Halves of a second, `1794923733.5`, written as JSON numbers.
+        let half = |whole: i64| {
+            serde_json::from_str::<Value>(&format!("{whole}.5")).unwrap_or(Value::Null)
+        };
+        claims.insert("iat".to_owned(), half(now - 1));
+        claims.insert("exp".to_owned(), half(now + expires_in));
+    }
     if let Some(nonce) = nonce {
         let nonce = if fault == Some(TokenFault::WrongNonce) {
             format!("{nonce}-not-it")
