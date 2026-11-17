@@ -65,6 +65,24 @@ pub struct VmOptions {
     administrators_group: Option<String>,
     tool_credential_lifetime: Option<u64>,
     platform: Option<Platform>,
+    /// More arguments, after the others (the OIDC settings, say).
+    extra_args: Vec<String>,
+    /// Environment variables the program is started with.
+    env: Vec<EnvVar>,
+}
+
+/// An environment variable for the program. Its value may be a secret
+/// (`VM_OIDC_CLIENT_SECRET`), so `Debug` shows only its name.
+#[derive(Clone)]
+struct EnvVar {
+    name: String,
+    value: String,
+}
+
+impl std::fmt::Debug for EnvVar {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}=<hidden>", self.name)
+    }
 }
 
 impl Default for VmOptions {
@@ -76,6 +94,8 @@ impl Default for VmOptions {
             administrators_group: None,
             tool_credential_lifetime: None,
             platform: None,
+            extra_args: Vec::new(),
+            env: Vec::new(),
         }
     }
 }
@@ -125,6 +145,35 @@ impl VmOptions {
         self
     }
 
+    /// Adds these arguments after the others.
+    #[must_use]
+    pub fn args_extra(mut self, args: &[&str]) -> Self {
+        self.extra_args.extend(args.iter().map(|a| (*a).to_owned()));
+        self
+    }
+
+    /// Starts the program with this environment variable set.
+    #[must_use]
+    pub fn env(mut self, name: &str, value: &str) -> Self {
+        self.env.push(EnvVar {
+            name: name.to_owned(),
+            value: value.to_owned(),
+        });
+        self
+    }
+
+    /// The same options without the extra arguments and environment, and
+    /// with the stand-in sign-in on: what installs the fixture Applications
+    /// before a program without the stand-in starts.
+    fn installer(&self) -> Self {
+        Self {
+            extra_args: Vec::new(),
+            env: Vec::new(),
+            ..self.clone()
+        }
+        .stand_in_sign_in()
+    }
+
     /// The `vm` arguments for these options. `VM_DATABASE_URL` goes in the
     /// environment, never here.
     pub fn args(&self) -> Vec<String> {
@@ -146,6 +195,7 @@ impl VmOptions {
             args.push("--tool-credential-lifetime".to_owned());
             args.push(seconds.to_string());
         }
+        args.extend(self.extra_args.iter().cloned());
         args
     }
 }
@@ -195,7 +245,7 @@ impl Vm {
             return vm;
         }
         if !options.applications.is_empty() {
-            let installer = Self::launch(&options.clone().stand_in_sign_in(), &platform);
+            let installer = Self::launch(&options.installer(), &platform);
             installer.install_all(&options.applications);
             drop(installer);
         }
@@ -275,6 +325,8 @@ impl Vm {
         let mut child = Command::new(vm_binary())
             .args(&args)
             .env("VM_DATABASE_URL", platform.url())
+            .env_remove("VM_OIDC_CLIENT_SECRET")
+            .envs(options.env.iter().map(|e| (&e.name, &e.value)))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())

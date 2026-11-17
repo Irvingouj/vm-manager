@@ -188,7 +188,7 @@ impl Request {
                 .write_all(&wire)
                 .map_err(|e| format!("cannot send the request: {e}"))?;
             let raw = read_to_end_before(&mut stream, deadline, self.timeout)?;
-            return Response::parse(&raw, self.to_string());
+            return Response::parse_answer(&raw, self.to_string(), self.method == "HEAD");
         }
         let mut writer = stream.try_clone().map_err(|e| e.to_string())?;
         let (read, wrote) = thread::scope(|scope| {
@@ -203,7 +203,9 @@ impl Request {
             (read, wrote)
         });
         match read {
-            Ok(raw) if !raw.is_empty() => Response::parse(&raw, self.to_string()),
+            Ok(raw) if !raw.is_empty() => {
+                Response::parse_answer(&raw, self.to_string(), self.method == "HEAD")
+            }
             Ok(_) => Err(format!(
                 "the connection closed with no answer (writing the request: {wrote:?})"
             )),
@@ -315,7 +317,9 @@ pub struct Response {
 }
 
 impl Response {
-    fn parse(raw: &[u8], request: String) -> Result<Self, String> {
+    /// Parses an answer; the answer to a `HEAD` has no body whatever its
+    /// `Content-Length` or `Transfer-Encoding` say.
+    fn parse_answer(raw: &[u8], request: String, answers_head: bool) -> Result<Self, String> {
         let head_end = find(raw, b"\r\n\r\n").ok_or_else(|| {
             format!(
                 "the answer has no complete head: {:?}",
@@ -344,7 +348,9 @@ impl Response {
         let chunked = response
             .header("transfer-encoding")
             .is_some_and(|te| te.to_ascii_lowercase().contains("chunked"));
-        response.body = if chunked {
+        response.body = if answers_head {
+            Vec::new()
+        } else if chunked {
             decode_chunked(rest)?
         } else if let Some(length) = response.header("content-length") {
             let length: usize = length
@@ -467,7 +473,7 @@ mod tests {
     use super::*;
 
     fn parse(raw: &str) -> Response {
-        Response::parse(raw.as_bytes(), "a test request".to_owned()).unwrap()
+        Response::parse_answer(raw.as_bytes(), "a test request".to_owned(), false).unwrap()
     }
 
     #[test]
@@ -476,6 +482,18 @@ mod tests {
         assert_eq!(r.status, 200);
         assert_eq!(r.text(), "hello");
         assert_eq!(r.request_id(), "r1");
+    }
+
+    #[test]
+    fn the_answer_to_head_has_no_body_whatever_its_length_says() {
+        let r = Response::parse_answer(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n",
+            "HEAD /".to_owned(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(r.status, 200);
+        assert!(r.body().is_empty());
     }
 
     #[test]

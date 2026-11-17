@@ -62,7 +62,10 @@
 //!   `vm local ...` on a machine with its own data folder and `TMPDIR`, what
 //!   they printed, the local Postgres seen from outside, a mirror that hands
 //!   over Postgres's archive, and a project whose handler does what each
-//!   path says.
+//!   path says;
+//! - [`oidc`] is the harness's own identity provider, [`browser`] a small
+//!   browser with a cookie jar that follows redirects a step at a time, and
+//!   [`sessions`] what the tests of sign-in and sessions share.
 //!
 //! Every wait has a timeout, so a failing test fails within seconds and
 //! never hangs. Each test starts its own program on its own port, so tests
@@ -76,6 +79,7 @@
 )]
 
 pub mod api;
+pub mod browser;
 pub mod changed_outside;
 pub mod deploy;
 pub mod dev;
@@ -94,6 +98,7 @@ pub mod left_behind;
 pub mod local;
 pub mod log;
 pub mod logs;
+pub mod oidc;
 pub mod out_of_reach;
 pub mod own_database;
 pub mod postgres;
@@ -104,6 +109,7 @@ pub mod scenario;
 pub mod sdk;
 pub mod sdk_history;
 pub mod server_log;
+pub mod sessions;
 pub mod shared_database;
 pub mod sql;
 pub mod structure;

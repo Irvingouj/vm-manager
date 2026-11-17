@@ -26,6 +26,11 @@ tar = { version = "0.4", default-features = false }
 # never the program's.
 tokio = { version = "1", features = ["rt", "net", "time"] }
 tokio-postgres = "0.7"
+# The harness's identity provider and browser (src/oidc.rs, src/browser.rs):
+# signing ID tokens, base64url, and URLs with their query strings.
+ring.workspace = true
+base64.workspace = true
+url.workspace = true
 
 [lints]
 workspace = true
