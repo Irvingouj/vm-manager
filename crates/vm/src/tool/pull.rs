@@ -219,7 +219,7 @@ impl<'a> Pull<'a> {
         let one_statement_each = answered
             .standin_sql
             .iter()
-            .all(|s| s.ends_with(';') && !s.contains("\n\n"));
+            .all(|s| s.ends_with(';'));
         if !one_statement_each {
             return Err(unexpected(
                 kept.connect,

@@ -220,7 +220,7 @@ pub fn as_new() -> Result<TestUsersFile, Ending> {
             "the template's vm.dev.json is not JSON".to_owned(),
         )
     })?;
-    checked(whole).map_err(|what| Ending::new(4, "tool-failed", what))
+    checked(whole).map_err(|what| Ending::new(1, "tool-failed", what))
 }
 
 /// `test-users-file`, saying what is wrong.
