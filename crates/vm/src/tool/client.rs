@@ -44,8 +44,11 @@ pub struct Installation<'a> {
 /// How a request is signed in.
 #[derive(Clone, Copy)]
 pub enum Sign<'a> {
-    /// With the tool credential.
+    /// With the tool credential (or the setup credential, which has the
+    /// same shape).
     Credential(&'a Secret),
+    /// Not signed in.
+    Anyone,
     /// With the stand-in: the User and, if any, the Groups, comma-separated.
     StandIn {
         user: &'a str,
@@ -127,6 +130,7 @@ fn request(
         .uri(path)
         .header(HOST, host);
     match sign {
+        Sign::Anyone => {}
         Sign::Credential(secret) => {
             let mut value =
                 HeaderValue::try_from(format!("Bearer {}", secret.expose())).map_err(|_| ())?;

@@ -36,7 +36,7 @@ Run them from this folder. Each has `--help` and `--json` (one JSON object on st
 | `vm dev` | keeps the project running on this machine for the Builder's browser, until interrupted |
 | `vm local reset` | starts the local databases over: empty, every migration applied again, test rows loaded |
 
-If a command says you are not signed in, ask the Builder to run `vm sign-in` (it needs their details), then run yours again.
+If a command says you are not signed in, run the `vm sign-in` command its message gives. It opens the Builder's browser (or shows an address for the Builder to open, and a check code to type there): tell the Builder so, let them answer in the browser, then run your own command again. If it ends with `sign-in-not-finished`, the Builder has not answered yet: ask them to, then run `vm sign-in` again. Never ask the Builder for a password or a token.
 
 ## How to work
 

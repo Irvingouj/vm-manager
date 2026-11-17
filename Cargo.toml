@@ -50,7 +50,7 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "sync", "ma
 # tools in a group of its own), behind a safe interface; and `fs`, to tell
 # whether standard output was closed when the tool started (`vm logs
 # --follow`).
-rustix = { version = "1", default-features = false, features = ["std", "process", "fs"] }
+rustix = { version = "1", default-features = false, features = ["std", "process", "fs", "system"] }
 # The SDK's tarball that `vm new` writes, made by crates/vm/build.rs.
 tar = { version = "0.4", default-features = false }
 flate2 = "1"

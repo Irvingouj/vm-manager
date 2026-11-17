@@ -1,12 +1,12 @@
 //! The platform program (ADR 0015).
 //!
 //! `VM_DATABASE_URL=postgres://... vm serve --domain <domain> --listen
-//! <ip:port> [--stand-in-sign-in] [--administrators-group <Group>]
-//! [--oidc-issuer <URL> --oidc-client-id <id> ...]` serves the
-//! Applications kept in the platform database, and the platform's API
-//! (blackbox/CONTRACT.md); with OIDC, `VM_OIDC_CLIENT_SECRET` in the
-//! environment.
-//! `vm sign-in`, `vm sign-out`, `vm whoami`, `vm resources`, `vm
+//! <ip:port> [--stand-in-sign-in [--administrators-group <Group>]]` serves
+//! the Applications kept in the platform database, and the platform's API
+//! (blackbox/CONTRACT.md); with the installation's key in `VM_SECRET_KEY`,
+//! OIDC as the platform database's connection says (crate::oidc).
+//! `VM_DATABASE_URL=... vm setup` prints the setup credential (crate::setup).
+//! `vm admin connect-oidc`, `vm sign-in`, `vm sign-out`, `vm whoami`, `vm resources`, `vm
 //! applications`, `vm pull`, `vm new`, `vm check`, `vm generate`, `vm
 //! deploy`, `vm versions`, `vm go-back` and `vm logs` are the Builder's tool
 //! (vm::tool). `vm --version` names the execution core.
@@ -21,21 +21,20 @@ use clap::{Parser, Subcommand};
 use serde_json::json;
 use tokio::net::TcpListener;
 
-use vm::api::Api;
+use vm::api::{Api, Signing};
 use vm::executor;
 use vm::ingress::Ingress;
-use vm::oidc::Oidc;
-use vm::oidc::secret::ClientSecret;
-use vm::oidc::settings::{self as oidc_settings, DEFAULT_GROUPS_CLAIM, Settings};
+use vm::oidc::key::InstallationKey;
+use vm::oidc::{Oidc, OidcParts, connection};
 use vm::origin::{Public, Scheme};
 use vm::platform::{Limits, Platform};
-use vm::platform_db::{self, DatabaseAddress, PoolLimits};
+use vm::platform_db::{self, DatabaseAddress, PlatformDatabase, PoolLimits};
 use vm::registry::is_dns_label;
 use vm::runner;
 use vm::sign_in::{NoSignIn, SignIn, StandInSignIn};
 use vm::tool;
 use vm::tool_credentials::{DEFAULT_LIFETIME, ToolCredentials};
-use vm::{log, server};
+use vm::{log, server, setup};
 
 #[derive(Parser)]
 #[command(
@@ -58,8 +57,15 @@ const DATABASE_START_TIMEOUT: Duration = Duration::from_secs(12);
 #[derive(Subcommand)]
 enum Command {
     /// Serve Applications, each on <name>.<domain>, and the platform's API
-    /// on api.<domain>. The platform database is named by VM_DATABASE_URL.
+    /// on api.<domain>. The platform database is named by VM_DATABASE_URL,
+    /// the installation's key is VM_SECRET_KEY.
     Serve(Serve),
+    /// Print the setup credential, good for 24 hours for connecting OIDC
+    /// once (vm admin connect-oidc). The platform database is named by
+    /// VM_DATABASE_URL.
+    Setup(SetupArgs),
+    /// Commands for Platform administrators: connect-oidc.
+    Admin(tool::AdminArgs),
     /// Sign the tool in to an installation, and keep its credential in your
     /// own configuration folder.
     SignIn(tool::SignInArgs),
@@ -124,28 +130,15 @@ struct Serve {
     /// Development only: the caller states the User in x-vm-stand-in-* headers.
     #[arg(long)]
     stand_in_sign_in: bool,
-    /// The Group whose members are Platform administrators. Without it no
-    /// one is.
+    /// With the stand-in only: the Group whose members are Platform
+    /// administrators. With OIDC the connection names it (vm admin
+    /// connect-oidc).
     #[arg(long)]
     administrators_group: Option<String>,
     /// How long a tool credential lives from its sign-in, in seconds.
     #[arg(long, default_value_t = DEFAULT_LIFETIME.as_secs(),
           value_parser = clap::value_parser!(u64).range(1..=MAX_TOOL_CREDENTIAL_LIFETIME))]
     tool_credential_lifetime: u64,
-    /// OIDC sign-in: the identity provider's issuer, https://... (http://
-    /// only on a loopback host). Needs --oidc-client-id and
-    /// VM_OIDC_CLIENT_SECRET in the environment.
-    #[arg(long)]
-    oidc_issuer: Option<String>,
-    /// OIDC sign-in: the platform's client id at the identity provider.
-    #[arg(long)]
-    oidc_client_id: Option<String>,
-    /// The ID token's claim that holds the person's Groups.
-    #[arg(long, default_value = DEFAULT_GROUPS_CLAIM)]
-    oidc_groups_claim: String,
-    /// The scopes asked for, separated by spaces; openid is always asked.
-    #[arg(long)]
-    oidc_scopes: Option<String>,
     /// How a browser reaches the installation: https (the default) or http.
     #[arg(long, value_enum, default_value_t = Scheme::Https)]
     public_scheme: Scheme,
@@ -162,59 +155,12 @@ struct Serve {
     session_lifetime: u64,
 }
 
-/// The variable that holds the OIDC client secret.
-const CLIENT_SECRET_VARIABLE: &str = "VM_OIDC_CLIENT_SECRET";
-
-/// The OIDC settings, when the program is started with OIDC: the issuer,
-/// the client id and the secret together, each checked. The message names
-/// each thing missing, and never the secret.
-fn oidc(serve: &Serve) -> Result<Option<Settings>, String> {
-    if serve.oidc_issuer.is_none() && serve.oidc_client_id.is_none() {
-        // The secret alone in the environment is not looked at.
-        return Ok(None);
-    }
-    let secret = std::env::var_os(CLIENT_SECRET_VARIABLE)
-        .and_then(|value| value.into_string().ok())
-        .filter(|value| !value.is_empty())
-        .map(ClientSecret::new);
-    let mut missing = Vec::new();
-    if serve.oidc_issuer.is_none() {
-        missing.push("--oidc-issuer");
-    }
-    if serve.oidc_client_id.is_none() {
-        missing.push("--oidc-client-id");
-    }
-    if secret.is_none() {
-        missing.push("VM_OIDC_CLIENT_SECRET (in the environment, as UTF-8)");
-    }
-    let (Some(issuer), Some(client_id), Some(client_secret)) =
-        (&serve.oidc_issuer, &serve.oidc_client_id, secret)
-    else {
-        return Err(format!(
-            "OIDC sign-in needs --oidc-issuer, --oidc-client-id and {CLIENT_SECRET_VARIABLE} together; missing: {}",
-            missing.join(", ")
-        ));
-    };
-    oidc_settings::check_issuer(issuer)
-        .map_err(|why| format!("--oidc-issuer {issuer:?} cannot be used: {why}"))?;
-    if client_id.is_empty() || client_id.len() > 256 || client_id.chars().any(char::is_control) {
-        return Err(
-            "--oidc-client-id must be 1 to 256 bytes without control characters".to_owned(),
-        );
-    }
-    let groups_claim = serve.oidc_groups_claim.trim();
-    if groups_claim.is_empty() {
-        return Err("--oidc-groups-claim names no claim".to_owned());
-    }
-    Ok(Some(Settings {
-        issuer: issuer.clone(),
-        client_id: client_id.clone(),
-        client_secret,
-        groups_claim: groups_claim.to_owned(),
-        scopes: oidc_settings::scopes(serve.oidc_scopes.as_deref()),
-        renewal: Duration::from_secs(serve.session_renewal),
-        lifetime: Duration::from_secs(serve.session_lifetime),
-    }))
+/// `vm setup`.
+#[derive(clap::Args)]
+struct SetupArgs {
+    /// Print exactly one JSON object on standard output.
+    #[arg(long)]
+    json: bool,
 }
 
 /// The longest lifetime `--tool-credential-lifetime` takes: ten years.
@@ -245,6 +191,8 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        Some(Command::Setup(args)) => run_setup(&args),
+        Some(Command::Admin(args)) => tool::run(tool::Command::Admin(args)),
         Some(Command::SignIn(args)) => tool::run(tool::Command::SignIn(args)),
         Some(Command::SignOut(output)) => tool::run(tool::Command::SignOut(output)),
         Some(Command::Whoami(output)) => tool::run(tool::Command::Whoami(output)),
@@ -302,9 +250,9 @@ fn run(serve: &Serve) -> Result<(), String> {
             serve.domain
         ));
     }
-    if serve.stand_in_sign_in && (serve.oidc_issuer.is_some() || serve.oidc_client_id.is_some()) {
+    if serve.administrators_group.is_some() && !serve.stand_in_sign_in {
         return Err(
-            "--stand-in-sign-in cannot be switched on together with OIDC (--oidc-issuer): the stand-in is for tests and the local run only"
+            "--administrators-group belongs to the stand-in (--stand-in-sign-in): with OIDC, the Group whose members are Platform administrators is named when OIDC is connected, with `vm admin connect-oidc --administrators-group <Group>`"
                 .to_owned(),
         );
     }
@@ -314,7 +262,7 @@ fn run(serve: &Serve) -> Result<(), String> {
             serve.listen
         ));
     }
-    let oidc = oidc(serve)?;
+    let key = InstallationKey::from_environment()?;
     let address = database_address()?;
     let sign_in: Box<dyn SignIn> = if serve.stand_in_sign_in {
         Box::new(StandInSignIn)
@@ -343,9 +291,21 @@ fn run(serve: &Serve) -> Result<(), String> {
             runner,
             ..
         } = Platform::open(&address, limits).await?;
+        let stored = tokio::time::timeout(DATABASE_START_TIMEOUT, connection::read(&database))
+            .await
+            .map_err(|_| "the platform database did not answer in time".to_owned())?
+            .map_err(|e| format!("the OIDC connection cannot be read: {e}"))?;
+        if serve.stand_in_sign_in && stored.is_some() {
+            return Err(
+                "--stand-in-sign-in cannot be switched on: this platform database holds an OIDC connection, and the stand-in cannot be on together with OIDC (it is for tests and the local run only)"
+                    .to_owned(),
+            );
+        }
+        let renewal = Duration::from_secs(serve.session_renewal);
         let credentials = Arc::new(ToolCredentials::new(
             Arc::clone(&database),
             Duration::from_secs(serve.tool_credential_lifetime),
+            renewal,
         ));
         let domain: Arc<str> = Arc::from(domain);
         let listener = TcpListener::bind(serve.listen)
@@ -361,20 +321,42 @@ fn run(serve: &Serve) -> Result<(), String> {
                 Scheme::Http => address.port(),
             }),
         );
-        let oidc = match oidc {
-            Some(settings) => Some(Arc::new(Oidc::new(
-                settings,
-                Arc::clone(&database),
-                Arc::clone(&registry),
-                Arc::clone(&domain),
-                public,
+        let oidc = match key.as_ref().filter(|_| !serve.stand_in_sign_in) {
+            Some(key) => Some(Arc::new(Oidc::new(
+                key,
+                OidcParts {
+                    database: Arc::clone(&database),
+                    credentials: Arc::clone(&credentials),
+                    registry: Arc::clone(&registry),
+                    domain: Arc::clone(&domain),
+                    public,
+                    renewal,
+                    lifetime: Duration::from_secs(serve.session_lifetime),
+                },
             )?)),
             None => None,
         };
-        let sign_in_name = match (&oidc, sign_in.is_stand_in()) {
-            (Some(_), _) => "oidc",
-            (None, true) => "stand-in",
-            (None, false) => "none",
+        if let Some(stored) = &stored {
+            let unusable = match &oidc {
+                None => Some("no-secret-key"),
+                Some(oidc) if !oidc.take_stored(stored)? => Some("another-secret-key"),
+                Some(_) => None,
+            };
+            if let Some(reason) = unusable {
+                log::record(
+                    "oidc-connection-unusable",
+                    json!({
+                        "reason": reason,
+                        "message": "the OIDC connection in the platform database cannot be used with this installation's key: connect OIDC again (vm setup, then vm admin connect-oidc)",
+                    }),
+                );
+            }
+        }
+        let connected = oidc.as_ref().is_some_and(|o| o.connected().is_some());
+        let sign_in_name = match (connected, sign_in.is_stand_in()) {
+            (true, _) => "oidc",
+            (false, true) => "stand-in",
+            (false, false) => "none",
         };
         let serving = registry.serving_names();
         let serving: Vec<&str> = serving.iter().map(AsRef::as_ref).collect();
@@ -396,7 +378,13 @@ fn run(serve: &Serve) -> Result<(), String> {
                 Arc::clone(&logs),
                 Arc::clone(&credentials),
                 Arc::clone(&domain),
-                administrators,
+                Signing {
+                    stand_in: serve.stand_in_sign_in,
+                    administrators,
+                    oidc: oidc.as_ref().map(Arc::clone),
+                    database: Arc::clone(&database),
+                    public,
+                },
             ),
             domain,
             registry,
@@ -411,6 +399,77 @@ fn run(serve: &Serve) -> Result<(), String> {
         server::serve(listener, ingress, server::Limits::default()).await;
         drop(writer);
         Ok(())
+    })
+}
+
+/// `vm setup`: the platform database brought up to date, then the setup
+/// credential made and printed once. Failures are those of a start-up:
+/// exit code 1, a message that never shows a password.
+fn run_setup(args: &SetupArgs) -> ExitCode {
+    match setup_credential() {
+        Ok(made) => {
+            let written = if args.json {
+                let line = json!({
+                    "setup_credential": made.credential.expose(),
+                    "expires_at": made.expires_at,
+                });
+                write_out(&format!("{line}\n"))
+            } else {
+                say_on_stderr(&format!(
+                    "The setup credential, good until {} for connecting OIDC once:\n\
+                     put it in VM_SETUP_CREDENTIAL and the client secret in VM_OIDC_CLIENT_SECRET, then run\n\
+                     vm admin connect-oidc --domain <domain> --connect <ip:port> --issuer <URL> --client-id <id> --administrators-group <Group>\n\
+                     A second vm setup ends this credential.",
+                    made.expires_at
+                ));
+                write_out(&format!("{}\n", made.credential.expose()))
+            };
+            if written.is_ok() {
+                ExitCode::SUCCESS
+            } else {
+                say_on_stderr(
+                    "vm setup: the setup credential could not be written out: run vm setup again",
+                );
+                ExitCode::FAILURE
+            }
+        }
+        Err(message) => {
+            say_on_stderr(&format!("vm setup: {message}"));
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn write_out(text: &str) -> std::io::Result<()> {
+    let mut out = std::io::stdout().lock();
+    out.write_all(text.as_bytes())?;
+    out.flush()
+}
+
+/// The platform database opened (and brought up to date) and the setup
+/// credential made, within [`DATABASE_START_TIMEOUT`].
+fn setup_credential() -> Result<setup::Made, String> {
+    let address = database_address()?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("cannot start the runtime: {e}"))?;
+    runtime.block_on(async move {
+        let made = tokio::time::timeout(DATABASE_START_TIMEOUT, async {
+            let database = PlatformDatabase::open(&address, &PoolLimits::default()).await?;
+            setup::make(&database)
+                .await
+                .map_err(|e| format!("the setup credential cannot be kept: {e}"))
+        })
+        .await
+        .map_err(|_| {
+            format!(
+                "the platform database did not answer within {} seconds: check {} and that Postgres is running",
+                DATABASE_START_TIMEOUT.as_secs(),
+                platform_db::VARIABLE
+            )
+        })??;
+        made.ok_or_else(|| "the operating system gave no randomness: run vm setup again".to_owned())
     })
 }
 

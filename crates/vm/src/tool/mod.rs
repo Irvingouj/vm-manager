@@ -1,7 +1,8 @@
 //! The tool: the same program run on a Builder's machine by their Coding
 //! agent (ADR 0006, ADR 0015; blackbox/CONTRACT.md, "The tool").
 //!
-//! `vm sign-in`, `vm sign-out`, `vm whoami`, `vm resources`, `vm
+//! `vm sign-in` (through the browser: [`browser`]), `vm admin
+//! connect-oidc` ([`admin`]), `vm sign-out`, `vm whoami`, `vm resources`, `vm
 //! applications`, `vm pull` ([`pull`]), `vm new` ([`new`]), `vm check`
 //! ([`check`]), `vm generate` ([`generate`]), `vm deploy` ([`deploy`]),
 //! `vm versions` and `vm go-back` ([`versions`]) and `vm logs` ([`logs`]),
@@ -20,6 +21,23 @@
 //! handles whose errors are taken: a closed standard output or standard
 //! error ends the command, never with a panic.
 
+/// Appends a formatted line to a `String`.
+macro_rules! say {
+    ($text:expr, $($arg:tt)*) => {{
+        $text.push_str(&format!($($arg)*));
+        $text.push('\n');
+    }};
+}
+
+/// Appends formatted text to a `String`.
+macro_rules! put {
+    ($text:expr, $($arg:tt)*) => {
+        $text.push_str(&format!($($arg)*))
+    };
+}
+
+mod admin;
+mod browser;
 mod check;
 mod child;
 mod client;
@@ -38,6 +56,7 @@ mod test_users;
 mod theirs;
 mod versions;
 
+pub use admin::AdminArgs;
 pub use check::CheckArgs;
 pub use deploy::DeployArgs;
 pub use generate::GenerateArgs;
@@ -65,21 +84,6 @@ use theirs::Theirs;
 
 use crate::registry::is_dns_label;
 use crate::sign_in::MAX_STAND_IN_VALUE_BYTES;
-
-/// Appends a formatted line to a `String`.
-macro_rules! say {
-    ($text:expr, $($arg:tt)*) => {{
-        $text.push_str(&format!($($arg)*));
-        $text.push('\n');
-    }};
-}
-
-/// Appends formatted text to a `String`.
-macro_rules! put {
-    ($text:expr, $($arg:tt)*) => {
-        $text.push_str(&format!($($arg)*))
-    };
-}
 
 /// What `vm --help` says about exit codes.
 pub const EXIT_CODES: &str = "\
@@ -114,10 +118,17 @@ pub struct SignInArgs {
     /// Development only, while sign-in is the stand-in: the User to sign in
     /// as.
     #[arg(long, value_parser = stand_in_value)]
-    pub stand_in_user: String,
+    pub stand_in_user: Option<String>,
     /// Development only: the User's Groups, comma-separated.
-    #[arg(long, value_parser = stand_in_value)]
+    #[arg(long, value_parser = stand_in_value, requires = "stand_in_user")]
     pub stand_in_groups: Option<String>,
+    /// Do not open a browser here: show an address to open on any device,
+    /// and a check code to type there.
+    #[arg(long)]
+    pub no_browser: bool,
+    /// How long to wait for the sign-in in the browser, in seconds.
+    #[arg(long, default_value_t = 300, value_parser = clap::value_parser!(u64).range(10..=600))]
+    pub timeout: u64,
     #[command(flatten)]
     pub output: Output,
 }
@@ -125,6 +136,7 @@ pub struct SignInArgs {
 /// A command of the tool.
 pub enum Command {
     SignIn(SignInArgs),
+    Admin(AdminArgs),
     SignOut(Output),
     Whoami(Output),
     Resources(Output),
@@ -316,6 +328,7 @@ const RUNTIME_END_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 pub fn run(command: Command) -> ExitCode {
     let json = match &command {
         Command::SignIn(args) => args.output.json,
+        Command::Admin(args) => args.json(),
         Command::Pull(args) => args.output.json,
         Command::New(args) => args.output.json,
         Command::Check(args) => args.output.json,
@@ -341,6 +354,7 @@ pub fn run(command: Command) -> ExitCode {
             let outcome = runtime.block_on(async {
                 match command {
                     Command::SignIn(args) => sign_in(&args).await,
+                    Command::Admin(args) => admin::admin(&args).await,
                     Command::SignOut(_) => sign_out().await,
                     Command::Whoami(_) => whoami().await,
                     Command::Resources(_) => resources().await,
@@ -422,6 +436,14 @@ fn json_line(value: &Value) -> String {
     }
     line.push('\n');
     line
+}
+
+/// Writes a line on standard error, as the command goes; a standard error
+/// that takes nothing is not waited for.
+fn say_on_stderr(text: &str) {
+    let mut line = text.trim_end().to_owned();
+    line.push('\n');
+    drop(write_to(&mut io::stderr().lock(), &line));
 }
 
 /// Writes all of `text` and flushes; the error, if any, is the caller's.
@@ -560,6 +582,13 @@ fn shell_word(text: &str) -> String {
 
 /// The whole `vm sign-in` command that signs in again as what is kept.
 fn sign_in_again(kept: &Kept) -> String {
+    if kept.through_browser {
+        return format!(
+            "vm sign-in --domain {} --connect {}",
+            shell_word(&kept.domain),
+            kept.connect
+        );
+    }
     let mut command = format!(
         "vm sign-in --domain {} --connect {} --stand-in-user {}",
         shell_word(&kept.domain),
@@ -580,7 +609,7 @@ fn not_signed_in() -> Ending {
     Ending::new(
         4,
         "not-signed-in",
-        "not signed in: run `vm sign-in --domain <domain> --connect <ip:port> --stand-in-user <id>`, then run this command again".into(),
+        "not signed in: run `vm sign-in --domain <domain> --connect <ip:port>` (it opens the browser, or shows an address to open), then run this command again".into(),
     )
 }
 
@@ -727,6 +756,17 @@ fn who_in_words(domain: &str, user: &Theirs, groups: &[Theirs], administrator: b
     text
 }
 
+/// What `GET /v1/installation` answers.
+#[derive(Deserialize)]
+struct InstallationAnswer {
+    sign_in: String,
+    sign_in_address: Option<String>,
+}
+
+fn sign_in_refused(message: String) -> Ending {
+    Ending::new(3, "sign-in-refused", message)
+}
+
 async fn sign_in(args: &SignInArgs) -> Result<Done, Ending> {
     let place = Place::from_environment().map_err(Ending::credential_file)?;
     // The folder first, so that a credential is never made that cannot be
@@ -742,38 +782,59 @@ async fn sign_in(args: &SignInArgs) -> Result<Done, Ending> {
         domain: &args.domain,
         connect: args.connect,
     };
-    let reply = client::send(
-        &at,
-        Method::POST,
-        "/v1/tool-credentials",
-        Sign::StandIn {
-            user: &args.stand_in_user,
-            groups: args.stand_in_groups.as_deref(),
-        },
-        Some(bytes::Bytes::from_static(b"{}")),
-    )
-    .await
-    .map_err(|f| failed(args.connect, f))?;
-    match reply.status {
-        StatusCode::CREATED => {}
-        StatusCode::UNAUTHORIZED => {
-            return Err(Ending::new(
-                3,
-                "sign-in-refused",
-                format!(
-                    "the installation at {} ({}) does not accept this sign-in: it takes the stand-in only when started with --stand-in-sign-in; ask whoever runs it, or sign in to another",
-                    args.connect, args.domain
-                ),
-            ));
-        }
-        _ => return Err(not_success(args.connect, &reply)),
+    let reply = client::send(&at, Method::GET, "/v1/installation", Sign::Anyone, None)
+        .await
+        .map_err(|f| failed(args.connect, f))?;
+    if reply.status != StatusCode::OK {
+        return Err(not_success(args.connect, &reply));
     }
-    let made: Made = shaped(
+    let installation: InstallationAnswer = shaped(
         args.connect,
         reply
             .json
             .ok_or_else(|| unexpected(args.connect, "its answer is not JSON"))?,
     )?;
+    let (made, through_browser) = match (installation.sign_in.as_str(), &args.stand_in_user) {
+        ("none", _) => {
+            return Err(sign_in_refused(format!(
+                "the installation at {} ({}) has no sign-in yet: OIDC is not connected. A Platform administrator connects it with `vm admin connect-oidc`; then run this command again",
+                args.connect, args.domain
+            )));
+        }
+        ("stand-in", None) => {
+            return Err(sign_in_refused(format!(
+                "the installation at {} ({}) takes the stand-in sign-in only, which needs --stand-in-user <id>: run the command again with it",
+                args.connect, args.domain
+            )));
+        }
+        ("stand-in", Some(user)) => (stand_in(args, user).await?, false),
+        ("oidc", Some(_)) => {
+            return Err(sign_in_refused(format!(
+                "the installation at {} ({}) signs in through the browser (OIDC), not with --stand-in-user: run the command again without --stand-in-user and --stand-in-groups",
+                args.connect, args.domain
+            )));
+        }
+        ("oidc", None) => {
+            let address = installation
+                .sign_in_address
+                .as_deref()
+                .ok_or_else(|| unexpected(args.connect, "it gave no sign-in address"))?;
+            let answer = browser::sign_in(
+                &at,
+                address,
+                args.no_browser,
+                std::time::Duration::from_secs(args.timeout),
+            )
+            .await?;
+            (shaped::<Made>(args.connect, answer)?, true)
+        }
+        (_, _) => {
+            return Err(unexpected(
+                args.connect,
+                "it names a sign-in this tool does not know",
+            ));
+        }
+    };
     let credential = Secret::new(made.credential)
         .ok_or_else(|| unexpected(args.connect, "the credential it gave is not one"))?;
     let kept = Kept {
@@ -783,6 +844,7 @@ async fn sign_in(args: &SignInArgs) -> Result<Done, Ending> {
         groups: made.groups,
         credential,
         expires_at: made.expires_at,
+        through_browser,
     };
     if let Err(message) = place.write(&kept) {
         // Not kept, so not left alive at the installation either.
@@ -813,6 +875,42 @@ async fn sign_in(args: &SignInArgs) -> Result<Done, Ending> {
         }),
         text,
     })
+}
+
+/// The stand-in's sign-in: `POST /v1/tool-credentials` as `user`.
+async fn stand_in(args: &SignInArgs, user: &str) -> Result<Made, Ending> {
+    let at = Installation {
+        domain: &args.domain,
+        connect: args.connect,
+    };
+    let reply = client::send(
+        &at,
+        Method::POST,
+        "/v1/tool-credentials",
+        Sign::StandIn {
+            user,
+            groups: args.stand_in_groups.as_deref(),
+        },
+        Some(bytes::Bytes::from_static(b"{}")),
+    )
+    .await
+    .map_err(|f| failed(args.connect, f))?;
+    match reply.status {
+        StatusCode::CREATED => {}
+        StatusCode::UNAUTHORIZED => {
+            return Err(sign_in_refused(format!(
+                "the installation at {} ({}) does not accept this sign-in: it takes the stand-in only when started with --stand-in-sign-in; ask whoever runs it, or sign in to another",
+                args.connect, args.domain
+            )));
+        }
+        _ => return Err(not_success(args.connect, &reply)),
+    }
+    shaped(
+        args.connect,
+        reply
+            .json
+            .ok_or_else(|| unexpected(args.connect, "its answer is not JSON"))?,
+    )
 }
 
 /// Ends `kept`'s credential at its installation; whether it is known to be

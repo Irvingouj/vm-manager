@@ -70,6 +70,8 @@ pub struct Kept {
     pub credential: Secret,
     /// RFC 3339, as the installation said.
     pub expires_at: Theirs,
+    /// Signed in through the browser (OIDC), not with the stand-in.
+    pub through_browser: bool,
 }
 
 /// The file as written, borrowed from what is kept.
@@ -82,6 +84,7 @@ struct Written<'a> {
     groups: &'a [Theirs],
     credential: &'a str,
     expires_at: &'a Theirs,
+    through_browser: bool,
 }
 
 /// The file as read.
@@ -94,6 +97,9 @@ struct OnDisk {
     groups: Vec<Theirs>,
     credential: String,
     expires_at: Theirs,
+    /// Absent in a file written before the sign-in through the browser.
+    #[serde(default)]
+    through_browser: bool,
 }
 
 /// What reading found.
@@ -178,6 +184,7 @@ impl Place {
             groups: on_disk.groups,
             credential,
             expires_at: on_disk.expires_at,
+            through_browser: on_disk.through_browser,
         }))
     }
 
@@ -228,6 +235,7 @@ impl Place {
             groups: &kept.groups,
             credential: kept.credential.expose(),
             expires_at: &kept.expires_at,
+            through_browser: kept.through_browser,
         })
         .map_err(|e| problem(&io::Error::other(e.to_string())))?;
         text.push(b'\n');
