@@ -417,9 +417,9 @@ mod tests {
     const PAGE: &str = r#"<!doctype html><p>Sign in Ada &amp; co?</p>
 <form method="post" action="/tool">
   <input type="hidden" name="sign_in" value="abc&amp;d">
-  <label>Code <input name=check_code autocomplete=off></label>
-  <button type="submit" name="decision" value="confirm">Yes, sign in</button>
-  <button type="submit" name="decision" value="decline">No, do not sign in</button>
+  <label>Code <input name=code autocomplete=off></label>
+  <button type="submit" name="answer" value="confirm">Yes, sign in</button>
+  <button type="submit" name="answer" value="decline">No, do not sign in</button>
 </form>"#;
 
     #[test]
@@ -433,11 +433,11 @@ mod tests {
         assert_eq!(
             form.submission(Decision::Confirm, Some("ABCD-1234"))
                 .unwrap(),
-            "sign_in=abc%26d&check_code=ABCD-1234&decision=confirm"
+            "sign_in=abc%26d&code=ABCD-1234&answer=confirm"
         );
         assert_eq!(
             form.submission(Decision::Decline, None).unwrap(),
-            "sign_in=abc%26d&check_code=&decision=decline"
+            "sign_in=abc%26d&code=&answer=decline"
         );
     }
 

@@ -204,17 +204,15 @@ fn the_stand_in_on_a_platform_database_that_holds_a_connection_is_a_start_up_fai
     );
     assert_eq!(started.listening()["sign_in"], "oidc");
     drop(started);
-    for key in [Some(key.expose()), None] {
+    let another = SecretKey::fresh();
+    for (case, key) in [
+        ("with the key", Some(key.expose())),
+        ("with another key", Some(another.expose())),
+        ("without a key", None),
+    ] {
         let finished = serve(Some(&platform), &["--stand-in-sign-in"], key);
         assert_start_fails(
-            &format!(
-                "--stand-in-sign-in on a platform database that holds a connection, {}",
-                if key.is_some() {
-                    "with the key"
-                } else {
-                    "without a key"
-                }
-            ),
+            &format!("--stand-in-sign-in on a platform database that holds a connection, {case}"),
             &finished,
             &["--stand-in-sign-in"],
             &[key.unwrap_or_default(), SECRET],

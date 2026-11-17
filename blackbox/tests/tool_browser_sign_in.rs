@@ -150,6 +150,45 @@ fn a_port() -> u16 {
     blackbox::postgres::free_port().unwrap()
 }
 
+/// Fails unless this `POST /tool` was answered as one for a sign-in that is
+/// over or not known: `400`, a page with no form.
+fn assert_over(at: &Installation, answer: &Step, context: &str) {
+    assert_eq!(
+        answer.response.status,
+        400,
+        "{context}: expected 400, a page with no form\n{}",
+        shown(&answer.response, &[])
+    );
+    assert!(
+        at.tool_form(answer).is_none(),
+        "{context}: the page has no form to answer again\n{}",
+        shown(&answer.response, &[])
+    );
+}
+
+/// Fails unless this `POST /tool` showed the page again: `200` with its
+/// form.
+fn assert_asked_again(at: &Installation, answer: &Step, context: &str) {
+    assert_eq!(
+        answer.response.status,
+        200,
+        "{context}: expected 200, the page again\n{}",
+        shown(&answer.response, &[])
+    );
+    assert!(
+        at.tool_form(answer).is_some(),
+        "{context}: the page is shown again, with its form\n{}",
+        shown(&answer.response, &[])
+    );
+}
+
+/// The form of the page as a browser would post it, and where to.
+fn submission_of(at: &Installation, page: &Step, decision: Decision) -> (String, Url) {
+    let (form, action) = at.tool_form(page).unwrap();
+    let body = form.submission(decision, None).unwrap();
+    (body, action)
+}
+
 fn assert_not_confirmed(answer: &Response, context: &str) {
     assert_eq!(
         answer.status,
@@ -311,12 +350,7 @@ fn without_a_browser_the_tool_shows_an_address_to_open_elsewhere_and_a_check_cod
         query_param(&address, "machine").as_deref(),
         Some(machine_name().as_str())
     );
-    assert!(
-        code.chars()
-            .filter(|c| *c != '-')
-            .all(|c| c.is_ascii_alphanumeric()),
-        "{code}"
-    );
+    assert_check_code_alphabet(&code);
     // On another device: a browser of its own.
     let mut browser = at.browser_as(ADA);
     let steps = at.walk_tool_to_page(&mut browser, &address);
@@ -326,6 +360,12 @@ fn without_a_browser_the_tool_shows_an_address_to_open_elsewhere_and_a_check_cod
         form.typed_field().is_some(),
         "without a port the page asks for the check code: {:?}",
         form.fields
+    );
+    let compact: String = code.chars().filter(|c| *c != '-').collect();
+    let html = page.response.text();
+    assert!(
+        !html.contains(&code) && !html.contains(&compact),
+        "the page never shows the check code"
     );
     let confirmed = at.answer_tool_page(&mut browser, page, Decision::Confirm, Some(&code));
     assert_eq!(
@@ -357,15 +397,44 @@ fn with_no_browser_command_and_no_display_the_tool_shows_the_address_and_the_che
         query_param(&address, "port").is_none(),
         "no port without a browser: {address}"
     );
+    // Typed in lower case and without the hyphen: the page takes it.
+    let typed: String = code
+        .chars()
+        .filter(|c| *c != '-')
+        .collect::<String>()
+        .to_ascii_lowercase();
     let mut browser = at.browser_as(ADA);
     let steps = at.walk_tool_to_page(&mut browser, &address);
-    at.answer_tool_page(
+    let confirmed = at.answer_tool_page(
         &mut browser,
         steps.last().unwrap(),
         Decision::Confirm,
-        Some(&code),
+        Some(&typed),
+    );
+    assert_eq!(
+        confirmed.response.status,
+        200,
+        "{}",
+        shown(&confirmed.response, &[])
     );
     ended(running).ok_json();
+}
+
+/// Fails unless the check code is `XXXX-XXXX` of digits and capital
+/// letters without I, L, O and U.
+fn assert_check_code_alphabet(code: &str) {
+    let ok = code.len() == 9
+        && code.chars().enumerate().all(|(i, c)| {
+            if i == 4 {
+                c == '-'
+            } else {
+                (c.is_ascii_digit() || c.is_ascii_uppercase()) && !"ILOU".contains(c)
+            }
+        });
+    assert!(
+        ok,
+        "expected a check code XXXX-XXXX of digits and capital letters without I, L, O and U, got {code:?}"
+    );
 }
 
 #[test]
@@ -527,6 +596,18 @@ fn get_tool_takes_only_a_well_formed_challenge_port_and_machine() {
             "a machine of 65 bytes",
             format!("challenge={challenge}&machine={long_machine}"),
         ),
+        (
+            "challenge given twice",
+            format!("challenge={challenge}&challenge={challenge}&machine=box"),
+        ),
+        (
+            "port given twice",
+            format!("challenge={challenge}&port=1024&port=1024&machine=box"),
+        ),
+        (
+            "machine given twice",
+            format!("challenge={challenge}&machine=box&machine=box"),
+        ),
     ];
     for (case, query) in &bad {
         let step = get_tool(&at, query);
@@ -659,13 +740,42 @@ fn post_tool_sign_ins_answers_the_credential_once_the_sign_in_is_confirmed() {
     assert!(credential.starts_with(TOOL_PREFIX));
     assert_eq!(bearer(&at.vm, "/v1/me", credential).send().status, 200);
     let again = at.post_tool_sign_in(challenge.verifier(), Some(&grant));
-    assert_ne!(
-        again.status,
-        201,
-        "the credential is answered once\n{}",
-        shown(&again, &[])
-    );
     assert!(!again.text().contains(TOOL_PREFIX));
+    assert_not_confirmed(&again, "the same verifier asked again after its 201");
+    // The page answered already: posting it again is a sign-in that is over.
+    let posted_again = at.answer_tool_page(&mut browser, &page, Decision::Confirm, None);
+    assert_over(&at, &posted_again, "the page posted again once answered");
+}
+
+#[test]
+fn post_tool_sign_ins_with_a_body_that_is_not_such_json_is_malformed() {
+    let at = installation();
+    let verifier = Challenge::fresh().verifier().to_owned();
+    let cases: Vec<(&str, Option<Value>, &str)> = vec![
+        ("not JSON", None, "{\"verifier\": "),
+        ("a JSON array", Some(json!([verifier])), ""),
+        ("no verifier", Some(json!({ "grant": "g" })), ""),
+        (
+            "a verifier that is a number",
+            Some(json!({ "verifier": 7 })),
+            "",
+        ),
+        (
+            "a grant that is a number",
+            Some(json!({ "verifier": verifier, "grant": 7 })),
+            "",
+        ),
+    ];
+    for (case, value, raw) in &cases {
+        let request = at.vm.api_request("/v1/tool-sign-ins").method("POST");
+        let request = match value {
+            Some(value) => request.json(value),
+            None => request.header("content-type", "application/json").body(raw),
+        };
+        let answer = request.send();
+        assert_eq!(answer.status, 400, "{case}\n{}", shown(&answer, &[]));
+        assert_api_error(&answer, 400, "malformed");
+    }
 }
 
 #[test]
@@ -695,6 +805,13 @@ fn declining_signs_nothing_in() {
     assert_not_confirmed(
         &at.post_tool_sign_in(challenge.verifier(), None),
         "after declining",
+    );
+    // Declined, the sign-in is over: confirming it afterwards is 400.
+    let confirmed = at.answer_tool_page(&mut browser, &page, Decision::Confirm, None);
+    assert_over(&at, &confirmed, "a confirm after declining");
+    assert_not_confirmed(
+        &at.post_tool_sign_in(challenge.verifier(), None),
+        "after a confirm that came after declining",
     );
 }
 
@@ -775,11 +892,7 @@ fn without_a_port_the_sign_in_needs_the_check_code_only_the_tool_shows() {
     let page = steps.last().unwrap();
     for (case, typed) in [("no code", ""), ("a guessed code", wrong.as_str())] {
         let answer = at.answer_tool_page(&mut browser, page, Decision::Confirm, Some(typed));
-        assert!(
-            at.tool_form(&answer).is_some(),
-            "{case}: the page is shown again\n{}",
-            shown(&answer.response, &[])
-        );
+        assert_asked_again(&at, &answer, case);
     }
     let run = ended(running);
     run.json_error(3, "sign-in-not-finished");
@@ -805,21 +918,14 @@ fn a_wrong_check_code_shows_the_page_again_and_after_the_fifth_the_sign_in_is_ov
     let mut page = steps.last().unwrap().clone();
     for attempt in 1..=4 {
         let answer = at.answer_tool_page(&mut browser, &page, Decision::Confirm, Some(&wrong));
-        assert!(
-            at.tool_form(&answer).is_some(),
-            "wrong code {attempt}: the page is shown again\n{}",
-            shown(&answer.response, &[])
-        );
+        assert_asked_again(&at, &answer, &format!("wrong code {attempt}"));
         page = answer;
     }
     let fifth = at.answer_tool_page(&mut browser, &page, Decision::Confirm, Some(&wrong));
-    assert!(
-        at.tool_form(&fifth).is_none(),
-        "after the fifth wrong code the sign-in is over: no form to try again\n{}",
-        shown(&fifth.response, &[])
-    );
+    assert_over(&at, &fifth, "the fifth wrong code");
     // The right code, on the page as it was, now signs nothing in.
-    at.answer_tool_page(&mut browser, &page, Decision::Confirm, Some(&code));
+    let right = at.answer_tool_page(&mut browser, &page, Decision::Confirm, Some(&code));
+    assert_over(&at, &right, "the right code after five wrong ones");
     let run = ended(running);
     run.json_error(3, "sign-in-not-finished");
     assert_nothing_kept(&machine, "after five wrong check codes");
@@ -869,13 +975,126 @@ fn post_tool_from_another_origin_is_refused() {
 }
 
 #[test]
+fn the_page_s_form_is_sign_in_code_and_two_buttons_named_answer() {
+    let at = installation();
+    for port in [Some(a_port()), None] {
+        let challenge = Challenge::fresh();
+        let (mut browser, page) = page_for(&at, ADA, &challenge, port);
+        let (form, action) = at.tool_form(&page).unwrap();
+        let case = if port.is_some() {
+            "with a port"
+        } else {
+            "without a port"
+        };
+        let named = |name: &str| -> Vec<&blackbox::tool_sign_ins::Field> {
+            form.fields
+                .iter()
+                .filter(|f| f.name.as_deref() == Some(name))
+                .collect()
+        };
+        let sign_in = named("sign_in");
+        assert!(
+            sign_in.len() == 1
+                && sign_in[0].tag == "input"
+                && sign_in[0].kind == "hidden"
+                && !sign_in[0].value.is_empty(),
+            "{case}: one hidden input `sign_in` with a value: {:?}",
+            form.fields
+                .iter()
+                .map(|f| (&f.tag, &f.kind, &f.name))
+                .collect::<Vec<_>>()
+        );
+        let code = named("code");
+        if port.is_some() {
+            assert!(code.is_empty(), "{case}: no input `code`");
+        } else {
+            assert!(
+                code.len() == 1 && code[0].tag == "input" && code[0].kind == "text",
+                "{case}: a text input `code`: {:?}",
+                form.fields
+                    .iter()
+                    .map(|f| (&f.tag, &f.kind, &f.name))
+                    .collect::<Vec<_>>()
+            );
+        }
+        let answers: BTreeSet<String> = named("answer")
+            .iter()
+            .filter(|f| f.kind == "submit")
+            .map(|f| f.value.clone())
+            .collect();
+        assert_eq!(
+            answers,
+            names(&["confirm", "decline"]),
+            "{case}: two submit buttons named `answer`"
+        );
+        // A post that is not such a form (no `answer`): 400.
+        let sign_in_value = sign_in[0].value.as_str();
+        let body = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("sign_in", sign_in_value)
+            .finish();
+        let request = browser.form_from(&page.url, &action, &body);
+        let answer = browser.send(&action, &request);
+        assert_eq!(
+            answer.status,
+            400,
+            "{case}: a post without `answer`\n{}",
+            shown(&answer, &[])
+        );
+        assert_not_confirmed(
+            &at.post_tool_sign_in(challenge.verifier(), None),
+            &format!("{case}: after a post without `answer`"),
+        );
+    }
+}
+
+#[test]
+fn a_sign_in_value_posted_from_another_browser_is_400_and_confirms_nothing() {
+    let at = installation();
+    let challenge = Challenge::fresh();
+    let port = a_port();
+    let (mut browser, page) = page_for(&at, ADA, &challenge, Some(port));
+    let (body, action) = submission_of(&at, &page, Decision::Confirm);
+    // A browser with no cookie of the sign-in address.
+    let mut bare = at.browser();
+    let request = bare.form_from(&page.url, &action, &body);
+    let answer = Step {
+        url: action.clone(),
+        response: bare.send(&action, &request),
+    };
+    assert_over(&at, &answer, "from a browser with no cookie");
+    // Another person's browser, with a sign-in of the tool of its own.
+    let (mut grace_browser, _grace_page) =
+        page_for(&at, GRACE, &Challenge::fresh(), Some(a_port()));
+    let request = grace_browser.form_from(&page.url, &action, &body);
+    let answer = Step {
+        url: action.clone(),
+        response: grace_browser.send(&action, &request),
+    };
+    assert_over(&at, &answer, "from another person's browser");
+    assert_not_confirmed(
+        &at.post_tool_sign_in(challenge.verifier(), None),
+        "after the posts from other browsers",
+    );
+    // The control: from the browser it was made for, it is taken.
+    let confirmed = at.answer_tool_page(&mut browser, &page, Decision::Confirm, None);
+    let grant = at.grant_of(&confirmed, port);
+    assert_eq!(
+        at.post_tool_sign_in(challenge.verifier(), Some(&grant))
+            .status,
+        201,
+        "the control: the browser the sign-in was made for confirms it"
+    );
+}
+
+#[test]
 fn the_browser_is_never_sent_to_another_host_than_127_0_0_1() {
     let at = installation();
+    // Other parameters are not looked at: the way goes on as without them.
+    let provider_host = at.provider.address().ip().to_string();
     for extra in [
         "&host=evil.example",
         "&redirect_uri=http%3A%2F%2Fevil.example%2F",
         "&next=http%3A%2F%2Fevil.example%2F",
-        "&port=1024",
     ] {
         let challenge = Challenge::fresh();
         let port = a_port();
@@ -884,16 +1103,14 @@ fn the_browser_is_never_sent_to_another_host_than_127_0_0_1() {
             "{}{extra}",
             at.tool_address(&challenge.challenge, Some(port), "box")
         ));
-        let steps = browser.navigate(&address);
-        let last = steps.last().unwrap();
-        if last.response.status == 400 {
-            continue;
-        }
+        let steps = at.walk_tool_to_page(&mut browser, &address);
+        let first = &steps[0];
         assert!(
-            at.tool_form(last).is_some(),
-            "{extra}: either 400 or the page that asks\n{}",
+            first.is_redirect() && first.location().host_str() == Some(provider_host.as_str()),
+            "{extra}: expected 302 to the identity provider\n{}",
             masked_steps(&steps)
         );
+        let last = steps.last().unwrap();
         let confirmed = at.answer_tool_page(&mut browser, last, Decision::Confirm, None);
         assert!(
             confirmed.is_redirect(),
@@ -946,6 +1163,9 @@ fn at_most_five_sign_ins_of_the_tool_await_an_answer_for_each_user_and_the_oldes
     let mut taken = Vec::new();
     for (i, (challenge, port, browser, page)) in awaiting.iter_mut().enumerate() {
         let confirmed = at.answer_tool_page(browser, page, Decision::Confirm, None);
+        if i == 0 {
+            assert_over(&at, &confirmed, "the confirm of the oldest of six");
+        }
         let to_tool = confirmed.is_redirect()
             && confirmed.location().host_str() == Some("127.0.0.1")
             && confirmed.location().port() == Some(*port);

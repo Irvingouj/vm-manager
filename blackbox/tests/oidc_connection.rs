@@ -29,6 +29,7 @@ use blackbox::oidc::{ConfigFault, Person, Provider};
 use blackbox::scenario::ADMINISTRATORS;
 use blackbox::sessions::{ADA, GRACE, Installation, ada, grace, oidc_options};
 use blackbox::tool::{Machine, bearer, platform_tables_holding, windows_in};
+use blackbox::tool_sign_ins::Challenge;
 use blackbox::{DOMAIN, Response, User, Vm, VmOptions, assert_api_error};
 use serde_json::{Value, json};
 
@@ -514,15 +515,34 @@ fn a_connection_that_is_not_well_formed_is_malformed_and_changes_nothing() {
         ("no client_secret", without("client_secret")),
         ("no administrators_group", without("administrators_group")),
         ("no issuer", without("issuer")),
+        ("an issuer that is a number", with("issuer", json!(7))),
+        ("an issuer that is null", with("issuer", Value::Null)),
     ];
     for (case, body) in cases {
         let answer = put_oidc(&at.vm, Some(setup.expose()), &body);
         assert_eq!(answer.status, 400, "{case}\n{}", shown(&answer, &[&secret]));
-        let reason = answer.json()["error"]["reason"].clone();
-        assert!(
-            reason == "malformed" || (case == "no issuer" && reason == "invalid-issuer"),
-            "{case}: expected `malformed`, got {reason}"
+        assert_eq!(
+            answer.json()["error"]["reason"],
+            "malformed",
+            "{case}\n{}",
+            shown(&answer, &[&secret])
         );
+        assert_eq!(installation_of(&at.vm).json()["sign_in"], "none", "{case}");
+    }
+    for (case, raw) in [
+        ("a body that is not JSON", "{\"issuer\": "),
+        ("a JSON array", "[]"),
+    ] {
+        let answer = at
+            .vm
+            .api_request("/v1/oidc")
+            .method("PUT")
+            .bearer(setup.expose())
+            .header("content-type", "application/json")
+            .body(raw)
+            .send();
+        assert_eq!(answer.status, 400, "{case}\n{}", shown(&answer, &[&secret]));
+        assert_api_error(&answer, 400, "malformed");
         assert_eq!(installation_of(&at.vm).json()["sign_in"], "none", "{case}");
     }
     let taken = put_oidc(&at.vm, Some(setup.expose()), &body);
@@ -647,6 +667,18 @@ fn without_the_installation_s_key_oidc_cannot_be_connected() {
     let connection = Connection::to(&at.provider);
     let answer = put_oidc(&at.vm, Some(setup.expose()), &connection.body());
     assert_api_error(&answer, 409, "no-secret-key");
+    // Who asks comes first: a made-up setup credential is 401, also with a
+    // body that is wrong.
+    for (case, body) in [
+        ("a good body", connection.body()),
+        ("a wrong body", json!({ "issuer": 7 })),
+    ] {
+        let answer = put_oidc(&at.vm, Some(&made_up_setup_credential()), &body);
+        assert_eq!(answer.status, 401, "{case}\n{}", shown(&answer, &[]));
+    }
+    // The 409 comes before the body: a wrong body is still no-secret-key.
+    let wrong = put_oidc(&at.vm, Some(setup.expose()), &json!({ "issuer": 7 }));
+    assert_api_error(&wrong, 409, "no-secret-key");
     let machine = Machine::new();
     let setup = setup_credential(at.vm.platform());
     let run = hide(
@@ -677,7 +709,62 @@ fn with_the_stand_in_oidc_cannot_be_connected() {
         .json(&connection.body())
         .send();
     assert_api_error(&as_administrator, 409, "stand-in-sign-in");
+    // Who asks comes first: a made-up setup credential is 401, someone who
+    // is no Platform administrator 403, whatever the body.
+    for body in [connection.body(), json!({ "issuer": 7 })] {
+        let answer = put_oidc(&at.vm, Some(&made_up_setup_credential()), &body);
+        assert_eq!(answer.status, 401, "{body}\n{}", shown(&answer, &[]));
+        let not_administrator = at
+            .vm
+            .api_request("/v1/oidc")
+            .method("PUT")
+            .as_user(&User::new("someone").in_groups(&["finance"]))
+            .json(&body)
+            .send();
+        assert_api_error(&not_administrator, 403, "not-an-administrator");
+    }
+    // The 409 comes before the body: a wrong body is still stand-in-sign-in.
+    let wrong = at
+        .vm
+        .api_request("/v1/oidc")
+        .method("PUT")
+        .as_user(&User::new("it-admin").in_groups(&[ADMINISTRATORS]))
+        .json(&json!({ "issuer": 7 }))
+        .send();
+    assert_api_error(&wrong, 409, "stand-in-sign-in");
     assert_eq!(installation_of(&at.vm).json()["sign_in"], "stand-in");
+}
+
+#[test]
+fn with_the_stand_in_and_no_key_the_stand_in_is_said_first() {
+    let provider = Provider::start(&[ada()]);
+    let at = Installation::unconnected(
+        provider,
+        &VmOptions::new()
+            .args_extra(&["--public-scheme", "http"])
+            .stand_in_sign_in()
+            .administrators_group(ADMINISTRATORS),
+    );
+    let connection = Connection::to(&at.provider);
+    let as_administrator = at
+        .vm
+        .api_request("/v1/oidc")
+        .method("PUT")
+        .as_user(&User::new("it-admin").in_groups(&[ADMINISTRATORS]))
+        .json(&connection.body())
+        .send();
+    assert_api_error(&as_administrator, 409, "stand-in-sign-in");
+    let answer = put_oidc(
+        &at.vm,
+        Some(&made_up_setup_credential()),
+        &connection.body(),
+    );
+    assert_eq!(answer.status, 401, "{}", shown(&answer, &[]));
+}
+
+/// A setup credential of the right form that was never made.
+fn made_up_setup_credential() -> String {
+    format!("vmsc_{}", Challenge::fresh().challenge)
 }
 
 #[test]
