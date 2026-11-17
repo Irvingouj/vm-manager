@@ -19,16 +19,12 @@ use serde_json::json;
 use tokio::net::TcpListener;
 
 use vm::api::Api;
-use vm::app_logs;
 use vm::executor;
-use vm::gateway::{Gateway, PlatformGateway};
 use vm::ingress::Ingress;
-use vm::oplog::OperationLog;
-use vm::own_db::OwnDatabases;
-use vm::platform_db::{self, DatabaseAddress, PlatformDatabase, PoolLimits};
-use vm::registry::{Registry, is_dns_label};
-use vm::resources::Resources;
-use vm::runner::{self, RequestRunner};
+use vm::platform::{Limits, Platform};
+use vm::platform_db::{self, DatabaseAddress, PoolLimits};
+use vm::registry::is_dns_label;
+use vm::runner;
 use vm::sign_in::{NoSignIn, SignIn, StandInSignIn};
 use vm::tool;
 use vm::tool_credentials::{DEFAULT_LIFETIME, ToolCredentials};
@@ -97,6 +93,13 @@ enum Command {
     /// What the Application printed and the errors it did not catch,
     /// request by request; --follow prints new entries as they come.
     Logs(tool::LogsArgs),
+    /// Run the project on this machine, beside a private Postgres with an
+    /// empty stand-in of each pulled Resource, and send it one request as a
+    /// test User of vm.dev.json (--as builder, --as outsider, ...).
+    Request(tool::RequestArgs),
+    /// Read what the project's local runs recorded: its operation-log and
+    /// change-history.
+    Local(tool::LocalArgs),
 }
 
 #[derive(clap::Args)]
@@ -161,6 +164,8 @@ fn main() -> ExitCode {
         Some(Command::Versions(args)) => tool::run(tool::Command::Versions(args)),
         Some(Command::GoBack(args)) => tool::run(tool::Command::GoBack(args)),
         Some(Command::Logs(args)) => tool::run(tool::Command::Logs(args)),
+        Some(Command::Request(args)) => tool::run(tool::Command::Request(args)),
+        Some(Command::Local(args)) => tool::run(tool::Command::Local(args)),
         None => {
             say_on_stderr(
                 "vm: name a command (see vm --help): vm sign-in ..., vm serve ..., or vm --version",
@@ -214,64 +219,26 @@ fn run(serve: &Serve) -> Result<(), String> {
         .build()
         .map_err(|e| format!("cannot start the server's runtime: {e}"))?;
     runtime.block_on(async move {
-        let started = tokio::time::timeout(DATABASE_START_TIMEOUT, async {
-            let database = Arc::new(PlatformDatabase::open(&address, &PoolLimits::default()).await?);
-            let unreadable = |e: platform_db::DbError| {
-                format!(
-                    "cannot read the Applications and Resources from the platform database \"{}\": {e}",
-                    address.database()
-                )
-            };
-            let own = Arc::new(
-                OwnDatabases::load(Arc::clone(&database), &address)
-                    .await
-                    .map_err(unreadable)?,
-            );
-            let registry = Registry::load(Arc::clone(&database), Arc::clone(&own))
-                .await
-                .map_err(unreadable)?;
-            let resources = Resources::load(Arc::clone(&database), executor::Limits::default())
-                .await
-                .map_err(unreadable)?;
-            Ok::<_, String>((database, own, registry, resources))
-        })
-        .await;
-        let (database, own, registry, resources) = match started {
-            Ok(started) => started?,
-            Err(_) => {
-                return Err(format!(
-                    "the platform database \"{}\" on Postgres at {} was not ready within {} s",
-                    address.database(),
-                    address.server(),
-                    DATABASE_START_TIMEOUT.as_secs()
-                ));
-            }
+        let limits = Limits {
+            pool: PoolLimits::default(),
+            executor: executor::Limits::default(),
+            runner: runner::Limits::default(),
+            start: DATABASE_START_TIMEOUT,
         };
-        // Before serving: every own database in this program's form, its
-        // migration role closed (each within its own time limits).
-        own.bring_to_form().await;
-        // Then what every outbox holds is shipped, without delaying serving
-        // (blackbox/CONTRACT.md, "Shipping: When").
-        own.ship_all();
-        let registry = Arc::new(registry);
-        let resources = Arc::new(resources);
+        let Platform {
+            database,
+            registry,
+            resources,
+            logs,
+            writer,
+            log,
+            runner,
+            ..
+        } = Platform::open(&address, limits).await?;
         let credentials = Arc::new(ToolCredentials::new(
-            Arc::clone(&database),
+            database,
             Duration::from_secs(serve.tool_credential_lifetime),
         ));
-        // The writer of Logs is owned here, for as long as the program
-        // serves; dropping it ends its task.
-        let (logs, writer) = app_logs::start(Arc::clone(&database));
-        let logs = Arc::new(logs);
-        let log = Arc::new(OperationLog::new(database));
-        let gateway: Arc<dyn Gateway> = Arc::new(PlatformGateway::new(
-            Arc::clone(&resources),
-            own,
-            Arc::clone(&log),
-            tokio::runtime::Handle::current(),
-        ));
-        let runner = RequestRunner::start(&runner::Limits::default(), &gateway)
-            .map_err(|e| format!("cannot start the engine threads: {e}"))?;
         let domain: Arc<str> = Arc::from(domain);
         let listener = TcpListener::bind(serve.listen)
             .await

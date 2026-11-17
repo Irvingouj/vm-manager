@@ -28,6 +28,7 @@ mod data_loss;
 mod deploy;
 mod drizzle;
 mod generate;
+mod local;
 mod logs;
 mod new;
 mod project_tools;
@@ -40,6 +41,7 @@ mod versions;
 pub use check::CheckArgs;
 pub use deploy::DeployArgs;
 pub use generate::GenerateArgs;
+pub use local::{ChangeHistoryArgs, LocalArgs, LocalCommand, OperationLogArgs, RequestArgs};
 pub use logs::LogsArgs;
 pub use new::NewArgs;
 pub use pull::PullArgs;
@@ -133,6 +135,8 @@ pub enum Command {
     Versions(VersionsArgs),
     GoBack(GoBackArgs),
     Logs(LogsArgs),
+    Request(RequestArgs),
+    Local(LocalArgs),
 }
 
 /// A message: the tool's own words, or the installation's (a refusal's
@@ -282,6 +286,8 @@ pub fn run(command: Command) -> ExitCode {
         Command::Versions(args) => args.output.json,
         Command::GoBack(args) => args.output.json,
         Command::Logs(args) => args.output.json,
+        Command::Request(args) => args.output.json,
+        Command::Local(args) => args.json(),
         Command::SignOut(o)
         | Command::Whoami(o)
         | Command::Resources(o)
@@ -307,6 +313,8 @@ pub fn run(command: Command) -> ExitCode {
                 Command::Versions(args) => versions::versions(&args).await,
                 Command::GoBack(args) => versions::go_back(&args).await,
                 Command::Logs(args) => logs::logs(&args).await,
+                Command::Request(args) => local::request(&args).await,
+                Command::Local(args) => local::local(&args).await,
             }
         }),
         Err(error) => Err(Ending::new(

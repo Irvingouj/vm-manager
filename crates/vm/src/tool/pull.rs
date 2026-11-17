@@ -216,10 +216,7 @@ impl<'a> Pull<'a> {
                 "its answer's access is not one of structure, read and write",
             ));
         };
-        let one_statement_each = answered
-            .standin_sql
-            .iter()
-            .all(|s| s.ends_with(';'));
+        let one_statement_each = answered.standin_sql.iter().all(|s| s.ends_with(';'));
         if !one_statement_each {
             return Err(unexpected(
                 kept.connect,

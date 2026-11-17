@@ -295,9 +295,9 @@ struct Existing {
 }
 
 /// One migration of `migrations/`, in the journal's order.
-struct ProjectMigration {
-    name: String,
-    sql: String,
+pub(super) struct ProjectMigration {
+    pub name: String,
+    pub sql: String,
 }
 
 /// Everything needed to send the Version, made on the machine.
@@ -431,7 +431,7 @@ async fn prepared(
     };
 
     stage.set(Stage::ReadingMigrations);
-    let migrations = project_migrations(project)?;
+    let migrations = project_migrations(project, &WHO)?;
     let latest = existing.as_ref().and_then(|e| e.latest.as_ref());
     let applied: BTreeSet<&str> = latest
         .map(|list| list.iter().map(|m| m.name.as_str()).collect())
@@ -448,8 +448,15 @@ async fn prepared(
     }
 
     stage.set(Stage::Bundling);
-    let bundle = bundle(&cx, &packages).await?;
-    let body = body(&bundle, &manifest, &git_commit, &migrations, &structures)?;
+    let bundle = bundle(&cx, &packages, &WHO).await?;
+    let body = body(
+        &bundle,
+        &manifest,
+        &git_commit,
+        &migrations,
+        &structures,
+        &WHO,
+    )?;
     Ok(Ready {
         kept,
         // The names only, once, for what is printed.
@@ -805,14 +812,18 @@ fn uncommitted(named: &Named) -> Ending {
 
 /// The migrations of `migrations/`, in the journal's order (none without a
 /// journal), read to [`MAX_VERSION_BYTES`] in all.
-fn project_migrations(project: &Path) -> Result<Vec<ProjectMigration>, Ending> {
+pub(super) fn project_migrations(
+    project: &Path,
+    who: &Who,
+) -> Result<Vec<ProjectMigration>, Ending> {
     let folder = project.join("migrations");
     let unreadable = |what: String| {
         Ending::theirs(
             1,
             "migrations-unreadable",
             &format!(
-                "{what}: the migrations cannot be sent. Bring migrations/ back as it was last committed (migrations are never edited by hand), then run vm deploy again"
+                "{what}: the migrations cannot be read. Bring migrations/ back as it was last committed (migrations are never edited by hand), then run {} again",
+                who.command
             ),
         )
     };
@@ -993,7 +1004,11 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 /// The bundle: the SDK's tooling's `bundle`, kept to [`MAX_VERSION_BYTES`].
-async fn bundle(cx: &Cx<'_>, packages: &check::Packages) -> Result<String, Ending> {
+pub(super) async fn bundle(
+    cx: &Cx<'_>,
+    packages: &check::Packages,
+    who: &Who,
+) -> Result<String, Ending> {
     let ran = cx
         .run(
             &[
@@ -1005,14 +1020,14 @@ async fn bundle(cx: &Cx<'_>, packages: &check::Packages) -> Result<String, Endin
             KeptOutput::up_to(TEXT_BYTES),
         )
         .await
-        .map_err(|error| tool_failed("node", &format!("cannot be started ({error})"), &WHO))?;
+        .map_err(|error| tool_failed("node", &format!("cannot be started ({error})"), who))?;
     match ran.status.code() {
         Some(0) if ran.out.over => Err(too_large()),
         Some(0) => String::from_utf8(ran.out.into_bytes()).map_err(|_| {
             tool_failed(
                 "the SDK's tooling (bundle)",
                 "wrote a bundle that is not UTF-8",
-                &WHO,
+                who,
             )
         }),
         Some(2) => {
@@ -1024,7 +1039,7 @@ async fn bundle(cx: &Cx<'_>, packages: &check::Packages) -> Result<String, Endin
                 return Err(tool_failed(
                     "the SDK's tooling (bundle)",
                     "ended with 2 without an answer it understands",
-                    &WHO,
+                    who,
                 ));
             };
             let mut errors = match error.get_mut("errors").map(Value::take) {
@@ -1036,9 +1051,17 @@ async fn bundle(cx: &Cx<'_>, packages: &check::Packages) -> Result<String, Endin
                 .get("message")
                 .and_then(Value::as_str)
                 .unwrap_or("The project does not build");
-            let message = format!(
-                "{said}. It type-checks, and esbuild cannot bundle it: correct what the errors name (an import of a package that is not installed, or of one that runs only on Node), commit, then run vm deploy again; nothing was sent"
-            );
+            // A deploy checked the types and sends nothing; the local run
+            // builds what is there, committed or not.
+            let next = if who.command == WHO.command {
+                "It type-checks, and esbuild cannot bundle it: correct what the errors name (an import of a package that is not installed, or of one that runs only on Node), commit, then run vm deploy again; nothing was sent".to_owned()
+            } else {
+                format!(
+                    "esbuild cannot bundle it: correct what the errors name (an import of a package that is not installed, or of one that runs only on Node), then run {} again",
+                    who.command
+                )
+            };
+            let message = format!("{said}. {next}");
             Err(Ending::detailed(
                 1,
                 "build-failed",
@@ -1060,18 +1083,19 @@ async fn bundle(cx: &Cx<'_>, packages: &check::Packages) -> Result<String, Endin
                 ended(ran.status),
                 cx.words(&ran.err.text(), "")
             ),
-            &WHO,
+            who,
         )),
     }
 }
 
 /// The Version's body, at most [`MAX_VERSION_BYTES`].
-fn body(
+pub(super) fn body(
     bundle: &str,
     manifest: &Manifest,
     git_commit: &str,
     migrations: &[ProjectMigration],
     structures: &BTreeMap<String, String>,
+    who: &Who,
 ) -> Result<Bytes, Ending> {
     /// The body of `POST .../versions`, borrowing what it holds.
     #[derive(Serialize)]
@@ -1102,7 +1126,7 @@ fn body(
             .collect(),
         structures,
     })
-    .map_err(|_| tool_failed("vm deploy", "cannot write the Version as JSON", &WHO))?;
+    .map_err(|_| tool_failed(who.command, "cannot write the Version as JSON", who))?;
     if body.len() > MAX_VERSION_BYTES {
         return Err(too_large());
     }
@@ -1243,7 +1267,7 @@ fn refused(kept: &Kept, reply: &client::Reply, serving: Option<u64>) -> Ending {
 
 /// A refusal of the installation's with fields of its own beside the
 /// reason and the message.
-fn detailed_refusal(reason: &str, message: &str, fields: &[(&str, &str)]) -> Ending {
+pub(super) fn detailed_refusal(reason: &str, message: &str, fields: &[(&str, &str)]) -> Ending {
     let mut error = Map::new();
     error.insert("reason".into(), json!(reason));
     error.insert("message".into(), json!(message));

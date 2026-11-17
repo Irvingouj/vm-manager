@@ -217,12 +217,13 @@ async fn exited(leader: Option<Pid>) -> bool {
     }
 }
 
-/// Runs `<program> <args>` (`program` found on the `PATH`) in `cwd`, with
+/// Runs `<program> <args>` (`program` a path, or a name found on the
+/// `PATH`) in `cwd`, with
 /// `tmpdir` as its `TMPDIR`, and reads its pipes into `out` and `err`. The
 /// error is the one of starting it (`NotFound`: no such program on the
 /// `PATH`).
-pub async fn run<O: Sink, E: Sink>(
-    program: &str,
+pub async fn run<P: AsRef<OsStr>, O: Sink, E: Sink>(
+    program: P,
     cwd: &Path,
     tmpdir: &Path,
     args: &[&OsStr],

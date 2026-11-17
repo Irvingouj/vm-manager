@@ -157,14 +157,12 @@ impl Serialize for Json {
 }
 
 /// A test User of the file.
-#[expect(dead_code, reason = "read by vm request, the next step")]
 pub struct TestUser {
     pub id: String,
     pub groups: Vec<String>,
 }
 
 /// A Grant of the file.
-#[expect(dead_code, reason = "read by vm request, the next step")]
 pub struct TestGrant {
     pub group: String,
     pub resource: String,
@@ -173,7 +171,6 @@ pub struct TestGrant {
 }
 
 /// The file, as read and checked.
-#[expect(dead_code, reason = "read by vm request, the next step")]
 pub struct TestUsersFile {
     /// The whole file, as it was read.
     pub whole: Json,
@@ -215,7 +212,7 @@ pub fn read(project: &Path, command: &str) -> Result<Option<TestUsersFile>, Endi
 pub fn as_new() -> Result<TestUsersFile, Ending> {
     let whole: Json = serde_json::from_str(super::template::NEW_TEST_USERS).map_err(|_| {
         Ending::new(
-            4,
+            1,
             "tool-failed",
             "the template's vm.dev.json is not JSON".to_owned(),
         )
@@ -440,7 +437,6 @@ impl TestUsersFile {
     }
 
     /// The User of `id`.
-    #[expect(dead_code, reason = "read by vm request, the next step")]
     pub fn user(&self, id: &str) -> Option<&TestUser> {
         self.users.iter().find(|u| u.id == id)
     }

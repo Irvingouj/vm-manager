@@ -35,6 +35,12 @@ tokio-postgres.workspace = true
 tokio.workspace = true
 uuid.workspace = true
 rustix.workspace = true
+rustls.workspace = true
+tokio-rustls.workspace = true
+webpki-roots.workspace = true
+zip.workspace = true
+liblzma.workspace = true
+tar.workspace = true
 
 [build-dependencies]
 flate2.workspace = true

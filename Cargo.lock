@@ -2190,6 +2190,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokio-rustls"
+version = "0.26.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c9cc2678c2cdd569ef8215e2afd7954ada2ae20b4fdd2c5fe6139a3b02d105db"
+dependencies = [
+ "rustls",
+ "tokio",
+]
+
+[[package]]
 name = "tokio-stream"
 version = "0.1.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2408,18 +2418,23 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "liblzma",
  "openworkers-core",
  "openworkers-runtime-v8",
  "pg_query",
  "postgres-protocol",
  "rustix 1.1.6",
+ "rustls",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "tar",
  "tokio",
  "tokio-postgres",
+ "tokio-rustls",
  "uuid",
+ "webpki-roots",
+ "zip",
 ]
 
 [[package]]

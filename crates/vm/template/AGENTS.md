@@ -30,6 +30,9 @@ Run them from this folder. Each has `--help` and `--json` (one JSON object on st
 | `vm versions <name>` | the Application's Versions: commit, when, by whom, and which one serves |
 | `vm go-back <name>` | serves the Version before the serving one again, at once (`--to <n>` for an earlier one) |
 | `vm logs <name>` | what the Application printed and the errors it did not catch, request by request |
+| `vm request <path> --as <user>` | runs the project on this machine and sends it one request as a test User of `vm.dev.json` |
+| `vm local operation-log` | the operations of those local requests, and what came of each |
+| `vm local change-history` | the changes those local requests made in the own database |
 
 If a command says you are not signed in, ask the Builder to run `vm sign-in` (it needs their details), then run yours again.
 
@@ -64,7 +67,9 @@ A migration destroys data when it drops a table, a column or a schema, or change
 
 ## Trying it as people with and without access
 
-`vm.dev.json` holds the test Users of this project. It has one already, `outsider`, who is in no Group and so holds no Grant. Before you call the work done, check what `outsider` gets as well as what the Builder gets: every operation on a Resource is refused for `outsider`, and the page must say so plainly rather than break. Add test Users of your own there for the other Groups the Application serves. The rules are the same on this machine as after deploying.
+Try the Application before deploying with `vm request <path> --as <user>`: it builds the project as it is now (uncommitted changes too), runs it on this machine and prints the response. Try each page as `builder` (the Builder's own access) and as `outsider` (a test User of `vm.dev.json` in no Group, so every operation on a Resource is refused): the page must say so plainly rather than break. The output also has what the code printed, the errors it did not catch, and each operation's outcome with the reason of a refusal; `vm local operation-log` and `vm local change-history` show what the local requests did.
+
+The Resources there are empty stand-ins with the real structure: a list is empty, and a refusal is real. Nothing of the company's rows is on this machine. The Grants of `vm.dev.json` decide who may do what; `vm pull` copies the Builder's own Grant there, for the test User `builder`. Add test Users and Grants of your own there for the other Groups the Application serves. The rules are the same on this machine as after deploying.
 
 ## Deploying
 
