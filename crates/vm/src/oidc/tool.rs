@@ -654,10 +654,21 @@ impl Oidc {
             Err(error) => return Answer::unavailable(&error),
         };
         let grant = grant.as_deref().map(digest);
-        let Some(taken) = found.into_iter().find(|c| match (&c.grant, &grant) {
-            (Some(kept), Some(given)) => same(kept, given),
-            (Some(_), None) => false,
-            (None, _) => !c.with_port,
+        // The two ways are kept apart: a request that carries a grant,
+        // whatever it is, takes only a sign-in begun with a port, and only
+        // with that sign-in's grant; one without takes only a sign-in begun
+        // without a port.
+        let Some(taken) = found.into_iter().find(|c| match (c.with_port, &grant) {
+            // Begun with a port, asked with a grant: the grant it was
+            // confirmed with, and no other.
+            (true, Some(given)) => c.grant.as_ref().is_some_and(|kept| same(kept, given)),
+            // Begun with a port, asked without a grant: never.
+            (true, None) => false,
+            // Begun without a port, asked with a grant: never.
+            (false, Some(_)) => false,
+            // Begun without a port, asked without a grant: its check code
+            // was typed in the browser.
+            (false, None) => true,
         }) else {
             return not_confirmed();
         };
