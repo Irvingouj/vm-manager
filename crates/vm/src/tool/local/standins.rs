@@ -394,6 +394,70 @@ async fn make(
     .map_err(|why| failed("marking it", why))
 }
 
+/// Removes every stand-in database, and every stand-in role, that no pulled
+/// Resource has now (its folder was removed). Only names a stand-in has
+/// are touched: `standin_` and 16 lower-case hex digits, and that with
+/// `_owner`, `_read` or `_write`; any other database or role is left as it
+/// is. `kept` are the stand-in databases of the pulled Resources.
+pub(super) async fn remove_others(superuser: &Client, kept: &[&str]) -> Result<(), String> {
+    let failed = |why: String| format!("a stand-in no longer pulled cannot be removed ({why})");
+    let listed = |query: &'static str| async move {
+        tokio::time::timeout(STATEMENT_WAIT, superuser.query(query, &[]))
+            .await
+            .map_err(|_| failed("no answer in time".to_owned()))?
+            .map_err(|e| failed(database_message(&e)))
+            .map(|rows| {
+                rows.iter()
+                    .filter_map(|row| row.try_get::<_, String>(0).ok())
+                    .collect::<Vec<String>>()
+            })
+    };
+    let databases = listed(
+        "SELECT datname FROM pg_catalog.pg_database WHERE datname ~ '^standin_[0-9a-f]{16}$'",
+    )
+    .await?;
+    for database in databases.iter().filter(|d| !kept.contains(&d.as_str())) {
+        if is_standin_database(database) {
+            run(
+                superuser,
+                &format!(
+                    "DROP DATABASE IF EXISTS {} WITH (FORCE)",
+                    quote_identifier(database)
+                ),
+            )
+            .await
+            .map_err(failed)?;
+        }
+    }
+    let roles = listed(
+        "SELECT rolname FROM pg_catalog.pg_roles WHERE rolname ~ '^standin_[0-9a-f]{16}_(owner|read|write)$'",
+    )
+    .await?;
+    for role in &roles {
+        let database = role.rsplit_once('_').map_or("", |(d, _)| d);
+        if is_standin_database(database) && !kept.contains(&database) {
+            run(
+                superuser,
+                &format!("DROP ROLE IF EXISTS {}", quote_identifier(role)),
+            )
+            .await
+            .map_err(failed)?;
+        }
+    }
+    Ok(())
+}
+
+/// Whether `name` is a stand-in database's: `standin_` and 16 lower-case
+/// hex digits.
+fn is_standin_database(name: &str) -> bool {
+    name.strip_prefix("standin_").is_some_and(|hex| {
+        hex.len() == 16
+            && hex
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
+}
+
 /// `text` as an SQL string literal.
 fn literal(text: &str) -> String {
     format!("'{}'", text.replace('\'', "''"))

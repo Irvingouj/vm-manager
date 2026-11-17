@@ -788,6 +788,12 @@ impl OwnDatabases {
     /// `change_history`, `false` if the shipment failed or there is no own
     /// database. Before a read of the history; the caller bounds the wait
     /// (the shipment goes on by itself if it stops waiting).
+    /// Whether `application` has an own database this program knows: one
+    /// whose outbox [`OwnDatabases::ship_and_wait`] can ship.
+    pub fn has_own_database(&self, application: &str) -> bool {
+        self.known(application).is_some()
+    }
+
     pub async fn ship_and_wait(&self, application: &str) -> bool {
         match self.ask_shipment(application, true) {
             Some((known, Some(ticket))) => known.shipping.wait(ticket).await,

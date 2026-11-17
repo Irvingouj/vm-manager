@@ -64,7 +64,7 @@ use super::project_tools::{
     Bounded, Cx, DEFAULT_TIMEOUT, Scratch, Signals, Who, node_is_there, own_folder_failed,
     tool_failed,
 };
-use super::test_users::{self, BUILDER, TestUser};
+use super::test_users::{self, BUILDER, TestUser, TestUsersFile};
 use super::theirs::Theirs;
 use super::{Done, Ending, Output, project_of};
 use crate::api::{Api, read_version};
@@ -92,6 +92,13 @@ const DRAIN_WAIT: Duration = Duration::from_secs(10);
 /// The longest the platform database may take to be opened and brought up
 /// to date.
 const PLATFORM_WAIT: Duration = Duration::from_secs(60);
+
+/// The longest the run's connections may take to close before its Postgres
+/// is stopped all the same.
+const CLOSE_WAIT: Duration = Duration::from_secs(2);
+
+/// The local Versions kept: the newest, the earlier ones forgotten.
+const KEPT_VERSIONS: u32 = 50;
 
 /// The commit a local Version is recorded with: none.
 const NO_COMMIT: &str = "0000000000000000000000000000000000000000";
@@ -317,6 +324,10 @@ struct Held {
 
 impl Held {
     async fn release(&self) {
+        // The run's connections were let go of with its future; each
+        // closes its socket once the runtime drops its task. Closed before
+        // Postgres is told to stop, so that it sees each client leave.
+        crate::platform_db::wait_for_no_connection(CLOSE_WAIT).await;
         let server = self.server.borrow_mut().take();
         if let Some(server) = server {
             server.stop().await;
@@ -428,14 +439,26 @@ async fn start(
     local.make().map_err(|why| local_state_failed(&why, name))?;
     stage.set(Stage::Waiting);
     let lock = local
-        .lock(|| ())
+        .lock(|| {
+            if !json {
+                let mut err = std::io::stderr().lock();
+                writeln!(
+                    err,
+                    "Another local command of this project (vm request or vm local) is running: waiting for it to end."
+                )
+                .and_then(|()| err.flush())
+                .ok();
+            }
+        })
         .await
         .map_err(|why| local_state_failed(&why, name))?;
     *held.lock.borrow_mut() = Some(lock);
-    // The parts' own records go to .vm/local/vm.log, not the terminal.
+    // The parts' own records go to .vm/local/vm.log, not the terminal;
+    // started anew by every run, so that it does not grow from run to run.
     if let Ok(file) = OpenOptions::new()
         .create(true)
-        .append(true)
+        .write(true)
+        .truncate(true)
         .mode(0o600)
         .open(local.dir.join("vm.log"))
     {
@@ -537,6 +560,7 @@ pub(super) async fn request(args: &RequestArgs) -> Result<Done, Ending> {
     let held = Held::default();
     let asked = Asked {
         args,
+        file: &file,
         user,
         method,
         body: body.unwrap_or_default(),
@@ -591,6 +615,9 @@ fn read_data_file(path: &Path) -> Result<Bytes, Ending> {
 /// What the request is.
 struct Asked<'a> {
     args: &'a RequestArgs,
+    /// The test Users file, as read once for the run: its User and its
+    /// Grants are of one reading.
+    file: &'a TestUsersFile,
     user: &'a TestUser,
     method: Method,
     body: Bytes,
@@ -644,7 +671,10 @@ async fn run(
     .map_err(|why| postgres_failed(&why, name))?;
 
     stage.set(Stage::Standins);
-    let standins = standins_of(project, &local, &state, port, &platform, &mut said).await?;
+    let standins = standins_of(
+        project, asked.file, &local, &state, port, &platform, &mut said,
+    )
+    .await?;
 
     stage.set(Stage::Building);
     let mut found = Found::default();
@@ -747,6 +777,13 @@ async fn run(
         Ok(collected) => collected.to_bytes(),
         Err(never) => match never {},
     };
+    // A response to HEAD has no body, as on the wire (where hyper leaves it
+    // out for a deployed Application).
+    let bytes = if asked.method == Method::HEAD {
+        Bytes::new()
+    } else {
+        bytes
+    };
     let request_id = parts
         .headers
         .get("x-vm-request-id")
@@ -761,20 +798,43 @@ async fn run(
         runner, logs, api, ..
     } = ingress;
     drop(api);
-    runner.stop(DRAIN_WAIT).await;
-    gateway.drain(DRAIN_WAIT).await;
+    // Operations: the engine thread ends (the request's work, waitUntil
+    // included, with it), then what the gateway still runs; one time for
+    // both.
+    let operations_by = tokio::time::Instant::now() + DRAIN_WAIT;
+    let threads_ended = runner.stop(DRAIN_WAIT).await;
+    let left = operations_by.saturating_duration_since(tokio::time::Instant::now());
+    let operations_ended = gateway.drain(left).await;
     drop(gateway);
-    tokio::time::timeout(DRAIN_WAIT, own_databases.ship_and_wait(&manifest.name))
-        .await
-        .ok();
-    let Some(logs) = Arc::into_inner(logs) else {
-        return Err(tool_failed(
-            "vm request",
-            "cannot finish writing the request's log entry (it is still in use)",
-            &WHO,
+    if !(threads_ended && operations_ended) {
+        said.warnings.push(incomplete(
+            "operations",
+            "the request's operations did not all end within 10 seconds of its response: the operations below may lack some, and their entries in the local Operation log may come later or not at all",
         ));
+    }
+    // Changes: only an Application with an own database has an outbox to
+    // ship into the Change history.
+    if own_databases.has_own_database(&manifest.name) {
+        let shipped =
+            tokio::time::timeout(DRAIN_WAIT, own_databases.ship_and_wait(&manifest.name)).await;
+        if shipped != Ok(true) {
+            said.warnings.push(incomplete(
+                "changes",
+                "the changes the request made in the own database did not reach the local Change history within 10 seconds: vm local change-history may lack them until a later run ships them",
+            ));
+        }
+    }
+    // Its log entry: written once every other holder of Logs has let go.
+    let logged = match Arc::into_inner(logs) {
+        Some(logs) => writer.finish(logs, DRAIN_WAIT).await,
+        None => false,
     };
-    writer.finish(logs, DRAIN_WAIT).await;
+    if !logged {
+        said.warnings.push(incomplete(
+            "log",
+            "the request's log entry was not written within 10 seconds: printed and uncaught may lack what the code printed",
+        ));
+    }
 
     let operations = if request_id.is_empty() {
         Vec::new()
@@ -856,11 +916,22 @@ async fn run(
     Ok(Done { json, text })
 }
 
+/// The warning of a part of what the request recorded that did not come
+/// in time.
+fn incomplete(part: &str, what: &str) -> Value {
+    json!({
+        "reason": "records-incomplete",
+        "part": part,
+        "message": format!("{what}. The response above is the Application's all the same."),
+    })
+}
+
 /// Makes and readies the stand-ins, then makes them the Resources of the
 /// run, with the Grants of `vm.dev.json`. Each pulled Resource's name, and
 /// whether its stand-in was made by this run.
 async fn standins_of(
     project: &Path,
+    file: &TestUsersFile,
     local: &Local,
     state: &postgres::State,
     port: u16,
@@ -883,6 +954,10 @@ async fn standins_of(
                     .map_err(|why| postgres_failed(&why, name))?,
             );
         }
+        let kept: Vec<&str> = ready.iter().map(|s| s.database.as_str()).collect();
+        standins::remove_others(connection.client(), &kept)
+            .await
+            .map_err(|why| postgres_failed(&why, name))?;
         ready
     };
     let resources = &platform.resources;
@@ -918,8 +993,7 @@ async fn standins_of(
             .map_err(|e| database_failed(&e, name))?;
         made.push((standin.resource, standin.made));
     }
-    let file = test_users::read(project, name)?;
-    for grant in file.iter().flat_map(|f| f.grants.iter()) {
+    for grant in &file.grants {
         let level = resources::level_of(&grant.access);
         match (resources.get(&grant.resource), level) {
             (Some(_), Some(level)) => {
@@ -1012,7 +1086,13 @@ async fn local_version(
         .await
         .map_err(failed)?
     {
-        Sent::Sent(record) => Ok((record.number, added)),
+        Sent::Sent(record) => {
+            registry
+                .forget_versions(&manifest.name, KEPT_VERSIONS)
+                .await
+                .map_err(failed)?;
+            Ok((record.number, added))
+        }
         Sent::Diverged => {
             let migration = diverged_at.unwrap_or_default();
             Err(Ending::theirs(

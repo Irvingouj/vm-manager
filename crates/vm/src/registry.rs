@@ -398,6 +398,41 @@ impl Registry {
         }))
     }
 
+    /// Forgets the Versions of `name` older than its newest `keep`, in one
+    /// statement, never the serving one; answers how many were forgotten.
+    /// For the local run (blackbox/CONTRACT.md, "The local loop: What a run
+    /// does", step 6), whose Application would otherwise keep every bundle
+    /// it was ever built with.
+    ///
+    /// Safe for what refers to a Version: only `applications.serving_version`
+    /// does by a key, and the serving Version is kept; the newest is kept, so
+    /// the next number (the greatest plus one) is never one used before; a
+    /// log entry and an Operation log entry hold a Version's number as a
+    /// number only, and read the same without its row; the own database
+    /// records the migrations it applied by name and text, and a new Version
+    /// is compared with the newest, which is kept. Going back to a forgotten
+    /// Version is not possible, and the local run never goes back.
+    pub async fn forget_versions(&self, name: &str, keep: u32) -> Result<u64, DbError> {
+        let keep = i32::try_from(keep).unwrap_or(i32::MAX);
+        self.database
+            .pool()
+            .run(async |client: &mut Client| {
+                client
+                    .execute(
+                        "DELETE FROM versions v
+                          USING applications a
+                          WHERE a.name = $1 AND v.application_id = a.id
+                            AND v.number IS DISTINCT FROM a.serving_version
+                            AND v.number <= (SELECT max(number) FROM versions
+                                              WHERE application_id = a.id) - $2",
+                        &[&name, &keep],
+                    )
+                    .await
+                    .map_err(DbError::from)
+            })
+            .await
+    }
+
     /// The Application `name`, if there is one.
     pub async fn application(&self, name: &str) -> Result<Option<ApplicationRecord>, DbError> {
         let row = self
