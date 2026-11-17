@@ -134,10 +134,10 @@ pub struct RequestRunner {
     lanes: Vec<mpsc::Sender<Job>>,
     next: AtomicUsize,
     deadline: Duration,
-    /// The engine threads. They run until the program ends; the program is
-    /// stopped by killing it (blackbox/CONTRACT.md), so they are never
-    /// joined, but they are kept rather than detached.
-    _threads: Vec<JoinHandle<()>>,
+    /// The engine threads, kept rather than detached. `vm serve` runs them
+    /// until the program is killed (blackbox/CONTRACT.md); the local run
+    /// ends them with [`RequestRunner::stop`].
+    threads: Vec<JoinHandle<()>>,
 }
 
 impl RequestRunner {
@@ -164,7 +164,7 @@ impl RequestRunner {
             lanes,
             next: AtomicUsize::new(0),
             deadline: limits.deadline,
-            _threads: threads,
+            threads,
         })
     }
 
@@ -175,14 +175,12 @@ impl RequestRunner {
     /// For a caller that must know the threads have let go of the gateway
     /// (the local run, before it stops its Postgres).
     pub async fn stop(self, limit: Duration) -> bool {
-        let Self {
-            lanes, _threads, ..
-        } = self;
+        let Self { lanes, threads, .. } = self;
         // Closing every lane ends each thread's loop once it is idle.
         drop(lanes);
         let deadline = tokio::time::Instant::now() + limit;
         loop {
-            if _threads.iter().all(JoinHandle::is_finished) {
+            if threads.iter().all(JoinHandle::is_finished) {
                 return true;
             }
             if tokio::time::Instant::now() >= deadline {

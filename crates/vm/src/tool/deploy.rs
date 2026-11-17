@@ -853,7 +853,7 @@ pub(super) fn project_migrations(
         let shown = format!("migrations/{}.sql", entry.tag);
         let bytes = drizzle::read_bounded(&folder.join(format!("{}.sql", entry.tag)), left)
             .map_err(|e| unreadable(format!("{shown} cannot be read ({e})")))?
-            .ok_or_else(too_large)?;
+            .ok_or_else(|| too_large(who))?;
         left = left.saturating_sub(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
         let sql = String::from_utf8(bytes)
             .map_err(|_| unreadable(format!("{shown} is not UTF-8 text")))?;
@@ -865,15 +865,19 @@ pub(super) fn project_migrations(
     Ok(migrations)
 }
 
-fn too_large() -> Ending {
-    Ending::new(
-        1,
-        "too-large",
+fn too_large(who: &Who) -> Ending {
+    let mib = MAX_VERSION_BYTES / (1024 * 1024);
+    let message = if who.command == WHO.command {
         format!(
-            "the Version (its bundle and its migrations together) is larger than the {} MiB the installation takes, so nothing was sent: make the bundle smaller (fewer or smaller packages imported), then run vm deploy again",
-            MAX_VERSION_BYTES / (1024 * 1024)
-        ),
-    )
+            "the Version (its bundle and its migrations together) is larger than the {mib} MiB the installation takes, so nothing was sent: make the bundle smaller (fewer or smaller packages imported), then run vm deploy again"
+        )
+    } else {
+        format!(
+            "the project's Version (its bundle and its migrations together) is larger than the {mib} MiB an installation takes, so the local run does not run it either: make the bundle smaller (fewer or smaller packages imported, less text in the code), then run {} again",
+            who.command
+        )
+    };
+    Ending::new(1, "too-large", message)
 }
 
 /// Step 7: no migration this Version adds destroys data, as
@@ -1022,7 +1026,7 @@ pub(super) async fn bundle(
         .await
         .map_err(|error| tool_failed("node", &format!("cannot be started ({error})"), who))?;
     match ran.status.code() {
-        Some(0) if ran.out.over => Err(too_large()),
+        Some(0) if ran.out.over => Err(too_large(who)),
         Some(0) => String::from_utf8(ran.out.into_bytes()).map_err(|_| {
             tool_failed(
                 "the SDK's tooling (bundle)",
@@ -1128,7 +1132,7 @@ pub(super) fn body(
     })
     .map_err(|_| tool_failed(who.command, "cannot write the Version as JSON", who))?;
     if body.len() > MAX_VERSION_BYTES {
-        return Err(too_large());
+        return Err(too_large(who));
     }
     Ok(Bytes::from(body))
 }

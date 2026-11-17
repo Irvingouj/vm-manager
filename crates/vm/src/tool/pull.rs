@@ -284,7 +284,7 @@ impl<'a> Pull<'a> {
                 if changed {
                     let text = file.text().map_err(|_| {
                         Ending::new(
-                            4,
+                            1,
                             "tool-failed",
                             format!("{} cannot be made", test_users::FILE),
                         )
