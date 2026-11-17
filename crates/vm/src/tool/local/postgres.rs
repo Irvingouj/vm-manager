@@ -39,6 +39,7 @@ use serde_json::{Value, json};
 use super::super::child::{self, Kept};
 use super::download::{self, Archive};
 use crate::platform_db::{Connection, DatabaseAddress, DbError};
+use tokio_postgres::error::SqlState;
 
 /// The variable naming a Postgres the Builder has.
 pub(super) const BIN_VARIABLE: &str = "VM_LOCAL_POSTGRES_BIN";
@@ -545,24 +546,47 @@ impl Local {
         }
         let address = self.superuser_address(state, port, "postgres");
         let ours = async {
-            let connection = Connection::open(&address.config(CONNECT_WAIT), CONNECT_WAIT)
-                .await
-                .ok()?;
+            // A server still starting up (or recovering from being killed)
+            // says so, and is waited for.
+            let deadline = tokio::time::Instant::now() + READY_WAIT;
+            let connection = loop {
+                match Connection::open(&address.config(CONNECT_WAIT), CONNECT_WAIT).await {
+                    Ok(connection) => break connection,
+                    Err(error)
+                        if error.code() == Some(&SqlState::CANNOT_CONNECT_NOW)
+                            && tokio::time::Instant::now() < deadline =>
+                    {
+                        tokio::time::sleep(LOCK_POLL).await;
+                    }
+                    Err(error) => {
+                        return Err(format!("it does not take this project's login ({error})"));
+                    }
+                }
+            };
             let row = tokio::time::timeout(
                 CONNECT_WAIT,
                 connection.client().query_one("SHOW data_directory", &[]),
             )
             .await
-            .ok()?
-            .ok()?;
-            let said: String = row.try_get(0).ok()?;
-            let theirs = fs::canonicalize(said).ok()?;
-            let mine = fs::canonicalize(self.data()).ok()?;
-            Some(theirs == mine)
+            .map_err(|_| "it does not say its data folder in time".to_owned())?
+            .map_err(|e| format!("it does not say its data folder ({})", DbError::from(e)))?;
+            let said: String = row
+                .try_get(0)
+                .map_err(|e| format!("it does not say its data folder ({e})"))?;
+            let theirs = fs::canonicalize(&said)
+                .map_err(|e| format!("its data folder {said} cannot be found ({e})"))?;
+            let mine = fs::canonicalize(self.data())
+                .map_err(|e| format!("the data folder cannot be found ({e})"))?;
+            if theirs == mine {
+                Ok(())
+            } else {
+                Err(format!("its data folder is {said}"))
+            }
         };
-        if ours.await != Some(true) {
+        if let Err(why) = ours.await {
             return Err(format!(
-                "a process ({pid:?}) holds the data folder {} and is not this project's Postgres as far as can be told: stop it, then run the command again",
+                "a process ({}) holds the data folder {} and is not this project's Postgres as far as can be told ({why}): stop it, then run the command again",
+                pid.as_raw_nonzero(),
                 self.data().display()
             ));
         }
