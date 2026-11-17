@@ -1636,3 +1636,78 @@ From this ticket on the template's `AGENTS.md` names `vm request` in its table o
 - The archive of Postgres is a third party's build, pinned by its checksum; where it comes from before release is the ticket on installing.
 - Each run starts and stops its Postgres and builds the project: a request takes seconds, not milliseconds. The next ticket keeps the local Application running.
 - `vm.dev.json` is in the repository: the Grant a pull copies there is the one of whoever pulled last.
+
+## The local loop, kept running: the browser, test rows and reset (ticket: Local loop in the browser, with test rows, reset and working offline)
+
+`vm dev` keeps the project's local Application running, so that the Builder opens it in a browser and chooses which test User they are; the stand-ins and the local own database get test rows from files of the project; one command starts the local databases over. Everything here is the local run of "The local loop: one request as a test User", kept up: the same private Postgres, stand-ins, Grants, Version and records, and nothing of it reaches the installation.
+
+### The command
+
+```
+vm dev [--port <n>] [--project <directory>] [--json]
+```
+
+- It does what a run of `vm request` does up to the request (the private Postgres, the stand-ins, the Grants of `vm.dev.json`, the local Version, the migrations, the test rows), then **listens and serves until it is interrupted**. Failures before it listens are those of `vm request`, with the same reasons and exit codes. `SIGINT`, `SIGTERM` and `SIGHUP` end it: everything it started is stopped, as a run stops it, and the exit code is `0`.
+- It listens on the loopback address only: `127.0.0.1`, and `::1` where the machine has it, on `--port` (1 to 65535; `7480` without it). A port that is taken: reason `port-in-use`, exit code `1`, naming `--port`.
+- The address is `http://<application>.localhost:<port>/`. Browsers resolve `*.localhost` to the loopback address by themselves; a tool that does not connects to `127.0.0.1:<port>` and names the Application in `Host`.
+- When it listens it says so: in words, on standard output, the address and that it runs until interrupted; with `--json`, one JSON object a line, the first `{ "event": "listening", "url": "http://<application>.localhost:<port>/", "application", "port", "version" }`. Then one line for each request it served: in words the method, the path, the status and the test User; with `--json` `{ "event": "request", "as", "method", "path", "status", "request_id" }`. A rebuild (below) is a line too: `{ "event": "rebuilt", "version", "migrations_applied", "standins", "test_rows" }`, or `{ "event": "rebuild-failed", "error": { "reason", "message", ... } }`. An output that is closed ends it as `vm logs --follow` ends.
+- **One `vm dev` a project.** A second one in the same project: reason `already-running`, exit code `1`, at once, the message giving the address of the first.
+
+### Which requests it serves
+
+- **Only its own name.** A request whose `Host` is `<application>.localhost` (with or without the port) is the Application's. `localhost` and `127.0.0.1` (and `[::1]`), with or without the port, are answered `307` to the same path at `<application>.localhost:<port>`. Any other `Host` is answered `421` with a page of the local run's own that gives the address, and the Application's code is not run: a page of another site that points a name of its own at the loopback address reaches nothing.
+- **Paths under `/_vm/` are the local run's own** and never reach the Application's code. Only `/_vm/test-user` is a page; `/_vm/control/` is what the tool's own commands talk to (below); anything else there is `404`.
+- Every other path is the Application's, served as an installation serves it (the same limits, the same headers taken away and added, `x-vm-request-id`), as the chosen test User.
+
+### Choosing the test User
+
+- `GET /_vm/test-user` is a page (`200`, `text/html; charset=utf-8`, `cache-control: no-store`) listing every test User of `vm.dev.json` as it is now: the `id`, the `displayName` and `email` when there are, the Groups, and for each pulled Resource the access those Groups' Grants give (`write`, `read`, `structure`, or `none`), with one button for each User, and which one is chosen now. Everything of the file's is escaped as HTML.
+- `POST /_vm/test-user` with a form body `user=<id>` and optionally `next=<path>` chooses: `303` to `next` (when it begins with one `/` and not with `//` or `/\`; else to `/`), with `Set-Cookie: vm_test_user=<the id, percent-encoded>; Path=/; HttpOnly; SameSite=Lax`. A `user` that is not in the file: `400`, the page again saying so. A `POST` whose `Origin` is another site's is `403`.
+- **A request with no chosen User** (no `vm_test_user` cookie, or one naming a User that is not in the file now) does not reach the Application: a `GET` or `HEAD` whose `Accept` has `text/html` is answered `303` to `/_vm/test-user?next=<the path and query, percent-encoded>`; any other is answered `401`, `text/plain`, saying to choose a test User at that address (or to send `Cookie: vm_test_user=<id>`).
+- The Application is given the request as that User: the User's `id` and `groups` as the file has them at that moment. The cookie `vm_test_user` is taken out of the `Cookie` header before the request reaches the code (other cookies stay; a `Cookie` header left empty is left out).
+- **This page is the local run's only.** `vm serve` has no such page, with the stand-in sign-in or without: `/_vm/test-user` on a deployed Application is a path like any other and is given to its code.
+
+### The project as it is now
+
+- Before each request it serves (the browser's, or one a command sends), `vm dev` looks whether the project changed since it last built: any file of the project but those under `node_modules/`, `.vm/` and `.git/`, by its size and its time of modification (at most 20,000 entries are looked at; a project with more is rebuilt only when it is started again, and `vm dev` says so once). When it changed, it does again what a run does: the stand-ins of the pulled Resources (remade when their structure changed), the Grants of `vm.dev.json`, the build, a new local Version when the bundle, the Declared access or the migrations differ, the new migrations, the test rows that changed. Requests wait for it, and those under way are finished first.
+- **A project that does not build** (or whose `vm.dev.json` cannot be read, whose migration fails, whose test rows fail): the request that found it is answered `500` with a page of the local run's own, `text/html`, giving the reason and the message that `vm request` would give, escaped. The Version built before is not served meanwhile: every request is answered so until the project is corrected, and the first request after a change tries again.
+
+### The tool's own commands while it runs
+
+- While `vm dev` runs in a project, `vm request`, `vm local operation-log`, `vm local change-history` and `vm local reset` in that project do not wait for it and start nothing: **they are answered by it**, with the same output, the same reasons and the same exit codes as alone. A `vm request` is served like a browser's request (after the same look at the project), as the User `--as` names, and takes milliseconds, not seconds. Its `migrations_applied`, `standins` and `test_rows` are what the rebuild it caused did (empty when it caused none).
+- They find it through a file of `.vm/local/` (mode `0600`) that holds its port and a secret made for that run from the system's randomness. `/_vm/control/` answers `404` to a request without that secret, whatever it asks, and the secret is in no output, no log and no page. A file left by a `vm dev` that was killed outright is not believed: the command sees that nothing holds the project's lock and runs alone.
+
+### Test rows
+
+- **Files of the project**: `test-rows/<resource>.sql` for the stand-in of a pulled Resource, and `test-rows/own-database.sql` for the own database. Each is SQL the Builder or the Coding agent writes: `INSERT` statements for the most part. A new project has the folder with a `README.md` saying this; a file for a Resource that is not pulled is a note (`test-rows-without-resource`) and does nothing. A file is at most 16 MiB (`test-rows-failed` past it).
+- **A stand-in's rows.** The file's statements are run in order in one transaction by the stand-in's write login (so they can insert into, update and delete from every table, a view's and a materialized view's stand-in included, and can do nothing else: no table is made or changed). Before, every table of the stand-in is emptied and its sequences and identities start again, so loading the same file twice gives the same rows. It is loaded when the stand-in is made or remade, when the file's content is not the one loaded last (a file removed: the stand-in is emptied), and by a reset; **not otherwise**, so that what the Application wrote into a stand-in through a `write` Grant stays from one run to the next.
+- **The own database's rows.** `test-rows/own-database.sql` is run in order in one transaction after the migrations, by the role the Application's own statements run as, so only what the Application itself could do. Each row it changes is recorded in the local Change history like any other change, with `user_id` `test-rows`, `actor` `application` and a `request` that begins with `test-rows-`; it is not in the Operation log. It is loaded when the own database is made, and when the file's content is not the one loaded last: then **the own database is made anew first** (emptied, its migrations applied again), since rows cannot be loaded twice into tables that have them.
+- **A statement that fails** ends the loading: reason `test-rows-failed`, exit code `1`, with `file`, `statement` (its first line) and `error` (the database's message) beside the message; nothing of that file is loaded (a stand-in is left empty; the own database is left as the migrations make it), and the next run tries again. `vm dev` answers requests with its page for a project that does not build until the file is corrected.
+- The output of `vm request` gains `"test_rows": [ { "file": "test-rows/devops.sql", "rows": <the rows the file's statements changed> } ]`: the files this run loaded, in name order; empty when it loaded none. In words, one line for each.
+- The statements are split by Postgres's own scanner. Test rows are the Builder's: they are never sent anywhere, and a deploy does not read them.
+
+### Starting over
+
+```
+vm local reset [--project <directory>] [--timeout <seconds>] [--json]
+```
+
+- It removes everything the local runs made in the project: the local own database, the stand-ins, the local Versions, the local Operation log, Change history and logs. Then it does a run's work again up to the request: a new private Postgres, the stand-ins, the Version (numbered from 1), every migration, the test rows. It prints `{ "reset": true, "application", "version": 1, "migrations_applied": [ ... ], "standins": [ ... ], "test_rows": [ ... ], "warnings", "notes" }`; in words, what it did. Its failures are a run's.
+- The programs of Postgres in the user's own folder are not touched, and nothing is downloaded again. `vm.dev.json`, the test rows and every other file of the project are not touched.
+- While `vm dev` runs, the reset is done by it: requests under way are finished, those that come meanwhile wait, and it goes on serving at the same address afterwards. The chosen test User stays chosen.
+- A project that never had a local run: the same, from nothing.
+
+### Without a connection
+
+- With the structure pulled, the packages installed and Postgres in the user's own folder (or `VM_LOCAL_POSTGRES_BIN`), `vm dev`, `vm request`, `vm local operation-log`, `vm local change-history` and `vm local reset` open no connection but to the private Postgres and their own loopback address: no name is looked up, the installation is not asked, no sign-in is needed, and nothing is downloaded. They work with the installation stopped and with `VM_LOCAL_POSTGRES_MIRROR` naming an address that does not answer.
+
+### The instruction file
+
+From this ticket on the template's `AGENTS.md` names `vm dev` and `vm local reset` in its table of commands, and says: that `vm dev` serves the project at `http://<name>.localhost:7480/` for the Builder's browser, where the Builder chooses the test User, and that the agent's own `vm request` is answered by it while it runs; that test rows are SQL files in `test-rows/` (one a pulled Resource, and `own-database.sql`), loaded when they change; and that `vm local reset` starts the local databases over.
+
+### What this does not close
+
+- Static files, and the limits of a request in full: their tickets.
+- Windows, where the system does not resolve `*.localhost`: the ticket on the three systems.
+- The chosen test User is a cookie anyone on the machine can set: the local run holds test rows only, and listens on the loopback address only.
+- A change of a file is seen at the next request, not before: nothing is rebuilt while nobody asks.
