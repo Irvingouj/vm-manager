@@ -22,7 +22,7 @@ vm serve --domain <domain> --listen <ip:port> [--stand-in-sign-in] [--administra
 ```
 
 - `--domain` is the installation's domain. `--listen 127.0.0.1:0` picks a free port.
-- `--administrators-group` names the Group whose members are Platform administrators. Without it nobody is one.
+- `--administrators-group` names the Group whose members are Platform administrators. Without it nobody is one. (From the ticket on the tool's sign-in through the browser on, it belongs to the stand-in; with OIDC the Group is the connection's.)
 - `VM_DATABASE_URL`, in the environment and never on the command line, names the platform database and a role that may create databases and roles. See "The platform database".
 - A start-up that cannot work exits non-zero, within 15 seconds, with a message on standard error naming the problem: no `VM_DATABASE_URL`, one that cannot be parsed, a Postgres that cannot be reached or refuses the role, a platform database written by a newer program. The message never shows the password.
 - (Ticket: Walking skeleton named fixture Applications with `--application <name>=<path>`. That option is gone: Applications enter through the platform's API.)
@@ -1073,7 +1073,7 @@ vm sign-out [--json]
 vm whoami [--json]
 ```
 
-- `vm sign-in` asks the installation for a **tool credential** for that User and keeps it on the Builder's machine. While sign-in is the stand-in, the User and their Groups are stated on the command line (`--stand-in-user` is required); the ticket on signing the tool in through the browser replaces those two options and nothing else here.
+- `vm sign-in` asks the installation for a **tool credential** for that User and keeps it on the Builder's machine. While sign-in is the stand-in, the User and their Groups are stated on the command line (`--stand-in-user` is required); with OIDC the tool signs in through the browser ("The tool signs in through the browser, and OIDC is connected from the tool"), and nothing else here changes.
 - Until the ticket on installing brings HTTPS, the tool speaks plain HTTP and only to the address given with `--connect`, which must be a loopback address (`127.0.0.1:<port>`, `[::1]:<port>`); another address is exit code `2`. It sends `Host: api.<domain>`.
 - It prints the User, their Groups and the installation: `{ "user": "<id>", "groups": [...], "platform_administrator": <bool>, "domain": "<domain>", "expires_at": "<RFC 3339 time>" }`. An installation that does not accept the sign-in (the stand-in is off) is `sign-in-refused`, exit code `3`, and nothing is kept.
 - Signing in again replaces the credential kept; the earlier one is ended at the installation if it can be reached. A sign-in whose credential cannot be kept (the file cannot be written) is `credential-file`, and the credential just made is ended at the installation: none is left alive that no file holds.
@@ -1723,7 +1723,7 @@ From this ticket on the template's `AGENTS.md` names `vm dev` and `vm local rese
 
 ## Sign-in and sessions (ticket: OIDC sign-in and per-subdomain sessions)
 
-The platform is the OIDC relying party (ADR 0011, the answer of "Sign-in, sessions and Application URLs"). A session lives on the platform's side; a browser holds opaque cookies, one for the platform's sign-in address and one for each Application's address, none of them valid anywhere else. The stand-in sign-in stays for tests and the local run only.
+The platform is the OIDC relying party (ADR 0011, the answer of "Sign-in, sessions and Application URLs"). **From the ticket on the tool's sign-in through the browser on**, the issuer, the client id, the client secret, the Groups claim and the scopes are no longer given to `vm serve`: they are the connection a Platform administrator makes with `vm admin connect-oidc` ("The tool signs in through the browser, and OIDC is connected from the tool"). What each of them means, and everything else in this section, stands. A session lives on the platform's side; a browser holds opaque cookies, one for the platform's sign-in address and one for each Application's address, none of them valid anywhere else. The stand-in sign-in stays for tests and the local run only.
 
 ### Starting with OIDC
 
@@ -1753,7 +1753,7 @@ vm serve --domain <domain> --listen <ip:port> \
 
 - **One sign-in for all**: a browser that has a platform session goes through 1, 2 and 4 for a second Application without seeing the identity provider.
 - A redirect of the platform's never leaves the installation but in step 2's second case: `next` is only ever a path, `application` only ever a name.
-- At most 10 minutes may pass between 2 and 3. **The platform keeps nothing of a sign-in under way.** The `state` it sends to the identity provider holds what the callback needs (where the browser goes afterwards, and what the token is checked against), sealed with a key of the platform's own, so that nobody else can read one or make one, and good only in the browser that began it (a cookie on the sign-in address says which). So sign-ins begun and never finished, however many, stop no other; and one under way goes on when the program is started again meanwhile with the same client secret.
+- At most 10 minutes may pass between 2 and 3. **The platform keeps nothing of a sign-in under way.** The `state` it sends to the identity provider holds what the callback needs (where the browser goes afterwards, and what the token is checked against), sealed with a key of the platform's own, so that nobody else can read one or make one, and good only in the browser that began it (a cookie on the sign-in address says which). So sign-ins begun and never finished, however many, stop no other; and one under way goes on when the program is started again meanwhile with the same key (the client secret's until the ticket on the tool's sign-in through the browser, the installation's from then on).
 
 ### The cookies
 
@@ -1776,7 +1776,7 @@ vm serve --domain <domain> --listen <ip:port> \
 
 - **Groups are read again at each renewal.** When a request finds its session last renewed more than `--session-renewal` ago, the platform first asks the identity provider with the session's refresh token. A new ID token that holds (its signature, `iss`, `aud` and `exp`; a `nonce` is not asked of it): the session's Groups are those of the new token from that request on, in every Application. A refusal (the token endpoint answers `4xx` other than `408` and `429`: `invalid_grant` when the person was disabled or the token revoked), an answer without an ID token, an ID token that does not hold, or one of another `sub`: the session ends. A provider that does not answer (not reached, late, `408`, `429`, `5xx`, an answer that cannot be read): the request is answered `503` with `Retry-After`, the code not run, and the session stays; the Groups read before are never used past their time.
 - **One renewal serves every request of its session that comes meanwhile**: they wait for it and take its outcome, whatever it is, and the provider is asked once. A renewal ends within 10 seconds, so each of them is answered within about that. It is the platform's work and not the request's: it goes on to its end when the request that began it goes away, so a refresh token the provider replaced meanwhile is not lost. At most 256 sessions are being renewed at once, a quarter of the 1,024 connections the program serves at once, so that requests waiting for a provider that does not answer never take them all: a request whose session's renewal cannot begin is answered `503` at once, and the requests of other sessions, of nobody signed in and to the API go on being answered meanwhile.
-- A session's refresh token is kept sealed, with a key made from the client secret (which is not in the platform database). After the client secret is changed, the sessions begun before it end at their next renewal.
+- A session's refresh token is kept sealed, with a key made from the installation's key (`VM_SECRET_KEY`, which is not in the platform database; until the ticket on the tool's sign-in through the browser it was made from the client secret). A session whose refresh token no longer opens (the installation's key was changed and OIDC connected again) ends at its next renewal.
 - A session whose sign-in brought no refresh token ends at its first renewal.
 - A session ends, for every Application at once: at `--session-lifetime` after its sign-in; at a renewal as above; at sign-out. A request with an ended session is one without a session (1 above): a page goes through sign-in again, which the identity provider may answer without asking.
 - **Sign-out.** `GET <sign-in address>/sign-out` is a page with one button; `POST <sign-in address>/sign-out` (same origin, by the rule above) ends the platform session and every Application session made from it, clears the cookie, and answers a page saying so, and that the company's own sign-in may still be open. The identity provider is not told.
@@ -1794,9 +1794,98 @@ The black-box harness has an identity provider of its own (`blackbox`, no produc
 
 ### What this does not close
 
-- The tool's own sign-in (`vm sign-in`) still uses the stand-in: the ticket "The tool signs in through the browser". Until then an installation with OIDC has no way to make a tool credential; the tests deploy with the stand-in and start the program again with OIDC on the same platform database.
+- The tool's own sign-in (`vm sign-in`) still uses the stand-in: the ticket "The tool signs in through the browser" (closed there).
 - Whom an Application is shared with: the ticket on Contributors and sharing. Here every signed-in User may open every Application.
 - The Dashboard at `dashboard.<domain>`: its ticket; it signs in by the same way through.
 - Signing out at the identity provider, and being signed out by it (back-channel logout).
 - TLS: the program listens in plain HTTP behind what ends TLS (the ticket on installing).
 - An identity provider whose certificate is signed by a company's own certificate authority: the program trusts the public roots compiled into it and no other (the ticket on installing).
+
+## The tool signs in through the browser, and OIDC is connected from the tool (ticket: The tool signs in through the browser; Platform administrators come from the directory)
+
+From this ticket on OIDC is not a way of starting the program: it is a **connection** a Platform administrator makes from the tool, kept in the platform database (ADR 0018). Nobody can sign in before it is made, so the first one is made with a one-time **setup credential** that whoever installs the platform prints. The tool then signs in through the Builder's browser, and Platform administrators are the members of the Group the connection names.
+
+### The installation's key
+
+- `VM_SECRET_KEY`, in the environment of `vm serve` and never on the command line: 32 random bytes in base64 (`openssl rand -base64 32`). Set to anything else: a start-up failure as "Serving" says, and the value is never shown.
+- With it the platform seals what it keeps secret in the platform database (AES-256-GCM, a key of its own for each use, made from this one): the client secret of the OIDC connection, each session's and each tool credential's refresh token, and the `state` of a sign-in under way. This replaces the key made from the client secret in "Sign-in and sessions": a changed client secret ends no session. A dump of the platform database holds none of them in a form that can be used.
+- Without it the program serves all the same, but OIDC cannot be connected (`409` `no-secret-key`), and a connection that is in the platform database is not used: the listening line says `"sign_in":"none"` and the log gets `{"event":"oidc-connection-unusable","reason":"no-secret-key"}`. With another key than the one the connection was made under: the same, with `"reason":"another-secret-key"`. Then OIDC is connected again (below).
+
+### The setup credential
+
+```
+VM_DATABASE_URL=postgres://... vm setup [--json]
+```
+
+- Run by whoever installs the platform, beside the platform database, whether the program is running or not (it brings the platform database's structure up to date first, as `vm serve` does). It makes **the setup credential** and prints it, once: `{ "setup_credential": "vmsc_<...>", "expires_at": "<RFC 3339 time>" }` with `--json`; without, the credential alone on standard output and what to do with it on standard error. The platform database keeps only its SHA-256. It is 32 random bytes or more.
+- It is good for 24 hours and for one thing: connecting OIDC (below), once. Any other request made with it is `401`. A second `vm setup` ends the first one's credential.
+- It is also the way back in when nobody can sign in (a connection that turned out wrong, a lost key): `vm setup` again, by someone who has the platform database's address. Its failures are those of a start-up: exit code `1` and a message that never shows a password.
+
+### Connecting OIDC
+
+```
+VM_SETUP_CREDENTIAL=vmsc_... VM_OIDC_CLIENT_SECRET=<secret> \
+vm admin connect-oidc --domain <domain> --connect <ip:port> \
+    --issuer <URL> --client-id <id> --administrators-group <Group> \
+    [--groups-claim <name>] [--scopes "<scope> <scope> ..."] [--json]
+```
+
+- `VM_OIDC_CLIENT_SECRET`, in the tool's environment and never on the command line, is required (without it: exit code `2`). With `VM_SETUP_CREDENTIAL` in the environment the command is made with the setup credential, and `--domain` and `--connect` say where (both required then; `--connect` as in "Signing in"). Without it the command is made with the tool's own credential, at the installation it is signed in to (`--domain` and `--connect` are exit code `2` then), and its User must be a Platform administrator.
+- `--issuer`, `--client-id`, `--groups-claim` (`groups` without it) and `--scopes` (`openid profile email offline_access` without it; `openid` always among them) mean what "Sign-in and sessions: Starting with OIDC" said of the options of `vm serve` that are gone now. `--administrators-group` names the Group whose members are Platform administrators (1 to 256 bytes, no control characters).
+- It prints the connection: `{ "issuer", "client_id", "groups_claim", "scopes": [...], "administrators_group", "connected_at", "connected_by" }` (`connected_by` is the User's id, or `setup-credential`). Neither secret is ever printed, and neither is kept on the Builder's machine.
+- Reasons of its own: `setup-credential-refused` (exit code `3`: the installation answered `401` to the setup credential; the message says it is used up, replaced or expired and to run `vm setup` again). The API's refusals keep their reasons, as for every command.
+
+On the platform's API:
+
+- `PUT /v1/oidc`, by a Platform administrator, or with `Authorization: Bearer <the setup credential>`: `{ "issuer", "client_id", "client_secret", "administrators_group", "groups_claim"?, "scopes"? }` (`scopes` one string, separated by spaces). Answers `200` with the connection as above.
+  - `400` `invalid-issuer` for an issuer that is not `https://...` or `http://` on a loopback host (no user, query or fragment); `400` `malformed` for the rest (a `client_id` or `client_secret` that is empty, longer than 256 bytes (the secret: 1,024) or has control characters, a Group that is no Group, an empty `groups_claim`).
+  - `409` `no-secret-key` when the program has no `VM_SECRET_KEY`; `409` `stand-in-sign-in` when it was started with `--stand-in-sign-in`.
+  - **The provider is asked before the connection is taken**: the platform fetches the issuer's configuration (within 10 seconds, read up to 1 MiB). When it cannot be used (not reached, late, not JSON, another issuer, an endpoint missing): `422` `identity-provider-unusable`, the message says which of these it was, and nothing is changed. The client secret cannot be checked this way: a wrong one shows at the first sign-in.
+  - It takes effect at once, in the running program: the sign-in address serves, and `GET /v1/installation` says `oidc`. The log gets `{"event":"oidc-connected","issuer","client_id","administrators_group","by"}` and never a secret.
+  - Made with the setup credential, it ends that credential in the same act: used again, it is `401`.
+  - A connection made over an earlier one: when the issuer or the client id differ, every session and every tool credential that came from a sign-in ends (they were another provider's people). Otherwise they stay, and their next renewal is made with the new settings; who is a Platform administrator follows the new Group at once.
+- `GET /v1/oidc`, by a Platform administrator: the connection; `404` `not-found` when there is none.
+- `GET /v1/installation`, by anyone, signed in or not: `{ "domain", "sign_in": "oidc" | "stand-in" | "none", "sign_in_address": "<scheme>://auth.<domain>[:<port>]" | null }` (the address only with `oidc`).
+
+### Starting, from this ticket on
+
+- `vm serve` no longer has `--oidc-issuer`, `--oidc-client-id`, `--oidc-groups-claim` and `--oidc-scopes` (each is exit code `2`, like any option it does not have), and does not look at `VM_OIDC_CLIENT_SECRET`. `--public-scheme`, `--public-port`, `--session-renewal` and `--session-lifetime` stay as they are. At its start the program uses the connection the platform database holds: the listening line says `"sign_in":"oidc"` then, and the provider is still asked nothing before someone signs in.
+- `--stand-in-sign-in` on a platform database that holds a connection is a start-up failure (the stand-in cannot be on together with OIDC).
+- `--administrators-group` belongs to the stand-in: given without `--stand-in-sign-in` it is a start-up failure whose message names `vm admin connect-oidc`.
+
+### Who is a Platform administrator
+
+- With OIDC: a User whose Groups, as last read from the provider, hold the connection's administrators' Group. A session or a tool credential of someone taken out of that Group at the provider stops being an administrator's at its next renewal, and of someone put into it becomes one then. Everyone else is refused (`403` `not-an-administrator`) as before.
+
+### Signing the tool in
+
+```
+vm sign-in --domain <domain> --connect <ip:port> [--no-browser] [--timeout <seconds>] [--json]
+```
+
+- The tool asks `GET /v1/installation`. `none`: `sign-in-refused` (exit code `3`), the message says that OIDC is not connected yet and that a Platform administrator connects it with `vm admin connect-oidc`. `stand-in`: as before, with `--stand-in-user` (without it: `sign-in-refused`, saying so). `oidc`: through the browser, as follows; `--stand-in-user` is `sign-in-refused` there.
+- The tool makes a **verifier** (256 random bits, kept in its memory only) and sends its **challenge** (`BASE64URL(SHA-256(verifier))`) through the browser. Nothing is copied by hand, and the Builder never sees a credential.
+- **With a browser on the machine**: the tool listens on `127.0.0.1:<a free port>` and opens `<sign-in address>/tool?challenge=<challenge>&port=<port>&machine=<the machine's name>`: with the command in `BROWSER` when that is set (the address is its last argument), else with the system's own (`xdg-open`, `open`). It also writes the address to standard error, for a browser that did not open.
+- **Without one** (`--no-browser`; or no `BROWSER`, and on Linux neither `DISPLAY` nor `WAYLAND_DISPLAY`): it writes to standard error the address `<sign-in address>/tool?challenge=<challenge>&machine=<name>`, to open on any device, and a **check code** of eight characters (`XXXX-XXXX`, made from the challenge) that the page will ask for.
+- At the sign-in address:
+  1. `GET /tool` with a `challenge` of 43 base64url characters, a `port` of 1024 to 65535 when there is one, and a `machine` of at most 64 bytes (control characters dropped): `302` to the identity provider, an authorization of its own (so the tool's credential has its own refresh token), sealed into `state` as every sign-in under way. Anything else: `400`, a page of the platform's own.
+  2. Back at `/callback`, signed in at the provider: a page that says who is being signed in (name, email, id), on which machine, and asks. With a `port` it says the tool is on this computer; without, it asks for the check code the tool shows. One form, `POST /tool`, same origin by the rule of "Whose request it is".
+  3. `POST /tool`, confirmed: with a `port`, the browser is sent to `http://127.0.0.1:<port>/?grant=<a one-time value>` (never to another host), where the tool answers a page saying it is signed in; without, a page says so and to go back to the tool. A wrong check code shows the page again; after the fifth the sign-in is over. Declined: a page says nothing was signed in.
+  - The platform keeps something only from step 2 on, when someone has signed in at the provider: at most 5 sign-ins of the tool awaiting an answer for each User (the oldest goes), each for 10 minutes. Before that there is nothing of the platform's to use up.
+- `POST /v1/tool-sign-ins`, by anyone, with `{ "verifier": "<...>", "grant": "<...>"? }`: `201` with the answer of `POST /v1/tool-credentials` (the credential, once) when the sign-in whose challenge this verifier makes has been confirmed, and, if it was begun with a `port`, the `grant` is the one the browser was sent to the tool with. Until then, and for a verifier nothing is known of: `409` `sign-in-not-confirmed`. So a link sent to someone else gains nothing: without a `port` they must type a code only the sender's tool shows, with one the grant goes to their own machine.
+- The tool asks every 2 seconds (at once when the browser reaches its port), for at most `--timeout` seconds (10 to 600; `300` without it). Then: `sign-in-not-finished`, exit code `3`, the message gives the address again and says to run the command again when the Builder is ready. Nothing is kept.
+- What it prints and keeps is as in "The tool: Signing in" and "The credential". The credential's User is the `sub`; **its Groups are read again at each renewal, like a session's** (`--session-renewal`), with its own refresh token: a refusal of the provider ends it (the usual `401`; the tool says `sign-in-expired`), a provider that does not answer is `503` `unavailable` and the credential stays, and one whose sign-in brought no refresh token ends at its first renewal. `GET /v1/me` and `vm whoami` give the Groups as last read. It still ends at its lifetime, at `vm sign-out`, and when its User makes a seventeenth.
+
+### The instruction file
+
+- `AGENTS.md` of a new project tells the Coding agent that when a command says it is not signed in, it runs the `vm sign-in` command the message gives, which opens the Builder's browser (or shows an address for the Builder to open), tells the Builder so, and runs its own command again after; and that `sign-in-not-finished` means the Builder has not answered yet: ask them, then run `vm sign-in` again. It never asks the Builder for a password or a token.
+
+### The harness
+
+The harness connects OIDC as an administrator would (`vm setup`, then the connection), walks a browser through `/tool`, and plays the opened browser with a `BROWSER` command of its own.
+
+### What this does not close
+
+- Other commands for Platform administrators: the tickets on Resources and Grants in full and on what Platform administrators see.
+- A Platform administrator ending someone else's tool credential or session.
+- The tool still speaks plain HTTP to a loopback address (the ticket on installing brings HTTPS). The Dashboard: its ticket.
