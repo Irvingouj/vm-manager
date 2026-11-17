@@ -53,8 +53,8 @@ impl ClientSecret {
         Self(text)
     }
 
-    /// The text, where the client authenticates and where the key that
-    /// seals refresh tokens is derived.
+    /// The text, where the client authenticates, where it is sealed into
+    /// the platform database, and where the tool sends it once.
     pub fn expose(&self) -> &str {
         &self.0
     }

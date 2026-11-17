@@ -62,7 +62,7 @@ use crate::registry::{NewVersion, Registry, Sent};
 use crate::resources::{self, Login, NewResource, Resources};
 use crate::runner;
 use crate::sign_in::{ChosenTestUser, LocalSignIn};
-use crate::tool_credentials::{DEFAULT_LIFETIME, ToolCredentials};
+use crate::tool_credentials::{DEFAULT_LIFETIME, ToolCredentials, Unchecked};
 use crate::user::User;
 
 /// Where a local command works, and how it names itself.
@@ -328,11 +328,15 @@ impl Live {
         .await
         .map_err(|why| postgres_failed(&why, who.command))?;
         // The local run has no sign-in of the tool through the browser, so
-        // no credential of it is ever renewed: the renewal is its lifetime.
+        // no credential of it is ever renewed (the renewal is its lifetime).
+        // Its program is never started with OIDC, and its own Postgres never
+        // holds a connection: credentials made without a sign-in are taken,
+        // as with the stand-in.
         let credentials = Arc::new(ToolCredentials::new(
             Arc::clone(&database),
             DEFAULT_LIFETIME,
             DEFAULT_LIFETIME,
+            Unchecked::Taken,
         ));
         let ingress = Ingress {
             domain: Arc::from(DOMAIN),

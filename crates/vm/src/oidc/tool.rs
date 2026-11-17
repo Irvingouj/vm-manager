@@ -521,11 +521,14 @@ impl Oidc {
             .database
             .pool()
             .run(async |client: &mut Client| {
+                // Never one that five wrong check codes ended: the count
+                // and the end are one transaction under the row's lock
+                // ([`Self::wrong_code`]), and this waits for it.
                 client
                     .execute(
                         "UPDATE tool_sign_ins SET confirmed = true, grant_digest = $2
-                         WHERE id = $1 AND NOT confirmed",
-                        &[&id, &grant],
+                         WHERE id = $1 AND NOT confirmed AND wrong_codes < $3",
+                        &[&id, &grant, &MAX_WRONG_CODES],
                     )
                     .await
                     .map_err(DbError::from)
@@ -560,28 +563,51 @@ impl Oidc {
     /// sign-in over.
     async fn wrong_code(&self, awaiting: &Awaiting, sign_in: &str) -> Result<Page, DbError> {
         let id = awaiting.id;
+        // One act: the row locked, the count read, and then either counted
+        // or, at the fifth, the sign-in deleted, in one transaction. A
+        // confirm waits on the lock and then finds the row gone.
         let counted = self
             .database
             .pool()
             .run(async |client: &mut Client| {
-                client
+                let transaction = client.transaction().await.map_err(DbError::from)?;
+                let row = transaction
                     .query_opt(
-                        "UPDATE tool_sign_ins SET wrong_codes = wrong_codes + 1
-                         WHERE id = $1 AND NOT confirmed RETURNING wrong_codes",
+                        "SELECT wrong_codes FROM tool_sign_ins
+                         WHERE id = $1 AND NOT confirmed FOR UPDATE",
                         &[&id],
                     )
                     .await
-                    .map_err(DbError::from)
+                    .map_err(DbError::from)?;
+                let Some(row) = row else {
+                    return Ok(None);
+                };
+                let wrong: i32 = row
+                    .try_get(0)
+                    .map_err(|_| DbError::unexpected("a count of wrong check codes"))?;
+                let wrong = wrong.saturating_add(1);
+                if wrong >= MAX_WRONG_CODES {
+                    transaction
+                        .execute("DELETE FROM tool_sign_ins WHERE id = $1", &[&id])
+                        .await
+                        .map_err(DbError::from)?;
+                } else {
+                    transaction
+                        .execute(
+                            "UPDATE tool_sign_ins SET wrong_codes = $2 WHERE id = $1",
+                            &[&id, &wrong],
+                        )
+                        .await
+                        .map_err(DbError::from)?;
+                }
+                transaction.commit().await.map_err(DbError::from)?;
+                Ok(Some(wrong))
             })
             .await?;
-        let Some(row) = counted else {
+        let Some(wrong) = counted else {
             return Ok(pages::tool_over());
         };
-        let wrong: i32 = row
-            .try_get(0)
-            .map_err(|_| DbError::unexpected("a count of wrong check codes"))?;
         if wrong >= MAX_WRONG_CODES {
-            self.end_sign_in(id).await?;
             log::record(
                 "tool-sign-in-ended",
                 json!({ "reason": "wrong-check-codes" }),

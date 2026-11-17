@@ -156,6 +156,20 @@ pub struct ToolCredentials {
     /// How long the Groups of a credential from a sign-in are used before
     /// they are read again, in whole seconds.
     renewal_seconds: i64,
+    /// Whether a credential made without a sign-in of the tool (with the
+    /// stand-in, or in the local run) signs anyone in: it states its own
+    /// User and Groups, which nobody checked.
+    unchecked: Unchecked,
+}
+
+/// Whether credentials made without a sign-in of the tool are taken.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Unchecked {
+    /// The program runs with the stand-in, or is the local run: they are.
+    Taken,
+    /// The program runs without the stand-in: they sign nobody in (`401`,
+    /// as unknown ones), and are good again at a start with the stand-in.
+    Refused,
 }
 
 /// A presented credential that is alive.
@@ -191,11 +205,17 @@ impl ToolCredentials {
     /// `lifetime` is how long each credential made lives, `renewal` how
     /// long the Groups of one made by a sign-in are used; each at least a
     /// second.
-    pub fn new(database: Arc<PlatformDatabase>, lifetime: Duration, renewal: Duration) -> Self {
+    pub fn new(
+        database: Arc<PlatformDatabase>,
+        lifetime: Duration,
+        renewal: Duration,
+        unchecked: Unchecked,
+    ) -> Self {
         Self {
             database,
             lifetime_seconds: whole_seconds(lifetime),
             renewal_seconds: whole_seconds(renewal),
+            unchecked,
         }
     }
 
@@ -316,9 +336,11 @@ impl ToolCredentials {
 
     /// The User a credential signs in, with the Groups as last read, and
     /// whether they must be read again first; `None` when it is unknown,
-    /// expired or signed out.
+    /// expired, signed out, or made without a sign-in where those are
+    /// [`Unchecked::Refused`].
     pub async fn user_of(&self, digest: Digest) -> Result<Option<Found>, DbError> {
         let renewal = self.renewal_seconds;
+        let unchecked = self.unchecked == Unchecked::Taken;
         let row = self
             .database
             .pool()
@@ -329,8 +351,9 @@ impl ToolCredentials {
                                 from_sign_in
                                 AND renewed_at + $2::bigint * interval '1 second' <= now()
                          FROM tool_credentials
-                         WHERE digest = $1 AND expires_at > now()",
-                        &[&digest.0.as_slice(), &renewal],
+                         WHERE digest = $1 AND expires_at > now()
+                           AND (from_sign_in OR $3)",
+                        &[&digest.0.as_slice(), &renewal, &unchecked],
                     )
                     .await
                     .map_err(DbError::from)

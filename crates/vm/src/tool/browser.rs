@@ -7,18 +7,25 @@
 //!   browser.
 //! - With a browser: a listener on `127.0.0.1:<a free port>`, and the
 //!   address `<sign-in address>/tool?challenge=&port=&machine=` opened with
-//!   `BROWSER` (the address its last argument) or the system's own command;
-//!   the command is waited for [`BROWSER_WAIT`] at most (one still running
-//!   then is left to itself: it is the person's browser). Without one: the
-//!   address without a port and the check code
-//!   (crate::oidc::tool::check_code) on standard error.
-//! - Then `POST /v1/tool-sign-ins` every [`POLL_EVERY`], at once when the
-//!   browser reaches the port, each waited for [`POLL_WAIT`] at most, all
-//!   within `--timeout`.
-//! - The listener takes one connection at a time, reads at most
-//!   [`MAX_REQUEST_BYTES`] of it within [`REQUEST_WAIT`], takes only `GET
-//!   /?grant=<...>`, answers one small page and closes. It ends with the
-//!   command.
+//!   `BROWSER` (the address its last argument) or the system's own command.
+//!   The command is not waited for (it may be the browser itself): its
+//!   handle is held while the tool runs, its ending watched beside the
+//!   listener (a failure is said on standard error), and one still running
+//!   when the sign-in ends is left running. Without one: the address
+//!   without a port and the check code (crate::oidc::tool::check_code) on
+//!   standard error.
+//! - Then `POST /v1/tool-sign-ins`, each waited for [`POLL_WAIT`] at most,
+//!   all within `--timeout`. Without a port: every [`POLL_EVERY`]. With a
+//!   port: only with a grant the port was given, at once when the browser
+//!   reaches it, then every [`POLL_EVERY`] with that grant; never without
+//!   one, so a sign-in confirmed elsewhere under the same challenge and no
+//!   port does not sign this tool in.
+//! - The listener takes one connection at a time, reads its head (at most
+//!   [`MAX_REQUEST_BYTES`]) within [`REQUEST_WAIT`], looks only at the first
+//!   line, takes only `GET /?grant=<...>`, answers one small page and
+//!   closes. It ends with the command.
+//! - The verifier and the grant are [`Secret`]s, which do not print; each
+//!   body that carries them is bytes sent once.
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
@@ -27,17 +34,16 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use bytes::Bytes;
 use hyper::{Method, StatusCode};
-use ring::rand::{SecureRandom, SystemRandom};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::process::Command;
+use tokio::process::{Child, Command};
 use tokio::time::Instant;
 use url::{Url, form_urlencoded};
 
 use super::client::{self, Installation, Reply, Sign};
 use super::{Ending, failed, not_success, shell_word, unexpected};
+use crate::oidc::secret::Secret;
 use crate::oidc::tool::{check_code, shown_code};
 
 /// How often the installation is asked whether the sign-in was confirmed.
@@ -47,11 +53,10 @@ pub const POLL_EVERY: Duration = Duration::from_secs(2);
 /// deadline).
 pub const POLL_WAIT: Duration = Duration::from_secs(10);
 
-/// The longest the command that opens the browser is waited for.
-pub const BROWSER_WAIT: Duration = Duration::from_secs(10);
-
-/// The most read of a request to the tool's port.
-pub const MAX_REQUEST_BYTES: usize = 8 * 1024;
+/// The most read of a request's head at the tool's port: a browser sends
+/// there the cookies other programs on 127.0.0.1 set. A longer head is
+/// answered `404` without being read to its end.
+pub const MAX_REQUEST_BYTES: usize = 64 * 1024;
 
 /// The longest a request to the tool's port may take to arrive, and its
 /// answer to be written.
@@ -77,14 +82,14 @@ pub async fn sign_in(
         .ok()
         .filter(|u| matches!(u.scheme(), "http" | "https") && u.host_str().is_some())
         .ok_or_else(|| unexpected(at.connect, "the sign-in address it gave is not one"))?;
-    let verifier = verifier().ok_or_else(|| {
+    let verifier = Secret::random().ok_or_else(|| {
         Ending::new(
             1,
             "failed",
             "the operating system gave no randomness: run the command again".into(),
         )
     })?;
-    let challenge: [u8; 32] = Sha256::digest(verifier.as_bytes()).into();
+    let challenge = verifier.digest();
     let challenge_text = URL_SAFE_NO_PAD.encode(challenge);
     let machine = machine_name();
     let opener = if no_browser { None } else { opener() };
@@ -92,38 +97,24 @@ pub async fn sign_in(
         Some(_) => Some(
             TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
                 .await
-                .map_err(|e| {
-                    Ending::new(
-                        1,
-                        "failed",
-                        format!("the tool cannot listen on 127.0.0.1 for the browser ({e}): run the command again, or with --no-browser"),
-                    )
-                })?,
+                .map_err(|e| cannot_listen(&e))?,
         ),
         None => None,
     };
     let port = match &listener {
-        Some(listener) => Some(
-            listener
-                .local_addr()
-                .map_err(|e| {
-                    Ending::new(
-                        1,
-                        "failed",
-                        format!("the tool cannot listen on 127.0.0.1 for the browser ({e}): run the command again, or with --no-browser"),
-                    )
-                })?
-                .port(),
-        ),
+        Some(listener) => Some(listener.local_addr().map_err(|e| cannot_listen(&e))?.port()),
         None => None,
     };
     let address = tool_address(&base, &challenge_text, port, &machine);
+    // The browser command's handle, held while the tool runs and dropped
+    // (not killed) at its end: a browser still running is the person's.
+    let mut opened: Option<Child> = None;
     match (opener, port) {
         (Some(opener), Some(_)) => {
             super::say_on_stderr(&format!(
                 "Opening your browser to sign the tool in. If it does not open, open this address on this computer:\n{address}\n"
             ));
-            open(opener, address.as_str()).await;
+            opened = open(opener, address.as_str());
         }
         _ => {
             super::say_on_stderr(&format!(
@@ -132,27 +123,43 @@ pub async fn sign_in(
             ));
         }
     }
-    let mut grant: Option<String> = None;
+    let with_port = listener.is_some();
+    let mut grant: Option<Secret> = None;
     let mut next_poll = Instant::now();
     loop {
+        // With a port, asked only once the port was given a grant.
+        let may_poll = !with_port || grant.is_some();
         let reached = tokio::select! {
             () = tokio::time::sleep_until(deadline) => {
                 return Err(not_finished(at, &address, timeout));
             }
-            () = tokio::time::sleep_until(next_poll) => None,
-            accepted = accept(listener.as_ref()) => accepted,
+            () = tokio::time::sleep_until(next_poll), if may_poll => Reached::Poll,
+            ended = ended(&mut opened) => Reached::Opener(ended),
+            accepted = accept(listener.as_ref()) => Reached::Browser(accepted),
         };
         match reached {
-            None => {
+            Reached::Opener(ended) => {
+                opened = None;
+                match ended {
+                    Ok(status) if status.success() => {}
+                    Ok(status) => super::say_on_stderr(&format!(
+                        "The command that opens the browser ended with {status}: open the address above yourself if no browser opened."
+                    )),
+                    Err(error) => super::say_on_stderr(&format!(
+                        "The command that opens the browser could not be waited for ({error}): open the address above yourself if no browser opened."
+                    )),
+                }
+            }
+            Reached::Poll => {
                 next_poll = Instant::now() + POLL_EVERY;
-                if let Some(made) = poll(at, &verifier, grant.as_deref(), deadline).await? {
+                if let Some(made) = poll(at, &verifier, grant.as_ref(), deadline).await? {
                     return Ok(made);
                 }
                 if Instant::now() >= deadline {
                     return Err(not_finished(at, &address, timeout));
                 }
             }
-            Some(mut stream) => {
+            Reached::Browser(mut stream) => {
                 let Some(given) = read_grant(&mut stream).await else {
                     answer(&mut stream, "404 Not Found", NOT_HERE).await;
                     continue;
@@ -160,7 +167,7 @@ pub async fn sign_in(
                 grant = Some(given);
                 // Asked at once, before the browser is answered: the page
                 // says what came of it.
-                let made = poll(at, &verifier, grant.as_deref(), deadline).await;
+                let made = poll(at, &verifier, grant.as_ref(), deadline).await;
                 match made {
                     Ok(Some(made)) => {
                         answer(&mut stream, "200 OK", SIGNED_IN).await;
@@ -180,11 +187,32 @@ pub async fn sign_in(
     }
 }
 
-/// 256 random bits in base64url.
-fn verifier() -> Option<String> {
-    let mut bytes = [0_u8; 32];
-    SystemRandom::new().fill(&mut bytes).ok()?;
-    Some(URL_SAFE_NO_PAD.encode(bytes))
+/// What the loop of [`sign_in`] was woken by.
+enum Reached {
+    /// Time to ask the installation.
+    Poll,
+    /// The browser command ended.
+    Opener(std::io::Result<std::process::ExitStatus>),
+    /// A connection to the tool's port.
+    Browser(TcpStream),
+}
+
+fn cannot_listen(error: &std::io::Error) -> Ending {
+    Ending::new(
+        1,
+        "failed",
+        format!(
+            "the tool cannot listen on 127.0.0.1 for the browser ({error}): run the command again, or with --no-browser"
+        ),
+    )
+}
+
+/// The browser command's ending; never, while there is none.
+async fn ended(opened: &mut Option<Child>) -> std::io::Result<std::process::ExitStatus> {
+    match opened {
+        Some(child) => child.wait().await,
+        None => std::future::pending().await,
+    }
 }
 
 /// The machine's host name, at most [`MAX_MACHINE`] bytes, without control
@@ -228,14 +256,12 @@ fn opener() -> Option<Vec<String>> {
     display.then(|| vec!["xdg-open".to_owned()])
 }
 
-/// Runs the opener with the address as its last argument, waiting
-/// [`BROWSER_WAIT`] at most. Its failure is not the sign-in's: the address
-/// is on standard error too.
-async fn open(opener: Vec<String>, address: &str) {
+/// Starts the opener with the address as its last argument, without
+/// waiting for it: its handle, or `None` when it could not start (said on
+/// standard error; the address is there too).
+fn open(opener: Vec<String>, address: &str) -> Option<Child> {
     let mut words = opener.into_iter();
-    let Some(program) = words.next() else {
-        return;
-    };
+    let program = words.next()?;
     let child = Command::new(program)
         .args(words)
         .arg(address)
@@ -244,20 +270,12 @@ async fn open(opener: Vec<String>, address: &str) {
         .stderr(std::process::Stdio::null())
         .spawn();
     match child {
-        Ok(mut child) => {
-            if tokio::time::timeout(BROWSER_WAIT, child.wait())
-                .await
-                .is_err()
-            {
-                super::say_on_stderr(
-                    "The command that opens the browser has not ended; open the address above yourself if no browser opened.",
-                );
-            }
-        }
+        Ok(child) => Some(child),
         Err(error) => {
             super::say_on_stderr(&format!(
                 "The browser could not be opened ({error}): open the address above yourself."
             ));
+            None
         }
     }
 }
@@ -278,10 +296,10 @@ fn tool_address(base: &Url, challenge: &str, port: Option<u16>, machine: &str) -
 }
 
 /// The next connection to the listener; never, without one.
-async fn accept(listener: Option<&TcpListener>) -> Option<TcpStream> {
+async fn accept(listener: Option<&TcpListener>) -> TcpStream {
     match listener {
         Some(listener) => match listener.accept().await {
-            Ok((stream, _)) => Some(stream),
+            Ok((stream, _)) => stream,
             // Not a browser that can be answered: wait on.
             Err(_) => std::future::pending().await,
         },
@@ -289,27 +307,31 @@ async fn accept(listener: Option<&TcpListener>) -> Option<TcpStream> {
     }
 }
 
-/// The grant of `GET /?grant=<...>`, read within [`REQUEST_WAIT`] and
-/// [`MAX_REQUEST_BYTES`]; `None` for anything else.
-async fn read_grant(stream: &mut TcpStream) -> Option<String> {
+/// The grant of `GET /?grant=<...>`, the head read within
+/// [`REQUEST_WAIT`] and [`MAX_REQUEST_BYTES`]; `None` for anything else.
+/// Only the first line is looked at, but the whole head is read before the
+/// answer, so that nothing the browser sent is left unread when the socket
+/// closes (which would reset the connection under the answer).
+async fn read_grant(stream: &mut TcpStream) -> Option<Secret> {
     let mut read = Vec::new();
-    let mut chunk = [0_u8; 1024];
+    let mut chunk = [0_u8; 8 * 1024];
     let head = tokio::time::timeout(REQUEST_WAIT, async {
         loop {
             let n = stream.read(&mut chunk).await.ok()?;
             if n == 0 {
                 return None;
             }
+            // Where the end of the head may begin: from three bytes before
+            // what was just read.
+            let from = read.len().saturating_sub(3);
             read.extend_from_slice(chunk.get(..n)?);
-            // The whole head is read before the answer, so that nothing
-            // the browser sent is left unread when the socket closes (which
-            // would reset the connection under the answer).
-            if read.windows(4).any(|w| w == b"\r\n\r\n") {
-                let end = read.windows(2).position(|w| w == b"\r\n")?;
-                return read.get(..end).map(<[u8]>::to_vec);
-            }
-            if read.len() >= MAX_REQUEST_BYTES {
+            if read.len() > MAX_REQUEST_BYTES {
                 return None;
+            }
+            if read.get(from..)?.windows(4).any(|w| w == b"\r\n\r\n") {
+                let end = read.windows(2).position(|w| w == b"\r\n")?;
+                read.truncate(end);
+                return Some(read);
             }
         }
     })
@@ -326,16 +348,17 @@ async fn read_grant(stream: &mut TcpStream) -> Option<String> {
         return None;
     }
     let query = target.strip_prefix("/?")?;
-    let mut grant = None;
+    let mut grant: Option<Secret> = None;
     for (name, value) in form_urlencoded::parse(query.as_bytes()) {
         if name == "grant" {
             if grant.is_some() {
                 return None;
             }
-            grant = Some(value.into_owned());
+            grant = Some(Secret::from_text(value.into_owned()));
         }
     }
     grant.filter(|g| {
+        let g = g.expose();
         !g.is_empty()
             && g.len() <= MAX_GRANT
             && g.bytes()
@@ -371,13 +394,14 @@ async fn answer(stream: &mut TcpStream, status: &str, page: &str) {
 /// confirmed. Never waited for past `deadline`.
 async fn poll(
     at: &Installation<'_>,
-    verifier: &str,
-    grant: Option<&str>,
+    verifier: &Secret,
+    grant: Option<&Secret>,
     deadline: Instant,
 ) -> Result<Option<Value>, Ending> {
+    // The body is bytes sent once; it is never printed or kept.
     let body = match grant {
-        Some(grant) => json!({ "verifier": verifier, "grant": grant }),
-        None => json!({ "verifier": verifier }),
+        Some(grant) => json!({ "verifier": verifier.expose(), "grant": grant.expose() }),
+        None => json!({ "verifier": verifier.expose() }),
     };
     let wait = deadline
         .saturating_duration_since(Instant::now())

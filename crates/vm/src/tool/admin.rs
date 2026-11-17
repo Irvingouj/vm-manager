@@ -18,6 +18,7 @@ use super::{
     Done, Ending, Output, domain, failed, loopback, not_success, read_kept, sign_in_expired,
     unexpected,
 };
+use crate::oidc::secret::ClientSecret;
 
 /// The variable that holds the client secret.
 const CLIENT_SECRET_VARIABLE: &str = "VM_OIDC_CLIENT_SECRET";
@@ -94,7 +95,7 @@ fn variable(name: &str) -> Option<String> {
 }
 
 async fn connect_oidc(args: &ConnectOidcArgs) -> Result<Done, Ending> {
-    let Some(client_secret) = variable(CLIENT_SECRET_VARIABLE) else {
+    let Some(client_secret) = variable(CLIENT_SECRET_VARIABLE).map(ClientSecret::new) else {
         return Err(Ending::new(
             2,
             "usage",
@@ -103,10 +104,12 @@ async fn connect_oidc(args: &ConnectOidcArgs) -> Result<Done, Ending> {
             ),
         ));
     };
+    // The body that carries the client secret is bytes sent once, in the
+    // one request below; it is never printed or kept.
     let mut body = serde_json::Map::new();
     body.insert("issuer".into(), json!(args.issuer));
     body.insert("client_id".into(), json!(args.client_id));
-    body.insert("client_secret".into(), json!(client_secret));
+    body.insert("client_secret".into(), json!(client_secret.expose()));
     body.insert(
         "administrators_group".into(),
         json!(args.administrators_group),
@@ -119,7 +122,9 @@ async fn connect_oidc(args: &ConnectOidcArgs) -> Result<Done, Ending> {
         body.insert("scopes".into(), json!(scopes));
     }
     let body = Bytes::from(Value::Object(body).to_string());
-    let reply = match variable(SETUP_VARIABLE) {
+    // The setup credential is a Secret from the moment it is read; a value
+    // that cannot be one is said so, never shown.
+    let reply = match variable(SETUP_VARIABLE).map(Secret::new) {
         Some(setup) => {
             let (Some(domain), Some(connect)) = (&args.domain, args.connect) else {
                 return Err(Ending::new(
@@ -130,7 +135,7 @@ async fn connect_oidc(args: &ConnectOidcArgs) -> Result<Done, Ending> {
                     ),
                 ));
             };
-            let setup = Secret::new(setup).ok_or_else(|| {
+            let setup = setup.ok_or_else(|| {
                 Ending::new(
                     2,
                     "usage",

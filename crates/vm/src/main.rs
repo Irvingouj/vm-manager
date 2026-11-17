@@ -33,7 +33,7 @@ use vm::registry::is_dns_label;
 use vm::runner;
 use vm::sign_in::{NoSignIn, SignIn, StandInSignIn};
 use vm::tool;
-use vm::tool_credentials::{DEFAULT_LIFETIME, ToolCredentials};
+use vm::tool_credentials::{DEFAULT_LIFETIME, ToolCredentials, Unchecked};
 use vm::{log, server, setup};
 
 #[derive(Parser)]
@@ -306,6 +306,11 @@ fn run(serve: &Serve) -> Result<(), String> {
             Arc::clone(&database),
             Duration::from_secs(serve.tool_credential_lifetime),
             renewal,
+            if serve.stand_in_sign_in {
+                Unchecked::Taken
+            } else {
+                Unchecked::Refused
+            },
         ));
         let domain: Arc<str> = Arc::from(domain);
         let listener = TcpListener::bind(serve.listen)
