@@ -253,3 +253,127 @@ esac"#;
         mirror.requests()
     );
 }
+
+/// A folder of three scripts, `postgres`, `initdb` and `pg_ctl`, each
+/// running the harness's own program of that name, `postgres` saying this
+/// version line when asked: a distribution's Postgres, as Homebrew's.
+fn distribution(local: &Local, name: &str, version_line: &str) -> std::path::PathBuf {
+    let real = blackbox::local::local_postgres_bin();
+    let postgres = format!(
+        "case \"$1\" in\n  --version|-V) echo \"{version_line}\" ;;\n  *) exec \"{real}/postgres\" \"$@\" ;;\nesac"
+    );
+    let initdb = format!("exec \"{real}/initdb\" \"$@\"");
+    let pg_ctl = format!("exec \"{real}/pg_ctl\" \"$@\"");
+    stand_ins(
+        &local.machine.root().join(name),
+        &[
+            ("postgres", postgres.as_str()),
+            ("initdb", initdb.as_str()),
+            ("pg_ctl", pg_ctl.as_str()),
+        ],
+    )
+}
+
+/// The number the harness's own Postgres gives after `(PostgreSQL)`.
+fn real_version() -> String {
+    let out = std::process::Command::new(
+        Path::new(&blackbox::local::local_postgres_bin()).join("postgres"),
+    )
+    .arg("--version")
+    .output()
+    .unwrap();
+    let line = String::from_utf8(out.stdout).unwrap();
+    line.split("(PostgreSQL)")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .unwrap_or_else(|| panic!("the harness's own check: a version line, got {line:?}"))
+        .to_owned()
+}
+
+#[test]
+fn a_distributions_version_line_is_read_up_to_the_number() {
+    let mirror = Mirror::start(Serving::Archive);
+    let probe = Local::new();
+    let line = format!("postgres (PostgreSQL) {} (Homebrew)", real_version());
+    let bin = distribution(&probe, "homebrew", &line);
+    let local = Local::new()
+        .with_bin(bin.to_str().unwrap())
+        .with_mirror(&mirror.base_url());
+    let project = local_project(&local.machine, "pg-homebrew", &[]);
+    page_ok(&local, &project.dir);
+    assert!(
+        mirror.requests().is_empty(),
+        "expected the Builder's Postgres used, nothing downloaded"
+    );
+}
+
+#[test]
+fn a_distributions_postgres_15_is_postgres_unavailable_naming_15() {
+    let mirror = Mirror::start(Serving::Archive);
+    let probe = Local::new();
+    let bin = distribution(
+        &probe,
+        "homebrew-15",
+        "postgres (PostgreSQL) 15.4 (Homebrew)",
+    );
+    let local = Local::new()
+        .with_bin(bin.to_str().unwrap())
+        .with_mirror(&mirror.base_url());
+    let project = local_project(&local.machine, "pg-homebrew-15", &[]);
+    let message = local
+        .request(&project.dir, "/", OUTSIDER, &[])
+        .json_error(1, "postgres-unavailable");
+    assert!(
+        message.contains("15"),
+        "expected the message to name the version found, 15, got {message:?}"
+    );
+    assert!(mirror.requests().is_empty());
+}
+
+/// Sets the modification time of `path` (a file or a folder) to `ago`
+/// before now.
+fn age(path: &Path, ago: std::time::Duration) {
+    let when = std::time::SystemTime::now() - ago;
+    std::fs::File::open(path)
+        .unwrap()
+        .set_modified(when)
+        .unwrap();
+}
+
+#[test]
+fn what_a_killed_download_left_is_removed_once_it_is_old_and_a_young_one_is_left() {
+    use std::os::unix::fs::PermissionsExt;
+    let mirror = Mirror::start(Serving::Archive);
+    let local = Local::new().without_bin().with_mirror(&mirror.base_url());
+    let project = local_project(&local.machine, "pg-leftovers", &[]);
+    let folder = local.postgres_folder();
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let old_part = folder.join(".download-0000000000000000.jar");
+    std::fs::write(&old_part, b"part of an archive").unwrap();
+    let old_unpacking = folder.join(".unpacking-0000000000000000");
+    std::fs::create_dir_all(old_unpacking.join("bin")).unwrap();
+    std::fs::write(old_unpacking.join("bin/half"), b"half unpacked").unwrap();
+    let hour = std::time::Duration::from_secs(3600);
+    age(&old_part, hour);
+    age(&old_unpacking.join("bin/half"), hour);
+    age(&old_unpacking.join("bin"), hour);
+    age(&old_unpacking, hour);
+    let young_part = folder.join(".download-1111111111111111.jar");
+    std::fs::write(&young_part, b"another command's, at work").unwrap();
+
+    page_ok(&local, &project.dir);
+    assert_eq!(
+        mirror.requests(),
+        vec![archive_path()],
+        "the harness's own check: the run downloaded"
+    );
+    assert!(
+        !old_part.exists() && !old_unpacking.exists(),
+        "expected what a killed download left an hour ago removed"
+    );
+    assert!(
+        young_part.exists(),
+        "expected a part made just now left: it may be another command's, at work"
+    );
+}

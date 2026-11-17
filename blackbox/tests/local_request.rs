@@ -342,8 +342,14 @@ fn headers_are_by_lower_case_name_with_their_values_in_order() {
     let requested = board.request_ok("/headers", BUILDER, &[]);
     assert_eq!(
         requested.body["headers"]["x-many"],
-        json!(["1", "2"]),
-        "{}",
+        json!(["1, 2"]),
+        "expected a name the code appended twice as one value, joined with `, `, as the platform sends it\n{}",
+        requested.describe()
+    );
+    assert_eq!(
+        requested.body["headers"]["set-cookie"],
+        json!(["first=1; Path=/", "second=2, with a comma; Path=/"]),
+        "expected each set-cookie a value of its own, in order\n{}",
         requested.describe()
     );
     assert_eq!(
@@ -435,5 +441,44 @@ fn path_is_the_path_as_it_was_given_with_its_query() {
         json!("?a=1&b=two%20words&a=3"),
         "expected the Application given the query as it was\n{}",
         requested.describe()
+    );
+}
+
+#[test]
+fn a_project_larger_than_an_installation_takes_is_too_large_in_the_local_runs_words() {
+    let local = Local::new();
+    let project = local_project(&local.machine, "large-board", &[]);
+    // 17 MiB of text no compression shortens much, in one string literal
+    // the handler uses, so that the bundle holds it.
+    let mut text = String::with_capacity(17 * 1024 * 1024);
+    let mut state: u64 = 0x2545_f491_4f6c_dd1d;
+    const LETTERS: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    while text.len() < 17 * 1024 * 1024 {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        let at = usize::try_from(state % 62).unwrap();
+        text.push(char::from(LETTERS[at]));
+    }
+    project.write("src/big.ts", &format!("export const BIG = \"{text}\";\n"));
+    let index = std::fs::read_to_string(project.dir.join("src/index.ts")).unwrap();
+    project.write(
+        "src/index.ts",
+        &format!("import {{ BIG }} from \"./big.ts\";\nconsole.log(BIG.length);\n{index}"),
+    );
+    let run = local.request(&project.dir, "/", OUTSIDER, &[]);
+    let message = run.json_error(1, "too-large");
+    assert!(
+        message.contains("vm request"),
+        "expected the message in the local run's words, naming vm request, got {message:?}"
+    );
+    assert!(
+        !message.contains("vm deploy") && !message.contains("sent"),
+        "expected nothing of a deploy or of sending in the local run's message, got {message:?}"
+    );
+    let left = local.processes_after(std::time::Duration::from_secs(5));
+    assert!(
+        left.is_empty(),
+        "expected nothing left running, found {left:#?}"
     );
 }

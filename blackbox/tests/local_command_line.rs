@@ -73,11 +73,80 @@ fn the_method_is_get_without_a_body_and_post_with_one_and_any_token_is_taken() {
         &["--method", "PATCH", "--data", "x"],
     );
     assert_eq!(echoed(&patch)["method"], json!("PATCH"));
+    let put = local.request_ok(
+        &project.dir,
+        "/echo",
+        OUTSIDER,
+        &["--method", "PUT", "--data", "put body"],
+    );
+    let got = echoed(&put);
+    assert_eq!(got["method"], json!("PUT"), "{}", put.describe());
+    assert_eq!(got["body"], json!("put body"));
+    for method in ["DELETE", "OPTIONS"] {
+        let sent = local.request_ok(&project.dir, "/echo", OUTSIDER, &["--method", method]);
+        assert_eq!(
+            echoed(&sent)["method"],
+            json!(method),
+            "expected {method} handed to the Application\n{}",
+            sent.describe()
+        );
+    }
+}
+
+#[test]
+fn head_reaches_the_application_and_no_body_is_printed() {
+    let local = Local::new();
+    let project = echo_project(&local);
+    // HEAD reaches the Application (its JSON's content type comes back);
+    // no body is printed: a response to HEAD has none, as deployed.
+    let head = local.request_ok(&project.dir, "/echo", OUTSIDER, &["--method", "HEAD"]);
+    assert_eq!(head.status(), 200, "{}", head.describe());
+    assert_eq!(head.body["method"], json!("HEAD"));
+    assert_eq!(
+        head.body["body"],
+        json!(""),
+        "expected no body for HEAD\n{}",
+        head.describe()
+    );
+    assert!(
+        head.body["headers"]["content-type"]
+            .to_string()
+            .contains("application/json"),
+        "expected the Application's own response to HEAD\n{}",
+        head.describe()
+    );
+}
+
+#[test]
+fn a_method_the_platform_does_not_hand_on_gets_the_platforms_own_405() {
+    let local = Local::new();
+    let project = echo_project(&local);
     let purge = local.request_ok(&project.dir, "/echo", OUTSIDER, &["--method", "PURGE"]);
     assert_eq!(
-        echoed(&purge)["method"],
-        json!("PURGE"),
-        "expected any token taken as the method"
+        purge.status(),
+        405,
+        "expected the token taken by the tool and the platform's own 405 printed, exit code 0\n{}",
+        purge.describe()
+    );
+    assert_eq!(purge.body["method"], json!("PURGE"));
+    for (field, what) in [
+        ("printed", "nothing printed: the code never loaded"),
+        ("uncaught", "no uncaught error"),
+        ("operations", "no operation"),
+    ] {
+        assert_eq!(
+            purge.body[field],
+            json!([]),
+            "expected {what}\n{}",
+            purge.describe()
+        );
+    }
+    assert!(
+        purge.body["body"]
+            .as_str()
+            .is_none_or(|b| !b.contains("\"method\"")),
+        "expected not the Application's echo\n{}",
+        purge.describe()
     );
 }
 
@@ -120,6 +189,25 @@ fn headers_may_be_given_several_times_and_a_data_file_is_sent_as_it_is() {
         "expected the file's bytes as the body"
     );
     assert_eq!(got["method"], json!("POST"));
+}
+
+#[test]
+fn a_data_file_that_is_not_there_is_data_file_naming_it() {
+    let local = Local::new();
+    let project = echo_project(&local);
+    let missing = local.machine.root().join("no-such-body.txt");
+    let message = local
+        .request(
+            &project.dir,
+            "/echo",
+            OUTSIDER,
+            &["--data-file", missing.to_str().unwrap()],
+        )
+        .json_error(1, "data-file");
+    assert!(
+        message.contains("no-such-body.txt"),
+        "expected the message to name the file, got {message:?}"
+    );
 }
 
 #[test]

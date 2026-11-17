@@ -1041,6 +1041,8 @@ export default defineApp(manifest, {{
         headers.append("x-many", "1");
         headers.append("x-many", "2");
         headers.set("X-One", "a");
+        headers.append("set-cookie", "first=1; Path=/");
+        headers.append("set-cookie", "second=2, with a comma; Path=/");
         return new Response("headers", {{ headers }});
       }}
       case "/echo": {{

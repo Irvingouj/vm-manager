@@ -127,7 +127,7 @@ SELECT n.nspname || '.' || c.relname, a.attname, format_type(a.atttypid, a.attty
  WHERE c.relkind IN ('r', 'p', 'v', 'm') AND NOT c.relispartition
    AND n.nspname NOT LIKE 'pg\_%' AND n.nspname <> 'information_schema'
    AND a.attnum > 0 AND NOT a.attisdropped
- ORDER BY 1 COLLATE "C", a.attnum"#;
+ ORDER BY (n.nspname || '.' || c.relname) COLLATE "C", a.attnum"#;
 
 /// The kind of each relation of [`COLUMNS`]: `r`, `p`, `v` or `m`.
 const KINDS: &str = r#"
@@ -135,13 +135,13 @@ SELECT n.nspname || '.' || c.relname, c.relkind::text
   FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
  WHERE c.relkind IN ('r', 'p', 'v', 'm') AND NOT c.relispartition
    AND n.nspname NOT LIKE 'pg\_%' AND n.nspname <> 'information_schema'
- ORDER BY 1 COLLATE "C""#;
+ ORDER BY (n.nspname || '.' || c.relname) COLLATE "C""#;
 
 /// Every enum with its labels in order.
 const ENUMS: &str = r#"
 SELECT n.nspname || '.' || t.typname, string_agg(e.enumlabel, ',' ORDER BY e.enumsortorder)
   FROM pg_enum e JOIN pg_type t ON t.oid = e.enumtypid JOIN pg_namespace n ON n.oid = t.typnamespace
- GROUP BY 1 ORDER BY 1 COLLATE "C""#;
+ GROUP BY 1 ORDER BY (n.nspname || '.' || t.typname) COLLATE "C""#;
 
 /// Every default and generation expression of a relation that is no
 /// partition.
@@ -152,7 +152,7 @@ SELECT n.nspname || '.' || c.relname, a.attname, pg_get_expr(d.adbin, d.adrelid)
   JOIN pg_namespace n ON n.oid = c.relnamespace
   JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum
  WHERE NOT c.relispartition AND n.nspname NOT LIKE 'pg\_%'
- ORDER BY 1 COLLATE "C", 2 COLLATE "C""#;
+ ORDER BY (n.nspname || '.' || c.relname) COLLATE "C", a.attname::text COLLATE "C""#;
 
 /// Every primary key, unique constraint and foreign key of a relation that
 /// is no partition, without its name: (relation, kind, definition).
@@ -162,7 +162,7 @@ SELECT n.nspname || '.' || c.relname, k.contype::text, pg_get_constraintdef(k.oi
   JOIN pg_class c ON c.oid = k.conrelid
   JOIN pg_namespace n ON n.oid = c.relnamespace
  WHERE k.contype IN ('p', 'u', 'f') AND NOT c.relispartition AND n.nspname NOT LIKE 'pg\_%'
- ORDER BY 1 COLLATE "C", 2, 3 COLLATE "C""#;
+ ORDER BY (n.nspname || '.' || c.relname) COLLATE "C", k.contype, pg_get_constraintdef(k.oid) COLLATE "C""#;
 
 fn rows(sql: &Sql, query: &str) -> Vec<Vec<String>> {
     sql.batch(query)
@@ -217,11 +217,17 @@ fn the_statements_are_one_kind_after_another_in_the_stated_order() {
         last = rank;
     }
     let count = |r: u8| statements.iter().filter(|s| rank(s) == Some(r)).count();
-    // 20 relations listed (the tables, the views, the materialized views and
-    // the partitioned table; no partition), as many tables.
+    // As many tables as the shared database has relations listed (tables,
+    // views, materialized views, partitioned tables; no partition), counted
+    // from its catalog.
+    let listed = rows(&stock.db().superuser(), KINDS).len();
+    assert!(
+        listed >= 20,
+        "the harness's own check: the fixture's 20 relations at least, got {listed}"
+    );
     assert_eq!(
         count(2),
-        20,
+        listed,
         "expected one CREATE TABLE for each table, view, materialized view and partitioned table listed, and none for a partition\n{}",
         statements.join(";\n")
     );

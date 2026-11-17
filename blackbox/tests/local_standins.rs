@@ -284,3 +284,47 @@ fn with_a_write_grant_a_write_lands_in_the_standin_and_never_in_the_shared_datab
     let outsider = board.request_ok("/add-incident", OUTSIDER, &["--data", "x"]);
     assert_eq!(refusal_of(&outsider)["reason"], json!("no-grant"));
 }
+
+#[test]
+fn the_standin_of_a_resource_no_longer_pulled_is_removed_by_the_next_run() {
+    let board = Board::start("read", "read");
+    let first = board.request_ok("/columns", BUILDER, &[]);
+    assert_eq!(
+        first.body["standins"],
+        json!([{ "resource": DEVOPS, "made": true }]),
+        "{}",
+        first.describe()
+    );
+    // While it is pulled and unchanged, it is kept.
+    let kept = board.request_ok("/columns", BUILDER, &[]);
+    assert_eq!(
+        kept.body["standins"],
+        json!([{ "resource": DEVOPS, "made": false }]),
+        "the harness's own check: an unchanged stand-in is kept"
+    );
+    // The code stops importing the pulled definition, and its folder goes.
+    board
+        .project
+        .write("src/index.ts", &blackbox::local::handler(false, false));
+    fs::remove_dir_all(board.dir().join("resources/devops")).unwrap();
+    let without = board.request_ok("/", BUILDER, &[]);
+    assert_eq!(
+        without.body["standins"],
+        json!([]),
+        "expected no stand-in of a Resource no longer pulled\n{}",
+        without.describe()
+    );
+    // Pulled again with the same structure: had the stand-in been kept, it
+    // would be used as it was; removed, it is made anew.
+    board.local.pull_ok(board.dir(), DEVOPS);
+    board
+        .project
+        .write("src/index.ts", &blackbox::local::handler(true, false));
+    let again = board.request_ok("/columns", BUILDER, &[]);
+    assert_eq!(
+        again.body["standins"],
+        json!([{ "resource": DEVOPS, "made": true }]),
+        "expected the stand-in removed when its folder was, and so made anew once pulled again\n{}",
+        again.describe()
+    );
+}
