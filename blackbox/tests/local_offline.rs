@@ -199,6 +199,30 @@ fn ok_json_of(out: &std::path::Path, name: &str) -> Value {
         .unwrap_or_else(|e| panic!("`{name}` printed no JSON ({e}): {stdout}"))
 }
 
+/// The command that makes the namespace, run with `true` in place of the
+/// commands: `unshare -rn sh -c 'ip link set lo up && exec unshare -U
+/// --map-user=<uid> --map-group=<gid> true'`. Fails the test, saying why,
+/// when this machine does not let a user do so.
+fn assert_namespaces_allowed(uid: u32, gid: u32) {
+    let mut command = Command::new("unshare");
+    command.arg("-rn").arg("sh").arg("-c").arg(format!(
+        "ip link set lo up && exec unshare -U --map-user={uid} --map-group={gid} true"
+    ));
+    let finished = run_to_exit(command, Duration::from_secs(30));
+    let why = match finished {
+        Ok(f) if f.status.is_some_and(|s| s.success()) => return,
+        Ok(f) => format!("it ended with {}: {}", f.status_text(), f.stderr.trim()),
+        Err(e) => e,
+    };
+    panic!(
+        "this test needs a network namespace with only the loopback interface, made by the user \
+         without administrator rights (`unshare -rn sh -c 'ip link set lo up && exec unshare -U \
+         --map-user={uid} --map-group={gid} true'`: util-linux's unshare, iproute2's ip, and \
+         unprivileged user namespaces allowed, e.g. kernel.unprivileged_userns_clone=1 and no \
+         AppArmor restriction on them); on this machine {why}"
+    );
+}
+
 #[test]
 fn with_no_network_but_the_loopback_the_local_commands_and_vm_dev_work() {
     let board = Board::start("read", "read");
@@ -211,6 +235,7 @@ fn with_no_network_but_the_loopback_the_local_commands_and_vm_dev_work() {
     fs::write(&script, SCRIPT).unwrap();
     let port = free_port();
     let meta = fs::metadata(local.machine.root()).unwrap();
+    assert_namespaces_allowed(meta.uid(), meta.gid());
     let mut command = Command::new("unshare");
     command
         .arg("-rn")

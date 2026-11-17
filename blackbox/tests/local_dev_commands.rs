@@ -20,7 +20,7 @@ use std::fs;
 use std::net::{Ipv4Addr, TcpListener};
 use std::time::Duration;
 
-use blackbox::dev::{Dev, local_files_holding, random_looking_runs};
+use blackbox::dev::{Dev, hex64_runs, local_files_but_postgres, local_files_holding};
 use blackbox::generate::{Generated, generate};
 use blackbox::local::{APP, BUILDER, Board, OUTSIDER, Requested, handler, port_open};
 use blackbox::project::{NOTES_SCHEMA_TS, is_running};
@@ -72,8 +72,8 @@ fn vm_request_is_answered_by_it_as_the_user_as_names_whatever_the_browser_chose(
     assert_eq!(requested.operations().len(), 1, "{}", requested.describe());
     assert_eq!(
         requested.body["standins"],
-        json!([]),
-        "expected `standins` empty: the request caused no rebuild"
+        json!([{ "resource": "devops", "made": false }]),
+        "expected every pulled Resource in `standins`, `made` false: the request caused no rebuild"
     );
     assert_eq!(requested.body["migrations_applied"], json!([]));
     assert_eq!(requested.test_rows(), json!([]));
@@ -255,19 +255,20 @@ fn the_file_that_finds_it_is_0600_and_its_secret_is_in_no_output_log_or_page() {
             file.display()
         );
     }
-    let known: Vec<String> = [
-        board.dir().to_string_lossy().into_owned(),
-        board.local.machine.root().to_string_lossy().into_owned(),
-    ]
-    .to_vec();
-    let secrets: Vec<String> = found
+    let holding_port: Vec<String> = found
         .iter()
-        .flat_map(|f| random_looking_runs(&fs::read(f).unwrap(), &known))
+        .flat_map(|f| hex64_runs(&fs::read(f).unwrap()))
         .collect();
     assert!(
-        !secrets.is_empty(),
-        "expected a secret made from the system's randomness in {found:?}: the harness looks for a run of 16 or more letters and digits"
+        !holding_port.is_empty(),
+        "expected a secret of 64 lower-case hex digits in the file that holds the port, {found:?}"
     );
+    // Every such run of the files of .vm/local/ but Postgres's own: the
+    // secret, and the private Postgres's passwords when written so.
+    let secrets: Vec<String> = local_files_but_postgres(board.dir(), &postgres.data)
+        .iter()
+        .flat_map(|f| hex64_runs(&fs::read(f).unwrap()))
+        .collect();
     // What a run shows: pages, answers, `vm request`, the records.
     let mut seen: Vec<(String, String)> = Vec::new();
     let mut browser = dev.browser();

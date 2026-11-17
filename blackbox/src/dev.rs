@@ -582,19 +582,31 @@ pub fn local_files_holding(dir: &Path, data: Option<&Path>, needle: &[u8]) -> Ve
         .collect()
 }
 
-/// The runs of at least 16 characters of `A-Z a-z 0-9 - _ + / =` in
-/// `bytes` that hold a letter and a digit and are not inside any of
-/// `known` (paths the harness made, say): what a secret written as text
-/// looks like.
-pub fn random_looking_runs(bytes: &[u8], known: &[String]) -> Vec<String> {
+/// The runs of exactly 64 lower-case hex digits in `bytes` (a run of more
+/// is not one): what the secret of the file that finds `vm dev` is, and
+/// what a password written the same way would be.
+pub fn hex64_runs(bytes: &[u8]) -> Vec<String> {
     bytes
-        .split(|b| !(b.is_ascii_alphanumeric() || b"-_+/=".contains(b)))
-        .filter(|run| run.len() >= 16)
+        .split(|b| !b.is_ascii_hexdigit())
+        .filter(|run| run.len() == 64 && run.iter().all(|b| !b.is_ascii_uppercase()))
         .map(|run| String::from_utf8_lossy(run).into_owned())
-        .filter(|run| {
-            run.chars().any(|c| c.is_ascii_digit())
-                && run.chars().any(|c| c.is_ascii_alphabetic())
-                && !known.iter().any(|k| k.contains(run.as_str()))
+        .collect()
+}
+
+/// Every file of `.vm/local/` of the project in `dir` but those of its
+/// Postgres (inside `data`, and `postgres.log`) and `vm.log`.
+pub fn local_files_but_postgres(dir: &Path, data: &Path) -> Vec<PathBuf> {
+    let data = fs::canonicalize(data).ok();
+    let mut files = Vec::new();
+    crate::local::every_file(&dir.join(".vm").join("local"), &mut files);
+    files
+        .into_iter()
+        .filter(|f| {
+            let name = f.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+            let inside_data = data
+                .as_ref()
+                .is_some_and(|d| fs::canonicalize(f).is_ok_and(|c| c.starts_with(d)));
+            !inside_data && name != "vm.log" && name != "postgres.log"
         })
         .collect()
 }
@@ -679,9 +691,13 @@ mod tests {
     }
 
     #[test]
-    fn a_secret_looking_run_is_found_and_a_known_path_is_not() {
-        let file = b"{\"port\":7480,\"secret\":\"Q2xhdWRlIHdhcyBoZXJlIDEyMzQ1\",\"dir\":\"/tmp/new-board-abc123def456ghi789\"}";
-        let runs = random_looking_runs(file, &["/tmp/new-board-abc123def456ghi789".to_owned()]);
-        assert_eq!(runs, ["Q2xhdWRlIHdhcyBoZXJlIDEyMzQ1"]);
+    fn a_run_of_64_hex_digits_is_found_and_a_longer_or_upper_case_one_is_not() {
+        let secret = "0123456789abcdef".repeat(4);
+        let longer = format!("{secret}0");
+        let upper = secret.to_uppercase();
+        let file = format!(
+            "{{\"port\":7480,\"secret\":\"{secret}\",\"x\":\"{longer}\",\"y\":\"{upper}\"}}"
+        );
+        assert_eq!(hex64_runs(file.as_bytes()), [secret]);
     }
 }

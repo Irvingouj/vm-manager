@@ -72,6 +72,21 @@ fn a_change_of_the_code_is_served_at_the_next_request_and_said_in_a_rebuilt_line
     let mut browser = dev.browser();
     browser.choose(OUTSIDER);
     assert_eq!(browser.get("/").json(), json!({ "user": OUTSIDER }));
+    let said = dev.events("too-many-files");
+    assert_eq!(
+        said.len(),
+        1,
+        "expected `vm dev` to say once, when it starts, that the project has too many files\n{}",
+        dev.stdout()
+    );
+    assert_eq!(sorted_keys(&said[0]), ["event", "message"], "{}", said[0]);
+    assert!(
+        said[0]["message"]
+            .as_str()
+            .is_some_and(|m| !m.trim().is_empty()),
+        "{}",
+        said[0]
+    );
     change_code(&project, DEFAULT_ANSWER, CHANGED_ANSWER);
     let after = browser.get("/");
     assert_eq!(
@@ -345,6 +360,21 @@ fn a_project_of_more_than_20000_entries_is_rebuilt_only_when_started_again() {
     let mut browser = dev.browser();
     browser.choose(OUTSIDER);
     assert_eq!(browser.get("/").json(), json!({ "user": OUTSIDER }));
+    let said = dev.events("too-many-files");
+    assert_eq!(
+        said.len(),
+        1,
+        "expected `vm dev` to say once, when it starts, that the project has too many files\n{}",
+        dev.stdout()
+    );
+    assert_eq!(sorted_keys(&said[0]), ["event", "message"], "{}", said[0]);
+    assert!(
+        said[0]["message"]
+            .as_str()
+            .is_some_and(|m| !m.trim().is_empty()),
+        "{}",
+        said[0]
+    );
     change_code(&project, DEFAULT_ANSWER, CHANGED_ANSWER);
     assert_eq!(
         browser.get("/").json(),
@@ -352,6 +382,12 @@ fn a_project_of_more_than_20000_entries_is_rebuilt_only_when_started_again() {
         "expected a project of more than 20,000 entries not looked at again while it runs"
     );
     assert_eq!(dev.events("rebuilt"), Vec::<Value>::new());
+    assert_eq!(
+        dev.events("too-many-files").len(),
+        1,
+        "expected it said once only\n{}",
+        dev.stdout()
+    );
     dev.stop("INT").expect_code(0);
     let again = Dev::start(&local, &project.dir, NAME);
     let mut browser = again.browser();

@@ -21,6 +21,7 @@
 )]
 
 use std::fs;
+use std::time::Duration;
 
 use blackbox::User;
 use blackbox::deploy::{Deployed, commit_all, deploy, init_repository};
@@ -63,15 +64,18 @@ fn note_bodies(dev: &Dev) -> Vec<String> {
         .collect()
 }
 
-/// The `Location` of a redirect, without `http://<host>` when it has it.
-fn location_path(response: &Response, host: &str) -> String {
+/// The `Location` of a `303`, which must be a path: it begins with one `/`
+/// and is not an absolute address.
+fn location_path(response: &Response) -> String {
     let location = response
         .header("location")
         .unwrap_or_else(|| panic!("expected a Location\n{}", response.describe()));
-    location
-        .strip_prefix(&format!("http://{host}"))
-        .unwrap_or(location)
-        .to_owned()
+    assert!(
+        location.starts_with('/') && !location.starts_with("//") && !location.contains("://"),
+        "expected the Location a path, not an absolute address, got {location:?}\n{}",
+        response.describe()
+    );
+    location.to_owned()
 }
 
 #[test]
@@ -345,16 +349,11 @@ fn choosing_sets_the_cookie_and_sends_the_browser_to_a_local_next_only() {
     let local = Local::new();
     let project = notes_project(&local);
     let dev = Dev::start(&local, &project.dir, NAME);
-    let host = dev.host();
     let mut browser = dev.browser();
     let origin = browser.origin();
     let response = browser.post_form("/_vm/test-user", &[("user", OUTSIDER)], Some(&origin));
     assert_eq!(response.status, 303, "{}", response.describe());
-    assert_eq!(
-        location_path(&response, &host),
-        "/",
-        "expected / without next"
-    );
+    assert_eq!(location_path(&response), "/", "expected / without next");
     let cookies = response.headers_named("set-cookie");
     let cookie = cookies
         .iter()
@@ -393,7 +392,7 @@ fn choosing_sets_the_cookie_and_sends_the_browser_to_a_local_next_only() {
             response.describe()
         );
         assert_eq!(
-            location_path(&response, &host),
+            location_path(&response),
             expected,
             "next {next:?}: expected the browser sent to {expected:?}\n{}",
             response.describe()
@@ -442,6 +441,14 @@ fn a_user_not_in_the_file_is_400_with_the_page_and_another_sites_origin_is_403()
         );
         assert_eq!(browser.cookie("vm_test_user"), None, "Origin {other}");
     }
+    let without = browser.post_form("/_vm/test-user", &[("user", OUTSIDER)], None);
+    assert_eq!(
+        without.status,
+        303,
+        "expected a POST without Origin taken\n{}",
+        without.describe()
+    );
+    assert_eq!(browser.cookie("vm_test_user").as_deref(), Some(OUTSIDER));
     let same = browser.post_form("/_vm/test-user", &[("user", OUTSIDER)], Some(&origin));
     assert_eq!(
         same.status,
@@ -457,14 +464,17 @@ fn with_no_user_chosen_a_page_is_sent_to_the_choice_and_anything_else_is_401() {
     let local = Local::new();
     let project = notes_project(&local);
     let dev = Dev::start(&local, &project.dir, NAME);
-    let host = dev.host();
     let mut browser = dev.browser();
     let target = "/notes?a=1&b=two%20words";
     for method in ["GET", "HEAD"] {
         let request = browser.build(method, target);
         let response = browser.send(&request);
         assert_eq!(response.status, 303, "{method}\n{}", response.describe());
-        let location = location_path(&response, &host);
+        let location = location_path(&response);
+        assert_eq!(
+            location, "/_vm/test-user?next=/notes%3Fa%3D1%26b%3Dtwo%2520words",
+            "{method}: expected next with every byte but letters, digits, -._~ and / percent-encoded"
+        );
         let next = location
             .strip_prefix("/_vm/test-user?next=")
             .unwrap_or_else(|| {
@@ -572,11 +582,14 @@ fn the_application_is_given_the_users_id_and_groups_as_the_file_has_them_now() {
 }
 
 #[test]
-fn an_id_with_markup_and_quotes_is_escaped_on_the_page_and_chosen_through_a_percent_encoded_cookie()
-{
+fn an_id_with_markup_quotes_a_percent_and_a_semicolon_is_escaped_on_the_page_and_percent_encoded_in_the_cookie()
+ {
     let local = Local::new();
     let project = notes_project(&local);
-    let id = "eve <i>\"x\"</i> é; y=1";
+    let id = "eve <i>\"x\"</i> 100%; é";
+    // Every byte but letters, digits, `-`, `.`, `_` and `~` encoded.
+    let encoded = "eve%20%3Ci%3E%22x%22%3C%2Fi%3E%20100%25%3B%20%C3%A9";
+    assert_eq!(percent_encode(id), encoded, "the harness's own check");
     let mut file = dev_json(&project.dir);
     file["users"]
         .as_array_mut()
@@ -605,16 +618,9 @@ fn an_id_with_markup_and_quotes_is_escaped_on_the_page_and_chosen_through_a_perc
         .next()
         .unwrap()
         .trim_start_matches("vm_test_user=");
-    assert!(
-        value
-            .bytes()
-            .all(|b| b.is_ascii_graphic() && !b"\";,\\ ".contains(&b)),
-        "expected the id percent-encoded in the cookie, got {value:?}"
-    );
     assert_eq!(
-        percent_decode(value, false).as_deref(),
-        Some(id),
-        "expected the cookie to decode to the id"
+        value, encoded,
+        "expected the id percent-encoded, every byte but letters, digits, -._~"
     );
     assert_eq!(browser.get("/me").json(), json!({ "id": id, "groups": [] }));
     // The same cookie written by hand, encoded by the harness.
@@ -672,7 +678,7 @@ fn switching_user_changes_what_the_application_shows() {
         "expected the choice first\n{}",
         first.describe()
     );
-    let next = location_path(&first, &dev.host());
+    let next = location_path(&first);
     let page = browser.get(&next);
     assert_eq!(page.status, 200, "{}", page.describe());
     let origin = browser.origin();
@@ -681,7 +687,7 @@ fn switching_user_changes_what_the_application_shows() {
         &[("user", BUILDER), ("next", "/incidents")],
         Some(&origin),
     );
-    assert_eq!(location_path(&chosen, &dev.host()), "/incidents");
+    assert_eq!(location_path(&chosen), "/incidents");
     let as_builder = browser.get("/incidents");
     assert_eq!(as_builder.status, 200, "{}", as_builder.describe());
     assert_eq!(
@@ -733,4 +739,45 @@ fn on_an_installation_vm_test_user_is_a_path_like_any_other_given_to_the_code() 
         "expected no choosing of a test User on an installation"
     );
     assert!(posted.header("set-cookie").is_none());
+}
+
+#[test]
+fn only_requests_given_to_the_applications_code_have_a_request_line() {
+    let local = Local::new();
+    let project = notes_project(&local);
+    let dev = Dev::start(&local, &project.dir, NAME);
+    let port = dev.port;
+    // No User chosen: a page sent to the choice, anything else 401.
+    let mut browser = dev.browser();
+    assert_eq!(browser.get("/notes").status, 303);
+    let mut api = dev.browser();
+    api.accept = "application/json".to_owned();
+    assert_eq!(api.get("/notes").status, 401);
+    // The page, and choosing.
+    assert_eq!(browser.get("/_vm/test-user").status, 200);
+    browser.choose(OUTSIDER);
+    // A 307, a 421, a 404 under /_vm/.
+    let mut loopback = Browser::new(dev.address(), &format!("127.0.0.1:{port}"));
+    loopback.set_cookie("vm_test_user", OUTSIDER);
+    assert_eq!(loopback.get("/notes").status, 307);
+    let mut other = Browser::new(dev.address(), &format!("evil.example:{port}"));
+    other.set_cookie("vm_test_user", OUTSIDER);
+    assert_eq!(other.get("/notes").status, 421);
+    assert_eq!(browser.get("/_vm/nothing-here").status, 404);
+    // One the code is given.
+    let served = browser.get("/notes");
+    assert_eq!(served.status, 200, "{}", served.describe());
+    let id = served.request_id();
+    dev.wait_for_line(
+        "the `request` line of /notes",
+        Duration::from_secs(10),
+        |l| l["event"] == "request" && l["request_id"] == id.as_str(),
+    );
+    let lines = dev.events("request");
+    assert_eq!(
+        lines.len(),
+        1,
+        "expected a `request` line only for the request the code was given, got {lines:#?}"
+    );
+    dev.stop("INT").expect_code(0);
 }
