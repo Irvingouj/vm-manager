@@ -249,7 +249,7 @@ impl Request {
 
 impl fmt::Display for Request {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} {}", self.method, self.target)?;
+        write!(f, "{} {}", self.method, mask_values(&self.target))?;
         match &self.host {
             Some(host) => write!(f, " (Host: {})", String::from_utf8_lossy(host))?,
             None => write!(f, " (no Host)")?,
@@ -435,14 +435,14 @@ impl Response {
         let headers: Vec<String> = self
             .headers
             .iter()
-            .map(|(n, v)| format!("  {n}: {v}"))
+            .map(|(n, v)| format!("  {n}: {}", mask_header(n, v)))
             .collect();
-        format!(
+        mask_values(&format!(
             "status {}\n{}\nbody: {}",
             self.status,
             headers.join("\n"),
             self.text()
-        )
+        ))
     }
 }
 
@@ -468,9 +468,167 @@ fn decode_chunked(mut rest: &[u8]) -> Result<Vec<u8>, String> {
     }
 }
 
+/// The names whose values a failure message never shows in full: as a
+/// query or form parameter (`name=value`) or a JSON member
+/// (`"name": "value"`).
+pub const MASKED_NAMES: [&str; 9] = [
+    "grant",
+    "verifier",
+    "sign_in",
+    "code",
+    "state",
+    "credential",
+    "refresh_token",
+    "access_token",
+    "id_token",
+];
+
+fn hidden(value: &str) -> String {
+    format!("<hidden, {} characters>", value.chars().count())
+}
+
+/// A header's value for a failure message: a cookie's value, a
+/// `Set-Cookie`'s value and a bearer are shown by their length.
+pub fn mask_header(name: &str, value: &str) -> String {
+    if name.eq_ignore_ascii_case("cookie") {
+        return value
+            .split(';')
+            .map(|pair| match pair.split_once('=') {
+                Some((n, v)) => format!("{n}={}", hidden(v)),
+                None => pair.to_owned(),
+            })
+            .collect::<Vec<_>>()
+            .join(";");
+    }
+    if name.eq_ignore_ascii_case("set-cookie") {
+        let (first, rest) = value.split_once(';').unwrap_or((value, ""));
+        let first = match first.split_once('=') {
+            Some((n, v)) => format!("{n}={}", hidden(v)),
+            None => first.to_owned(),
+        };
+        return if rest.is_empty() {
+            first
+        } else {
+            format!("{first};{rest}")
+        };
+    }
+    if name.eq_ignore_ascii_case("authorization") {
+        return match value.split_once(' ') {
+            Some((scheme, v)) => format!("{scheme} {}", hidden(v)),
+            None => hidden(value),
+        };
+    }
+    value.to_owned()
+}
+
+/// `text` with the value of every parameter or JSON member named in
+/// [`MASKED_NAMES`], and of every `Bearer`, replaced by its length: for
+/// failure messages, which never show them in full.
+pub fn mask_values(text: &str) -> String {
+    let mut out = text.to_owned();
+    for name in MASKED_NAMES {
+        out = mask_after(
+            &out,
+            &format!("{name}="),
+            |c| c.is_whitespace() || "&\"'<>);,#".contains(c),
+            |before| before.is_none_or(|c| !(c.is_ascii_alphanumeric() || c == '_')),
+        );
+        for quoted in [format!("\"{name}\":\""), format!("\"{name}\": \"")] {
+            out = mask_after(&out, &quoted, |c| c == '"', |_| true);
+        }
+    }
+    for bearer in ["Bearer ", "bearer "] {
+        out = mask_after(
+            &out,
+            bearer,
+            |c| c.is_whitespace() || "\"',".contains(c),
+            |_| true,
+        );
+    }
+    out
+}
+
+/// Replaces what follows each `marker` (where `starts` takes the character
+/// before it) up to the first character `ends` takes with its length.
+fn mask_after(
+    text: &str,
+    marker: &str,
+    ends: impl Fn(char) -> bool,
+    starts: impl Fn(Option<char>) -> bool,
+) -> String {
+    let mut result = String::new();
+    let mut rest = text;
+    while let Some(at) = rest.find(marker) {
+        let (before, from) = rest.split_at(at);
+        result.push_str(before);
+        let after = from.get(marker.len()..).unwrap_or_default();
+        result.push_str(marker);
+        let previous = result
+            .get(..result.len() - marker.len())
+            .and_then(|r| r.chars().last());
+        if !starts(previous) {
+            rest = after;
+            continue;
+        }
+        let run = after
+            .char_indices()
+            .find(|(_, c)| ends(*c))
+            .map_or(after.len(), |(i, _)| i);
+        let value = after.get(..run).unwrap_or_default();
+        if value.starts_with("<hidden, ") || value.is_empty() {
+            rest = after;
+            continue;
+        }
+        result.push_str(&hidden(value));
+        rest = after.get(run..).unwrap_or_default();
+    }
+    result.push_str(rest);
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn values_that_must_not_be_shown_are_shown_by_their_length() {
+        assert_eq!(
+            mask_values("GET /?grant=abcd&port=1 and /cb?code=xy&state=s1 error_code=7"),
+            "GET /?grant=<hidden, 4 characters>&port=1 and /cb?code=<hidden, 2 characters>&state=<hidden, 2 characters> error_code=7"
+        );
+        assert_eq!(
+            mask_values(r#"{"verifier":"abc","grant": "de","sign_in":"x","other":"y"}"#),
+            r#"{"verifier":"<hidden, 3 characters>","grant": "<hidden, 2 characters>","sign_in":"<hidden, 1 characters>","other":"y"}"#
+        );
+        assert_eq!(
+            mask_values("authorization: Bearer vmtc_secret"),
+            "authorization: Bearer <hidden, 11 characters>"
+        );
+        assert_eq!(
+            mask_values(&mask_values("code=abc")),
+            "code=<hidden, 3 characters>"
+        );
+        assert_eq!(
+            mask_header("cookie", "a=12; b=345"),
+            "a=<hidden, 2 characters>; b=<hidden, 3 characters>"
+        );
+        assert_eq!(
+            mask_header("set-cookie", "vm_session=abcdef; Path=/; HttpOnly"),
+            "vm_session=<hidden, 6 characters>; Path=/; HttpOnly"
+        );
+    }
+
+    #[test]
+    fn a_failure_message_of_an_answer_hides_cookies_and_parameters() {
+        let answer = parse(
+            "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:9/?grant=topsecret\r\nSet-Cookie: s=cookievalue; Path=/\r\nContent-Length: 0\r\n\r\n",
+        );
+        let text = answer.describe();
+        assert!(
+            !text.contains("topsecret") && !text.contains("cookievalue"),
+            "{text}"
+        );
+    }
 
     fn parse(raw: &str) -> Response {
         Response::parse_answer(raw.as_bytes(), "a test request".to_owned(), false).unwrap()

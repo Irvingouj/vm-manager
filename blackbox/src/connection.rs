@@ -87,10 +87,11 @@ impl fmt::Debug for SetupCredential {
 }
 
 /// `text` with every run that begins with `vmsc_` or `vmtc_` replaced by
-/// its prefix and its length, and each of `secrets` (when not empty)
-/// replaced by `<hidden>`.
+/// its prefix and its length, each value [`crate::http::mask_values`]
+/// hides hidden, and each of `secrets` (when not empty) replaced by
+/// `<hidden>`.
 pub fn masked(text: &str, secrets: &[&str]) -> String {
-    let mut out = text.to_owned();
+    let mut out = crate::http::mask_values(text);
     for secret in secrets.iter().filter(|s| !s.is_empty()) {
         out = out.replace(secret, "<hidden>");
     }

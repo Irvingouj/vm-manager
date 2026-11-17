@@ -36,6 +36,7 @@ use std::time::{Duration, Instant};
 use blackbox::api::parse_rfc3339;
 use blackbox::browser::{Step, query_param, url};
 use blackbox::connection::{TOOL_PREFIX, hide, masked, shown};
+use blackbox::http::mask_values;
 use blackbox::oidc::Outage;
 use blackbox::project::new_project;
 use blackbox::sessions::{ADA, GRACE, Installation, ada, grace, masked_steps, oidc_options};
@@ -1126,8 +1127,9 @@ fn the_browser_is_never_sent_to_another_host_than_127_0_0_1() {
             shown(&confirmed.response, &[])
         );
         let to = confirmed.location();
-        assert_eq!(to.host_str(), Some("127.0.0.1"), "{extra}: {to}");
-        assert_eq!(to.scheme(), "http", "{extra}: {to}");
+        let shown_to = mask_values(to.as_str());
+        assert_eq!(to.host_str(), Some("127.0.0.1"), "{extra}: {shown_to}");
+        assert_eq!(to.scheme(), "http", "{extra}: {shown_to}");
     }
 }
 
@@ -1751,4 +1753,95 @@ fn the_tool_s_port_answers_404_to_anything_but_get_with_a_grant_and_goes_on_wait
     );
     let printed = ended(running).ok_json();
     assert_eq!(printed["user"], ADA, "{printed}");
+}
+
+/// A value of 43 base64url characters that no sign-in gave: a made-up
+/// grant.
+fn made_up_grant() -> String {
+    Challenge::fresh().challenge
+}
+
+#[test]
+fn a_sign_in_begun_without_a_port_is_not_given_to_a_request_that_carries_a_grant() {
+    let at = installation();
+    let challenge = Challenge::fresh();
+    let code = check_code_of(&challenge.challenge).unwrap();
+    let (mut browser, page) = page_for(&at, ADA, &challenge, None);
+    let confirmed = at.answer_tool_page(&mut browser, &page, Decision::Confirm, Some(&code));
+    assert_eq!(
+        confirmed.response.status,
+        200,
+        "{}",
+        shown(&confirmed.response, &[])
+    );
+    assert!(
+        at.tool_form(&confirmed).is_none(),
+        "the control: the check code is taken and the sign-in confirmed\n{}",
+        shown(&confirmed.response, &[])
+    );
+    let grant = made_up_grant();
+    let with_grant = at.post_tool_sign_in(challenge.verifier(), Some(&grant));
+    assert_not_confirmed(
+        &with_grant,
+        "a sign-in begun without a port, asked with a made-up grant",
+    );
+    assert!(!with_grant.text().contains(TOOL_PREFIX));
+    let without = at.post_tool_sign_in(challenge.verifier(), None);
+    assert_eq!(
+        without.status,
+        201,
+        "the control: the same verifier without a grant takes it\n{}",
+        shown(&without, &[])
+    );
+    assert_eq!(without.json()["user"], ADA);
+}
+
+#[test]
+fn a_made_up_grant_at_the_tool_s_port_does_not_take_a_sign_in_confirmed_elsewhere_without_a_port() {
+    let at = installation();
+    let machine = Machine::new();
+    let opener = BrowserCommand::on(&machine);
+    let (name, value) = opener.env();
+    let running = at.spawn_sign_in(
+        &machine,
+        &["--json", "--timeout", "14"],
+        &[(name, value.as_str())],
+    );
+    let address = opened(&opener, &running);
+    let port = port_of(&address);
+    let challenge = query_param(&address, "challenge").unwrap();
+    let code = check_code_of(&challenge).unwrap();
+    let mut browser = at.browser_as(GRACE);
+    let elsewhere = at.auth_url(&format!("/tool?challenge={challenge}&machine=elsewhere"));
+    let steps = at.walk_tool_to_page(&mut browser, &elsewhere);
+    let confirmed = at.answer_tool_page(
+        &mut browser,
+        steps.last().unwrap(),
+        Decision::Confirm,
+        Some(&code),
+    );
+    assert!(
+        confirmed.response.status == 200 && at.tool_form(&confirmed).is_none(),
+        "the control: Grace's sign-in without a port is confirmed\n{}",
+        shown(&confirmed.response, &[])
+    );
+    // A page in the browser, or anything on the machine, sends the tool's
+    // port a grant it made up.
+    let grant = made_up_grant();
+    let head = head_with_cookie(&format!("/?grant={grant}"), port, 0);
+    let (status, body) = raw_to_tool(port, &head);
+    assert_ne!(
+        status,
+        0,
+        "the tool's port answers\n{}",
+        masked(&body, &[&grant])
+    );
+    let run = ended(running);
+    assert!(
+        !run.stdout.contains(GRACE),
+        "the tool is not signed in as Grace with a made-up grant (its port answered {status}):\n{}",
+        run.describe()
+    );
+    run.json_error(3, "sign-in-not-finished");
+    assert_nothing_kept(&machine, "after a made-up grant at the tool's port");
 }

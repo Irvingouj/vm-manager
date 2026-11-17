@@ -472,7 +472,8 @@ pub fn target_of(url: &Url) -> String {
 
 /// Parses a URL the test wrote, failing the test if it is not one.
 pub fn url(text: &str) -> Url {
-    Url::parse(text).unwrap_or_else(|e| panic!("{text:?} is not a URL: {e}"))
+    Url::parse(text)
+        .unwrap_or_else(|e| panic!("{:?} is not a URL: {e}", crate::http::mask_values(text)))
 }
 
 /// The value of a query parameter of a URL.
@@ -501,14 +502,15 @@ impl Step {
         let location = self.response.header("location").unwrap_or_else(|| {
             panic!(
                 "expected a Location on the answer to {}\n{}",
-                self.url,
+                crate::http::mask_values(self.url.as_str()),
                 self.response.describe()
             )
         });
         self.url.join(location).unwrap_or_else(|e| {
             panic!(
-                "the Location {location:?} on the answer to {} is not a URL: {e}",
-                self.url
+                "the Location {:?} on the answer to {} is not a URL: {e}",
+                crate::http::mask_values(location),
+                crate::http::mask_values(self.url.as_str())
             )
         })
     }
@@ -694,7 +696,14 @@ pub fn describe_steps(steps: &[Step]) -> String {
     steps
         .iter()
         .enumerate()
-        .map(|(i, s)| format!("step {}: GET {}\n{}\n", i + 1, s.url, s.response.describe()))
+        .map(|(i, s)| {
+            format!(
+                "step {}: GET {}\n{}\n",
+                i + 1,
+                crate::http::mask_values(s.url.as_str()),
+                s.response.describe()
+            )
+        })
         .collect()
 }
 

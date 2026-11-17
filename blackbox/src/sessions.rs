@@ -641,7 +641,12 @@ impl Installation {
             .query_pairs()
             .find(|(n, _)| n == "port")
             .and_then(|(_, v)| v.parse::<u16>().ok())
-            .unwrap_or_else(|| panic!("expected a port in the address the tool opened: {opened}"));
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected a port in the address the tool opened: {}",
+                    crate::http::mask_values(&opened)
+                )
+            });
         self.grant_of(&confirmed, port);
         let at_tool = browser.follow(&confirmed);
         let run: Run = hide(&running.wait(Duration::from_secs(30)), &[]);
