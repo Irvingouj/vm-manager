@@ -742,6 +742,25 @@ impl PlatformGateway {
 }
 
 impl PlatformGateway {
+    /// Waits, up to `limit`, for every operation's task under way to end
+    /// (its Operation log entry written): for a caller that reads the log
+    /// right after its request (the local run). Answers whether all ended;
+    /// those still running at `limit` are ended with the set that held
+    /// them.
+    pub async fn drain(&self, limit: Duration) -> bool {
+        let mut taken = {
+            let mut tasks = self
+                .operations
+                .tasks
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            std::mem::take(&mut *tasks)
+        };
+        tokio::time::timeout(limit, async { while taken.join_next().await.is_some() {} })
+            .await
+            .is_ok()
+    }
+
     /// Answers `work`'s refusal now and writes its entry in a task of its
     /// own. Past [`OPERATIONS_AT_ONCE`] the entry is not written, and the
     /// program's log says so.

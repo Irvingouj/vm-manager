@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, Limited};
-use hyper::body::Incoming;
+use hyper::body::Body;
 use hyper::header::{CONTENT_TYPE, HOST, HeaderName, HeaderValue};
 use hyper::{HeaderMap, Request, Response, StatusCode};
 use openworkers_core::{HttpMethod, HttpRequest, RequestBody};
@@ -71,7 +71,14 @@ struct Known<'a> {
 }
 
 impl Ingress {
-    pub async fn handle(&self, request: Request<Incoming>) -> Response<Full<Bytes>> {
+    /// Answers one request: off the wire (`vm serve`, whose body is
+    /// [`hyper::body::Incoming`]) or handed over in the process (the local
+    /// run's).
+    pub async fn handle<B>(&self, request: Request<B>) -> Response<Full<Bytes>>
+    where
+        B: Body<Data = Bytes> + Send,
+        B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
         let id: Arc<str> = uuid::Uuid::new_v4().to_string().into();
         let (mut parts, body) = request.into_parts();
         let known = Known {

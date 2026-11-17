@@ -26,6 +26,19 @@ use tokio_postgres::types::FromSql;
 use crate::platform_db::{DbError, PlatformDatabase, rfc3339};
 use std::sync::Arc;
 
+/// The columns [`entry_of`] reads, in its order.
+macro_rules! ENTRY_COLUMNS {
+    () => {
+        concat!(
+            "id, ",
+            rfc3339!("time"),
+            ", request, user_id, application, version, resource, operation,
+               statement, outcome, reason, error, rows, duration_ms,
+               actor, own_database, transaction_id"
+        )
+    };
+}
+
 /// The longest writing one entry may take; past it the write has failed.
 pub const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -291,12 +304,9 @@ impl OperationLog {
                 client
                     .query(
                         concat!(
-                            "SELECT id, ",
-                            rfc3339!("time"),
-                            ", request, user_id, application, version, resource, operation,
-                               statement, outcome, reason, error, rows, duration_ms,
-                               actor, own_database, transaction_id
-                             FROM (SELECT * FROM operation_log ORDER BY id DESC LIMIT $1) newest
+                            "SELECT ",
+                            ENTRY_COLUMNS!(),
+                            " FROM (SELECT * FROM operation_log ORDER BY id DESC LIMIT $1) newest
                              ORDER BY id"
                         ),
                         &[&limit],
@@ -305,30 +315,55 @@ impl OperationLog {
                     .map_err(DbError::from)
             })
             .await?;
-        let mut entries = Vec::with_capacity(rows.len());
-        for row in &rows {
-            let mut entry = Map::with_capacity(17);
-            entry.insert("id".into(), get::<i64>(row, 0)?.into());
-            entry.insert("time".into(), get::<String>(row, 1)?.into());
-            entry.insert("request".into(), get::<Option<String>>(row, 2)?.into());
-            entry.insert("user".into(), get::<Option<String>>(row, 3)?.into());
-            entry.insert("application".into(), get::<Option<String>>(row, 4)?.into());
-            entry.insert("version".into(), get::<Option<i32>>(row, 5)?.into());
-            entry.insert("resource".into(), get::<Option<String>>(row, 6)?.into());
-            entry.insert("actor".into(), get::<String>(row, 14)?.into());
-            entry.insert("own_database".into(), get::<bool>(row, 15)?.into());
-            entry.insert("operation".into(), get::<String>(row, 7)?.into());
-            entry.insert("statement".into(), get::<Option<String>>(row, 8)?.into());
-            entry.insert("outcome".into(), get::<String>(row, 9)?.into());
-            entry.insert("reason".into(), get::<Option<String>>(row, 10)?.into());
-            entry.insert("error".into(), get::<Option<String>>(row, 11)?.into());
-            entry.insert("rows".into(), get::<Option<i64>>(row, 12)?.into());
-            entry.insert("duration_ms".into(), get::<Option<i64>>(row, 13)?.into());
-            entry.insert("transaction".into(), get::<Option<String>>(row, 16)?.into());
-            entries.push(Value::Object(entry));
-        }
-        Ok(entries)
+        rows.iter().map(entry_of).collect()
     }
+
+    /// The entries of the request `request`, oldest first, as the API
+    /// answers them; at most [`MAX_READ`].
+    pub async fn of_request(&self, request: &str) -> Result<Vec<Value>, DbError> {
+        let limit = i64::from(MAX_READ);
+        let rows = self
+            .database
+            .pool()
+            .run(async |client: &mut Client| {
+                client
+                    .query(
+                        concat!(
+                            "SELECT ",
+                            ENTRY_COLUMNS!(),
+                            " FROM operation_log WHERE request = $1 ORDER BY id LIMIT $2"
+                        ),
+                        &[&request, &limit],
+                    )
+                    .await
+                    .map_err(DbError::from)
+            })
+            .await?;
+        rows.iter().map(entry_of).collect()
+    }
+}
+
+/// One entry as the API answers it, from a row of [`ENTRY_COLUMNS`].
+fn entry_of(row: &tokio_postgres::Row) -> Result<Value, DbError> {
+    let mut entry = Map::with_capacity(17);
+    entry.insert("id".into(), get::<i64>(row, 0)?.into());
+    entry.insert("time".into(), get::<String>(row, 1)?.into());
+    entry.insert("request".into(), get::<Option<String>>(row, 2)?.into());
+    entry.insert("user".into(), get::<Option<String>>(row, 3)?.into());
+    entry.insert("application".into(), get::<Option<String>>(row, 4)?.into());
+    entry.insert("version".into(), get::<Option<i32>>(row, 5)?.into());
+    entry.insert("resource".into(), get::<Option<String>>(row, 6)?.into());
+    entry.insert("actor".into(), get::<String>(row, 14)?.into());
+    entry.insert("own_database".into(), get::<bool>(row, 15)?.into());
+    entry.insert("operation".into(), get::<String>(row, 7)?.into());
+    entry.insert("statement".into(), get::<Option<String>>(row, 8)?.into());
+    entry.insert("outcome".into(), get::<String>(row, 9)?.into());
+    entry.insert("reason".into(), get::<Option<String>>(row, 10)?.into());
+    entry.insert("error".into(), get::<Option<String>>(row, 11)?.into());
+    entry.insert("rows".into(), get::<Option<i64>>(row, 12)?.into());
+    entry.insert("duration_ms".into(), get::<Option<i64>>(row, 13)?.into());
+    entry.insert("transaction".into(), get::<Option<String>>(row, 16)?.into());
+    Ok(Value::Object(entry))
 }
 
 fn version_of(version: u64) -> Result<i32, DbError> {

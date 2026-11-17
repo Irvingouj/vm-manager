@@ -43,6 +43,8 @@
 //!   requests' path, and read through the API.
 //! - [`log`]: the program's log, one JSON record per line.
 //! - [`server`]: the listening socket and the connections.
+//! - [`platform`]: the parts above put together, for `vm serve` and for
+//!   the local run alike.
 
 pub mod api;
 pub mod app_logs;
@@ -54,6 +56,7 @@ pub mod log;
 pub mod migration_text;
 pub mod oplog;
 pub mod own_db;
+pub mod platform;
 pub mod platform_db;
 pub mod registry;
 pub mod resources;

@@ -596,3 +596,70 @@ impl HistoryAnswer {
 fn literal(text: &str) -> String {
     super::literal(text)
 }
+
+/// The newest `limit` changes of the Change history, newest first, of every
+/// Application and table, or of the table `table` (`(schema, table)`): each
+/// as it is recorded, `old` and `new` the rows by column name, `id` as
+/// text. For the local run's `vm local change-history`, which reads the
+/// private platform database whole.
+pub async fn recorded(
+    platform: &crate::platform_db::PlatformDatabase,
+    table: Option<(&str, &str)>,
+    limit: u16,
+) -> Result<Vec<Value>, DbError> {
+    let limit = i64::from(limit);
+    let (schema, name) = table.unzip();
+    let rows = platform
+        .pool()
+        .run(async |client: &mut Client| {
+            client
+                .query(
+                    concat!(
+                        "SELECT id::text, ",
+                        rfc3339!("at"),
+                        ", schema_name, table_name, kind, key, old, new, changed, user_id,
+                           actor, request, migration, structure
+                         FROM change_history
+                         WHERE ($1::text IS NULL OR (schema_name = $1 AND table_name = $2))
+                         ORDER BY at DESC, id DESC
+                         LIMIT $3"
+                    ),
+                    &[&schema, &name, &limit],
+                )
+                .await
+                .map_err(DbError::from)
+        })
+        .await?;
+    let mut changes = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let get_text = |at: usize| -> Result<Value, DbError> {
+            Ok(row
+                .try_get::<_, Option<String>>(at)
+                .map_err(DbError::from)?
+                .map_or(Value::Null, Value::String))
+        };
+        let get_json = |at: usize| -> Result<Value, DbError> {
+            Ok(row
+                .try_get::<_, Option<Value>>(at)
+                .map_err(DbError::from)?
+                .unwrap_or(Value::Null))
+        };
+        let mut change = Map::with_capacity(14);
+        change.insert("id".into(), get_text(0)?);
+        change.insert("at".into(), get_text(1)?);
+        change.insert("schema".into(), get_text(2)?);
+        change.insert("table".into(), get_text(3)?);
+        change.insert("kind".into(), get_text(4)?);
+        change.insert("key".into(), get_json(5)?);
+        change.insert("old".into(), get_json(6)?);
+        change.insert("new".into(), get_json(7)?);
+        change.insert("changed".into(), get_json(8)?);
+        change.insert("user_id".into(), get_text(9)?);
+        change.insert("actor".into(), get_text(10)?);
+        change.insert("request".into(), get_text(11)?);
+        change.insert("migration".into(), get_text(12)?);
+        change.insert("structure".into(), get_json(13)?);
+        changes.push(Value::Object(change));
+    }
+    Ok(changes)
+}

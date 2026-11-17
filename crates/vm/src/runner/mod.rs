@@ -168,6 +168,30 @@ impl RequestRunner {
         })
     }
 
+    /// Stops the engine threads: no request is taken any more, and each
+    /// thread ends once the requests it runs have ended (each within its
+    /// deadline). Waits up to `limit`, polling, and answers whether every
+    /// thread ended; a thread still running then is left to end by itself.
+    /// For a caller that must know the threads have let go of the gateway
+    /// (the local run, before it stops its Postgres).
+    pub async fn stop(self, limit: Duration) -> bool {
+        let Self {
+            lanes, _threads, ..
+        } = self;
+        // Closing every lane ends each thread's loop once it is idle.
+        drop(lanes);
+        let deadline = tokio::time::Instant::now() + limit;
+        loop {
+            if _threads.iter().all(JoinHandle::is_finished) {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
     /// Runs one request to its end.
     pub async fn run(
         &self,

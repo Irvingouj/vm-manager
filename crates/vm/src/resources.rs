@@ -470,6 +470,39 @@ impl Resources {
         Ok(Registered::Registered(resource))
     }
 
+    /// Removes the Resource `name` and its Grants, in the database and then
+    /// in memory, before this returns; `false` when there was none. Its
+    /// pools close once the last request holding it lets go. For the local
+    /// run, whose Resources are made again from the project at each run.
+    pub async fn unregister(&self, name: &str) -> Result<bool, DbError> {
+        let removed = self
+            .database
+            .pool()
+            .run(async |client: &mut Client| {
+                let transaction = client.transaction().await.map_err(DbError::from)?;
+                transaction
+                    .execute(
+                        "DELETE FROM grants WHERE resource_id IN
+                           (SELECT id FROM resources WHERE name = $1)",
+                        &[&name],
+                    )
+                    .await
+                    .map_err(DbError::from)?;
+                let removed = transaction
+                    .execute("DELETE FROM resources WHERE name = $1", &[&name])
+                    .await
+                    .map_err(DbError::from)?;
+                transaction.commit().await.map_err(DbError::from)?;
+                Ok(removed > 0)
+            })
+            .await?;
+        self.all
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(name);
+        Ok(removed)
+    }
+
     /// Sets `group`'s Grant on `resource` to `level`, in the database and
     /// then in memory, before this returns.
     pub async fn grant(

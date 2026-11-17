@@ -266,6 +266,17 @@ pub struct Writer {
     task: JoinHandle<()>,
 }
 
+impl Writer {
+    /// Ends the writer once it has written what is queued: `logs` (the
+    /// last handle; the caller has let go of every other) is dropped, which
+    /// closes the queue, and the task is awaited up to `limit`. Answers
+    /// whether it ended in time; past it, it is aborted.
+    pub async fn finish(mut self, logs: Logs, limit: Duration) -> bool {
+        drop(logs);
+        tokio::time::timeout(limit, &mut self.task).await.is_ok()
+    }
+}
+
 impl Drop for Writer {
     fn drop(&mut self) {
         self.task.abort();
@@ -340,20 +351,30 @@ impl Logs {
     /// The entries of `application` that `query` asks for, oldest first,
     /// and the cursor `next`.
     pub async fn read(&self, application: &str, query: &Query) -> Result<Page, DbError> {
-        let limit = i64::from(query.limit);
-        let request = query.request.as_deref();
-        let (rows, last) = self
-            .database
-            .pool()
-            .run(async |client: &mut Client| {
-                let rows = match &query.after {
-                    Some((after, _)) => {
-                        client
-                            .query(
-                                concat!(
-                                    "SELECT e.id, ",
-                                    rfc3339!("e.made_at"),
-                                    ", e.request, e.version, e.user_id, e.method, e.path,
+        read(&self.database, application, query).await
+    }
+}
+
+/// [`Logs::read`], on the platform database itself: for a reader that has
+/// let go of its [`Logs`] (the local run, once its writer has finished).
+pub async fn read(
+    database: &PlatformDatabase,
+    application: &str,
+    query: &Query,
+) -> Result<Page, DbError> {
+    let limit = i64::from(query.limit);
+    let request = query.request.as_deref();
+    let (rows, last) = database
+        .pool()
+        .run(async |client: &mut Client| {
+            let rows = match &query.after {
+                Some((after, _)) => {
+                    client
+                        .query(
+                            concat!(
+                                "SELECT e.id, ",
+                                rfc3339!("e.made_at"),
+                                ", e.request, e.version, e.user_id, e.method, e.path,
                                        e.status, e.printed, e.uncaught, e.truncated,
                                        e.dropped_before
                                      FROM log_entries e
@@ -361,18 +382,18 @@ impl Logs {
                                      WHERE a.name = $1 AND e.id > $2
                                        AND ($3::text IS NULL OR e.request = $3)
                                      ORDER BY e.id LIMIT $4"
-                                ),
-                                &[&application, after, &request, &limit],
-                            )
-                            .await
-                    }
-                    None => {
-                        client
-                            .query(
-                                concat!(
-                                    "SELECT * FROM (SELECT e.id, ",
-                                    rfc3339!("e.made_at"),
-                                    ", e.request, e.version, e.user_id, e.method, e.path,
+                            ),
+                            &[&application, after, &request, &limit],
+                        )
+                        .await
+                }
+                None => {
+                    client
+                        .query(
+                            concat!(
+                                "SELECT * FROM (SELECT e.id, ",
+                                rfc3339!("e.made_at"),
+                                ", e.request, e.version, e.user_id, e.method, e.path,
                                        e.status, e.printed, e.uncaught, e.truncated,
                                        e.dropped_before
                                      FROM log_entries e
@@ -381,53 +402,52 @@ impl Logs {
                                        AND ($2::text IS NULL OR e.request = $2)
                                      ORDER BY e.id DESC LIMIT $3) newest
                                      ORDER BY id"
-                                ),
-                                &[&application, &request, &limit],
-                            )
-                            .await
-                    }
-                }
-                .map_err(DbError::from)?;
-                // With no entry and no `after`: a cursor after which only
-                // entries made later come.
-                let last = if rows.is_empty() && query.after.is_none() {
-                    let row = client
-                        .query_one("SELECT coalesce(max(id), 0) FROM log_entries", &[])
+                            ),
+                            &[&application, &request, &limit],
+                        )
                         .await
-                        .map_err(DbError::from)?;
-                    Some(row.try_get::<_, i64>(0).map_err(DbError::from)?)
-                } else {
-                    None
-                };
-                Ok((rows, last))
-            })
-            .await?;
-        let mut entries = Vec::with_capacity(rows.len());
-        for row in &rows {
-            entries.push(EntryView {
-                id: row.try_get::<_, i64>(0).map_err(DbError::from)?,
-                time: row.try_get(1).map_err(DbError::from)?,
-                request: row.try_get(2).map_err(DbError::from)?,
-                version: number(row.try_get::<_, i32>(3).map_err(DbError::from)?)?,
-                user: row.try_get(4).map_err(DbError::from)?,
-                method: row.try_get(5).map_err(DbError::from)?,
-                path: row.try_get(6).map_err(DbError::from)?,
-                status: number(row.try_get::<_, i32>(7).map_err(DbError::from)?)?,
-                printed: row.try_get(8).map_err(DbError::from)?,
-                uncaught: row.try_get(9).map_err(DbError::from)?,
-                truncated: row.try_get(10).map_err(DbError::from)?,
-                dropped_before: number(row.try_get::<_, i64>(11).map_err(DbError::from)?)?,
-            });
-        }
-        let next = match (entries.last(), &query.after, last) {
-            (Some(entry), _, _) => entry.id.to_string(),
-            // Copied: the answer is written from it; a cursor is a few digits.
-            (None, Some((_, given)), _) => given.clone(),
-            (None, None, Some(last)) => last.to_string(),
-            (None, None, None) => "0".to_owned(),
-        };
-        Ok(Page { entries, next })
+                }
+            }
+            .map_err(DbError::from)?;
+            // With no entry and no `after`: a cursor after which only
+            // entries made later come.
+            let last = if rows.is_empty() && query.after.is_none() {
+                let row = client
+                    .query_one("SELECT coalesce(max(id), 0) FROM log_entries", &[])
+                    .await
+                    .map_err(DbError::from)?;
+                Some(row.try_get::<_, i64>(0).map_err(DbError::from)?)
+            } else {
+                None
+            };
+            Ok((rows, last))
+        })
+        .await?;
+    let mut entries = Vec::with_capacity(rows.len());
+    for row in &rows {
+        entries.push(EntryView {
+            id: row.try_get::<_, i64>(0).map_err(DbError::from)?,
+            time: row.try_get(1).map_err(DbError::from)?,
+            request: row.try_get(2).map_err(DbError::from)?,
+            version: number(row.try_get::<_, i32>(3).map_err(DbError::from)?)?,
+            user: row.try_get(4).map_err(DbError::from)?,
+            method: row.try_get(5).map_err(DbError::from)?,
+            path: row.try_get(6).map_err(DbError::from)?,
+            status: number(row.try_get::<_, i32>(7).map_err(DbError::from)?)?,
+            printed: row.try_get(8).map_err(DbError::from)?,
+            uncaught: row.try_get(9).map_err(DbError::from)?,
+            truncated: row.try_get(10).map_err(DbError::from)?,
+            dropped_before: number(row.try_get::<_, i64>(11).map_err(DbError::from)?)?,
+        });
     }
+    let next = match (entries.last(), &query.after, last) {
+        (Some(entry), _, _) => entry.id.to_string(),
+        // Copied: the answer is written from it; a cursor is a few digits.
+        (None, Some((_, given)), _) => given.clone(),
+        (None, None, Some(last)) => last.to_string(),
+        (None, None, None) => "0".to_owned(),
+    };
+    Ok(Page { entries, next })
 }
 
 /// A number the database holds, as the API shows it.

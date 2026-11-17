@@ -89,7 +89,7 @@ use crate::platform_db::{
 mod history;
 mod relay;
 
-pub use history::{HistoryAnswer, HistoryRead};
+pub use history::{HistoryAnswer, HistoryRead, recorded as recorded_changes};
 
 /// The line `drizzle-kit` puts between the statements of a migration.
 pub const BREAKPOINT: &str = "--> statement-breakpoint";

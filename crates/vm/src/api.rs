@@ -25,7 +25,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Limited};
-use hyper::body::Incoming;
+use hyper::body::Body;
 use hyper::{Method, StatusCode};
 use serde::de::{self, DeserializeOwned, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -307,7 +307,7 @@ fn read_structures(
     Ok(structures)
 }
 
-fn read_version(body: &[u8]) -> Result<NewVersion, String> {
+pub(crate) fn read_version(body: &[u8]) -> Result<NewVersion, String> {
     let object = Object::read(body)?;
     let git_commit: String = object.required("git_commit")?;
     if git_commit.len() != 40 || !git_commit.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -684,7 +684,7 @@ impl Api {
         clippy::too_many_arguments,
         reason = "the parts of one request, each named"
     )]
-    pub async fn handle(
+    pub async fn handle<B>(
         &self,
         user: &User,
         with: SignedInWith,
@@ -692,8 +692,12 @@ impl Api {
         method: &Method,
         path: &str,
         query: Option<&str>,
-        body: Incoming,
-    ) -> Answer {
+        body: B,
+    ) -> Answer
+    where
+        B: Body<Data = Bytes> + Send,
+        B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
         let read = Limited::new(body, MAX_BODY_BYTES).collect();
         let body = match tokio::time::timeout(BODY_READ_TIMEOUT, read).await {
             Ok(Ok(collected)) => collected.to_bytes(),

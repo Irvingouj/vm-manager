@@ -93,6 +93,18 @@ impl DatabaseAddress {
         })
     }
 
+    /// An address made of its parts (the local run's, which makes its own
+    /// Postgres and role): the password moves in and is never printed.
+    pub fn new(host: &str, port: u16, role: &str, password: String, database: &str) -> Self {
+        Self {
+            host: host.to_owned(),
+            port,
+            role: role.to_owned(),
+            password: Some(Password(password)),
+            database: database.to_owned(),
+        }
+    }
+
     /// The same Postgres and role, another database.
     pub fn with_database(&self, database: &str) -> Self {
         Self {

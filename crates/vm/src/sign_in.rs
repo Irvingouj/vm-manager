@@ -64,6 +64,34 @@ impl SignIn for NoSignIn {
     }
 }
 
+/// The local run's (`vm request`): every request is the test User the
+/// command names, signed in with that User's id and Groups as the test
+/// Users file gives them. Nothing of the request's headers counts.
+pub struct FixedSignIn {
+    id: String,
+    groups: Vec<String>,
+}
+
+impl FixedSignIn {
+    pub fn new(id: String, groups: Vec<String>) -> Self {
+        Self { id, groups }
+    }
+}
+
+impl SignIn for FixedSignIn {
+    fn user_of(&self, _headers: &HeaderMap) -> SignedIn {
+        // Copied: each request owns its User; the local run makes one.
+        SignedIn::User(User {
+            id: self.id.clone(),
+            groups: self.groups.clone(),
+        })
+    }
+
+    fn is_stand_in(&self) -> bool {
+        false
+    }
+}
+
 /// Development only: the caller states who the User is.
 ///
 /// - [`STAND_IN_USER_HEADER`]: the User's id, exactly once, handed over
