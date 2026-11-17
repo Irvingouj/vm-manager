@@ -97,8 +97,12 @@ enum Command {
     /// empty stand-in of each pulled Resource, and send it one request as a
     /// test User of vm.dev.json (--as builder, --as outsider, ...).
     Request(tool::RequestArgs),
-    /// Read what the project's local runs recorded: its operation-log and
-    /// change-history.
+    /// Keep the project running on this machine and serve it to your
+    /// browser at http://<name>.localhost:7480/, as the test User you choose
+    /// there; rebuilt when the project changes, until interrupted.
+    Dev(tool::DevArgs),
+    /// The project's local runs: what they recorded (operation-log,
+    /// change-history), and reset, which starts the local databases over.
     Local(tool::LocalArgs),
 }
 
@@ -165,6 +169,7 @@ fn main() -> ExitCode {
         Some(Command::GoBack(args)) => tool::run(tool::Command::GoBack(args)),
         Some(Command::Logs(args)) => tool::run(tool::Command::Logs(args)),
         Some(Command::Request(args)) => tool::run(tool::Command::Request(args)),
+        Some(Command::Dev(args)) => tool::run(tool::Command::Dev(args)),
         Some(Command::Local(args)) => tool::run(tool::Command::Local(args)),
         None => {
             say_on_stderr(

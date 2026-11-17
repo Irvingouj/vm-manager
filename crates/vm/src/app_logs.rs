@@ -47,7 +47,7 @@
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -259,6 +259,16 @@ pub struct Logs {
     sender: mpsc::Sender<Entry>,
     dropped: Arc<Dropped>,
     database: Arc<PlatformDatabase>,
+    /// Entries handed to the writer, and those it has done with (written
+    /// or counted as dropped): for [`Logs::settled`].
+    progress: Arc<Progress>,
+}
+
+/// How far the writer is.
+#[derive(Default)]
+struct Progress {
+    queued: AtomicU64,
+    done: AtomicU64,
 }
 
 /// Owns the writing task: it is aborted when this is dropped.
@@ -289,16 +299,19 @@ pub fn start(database: Arc<PlatformDatabase>) -> (Logs, Writer) {
     // counts it.
     let (sender, receiver) = mpsc::channel(QUEUE);
     let dropped = Arc::new(Dropped::default());
+    let progress = Arc::new(Progress::default());
     let task = tokio::spawn(write_all(
         receiver,
         Arc::clone(&database),
         Arc::clone(&dropped),
+        Arc::clone(&progress),
     ));
     (
         Logs {
             sender,
             dropped,
             database,
+            progress,
         },
         Writer { task },
     )
@@ -339,12 +352,34 @@ impl Logs {
     /// when the queue is full.
     fn keep(&self, mut entry: Entry) {
         entry.dropped_before = self.dropped.take(&entry.application);
+        // Counted before it is sent, so that the writer's count never
+        // passes it.
+        self.progress.queued.fetch_add(1, Ordering::SeqCst);
         match self.sender.try_send(entry) {
             Ok(()) => {}
             Err(TrySendError::Full(entry) | TrySendError::Closed(entry)) => {
+                self.progress.done.fetch_add(1, Ordering::SeqCst);
                 self.dropped
                     .add(&entry.application, entry.dropped_before.saturating_add(1));
             }
+        }
+    }
+
+    /// Waits, up to `limit`, until the writer has done with every entry
+    /// handed to it before this call (written it, or counted it dropped):
+    /// for a caller that reads a request's entry right after it (the local
+    /// run). Answers whether it had in time. Polls every few milliseconds.
+    pub async fn settled(&self, limit: Duration) -> bool {
+        let target = self.progress.queued.load(Ordering::SeqCst);
+        let deadline = tokio::time::Instant::now() + limit;
+        loop {
+            if self.progress.done.load(Ordering::SeqCst) >= target {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
     }
 
@@ -581,6 +616,7 @@ async fn write_all(
     mut receiver: mpsc::Receiver<Entry>,
     database: Arc<PlatformDatabase>,
     dropped: Arc<Dropped>,
+    progress: Arc<Progress>,
 ) {
     // Entries written for each Application since its last trim: one number
     // per Application that has had an entry since the program started. An
@@ -638,6 +674,10 @@ async fn write_all(
                 );
             }
         }
+        progress.done.fetch_add(
+            u64::try_from(batch.len()).unwrap_or(u64::MAX),
+            Ordering::SeqCst,
+        );
         batch.clear();
     }
 }

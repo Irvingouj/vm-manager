@@ -16,7 +16,7 @@ const SDK_TARBALL: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/vm-sdk.tgz"
 
 /// The template's text files: the path in a new project, and the text,
 /// with `{{...}}` to fill in.
-const TEXT_FILES: [(&str, &str); 10] = [
+const TEXT_FILES: [(&str, &str); 11] = [
     (".gitignore", include_str!("../../template/gitignore")),
     ("AGENTS.md", include_str!("../../template/AGENTS.md")),
     ("CLAUDE.md", include_str!("../../template/CLAUDE.md")),
@@ -31,6 +31,10 @@ const TEXT_FILES: [(&str, &str); 10] = [
         include_str!("../../template/src/db/schema.ts"),
     ),
     ("src/index.ts", include_str!("../../template/src/index.ts")),
+    (
+        "test-rows/README.md",
+        include_str!("../../template/test-rows/README.md"),
+    ),
     (
         "tsconfig.json",
         include_str!("../../template/tsconfig.json"),

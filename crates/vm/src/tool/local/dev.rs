@@ -1,0 +1,1409 @@
+//! `vm dev` (blackbox/CONTRACT.md, "The local loop, kept running"): the
+//! project brought up as `vm request` brings it up, then served on the
+//! loopback address to the Builder's browser, as the test User chosen on
+//! its page, and to the tool's own commands of the project, until a signal.
+//!
+//! **Parts.** [`Front`] answers every request (the server's [`Handler`]):
+//! the `Host` first, then the local run's own paths (`/_vm/`), then the
+//! Application's, handed to the installation's own Ingress. What changes
+//! the project's state (a rebuild, a reset, a command of the tool's) is a
+//! [`Job`], done one after the other by the command's own task ([`jobs`]),
+//! never by a connection's; what is printed goes through [`printer`].
+//!
+//! **Serialization.** The state ([`State`]: the private Postgres and the
+//! installation's parts on it, what the last bring-up did or how it failed,
+//! which look at the project it is of) is behind one `tokio` read-write
+//! lock. A request of the browser holds it to read from before its look at
+//! the project is compared until the Application answered, so requests are
+//! served side by side. A job holds it to write: it waits for the requests
+//! under way to end (at most [`WRITE_WAIT`]), and the lock, which is fair,
+//! holds every request that comes meanwhile until the job is done (each at
+//! most [`READ_WAIT`]). Those waiting are bounded by the server's
+//! connections ([`CONNECTIONS`]): one request a connection at a time.
+//!
+//! **Bounds.** Jobs waiting: [`JOBS`] (a request that finds the queue full
+//! waits for room). Lines waiting to be printed: [`LINES`] (the request
+//! waits for room). A job takes at most [`JOB_WAIT`]. A form posted to the
+//! page is at most [`FORM_BYTES`], read within [`BODY_WAIT`]; what a command
+//! sends at most [`control::MAX_SENT_BYTES`].
+//!
+//! **Stopping.** `SIGINT`, `SIGTERM` or `SIGHUP`, or an output that cannot
+//! be written: no connection is taken any more, those open are given
+//! [`server::Limits::drain`] to finish their request then dropped, the job
+//! under way is dropped (which stops the tools it runs), the parts are
+//! closed, the private Postgres is stopped and waited for, the file that
+//! finds this `vm dev` removed, then the project's lock let go.
+
+use std::io::{ErrorKind, Write};
+use std::net::{Ipv4Addr, Ipv6Addr};
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, PoisonError};
+use std::time::Duration;
+
+use bytes::Bytes;
+use http_body_util::{BodyExt, Full, Limited};
+use hyper::body::Incoming;
+use hyper::header::{ACCEPT, CONTENT_TYPE, COOKIE, HOST, HeaderName, HeaderValue, ORIGIN};
+use hyper::{Method, Request, Response, StatusCode};
+use serde_json::{Value, json};
+use tokio::net::TcpListener;
+use tokio::sync::{RwLock, RwLockWriteGuard, mpsc, oneshot, watch};
+
+use super::super::check;
+use super::super::project_tools::{
+    Bounded, DEFAULT_TIMEOUT, Scratch, Signals, Who, own_folder_failed,
+};
+use super::super::test_users::TestUsersFile;
+use super::super::theirs::Theirs;
+use super::super::{Done, Ending, json_line};
+use super::control::{self, ControlSecret};
+use super::page::{self, COOKIE as TEST_USER_COOKIE};
+use super::postgres::{Local, Programs};
+use super::run::{self, Base, Brought, Held, Live, Pg, Size};
+use super::walk::{self, Look};
+use super::{
+    Command, DRAIN_WAIT, DevArgs, Progress, Reading, Stage, WHO, WHO_DEV, WHO_LOCAL, WHO_RESET,
+    local_state_failed, one_line, read_records, request_output, reset_output, standins,
+};
+use crate::runner;
+use crate::server::{self, Handler};
+use crate::sign_in::ChosenTestUser;
+use crate::user::User;
+
+/// Connections served at once.
+const CONNECTIONS: usize = 256;
+
+/// Jobs waiting to be done.
+const JOBS: usize = 64;
+
+/// Lines waiting to be printed.
+const LINES: usize = 256;
+
+/// The longest a job waits for the requests under way to end.
+const WRITE_WAIT: Duration = Duration::from_secs(60);
+
+/// The longest a job may take.
+const JOB_WAIT: Duration = Duration::from_secs(600);
+
+/// The longest a request waits for the state (a job under way).
+const READ_WAIT: Duration = Duration::from_secs(700);
+
+/// The longest a line may take to be written, or to find room.
+const OUTPUT_WAIT: Duration = Duration::from_secs(60);
+
+/// The largest form posted to the page.
+const FORM_BYTES: usize = 64 * 1024;
+
+/// The longest a body sent to the local run's own paths may take to come.
+const BODY_WAIT: Duration = Duration::from_secs(30);
+
+/// The private Postgres and the installation's parts on it.
+struct Session {
+    pg: Pg,
+    live: Live,
+}
+
+/// What `vm dev` serves from. See the module's text.
+struct State {
+    session: Option<Session>,
+    /// What the last bring-up that ended well did, as a request that
+    /// causes none reports it.
+    last: Option<Brought>,
+    /// How the bring-up of the project as it is now failed: what `vm
+    /// request` prints of it, and its exit code.
+    failed: Option<(u8, Done)>,
+    /// The look at the project the state is of.
+    seen: Option<Look>,
+}
+
+/// Why `vm dev` stops.
+#[derive(Clone, Copy)]
+enum Why {
+    Signal,
+    OutputClosed,
+}
+
+/// What the command's own task does for a request.
+enum Job {
+    /// Bring the project up again unless the state is of this look already.
+    Rebuild {
+        seen: Look,
+        reply: oneshot::Sender<()>,
+    },
+    /// A command of the tool's: what it prints, and its exit code.
+    Control {
+        asked: Asked,
+        reply: oneshot::Sender<(u8, Done)>,
+    },
+}
+
+/// What a command of the tool's asks.
+enum Asked {
+    Request(Wanted),
+    Read(Reading),
+    Reset,
+}
+
+/// The request of a `vm request` answered here, as it sent it.
+struct Wanted {
+    path: String,
+    user: String,
+    method: Method,
+    headers: Vec<(HeaderName, HeaderValue)>,
+    body: Bytes,
+}
+
+/// What the command's own task needs to do a job.
+struct Ctx<'a> {
+    own: &'a Path,
+    programs: &'a Programs,
+    held: &'a Held,
+    progress: &'a Progress,
+}
+
+/// What answers every request. See the module's text.
+struct Front {
+    project: Arc<Path>,
+    port: u16,
+    json: bool,
+    /// The Application's name, as the last bring-up gave it. Held only to
+    /// read or replace, never across an await.
+    application: std::sync::RwLock<Arc<str>>,
+    secret: ControlSecret,
+    state: RwLock<State>,
+    jobs: mpsc::Sender<Job>,
+    lines: mpsc::Sender<String>,
+    /// Whether the project is looked at before each request: not once it
+    /// had more entries than are looked at.
+    looking: AtomicBool,
+}
+
+/// The parts' size: requests side by side, each within the time an
+/// installation gives one.
+fn dev_size() -> Size {
+    Size {
+        pool: 8,
+        runner: runner::Limits {
+            threads: std::num::NonZeroUsize::new(2).unwrap_or(std::num::NonZeroUsize::MIN),
+            requests_per_thread: 8,
+            queue_per_thread: 16,
+            ..runner::Limits::default()
+        },
+    }
+}
+
+/// `vm dev`.
+pub(in super::super) async fn dev(args: &DevArgs) -> Result<Done, Ending> {
+    let name = WHO_DEV.command;
+    let project = super::project_path(args.project.as_deref(), name)?;
+    run::test_users_of(&project, name)?;
+    let local = Local::of(&project);
+    if let Some(address) = control::address_of(&local) {
+        return Err(Ending::new(
+            1,
+            "already-running",
+            format!(
+                "vm dev already runs in this project, at {address}: use that one, or end it (Ctrl-C where it runs) before starting another"
+            ),
+        ));
+    }
+    let listeners = bind(args.port)?;
+    let mut signals = Signals::listen(&WHO_DEV)?;
+    let own = Scratch::make(&WHO_DEV).map_err(|e| own_folder_failed(&e, &WHO_DEV))?;
+    let held = Held::default();
+    let json = args.output.json;
+    let command = Command {
+        who: &WHO_DEV,
+        json,
+        limit: DEFAULT_TIMEOUT,
+    };
+    let progress = Progress::new(Stage::Node);
+    let base = command.base(&project, &own.path);
+    let started = match signals
+        .within(DEFAULT_TIMEOUT, start(&base, &progress, &held))
+        .await
+    {
+        Bounded::Ended(Ok(started)) => started,
+        ended => {
+            held.release().await;
+            control::remove_left(&local);
+            return match ended {
+                Bounded::Ended(Err(ending)) => Err(ending),
+                Bounded::TimedOut => Err(command.timed_out(progress.get())),
+                // Interrupted before it listened: it ends as it would after.
+                Bounded::Interrupted(_) | Bounded::Ended(Ok(_)) => Ok(Done::printed()),
+            };
+        }
+    };
+    let Started {
+        programs,
+        pg,
+        live,
+        brought,
+        seen,
+    } = started;
+    let application: Arc<str> = Arc::from(brought.application.as_str());
+    let secret = match ControlSecret::generate().and_then(|secret| {
+        control::write(&local, args.port, &application, &secret).map(|()| secret)
+    }) {
+        Ok(secret) => secret,
+        Err(why) => {
+            live.close().await;
+            held.release().await;
+            control::remove_left(&local);
+            return Err(local_state_failed(&why, name));
+        }
+    };
+    let (jobs_tx, jobs_rx) = mpsc::channel(JOBS);
+    let (lines_tx, lines_rx) = mpsc::channel(LINES);
+    let looking = seen != Look::TooMany;
+    let front = Arc::new(Front {
+        project: Arc::from(project.as_path()),
+        port: args.port,
+        json,
+        application: std::sync::RwLock::new(Arc::clone(&application)),
+        secret,
+        state: RwLock::new(State {
+            session: Some(Session { pg, live }),
+            last: Some(brought.standing()),
+            failed: None,
+            seen: looking.then_some(seen),
+        }),
+        jobs: jobs_tx,
+        lines: lines_tx,
+        looking: AtomicBool::new(looking),
+    });
+    let (stop, _) = watch::channel(None::<Why>);
+    let mut listening = front.line(
+        &json!({
+            "event": "listening",
+            "url": front.address(&application),
+            "application": &*application,
+            "port": args.port,
+            "version": brought.version,
+        }),
+        &format!(
+            "vm dev serves {} at {} (local Version {}), as the test User you choose there. It runs until interrupted (Ctrl-C).",
+            Theirs::from(&*application),
+            front.address(&application),
+            brought.version
+        ),
+    );
+    if !looking {
+        listening.push_str(&front.line(&too_many_json(), &too_many_message()));
+    }
+    let printed = write_out(listening).await;
+    if printed.is_err() {
+        stop.send_replace(Some(Why::OutputClosed));
+    } else {
+        let ctx = Ctx {
+            own: &own.path,
+            programs: &programs,
+            held: &held,
+            progress: &progress,
+        };
+        let limits = server::Limits {
+            connections: CONNECTIONS,
+            header_read: Duration::from_secs(10),
+            // A command answered here may take as long as its --timeout.
+            connection: Duration::from_secs(3600),
+            drain: Duration::from_secs(10),
+        };
+        let mut stopped = stop.subscribe();
+        tokio::join!(
+            stopper(&mut signals, &stop),
+            server::serve_until(listeners, Arc::clone(&front), limits, async move {
+                drop(stopped.wait_for(Option::is_some).await);
+            }),
+            jobs(&front, &ctx, jobs_rx, &stop),
+            printer(lines_rx, &stop),
+        );
+    }
+    // Everything ended: no request holds the state.
+    let session = match tokio::time::timeout(WRITE_WAIT, front.state.write()).await {
+        Ok(mut state) => state.session.take(),
+        Err(_) => None,
+    };
+    if let Some(session) = session {
+        session.live.close().await;
+        drop(session.pg);
+    }
+    control::remove_left(&local);
+    held.release().await;
+    drop(front);
+    drop(own);
+    match *stop.borrow() {
+        Some(Why::OutputClosed) => Err(Ending::new(
+            1,
+            "output-closed",
+            "vm dev could not write its output, so it stopped, with everything it started".into(),
+        )),
+        _ => Ok(Done::printed()),
+    }
+}
+
+/// What starting did.
+struct Started {
+    programs: Programs,
+    pg: Pg,
+    live: Live,
+    brought: Brought,
+    seen: Look,
+}
+
+/// What `vm dev` does before it listens: what `vm request` does up to the
+/// request.
+async fn start(base: &Base<'_>, progress: &Progress, held: &Held) -> Result<Started, Ending> {
+    let packages = run::tools(base, progress).await?;
+    let programs = run::programs(base, progress).await?;
+    let local = Local::of(base.project);
+    run::lock_project(base, &local, progress, held).await?;
+    let pg = run::start_server(base, &programs, progress, held, false).await?;
+    let live = Live::open(&pg, dev_size(), base.who).await?;
+    let brought = async {
+        let file = run::test_users_of(base.project, base.who.command)?;
+        let seen = look_at(base.project).await;
+        let brought = run::bring_up(base, &pg, &live, &file, &packages, progress).await?;
+        Ok::<_, Ending>((brought, seen))
+    }
+    .await;
+    match brought {
+        Ok((brought, seen)) => Ok(Started {
+            programs,
+            pg,
+            live,
+            brought,
+            seen,
+        }),
+        Err(ending) => {
+            live.close().await;
+            Err(ending)
+        }
+    }
+}
+
+/// Listens on `127.0.0.1:<port>`, and `[::1]:<port>` where the machine has
+/// it.
+fn bind(port: u16) -> Result<Vec<TcpListener>, Ending> {
+    let in_use = || {
+        Ending::new(
+            1,
+            "port-in-use",
+            format!(
+                "Port {port} of this machine's loopback address is taken: give vm dev another with --port <n>, or end what holds it"
+            ),
+        )
+    };
+    let failed = |error: std::io::Error| {
+        Ending::new(
+            1,
+            "failed",
+            format!(
+                "vm dev cannot listen on 127.0.0.1:{port} ({error}): give it another port with --port <n>"
+            ),
+        )
+    };
+    let mut bound = Vec::with_capacity(2);
+    match std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port)) {
+        Ok(listener) => bound.push(listener),
+        Err(error) if error.kind() == ErrorKind::AddrInUse => return Err(in_use()),
+        Err(error) => return Err(failed(error)),
+    }
+    match std::net::TcpListener::bind((Ipv6Addr::LOCALHOST, port)) {
+        Ok(listener) => bound.push(listener),
+        Err(error) if error.kind() == ErrorKind::AddrInUse => return Err(in_use()),
+        // The machine has no ::1: 127.0.0.1 alone.
+        Err(_) => {}
+    }
+    bound
+        .into_iter()
+        .map(|listener| {
+            listener.set_nonblocking(true).map_err(failed)?;
+            TcpListener::from_std(listener).map_err(failed)
+        })
+        .collect()
+}
+
+/// Waits for a signal, or for another reason to stop, and says why.
+async fn stopper(signals: &mut Signals, stop: &watch::Sender<Option<Why>>) {
+    let mut stopped = stop.subscribe();
+    tokio::select! {
+        bounded = signals.within(Duration::MAX, std::future::pending::<()>()) => {
+            if let Bounded::Interrupted(_) = bounded {
+                stop.send_if_modified(|why| {
+                    if why.is_none() {
+                        *why = Some(Why::Signal);
+                        true
+                    } else {
+                        false
+                    }
+                });
+            }
+        }
+        _ = stopped.wait_for(Option::is_some) => {}
+    }
+}
+
+/// Writes `text` on standard output, off the async workers, within
+/// [`OUTPUT_WAIT`]: an output that takes no more for that long counts as
+/// closed. (Its writing thread is then left to the runtime's end, which
+/// waits a bounded time for it: see `tool::run`.)
+async fn write_out(text: String) -> Result<(), ()> {
+    let written = tokio::time::timeout(
+        OUTPUT_WAIT,
+        tokio::task::spawn_blocking(move || {
+            let mut out = std::io::stdout().lock();
+            out.write_all(text.as_bytes()).and_then(|()| out.flush())
+        }),
+    )
+    .await;
+    match written {
+        Ok(Ok(Ok(()))) => Ok(()),
+        _ => Err(()),
+    }
+}
+
+/// Prints the lines as they come; an output that cannot be written stops
+/// `vm dev`.
+async fn printer(mut lines: mpsc::Receiver<String>, stop: &watch::Sender<Option<Why>>) {
+    let mut stopped = stop.subscribe();
+    loop {
+        let line = tokio::select! {
+            biased;
+            line = lines.recv() => match line {
+                Some(line) => line,
+                None => return,
+            },
+            _ = stopped.wait_for(Option::is_some) => return,
+        };
+        let written = tokio::select! {
+            written = write_out(line) => written,
+            _ = stopped.wait_for(Option::is_some) => return,
+        };
+        if written.is_err() {
+            stop.send_if_modified(|why| {
+                if why.is_none() {
+                    *why = Some(Why::OutputClosed);
+                    true
+                } else {
+                    false
+                }
+            });
+            return;
+        }
+    }
+}
+
+/// Does the jobs one after the other, until `vm dev` stops.
+async fn jobs(
+    front: &Front,
+    ctx: &Ctx<'_>,
+    mut queue: mpsc::Receiver<Job>,
+    stop: &watch::Sender<Option<Why>>,
+) {
+    let mut stopped = stop.subscribe();
+    loop {
+        let job = tokio::select! {
+            _ = stopped.wait_for(Option::is_some) => return,
+            job = queue.recv() => match job {
+                Some(job) => job,
+                None => return,
+            },
+        };
+        tokio::select! {
+            _ = stopped.wait_for(Option::is_some) => return,
+            // A job past its time is dropped, which stops what it runs; its
+            // caller is answered that it could not be done.
+            _ = tokio::time::timeout(JOB_WAIT, front.run_job(ctx, job)) => {}
+        }
+    }
+}
+
+/// The error a command's report holds.
+fn error_of(report: &Done) -> &Value {
+    report.json.get("error").unwrap_or(&Value::Null)
+}
+
+/// `Done` again: what is printed is kept and sent.
+fn copy(done: &Done) -> Done {
+    Done {
+        json: done.json.clone(),
+        text: done.text.clone(),
+    }
+}
+
+/// A command's result as it is sent back: its exit code and what it
+/// prints.
+fn outcome(result: Result<Done, Ending>) -> (u8, Done) {
+    match result {
+        Ok(done) => (0, done),
+        Err(ending) => ending.printed(),
+    }
+}
+
+fn too_many_message() -> String {
+    format!(
+        "The project has more than {} files and folders (those under node_modules/, .vm/ and .git/ aside), so vm dev does not look for changes before each request: a change is served once vm dev is started again.",
+        walk::MAX_ENTRIES
+    )
+}
+
+fn too_many_json() -> Value {
+    json!({ "event": "too-many-files", "message": too_many_message() })
+}
+
+/// The project looked at, off the async workers.
+async fn look_at(project: &Path) -> Look {
+    // Copied: the walk owns its path on its own thread; once a look.
+    let project = project.to_path_buf();
+    let started = tokio::time::Instant::now();
+    let (look, entries) = tokio::task::spawn_blocking(move || walk::look(&project))
+        .await
+        .unwrap_or((Look::TooMany, 0));
+    crate::log::record(
+        "project-looked-at",
+        json!({
+            "entries": entries,
+            "micros": u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+        }),
+    );
+    look
+}
+
+impl Front {
+    fn application(&self) -> Arc<str> {
+        Arc::clone(
+            &self
+                .application
+                .read()
+                .unwrap_or_else(PoisonError::into_inner),
+        )
+    }
+
+    /// `http://<application>.localhost:<port>/`.
+    fn address(&self, application: &str) -> String {
+        format!("http://{application}.localhost:{}/", self.port)
+    }
+
+    /// One line of output: `json` with `--json`, else `words`.
+    fn line(&self, json: &Value, words: &str) -> String {
+        if self.json {
+            json_line(json)
+        } else {
+            format!("{words}\n")
+        }
+    }
+
+    /// Prints a line, after those before it.
+    async fn say(&self, json: Value, words: String) {
+        let line = self.line(&json, &words);
+        // Bound: LINES waiting; when full, this waits for room up to
+        // OUTPUT_WAIT, then the line is not printed (the output takes
+        // nothing: it is about to count as closed).
+        tokio::time::timeout(OUTPUT_WAIT, self.lines.send(line))
+            .await
+            .ok();
+    }
+
+    /// The project looked at, unless it is no longer looked at.
+    async fn look(&self) -> Option<Look> {
+        if !self.looking.load(Ordering::Acquire) {
+            return None;
+        }
+        match look_at(&self.project).await {
+            Look::TooMany => {
+                if self.looking.swap(false, Ordering::AcqRel) {
+                    self.say(too_many_json(), too_many_message()).await;
+                }
+                None
+            }
+            seen => Some(seen),
+        }
+    }
+
+    /// The Application's name after a bring-up: the file that finds `vm
+    /// dev` says it too.
+    fn named(&self, application: &str) {
+        let changed = {
+            let mut name = self
+                .application
+                .write()
+                .unwrap_or_else(PoisonError::into_inner);
+            if &**name == application {
+                false
+            } else {
+                *name = Arc::from(application);
+                true
+            }
+        };
+        if changed {
+            control::write(
+                &Local::of(&self.project),
+                self.port,
+                application,
+                &self.secret,
+            )
+            .ok();
+        }
+    }
+
+    async fn write_state(&self) -> Option<RwLockWriteGuard<'_, State>> {
+        tokio::time::timeout(WRITE_WAIT, self.state.write())
+            .await
+            .ok()
+    }
+
+    async fn run_job(&self, ctx: &Ctx<'_>, job: Job) {
+        match job {
+            Job::Rebuild { seen, reply } => {
+                if let Some(mut state) = self.write_state().await
+                    && state.seen != Some(seen)
+                {
+                    self.rebuild(ctx, &mut state, seen, &WHO).await;
+                }
+                reply.send(()).ok();
+            }
+            Job::Control { asked, reply } => {
+                let answered = match asked {
+                    Asked::Request(wanted) => outcome(self.forwarded_request(ctx, &wanted).await),
+                    Asked::Read(reading) => outcome(self.forwarded_read(ctx, &reading).await),
+                    Asked::Reset => outcome(self.forwarded_reset(ctx).await),
+                };
+                reply.send(answered).ok();
+            }
+        }
+    }
+
+    /// Opens the private Postgres and the parts again (after a reset that
+    /// failed half way).
+    async fn session(&self, ctx: &Ctx<'_>, base: &Base<'_>) -> Result<Session, Ending> {
+        let pg = run::start_server(base, ctx.programs, ctx.progress, ctx.held, false).await?;
+        let live = Live::open(&pg, dev_size(), base.who).await?;
+        Ok(Session { pg, live })
+    }
+
+    fn base<'a>(&'a self, ctx: &Ctx<'a>, who: &'a Who) -> Base<'a> {
+        Base {
+            project: &self.project,
+            own: ctx.own,
+            who,
+            json: self.json,
+        }
+    }
+
+    /// Brings the project up again (see `run::bring_up`), records how it
+    /// went in `state` as of `seen`, and says so. What it did, when it
+    /// ended well.
+    async fn rebuild(
+        &self,
+        ctx: &Ctx<'_>,
+        state: &mut State,
+        seen: Look,
+        who: &Who,
+    ) -> Option<Brought> {
+        let base = self.base(ctx, who);
+        let result = async {
+            let file = run::test_users_of(base.project, who.command)?;
+            let packages = check::packages(base.project, who)?;
+            if state.session.is_none() {
+                state.session = Some(self.session(ctx, &base).await?);
+            }
+            let Some(session) = state.session.as_ref() else {
+                return Err(super::postgres_failed("it is not running", who.command));
+            };
+            run::bring_up(
+                &base,
+                &session.pg,
+                &session.live,
+                &file,
+                &packages,
+                ctx.progress,
+            )
+            .await
+        }
+        .await;
+        state.seen = Some(seen);
+        self.brought(state, result).await
+    }
+
+    /// Records in `state` how a bring-up went, and says so.
+    async fn brought(&self, state: &mut State, result: Result<Brought, Ending>) -> Option<Brought> {
+        match result {
+            Ok(brought) => {
+                state.failed = None;
+                state.last = Some(brought.standing());
+                self.named(&brought.application);
+                self.say(
+                    json!({
+                        "event": "rebuilt",
+                        "version": brought.version,
+                        "migrations_applied": brought.migrations_applied,
+                        "standins": brought.standins_json(),
+                        "test_rows": brought.test_rows_json(),
+                    }),
+                    rebuilt_words(&brought),
+                )
+                .await;
+                Some(brought)
+            }
+            Err(ending) => {
+                let (code, report) = ending.printed();
+                let error = error_of(&report);
+                let words = format!(
+                    "The project could not be brought up again ({}): {}",
+                    one_line(error.get("reason").unwrap_or(&Value::Null)),
+                    one_line(error.get("message").unwrap_or(&Value::Null))
+                );
+                self.say(json!({ "event": "rebuild-failed", "error": error }), words)
+                    .await;
+                state.failed = Some((code, report));
+                None
+            }
+        }
+    }
+
+    /// `vm request`, answered here: served as a request of the browser is,
+    /// after the same look at the project, as the User it names.
+    async fn forwarded_request(&self, ctx: &Ctx<'_>, wanted: &Wanted) -> Result<Done, Ending> {
+        let seen = self.look().await;
+        let Some(mut state) = self.write_state().await else {
+            return Err(busy(&WHO));
+        };
+        let mut caused = None;
+        if let Some(seen) = seen
+            && state.seen != Some(seen)
+        {
+            caused = self.rebuild(ctx, &mut state, seen, &WHO).await;
+        }
+        if let Some((code, report)) = &state.failed {
+            return Err(Ending::from_printed(*code, copy(report)));
+        }
+        let brought = match caused {
+            Some(brought) => brought,
+            None => state
+                .last
+                .as_ref()
+                .map(Brought::standing)
+                .ok_or_else(|| busy(&WHO))?,
+        };
+        let Some(session) = state.session.as_ref() else {
+            return Err(busy(&WHO));
+        };
+        let file = run::test_users_of(&self.project, WHO.command)?;
+        let Some(user) = file.user(&wanted.user) else {
+            return Err(run::no_such_test_user(&file, &wanted.user));
+        };
+        let asked = run::Asked {
+            path: &wanted.path,
+            user,
+            method: wanted.method.clone(),
+            headers: &wanted.headers,
+            // A cheap copy: `Bytes` is shared.
+            body: wanted.body.clone(),
+        };
+        let served = run::serve_and_collect(
+            &session.live,
+            &brought.application,
+            &asked,
+            ctx.progress,
+            &WHO,
+        )
+        .await?;
+        if served.given_to_code {
+            self.say_request(
+                &user.id,
+                &wanted.method,
+                &wanted.path,
+                served.parts.status,
+                &served.request_id,
+            )
+            .await;
+        }
+        Ok(request_output(&brought, &served, &asked))
+    }
+
+    /// `vm local operation-log` or `change-history`, answered here, once
+    /// what the requests before recorded is in.
+    async fn forwarded_read(&self, ctx: &Ctx<'_>, reading: &Reading) -> Result<Done, Ending> {
+        let Some(mut state) = self.write_state().await else {
+            return Err(busy(&WHO_LOCAL));
+        };
+        if state.session.is_none() {
+            let base = self.base(ctx, &WHO_LOCAL);
+            state.session = Some(self.session(ctx, &base).await?);
+        }
+        let Some(session) = state.session.as_ref() else {
+            return Err(busy(&WHO_LOCAL));
+        };
+        // No request runs (the state is held): every operation's task
+        // under way is a finished request's.
+        session.live.gateway.drain(DRAIN_WAIT).await;
+        let application = self.application();
+        if session.live.own.has_own_database(&application) {
+            tokio::time::timeout(DRAIN_WAIT, session.live.own.ship_and_wait(&application))
+                .await
+                .ok();
+        }
+        session.live.ingress.logs.settled(DRAIN_WAIT).await;
+        read_records(&session.live.database, reading, WHO_LOCAL.command).await
+    }
+
+    /// `vm local reset`, done here: the parts closed, the private Postgres
+    /// stopped and made anew, the project brought up on it.
+    async fn forwarded_reset(&self, ctx: &Ctx<'_>) -> Result<Done, Ending> {
+        let seen = self.look().await;
+        let Some(mut state) = self.write_state().await else {
+            return Err(busy(&WHO_RESET));
+        };
+        if let Some(session) = state.session.take() {
+            session.live.close().await;
+            drop(session.pg);
+        }
+        ctx.held.stop_server().await;
+        let base = self.base(ctx, &WHO_RESET);
+        let result = async {
+            let file = run::test_users_of(base.project, WHO_RESET.command)?;
+            let packages = check::packages(base.project, &WHO_RESET)?;
+            let pg = run::start_server(&base, ctx.programs, ctx.progress, ctx.held, true).await?;
+            let live = Live::open(&pg, dev_size(), &WHO_RESET).await?;
+            let session = state.session.insert(Session { pg, live });
+            run::bring_up(
+                &base,
+                &session.pg,
+                &session.live,
+                &file,
+                &packages,
+                ctx.progress,
+            )
+            .await
+        }
+        .await;
+        if let Some(seen) = seen {
+            state.seen = Some(seen);
+        }
+        match result {
+            Ok(brought) => {
+                state.failed = None;
+                state.last = Some(brought.standing());
+                self.named(&brought.application);
+                Ok(reset_output(&brought))
+            }
+            Err(ending) => {
+                let (code, report) = ending.printed();
+                state.failed = Some((code, copy(&report)));
+                Err(Ending::from_printed(code, report))
+            }
+        }
+    }
+
+    /// The line of a request the Application's code was given.
+    async fn say_request(
+        &self,
+        user: &str,
+        method: &Method,
+        path: &str,
+        status: StatusCode,
+        request_id: &str,
+    ) {
+        self.say(
+            json!({
+                "event": "request",
+                "as": user,
+                "method": method.as_str(),
+                "path": path,
+                "status": status.as_u16(),
+                "request_id": request_id,
+            }),
+            format!(
+                "{} {} {} as {} (request {})",
+                Theirs::from(method.as_str()),
+                Theirs::from(path),
+                status.as_u16(),
+                Theirs::from(user),
+                Theirs::from(request_id)
+            ),
+        )
+        .await;
+    }
+
+    /// Answers one request. See the module's text.
+    async fn answer(&self, request: Request<Incoming>) -> Response<Full<Bytes>> {
+        let application = self.application();
+        let address = self.address(&application);
+        let host = request
+            .headers()
+            .get(HOST)
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or_default();
+        match self.which(host, &application) {
+            Which::Ours => {}
+            Which::Loopback => {
+                let target = request.uri().path_and_query().map_or("/", |p| p.as_str());
+                return page::redirect(
+                    StatusCode::TEMPORARY_REDIRECT,
+                    &format!("http://{application}.localhost:{}{target}", self.port),
+                );
+            }
+            Which::Other => return page::misdirected(&address),
+        }
+        if request.uri().path().starts_with("/_vm/") {
+            return self.own_path(request, &application).await;
+        }
+        self.application_request(request, &address).await
+    }
+
+    /// Whose `host` is: the Application's, the loopback address's, or
+    /// another's.
+    fn which(&self, host: &str, application: &str) -> Which {
+        let host = host.trim().to_ascii_lowercase();
+        let (name, port) = if host.starts_with('[') {
+            match host.split_once(']') {
+                Some((inside, "")) => (format!("{inside}]"), None),
+                Some((inside, after)) => match after.strip_prefix(':') {
+                    Some(port) => (format!("{inside}]"), Some(port.to_owned())),
+                    None => return Which::Other,
+                },
+                None => return Which::Other,
+            }
+        } else {
+            match host.rsplit_once(':') {
+                Some((name, port)) => (name.to_owned(), Some(port.to_owned())),
+                None => (host.clone(), None),
+            }
+        };
+        if let Some(port) = port
+            && port.parse::<u16>().ok() != Some(self.port)
+        {
+            return Which::Other;
+        }
+        if name == format!("{application}.localhost") {
+            Which::Ours
+        } else if ["localhost", "127.0.0.1", "[::1]"].contains(&name.as_str()) {
+            Which::Loopback
+        } else {
+            Which::Other
+        }
+    }
+
+    /// A path under `/_vm/`: the page, the control paths, or nothing.
+    async fn own_path(
+        &self,
+        request: Request<Incoming>,
+        application: &str,
+    ) -> Response<Full<Bytes>> {
+        let path = request.uri().path();
+        if path == page::CHOOSER {
+            return match *request.method() {
+                Method::GET | Method::HEAD => self.chooser(&request).await,
+                Method::POST => self.choose(request, application).await,
+                _ => page::method_not_allowed(),
+            };
+        }
+        if let Some(what) = path.strip_prefix("/_vm/control/") {
+            let held = request
+                .headers()
+                .get(control::SECRET_HEADER)
+                .is_some_and(|given| self.secret.matches(given.as_bytes()));
+            if held && request.method() == Method::POST {
+                // Copied: the request's body is read after; a few bytes.
+                let what = what.to_owned();
+                return self.control(request, &what).await;
+            }
+        }
+        page::not_found()
+    }
+
+    /// The chosen test User's id, from the cookie.
+    fn chosen(headers: &hyper::HeaderMap) -> Option<String> {
+        headers
+            .get_all(COOKIE)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .flat_map(|v| v.split(';'))
+            .filter_map(|pair| pair.trim().split_once('='))
+            .find(|(name, _)| *name == TEST_USER_COOKIE)
+            .and_then(|(_, value)| page::percent_decode(value, false))
+    }
+
+    /// `vm.dev.json` as it is now, and (for the page, `with_pulled`) the
+    /// pulled Resources, read off the async workers.
+    async fn users(&self, with_pulled: bool) -> Result<(TestUsersFile, Vec<String>), Ending> {
+        let project = Arc::clone(&self.project);
+        tokio::task::spawn_blocking(move || {
+            let file = run::test_users_of(&project, WHO.command)?;
+            let pulled = if with_pulled {
+                standins::pulled(&project, WHO.command)
+                    .files
+                    .into_iter()
+                    .map(|f| f.resource)
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            Ok((file, pulled))
+        })
+        .await
+        .unwrap_or_else(|_| {
+            Err(super::local_state_failed(
+                "vm.dev.json could not be read",
+                WHO.command,
+            ))
+        })
+    }
+
+    /// `GET /_vm/test-user`.
+    async fn chooser(&self, request: &Request<Incoming>) -> Response<Full<Bytes>> {
+        let next = request
+            .uri()
+            .query()
+            .map(page::form_fields)
+            .and_then(|fields| fields.into_iter().find(|(n, _)| n == "next"))
+            .map(|(_, v)| v);
+        let next = page::local_path(next.as_deref());
+        let chosen = Self::chosen(request.headers());
+        match self.users(true).await {
+            Ok((file, pulled)) => page::chooser(
+                StatusCode::OK,
+                &file,
+                &pulled,
+                chosen.as_deref(),
+                &next,
+                &page::Said::Nothing,
+            ),
+            Err(ending) => page::failed(error_of(&ending.printed().1)),
+        }
+    }
+
+    /// `POST /_vm/test-user`.
+    async fn choose(&self, request: Request<Incoming>, application: &str) -> Response<Full<Bytes>> {
+        let own_origin = format!("http://{application}.localhost:{}", self.port);
+        if let Some(origin) = request.headers().get(ORIGIN)
+            && !origin
+                .as_bytes()
+                .eq_ignore_ascii_case(own_origin.as_bytes())
+        {
+            return page::other_origin();
+        }
+        let chosen = Self::chosen(request.headers());
+        let Some(body) = read_body(request.into_body(), FORM_BYTES).await else {
+            return page::plain(
+                StatusCode::BAD_REQUEST,
+                "The form did not come whole, or is larger than 64 KiB.\n".to_owned(),
+            );
+        };
+        let fields = page::form_fields(&String::from_utf8_lossy(&body));
+        let field = |name: &str| {
+            fields
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, v)| v.as_str())
+        };
+        let next = page::local_path(field("next"));
+        let (file, pulled) = match self.users(true).await {
+            Ok(read) => read,
+            Err(ending) => return page::failed(error_of(&ending.printed().1)),
+        };
+        let user = field("user").unwrap_or_default();
+        if file.user(user).is_some() {
+            page::chosen(&next, user)
+        } else {
+            page::chooser(
+                StatusCode::BAD_REQUEST,
+                &file,
+                &pulled,
+                chosen.as_deref(),
+                &next,
+                &page::Said::NotInFile(user),
+            )
+        }
+    }
+
+    /// A command of the tool's, holding the secret.
+    async fn control(&self, request: Request<Incoming>, what: &str) -> Response<Full<Bytes>> {
+        let Some(body) = read_body(request.into_body(), control::MAX_SENT_BYTES).await else {
+            return page::plain(StatusCode::BAD_REQUEST, "Not read whole.\n".to_owned());
+        };
+        let Ok(value) = serde_json::from_slice::<Value>(&body) else {
+            return page::plain(StatusCode::BAD_REQUEST, "Not JSON.\n".to_owned());
+        };
+        let asked = match what {
+            "request" => wanted_of(&value).map(Asked::Request),
+            "read" => reading_of(&value).map(Asked::Read),
+            "reset" => Some(Asked::Reset),
+            _ => return page::not_found(),
+        };
+        let Some(asked) = asked else {
+            return page::plain(StatusCode::BAD_REQUEST, "Not a command.\n".to_owned());
+        };
+        let (reply, answered) = oneshot::channel();
+        let sent = tokio::time::timeout(READ_WAIT, self.jobs.send(Job::Control { asked, reply }));
+        if !matches!(sent.await, Ok(Ok(()))) {
+            return page::unavailable("vm dev is stopping.");
+        }
+        let Ok(Ok((code, done))) = tokio::time::timeout(READ_WAIT, answered).await else {
+            return page::unavailable("vm dev could not do the command in time, or is stopping.");
+        };
+        let body = json!({ "code": code, "json": done.json, "text": done.text }).to_string();
+        let mut response = Response::new(Full::new(Bytes::from(body)));
+        response
+            .headers_mut()
+            .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        response.headers_mut().insert(
+            hyper::header::CACHE_CONTROL,
+            HeaderValue::from_static("no-store"),
+        );
+        response
+    }
+
+    /// The project brought up to date for a request of the browser: a
+    /// rebuild asked for, and waited for, when it changed. `Err` is what the
+    /// request is answered instead.
+    async fn up_to_date(&self) -> Result<(), Box<Response<Full<Bytes>>>> {
+        let Some(seen) = self.look().await else {
+            return Ok(());
+        };
+        {
+            let state = tokio::time::timeout(READ_WAIT, self.state.read())
+                .await
+                .map_err(|_| Box::new(page::unavailable("vm dev is busy: try again shortly.")))?;
+            if state.seen == Some(seen) {
+                return Ok(());
+            }
+        }
+        let (reply, answered) = oneshot::channel();
+        let sent = tokio::time::timeout(READ_WAIT, self.jobs.send(Job::Rebuild { seen, reply }));
+        if !matches!(sent.await, Ok(Ok(()))) {
+            return Err(Box::new(page::unavailable("vm dev is stopping.")));
+        }
+        match tokio::time::timeout(READ_WAIT, answered).await {
+            Ok(Ok(())) => Ok(()),
+            _ => Err(Box::new(page::unavailable(
+                "vm dev could not bring the project up in time, or is stopping.",
+            ))),
+        }
+    }
+
+    /// A request for the Application.
+    async fn application_request(
+        &self,
+        request: Request<Incoming>,
+        address: &str,
+    ) -> Response<Full<Bytes>> {
+        if let Err(answer) = self.up_to_date().await {
+            return *answer;
+        }
+        let users = self.users(false).await;
+        let Ok(state) = tokio::time::timeout(READ_WAIT, self.state.read()).await else {
+            return page::unavailable("vm dev is busy: try again shortly.");
+        };
+        if let Some((_, report)) = &state.failed {
+            return page::failed(error_of(report));
+        }
+        let Some(session) = state.session.as_ref() else {
+            return page::unavailable("vm dev is starting the local databases over.");
+        };
+        let file = match users {
+            Ok((file, _)) => file,
+            Err(ending) => return page::failed(error_of(&ending.printed().1)),
+        };
+        // Copied: the request owns its User, as the file has it now; once
+        // a request.
+        let user = Self::chosen(request.headers())
+            .and_then(|id| file.user(&id).map(|u| (u.id.clone(), u.groups.clone())));
+        let Some((id, groups)) = user else {
+            let page_wanted = matches!(*request.method(), Method::GET | Method::HEAD)
+                && request.headers().get_all(ACCEPT).iter().any(|a| {
+                    a.as_bytes()
+                        .to_ascii_lowercase()
+                        .windows(9)
+                        .any(|w| w == b"text/html")
+                });
+            if page_wanted {
+                let target = request.uri().path_and_query().map_or("/", |p| p.as_str());
+                return page::redirect(
+                    StatusCode::SEE_OTHER,
+                    &format!(
+                        "{}?next={}",
+                        page::CHOOSER,
+                        page::percent_encode(target, true)
+                    ),
+                );
+            }
+            return page::no_user(address);
+        };
+        let (mut parts, body) = request.into_parts();
+        without_test_user_cookie(&mut parts.headers);
+        // Copied: the line printed after names them; once a request.
+        let method = parts.method.clone();
+        let path = parts
+            .uri
+            .path_and_query()
+            .map_or_else(|| "/".to_owned(), |p| p.as_str().to_owned());
+        parts.extensions.insert(ChosenTestUser(User {
+            // Copied: the line printed after names the User too.
+            id: id.clone(),
+            groups,
+        }));
+        let response = session
+            .live
+            .ingress
+            .handle(Request::from_parts(parts, body))
+            .await;
+        drop(state);
+        if response
+            .extensions()
+            .get::<crate::ingress::GivenToCode>()
+            .is_some()
+        {
+            let request_id = response
+                .headers()
+                .get(crate::ingress::REQUEST_ID_HEADER)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default();
+            self.say_request(&id, &method, &path, response.status(), request_id)
+                .await;
+        }
+        response
+    }
+}
+
+impl Handler for Front {
+    fn handle(
+        &self,
+        request: Request<Incoming>,
+    ) -> impl Future<Output = Response<Full<Bytes>>> + Send {
+        self.answer(request)
+    }
+}
+
+/// Whose a `Host` is.
+enum Which {
+    Ours,
+    Loopback,
+    Other,
+}
+
+/// `vm dev` could not take the command now.
+fn busy(who: &Who) -> Ending {
+    Ending::new(
+        1,
+        "failed",
+        format!(
+            "vm dev, which runs in this project, could not do {} now (it is busy or starting the local databases over): run it again",
+            who.command
+        ),
+    )
+}
+
+/// The cookie of the chosen test User taken out of `Cookie` (the others
+/// stay; a header left empty is left out).
+fn without_test_user_cookie(headers: &mut hyper::HeaderMap) {
+    let kept: Vec<String> = headers
+        .get_all(COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(';'))
+        .map(str::trim)
+        .filter(|pair| !pair.is_empty())
+        .filter(|pair| pair.split_once('=').map_or(*pair, |(n, _)| n) != TEST_USER_COOKIE)
+        .map(str::to_owned)
+        .collect();
+    headers.remove(COOKIE);
+    if !kept.is_empty()
+        && let Ok(value) = HeaderValue::from_str(&kept.join("; "))
+    {
+        headers.insert(COOKIE, value);
+    }
+}
+
+/// A body of at most `limit` bytes, within [`BODY_WAIT`].
+async fn read_body(body: Incoming, limit: usize) -> Option<Bytes> {
+    let read = Limited::new(body, limit).collect();
+    match tokio::time::timeout(BODY_WAIT, read).await {
+        Ok(Ok(collected)) => Some(collected.to_bytes()),
+        _ => None,
+    }
+}
+
+/// Hex digits back to their bytes.
+fn unhex(text: &str) -> Option<Vec<u8>> {
+    if !text.len().is_multiple_of(2) {
+        return None;
+    }
+    text.as_bytes()
+        .chunks(2)
+        .map(|pair| {
+            let digits = std::str::from_utf8(pair).ok()?;
+            u8::from_str_radix(digits, 16).ok()
+        })
+        .collect()
+}
+
+/// The request a `vm request` sent.
+fn wanted_of(value: &Value) -> Option<Wanted> {
+    let mut headers = Vec::new();
+    for pair in value["headers"].as_array()? {
+        let name = HeaderName::from_bytes(pair.get(0)?.as_str()?.as_bytes()).ok()?;
+        let value = HeaderValue::from_bytes(&unhex(pair.get(1)?.as_str()?)?).ok()?;
+        headers.push((name, value));
+    }
+    Some(Wanted {
+        path: value["path"].as_str()?.to_owned(),
+        user: value["as"].as_str()?.to_owned(),
+        method: Method::from_bytes(value["method"].as_str()?.as_bytes()).ok()?,
+        headers,
+        body: Bytes::from(unhex(value["body"].as_str()?)?),
+    })
+}
+
+/// What a `vm local` sent.
+fn reading_of(value: &Value) -> Option<Reading> {
+    let limit = u16::try_from(value["limit"].as_u64()?).ok()?;
+    match value["read"].as_str()? {
+        "operation-log" => Some(Reading::OperationLog { limit }),
+        "change-history" => {
+            let table = match &value["table"] {
+                Value::Null => None,
+                pair => Some((
+                    pair.get(0)?.as_str()?.to_owned(),
+                    pair.get(1)?.as_str()?.to_owned(),
+                )),
+            };
+            Some(Reading::ChangeHistory { limit, table })
+        }
+        _ => None,
+    }
+}
+
+/// A rebuild in words, on one line.
+fn rebuilt_words(brought: &Brought) -> String {
+    let mut words = format!("Rebuilt: local Version {}", brought.version);
+    if !brought.migrations_applied.is_empty() {
+        let names: Vec<String> = brought
+            .migrations_applied
+            .iter()
+            .map(|m| Theirs::from(m.as_str()).to_string())
+            .collect();
+        words.push_str(&format!("; migrations applied: {}", names.join(", ")));
+    }
+    let made: Vec<String> = brought
+        .standins
+        .iter()
+        .filter(|(_, made)| *made)
+        .map(|(resource, _)| Theirs::from(resource.as_str()).to_string())
+        .collect();
+    if !made.is_empty() {
+        words.push_str(&format!("; stand-ins made: {}", made.join(", ")));
+    }
+    let loaded: Vec<String> = brought
+        .test_rows
+        .iter()
+        .map(|(file, rows)| format!("{} ({rows} rows)", Theirs::from(file.as_str())))
+        .collect();
+    if !loaded.is_empty() {
+        words.push_str(&format!("; test rows loaded: {}", loaded.join(", ")));
+    }
+    words.push('.');
+    words
+}

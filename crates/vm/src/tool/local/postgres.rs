@@ -318,6 +318,26 @@ impl Local {
         }
     }
 
+    /// Empties the private Postgres's data folder, for a reset: what the
+    /// local runs made goes with it. The caller holds the lock and has
+    /// stopped the server.
+    pub(super) fn empty_data(&self) -> Result<(), String> {
+        let data = self.data();
+        empty_folder(&data)
+            .map_err(|error| format!("{} cannot be emptied ({error})", data.display()))
+    }
+
+    /// New passwords, for a reset: the state written anew, whole.
+    pub(super) fn renew_state(&self) -> Result<State, String> {
+        let state = State {
+            superuser: Secret::generate()?,
+            platform: Secret::generate()?,
+            ready: false,
+        };
+        self.write_state(&state)?;
+        Ok(state)
+    }
+
     /// Takes the lock, trying every [`LOCK_POLL`] while another command
     /// holds it (`waiting` is called once, then); the caller bounds the
     /// wait.
@@ -424,11 +444,11 @@ impl Local {
         if data.join("PG_VERSION").is_file() {
             return Ok(());
         }
-        if data.exists() {
-            fs::remove_dir_all(&data)
-                .map_err(|e| format!("{} cannot be made anew ({e})", data.display()))?;
-        }
-        let password_file = self.dir.join(".initdb-password");
+        // A folder left without a cluster (a reset's, or an initdb that
+        // failed) is emptied, not removed: initdb takes an empty folder.
+        empty_folder(&data).map_err(|e| format!("{} cannot be made anew ({e})", data.display()))?;
+        // In the command's own folder (private, in TMPDIR), not the project.
+        let password_file = own.join(".initdb-password");
         fs::remove_file(&password_file).ok();
         let written = OpenOptions::new()
             .write(true)
@@ -651,6 +671,25 @@ impl Local {
             Answer::NotOurs
         }
     }
+}
+
+/// Removes everything inside `folder`, which stays; nothing when it is not
+/// there. No link is followed: a link inside is removed, not its target.
+fn empty_folder(folder: &Path) -> std::io::Result<()> {
+    let entries = match fs::read_dir(folder) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    for entry in entries {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            fs::remove_dir_all(entry.path())?;
+        } else {
+            fs::remove_file(entry.path())?;
+        }
+    }
+    Ok(())
 }
 
 /// What a server named by a `postmaster.pid` showed itself to be.

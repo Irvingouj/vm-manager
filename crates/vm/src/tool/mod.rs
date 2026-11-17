@@ -41,7 +41,9 @@ mod versions;
 pub use check::CheckArgs;
 pub use deploy::DeployArgs;
 pub use generate::GenerateArgs;
-pub use local::{ChangeHistoryArgs, LocalArgs, LocalCommand, OperationLogArgs, RequestArgs};
+pub use local::{
+    ChangeHistoryArgs, DevArgs, LocalArgs, LocalCommand, OperationLogArgs, RequestArgs, ResetArgs,
+};
 pub use logs::LogsArgs;
 pub use new::NewArgs;
 pub use pull::PullArgs;
@@ -136,6 +138,7 @@ pub enum Command {
     GoBack(GoBackArgs),
     Logs(LogsArgs),
     Request(RequestArgs),
+    Dev(DevArgs),
     Local(LocalArgs),
 }
 
@@ -252,6 +255,38 @@ impl Ending {
         }
     }
 
+    /// What [`run`] prints of this ending: its exit code, the JSON (with
+    /// `--json`, on standard output) and the words (on standard error).
+    fn printed(self) -> (u8, Done) {
+        match self.detail {
+            Some(report) => (self.code, *report),
+            None => {
+                let json =
+                    json!({ "error": { "reason": self.reason, "message": self.message.json() } });
+                let text = format!("{}\n", self.message.words());
+                (self.code, Done { json, text })
+            }
+        }
+    }
+
+    /// The ending that prints `report` with exit code `code`: one
+    /// [`Ending::printed`] gave, sent from elsewhere (a `vm dev` that
+    /// answered the command).
+    fn from_printed(code: u8, report: Done) -> Self {
+        let reason = report
+            .json
+            .get("error")
+            .and_then(|error| error.get("reason"))
+            .cloned()
+            .unwrap_or(Value::Null);
+        Self {
+            code,
+            reason,
+            message: Said::Ours(String::new()),
+            detail: Some(Box::new(report)),
+        }
+    }
+
     fn credential_file(message: String) -> Self {
         Self::new(1, "credential-file", message)
     }
@@ -274,6 +309,9 @@ impl Done {
     }
 }
 
+/// The longest the end of a command waits for a blocking task of its own.
+const RUNTIME_END_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Runs a command of the tool and prints its outcome.
 pub fn run(command: Command) -> ExitCode {
     let json = match &command {
@@ -287,6 +325,7 @@ pub fn run(command: Command) -> ExitCode {
         Command::GoBack(args) => args.output.json,
         Command::Logs(args) => args.output.json,
         Command::Request(args) => args.output.json,
+        Command::Dev(args) => args.output.json,
         Command::Local(args) => args.json(),
         Command::SignOut(o)
         | Command::Whoami(o)
@@ -298,25 +337,33 @@ pub fn run(command: Command) -> ExitCode {
         .enable_time()
         .build()
     {
-        Ok(runtime) => runtime.block_on(async {
-            match command {
-                Command::SignIn(args) => sign_in(&args).await,
-                Command::SignOut(_) => sign_out().await,
-                Command::Whoami(_) => whoami().await,
-                Command::Resources(_) => resources().await,
-                Command::Applications(_) => applications().await,
-                Command::Pull(args) => pull::pull(&args).await,
-                Command::New(args) => new::new(&args),
-                Command::Check(args) => check::check(&args).await,
-                Command::Generate(args) => generate::generate(&args).await,
-                Command::Deploy(args) => deploy::deploy(&args).await,
-                Command::Versions(args) => versions::versions(&args).await,
-                Command::GoBack(args) => versions::go_back(&args).await,
-                Command::Logs(args) => logs::logs(&args).await,
-                Command::Request(args) => local::request(&args).await,
-                Command::Local(args) => local::local(&args).await,
-            }
-        }),
+        Ok(runtime) => {
+            let outcome = runtime.block_on(async {
+                match command {
+                    Command::SignIn(args) => sign_in(&args).await,
+                    Command::SignOut(_) => sign_out().await,
+                    Command::Whoami(_) => whoami().await,
+                    Command::Resources(_) => resources().await,
+                    Command::Applications(_) => applications().await,
+                    Command::Pull(args) => pull::pull(&args).await,
+                    Command::New(args) => new::new(&args),
+                    Command::Check(args) => check::check(&args).await,
+                    Command::Generate(args) => generate::generate(&args).await,
+                    Command::Deploy(args) => deploy::deploy(&args).await,
+                    Command::Versions(args) => versions::versions(&args).await,
+                    Command::GoBack(args) => versions::go_back(&args).await,
+                    Command::Logs(args) => logs::logs(&args).await,
+                    Command::Request(args) => local::request(&args).await,
+                    Command::Dev(args) => local::dev(&args).await,
+                    Command::Local(args) => local::local(&args).await,
+                }
+            });
+            // A blocking task still running (a write to an output that
+            // takes nothing, `vm dev`'s) is waited for a bounded time, not
+            // for ever.
+            runtime.shutdown_timeout(RUNTIME_END_WAIT);
+            outcome
+        }
         Err(error) => Err(Ending::new(
             1,
             "failed",
@@ -334,29 +381,14 @@ pub fn run(command: Command) -> ExitCode {
             };
             (0, written)
         }
-        Err(Ending {
-            code,
-            detail: Some(report),
-            ..
-        }) => {
+        Err(ending) => {
+            let (code, report) = ending.printed();
             let written = if json {
                 write_to(&mut io::stdout().lock(), &json_line(&report.json))
             } else {
                 write_to(&mut io::stderr().lock(), &report.text)
             };
             (code, written)
-        }
-        Err(ending) => {
-            let written = if json {
-                let body = json!({ "error": { "reason": ending.reason, "message": ending.message.json() } });
-                write_to(&mut io::stdout().lock(), &json_line(&body))
-            } else {
-                write_to(
-                    &mut io::stderr().lock(),
-                    &format!("{}\n", ending.message.words()),
-                )
-            };
-            (ending.code, written)
         }
     };
     match written {

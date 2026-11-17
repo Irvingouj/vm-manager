@@ -38,6 +38,12 @@ use crate::tool_credentials::{self, Presented, ToolCredentials};
 /// The header that names a request, in every answer and every record.
 pub const REQUEST_ID_HEADER: &str = "x-vm-request-id";
 
+/// Marks, in a response's extensions (never sent), an answer to a request
+/// the Application's code was given: for the local run's lines of what it
+/// served (crate::tool's `local`).
+#[derive(Clone, Copy, Debug)]
+pub struct GivenToCode;
+
 /// The name under the domain where the platform's API is.
 const API_NAME: &str = "api";
 
@@ -96,7 +102,7 @@ impl Ingress {
                 own(StatusCode::BAD_REQUEST, "Bad request: no Host header.\n"),
             );
         };
-        let stated = self.sign_in.user_of(&parts.headers);
+        let stated = self.sign_in.user_of(&parts);
         if let SignedIn::Malformed(_) = stated {
             return finish(
                 &known,
@@ -268,6 +274,7 @@ impl Ingress {
         // The Application's code was given the request: its log entry,
         // made now and handed over without waiting, before the request
         // record.
+        let mut response = response;
         if ran {
             self.logs.request_ended(
                 &in_flight,
@@ -275,6 +282,7 @@ impl Ingress {
                 parts.uri.path(),
                 response.status(),
             );
+            response.extensions_mut().insert(GivenToCode);
         }
         finish(&known, response)
     }

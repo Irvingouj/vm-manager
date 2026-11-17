@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 /// An employee signed in to an Application, with the Groups the identity
 /// provider (for now: the stand-in sign-in) reports for them, in the order
 /// they were first stated.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct User {
     pub id: String,
     pub groups: Vec<String>,

@@ -775,6 +775,55 @@ impl OwnDatabases {
         self.migrate(&known, name, sender, list).await
     }
 
+    /// The local run's only (blackbox/CONTRACT.md, "Test rows": the own
+    /// database made anew before its test rows are loaded again; never
+    /// called by `vm serve`): forgets the own database of `application`,
+    /// whose database the caller has dropped (the local run's superuser
+    /// may; the platform's role may not). Its pool and what this program
+    /// knows of it are let go, and its rows of `own_databases` and
+    /// `own_database_states` are deleted, so that the next
+    /// [`OwnDatabases::prepare`] makes it again from nothing: its roles
+    /// (which stay, by their names, and get new passwords), its database,
+    /// the platform's schema and keys. Answers its number when it had one.
+    pub async fn forget(&self, application: &str) -> Result<Option<i64>, DbError> {
+        let removed = self
+            .known
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(application);
+        self.pools
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .held
+            .remove(application);
+        let Some(known) = removed else {
+            return Ok(None);
+        };
+        let number = known.number;
+        self.platform
+            .pool()
+            .run(async |client: &mut Client| {
+                let transaction = client.transaction().await.map_err(DbError::from)?;
+                for table in ["own_database_states", "own_databases"] {
+                    transaction
+                        .execute(
+                            &format!("DELETE FROM {table} WHERE application_id = $1"),
+                            &[&number],
+                        )
+                        .await
+                        .map_err(DbError::from)?;
+                }
+                transaction.commit().await.map_err(DbError::from)
+            })
+            .await?;
+        Ok(Some(number))
+    }
+
+    /// The name of the own database of the Application numbered `number`.
+    pub fn database_name(&self, number: i64) -> String {
+        format!("{}_app_{number}", self.prefix)
+    }
+
     /// Asks for a shipment of `application`'s outbox ([`relay`]) and does
     /// not wait for it: after a write, a committed transaction or a Version
     /// was answered (blackbox/CONTRACT.md, "Shipping: When"). Nothing for an

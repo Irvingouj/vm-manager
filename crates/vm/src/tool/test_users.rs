@@ -160,6 +160,9 @@ impl Serialize for Json {
 pub struct TestUser {
     pub id: String,
     pub groups: Vec<String>,
+    /// `displayName`, when the file gives one.
+    pub display_name: Option<String>,
+    pub email: Option<String>,
 }
 
 /// A Grant of the file.
@@ -293,9 +296,12 @@ fn checked(whole: Json) -> Result<TestUsersFile, String> {
                 return Err(format!("has {at}.{key} ({id}) that is not text"));
             }
         }
+        let text_of = |key: &str| user.get(key).and_then(Json::as_str).map(str::to_owned);
         read_users.push(TestUser {
             id: id.clone(),
             groups: read_groups,
+            display_name: text_of("displayName"),
+            email: text_of("email"),
         });
     }
     let grants = match whole.get("grants") {

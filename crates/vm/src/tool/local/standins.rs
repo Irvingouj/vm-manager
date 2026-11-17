@@ -118,14 +118,14 @@ fn read(project: &Path, name: &str) -> Option<StandinFile> {
 
 /// A statement of a `standin.sql`: its text and its first line as
 /// written (with its `;` when the statement is one line).
-struct Statement<'a> {
-    text: &'a str,
-    first_line: &'a str,
+pub(super) struct Statement<'a> {
+    pub text: &'a str,
+    pub first_line: &'a str,
 }
 
 /// The statements of `text`, as Postgres's scanner splits them; `None`
 /// when it cannot.
-fn statements(text: &str) -> Option<Vec<Statement<'_>>> {
+pub(super) fn statements(text: &str) -> Option<Vec<Statement<'_>>> {
     let pieces = pg_query::split_with_scanner(text).ok()?;
     let mut found = Vec::with_capacity(pieces.len());
     let mut from = 0;

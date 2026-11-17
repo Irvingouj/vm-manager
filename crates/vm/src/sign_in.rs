@@ -9,6 +9,9 @@
 //!   unless the stand-in is switched on.
 //! - [`StandInSignIn`]: development only. The caller states the User and
 //!   their Groups in two headers.
+//! - [`LocalSignIn`]: the local run's (`vm request`, `vm dev`): the test
+//!   User the local run chose is put in the request's extensions, where
+//!   nothing that comes over the wire can put anything.
 //!
 //! Whatever the caller uses to state the User never reaches Application
 //! code: Ingress removes every header under [`RESERVED_HEADER_PREFIX`],
@@ -16,6 +19,7 @@
 
 use hyper::HeaderMap;
 use hyper::header::HeaderValue;
+use hyper::http::request::Parts;
 
 use crate::user::User;
 
@@ -45,7 +49,7 @@ pub enum SignedIn {
 
 /// A way of establishing the User of a request.
 pub trait SignIn: Send + Sync {
-    fn user_of(&self, headers: &HeaderMap) -> SignedIn;
+    fn user_of(&self, request: &Parts) -> SignedIn;
 
     /// Whether this is the development-only stand-in.
     fn is_stand_in(&self) -> bool;
@@ -55,7 +59,7 @@ pub trait SignIn: Send + Sync {
 pub struct NoSignIn;
 
 impl SignIn for NoSignIn {
-    fn user_of(&self, _headers: &HeaderMap) -> SignedIn {
+    fn user_of(&self, _request: &Parts) -> SignedIn {
         SignedIn::NotSignedIn
     }
 
@@ -64,27 +68,23 @@ impl SignIn for NoSignIn {
     }
 }
 
-/// The local run's (`vm request`): every request is the test User the
-/// command names, signed in with that User's id and Groups as the test
-/// Users file gives them. Nothing of the request's headers counts.
-pub struct FixedSignIn {
-    id: String,
-    groups: Vec<String>,
-}
+/// The test User the local run chose for a request, put in the request's
+/// extensions by the local run itself (`vm request`, `vm dev`).
+#[derive(Clone, Debug)]
+pub struct ChosenTestUser(pub User);
 
-impl FixedSignIn {
-    pub fn new(id: String, groups: Vec<String>) -> Self {
-        Self { id, groups }
-    }
-}
+/// The local run's: a request is signed in as the [`ChosenTestUser`] its
+/// extensions hold, and is not signed in without one. Nothing of the
+/// request's headers counts: an extension is never made from the wire.
+pub struct LocalSignIn;
 
-impl SignIn for FixedSignIn {
-    fn user_of(&self, _headers: &HeaderMap) -> SignedIn {
-        // Copied: each request owns its User; the local run makes one.
-        SignedIn::User(User {
-            id: self.id.clone(),
-            groups: self.groups.clone(),
-        })
+impl SignIn for LocalSignIn {
+    fn user_of(&self, request: &Parts) -> SignedIn {
+        match request.extensions.get::<ChosenTestUser>() {
+            // Copied: each request owns its User; once per request.
+            Some(chosen) => SignedIn::User(chosen.0.clone()),
+            None => SignedIn::NotSignedIn,
+        }
     }
 
     fn is_stand_in(&self) -> bool {
@@ -105,7 +105,8 @@ impl SignIn for FixedSignIn {
 pub struct StandInSignIn;
 
 impl SignIn for StandInSignIn {
-    fn user_of(&self, headers: &HeaderMap) -> SignedIn {
+    fn user_of(&self, request: &Parts) -> SignedIn {
+        let headers = &request.headers;
         let id = match one_value(headers, STAND_IN_USER_HEADER) {
             Ok(Some(id)) => id,
             Ok(None) => return SignedIn::NotSignedIn,
