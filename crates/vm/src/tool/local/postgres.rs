@@ -76,6 +76,11 @@ const STOP_WAIT: Duration = Duration::from_secs(15);
 /// run's set-up).
 pub(super) const CONNECT_WAIT: Duration = Duration::from_secs(5);
 
+/// How long a refused connection is tried again before what a
+/// `postmaster.pid` names is taken for gone: a server of ours that was just
+/// started listens within it.
+const REFUSED_WAIT: Duration = Duration::from_secs(3);
+
 /// Ports tried before starting is given up.
 const PORT_ATTEMPTS: usize = 5;
 
@@ -232,10 +237,17 @@ async fn checked(programs: &Programs, own: &Path) -> Result<(), String> {
     .map_err(|_| "has a postgres that did not say its version in time".to_owned())?
     .map_err(|e| format!("has a postgres that cannot be run ({e})"))?;
     let said = ran.out.text();
+    // `postgres (PostgreSQL) 18.6`, and whatever a distribution adds after
+    // the number (`(Homebrew)`, `(Debian 18.6-1)`) or in it (`18beta1`).
     let major = said
-        .split_whitespace()
-        .last()
-        .and_then(|v| v.split(['.', 'b', 'r']).next())
+        .split_once("(PostgreSQL)")
+        .and_then(|(_, rest)| rest.split_whitespace().next())
+        .map(|number| {
+            number
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>()
+        })
         .and_then(|m| m.parse::<u32>().ok());
     match major {
         Some(16..=18) if ran.status.success() => Ok(()),
@@ -526,69 +538,57 @@ impl Local {
     }
 
     /// Stops a server a run killed outright left running, once it has shown
-    /// it is this project's (see the module's text). Nothing when there is
+    /// it is this project's: it takes this project's superuser and
+    /// password on the port `postmaster.pid` names and says its data folder
+    /// is this one. A file whose server does not is not believed: nobody is
+    /// signalled, the file is removed (Postgres would not start while the
+    /// process it names lives), and the run goes on. Nothing when there is
     /// no `postmaster.pid`.
     pub(super) async fn stop_leftover(&self, state: &State) -> Result<(), String> {
         let pid_file = self.data().join("postmaster.pid");
         let Ok(text) = fs::read_to_string(&pid_file) else {
             return Ok(());
         };
+        let not_believed = || {
+            fs::remove_file(&pid_file)
+                .or_else(|e| {
+                    if e.kind() == ErrorKind::NotFound {
+                        Ok(())
+                    } else {
+                        Err(e)
+                    }
+                })
+                .map_err(|e| format!("{} cannot be removed ({e})", pid_file.display()))
+        };
         let mut lines = text.lines();
-        let pid = lines.next().and_then(|l| l.trim().parse::<i32>().ok());
+        let pid = lines
+            .next()
+            .and_then(|l| l.trim().parse::<i32>().ok())
+            .and_then(Pid::from_raw);
         let port = lines.nth(2).and_then(|l| l.trim().parse::<u16>().ok());
-        let (Some(pid), Some(port)) = (pid.and_then(Pid::from_raw), port) else {
-            return Ok(());
+        let (Some(pid), Some(port)) = (pid, port) else {
+            return not_believed();
         };
         if test_kill_process(pid).is_err() {
-            // Nothing runs under that number: Postgres removes a file left
-            // by a server that is gone.
-            return Ok(());
+            return not_believed();
         }
-        let address = self.superuser_address(state, port, "postgres");
-        let ours = async {
-            // A server still starting up (or recovering from being killed)
-            // says so, and is waited for.
-            let deadline = tokio::time::Instant::now() + READY_WAIT;
-            let connection = loop {
-                match Connection::open(&address.config(CONNECT_WAIT), CONNECT_WAIT).await {
-                    Ok(connection) => break connection,
-                    Err(error)
-                        if error.code() == Some(&SqlState::CANNOT_CONNECT_NOW)
-                            && tokio::time::Instant::now() < deadline =>
-                    {
-                        tokio::time::sleep(LOCK_POLL).await;
-                    }
-                    Err(error) => {
-                        return Err(format!("it does not take this project's login ({error})"));
-                    }
+        match self.answers_as_ours(state, port).await {
+            Answer::Ours => {}
+            Answer::NotOurs => {
+                // A Postgres whose working folder is this data folder (it
+                // works in it) is ours even when it does not answer: it is
+                // left alone, and its file is not removed.
+                let cwd = fs::read_link(format!("/proc/{}/cwd", pid.as_raw_nonzero()))
+                    .ok()
+                    .and_then(|c| fs::canonicalize(c).ok());
+                let data = fs::canonicalize(self.data()).ok();
+                if cwd.is_some() && cwd == data {
+                    return Err(
+                        "a Postgres of this project's data is running and does not answer as this project's: wait for the command that started it to end, or remove the folder .vm/local/ to start the local databases anew".to_owned(),
+                    );
                 }
-            };
-            let row = tokio::time::timeout(
-                CONNECT_WAIT,
-                connection.client().query_one("SHOW data_directory", &[]),
-            )
-            .await
-            .map_err(|_| "it does not say its data folder in time".to_owned())?
-            .map_err(|e| format!("it does not say its data folder ({})", DbError::from(e)))?;
-            let said: String = row
-                .try_get(0)
-                .map_err(|e| format!("it does not say its data folder ({e})"))?;
-            let theirs = fs::canonicalize(&said)
-                .map_err(|e| format!("its data folder {said} cannot be found ({e})"))?;
-            let mine = fs::canonicalize(self.data())
-                .map_err(|e| format!("the data folder cannot be found ({e})"))?;
-            if theirs == mine {
-                Ok(())
-            } else {
-                Err(format!("its data folder is {said}"))
+                return not_believed();
             }
-        };
-        if let Err(why) = ours.await {
-            return Err(format!(
-                "a process ({}) holds the data folder {} and is not this project's Postgres as far as can be told ({why}): stop it, then run the command again",
-                pid.as_raw_nonzero(),
-                self.data().display()
-            ));
         }
         for signal in [Signal::INT, Signal::QUIT] {
             kill_process(pid, signal).ok();
@@ -602,10 +602,61 @@ impl Local {
             Ok(())
         } else {
             Err(format!(
-                "the Postgres a killed run left ({pid:?}) does not stop: stop it, then run the command again"
+                "this project's Postgres that a killed run left (process {}) does not stop, even when killed: run the command again in a moment",
+                pid.as_raw_nonzero()
             ))
         }
     }
+
+    /// Whether a server on `port` is this project's: it takes this
+    /// project's superuser and password, and says its data folder is this
+    /// one. One starting up or shutting down (`57P03`) is waited for up to
+    /// [`READY_WAIT`]; a refused connection is tried again for
+    /// [`REFUSED_WAIT`].
+    async fn answers_as_ours(&self, state: &State, port: u16) -> Answer {
+        let address = self.superuser_address(state, port, "postgres");
+        let started = tokio::time::Instant::now();
+        let connection = loop {
+            match Connection::open(&address.config(CONNECT_WAIT), CONNECT_WAIT).await {
+                Ok(connection) => break connection,
+                Err(error) => {
+                    let waited = started.elapsed();
+                    let again = match error.code() {
+                        Some(code) => *code == SqlState::CANNOT_CONNECT_NOW && waited < READY_WAIT,
+                        // No SQLSTATE: nothing answered (refused, or no
+                        // answer in time).
+                        None => !error.is_timeout() && waited < REFUSED_WAIT,
+                    };
+                    if !again {
+                        return Answer::NotOurs;
+                    }
+                    tokio::time::sleep(LOCK_POLL).await;
+                }
+            }
+        };
+        let said = tokio::time::timeout(
+            CONNECT_WAIT,
+            connection.client().query_one("SHOW data_directory", &[]),
+        )
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .and_then(|row| row.try_get::<_, String>(0).ok());
+        drop(connection);
+        let theirs = said.and_then(|s| fs::canonicalize(s).ok());
+        let mine = fs::canonicalize(self.data()).ok();
+        if theirs.is_some() && theirs == mine {
+            Answer::Ours
+        } else {
+            Answer::NotOurs
+        }
+    }
+}
+
+/// What a server named by a `postmaster.pid` showed itself to be.
+enum Answer {
+    Ours,
+    NotOurs,
 }
 
 /// Whether the process `pid` is gone within `limit`.
