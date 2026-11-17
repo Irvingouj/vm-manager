@@ -91,6 +91,8 @@ struct Query(Vec<(String, String)>);
 
 impl Query {
     fn of(parts: &Parts) -> Self {
+        // Decoded into owned text: percent-decoding makes new strings;
+        // once a request, of a query hyper bounds with the head.
         let pairs = parts
             .uri
             .query()
@@ -249,6 +251,8 @@ impl Oidc {
         let kept = cookies::find(&parts.headers, cookies::sign_in_name(self.secure()))
             .filter(|v| looks_random(v))
             .map(str::to_owned);
+        // Owned: the value is written into the address and the cookie;
+        // once a request, 43 bytes.
         let state = match kept {
             Some(state) => state,
             None => match Secret::random() {
@@ -341,6 +345,7 @@ impl Oidc {
         let kept = cookies::find(&parts.headers, cookies::sign_in_name(self.secure()))
             .filter(|v| looks_random(v))
             .map(str::to_owned);
+        // Owned as in step 1: once a sign-in, 43 bytes.
         let browser = match kept {
             Some(browser) => browser,
             None => match Secret::random() {
@@ -353,6 +358,8 @@ impl Oidc {
         else {
             return pages::unavailable(&again);
         };
+        // Copied: the kept configuration's address, with this sign-in's
+        // query added; once a sign-in.
         let mut authorization = configuration.authorization_endpoint.clone();
         authorization
             .query_pairs_mut()
@@ -364,6 +371,8 @@ impl Oidc {
             .append_pair("nonce", nonce.expose())
             .append_pair("code_challenge", &s256(&verifier))
             .append_pair("code_challenge_method", "S256");
+        // What the callback needs is kept until it comes: copied once a
+        // sign-in, each bounded (MAX_PARAMETER_BYTES).
         let begun = self.under_way.begin(
             &provider_state,
             Pending {
@@ -487,6 +496,7 @@ impl Oidc {
                 &again,
             );
         };
+        // Held as a secret from here; once a sign-in.
         let code = Secret::from_text(code.to_owned());
         let exchanged = self
             .provider

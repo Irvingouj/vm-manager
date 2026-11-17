@@ -328,6 +328,7 @@ impl Provider {
             log_problem("token", "no-id-token", None);
             return Err(Problem::NoIdToken);
         };
+        // Held as secrets from here on; once a sign-in or renewal.
         let id_token = Secret::from_text(id_token.to_owned());
         let refresh_token = json
             .get("refresh_token")

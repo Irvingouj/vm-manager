@@ -52,8 +52,8 @@ pub fn own_headers(headers: &mut HeaderMap) {
     headers.insert(CONTENT_SECURITY_POLICY, HeaderValue::from_static(POLICY));
 }
 
-fn own(status: StatusCode, content_type: &'static str, body: String) -> Response<Full<Bytes>> {
-    let mut response = Response::new(Full::new(Bytes::from(body)));
+fn own(status: StatusCode, content_type: &'static str, body: Bytes) -> Response<Full<Bytes>> {
+    let mut response = Response::new(Full::new(body));
     *response.status_mut() = status;
     let headers = response.headers_mut();
     headers.insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
@@ -70,9 +70,9 @@ fn page(status: StatusCode, title: &str, body: &str) -> Response<Full<Bytes>> {
     own(
         status,
         "text/html; charset=utf-8",
-        format!(
+        Bytes::from(format!(
             "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>{title}</title><style>{STYLE}</style></head><body><h1>{title}</h1>{body}</body></html>\n"
-        ),
+        )),
     )
 }
 
@@ -144,7 +144,11 @@ pub fn signed_out(clear: Option<HeaderValue>) -> Response<Full<Bytes>> {
 
 /// A short plain-text answer.
 pub fn plain(status: StatusCode, text: &'static str) -> Response<Full<Bytes>> {
-    own(status, "text/plain; charset=utf-8", text.to_owned())
+    own(
+        status,
+        "text/plain; charset=utf-8",
+        Bytes::from_static(text.as_bytes()),
+    )
 }
 
 /// `503` as a page: the platform database or the provider could not be
@@ -162,16 +166,12 @@ pub fn unavailable(again: &str) -> Response<Full<Bytes>> {
 
 /// A JSON answer.
 pub fn json(body: String) -> Response<Full<Bytes>> {
-    own(StatusCode::OK, "application/json", body)
+    own(StatusCode::OK, "application/json", Bytes::from(body))
 }
 
 /// `302` to `location`, setting these cookies.
 pub fn redirect(location: &str, cookies: Vec<HeaderValue>) -> Response<Full<Bytes>> {
-    let mut response = own(
-        StatusCode::FOUND,
-        "text/plain; charset=utf-8",
-        String::new(),
-    );
+    let mut response = own(StatusCode::FOUND, "text/plain; charset=utf-8", Bytes::new());
     let headers = response.headers_mut();
     match HeaderValue::from_str(location) {
         Ok(value) => {

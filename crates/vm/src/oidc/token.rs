@@ -349,6 +349,8 @@ pub fn groups(claim: Option<&Value>) -> Result<Vec<String>, Refused> {
             if kept.len() >= MAX_GROUPS {
                 return Err(Refused::Invalid("there are more than 1,000 Groups"));
             }
+            // The session keeps them: copied once a sign-in or renewal,
+            // at most MAX_GROUPS of MAX_CLAIM_BYTES.
             kept.push(entry.to_owned());
         }
     }

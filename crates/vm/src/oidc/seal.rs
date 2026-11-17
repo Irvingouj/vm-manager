@@ -47,6 +47,7 @@ impl Sealer {
     pub fn seal(&self, token: &Secret, session: &[u8; 32]) -> Option<Vec<u8>> {
         let mut nonce = [0_u8; NONCE_LEN];
         self.random.fill(&mut nonce).ok()?;
+        // Sealed in place: a copy, once a sign-in or renewal.
         let mut sealed = token.expose().as_bytes().to_vec();
         self.key
             .seal_in_place_append_tag(
@@ -71,6 +72,7 @@ impl Sealer {
         }
         let (nonce, sealed) = rest.split_at_checked(NONCE_LEN)?;
         let nonce = Nonce::try_assume_unique_for_key(nonce).ok()?;
+        // Opened in place: a copy of the row's bytes, once a renewal.
         let mut buffer = sealed.to_vec();
         let opened = self
             .key
