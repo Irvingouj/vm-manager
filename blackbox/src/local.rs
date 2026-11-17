@@ -45,8 +45,10 @@ use crate::tool::{Machine, Run, Running};
 /// migrations on a loaded machine.
 pub const LOCAL_TIMEOUT: Duration = Duration::from_secs(240);
 
-/// The fields of what `vm request --json` prints, sorted.
-pub const REQUESTED_KEYS: [&str; 18] = [
+/// The fields of what `vm request --json` prints, sorted (`test_rows` from
+/// ticket "Local loop in the browser, with test rows, reset and working
+/// offline" on).
+pub const REQUESTED_KEYS: [&str; 19] = [
     "application",
     "as",
     "body",
@@ -62,6 +64,7 @@ pub const REQUESTED_KEYS: [&str; 18] = [
     "request_id",
     "standins",
     "status",
+    "test_rows",
     "uncaught",
     "version",
     "warnings",
@@ -571,6 +574,21 @@ impl Requested {
                 describe()
             );
         }
+        for item in body["test_rows"]
+            .as_array()
+            .unwrap_or_else(|| panic!("expected `test_rows` an array\n{}", describe()))
+        {
+            let mut inner: Vec<&str> = item
+                .as_object()
+                .map(|o| o.keys().map(String::as_str).collect())
+                .unwrap_or_default();
+            inner.sort_unstable();
+            assert!(
+                inner == ["file", "rows"] && item["file"].is_string() && item["rows"].is_u64(),
+                "expected each of `test_rows` to be {{ file, rows }}, got {item}\n{}",
+                describe()
+            );
+        }
         for key in ["warnings", "notes"] {
             for item in body[key]
                 .as_array()
@@ -640,6 +658,11 @@ impl Requested {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// `test_rows`: what this run loaded.
+    pub fn test_rows(&self) -> Value {
+        self.body["test_rows"].clone()
     }
 
     pub fn standins(&self) -> Vec<Value> {
@@ -959,6 +982,8 @@ pub fn declaring(name: &str, declared: &[(&str, &str)]) -> String {
 /// - `/incidents` (with `devops`): `incidents.id` and `.title` of `devops`
 ///   read as the User through the pulled definition: `{ user, incidents }`;
 /// - `/columns` (with `devops`): every column of `incidents`: `{ rows }`;
+/// - `/devops-notes` (with `devops`): `notes.id` and `.body` of `devops`
+///   read as the User: `{ notes }`;
 /// - `/add-incident` (with `devops`): inserts incident 1000 with the body as
 ///   its title (the handle cast so that it writes whatever is declared),
 ///   then reads them all: `{ incidents }`;
@@ -972,6 +997,7 @@ pub fn declaring(name: &str, declared: &[(&str, &str)]) -> String {
 /// - `/echo`: `{ method, headers, body, search }` of the request;
 /// - `/text`: [`TEXT_BODY`];
 /// - `/slow?ms=<ms>`: answers after `ms` milliseconds;
+/// - `/me`: `{ id, groups }` of the User;
 /// - anything else: `{ user }`.
 ///
 /// A refusal is answered `403` with `{ refusal, fix }`. It prints
@@ -982,7 +1008,9 @@ pub fn handler(devops: bool, own_notes: bool) -> String {
     );
     let mut routes = String::new();
     if devops {
-        imports.push_str("import { incidents } from \"../resources/devops/schema.ts\";\n");
+        imports.push_str(
+            "import { incidents, notes as devopsNotes } from \"../resources/devops/schema.ts\";\n",
+        );
         routes.push_str(
             r#"      case "/incidents": {
         const rows = await ctx.user().db("devops").select({ id: incidents.id, title: incidents.title }).from(incidents);
@@ -991,6 +1019,10 @@ pub fn handler(devops: bool, own_notes: bool) -> String {
       case "/columns": {
         const rows = await ctx.user().db("devops").select().from(incidents);
         return Response.json({ rows });
+      }
+      case "/devops-notes": {
+        const rows = await ctx.user().db("devops").select({ id: devopsNotes.id, body: devopsNotes.body }).from(devopsNotes);
+        return Response.json({ notes: rows });
       }
       case "/add-incident": {
         const title = await request.text();
@@ -1057,6 +1089,8 @@ export default defineApp(manifest, {{
       case "/slow":
         await sleep(Number(url.searchParams.get("ms") ?? "0"));
         return new Response("slow");
+      case "/me":
+        return Response.json({{ id: ctx.user().id, groups: ctx.user().groups }});
       default:
         return Response.json({{ user: ctx.user().id }});
       }}
@@ -1109,10 +1143,23 @@ impl Board {
 
     /// As [`Board::start`], the Application named `name`.
     pub fn named(name: &str, declared: &str, held: &str) -> Self {
+        Self::on(Local::new(), name, declared, held, "")
+    }
+
+    /// As [`Board::named`], on this machine, with `setup` run by the
+    /// shared database's superuser before the pull (a view, say). `%READER%`
+    /// and `%WRITER%` in it are replaced by the roles of the Resource's
+    /// logins.
+    pub fn on(local: Local, name: &str, declared: &str, held: &str, setup: &str) -> Self {
         let scenario = crate::scenario::Scenario::start();
+        if !setup.is_empty() {
+            let sql = setup
+                .replace("%READER%", &scenario.db.reader.role)
+                .replace("%WRITER%", &scenario.db.writer.role);
+            scenario.db.superuser().batch(&sql);
+        }
         scenario.register_writable(DEVOPS);
         scenario.grant(DEVOPS, crate::deploy::BUILDERS, held);
-        let local = Local::new();
         local.machine.sign_in(&scenario.vm, &crate::deploy::dana());
         let project = local_project(&local.machine, name, &[(DEVOPS, declared)]);
         local.pull_ok(&project.dir, DEVOPS);
@@ -1314,7 +1361,16 @@ mod tests {
     #[test]
     fn the_handler_names_each_route() {
         let ts = handler(true, true);
-        for route in ["/incidents", "/notes", "/fail", "/echo", "/slow", "/bytes"] {
+        for route in [
+            "/incidents",
+            "/devops-notes",
+            "/notes",
+            "/fail",
+            "/echo",
+            "/slow",
+            "/bytes",
+            "/me",
+        ] {
             assert!(ts.contains(&format!("case \"{route}\"")), "{route}");
         }
         assert!(!handler(false, false).contains("resources/devops"));

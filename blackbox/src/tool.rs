@@ -316,6 +316,15 @@ impl Machine {
     /// standard error written to a file; returns at once. The [`Run`] that
     /// [`Running::wait`] gives has an empty standard output.
     pub fn spawn_piped(&self, args: &[&str]) -> (Running, std::io::PipeReader) {
+        self.spawn_piped_with_env(args, &[])
+    }
+
+    /// As [`Machine::spawn_piped`], with these environment variables added.
+    pub fn spawn_piped_with_env(
+        &self,
+        args: &[&str],
+        env: &[(&str, &str)],
+    ) -> (Running, std::io::PipeReader) {
         let outputs = std::env::temp_dir().join(format!("vm-blackbox-run-{}", token()));
         fs::create_dir_all(&outputs)
             .unwrap_or_else(|e| panic!("cannot make {}: {e}", outputs.display()));
@@ -323,7 +332,7 @@ impl Machine {
             .unwrap_or_else(|e| panic!("cannot make stderr in {}: {e}", outputs.display()));
         let (reader, writer) =
             std::io::pipe().unwrap_or_else(|e| panic!("cannot make a pipe: {e}"));
-        let mut command = self.command(args, &[], None);
+        let mut command = self.command(args, env, None);
         command.stdin(Stdio::null()).stdout(writer).stderr(stderr);
         let began = Instant::now();
         let child = command

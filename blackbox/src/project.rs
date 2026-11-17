@@ -54,7 +54,7 @@ pub const CHECKS: [&str; 4] = ["manifest", "resources", "migrations", "types"];
 /// The files a new project holds (CONTRACT.md, "What a new project holds"),
 /// but for the SDK's tarball, whose name holds a version: see
 /// [`template_files`].
-pub const TEMPLATE_FILES: [&str; 10] = [
+pub const TEMPLATE_FILES: [&str; 11] = [
     ".gitignore",
     "AGENTS.md",
     "CLAUDE.md",
@@ -63,6 +63,7 @@ pub const TEMPLATE_FILES: [&str; 10] = [
     "package.json",
     "src/db/schema.ts",
     "src/index.ts",
+    "test-rows/README.md",
     "tsconfig.json",
     "vm.dev.json",
 ];

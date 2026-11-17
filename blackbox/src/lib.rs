@@ -78,6 +78,7 @@
 pub mod api;
 pub mod changed_outside;
 pub mod deploy;
+pub mod dev;
 pub mod expect;
 pub mod generate;
 pub mod history;
