@@ -2,16 +2,14 @@
 //!
 //! Written here rather than taken from a crate because the program needs
 //! three things a general pool hides: each connection's background task
-//! owned by the connection (told to close the session when it is dropped,
-//! and ended within a stated time, never left running); a
+//! owned by the connection (ended when it is dropped, never detached); a
 //! timeout on every wait (checkout, connect, and the whole operation); and,
 //! for later tickets, a pool per database and Access level with the same
 //! small interface. It is one type and one method, [`Pool::run`].
 //!
 //! A connection is handed back only when the operation finished within its
 //! time and the connection is still open. One that timed out is dropped
-//! (its task closes the session within a stated time), since what it was
-//! in the middle of is unknown.
+//! (its task ends with it), since what it was in the middle of is unknown.
 
 use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
@@ -47,63 +45,18 @@ impl Default for PoolLimits {
     }
 }
 
-/// The connections to Postgres of this process still open: each one's task
-/// counts itself while it lives (driving its socket), here and in the own
-/// databases' relay. What lets go of its connections and must know they are
-/// closed (the local run, before it stops its Postgres) waits for none
-/// ([`wait_for_no_connection`]).
-static LIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-/// One live connection's count in [`LIVE`], given back when dropped (the
-/// connection's task ended or was aborted and dropped: its socket closed).
-pub(crate) struct Live(());
-
-impl Live {
-    pub(crate) fn new() -> Self {
-        LIVE.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Self(())
-    }
-}
-
-impl Drop for Live {
-    fn drop(&mut self) {
-        LIVE.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-    }
-}
-
-/// Waits, up to `limit`, until no connection of this process is open (an
-/// aborted connection's task is dropped, its socket closed, when the
-/// runtime next runs it). Answers whether none is.
-pub async fn wait_for_no_connection(limit: Duration) -> bool {
-    let deadline = tokio::time::Instant::now() + limit;
-    loop {
-        if LIVE.load(std::sync::atomic::Ordering::SeqCst) == 0 {
-            return true;
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return false;
-        }
-        tokio::time::sleep(Duration::from_millis(2)).await;
-    }
-}
-
-/// The longest a dropped connection's task goes on, closing it: reading the
-/// answers to what was sent last (a prepared statement's close, say) and
-/// sending Postgres the message that ends a session. Closing the socket
-/// before those answers are read would make the server's side see the
-/// connection reset rather than ended.
-const CLOSE_WAIT: Duration = Duration::from_secs(2);
-
 /// One open connection and the task that drives it.
 pub(crate) struct Connection {
     client: Client,
-    /// Dropped with the connection: tells its task to stop waiting on
-    /// requests and to close within [`CLOSE_WAIT`].
-    _closing: tokio::sync::oneshot::Sender<()>,
-    /// Owned while the connection lives. When it is dropped the task is not
-    /// aborted: it ends by itself once the session is closed, at most
-    /// [`CLOSE_WAIT`] later, and counts itself in [`LIVE`] until then.
-    _task: JoinHandle<()>,
+    /// Owned: aborted when the connection is dropped. It ends by itself
+    /// when the client is dropped or the server closes the connection.
+    task: JoinHandle<()>,
+}
+
+impl Drop for Connection {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
 }
 
 impl Connection {
@@ -113,37 +66,15 @@ impl Connection {
             .await
             .map_err(|_| DbError::timed_out("opening a connection", limit))?
             .map_err(DbError::from)?;
-        let live = Live::new();
-        let (closing, dropped) = tokio::sync::oneshot::channel::<()>();
         let task = tokio::spawn(async move {
-            let _live = live;
-            let mut connection = connection;
-            let ended = tokio::select! {
-                ended = &mut connection => Some(ended),
-                _ = dropped => None,
-            };
-            // The client is dropped with the connection, so from here the
-            // session reads what is still owed to it, says it ends, and
-            // closes; a server that does not answer is given up on.
-            let ended = match ended {
-                Some(ended) => ended,
-                None => match tokio::time::timeout(CLOSE_WAIT, connection).await {
-                    Ok(ended) => ended,
-                    Err(_) => return,
-                },
-            };
-            if let Err(error) = ended {
+            if let Err(error) = connection.await {
                 log::record(
                     "platform-database-connection-ended",
                     serde_json::json!({ "error": DbError::from(error).to_string() }),
                 );
             }
         });
-        Ok(Self {
-            client,
-            _closing: closing,
-            _task: task,
-        })
+        Ok(Self { client, task })
     }
 
     pub(crate) fn client(&self) -> &Client {

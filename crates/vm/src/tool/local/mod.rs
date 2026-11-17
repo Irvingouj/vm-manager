@@ -14,9 +14,13 @@
 //! **Endings.** The whole run is held to `--timeout` and ended by `SIGINT`,
 //! `SIGTERM` and `SIGHUP` ([`Signals::within`]). The private Postgres and
 //! the project's lock are kept outside the run's future ([`Held`]), so that
-//! however it ends, the run's connections are closed first (its future is
-//! dropped), then Postgres is stopped and waited for, then the lock is let
-//! go.
+//! however it ends, the run's connections are dropped first (its future is
+//! dropped, which ends their tasks and closes their sockets), then Postgres
+//! is stopped and waited for, then the lock is let go. A dropped connection
+//! closes its socket without reading the answer to what it sent last (the
+//! close of a prepared statement), so postgres.log may say "could not
+//! receive data from client: Connection reset by peer": nothing is lost by
+//! it, since every statement of the run was answered before.
 //!
 //! **Bounds.** A request body is at most [`MAX_BODY_BYTES`]; of the
 //! response's body [`MAX_BODY_BYTES`] are printed; the drain of what the
@@ -92,10 +96,6 @@ const DRAIN_WAIT: Duration = Duration::from_secs(10);
 /// The longest the platform database may take to be opened and brought up
 /// to date.
 const PLATFORM_WAIT: Duration = Duration::from_secs(60);
-
-/// The longest the run's connections may take to close before its Postgres
-/// is stopped all the same.
-const CLOSE_WAIT: Duration = Duration::from_secs(2);
 
 /// The local Versions kept: the newest, the earlier ones forgotten.
 const KEPT_VERSIONS: u32 = 50;
@@ -324,10 +324,9 @@ struct Held {
 
 impl Held {
     async fn release(&self) {
-        // The run's connections were let go of with its future; each
-        // closes its socket once the runtime drops its task. Closed before
-        // Postgres is told to stop, so that it sees each client leave.
-        crate::platform_db::wait_for_no_connection(CLOSE_WAIT).await;
+        // The run's connections were dropped with its future, which ends
+        // their tasks and closes their sockets (see the module's text on
+        // what postgres.log may say of it).
         let server = self.server.borrow_mut().take();
         if let Some(server) = server {
             server.stop().await;
@@ -809,7 +808,10 @@ async fn run(
     if !(threads_ended && operations_ended) {
         said.warnings.push(incomplete(
             "operations",
-            "the request's operations did not all end within 10 seconds of its response: the operations below may lack some, and their entries in the local Operation log may come later or not at all",
+            &format!(
+                "the request's operations did not all end within {} seconds of its response: the operations below may lack some, and their entries in the local Operation log may come later or not at all",
+                DRAIN_WAIT.as_secs()
+            ),
         ));
     }
     // Changes: only an Application with an own database has an outbox to
@@ -820,7 +822,10 @@ async fn run(
         if shipped != Ok(true) {
             said.warnings.push(incomplete(
                 "changes",
-                "the changes the request made in the own database did not reach the local Change history within 10 seconds: vm local change-history may lack them until a later run ships them",
+                &format!(
+                    "the changes the request made in the own database did not reach the local Change history within {} seconds: vm local change-history may lack them until a later run ships them",
+                    DRAIN_WAIT.as_secs()
+                ),
             ));
         }
     }
@@ -832,7 +837,10 @@ async fn run(
     if !logged {
         said.warnings.push(incomplete(
             "log",
-            "the request's log entry was not written within 10 seconds: printed and uncaught may lack what the code printed",
+            &format!(
+                "the request's log entry was not written within {} seconds: printed and uncaught may lack what the code printed",
+                DRAIN_WAIT.as_secs()
+            ),
         ));
     }
 
@@ -871,7 +879,8 @@ async fn run(
         .and_then(|e| e.get("uncaught"))
         .cloned()
         .unwrap_or_else(|| json!([]));
-    // Every pool closed before Postgres is stopped (by the caller).
+    // Every pool dropped (its connections' tasks ended, their sockets
+    // closed) before Postgres is stopped (by the caller).
     drop(log);
     drop(registry);
     drop(own_databases);

@@ -567,9 +567,7 @@ impl Courier {
             .map_err(|_| DbError::timed_out("opening a connection", CONNECT_TIMEOUT))?
             .map_err(DbError::from)?;
         // Owned by the Line, ended with it.
-        let live = crate::platform_db::Live::new();
         let task = tokio::spawn(async move {
-            let _live = live;
             connection.await.ok();
         });
         Ok(Line {
