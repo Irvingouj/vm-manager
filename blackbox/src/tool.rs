@@ -644,6 +644,12 @@ impl Running {
         String::from_utf8_lossy(&bytes).into_owned()
     }
 
+    /// What `vm` has written on its standard error so far, while it runs.
+    pub fn stderr_so_far(&self) -> String {
+        let bytes = fs::read(self.outputs.join("stderr")).unwrap_or_default();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
     /// Whether `vm` has ended.
     pub fn has_ended(&mut self) -> bool {
         matches!(self.child.try_wait(), Ok(Some(_)))

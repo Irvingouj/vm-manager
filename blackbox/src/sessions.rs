@@ -1,17 +1,25 @@
 //! What the tests of sign-in and sessions share (CONTRACT.md, "Sign-in and
-//! sessions"): the harness's identity provider beside a program started
-//! with OIDC (its fixture Applications installed first by a start with the
-//! stand-in on the same platform database), the addresses a browser sees,
-//! test people, and checks on cookies, pages and the log.
+//! sessions", and "The tool signs in through the browser, and OIDC is
+//! connected from the tool"): the harness's identity provider beside a
+//! program started with an installation's key (its fixture Applications
+//! installed first by a start with the stand-in on the same platform
+//! database) on which OIDC was then connected as an administrator connects
+//! it, the addresses a browser sees, test people, the tool's sign-in walked
+//! through a browser, and checks on cookies, pages and the log.
 
 use std::time::{Duration, SystemTime};
 
 use serde_json::Value;
 use url::Url;
 
-use crate::browser::{Browser, SetCookie, Step, describe_steps, url};
+use crate::browser::{Browser, SetCookie, Step, describe_steps, query_param, url};
+use crate::connection::{
+    Connection, SecretKey, connect_with_setup, hide, put_oidc, setup_credential, shown,
+};
 use crate::http::Response;
-use crate::oidc::{CLIENT_ID, Person, Provider};
+use crate::oidc::{Person, Provider};
+use crate::tool::{Machine, Run};
+use crate::tool_sign_ins::{BrowserCommand, Challenge, Decision, OPEN_TIMEOUT, forms};
 use crate::vm::{DOMAIN, Vm, VmOptions};
 
 /// Ada: `sub` distinct from her name and email, in `finance`.
@@ -38,23 +46,18 @@ pub fn grace() -> Person {
         .in_groups(&["devops"])
 }
 
-/// The options that start the program with OIDC against this provider:
-/// `--oidc-issuer`, `--oidc-client-id`, `VM_OIDC_CLIENT_SECRET`, and
-/// `--public-scheme http` so the browser can follow every redirect.
-pub fn oidc_options(provider: &Provider) -> VmOptions {
+/// The options of a program on which OIDC can be connected: a fresh
+/// installation's key in `VM_SECRET_KEY`, and `--public-scheme http` so the
+/// browser can follow every redirect.
+pub fn oidc_options() -> VmOptions {
     VmOptions::new()
-        .args_extra(&[
-            "--oidc-issuer",
-            provider.issuer(),
-            "--oidc-client-id",
-            CLIENT_ID,
-            "--public-scheme",
-            "http",
-        ])
-        .env("VM_OIDC_CLIENT_SECRET", provider.client_secret().expose())
+        .args_extra(&["--public-scheme", "http"])
+        .env("VM_SECRET_KEY", SecretKey::fresh().expose())
 }
 
-/// A provider and a program signed in through it.
+/// A provider and a program signed in through it: started with an
+/// installation's key, then connected as an administrator would connect it
+/// (`vm setup`, then `vm admin connect-oidc` with the setup credential).
 pub struct Installation {
     // The program first, so that it ends before the provider does.
     pub vm: Vm,
@@ -65,25 +68,53 @@ pub struct Installation {
 
 impl Installation {
     /// Ada and Grace at the provider, these Applications (name, fixture
-    /// file) installed, the program started with OIDC.
+    /// file) installed, the program started and OIDC connected.
     pub fn start(applications: &[(&str, &str)]) -> Self {
         Self::start_with(applications, &[ada(), grace()], &[])
     }
 
-    /// As [`Installation::start`] with these people and more arguments
-    /// (`--session-renewal 2`, say).
+    /// As [`Installation::start`] with these people and more arguments of
+    /// `vm serve` (`--session-renewal 2`, say).
     pub fn start_with(applications: &[(&str, &str)], people: &[Person], more: &[&str]) -> Self {
+        Self::start_connected(applications, people, more, |c| c)
+    }
+
+    /// As [`Installation::start_with`], the connection changed by `change`
+    /// (`--groups-claim`, `--scopes`, the administrators' Group).
+    pub fn start_connected(
+        applications: &[(&str, &str)],
+        people: &[Person],
+        more: &[&str],
+        change: impl FnOnce(Connection) -> Connection,
+    ) -> Self {
         let provider = Provider::start(people);
         let options = applications
             .iter()
-            .fold(oidc_options(&provider).args_extra(more), |o, (n, f)| {
+            .fold(oidc_options().args_extra(more), |o, (n, f)| {
                 o.application(n, f)
             });
-        Self::from(provider, &options)
+        let connection = change(Connection::to(&provider));
+        Self::connected(provider, &options, &connection)
     }
 
-    /// The program started with these options beside this provider.
+    /// The program started with these options beside this provider, and
+    /// OIDC connected to it as the harness registered the platform there.
     pub fn from(provider: Provider, options: &VmOptions) -> Self {
+        let connection = Connection::to(&provider);
+        Self::connected(provider, options, &connection)
+    }
+
+    /// The program started with these options beside this provider, and
+    /// this connection made.
+    pub fn connected(provider: Provider, options: &VmOptions, connection: &Connection) -> Self {
+        let at = Self::unconnected(provider, options);
+        at.connect(connection);
+        at
+    }
+
+    /// The program started with these options beside this provider, OIDC
+    /// not connected.
+    pub fn unconnected(provider: Provider, options: &VmOptions) -> Self {
         let public_port = options
             .extra_arg_value("--public-port")
             .and_then(|p| p.parse().ok());
@@ -95,6 +126,39 @@ impl Installation {
         }
     }
 
+    /// Makes this connection as an administrator who has no sign-in yet
+    /// would: `vm setup` beside the platform database, then `vm admin
+    /// connect-oidc --json` with the setup credential, which must end with
+    /// `0`. Returns what it printed.
+    pub fn connect(&self, connection: &Connection) -> Value {
+        let setup = setup_credential(self.vm.platform());
+        let machine = Machine::new();
+        let run = connect_with_setup(&machine, &self.vm, &setup, connection, true);
+        let hidden = hide(&run, &[setup.expose(), connection.secret().expose()]);
+        if hidden.code != Some(0) {
+            self.vm.fail(&format!(
+                "expected `vm admin connect-oidc` with the setup credential to end with 0\n{}",
+                hidden.describe()
+            ));
+        }
+        hidden.json()
+    }
+
+    /// `PUT /v1/oidc` with a fresh setup credential (`vm setup`) and this
+    /// connection's body.
+    pub fn connect_through_the_api(&self, connection: &Connection) -> Response {
+        let setup = setup_credential(self.vm.platform());
+        put_oidc(&self.vm, Some(setup.expose()), &connection.body())
+    }
+
+    /// The installation's key the program was started with, if any.
+    pub fn key(&self) -> Option<SecretKey> {
+        self.vm
+            .options()
+            .env_value("VM_SECRET_KEY")
+            .map(SecretKey::of)
+    }
+
     /// Ends the program and starts it again with the same options on the
     /// same platform database, beside the same provider.
     #[must_use]
@@ -103,18 +167,36 @@ impl Installation {
         self.restarted_with(&options)
     }
 
-    /// Ends the program and starts it again with `VM_OIDC_CLIENT_SECRET`
-    /// set to `secret` (the provider told to take it too), the rest as
-    /// before.
+    /// Ends the program and starts it again with this installation's key,
+    /// or none, the rest as before.
     #[must_use]
-    pub fn restarted_with_secret(self, secret: &str) -> Self {
-        self.provider.also_take_secret(secret);
-        let options = self
-            .vm
-            .options()
-            .clone()
-            .env("VM_OIDC_CLIENT_SECRET", secret);
+    pub fn restarted_with_key(self, key: Option<&SecretKey>) -> Self {
+        let options = self.vm.options().clone();
+        let options = match key {
+            Some(key) => options.env("VM_SECRET_KEY", key.expose()),
+            None => options.without_env("VM_SECRET_KEY"),
+        };
         self.restarted_with(&options)
+    }
+
+    /// Ends the program and the provider, and starts the program again as
+    /// before beside `provider` in its place: the provider the connection
+    /// names is gone (its address refuses connections).
+    #[must_use]
+    pub fn restarted_beside(self, provider: Provider) -> Self {
+        let Self {
+            vm,
+            provider: gone,
+            public_port,
+        } = self;
+        let options = vm.options().clone().platform(vm.platform());
+        drop(vm);
+        drop(gone);
+        Self {
+            vm: Vm::start(&options),
+            provider,
+            public_port,
+        }
     }
 
     fn restarted_with(self, options: &VmOptions) -> Self {
@@ -353,6 +435,232 @@ impl Installation {
             })
     }
 
+    /// `<sign-in address>/tool?challenge=<challenge>[&port=<port>]&machine=<machine>`,
+    /// the address the tool opens or shows.
+    pub fn tool_address(&self, challenge: &str, port: Option<u16>, machine: &str) -> Url {
+        let mut at = self.auth_url("/tool");
+        {
+            let mut query = at.query_pairs_mut();
+            query.append_pair("challenge", challenge);
+            if let Some(port) = port {
+                query.append_pair("port", &port.to_string());
+            }
+            query.append_pair("machine", machine);
+        }
+        at
+    }
+
+    /// Opens this `/tool` address in the browser and follows every redirect
+    /// (to the provider and back); fails unless the way ends with a `200`
+    /// page on the sign-in address holding a form that posts to `/tool`.
+    /// Returns the steps; the last is the page.
+    pub fn walk_tool_to_page(&self, browser: &mut Browser, address: &Url) -> Vec<Step> {
+        let steps = browser.navigate(address);
+        let last = steps.last().unwrap_or_else(|| panic!("no steps"));
+        let on_auth = last.url.host_str() == Some(self.auth_host().as_str());
+        if last.response.status != 200 || !on_auth || self.tool_form(last).is_none() {
+            self.vm.fail(&format!(
+                "expected the way through /tool to end with a 200 page on the sign-in address with a form that posts to /tool, but it went:\n{}",
+                masked_steps(&steps)
+            ));
+        }
+        steps
+    }
+
+    /// The form of a page that posts to `<sign-in address>/tool`, and the
+    /// address it posts to.
+    pub fn tool_form(&self, page: &Step) -> Option<(crate::tool_sign_ins::Form, Url)> {
+        forms(&page.response.text()).into_iter().find_map(|form| {
+            let action = page.url.join(&form.action).ok()?;
+            let posts_to_tool = form.method == "post"
+                && action.host_str() == Some(self.auth_host().as_str())
+                && action.path() == "/tool";
+            posts_to_tool.then_some((form, action))
+        })
+    }
+
+    /// Answers the page of step 2 as a person would (confirm or decline,
+    /// with this check code or none), from the page itself (same origin);
+    /// returns the step of `POST /tool`.
+    pub fn answer_tool_page(
+        &self,
+        browser: &mut Browser,
+        page: &Step,
+        decision: Decision,
+        code: Option<&str>,
+    ) -> Step {
+        let (form, action) = self.tool_form(page).unwrap_or_else(|| {
+            self.vm.fail(&format!(
+                "expected a form that posts to /tool on the page\n{}",
+                shown(&page.response, &[])
+            ))
+        });
+        let body = form.submission(decision, code).unwrap_or_else(|| {
+            self.vm.fail(&format!(
+                "expected the form on the page to have a button to {decision:?}; its fields are {:?}",
+                form.fields
+            ))
+        });
+        let request = browser.form_from(&page.url, &action, &body);
+        let response = browser.send(&action, &request);
+        Step {
+            url: action,
+            response,
+        }
+    }
+
+    /// The grant a confirmed sign-in with a port sent the browser to the
+    /// tool with: fails unless the answer is a redirect to exactly
+    /// `http://127.0.0.1:<port>/?grant=<value>`.
+    pub fn grant_of(&self, confirmed: &Step, port: u16) -> String {
+        let to_tool = confirmed.is_redirect() && {
+            let at = confirmed.location();
+            at.scheme() == "http"
+                && at.host_str() == Some("127.0.0.1")
+                && at.port() == Some(port)
+                && at.path() == "/"
+        };
+        if !to_tool {
+            self.vm.fail(&format!(
+                "expected the confirmed sign-in to send the browser to http://127.0.0.1:{port}/?grant=..., got\n{}",
+                shown(&confirmed.response, &[])
+            ));
+        }
+        query_param(&confirmed.location(), "grant").unwrap_or_else(|| {
+            self.vm.fail(&format!(
+                "expected a `grant` in the address the browser was sent to\n{}",
+                shown(&confirmed.response, &[])
+            ))
+        })
+    }
+
+    /// `POST /v1/tool-sign-ins`, not signed in, with this verifier and
+    /// grant.
+    pub fn post_tool_sign_in(&self, verifier: &str, grant: Option<&str>) -> Response {
+        let mut body = serde_json::json!({ "verifier": verifier });
+        if let Some(grant) = grant {
+            body["grant"] = serde_json::json!(grant);
+        }
+        self.vm
+            .api_request("/v1/tool-sign-ins")
+            .method("POST")
+            .json(&body)
+            .send()
+    }
+
+    /// A tool credential for this person, made the way the tool makes one
+    /// with a browser, played by hand: a challenge with a port, the
+    /// person's browser through `/tool` and the provider, confirmed, and
+    /// `POST /v1/tool-sign-ins` with the verifier and the grant, which must
+    /// answer `201`. Returns the credential.
+    pub fn tool_credential_for(&self, sub: &str) -> String {
+        let (credential, _) = self.tool_sign_in_for(sub);
+        credential
+    }
+
+    /// As [`Installation::tool_credential_for`], with the answer's JSON.
+    pub fn tool_sign_in_for(&self, sub: &str) -> (String, Value) {
+        let challenge = Challenge::fresh();
+        let port =
+            crate::postgres::free_port().unwrap_or_else(|e| panic!("cannot find a free port: {e}"));
+        let mut browser = self.browser_as(sub);
+        let address = self.tool_address(&challenge.challenge, Some(port), "harness-machine");
+        let steps = self.walk_tool_to_page(&mut browser, &address);
+        let page = steps.last().unwrap_or_else(|| panic!("no steps"));
+        let confirmed = self.answer_tool_page(&mut browser, page, Decision::Confirm, None);
+        let grant = self.grant_of(&confirmed, port);
+        let answer = self.post_tool_sign_in(challenge.verifier(), Some(&grant));
+        if answer.status != 201 {
+            self.vm.fail(&format!(
+                "expected 201 from POST /v1/tool-sign-ins for a confirmed sign-in with its grant, got\n{}",
+                shown(&answer, &[])
+            ));
+        }
+        let body = answer.json();
+        let credential = body["credential"]
+            .as_str()
+            .unwrap_or_else(|| {
+                self.vm.fail(&format!(
+                    "expected a `credential` in the answer\n{}",
+                    shown(&answer, &[])
+                ))
+            })
+            .to_owned();
+        (credential, body)
+    }
+
+    /// The arguments of `vm sign-in` to this installation through the
+    /// browser, with these more (`--json`, `--timeout 10`, ...).
+    pub fn sign_in_args(&self, more: &[&str]) -> Vec<String> {
+        let mut args = vec![
+            "sign-in".to_owned(),
+            "--domain".to_owned(),
+            DOMAIN.to_owned(),
+            "--connect".to_owned(),
+            self.vm.address().to_string(),
+        ];
+        args.extend(more.iter().map(|a| (*a).to_owned()));
+        args
+    }
+
+    /// Starts `vm sign-in` with these more arguments on `machine`, with
+    /// these environment variables, and returns at once.
+    pub fn spawn_sign_in(
+        &self,
+        machine: &Machine,
+        more: &[&str],
+        env: &[(&str, &str)],
+    ) -> crate::tool::Running {
+        let args = self.sign_in_args(more);
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        machine.spawn_into_files(&machine.cwd(), &refs, env)
+    }
+
+    /// Signs the tool on `machine` in as this person through the browser,
+    /// as a Builder does: `vm sign-in --json` with the harness's `BROWSER`;
+    /// the person's browser opens what the tool opened, goes through the
+    /// provider, confirms, and is sent to the tool, which must answer it
+    /// `200` and end with `0`. Returns what the tool printed.
+    pub fn sign_in_tool(&self, machine: &Machine, sub: &str) -> Value {
+        let opener = BrowserCommand::on(machine);
+        let (name, value) = opener.env();
+        let running = self.spawn_sign_in(machine, &["--json"], &[(name, value.as_str())]);
+        let Some(opened) = opener.wait_opened(OPEN_TIMEOUT) else {
+            let stderr = running.stderr_so_far();
+            drop(running);
+            self.vm.fail(&format!(
+                "expected `vm sign-in` to open the browser with BROWSER within {OPEN_TIMEOUT:?}; it wrote on standard error:\n{}",
+                crate::connection::masked(&stderr, &[])
+            ));
+        };
+        let mut browser = self.browser_as(sub);
+        let steps = self.walk_tool_to_page(&mut browser, &url(&opened));
+        let page = steps.last().unwrap_or_else(|| panic!("no steps"));
+        let confirmed = self.answer_tool_page(&mut browser, page, Decision::Confirm, None);
+        let port = url(&opened)
+            .query_pairs()
+            .find(|(n, _)| n == "port")
+            .and_then(|(_, v)| v.parse::<u16>().ok())
+            .unwrap_or_else(|| panic!("expected a port in the address the tool opened: {opened}"));
+        self.grant_of(&confirmed, port);
+        let at_tool = browser.follow(&confirmed);
+        let run: Run = hide(&running.wait(Duration::from_secs(30)), &[]);
+        if at_tool.response.status != 200 {
+            self.vm.fail(&format!(
+                "expected the tool to answer the browser sent to it with a 200 page, got\n{}\nthe tool:\n{}",
+                shown(&at_tool.response, &[]),
+                run.describe()
+            ));
+        }
+        if run.code != Some(0) {
+            self.vm.fail(&format!(
+                "expected `vm sign-in` through the browser to end with 0\n{}",
+                run.describe()
+            ));
+        }
+        run.json()
+    }
+
     /// Fails if any of these values appears in any line of the program's
     /// log.
     pub fn assert_none_in_log(&self, values: &[String], context: &str) {
@@ -552,4 +860,10 @@ pub fn assert_failure_page(
             .all(|c| c.name != SESSION_COOKIE && c.name != format!("__Host-{SESSION_COOKIE}")),
         "{context}: expected no session to begin, but the page sets a session cookie\n{text}"
     );
+}
+
+/// Every step of a navigation with credentials taken out, for failure
+/// messages.
+pub fn masked_steps(steps: &[Step]) -> String {
+    crate::connection::masked(&describe_steps(steps), &[])
 }

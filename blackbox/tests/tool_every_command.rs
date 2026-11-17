@@ -134,14 +134,10 @@ fn a_wrong_command_line_ends_with_2_and_keeps_nothing() {
         vec!["no-such-command".into()],
         vec!["whoami".into(), "--no-such-option".into()],
         vec!["resources".into(), "extra".into()],
-        // No User.
-        vec![
-            "sign-in".into(),
-            "--domain".into(),
-            DOMAIN.into(),
-            "--connect".into(),
-            address.clone(),
-        ],
+        // (No User is no longer a wrong command line: the tool asks the
+        // installation how it signs in first, and the stand-in's answer
+        // without `--stand-in-user` is `sign-in-refused`. See
+        // `tool_browser_sign_in.rs`.)
         // No domain.
         vec![
             "sign-in".into(),

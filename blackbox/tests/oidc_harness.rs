@@ -454,6 +454,10 @@ fn the_configuration_and_keys_can_be_made_unusable() {
     assert!(configuration().json().get("token_endpoint").is_none());
     provider.config_fault(Some(ConfigFault::Oversize));
     assert!(configuration().body().len() > 1024 * 1024);
+    provider.config_fault(Some(ConfigFault::NotJson));
+    let not_json = configuration();
+    assert_eq!(not_json.status, 200);
+    assert!(serde_json::from_slice::<Value>(not_json.body()).is_err());
     provider.config_fault(None);
     provider.unreadable_jwks(true);
     assert!(get(&provider, "/jwks").json()["keys"].is_string());
@@ -581,4 +585,90 @@ fn parked_connections_are_held_unanswered_and_closed_when_the_outage_ends() {
         Ok(0) | Err(_)
     ));
     assert_eq!(get(&provider, "/jwks").status, 200);
+}
+
+#[test]
+fn another_client_id_is_taken_when_told_and_its_tokens_name_it() {
+    let provider = Provider::start(&[ada()]);
+    let second = "vm-harness-client-2";
+    let authorize_as = |client: &str| {
+        let mut browser = Browser::new(provider.address());
+        browser.sign_in_at_provider(&provider, "ada-sub");
+        let mut authorize = url(&format!("{}/authorize", provider.issuer()));
+        authorize
+            .query_pairs_mut()
+            .append_pair("response_type", "code")
+            .append_pair("client_id", client)
+            .append_pair("redirect_uri", REDIRECT)
+            .append_pair("scope", "openid")
+            .append_pair("nonce", "n");
+        browser.open(&authorize)
+    };
+    assert_eq!(
+        authorize_as(second).response.status,
+        400,
+        "unknown at first"
+    );
+    provider.also_take_client(second);
+    let step = authorize_as(second);
+    assert!(step.is_redirect(), "{}", step.response.describe());
+    let code = query_param(&step.location(), "code").unwrap();
+    let exchange_as = |client: &str, code: &str| {
+        Request::new(provider.address(), "/token", "127.0.0.1")
+            .method("POST")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header(
+                "authorization",
+                format!(
+                    "Basic {}",
+                    STANDARD.encode(format!("{client}:{}", provider.client_secret().expose()))
+                ),
+            )
+            .body(form(&[
+                ("grant_type", "authorization_code"),
+                ("code", code),
+                ("redirect_uri", REDIRECT),
+            ]))
+            .send()
+    };
+    let answer = exchange_as(second, &code);
+    assert_eq!(answer.status, 200, "{}", answer.describe());
+    let claims = claims_of(answer.json()["id_token"].as_str().unwrap()).unwrap();
+    assert_eq!(claims["aud"], second);
+    let step = authorize_as(second);
+    let code = query_param(&step.location(), "code").unwrap();
+    assert_eq!(
+        exchange_as(CLIENT_ID, &code).status,
+        400,
+        "a code is the client's it was asked for"
+    );
+}
+
+#[test]
+fn its_own_secret_is_refused_once_revoked() {
+    let provider = Provider::start(&[ada()]);
+    let code = code_for(&provider, "ada-sub", "n");
+    provider.revoke_own_secret();
+    let refused = token(
+        &provider,
+        &[
+            ("grant_type", "authorization_code"),
+            ("code", &code),
+            ("redirect_uri", REDIRECT),
+            ("code_verifier", VERIFIER),
+        ],
+        true,
+    );
+    assert_eq!(refused.status, 401, "{}", refused.describe());
+}
+
+#[test]
+fn refresh_tokens_issued_are_kept_apart() {
+    let provider = Provider::start(&[ada()]);
+    let code = code_for(&provider, "ada-sub", "n");
+    let answer = exchange(&provider, &code).json();
+    assert_eq!(
+        provider.refresh_tokens_issued(),
+        vec![answer["refresh_token"].as_str().unwrap().to_owned()]
+    );
 }

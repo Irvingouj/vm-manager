@@ -106,11 +106,12 @@ fn more_than_a_thousand_groups_or_one_longer_than_256_bytes_fails_the_sign_in() 
 }
 
 #[test]
-fn the_groups_are_read_from_the_claim_named_by_oidc_groups_claim() {
-    let at = Installation::start_with(
+fn the_groups_are_read_from_the_claim_named_by_the_connection_s_groups_claim() {
+    let at = Installation::start_connected(
         &[("honest", "honest.js")],
         &[person("ada", Some(json!(["finance", "devops"])))],
-        &["--oidc-groups-claim", "roles"],
+        &[],
+        |c| c.groups_claim("roles"),
     );
     at.provider.groups_claim_name("roles");
     let mut browser = at.browser_as("ada");
@@ -125,7 +126,7 @@ fn the_groups_are_read_from_the_claim_named_by_oidc_groups_claim() {
 fn groups_under_another_claim_than_the_one_read_are_no_groups() {
     let provider = Provider::start(&[person("ada", Some(json!(["finance"])))]);
     provider.groups_claim_name("roles");
-    let options = oidc_options(&provider).application("honest", "honest.js");
+    let options = oidc_options().application("honest", "honest.js");
     let at = Installation::from(provider, &options);
     let mut browser = at.browser_as("ada");
     at.sign_in(&mut browser, "honest", "/");

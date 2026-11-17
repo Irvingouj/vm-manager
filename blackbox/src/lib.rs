@@ -65,7 +65,12 @@
 //!   path says;
 //! - [`oidc`] is the harness's own identity provider, [`browser`] a small
 //!   browser with a cookie jar that follows redirects a step at a time, and
-//!   [`sessions`] what the tests of sign-in and sessions share.
+//!   [`sessions`] what the tests of sign-in and sessions share;
+//! - [`connection`] connects OIDC as an administrator would (the
+//!   installation's key, `vm setup`, `vm admin connect-oidc`, `PUT
+//!   /v1/oidc`), and [`tool_sign_ins`] is what the tests of the tool's
+//!   sign-in through the browser share: a verifier and its challenge, the
+//!   forms of a page, and the harness's `BROWSER` command.
 //!
 //! Every wait has a timeout, so a failing test fails within seconds and
 //! never hangs. Each test starts its own program on its own port, so tests
@@ -81,6 +86,7 @@
 pub mod api;
 pub mod browser;
 pub mod changed_outside;
+pub mod connection;
 pub mod deploy;
 pub mod dev;
 pub mod expect;
@@ -114,6 +120,7 @@ pub mod shared_database;
 pub mod sql;
 pub mod structure;
 pub mod tool;
+pub mod tool_sign_ins;
 pub mod transactions;
 pub mod vm;
 

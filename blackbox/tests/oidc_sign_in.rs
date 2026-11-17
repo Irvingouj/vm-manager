@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 
 use blackbox::Request;
 use blackbox::browser::{describe_steps, query_param, set_cookies, url};
+use blackbox::connection::SecretKey;
 use blackbox::oidc::{CLIENT_ID, Key, Outage, Provider};
 use blackbox::sessions::{
     ADA, GRACE, Installation, Link, SESSION_COOKIE, SIGN_IN_COOKIE, ada, assert_256_bits,
@@ -681,23 +682,18 @@ fn only_vm_session_is_the_platforms_under_vm_and_never_reaches_application_code(
 #[test]
 fn the_scopes_asked_for_are_the_default_or_the_ones_given_and_always_openid() {
     for (given, want) in [
-        (Some("openid email"), set_of(&["openid", "email"])),
-        (
-            Some("email profile"),
-            set_of(&["openid", "email", "profile"]),
-        ),
+        ("openid email", set_of(&["openid", "email"])),
+        ("email profile", set_of(&["openid", "email", "profile"])),
     ] {
-        let mut more = vec![];
-        if let Some(scopes) = given {
-            more = vec!["--oidc-scopes", scopes];
-        }
-        let at = Installation::start_with(&[("honest", "honest.js")], &[ada()], &more);
+        let at = Installation::start_connected(&[("honest", "honest.js")], &[ada()], &[], |c| {
+            c.scopes(given)
+        });
         let mut browser = at.browser_as(ADA);
         let steps = at.sign_in(&mut browser, "honest", "/");
         assert_eq!(
             scopes_of(&steps[1].location()),
             want,
-            "--oidc-scopes {given:?}"
+            "the connection's --scopes {given:?}"
         );
     }
 }
@@ -706,7 +702,7 @@ fn the_scopes_asked_for_are_the_default_or_the_ones_given_and_always_openid() {
 fn the_client_authenticates_with_client_secret_post_when_the_provider_names_only_it() {
     let provider = Provider::start(&[ada()]);
     provider.token_auth_methods(&["client_secret_post"]);
-    let options = oidc_options(&provider).application("honest", "honest.js");
+    let options = oidc_options().application("honest", "honest.js");
     let at = Installation::from(provider, &options);
     let mut browser = at.browser_as(ADA);
     at.sign_in(&mut browser, "honest", "/");
@@ -726,8 +722,11 @@ fn an_es256_id_token_is_taken() {
 
 #[test]
 fn a_provider_unreachable_at_first_is_used_once_it_answers() {
+    // Connecting asked the provider for its configuration; started again,
+    // the program holds nothing of it and meets the outage at step 2.
     let at = Installation::start(&[("honest", "honest.js")]);
     at.provider.set_outage(Outage::Close);
+    let at = at.restarted();
     let mut browser = at.browser_as(ADA);
     let first = browser.open(&at.app_url("honest", "/"));
     assert_eq!(first.response.status, 302, "step 1 needs no provider");
@@ -772,14 +771,8 @@ fn a_token_endpoint_that_does_not_answer_within_ten_seconds_is_a_502_page() {
 fn with_public(more: &[&str]) -> Installation {
     let provider = Provider::start(&[ada()]);
     let options = VmOptions::new()
-        .args_extra(&[
-            "--oidc-issuer",
-            provider.issuer(),
-            "--oidc-client-id",
-            CLIENT_ID,
-        ])
         .args_extra(more)
-        .env("VM_OIDC_CLIENT_SECRET", provider.client_secret().expose())
+        .env("VM_SECRET_KEY", SecretKey::fresh().expose())
         .application("honest", "honest.js");
     Installation::from(provider, &options)
 }

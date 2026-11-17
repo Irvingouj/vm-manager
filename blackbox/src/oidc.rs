@@ -214,6 +214,8 @@ pub enum ConfigFault {
     Oversize,
     /// Answered with this status (and a JSON error) instead of `200`.
     Status(u16),
+    /// Answered `200` with a body that is not JSON.
+    NotJson,
 }
 
 /// Whether the provider answers.
@@ -287,6 +289,8 @@ fn find<'a>(pairs: &'a [(String, String)], name: &str) -> Option<&'a str> {
 /// What an authorization code or a refresh token stands for.
 #[derive(Clone, Debug)]
 struct Grant {
+    /// The client the code was asked for.
+    client_id: String,
     sub: String,
     nonce: Option<String>,
     code_challenge: Option<String>,
@@ -302,6 +306,7 @@ struct State {
     refresh_tokens: HashMap<String, Grant>,
     issued: Vec<String>,
     issued_dropped: usize,
+    refresh_issued: Vec<String>,
     recorded: Vec<Recorded>,
     recorded_dropped: usize,
     outage: Outage,
@@ -321,6 +326,8 @@ struct State {
     keys_status: Option<u16>,
     unreadable_jwks: bool,
     other_secrets: Vec<String>,
+    other_clients: Vec<String>,
+    own_secret_revoked: bool,
     parked: usize,
 }
 
@@ -360,6 +367,11 @@ impl Shared {
 pub struct ClientSecret(String);
 
 impl ClientSecret {
+    /// A client secret of this value (one a test made up).
+    pub fn new(value: &str) -> Self {
+        Self(value.to_owned())
+    }
+
     /// The value, for `VM_OIDC_CLIENT_SECRET` and for looking for it where
     /// it must not be. Never print it.
     pub fn expose(&self) -> &str {
@@ -407,6 +419,7 @@ impl Provider {
             refresh_tokens: HashMap::new(),
             issued: Vec::new(),
             issued_dropped: 0,
+            refresh_issued: Vec::new(),
             recorded: Vec::new(),
             recorded_dropped: 0,
             outage: Outage::None,
@@ -429,6 +442,8 @@ impl Provider {
             keys_status: None,
             unreadable_jwks: false,
             other_secrets: Vec::new(),
+            other_clients: Vec::new(),
+            own_secret_revoked: false,
             parked: 0,
         };
         let shared = Arc::new(Shared {
@@ -606,6 +621,20 @@ impl Provider {
         self.shared.lock().other_secrets.push(secret.to_owned());
     }
 
+    /// Takes its own client secret no more: only those given with
+    /// [`Provider::also_take_secret`]. The client secret changed at the
+    /// provider, the old one revoked.
+    pub fn revoke_own_secret(&self) {
+        self.shared.lock().own_secret_revoked = true;
+    }
+
+    /// Takes this client id too, beside [`CLIENT_ID`]: a second
+    /// registration of the platform at the same provider. Its ID tokens
+    /// name it as their `aud`.
+    pub fn also_take_client(&self, client_id: &str) {
+        self.shared.lock().other_clients.push(client_id.to_owned());
+    }
+
     /// What the token endpoint's successful answers look like from now on.
     pub fn token_answer(&self, answer: TokenAnswer) {
         self.shared.lock().token_answer = answer;
@@ -647,6 +676,11 @@ impl Provider {
             "the identity provider issued more than {MAX_ISSUED} codes and tokens and kept only the first"
         );
         state.issued.clone()
+    }
+
+    /// The refresh tokens issued so far (the first [`MAX_ISSUED`]).
+    pub fn refresh_tokens_issued(&self) -> Vec<String> {
+        self.shared.lock().refresh_issued.clone()
     }
 
     /// The people as they are now.
@@ -1016,6 +1050,9 @@ fn configuration(shared: &Shared) -> Answer {
     if let Some(ConfigFault::Status(status)) = fault {
         return Answer::json(status, &json!({ "error": "harness_status" }));
     }
+    if fault == Some(ConfigFault::NotJson) {
+        return Answer::html(200, "this is not a configuration");
+    }
     let mut body = json!({
             "issuer": issuer,
             "authorization_endpoint": format!("{issuer}/authorize"),
@@ -1042,7 +1079,7 @@ fn configuration(shared: &Shared) -> Answer {
         Some(ConfigFault::Oversize) => {
             body["padding"] = Value::String("x".repeat(OVERSIZE_BYTES));
         }
-        Some(ConfigFault::Status(_)) | None => {}
+        Some(ConfigFault::Status(_) | ConfigFault::NotJson) | None => {}
     }
     Answer::json(200, &body)
 }
@@ -1117,9 +1154,11 @@ fn authorize(recorded: &Recorded, shared: &Shared) -> Answer {
     if param("response_type") != Some("code") {
         return Answer::html(400, "unsupported response_type");
     }
-    if param("client_id") != Some(CLIENT_ID) {
+    let Some(client_id) = param("client_id")
+        .filter(|id| *id == CLIENT_ID || shared.lock().other_clients.iter().any(|o| o == id))
+    else {
         return Answer::html(400, "unknown client_id");
-    }
+    };
     let Some(redirect_uri) = param("redirect_uri").filter(|r| !r.is_empty()) else {
         return Answer::html(400, "no redirect_uri");
     };
@@ -1150,6 +1189,7 @@ fn authorize(recorded: &Recorded, shared: &Shared) -> Answer {
     state.codes.insert(
         code.clone(),
         Grant {
+            client_id: client_id.to_owned(),
             sub,
             nonce: param("nonce").map(str::to_owned),
             code_challenge: param("code_challenge").map(str::to_owned),
@@ -1229,11 +1269,14 @@ fn token(recorded: &mut Recorded, shared: &Shared) -> Answer {
             &json!({ "error": status.error, "error_description": status.description }),
         );
     }
-    let secret_taken = secret
+    let secret_taken = secret.as_deref().is_some_and(|s| {
+        (s == shared.secret && !state.own_secret_revoked)
+            || state.other_secrets.iter().any(|o| o == s)
+    });
+    let known_client = id
         .as_deref()
-        .is_some_and(|s| s == shared.secret || state.other_secrets.iter().any(|o| o == s));
-    let authenticated =
-        state.auth_methods.contains(&method) && id.as_deref() == Some(CLIENT_ID) && secret_taken;
+        .is_some_and(|id| id == CLIENT_ID || state.other_clients.iter().any(|o| o == id));
+    let authenticated = state.auth_methods.contains(&method) && known_client && secret_taken;
     if !authenticated {
         return token_error(401, "invalid_client");
     }
@@ -1243,7 +1286,7 @@ fn token(recorded: &mut Recorded, shared: &Shared) -> Answer {
             let Some(grant) = state.codes.get_mut(code) else {
                 return token_error(400, "invalid_grant");
             };
-            if grant.used {
+            if grant.used || id.as_deref() != Some(grant.client_id.as_str()) {
                 return token_error(400, "invalid_grant");
             }
             grant.used = true;
@@ -1267,7 +1310,12 @@ fn token(recorded: &mut Recorded, shared: &Shared) -> Answer {
             let presented = recorded.form_param("refresh_token").unwrap_or_default();
             // Refresh tokens are one use each: a renewal that brings a new
             // one uses up the one presented, and a used one is refused.
-            let Some(grant) = state.refresh_tokens.get(presented).cloned() else {
+            let Some(grant) = state
+                .refresh_tokens
+                .get(presented)
+                .filter(|g| id.as_deref() == Some(g.client_id.as_str()))
+                .cloned()
+            else {
                 return token_error(400, "invalid_grant");
             };
             if state.issue_refresh_tokens {
@@ -1290,7 +1338,7 @@ fn token(recorded: &mut Recorded, shared: &Shared) -> Answer {
     } else {
         grant.nonce.as_deref()
     };
-    let id_token = id_token(shared, &state, &person, nonce);
+    let id_token = id_token(shared, &state, &person, nonce, &grant.client_id);
     let access_token = shared.random();
     keep_issued(&mut state, &id_token);
     keep_issued(&mut state, &access_token);
@@ -1304,6 +1352,9 @@ fn token(recorded: &mut Recorded, shared: &Shared) -> Answer {
     if state.issue_refresh_tokens {
         let refresh_token = shared.random();
         keep_issued(&mut state, &refresh_token);
+        if state.refresh_issued.len() < MAX_ISSUED {
+            state.refresh_issued.push(refresh_token.clone());
+        }
         state.refresh_tokens.insert(refresh_token.clone(), grant);
         body["refresh_token"] = Value::String(refresh_token);
     }
@@ -1328,7 +1379,13 @@ fn token(recorded: &mut Recorded, shared: &Shared) -> Answer {
     }
 }
 
-fn id_token(shared: &Shared, state: &State, person: &Person, nonce: Option<&str>) -> String {
+fn id_token(
+    shared: &Shared,
+    state: &State,
+    person: &Person,
+    nonce: Option<&str>,
+    client_id: &str,
+) -> String {
     let now = now_secs();
     let fault = state.fault;
     let mut claims = Map::new();
@@ -1340,7 +1397,7 @@ fn id_token(shared: &Shared, state: &State, person: &Person, nonce: Option<&str>
     let audience = if fault == Some(TokenFault::WrongAudience) {
         "another-client"
     } else {
-        CLIENT_ID
+        client_id
     };
     let sub = if fault == Some(TokenFault::OtherSubject) {
         format!("{}-someone-else", person.sub)

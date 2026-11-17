@@ -161,14 +161,32 @@ impl VmOptions {
             .map(String::as_str)
     }
 
-    /// Starts the program with this environment variable set.
+    /// Starts the program with this environment variable set, in place of
+    /// any value given for it before.
     #[must_use]
     pub fn env(mut self, name: &str, value: &str) -> Self {
+        self.env.retain(|e| e.name != name);
         self.env.push(EnvVar {
             name: name.to_owned(),
             value: value.to_owned(),
         });
         self
+    }
+
+    /// Starts the program without this environment variable.
+    #[must_use]
+    pub fn without_env(mut self, name: &str) -> Self {
+        self.env.retain(|e| e.name != name);
+        self
+    }
+
+    /// The value given for this environment variable, if any. It may be a
+    /// secret: never print it.
+    pub fn env_value(&self, name: &str) -> Option<&str> {
+        self.env
+            .iter()
+            .find(|e| e.name == name)
+            .map(|e| e.value.as_str())
     }
 
     /// The same options without the extra arguments and environment, and
@@ -335,6 +353,8 @@ impl Vm {
             .args(&args)
             .env("VM_DATABASE_URL", platform.url())
             .env_remove("VM_OIDC_CLIENT_SECRET")
+            .env_remove("VM_SECRET_KEY")
+            .env_remove("VM_SETUP_CREDENTIAL")
             .envs(options.env.iter().map(|e| (&e.name, &e.value)))
             .stdin(Stdio::null())
             .stdout(Stdio::null())

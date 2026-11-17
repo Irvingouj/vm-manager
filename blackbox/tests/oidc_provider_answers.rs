@@ -14,13 +14,22 @@
 
 use std::time::Duration;
 
-use blackbox::VmOptions;
-use blackbox::oidc::{CLIENT_ID, ConfigFault, Provider, TokenAnswer, TokenFault, TokenStatus};
+use blackbox::oidc::{ConfigFault, Provider, TokenAnswer, TokenFault, TokenStatus};
 use blackbox::sessions::{ADA, Installation, Link, SESSION_COOKIE, ada, assert_failure_page};
 use serde_json::{Value, json};
 
 fn installation() -> Installation {
     Installation::start(&[("honest", "honest.js")])
+}
+
+/// An installation whose program was started again after the provider's
+/// configuration went wrong: connecting asked for the configuration, and
+/// the program may keep what it read for up to an hour; started again it
+/// holds nothing and asks at its first sign-in.
+fn installation_after(fault: ConfigFault) -> Installation {
+    let at = installation();
+    at.provider.config_fault(Some(fault));
+    at.restarted()
 }
 
 /// Steps 1 to 3 and the callback with a fresh browser; fails unless the
@@ -113,8 +122,7 @@ fn a_refusal_at_the_callback_is_logged_with_its_error_and_never_its_description(
 
 #[test]
 fn a_configuration_naming_another_issuer_is_a_502_page_at_step_two() {
-    let at = installation();
-    at.provider.config_fault(Some(ConfigFault::AnotherIssuer));
+    let at = installation_after(ConfigFault::AnotherIssuer);
     assert_step_two_fails(&at, "a configuration naming another issuer");
     at.assert_logged(
         "identity-provider-unanswered",
@@ -124,9 +132,7 @@ fn a_configuration_naming_another_issuer_is_a_502_page_at_step_two() {
 
 #[test]
 fn a_configuration_without_a_token_endpoint_is_a_502_page_at_step_two() {
-    let at = installation();
-    at.provider
-        .config_fault(Some(ConfigFault::LacksTokenEndpoint));
+    let at = installation_after(ConfigFault::LacksTokenEndpoint);
     assert_step_two_fails(&at, "a configuration without a token endpoint");
     at.assert_logged(
         "identity-provider-unanswered",
@@ -136,8 +142,7 @@ fn a_configuration_without_a_token_endpoint_is_a_502_page_at_step_two() {
 
 #[test]
 fn a_configuration_larger_than_a_mebibyte_is_a_502_page_at_step_two() {
-    let at = installation();
-    at.provider.config_fault(Some(ConfigFault::Oversize));
+    let at = installation_after(ConfigFault::Oversize);
     assert_step_two_fails(&at, "a configuration of more than 1 MiB");
     at.assert_logged(
         "identity-provider-unanswered",
@@ -147,19 +152,9 @@ fn a_configuration_larger_than_a_mebibyte_is_a_502_page_at_step_two() {
 
 #[test]
 fn a_provider_that_cannot_be_reached_is_logged_as_unreachable() {
-    let provider = Provider::start(&[ada()]);
-    let options = VmOptions::new()
-        .args_extra(&[
-            "--oidc-issuer",
-            &Provider::unreachable_issuer(),
-            "--oidc-client-id",
-            CLIENT_ID,
-            "--public-scheme",
-            "http",
-        ])
-        .env("VM_OIDC_CLIENT_SECRET", provider.client_secret().expose())
-        .application("honest", "honest.js");
-    let at = Installation::from(provider, &options);
+    // Connected while the provider answered; then the provider is gone and
+    // the program started again, so that its first sign-in must reach it.
+    let at = installation().restarted_beside(Provider::start(&[ada()]));
     assert_step_two_fails(&at, "a provider that cannot be reached");
     at.assert_logged(
         "identity-provider-unanswered",
@@ -251,8 +246,7 @@ fn an_id_token_with_times_in_fractions_of_a_second_is_taken() {
 
 #[test]
 fn a_configuration_answered_with_a_status_other_than_200_is_a_502_page_at_step_two() {
-    let at = installation();
-    at.provider.config_fault(Some(ConfigFault::Status(500)));
+    let at = installation_after(ConfigFault::Status(500));
     assert_step_two_fails(&at, "a configuration answered 500");
     at.assert_logged(
         "identity-provider-unanswered",

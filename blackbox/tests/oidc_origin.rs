@@ -14,9 +14,10 @@
 )]
 
 use blackbox::oidc::{Person, Provider};
-use blackbox::scenario::{ADMINISTRATORS, Scenario, WRITERS, administrator, execute_sql};
+use blackbox::scenario::{ADMINISTRATORS, Scenario, WRITERS, execute_sql};
 use blackbox::sessions::{ADA, Installation, oidc_options};
-use blackbox::{DOMAIN, Request, Response, User, Vm, VmOptions};
+use blackbox::tool::bearer;
+use blackbox::{DOMAIN, Request, Response, User, Vm};
 use serde_json::{Value, json};
 
 /// One case of the rule: the method, the headers about where it comes
@@ -333,6 +334,10 @@ fn writer() -> User {
     User::new("wanda").in_groups(&[WRITERS])
 }
 
+/// A Platform administrator at the provider: in the connection's
+/// administrators' Group.
+const IT_ADMIN: &str = "00u-it-admin";
+
 const WRITE: &str = "update incidents set open = false where id = 1";
 
 /// `POST /` on `board` (`fixtures/operations.js`) with one `execute`.
@@ -372,8 +377,11 @@ fn a_refused_request_leaves_the_operation_log_untouched_under_oidc() {
     let Scenario { vm, db } = Scenario::writable();
     let platform = vm.platform().clone();
     drop(vm);
-    let provider = Provider::start(&[Person::new(ADA).in_groups(&[WRITERS])]);
-    let options = oidc_options(&provider).platform(&platform);
+    let provider = Provider::start(&[
+        Person::new(ADA).in_groups(&[WRITERS]),
+        Person::new(IT_ADMIN).in_groups(&[ADMINISTRATORS]),
+    ]);
+    let options = oidc_options().platform(&platform);
     let at = Installation::from(provider, &options);
     let mut browser = at.browser_as(ADA);
     // board's code answers only a POST, so the sign-in lands on an error of
@@ -404,14 +412,16 @@ fn a_refused_request_leaves_the_operation_log_untouched_under_oidc() {
     at.vm.records_of(&refused).assert_no_application_code_ran();
     let taken = post(at.app_origin("board"));
     assert_eq!(taken.status, 200, "{}", taken.describe());
-    drop(at);
-    let reader = Vm::start(
-        &VmOptions::new()
-            .stand_in_sign_in()
-            .administrators_group(ADMINISTRATORS)
-            .platform(&platform),
-    );
-    let entries = reader.api_as(&administrator()).operation_log_entries();
+    // The stand-in cannot be started on a platform database that holds a
+    // connection: the Operation log is read by a Platform administrator of
+    // the connection's Group, with a tool credential of their own.
+    let credential = at.tool_credential_for(IT_ADMIN);
+    let log = bearer(&at.vm, "/v1/operation-log?limit=1000", &credential).send();
+    assert_eq!(log.status, 200, "{}", log.describe());
+    let entries = log.json()["entries"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
     assert_eq!(
         entries_of(&entries, &refused),
         0,

@@ -19,6 +19,7 @@ use std::sync::Barrier;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use blackbox::connection::{Connection, SecretKey};
 use blackbox::oidc::{Outage, TokenAnswer, TokenFault, TokenStatus};
 use blackbox::sessions::{ADA, GRACE, Installation, ada, grace};
 use blackbox::{Request, Response};
@@ -484,23 +485,63 @@ fn another_4xx_at_a_renewal_ends_the_session_and_its_description_is_never_logged
 }
 
 #[test]
-fn after_the_client_secret_changes_a_session_ends_at_its_next_renewal() {
-    let at = renewing_every(8);
+fn after_the_installation_s_key_changes_and_oidc_is_connected_again_a_session_ends_at_its_next_renewal()
+ {
+    let at = renewing_every(20);
     let mut browser = at.browser_as(ADA);
     let signed_in = Instant::now();
     at.sign_in(&mut browser, "honest", "/");
-    let at = at.restarted_with_secret("harness-second-secret-Hk3d9Qw7");
+    let at = at.restarted_with_key(Some(&SecretKey::fresh()));
+    at.connect(&Connection::to(&at.provider));
     browser.reach(at.vm.address());
+    assert!(
+        signed_in.elapsed() < Duration::from_secs(20),
+        "the test was too slow to look before the renewal period ended ({:?})",
+        signed_in.elapsed()
+    );
     assert_eq!(
         at.user_seen(&mut browser, "honest")["id"],
         ADA,
         "the session holds until its renewal"
     );
-    wait_past(signed_in, Duration::from_secs(8));
-    at.assert_no_session(&mut browser, "honest", "after the client secret changed");
+    wait_past(signed_in, Duration::from_secs(20));
+    at.assert_no_session(
+        &mut browser,
+        "honest",
+        "after the installation's key changed and OIDC was connected again",
+    );
     at.assert_logged(
         "session-ended",
         &[("reason", json!("unreadable-refresh-token"))],
+    );
+}
+
+#[test]
+fn a_client_secret_changed_by_a_new_connection_ends_no_session() {
+    let at = renewing_every(4);
+    let mut browser = at.browser_as(ADA);
+    let signed_in = Instant::now();
+    at.sign_in(&mut browser, "honest", "/");
+    let new_secret = "harness-second-secret-Hk3d9Qw7";
+    at.provider.also_take_secret(new_secret);
+    at.provider.revoke_own_secret();
+    at.connect(&Connection::to(&at.provider).client_secret(new_secret));
+    at.provider.set_groups(ADA, &["devops"]);
+    let renewals = at.provider.grants("refresh_token").len();
+    wait_past(signed_in, Duration::from_secs(4));
+    assert_eq!(
+        at.user_seen(&mut browser, "honest")["groups"],
+        json!(["devops"]),
+        "the session stays, and its renewal is made with the new client secret (the old one is refused now)"
+    );
+    assert!(
+        at.provider.grants("refresh_token").len() > renewals,
+        "the session was renewed at the provider"
+    );
+    assert!(
+        at.logged("session-ended").is_empty(),
+        "no session ended: {:?}",
+        at.logged("session-ended")
     );
 }
 
