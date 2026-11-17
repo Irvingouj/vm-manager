@@ -587,14 +587,14 @@ fn a_renewal_whose_configuration_is_slow_and_token_endpoint_held_ends_within_10_
 }
 
 #[test]
-fn at_most_1024_sessions_are_renewed_at_once_and_one_more_is_503_at_once() {
+fn at_most_256_sessions_are_renewed_at_once_and_meanwhile_others_are_answered_at_once() {
     use std::io::{Read, Write};
     use std::net::TcpStream;
 
-    const PEOPLE: usize = 53;
+    const PEOPLE: usize = 14;
     const EACH: usize = 20;
-    const RENEWING: usize = 1024;
-    const RENEWAL: u64 = 20;
+    const RENEWING: usize = 256;
+    const RENEWAL: u64 = 6;
     let test_began = Instant::now();
     let people: Vec<blackbox::oidc::Person> = (0..PEOPLE)
         .map(|i| blackbox::oidc::Person::new(&format!("00u-many-{i:02}")))
@@ -604,16 +604,16 @@ fn at_most_1024_sessions_are_renewed_at_once_and_one_more_is_503_at_once() {
         &people,
         &["--session-renewal", &RENEWAL.to_string()],
     );
-    // 1,060 sessions, 20 for each of 53 people, each in a browser of its
-    // own; kept as the Cookie header honest is sent with.
+    // 280 sessions, 20 for each of 14 people, each in a browser of its own;
+    // kept as the Cookie header honest is sent with.
     let first_sign_in = Instant::now();
     let cookies: Vec<String> = thread::scope(|scope| {
-        let handles: Vec<_> = (0..10)
+        let handles: Vec<_> = (0..8)
             .map(|t| {
                 let at = &at;
                 scope.spawn(move || {
                     let mut cookies = Vec::new();
-                    for n in (t..PEOPLE * EACH).step_by(10) {
+                    for n in (t..PEOPLE * EACH).step_by(8) {
                         let mut browser = at.browser_as(&format!("00u-many-{:02}", n % PEOPLE));
                         at.sign_in(&mut browser, "honest", "/");
                         cookies.push(browser.jar.header_for(&at.app_url("honest", "/")).unwrap());
@@ -629,7 +629,7 @@ fn at_most_1024_sessions_are_renewed_at_once_and_one_more_is_503_at_once() {
     });
     let signed_in = first_sign_in.elapsed();
     assert!(
-        signed_in < Duration::from_secs(RENEWAL - 2),
+        signed_in < Duration::from_secs(RENEWAL - 1),
         "the sign-ins took {signed_in:?}, too long to make them all before the first renewal"
     );
     let host = format!("honest.{}:{}", blackbox::DOMAIN, at.port());
@@ -638,115 +638,126 @@ fn at_most_1024_sessions_are_renewed_at_once_and_one_more_is_503_at_once() {
             "GET / HTTP/1.1\r\nHost: {host}\r\nAccept: application/json\r\nCookie: {cookie}\r\nConnection: close\r\n\r\n"
         )
     };
-    // Every session due; the token endpoint held, many calls at once.
+    // Every session due; the provider holds every call.
     wait_past(first_sign_in, Duration::from_secs(RENEWAL) + signed_in);
     at.provider.set_outage(Outage::Park);
     let fired = Instant::now();
-    let held: Vec<TcpStream> = cookies[..RENEWING]
+    let held: Vec<(TcpStream, Instant)> = cookies[..RENEWING]
         .iter()
         .map(|cookie| {
             let mut stream = TcpStream::connect(at.vm.address()).unwrap();
             stream.write_all(raw(cookie).as_bytes()).unwrap();
-            stream
+            (stream, Instant::now())
         })
         .collect();
     let sent_in = fired.elapsed();
-    // Each of them, as a client would, takes its answer when it comes and
-    // leaves.
-    let (statuses, one_more) = thread::scope(|scope| {
+    // Each held client stays connected and takes its answer when it comes.
+    let (held_answers, meanwhile, parked, still_held) = thread::scope(|scope| {
         let reader = scope.spawn(move || {
-            let mut statuses = std::collections::BTreeMap::new();
-            for mut stream in held {
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(25)))
-                    .unwrap();
-                let mut head = Vec::new();
-                drop(stream.read_to_end(&mut head));
-                let line = String::from_utf8_lossy(&head)
-                    .lines()
-                    .next()
-                    .unwrap_or("no answer")
-                    .to_owned();
-                *statuses.entry(line).or_insert(0_usize) += 1;
-            }
-            statuses
+            held.into_iter()
+                .map(|(mut stream, sent)| {
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(25)))
+                        .unwrap();
+                    let mut answer = Vec::new();
+                    drop(stream.read_to_end(&mut answer));
+                    let line = String::from_utf8_lossy(&answer)
+                        .lines()
+                        .next()
+                        .unwrap_or("no answer")
+                        .to_owned();
+                    let retry_after = String::from_utf8_lossy(&answer)
+                        .to_ascii_lowercase()
+                        .contains("\r\nretry-after:");
+                    (line, retry_after, sent.elapsed())
+                })
+                .collect::<Vec<_>>()
         });
         while at.provider.parked() < RENEWING && fired.elapsed() < Duration::from_secs(4) {
             thread::sleep(Duration::from_millis(20));
         }
         let parked = at.provider.parked();
-        assert!(
-            fired.elapsed() < Duration::from_secs(8),
-            "the 1,024 renewals must still be under way (sent in {sent_in:?})"
-        );
-        // A request with no session meanwhile, which no renewal concerns:
-        // how long it takes tells a bound on connections from the bound on
-        // renewals.
-        let began = Instant::now();
-        let without = Request::new(at.vm.address(), "/", &host)
-            .header("accept", "application/json")
-            .timeout(Duration::from_secs(25))
-            .try_send()
-            .map(|a| a.status);
-        let without = (without, began.elapsed());
-        // One more session.
-        let began = Instant::now();
-        let answer = Request::new(at.vm.address(), "/", &host)
-            .header("accept", "application/json")
-            .header("cookie", &cookies[RENEWING + 10])
-            .timeout(Duration::from_secs(25))
-            .try_send();
-        let took = began.elapsed();
-        // The provider answers again: the held calls are closed unanswered.
+        let timed = |what: &'static str, request: Request| {
+            let began = Instant::now();
+            let answer = request.timeout(Duration::from_secs(25)).try_send();
+            (what, answer, began.elapsed())
+        };
+        let meanwhile = vec![
+            timed(
+                "a request of nobody signed in",
+                Request::new(at.vm.address(), "/", &host).header("accept", "application/json"),
+            ),
+            timed(
+                "a page of nobody signed in",
+                at.browser().navigation(&at.app_url("honest", "/")),
+            ),
+            timed(
+                "the API with no credential",
+                at.vm.api_request("/v1/applications"),
+            ),
+            timed(
+                "one more due session",
+                Request::new(at.vm.address(), "/", &host)
+                    .header("accept", "application/json")
+                    .header("cookie", &cookies[RENEWING + 10]),
+            ),
+        ];
+        let still_held = fired.elapsed();
+        let joined = reader.join().unwrap();
+        // The provider answers again.
         at.provider.set_outage(Outage::None);
-        (reader.join().unwrap(), (answer, took, parked, without))
+        (joined, meanwhile, parked, still_held)
     });
-    let (answer, took, parked, without) = one_more;
-    let answer = answer.unwrap_or_else(|e| {
-        at.vm.fail(&format!(
-            "one more session while {RENEWING} are being renewed ({parked} calls held at the provider, the requests sent in {sent_in:?}): {e}"
-        ))
-    });
-    assert_eq!(
-        answer.status,
-        503,
-        "one more session while {RENEWING} are being renewed ({parked} calls held at the provider)\n{}",
-        answer.describe()
+    let context = format!(
+        "{RENEWING} requests held (sent in {sent_in:?}, {parked} calls held at the provider; the last request meanwhile ended {still_held:?} after the first held one was sent)"
     );
+    for ((what, answer, took), want) in meanwhile.iter().zip([401, 302, 401, 503]) {
+        let answer = answer
+            .as_ref()
+            .unwrap_or_else(|e| panic!("{what}, while {context}: {e}"));
+        assert!(
+            answer.status == want && *took < Duration::from_secs(1),
+            "{what}, while {context}: expected {want} at once, got {} in {took:?}\n{}",
+            answer.status,
+            answer.describe()
+        );
+        if want == 503 {
+            assert!(
+                answer.header("retry-after").is_some(),
+                "{what}: expected Retry-After\n{}",
+                answer.describe()
+            );
+            at.vm.records_of(answer).assert_no_application_code_ran();
+        }
+    }
+    let late: Vec<_> = held_answers
+        .iter()
+        .filter(|(line, retry_after, took)| {
+            line != "HTTP/1.1 503 Service Unavailable"
+                || !retry_after
+                || *took > Duration::from_secs(12)
+        })
+        .take(5)
+        .collect();
     assert!(
-        took < Duration::from_secs(1),
-        "one more session is answered 503 at once, not after a renewal's time: it took {took:?} ({parked} calls held at the provider; the held requests got {statuses:?}; a request without a session just before got {:?} in {:?})",
-        without.0,
-        without.1
+        late.is_empty(),
+        "each held request ends 503 with Retry-After within about 12 s of its start; some did not: {late:?}"
     );
-    at.vm.records_of(&answer).assert_no_application_code_ran();
-    assert_eq!(
-        statuses.keys().map(String::as_str).collect::<Vec<_>>(),
-        ["HTTP/1.1 503 Service Unavailable"],
-        "each held request of a session whose provider does not answer is 503: {statuses:?}"
-    );
-    let released = Instant::now();
     for (n, cookie) in cookies[..20].iter().chain(&cookies[RENEWING..]).enumerate() {
         let answer = Request::new(at.vm.address(), "/", &host)
             .header("accept", "application/json")
             .header("cookie", cookie)
             .timeout(Duration::from_secs(15))
-            .try_send()
-            .unwrap_or_else(|e| {
-                at.vm.fail(&format!(
-                    "the session {n} after the provider answers again ({:?} after the release): {e}",
-                    released.elapsed()
-                ))
-            });
+            .send();
         assert_eq!(
             answer.status,
             200,
-            "once the provider answers, the session is served\n{}",
+            "once the provider answers, the session {n} is served\n{}",
             answer.describe()
         );
     }
     eprintln!(
-        "1,060 sign-ins in {signed_in:?}; 1,024 requests sent in {sent_in:?}; {parked} calls held at the provider; one more answered in {took:?}; the test took {:?}",
+        "280 sign-ins in {signed_in:?}; {RENEWING} requests sent in {sent_in:?}; {parked} calls held; the test took {:?}",
         test_began.elapsed()
     );
 }
