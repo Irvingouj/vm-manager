@@ -15,21 +15,56 @@
 //! The local run (`vm request`) sends the records to a file of the
 //! project's local state instead ([`to_file`]): its standard error is the
 //! Builder's terminal, and the command prints what matters of them itself.
+//! That file is bounded: once what was written into it passes
+//! [`MAX_FILE_BYTES`], it is emptied and written again from its start
+//! (`vm dev` runs for days).
 
 use std::fs::File;
-use std::io::Write;
+use std::io::{Seek, SeekFrom, Write};
 use std::sync::{Mutex, OnceLock, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Map, Value};
 
+/// The most a file of records holds before it is started anew.
+pub const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
+
+/// A file records go to, and how much is in it.
+struct Sink {
+    file: File,
+    written: u64,
+}
+
+impl Sink {
+    /// Writes one line; the file started anew first when the line would
+    /// take it past [`MAX_FILE_BYTES`].
+    fn write(&mut self, line: &str) {
+        let size = u64::try_from(line.len())
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
+        if self.written.saturating_add(size) > MAX_FILE_BYTES {
+            let emptied = self
+                .file
+                .set_len(0)
+                .and_then(|()| self.file.seek(SeekFrom::Start(0)));
+            if emptied.is_ok() {
+                self.written = 0;
+            }
+        }
+        if writeln!(self.file, "{line}").is_ok() {
+            self.written = self.written.saturating_add(size);
+        }
+    }
+}
+
 /// Where records go instead of standard error, once set.
-static SINK: OnceLock<Mutex<File>> = OnceLock::new();
+static SINK: OnceLock<Mutex<Sink>> = OnceLock::new();
 
 /// From now on, records are written to `file` and not to standard error.
 /// Once per process; `false` when a file was set already.
 pub fn to_file(file: File) -> bool {
-    SINK.set(Mutex::new(file)).is_ok()
+    let written = file.metadata().map_or(0, |m| m.len());
+    SINK.set(Mutex::new(Sink { file, written })).is_ok()
 }
 
 /// Writes one record. `fields` should be a JSON object; anything else is
@@ -48,8 +83,9 @@ pub fn record(event: &str, fields: Value) {
     let line = Value::Object(object).to_string();
     if let Some(file) = SINK.get() {
         // Held for this one write, never across an await.
-        let mut file = file.lock().unwrap_or_else(PoisonError::into_inner);
-        writeln!(file, "{line}").ok();
+        file.lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .write(&line);
         return;
     }
     let mut err = std::io::stderr().lock();

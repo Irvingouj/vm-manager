@@ -4,8 +4,8 @@
 //!
 //! **Every answer** carries `cache-control: no-store`,
 //! `x-content-type-options: nosniff` and a `content-security-policy` that
-//! lets a page run no script and load nothing (`default-src 'none';
-//! style-src 'unsafe-inline'; form-action 'self'`). A page has no script.
+//! lets a page run no script, load nothing and be shown inside no other
+//! page ([`POLICY`]). A page has no script.
 //! Everything of the project's or the Builder's on a page (an id, a name,
 //! a message) is escaped as HTML ([`escape`]), in text and in attributes
 //! alike; a `Location` holds only bytes from `!` to `~`; what is
@@ -23,7 +23,7 @@ use hyper::{Response, StatusCode};
 use super::super::test_users::{TestUser, TestUsersFile};
 
 /// The policy of every answer of the local run's own.
-const POLICY: &str = "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'";
+const POLICY: &str = "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'";
 
 /// The cookie that holds the chosen test User.
 pub(super) const COOKIE: &str = "vm_test_user";
@@ -150,6 +150,11 @@ fn page(status: StatusCode, title: &str, body: &str) -> Response<Full<Bytes>> {
 /// `text/plain`.
 pub(super) fn plain(status: StatusCode, text: String) -> Response<Full<Bytes>> {
     own(status, "text/plain; charset=utf-8", text)
+}
+
+/// `200`, `application/json`: what a command of the tool's prints.
+pub(super) fn json(body: String) -> Response<Full<Bytes>> {
+    own(StatusCode::OK, "application/json", body)
 }
 
 /// A redirect to `location`, which holds only bytes from `!` to `~`.

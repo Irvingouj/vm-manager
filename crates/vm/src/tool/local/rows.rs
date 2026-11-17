@@ -8,6 +8,12 @@
 //! `oid`, so that a database made anew is told from the one before) and the
 //! SHA-256 of the file loaded, or null when the target holds no file's rows
 //! (emptied, or a loading that failed). Nothing of it is in the project.
+//! One connection to that database serves a whole loading. A target is
+//! remembered as holding no file's rows before it is emptied, so that the
+//! record never says rows are there that are not.
+//!
+//! **Only files.** A `test-rows/<name>.sql` that is not a file (a link, a
+//! folder) is `test-rows-failed`: no link is followed.
 //!
 //! **A stand-in.** Its tables are emptied and their sequences and
 //! identities started again by the private Postgres's superuser, the role
@@ -48,7 +54,10 @@ use super::super::deploy;
 use super::super::project_tools::Who;
 use super::super::test_users::BUILDER;
 use super::postgres::{CONNECT_WAIT, HOST};
-use super::run::{Live, Pg, Said, migration_failed, migration_refused, own_database_unavailable};
+use super::run::{
+    Live, Pg, Said, migration_failed, migration_refused, off_thread, own_database_unavailable,
+    read_failed,
+};
 use super::standins::{self, Standin};
 use super::{database_failed, postgres_failed};
 use crate::executor::{Failure, Label, Level, Values};
@@ -77,23 +86,16 @@ const LOAD_WAIT: Duration = Duration::from_secs(120);
 /// before it is made anew.
 const SHIP_WAIT: Duration = Duration::from_secs(10);
 
-/// Makes the table of what was loaded last, unless it is there.
-pub(super) async fn set_up(superuser: &DatabaseAddress) -> Result<(), String> {
-    let connection = Connection::open(&superuser.config(CONNECT_WAIT), CONNECT_WAIT)
-        .await
-        .map_err(|e| format!("the private Postgres cannot be reached as its superuser ({e})"))?;
+/// Makes the table of what was loaded last, unless it is there, on
+/// `memory` (the maintenance database, as the superuser).
+async fn make_table(memory: &Connection, name: &str) -> Result<(), Ending> {
     let statement = format!(
         "CREATE TABLE IF NOT EXISTS {TABLE} (target text PRIMARY KEY, database oid NOT NULL, sha256 text)"
     );
-    tokio::time::timeout(CONNECT_WAIT, connection.client().batch_execute(&statement))
+    tokio::time::timeout(STATEMENT_WAIT, memory.client().batch_execute(&statement))
         .await
-        .map_err(|_| "the table of test rows was not made in time".to_owned())?
-        .map_err(|e| {
-            format!(
-                "the table of test rows cannot be made ({})",
-                DbError::from(e)
-            )
-        })
+        .map_err(|_| postgres_failed("the table of test rows was not made in time", name))?
+        .map_err(|e| database_failed(&DbError::from(e), name))
 }
 
 /// Where test rows are loaded.
@@ -131,14 +133,31 @@ struct Last {
 }
 
 /// Loads the test rows that changed: each stand-in's (of `standins`), then
-/// the own database's. A file for a Resource that is not pulled is a note.
+/// the own database's. A file for a Resource that is not pulled, or for an
+/// own database the Application does not have, is a note. One connection
+/// to the maintenance database serves the whole loading.
 pub(super) async fn load(
     target: &Target<'_>,
     standins: &[Standin],
     said: &mut Said,
 ) -> Result<Loaded, Ending> {
     let name = target.who.command;
-    let pulled = standins::pulled(target.project, name);
+    let (pulled, stems) = {
+        // Copied: the reads own their path on their own thread; once a
+        // loading.
+        let project = target.project.to_path_buf();
+        off_thread(move || (standins::pulled(&project, name), sql_files(&project)))
+            .await
+            .ok_or_else(|| read_failed(name))?
+    };
+    let stems = stems.map_err(|file| {
+        failed(
+            &file,
+            "",
+            "it is not a file (a link, or a folder): test rows are files of the project, and a link is not followed",
+            name,
+        )
+    })?;
     let mut known: Vec<String> = pulled.files.iter().map(|f| f.resource.clone()).collect();
     known.extend(
         pulled
@@ -146,8 +165,20 @@ pub(super) async fn load(
             .iter()
             .filter_map(|w| w["resource"].as_str().map(str::to_owned)),
     );
-    for stem in sql_files(target.project) {
-        if stem != "own-database" && !known.contains(&stem) {
+    let own_stem = OWN_FILE.trim_end_matches(".sql");
+    for stem in &stems {
+        if stem == own_stem {
+            if !has_own_tables(target) {
+                said.notes.push(json!({
+                    "reason": "test-rows-without-own-database",
+                    "file": format!("{FOLDER}/{OWN_FILE}"),
+                    "message": format!(
+                        "{FOLDER}/{OWN_FILE} holds rows for the own database, which {} does not have (it has no migrations): it is not loaded. Add a migration to have an own database, or remove the file",
+                        target.application
+                    ),
+                }));
+            }
+        } else if !known.contains(stem) {
             said.notes.push(json!({
                 "reason": "test-rows-without-resource",
                 "file": format!("{FOLDER}/{stem}.sql"),
@@ -158,7 +189,8 @@ pub(super) async fn load(
             }));
         }
     }
-    let memory = target.pg.superuser("postgres");
+    let memory = open(&target.pg.superuser("postgres"), name).await?;
+    make_table(&memory, name).await?;
     let mut loaded = Loaded {
         files: Vec::new(),
         remade: None,
@@ -172,21 +204,22 @@ pub(super) async fn load(
         let last_sha = last.and_then(|l| l.sha256);
         match file {
             Some(file) if fresh || last_sha.as_deref() != Some(file.sha256.as_str()) => {
-                // Remembered as empty first: a loading that fails leaves
-                // the stand-in empty, and the next run tries again.
-                empty(target.pg, &standin.database, name).await?;
+                // Remembered as empty first, then emptied: whatever fails
+                // after, the record never says rows are there that are not,
+                // and the next run loads the file again.
                 remember(&memory, &key, oid, None, name).await?;
+                empty(target.pg, &standin.database, name).await?;
                 let rows = load_standin(target.pg, standin, &file, name).await?;
                 remember(&memory, &key, oid, Some(&file.sha256), name).await?;
                 loaded.files.push((file.name, rows));
             }
             Some(_) => {}
             None => {
-                if !fresh && last_sha.is_some() {
-                    empty(target.pg, &standin.database, name).await?;
-                }
                 if fresh || last_sha.is_some() {
                     remember(&memory, &key, oid, None, name).await?;
+                }
+                if !fresh && last_sha.is_some() {
+                    empty(target.pg, &standin.database, name).await?;
                 }
             }
         }
@@ -194,20 +227,30 @@ pub(super) async fn load(
     if let Some(remade) = own_rows(target, &memory, &mut loaded).await? {
         loaded.remade = Some(remade);
     }
+    drop(memory);
     loaded.files.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(loaded)
+}
+
+/// Whether the Application has an own database to load rows into: one it
+/// made tables in. Every Application is given its own database with its
+/// first Version, but one whose project has no migration has nothing of
+/// its own in it, so `own-database.sql` is for an own database it does not
+/// have.
+fn has_own_tables(target: &Target<'_>) -> bool {
+    !target.migrations.is_empty() && target.live.own.has_own_database(target.application)
 }
 
 /// The own database's test rows; the migrations applied again when it was
 /// made anew.
 async fn own_rows(
     target: &Target<'_>,
-    memory: &DatabaseAddress,
+    memory: &Connection,
     loaded: &mut Loaded,
 ) -> Result<Option<Vec<String>>, Ending> {
     let name = target.who.command;
     let live = target.live;
-    if !live.own.has_own_database(target.application) {
+    if !has_own_tables(target) {
         return Ok(None);
     }
     let Some(number) = application_number(live, target.application, name).await? else {
@@ -227,7 +270,7 @@ async fn own_rows(
     let mut remade = None;
     let mut oid = oid;
     if !fresh {
-        remade = Some(remake(target, number, &database).await?);
+        remade = Some(remake(target, memory, number, &database).await?);
         oid = database_oid(memory, &database, name).await?;
     }
     remember(memory, &key, oid, None, name).await?;
@@ -239,21 +282,41 @@ async fn own_rows(
     Ok(remade)
 }
 
-/// The stems of `test-rows/*.sql` (files, no link followed), in name order.
-fn sql_files(project: &Path) -> Vec<String> {
-    let mut stems: Vec<String> = fs::read_dir(project.join(FOLDER))
-        .map(|entries| {
-            entries
-                .flatten()
-                .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
-                .filter_map(|e| e.file_name().into_string().ok())
-                .filter_map(|n| n.strip_suffix(".sql").map(str::to_owned))
-                .filter(|stem| !stem.is_empty())
-                .collect()
-        })
-        .unwrap_or_default();
+/// The stems of `test-rows/*.sql`, in name order. `Err` names the first
+/// that is not a file (a link, a folder; no link is followed), or the
+/// folder itself when it is a link.
+fn sql_files(project: &Path) -> Result<Vec<String>, String> {
+    let folder = project.join(FOLDER);
+    match fs::symlink_metadata(&folder) {
+        Ok(meta) if meta.is_dir() => {}
+        Ok(meta) if meta.file_type().is_symlink() => return Err(FOLDER.to_owned()),
+        _ => return Ok(Vec::new()),
+    }
+    let mut stems = Vec::new();
+    let mut not_files = Vec::new();
+    for entry in fs::read_dir(&folder).into_iter().flatten().flatten() {
+        let Ok(file_name) = entry.file_name().into_string() else {
+            continue;
+        };
+        let Some(stem) = file_name.strip_suffix(".sql") else {
+            continue;
+        };
+        if stem.is_empty() {
+            continue;
+        }
+        // The entry's own type: a link is not followed.
+        if entry.file_type().is_ok_and(|t| t.is_file()) {
+            stems.push(stem.to_owned());
+        } else {
+            not_files.push(format!("{FOLDER}/{file_name}"));
+        }
+    }
+    not_files.sort();
+    if let Some(first) = not_files.into_iter().next() {
+        return Err(first);
+    }
     stems.sort();
-    stems
+    Ok(stems)
 }
 
 /// `test-rows-failed` for `file`, beside `statement` (its first line) and
@@ -280,14 +343,17 @@ fn failed(file: &str, statement: &str, error: &str, name: &str) -> Ending {
 async fn read_named(project: &Path, file: &str, command: &str) -> Result<Option<RowsFile>, Ending> {
     let path = project.join(FOLDER).join(file);
     let name = format!("{FOLDER}/{file}");
-    let read = tokio::task::spawn_blocking(move || -> Result<Option<Vec<u8>>, String> {
+    let read = off_thread(move || -> Result<Option<Vec<u8>>, String> {
         let meta = match fs::symlink_metadata(&path) {
             Ok(meta) => meta,
             Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(format!("it cannot be read ({error})")),
         };
         if !meta.is_file() {
-            return Ok(None);
+            return Err(
+                "it is not a file (a link, or a folder): test rows are files of the project, and a link is not followed"
+                    .to_owned(),
+            );
         }
         if meta.len() > MAX_FILE_BYTES {
             return Err(format!(
@@ -311,7 +377,7 @@ async fn read_named(project: &Path, file: &str, command: &str) -> Result<Option<
         Ok(Some(bytes))
     })
     .await
-    .unwrap_or_else(|_| Err("it could not be read".to_owned()));
+    .unwrap_or_else(|| Err("it could not be read".to_owned()));
     let bytes = match read {
         Ok(Some(bytes)) => bytes,
         Ok(None) => return Ok(None),
@@ -340,7 +406,7 @@ async fn split(file: &RowsFile, name: &str) -> Result<Vec<Owned>, Ending> {
     // Copied: the work moves to a blocking thread; at most 16 MiB, once a
     // loading.
     let text = file.text.clone();
-    let split = tokio::task::spawn_blocking(move || {
+    let split = off_thread(move || {
         standins::statements(&text).map(|list| {
             list.into_iter()
                 .map(|statement| {
@@ -369,7 +435,6 @@ async fn split(file: &RowsFile, name: &str) -> Result<Vec<Owned>, Ending> {
         })
     })
     .await
-    .ok()
     .flatten();
     let list = split.ok_or_else(|| {
         failed(
@@ -391,11 +456,10 @@ async fn split(file: &RowsFile, name: &str) -> Result<Vec<Owned>, Ending> {
 }
 
 /// The `oid` of `database`.
-async fn database_oid(memory: &DatabaseAddress, database: &str, name: &str) -> Result<u32, Ending> {
-    let connection = open(memory, name).await?;
+async fn database_oid(memory: &Connection, database: &str, name: &str) -> Result<u32, Ending> {
     let row = tokio::time::timeout(
         STATEMENT_WAIT,
-        connection.client().query_opt(
+        memory.client().query_opt(
             "SELECT oid FROM pg_catalog.pg_database WHERE datname = $1",
             &[&database],
         ),
@@ -419,11 +483,10 @@ async fn open(address: &DatabaseAddress, name: &str) -> Result<Connection, Endin
 }
 
 /// What was loaded last into `key`.
-async fn last(memory: &DatabaseAddress, key: &str, name: &str) -> Result<Option<Last>, Ending> {
-    let connection = open(memory, name).await?;
+async fn last(memory: &Connection, key: &str, name: &str) -> Result<Option<Last>, Ending> {
     let row = tokio::time::timeout(
         STATEMENT_WAIT,
-        connection.client().query_opt(
+        memory.client().query_opt(
             &format!("SELECT database, sha256 FROM {TABLE} WHERE target = $1"),
             &[&key],
         ),
@@ -442,16 +505,15 @@ async fn last(memory: &DatabaseAddress, key: &str, name: &str) -> Result<Option<
 /// Remembers that `key`'s database `oid` holds the rows of the file of
 /// `sha256` (none: no file's rows).
 async fn remember(
-    memory: &DatabaseAddress,
+    memory: &Connection,
     key: &str,
     oid: u32,
     sha256: Option<&str>,
     name: &str,
 ) -> Result<(), Ending> {
-    let connection = open(memory, name).await?;
     tokio::time::timeout(
         STATEMENT_WAIT,
-        connection.client().execute(
+        memory.client().execute(
             &format!(
                 "INSERT INTO {TABLE} (target, database, sha256) VALUES ($1, $2, $3)
                  ON CONFLICT (target) DO UPDATE SET database = EXCLUDED.database, sha256 = EXCLUDED.sha256"
@@ -666,7 +728,12 @@ async fn load_own(target: &Target<'_>, file: &RowsFile) -> Result<u64, Ending> {
 /// nothing, its outbox's ids taken on after those already in the Change
 /// history, and every migration applied again by the same code as at a
 /// deploy. Answers their names.
-async fn remake(target: &Target<'_>, number: i64, database: &str) -> Result<Vec<String>, Ending> {
+async fn remake(
+    target: &Target<'_>,
+    memory: &Connection,
+    number: i64,
+    database: &str,
+) -> Result<Vec<String>, Ending> {
     let name = target.who.command;
     let live = target.live;
     let own = &live.own;
@@ -676,10 +743,9 @@ async fn remake(target: &Target<'_>, number: i64, database: &str) -> Result<Vec<
     own.forget(target.application)
         .await
         .map_err(|e| database_failed(&e, name))?;
-    let superuser = open(&target.pg.superuser("postgres"), name).await?;
     tokio::time::timeout(
         LOAD_WAIT,
-        superuser.client().batch_execute(&format!(
+        memory.client().batch_execute(&format!(
             "DROP DATABASE IF EXISTS {} WITH (FORCE)",
             quote_identifier(database)
         )),
@@ -687,7 +753,6 @@ async fn remake(target: &Target<'_>, number: i64, database: &str) -> Result<Vec<
     .await
     .map_err(|_| postgres_failed("the own database was not dropped in time", name))?
     .map_err(|e| database_failed(&DbError::from(e), name))?;
-    drop(superuser);
     let problem = |problem: Problem| match problem {
         Problem::Failed {
             migration,

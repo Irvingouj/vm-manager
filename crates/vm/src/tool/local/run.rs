@@ -139,36 +139,47 @@ pub(super) async fn tools(base: &Base<'_>, progress: &Progress) -> Result<Packag
     progress.set(Stage::Node);
     node_is_there(&cx, base.who).await?;
     progress.set(Stage::Packages);
-    check::packages(base.project, base.who)
+    packages(base.project, base.who).await
 }
 
 /// Makes `.vm/local/`, takes the project's lock (waiting for another local
 /// command of the project, as long as the caller lets it), and starts
 /// `vm.log` anew. A file that finds a `vm dev` is a killed one's now, and
-/// is removed.
+/// is removed. `Some` instead of the lock: while it waited, a `vm dev` of
+/// the project began to listen (one other than `tried`), and the command
+/// is to be handed to it.
 pub(super) async fn lock_project(
     base: &Base<'_>,
     local: &Local,
     progress: &Progress,
     held: &Held,
-) -> Result<(), Ending> {
+    tried: Option<&control::Found>,
+) -> Result<Option<control::Found>, Ending> {
     let name = base.who.command;
     local.make().map_err(|why| local_state_failed(&why, name))?;
     progress.set(Stage::Waiting);
     let json = base.json;
-    let lock = local
-        .lock(|| {
-            tell(
-                json,
-                "Another local command of this project (vm request, vm dev or vm local) is running: waiting for it to end.",
-            );
-        })
+    let taken = local
+        .lock(
+            || {
+                tell(
+                    json,
+                    "Another local command of this project (vm request, vm dev or vm local) is running: waiting for it to end.",
+                );
+            },
+            || control::found_while_waiting(local, tried),
+        )
         .await
         .map_err(|why| local_state_failed(&why, name))?;
+    let lock = match taken {
+        postgres::Taken::Lock(lock) => lock,
+        postgres::Taken::Other(found) => return Ok(Some(found)),
+    };
     held.keep_lock(lock);
     control::remove_left(local);
     // The parts' own records go to .vm/local/vm.log, not the terminal;
-    // started anew by every run, so that it does not grow from run to run.
+    // started anew by every run, so that it does not grow from run to run
+    // (and bounded while one runs: see crate::log).
     if let Ok(file) = OpenOptions::new()
         .create(true)
         .write(true)
@@ -178,7 +189,7 @@ pub(super) async fn lock_project(
     {
         crate::log::to_file(file);
     }
-    Ok(())
+    Ok(None)
 }
 
 /// The private Postgres, running: where it is and its passwords.
@@ -255,9 +266,6 @@ pub(super) async fn start_server(
     held.keep_server(server);
     local
         .set_up(&mut state, port)
-        .await
-        .map_err(|why| postgres_failed(&why, name))?;
-    rows::set_up(&local.superuser_address(&state, port, "postgres"))
         .await
         .map_err(|why| postgres_failed(&why, name))?;
     Ok(Pg { local, state, port })
@@ -473,6 +481,58 @@ pub(super) fn test_users_of(project: &Path, command: &str) -> Result<TestUsersFi
     test_users::read(project, command)?.ok_or_else(|| no_test_users_file(command))
 }
 
+/// Runs `work`, which reads or writes the file system, on a thread of its
+/// own and not on the async worker: the one way the local commands do it
+/// (`vm dev` serves every connection on the tool's one thread). `None` when
+/// that thread ended abnormally.
+pub(super) async fn off_thread<T: Send + 'static>(
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+    tokio::task::spawn_blocking(work).await.ok()
+}
+
+/// What a local command says when a read of the project's files ended
+/// abnormally.
+pub(super) fn read_failed(command: &str) -> Ending {
+    Ending::new(
+        1,
+        "failed",
+        format!(
+            "{command} could not read the project's files (the reading ended abnormally): run {command} again"
+        ),
+    )
+}
+
+/// [`test_users_of`], off the async worker.
+pub(super) async fn test_users(project: &Path, who: &Who) -> Result<TestUsersFile, Ending> {
+    let command = who.command;
+    // Copied: the read owns its path on its own thread; once a read.
+    let project = project.to_path_buf();
+    off_thread(move || test_users_of(&project, command))
+        .await
+        .unwrap_or_else(|| Err(read_failed(command)))
+}
+
+/// The project's packages (`check::packages`), off the async worker.
+pub(super) async fn packages(project: &Path, who: &Who) -> Result<Packages, Ending> {
+    let who = *who;
+    // Copied: the read owns its path on its own thread; once a read.
+    let project = project.to_path_buf();
+    off_thread(move || check::packages(&project, &who))
+        .await
+        .unwrap_or_else(|| Err(read_failed(who.command)))
+}
+
+/// The pulled Resources (`standins::pulled`), off the async worker.
+pub(super) async fn pulled(project: &Path, who: &Who) -> Result<standins::Pulled, Ending> {
+    let command = who.command;
+    // Copied: the read owns its path on its own thread; once a read.
+    let project = project.to_path_buf();
+    off_thread(move || standins::pulled(&project, command))
+        .await
+        .ok_or_else(|| read_failed(command))
+}
+
 /// `no-such-test-user`, naming those there are.
 pub(super) fn no_such_test_user(file: &TestUsersFile, id: &str) -> Ending {
     let there: Vec<&str> = file.users.iter().map(|u| u.id.as_str()).collect();
@@ -524,7 +584,15 @@ pub(super) async fn bring_up(
     said.warnings.append(&mut found.warnings);
     said.notes.append(&mut found.notes);
     let bundle = deploy::bundle(&cx, packages, who).await?;
-    let migrations = deploy::project_migrations(base.project, who)?;
+    let migrations = {
+        let who = *who;
+        // Copied: the read owns its path on its own thread; once a
+        // bring-up.
+        let project = base.project.to_path_buf();
+        off_thread(move || deploy::project_migrations(&project, &who))
+            .await
+            .unwrap_or_else(|| Err(read_failed(who.command)))?
+    };
     let body = deploy::body(
         &bundle,
         &manifest,
@@ -595,7 +663,7 @@ async fn standins_of(
     said: &mut Said,
 ) -> Result<Vec<Standin>, Ending> {
     let name = base.who.command;
-    let pulled = standins::pulled(base.project, name);
+    let pulled = pulled(base.project, base.who).await?;
     said.warnings.extend(pulled.warnings);
     let address = pg.superuser("postgres");
     let ready = {

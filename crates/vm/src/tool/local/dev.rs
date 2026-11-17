@@ -13,13 +13,29 @@
 //! **Serialization.** The state ([`State`]: the private Postgres and the
 //! installation's parts on it, what the last bring-up did or how it failed,
 //! which look at the project it is of) is behind one `tokio` read-write
-//! lock. A request of the browser holds it to read from before its look at
-//! the project is compared until the Application answered, so requests are
-//! served side by side. A job holds it to write: it waits for the requests
-//! under way to end (at most [`WRITE_WAIT`]), and the lock, which is fair,
-//! holds every request that comes meanwhile until the job is done (each at
-//! most [`READ_WAIT`]). Those waiting are bounded by the server's
+//! lock. A request of the browser looks at the project, then holds the
+//! state to read only for a moment, to compare the look with the state's;
+//! when they differ it asks for a rebuild and waits for it. It then holds
+//! the state to read again, from before it is handed to the Application
+//! until the Application answered, so requests are served side by side. A
+//! rebuild done between the two holds is served: the request is given the
+//! project as it is then. A job holds the state to write: it waits for the
+//! requests under way to end (at most [`WRITE_WAIT`]), and the lock, which
+//! is fair, holds every request that comes meanwhile until the job is done
+//! (each at most [`READ_WAIT`]). A rebuild looks at the project again
+//! itself, holding the state to write, and brings it up only when that look
+//! differs from the state's. Those waiting are bounded by the server's
 //! connections ([`CONNECTIONS`]): one request a connection at a time.
+//!
+//! **The address.** The `Host` of a request is checked against the
+//! Application's name as it is after the look at the project (and the
+//! rebuild it caused): a request at the old name of an Application renamed
+//! is `421`.
+//!
+//! **Files.** Every read or write of the file system goes off the tool's
+//! one thread ([`run::off_thread`]): the connections are served on it.
+//! `postgres.log` is emptied once larger than 16 MiB, looked at every
+//! [`LOG_EVERY`]; `vm.log` bounds itself (crate::log).
 //!
 //! **Bounds.** Jobs waiting: [`JOBS`] (a request that finds the queue full
 //! waits for room). Lines waiting to be printed: [`LINES`] (the request
@@ -44,13 +60,12 @@ use std::time::Duration;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Incoming;
-use hyper::header::{ACCEPT, CONTENT_TYPE, COOKIE, HOST, HeaderName, HeaderValue, ORIGIN};
+use hyper::header::{ACCEPT, COOKIE, HOST, HeaderName, HeaderValue, ORIGIN};
 use hyper::{Method, Request, Response, StatusCode};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tokio::sync::{RwLock, RwLockWriteGuard, mpsc, oneshot, watch};
 
-use super::super::check;
 use super::super::project_tools::{
     Bounded, DEFAULT_TIMEOUT, Scratch, Signals, Who, own_folder_failed,
 };
@@ -59,7 +74,7 @@ use super::super::theirs::Theirs;
 use super::super::{Done, Ending, json_line};
 use super::control::{self, ControlSecret};
 use super::page::{self, COOKIE as TEST_USER_COOKIE};
-use super::postgres::{Local, Programs};
+use super::postgres::{self, Local, Programs};
 use super::run::{self, Base, Brought, Held, Live, Pg, Size};
 use super::walk::{self, Look};
 use super::{
@@ -91,6 +106,13 @@ const READ_WAIT: Duration = Duration::from_secs(700);
 
 /// The longest a line may take to be written, or to find room.
 const OUTPUT_WAIT: Duration = Duration::from_secs(60);
+
+/// How often `postgres.log` is looked at.
+const LOG_EVERY: Duration = Duration::from_secs(10);
+
+/// A look at the project that took longer than this is recorded in
+/// `vm.log`, beside every look that caused a rebuild.
+const SLOW_LOOK: Duration = Duration::from_millis(50);
 
 /// The largest form posted to the page.
 const FORM_BYTES: usize = 64 * 1024;
@@ -126,11 +148,9 @@ enum Why {
 
 /// What the command's own task does for a request.
 enum Job {
-    /// Bring the project up again unless the state is of this look already.
-    Rebuild {
-        seen: Look,
-        reply: oneshot::Sender<()>,
-    },
+    /// Bring the project up again unless the state is of the project as it
+    /// is now.
+    Rebuild { reply: oneshot::Sender<()> },
     /// A command of the tool's: what it prints, and its exit code.
     Control {
         asked: Asked,
@@ -170,7 +190,7 @@ struct Front {
     /// The Application's name, as the last bring-up gave it. Held only to
     /// read or replace, never across an await.
     application: std::sync::RwLock<Arc<str>>,
-    secret: ControlSecret,
+    secret: Arc<ControlSecret>,
     state: RwLock<State>,
     jobs: mpsc::Sender<Job>,
     lines: mpsc::Sender<String>,
@@ -200,13 +220,7 @@ pub(in super::super) async fn dev(args: &DevArgs) -> Result<Done, Ending> {
     run::test_users_of(&project, name)?;
     let local = Local::of(&project);
     if let Some(address) = control::address_of(&local) {
-        return Err(Ending::new(
-            1,
-            "already-running",
-            format!(
-                "vm dev already runs in this project, at {address}: use that one, or end it (Ctrl-C where it runs) before starting another"
-            ),
-        ));
+        return Err(already_running(&address));
     }
     let listeners = bind(args.port)?;
     let mut signals = Signals::listen(&WHO_DEV)?;
@@ -244,9 +258,7 @@ pub(in super::super) async fn dev(args: &DevArgs) -> Result<Done, Ending> {
         seen,
     } = started;
     let application: Arc<str> = Arc::from(brought.application.as_str());
-    let secret = match ControlSecret::generate().and_then(|secret| {
-        control::write(&local, args.port, &application, &secret).map(|()| secret)
-    }) {
+    let secret = match write_control(&project, args.port, &application).await {
         Ok(secret) => secret,
         Err(why) => {
             live.close().await;
@@ -318,6 +330,7 @@ pub(in super::super) async fn dev(args: &DevArgs) -> Result<Done, Ending> {
             }),
             jobs(&front, &ctx, jobs_rx, &stop),
             printer(lines_rx, &stop),
+            keeper(&front.project, &stop),
         );
     }
     // Everything ended: no request holds the state.
@@ -343,6 +356,46 @@ pub(in super::super) async fn dev(args: &DevArgs) -> Result<Done, Ending> {
     }
 }
 
+/// A secret made for this run, and the file that finds this `vm dev`
+/// written with it.
+async fn write_control(
+    project: &Path,
+    port: u16,
+    application: &str,
+) -> Result<Arc<ControlSecret>, String> {
+    let secret = Arc::new(ControlSecret::generate()?);
+    rewrite_control(project, port, application, &secret).await?;
+    Ok(secret)
+}
+
+/// The file that finds this `vm dev` written (again), off the tool's thread.
+async fn rewrite_control(
+    project: &Path,
+    port: u16,
+    application: &str,
+    secret: &Arc<ControlSecret>,
+) -> Result<(), String> {
+    // Copied: the write owns what it writes on its own thread; once a
+    // start or a rename.
+    let project = project.to_path_buf();
+    let application = application.to_owned();
+    let secret = Arc::clone(secret);
+    run::off_thread(move || control::write(&Local::of(&project), port, &application, &secret))
+        .await
+        .unwrap_or_else(|| Err("the file that finds vm dev could not be written".to_owned()))
+}
+
+/// `already-running`: another `vm dev` serves this project at `address`.
+fn already_running(address: &str) -> Ending {
+    Ending::new(
+        1,
+        "already-running",
+        format!(
+            "vm dev already runs in this project, at {address}: use that one, or end it (Ctrl-C where it runs) before starting another"
+        ),
+    )
+}
+
 /// What starting did.
 struct Started {
     programs: Programs,
@@ -358,12 +411,15 @@ async fn start(base: &Base<'_>, progress: &Progress, held: &Held) -> Result<Star
     let packages = run::tools(base, progress).await?;
     let programs = run::programs(base, progress).await?;
     let local = Local::of(base.project);
-    run::lock_project(base, &local, progress, held).await?;
+    if let Some(other) = run::lock_project(base, &local, progress, held, None).await? {
+        // Another one began to listen while this one waited for the lock.
+        return Err(already_running(&other.address()));
+    }
     let pg = run::start_server(base, &programs, progress, held, false).await?;
     let live = Live::open(&pg, dev_size(), base.who).await?;
     let brought = async {
-        let file = run::test_users_of(base.project, base.who.command)?;
-        let seen = look_at(base.project).await;
+        let file = run::test_users(base.project, base.who).await?;
+        let seen = look_at(base.project).await.look;
         let brought = run::bring_up(base, &pg, &live, &file, &packages, progress).await?;
         Ok::<_, Ending>((brought, seen))
     }
@@ -452,14 +508,14 @@ async fn stopper(signals: &mut Signals, stop: &watch::Sender<Option<Why>>) {
 async fn write_out(text: String) -> Result<(), ()> {
     let written = tokio::time::timeout(
         OUTPUT_WAIT,
-        tokio::task::spawn_blocking(move || {
+        run::off_thread(move || {
             let mut out = std::io::stdout().lock();
             out.write_all(text.as_bytes()).and_then(|()| out.flush())
         }),
     )
     .await;
     match written {
-        Ok(Ok(Ok(()))) => Ok(()),
+        Ok(Some(Ok(()))) => Ok(()),
         _ => Err(()),
     }
 }
@@ -492,6 +548,20 @@ async fn printer(mut lines: mpsc::Receiver<String>, stop: &watch::Sender<Option<
             });
             return;
         }
+    }
+}
+
+/// Empties `postgres.log` once it is past its bound, every [`LOG_EVERY`],
+/// until `vm dev` stops.
+async fn keeper(project: &Arc<Path>, stop: &watch::Sender<Option<Why>>) {
+    let mut stopped = stop.subscribe();
+    loop {
+        tokio::select! {
+            _ = stopped.wait_for(Option::is_some) => return,
+            () = tokio::time::sleep(LOG_EVERY) => {}
+        }
+        let project = Arc::clone(project);
+        run::off_thread(move || postgres::trim_log(&Local::of(&project))).await;
     }
 }
 
@@ -553,22 +623,45 @@ fn too_many_json() -> Value {
     json!({ "event": "too-many-files", "message": too_many_message() })
 }
 
-/// The project looked at, off the async workers.
-async fn look_at(project: &Path) -> Look {
+/// A look at the project, and what it cost.
+struct Looked {
+    look: Look,
+    entries: usize,
+    took: Duration,
+}
+
+impl Looked {
+    /// Writes it in `vm.log`.
+    fn record(&self) {
+        crate::log::record(
+            "project-looked-at",
+            json!({
+                "entries": self.entries,
+                "micros": u64::try_from(self.took.as_micros()).unwrap_or(u64::MAX),
+            }),
+        );
+    }
+}
+
+/// The project looked at, off the tool's thread. Recorded in `vm.log` when
+/// it took longer than [`SLOW_LOOK`] (a rebuild records the look that
+/// caused it).
+async fn look_at(project: &Path) -> Looked {
     // Copied: the walk owns its path on its own thread; once a look.
     let project = project.to_path_buf();
     let started = tokio::time::Instant::now();
-    let (look, entries) = tokio::task::spawn_blocking(move || walk::look(&project))
+    let (look, entries) = run::off_thread(move || walk::look(&project))
         .await
         .unwrap_or((Look::TooMany, 0));
-    crate::log::record(
-        "project-looked-at",
-        json!({
-            "entries": entries,
-            "micros": u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
-        }),
-    );
-    look
+    let looked = Looked {
+        look,
+        entries,
+        took: started.elapsed(),
+    };
+    if looked.took > SLOW_LOOK {
+        looked.record();
+    }
+    looked
 }
 
 impl Front {
@@ -607,24 +700,23 @@ impl Front {
     }
 
     /// The project looked at, unless it is no longer looked at.
-    async fn look(&self) -> Option<Look> {
+    async fn look(&self) -> Option<Looked> {
         if !self.looking.load(Ordering::Acquire) {
             return None;
         }
-        match look_at(&self.project).await {
-            Look::TooMany => {
-                if self.looking.swap(false, Ordering::AcqRel) {
-                    self.say(too_many_json(), too_many_message()).await;
-                }
-                None
+        let looked = look_at(&self.project).await;
+        if looked.look == Look::TooMany {
+            if self.looking.swap(false, Ordering::AcqRel) {
+                self.say(too_many_json(), too_many_message()).await;
             }
-            seen => Some(seen),
+            return None;
         }
+        Some(looked)
     }
 
     /// The Application's name after a bring-up: the file that finds `vm
     /// dev` says it too.
-    fn named(&self, application: &str) {
+    async fn named(&self, application: &str) {
         let changed = {
             let mut name = self
                 .application
@@ -638,13 +730,9 @@ impl Front {
             }
         };
         if changed {
-            control::write(
-                &Local::of(&self.project),
-                self.port,
-                application,
-                &self.secret,
-            )
-            .ok();
+            rewrite_control(&self.project, self.port, application, &self.secret)
+                .await
+                .ok();
         }
     }
 
@@ -656,11 +744,14 @@ impl Front {
 
     async fn run_job(&self, ctx: &Ctx<'_>, job: Job) {
         match job {
-            Job::Rebuild { seen, reply } => {
+            Job::Rebuild { reply } => {
+                // Looked at again here, holding the state to write: the look
+                // of the request that asked may be older than another's.
                 if let Some(mut state) = self.write_state().await
-                    && state.seen != Some(seen)
+                    && let Some(looked) = self.look().await
+                    && state.seen != Some(looked.look)
                 {
-                    self.rebuild(ctx, &mut state, seen, &WHO).await;
+                    self.rebuild(ctx, &mut state, &looked, &WHO).await;
                 }
                 reply.send(()).ok();
             }
@@ -699,13 +790,16 @@ impl Front {
         &self,
         ctx: &Ctx<'_>,
         state: &mut State,
-        seen: Look,
+        looked: &Looked,
         who: &Who,
     ) -> Option<Brought> {
+        if looked.took <= SLOW_LOOK {
+            looked.record();
+        }
         let base = self.base(ctx, who);
         let result = async {
-            let file = run::test_users_of(base.project, who.command)?;
-            let packages = check::packages(base.project, who)?;
+            let file = run::test_users(base.project, who).await?;
+            let packages = run::packages(base.project, who).await?;
             if state.session.is_none() {
                 state.session = Some(self.session(ctx, &base).await?);
             }
@@ -723,7 +817,7 @@ impl Front {
             .await
         }
         .await;
-        state.seen = Some(seen);
+        state.seen = Some(looked.look);
         self.brought(state, result).await
     }
 
@@ -733,16 +827,19 @@ impl Front {
             Ok(brought) => {
                 state.failed = None;
                 state.last = Some(brought.standing());
-                self.named(&brought.application);
+                self.named(&brought.application).await;
+                let url = self.address(&brought.application);
                 self.say(
                     json!({
                         "event": "rebuilt",
+                        "application": brought.application,
+                        "url": url,
                         "version": brought.version,
                         "migrations_applied": brought.migrations_applied,
                         "standins": brought.standins_json(),
                         "test_rows": brought.test_rows_json(),
                     }),
-                    rebuilt_words(&brought),
+                    rebuilt_words(&brought, &url),
                 )
                 .await;
                 Some(brought)
@@ -766,15 +863,14 @@ impl Front {
     /// `vm request`, answered here: served as a request of the browser is,
     /// after the same look at the project, as the User it names.
     async fn forwarded_request(&self, ctx: &Ctx<'_>, wanted: &Wanted) -> Result<Done, Ending> {
-        let seen = self.look().await;
         let Some(mut state) = self.write_state().await else {
             return Err(busy(&WHO));
         };
         let mut caused = None;
-        if let Some(seen) = seen
-            && state.seen != Some(seen)
+        if let Some(looked) = self.look().await
+            && state.seen != Some(looked.look)
         {
-            caused = self.rebuild(ctx, &mut state, seen, &WHO).await;
+            caused = self.rebuild(ctx, &mut state, &looked, &WHO).await;
         }
         if let Some((code, report)) = &state.failed {
             return Err(Ending::from_printed(*code, copy(report)));
@@ -790,7 +886,7 @@ impl Front {
         let Some(session) = state.session.as_ref() else {
             return Err(busy(&WHO));
         };
-        let file = run::test_users_of(&self.project, WHO.command)?;
+        let file = run::test_users(&self.project, &WHO).await?;
         let Some(user) = file.user(&wanted.user) else {
             return Err(run::no_such_test_user(&file, &wanted.user));
         };
@@ -852,10 +948,14 @@ impl Front {
     /// `vm local reset`, done here: the parts closed, the private Postgres
     /// stopped and made anew, the project brought up on it.
     async fn forwarded_reset(&self, ctx: &Ctx<'_>) -> Result<Done, Ending> {
-        let seen = self.look().await;
         let Some(mut state) = self.write_state().await else {
             return Err(busy(&WHO_RESET));
         };
+        // Forgotten first: should the reset be dropped half way (past its
+        // time), the next request finds the state of no look and brings the
+        // project up again.
+        state.seen = None;
+        let looked = self.look().await;
         if let Some(session) = state.session.take() {
             session.live.close().await;
             drop(session.pg);
@@ -863,8 +963,8 @@ impl Front {
         ctx.held.stop_server().await;
         let base = self.base(ctx, &WHO_RESET);
         let result = async {
-            let file = run::test_users_of(base.project, WHO_RESET.command)?;
-            let packages = check::packages(base.project, &WHO_RESET)?;
+            let file = run::test_users(base.project, &WHO_RESET).await?;
+            let packages = run::packages(base.project, &WHO_RESET).await?;
             let pg = run::start_server(&base, ctx.programs, ctx.progress, ctx.held, true).await?;
             let live = Live::open(&pg, dev_size(), &WHO_RESET).await?;
             let session = state.session.insert(Session { pg, live });
@@ -879,14 +979,12 @@ impl Front {
             .await
         }
         .await;
-        if let Some(seen) = seen {
-            state.seen = Some(seen);
-        }
+        state.seen = looked.map(|looked| looked.look);
         match result {
             Ok(brought) => {
                 state.failed = None;
                 state.last = Some(brought.standing());
-                self.named(&brought.application);
+                self.named(&brought.application).await;
                 Ok(reset_output(&brought))
             }
             Err(ending) => {
@@ -929,14 +1027,32 @@ impl Front {
 
     /// Answers one request. See the module's text.
     async fn answer(&self, request: Request<Incoming>) -> Response<Full<Bytes>> {
-        let application = self.application();
-        let address = self.address(&application);
+        // Copied: compared again after the look, while the request is still
+        // held; a few bytes, once a request.
         let host = request
             .headers()
             .get(HOST)
             .and_then(|h| h.to_str().ok())
-            .unwrap_or_default();
-        match self.which(host, &application) {
+            .unwrap_or_default()
+            .to_owned();
+        let own_path = request.uri().path().starts_with("/_vm/");
+        // The project looked at first (and brought up again when it
+        // changed) for a request that may be the Application's: at its
+        // name, or at another name of the loopback's `.localhost` (the name
+        // it may have now).
+        let ready = if own_path {
+            None
+        } else {
+            match self.which(&host, &self.application()) {
+                Which::Ours => Some(self.up_to_date().await),
+                Which::Other if is_localhost_name(&host) => Some(self.up_to_date().await),
+                Which::Other | Which::Loopback => None,
+            }
+        };
+        // The name as it is now, after any rebuild.
+        let application = self.application();
+        let address = self.address(&application);
+        match self.which(&host, &application) {
             Which::Ours => {}
             Which::Loopback => {
                 let target = request.uri().path_and_query().map_or("/", |p| p.as_str());
@@ -947,8 +1063,11 @@ impl Front {
             }
             Which::Other => return page::misdirected(&address),
         }
-        if request.uri().path().starts_with("/_vm/") {
+        if own_path {
             return self.own_path(request, &application).await;
+        }
+        if let Some(Err(answer)) = ready {
+            return *answer;
         }
         self.application_request(request, &address).await
     }
@@ -1014,23 +1133,26 @@ impl Front {
         page::not_found()
     }
 
-    /// The chosen test User's id, from the cookie.
+    /// The chosen test User's id, from the cookie. The `Cookie` lines are
+    /// read as bytes: another cookie's value may hold any byte.
     fn chosen(headers: &hyper::HeaderMap) -> Option<String> {
         headers
             .get_all(COOKIE)
             .iter()
-            .filter_map(|v| v.to_str().ok())
-            .flat_map(|v| v.split(';'))
-            .filter_map(|pair| pair.trim().split_once('='))
-            .find(|(name, _)| *name == TEST_USER_COOKIE)
-            .and_then(|(_, value)| page::percent_decode(value, false))
+            .flat_map(|v| cookie_pairs(v.as_bytes()))
+            .filter_map(|pair| {
+                let at = pair.iter().position(|b| *b == b'=')?;
+                let (name, value) = (pair.get(..at)?, pair.get(at.saturating_add(1)..)?);
+                (name == TEST_USER_COOKIE.as_bytes()).then_some(value)
+            })
+            .find_map(|value| page::percent_decode(std::str::from_utf8(value).ok()?, false))
     }
 
     /// `vm.dev.json` as it is now, and (for the page, `with_pulled`) the
     /// pulled Resources, read off the async workers.
     async fn users(&self, with_pulled: bool) -> Result<(TestUsersFile, Vec<String>), Ending> {
         let project = Arc::clone(&self.project);
-        tokio::task::spawn_blocking(move || {
+        run::off_thread(move || {
             let file = run::test_users_of(&project, WHO.command)?;
             let pulled = if with_pulled {
                 standins::pulled(&project, WHO.command)
@@ -1044,12 +1166,7 @@ impl Front {
             Ok((file, pulled))
         })
         .await
-        .unwrap_or_else(|_| {
-            Err(super::local_state_failed(
-                "vm.dev.json could not be read",
-                WHO.command,
-            ))
-        })
+        .unwrap_or_else(|| Err(run::read_failed(WHO.command)))
     }
 
     /// `GET /_vm/test-user`.
@@ -1144,35 +1261,26 @@ impl Front {
         let Ok(Ok((code, done))) = tokio::time::timeout(READ_WAIT, answered).await else {
             return page::unavailable("vm dev could not do the command in time, or is stopping.");
         };
-        let body = json!({ "code": code, "json": done.json, "text": done.text }).to_string();
-        let mut response = Response::new(Full::new(Bytes::from(body)));
-        response
-            .headers_mut()
-            .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        response.headers_mut().insert(
-            hyper::header::CACHE_CONTROL,
-            HeaderValue::from_static("no-store"),
-        );
-        response
+        page::json(json!({ "code": code, "json": done.json, "text": done.text }).to_string())
     }
 
     /// The project brought up to date for a request of the browser: a
     /// rebuild asked for, and waited for, when it changed. `Err` is what the
     /// request is answered instead.
     async fn up_to_date(&self) -> Result<(), Box<Response<Full<Bytes>>>> {
-        let Some(seen) = self.look().await else {
+        let Some(looked) = self.look().await else {
             return Ok(());
         };
         {
             let state = tokio::time::timeout(READ_WAIT, self.state.read())
                 .await
                 .map_err(|_| Box::new(page::unavailable("vm dev is busy: try again shortly.")))?;
-            if state.seen == Some(seen) {
+            if state.seen == Some(looked.look) {
                 return Ok(());
             }
         }
         let (reply, answered) = oneshot::channel();
-        let sent = tokio::time::timeout(READ_WAIT, self.jobs.send(Job::Rebuild { seen, reply }));
+        let sent = tokio::time::timeout(READ_WAIT, self.jobs.send(Job::Rebuild { reply }));
         if !matches!(sent.await, Ok(Ok(()))) {
             return Err(Box::new(page::unavailable("vm dev is stopping.")));
         }
@@ -1190,9 +1298,6 @@ impl Front {
         request: Request<Incoming>,
         address: &str,
     ) -> Response<Full<Bytes>> {
-        if let Err(answer) = self.up_to_date().await {
-            return *answer;
-        }
         let users = self.users(false).await;
         let Ok(state) = tokio::time::timeout(READ_WAIT, self.state.read()).await else {
             return page::unavailable("vm dev is busy: try again shortly.");
@@ -1277,6 +1382,16 @@ impl Handler for Front {
     }
 }
 
+/// Whether `host` names something under `.localhost` (with or without a
+/// port).
+fn is_localhost_name(host: &str) -> bool {
+    let name = host.trim().to_ascii_lowercase();
+    let name = name
+        .rsplit_once(':')
+        .map_or(name.as_str(), |(name, _)| name);
+    name.ends_with(".localhost")
+}
+
 /// Whose a `Host` is.
 enum Which {
     Ours,
@@ -1296,22 +1411,37 @@ fn busy(who: &Who) -> Ending {
     )
 }
 
-/// The cookie of the chosen test User taken out of `Cookie` (the others
-/// stay; a header left empty is left out).
-fn without_test_user_cookie(headers: &mut hyper::HeaderMap) {
-    let kept: Vec<String> = headers
-        .get_all(COOKIE)
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .flat_map(|v| v.split(';'))
-        .map(str::trim)
+/// The cookies of one `Cookie` line, each without the spaces around it.
+fn cookie_pairs(line: &[u8]) -> impl Iterator<Item = &[u8]> {
+    line.split(|b| *b == b';')
+        .map(<[u8]>::trim_ascii)
         .filter(|pair| !pair.is_empty())
-        .filter(|pair| pair.split_once('=').map_or(*pair, |(n, _)| n) != TEST_USER_COOKIE)
-        .map(str::to_owned)
-        .collect();
+}
+
+/// The cookie of the chosen test User taken out of `Cookie` (the others
+/// stay, byte for byte; a header left empty is left out).
+fn without_test_user_cookie(headers: &mut hyper::HeaderMap) {
+    let mut kept: Vec<u8> = Vec::new();
+    for line in headers.get_all(COOKIE) {
+        for pair in cookie_pairs(line.as_bytes()) {
+            let name = pair
+                .iter()
+                .position(|b| *b == b'=')
+                .and_then(|at| pair.get(..at))
+                .unwrap_or(pair);
+            if name == TEST_USER_COOKIE.as_bytes() {
+                continue;
+            }
+            if !kept.is_empty() {
+                kept.extend_from_slice(b"; ");
+            }
+            kept.extend_from_slice(pair);
+        }
+    }
     headers.remove(COOKIE);
+    // Made of bytes that were in header values already, and "; ".
     if !kept.is_empty()
-        && let Ok(value) = HeaderValue::from_str(&kept.join("; "))
+        && let Ok(value) = HeaderValue::from_bytes(&kept)
     {
         headers.insert(COOKIE, value);
     }
@@ -1377,8 +1507,12 @@ fn reading_of(value: &Value) -> Option<Reading> {
 }
 
 /// A rebuild in words, on one line.
-fn rebuilt_words(brought: &Brought) -> String {
-    let mut words = format!("Rebuilt: local Version {}", brought.version);
+fn rebuilt_words(brought: &Brought, url: &str) -> String {
+    let mut words = format!(
+        "Rebuilt: {} at {url}, local Version {}",
+        Theirs::from(brought.application.as_str()),
+        brought.version
+    );
     if !brought.migrations_applied.is_empty() {
         let names: Vec<String> = brought
             .migrations_applied

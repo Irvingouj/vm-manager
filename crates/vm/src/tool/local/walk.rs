@@ -8,7 +8,7 @@
 //! the look gives up ([`Look::TooMany`]). No link is followed (an entry's
 //! own metadata is read, not its target's), so the walk stays inside the
 //! project and ends. It reads the file system: the caller runs it off the
-//! async workers (`spawn_blocking`).
+//! async workers (`run::off_thread`).
 
 use std::fs;
 use std::os::unix::ffi::OsStrExt;

@@ -51,6 +51,7 @@ const WORDS_LINES: usize = 12;
 const WORDS_CHARS: usize = 2000;
 
 /// The command that runs the project's tools, as its messages name it.
+#[derive(Clone, Copy)]
 pub(super) struct Who {
     /// As the Builder runs it: `vm check`.
     pub command: &'static str,

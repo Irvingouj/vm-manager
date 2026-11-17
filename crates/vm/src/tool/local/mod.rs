@@ -333,10 +333,11 @@ enum Stage {
     Request,
     Recording,
     Reading,
+    Dev,
 }
 
 impl Stage {
-    const ALL: [Self; 12] = [
+    const ALL: [Self; 13] = [
         Self::Node,
         Self::Packages,
         Self::Programs,
@@ -349,6 +350,7 @@ impl Stage {
         Self::Request,
         Self::Recording,
         Self::Reading,
+        Self::Dev,
     ];
 
     fn words(self) -> &'static str {
@@ -367,6 +369,7 @@ impl Stage {
             Self::Request => "waiting for the Application's response",
             Self::Recording => "waiting for what the request recorded",
             Self::Reading => "reading what the local runs recorded",
+            Self::Dev => "waiting for vm dev, which runs in this project, to do it",
         }
     }
 }
@@ -496,15 +499,16 @@ fn database_failed(error: &DbError, command: &str) -> Ending {
 }
 
 /// The size of the parts of a command that serves one request: a few
-/// connections, one engine thread, the request held to the command's time.
-fn one_request(limit: Duration) -> Size {
+/// connections, one engine thread. The request is given the time an
+/// installation gives one (the runner's own default), as under `vm dev`:
+/// `--timeout` bounds the whole command, not the Application's code.
+fn one_request() -> Size {
     Size {
         pool: 4,
         runner: runner::Limits {
             threads: std::num::NonZeroUsize::MIN,
             requests_per_thread: 1,
             queue_per_thread: 1,
-            deadline: limit,
             ..runner::Limits::default()
         },
     }
@@ -553,36 +557,88 @@ pub(super) async fn request(args: &RequestArgs) -> Result<Done, Ending> {
         json: args.output.json,
         limit,
     };
-    let progress = Progress::new(Stage::Request);
-    if let Some(found) = control::running(&Local::of(&project)) {
-        let sent = control::Sent::Request(control::request_body(&wanted));
-        let forwarded = signals
-            .within(limit, control::forward(&project, found, sent, &WHO))
-            .await;
-        match forwarded {
-            Bounded::Ended(Some(ended)) => return ended,
-            // Not answered: run alone, which waits for the project's lock.
-            Bounded::Ended(None) => {}
-            Bounded::TimedOut => return Err(command.timed_out(progress.get())),
-            Bounded::Interrupted(signal) => {
-                return Err(command.interrupted(signal, progress.get()));
+    let progress = Progress::new(Stage::Node);
+    let found = control::running(&Local::of(&project));
+    let sent = control::Sent::Request(control::request_body(&wanted));
+    handed_or_alone(
+        &project,
+        &command,
+        &mut signals,
+        &progress,
+        (found, &sent),
+        Stage::Node,
+        async |base, held, tried| request_alone(base, &file, &wanted, &progress, held, tried).await,
+    )
+    .await
+}
+
+/// What a local command did alone, or the `vm dev` it found while it waited
+/// for the project's lock.
+enum Alone {
+    Did(Done),
+    Dev(control::Found),
+}
+
+/// The time left until `deadline`.
+fn left(deadline: tokio::time::Instant) -> Duration {
+    deadline.saturating_duration_since(tokio::time::Instant::now())
+}
+
+/// Runs a local command, the whole of it within its `--timeout` and its
+/// signals: handed to the project's `vm dev` when one runs (`found`, or
+/// found while the command waits for the project's lock), else done alone
+/// by `alone` (starting in `first`), in a scratch folder of its own, with
+/// what it starts kept in a [`Held`] that is let go of after it however it
+/// ends. A `vm dev` that does not answer it is not turned to again: the
+/// command goes on alone.
+async fn handed_or_alone(
+    project: &Path,
+    command: &Command<'_>,
+    signals: &mut Signals,
+    progress: &Progress,
+    (found, sent): (Option<control::Found>, &control::Sent),
+    first: Stage,
+    mut alone: impl AsyncFnMut(&Base<'_>, &Held, Option<&control::Found>) -> Result<Alone, Ending>,
+) -> Result<Done, Ending> {
+    let deadline = tokio::time::Instant::now() + command.limit;
+    let mut found = found;
+    let mut tried: Option<control::Found> = None;
+    loop {
+        if let Some(dev) = found.take() {
+            progress.set(Stage::Dev);
+            match signals
+                .within(left(deadline), control::forward(&dev, sent, command.who))
+                .await
+            {
+                Bounded::Ended(Some(ended)) => return ended,
+                Bounded::Ended(None) => tried = Some(dev),
+                Bounded::TimedOut => return Err(command.timed_out(progress.get())),
+                Bounded::Interrupted(signal) => {
+                    return Err(command.interrupted(signal, progress.get()));
+                }
             }
         }
+        let own = Scratch::make(command.who).map_err(|e| own_folder_failed(&e, command.who))?;
+        progress.set(first);
+        let held = Held::default();
+        let base = command.base(project, &own.path);
+        let bounded = signals
+            .within(left(deadline), alone(&base, &held, tried.as_ref()))
+            .await;
+        held.release().await;
+        drop(own);
+        let bounded = match bounded {
+            Bounded::Ended(Ok(Alone::Dev(dev))) => {
+                found = Some(dev);
+                continue;
+            }
+            Bounded::Ended(Ok(Alone::Did(done))) => Bounded::Ended(Ok(done)),
+            Bounded::Ended(Err(ending)) => Bounded::Ended(Err(ending)),
+            Bounded::TimedOut => Bounded::TimedOut,
+            Bounded::Interrupted(signal) => Bounded::Interrupted(signal),
+        };
+        return command.ended(bounded, progress);
     }
-    let own = Scratch::make(&WHO).map_err(|e| own_folder_failed(&e, &WHO))?;
-    progress.set(Stage::Node);
-    let held = Held::default();
-    let base = command.base(&project, &own.path);
-    let bounded = signals
-        .within(
-            limit,
-            request_alone(&base, &file, &wanted, limit, &progress, &held),
-        )
-        .await;
-    let ended = command.ended(bounded, &progress);
-    held.release().await;
-    drop(own);
-    ended
 }
 
 /// `vm request` alone: the private Postgres, the project brought up, the
@@ -591,16 +647,18 @@ async fn request_alone(
     base: &Base<'_>,
     file: &TestUsersFile,
     wanted: &Wanted<'_>,
-    limit: Duration,
     progress: &Progress,
     held: &Held,
-) -> Result<Done, Ending> {
+    tried: Option<&control::Found>,
+) -> Result<Alone, Ending> {
     let packages = run::tools(base, progress).await?;
     let programs = run::programs(base, progress).await?;
     let local = Local::of(base.project);
-    run::lock_project(base, &local, progress, held).await?;
+    if let Some(dev) = run::lock_project(base, &local, progress, held, tried).await? {
+        return Ok(Alone::Dev(dev));
+    }
     let pg = run::start_server(base, &programs, progress, held, false).await?;
-    let live = Live::open(&pg, one_request(limit), base.who).await?;
+    let live = Live::open(&pg, one_request(), base.who).await?;
     let done = async {
         let brought = run::bring_up(base, &pg, &live, file, &packages, progress).await?;
         let Some(user) = file.user(wanted.user) else {
@@ -616,7 +674,7 @@ async fn request_alone(
         };
         let served =
             run::serve_and_collect(&live, &brought.application, &asked, progress, base.who).await?;
-        Ok(request_output(&brought, &served, &asked))
+        Ok(Alone::Did(request_output(&brought, &served, &asked)))
     }
     .await;
     live.close().await;
@@ -737,23 +795,10 @@ pub(super) async fn local(args: &LocalArgs) -> Result<Done, Ending> {
         json,
         limit,
     };
-    let progress = Progress::new(Stage::Reading);
-    if let Some(found) = control::running(&local) {
-        let mut signals = Signals::listen(&WHO_LOCAL)?;
-        let sent = control::Sent::Reading(control::reading_body(&reading));
-        match signals
-            .within(limit, control::forward(&project, found, sent, &WHO_LOCAL))
-            .await
-        {
-            Bounded::Ended(Some(ended)) => return ended,
-            Bounded::Ended(None) => {}
-            Bounded::TimedOut => return Err(command.timed_out(progress.get())),
-            Bounded::Interrupted(signal) => {
-                return Err(command.interrupted(signal, progress.get()));
-            }
-        }
-    }
-    if !local.has_run() {
+    let mut signals = Signals::listen(&WHO_LOCAL)?;
+    let progress = Progress::new(Stage::Programs);
+    let found = control::running(&local);
+    if found.is_none() && !local.has_run() {
         // Nothing made, nothing downloaded.
         return Ok(match reading {
             Reading::OperationLog { .. } => Done {
@@ -766,18 +811,17 @@ pub(super) async fn local(args: &LocalArgs) -> Result<Done, Ending> {
             },
         });
     }
-    let mut signals = Signals::listen(&WHO_LOCAL)?;
-    let own = Scratch::make(&WHO_LOCAL).map_err(|e| own_folder_failed(&e, &WHO_LOCAL))?;
-    progress.set(Stage::Programs);
-    let held = Held::default();
-    let base = command.base(&project, &own.path);
-    let bounded = signals
-        .within(limit, read_alone(&base, &reading, &progress, &held))
-        .await;
-    let ended = command.ended(bounded, &progress);
-    held.release().await;
-    drop(own);
-    ended
+    let sent = control::Sent::Reading(control::reading_body(&reading));
+    handed_or_alone(
+        &project,
+        &command,
+        &mut signals,
+        &progress,
+        (found, &sent),
+        Stage::Programs,
+        async |base, held, tried| read_alone(base, &reading, &progress, held, tried).await,
+    )
+    .await
 }
 
 async fn read_alone(
@@ -785,11 +829,14 @@ async fn read_alone(
     reading: &Reading,
     progress: &Progress,
     held: &Held,
-) -> Result<Done, Ending> {
+    tried: Option<&control::Found>,
+) -> Result<Alone, Ending> {
     let name = base.who.command;
     let programs = run::programs(base, progress).await?;
     let local = Local::of(base.project);
-    run::lock_project(base, &local, progress, held).await?;
+    if let Some(dev) = run::lock_project(base, &local, progress, held, tried).await? {
+        return Ok(Alone::Dev(dev));
+    }
     let pg = run::start_server(base, &programs, progress, held, false).await?;
     progress.set(Stage::Reading);
     let database = Arc::new(
@@ -805,7 +852,7 @@ async fn read_alone(
     );
     let read = read_records(&database, reading, name).await;
     drop(database);
-    read
+    read.map(Alone::Did)
 }
 
 /// The local Operation log or Change history, as the command prints them.
@@ -894,53 +941,41 @@ async fn reset(args: &ResetArgs) -> Result<Done, Ending> {
         limit,
     };
     let mut signals = Signals::listen(&WHO_RESET)?;
-    let progress = Progress::new(Stage::Starting);
-    if let Some(found) = control::running(&local) {
-        match signals
-            .within(
-                limit,
-                control::forward(&project, found, control::Sent::Reset, &WHO_RESET),
-            )
-            .await
-        {
-            Bounded::Ended(Some(ended)) => return ended,
-            Bounded::Ended(None) => {}
-            Bounded::TimedOut => return Err(command.timed_out(progress.get())),
-            Bounded::Interrupted(signal) => {
-                return Err(command.interrupted(signal, progress.get()));
-            }
-        }
-    }
-    let file = run::test_users_of(&project, WHO_RESET.command)?;
-    let own = Scratch::make(&WHO_RESET).map_err(|e| own_folder_failed(&e, &WHO_RESET))?;
-    progress.set(Stage::Node);
-    let held = Held::default();
-    let base = command.base(&project, &own.path);
-    let bounded = signals
-        .within(limit, reset_alone(&base, &file, limit, &progress, &held))
-        .await;
-    let ended = command.ended(bounded, &progress);
-    held.release().await;
-    drop(own);
-    ended
+    let progress = Progress::new(Stage::Node);
+    let found = control::running(&local);
+    handed_or_alone(
+        &project,
+        &command,
+        &mut signals,
+        &progress,
+        (found, &control::Sent::Reset),
+        Stage::Node,
+        async |base, held, tried| {
+            let file = run::test_users_of(base.project, WHO_RESET.command)?;
+            reset_alone(base, &file, &progress, held, tried).await
+        },
+    )
+    .await
 }
 
 async fn reset_alone(
     base: &Base<'_>,
     file: &TestUsersFile,
-    limit: Duration,
     progress: &Progress,
     held: &Held,
-) -> Result<Done, Ending> {
+    tried: Option<&control::Found>,
+) -> Result<Alone, Ending> {
     let packages = run::tools(base, progress).await?;
     let programs = run::programs(base, progress).await?;
     let local = Local::of(base.project);
-    run::lock_project(base, &local, progress, held).await?;
+    if let Some(dev) = run::lock_project(base, &local, progress, held, tried).await? {
+        return Ok(Alone::Dev(dev));
+    }
     let pg = run::start_server(base, &programs, progress, held, true).await?;
-    let live = Live::open(&pg, one_request(limit), base.who).await?;
+    let live = Live::open(&pg, one_request(), base.who).await?;
     let brought = run::bring_up(base, &pg, &live, file, &packages, progress).await;
     live.close().await;
-    Ok(reset_output(&brought?))
+    Ok(Alone::Did(reset_output(&brought?)))
 }
 
 /// What `vm local reset` prints.

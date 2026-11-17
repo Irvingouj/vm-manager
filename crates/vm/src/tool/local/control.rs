@@ -15,18 +15,30 @@
 //! killed `vm dev`'s, the command runs alone, and the first command that
 //! takes the lock removes the file ([`remove_left`]).
 //!
+//! **Found while waiting.** A command that waits for the project's lock
+//! reads the file at each try that finds the lock held
+//! ([`found_while_waiting`]), without looking at the lock again: a `vm dev`
+//! that was starting writes it once it listens, and the command is then
+//! handed to it. So the only look at the lock is the one a command makes
+//! before it waits (a shared lock for a moment, never while it holds the
+//! lock itself).
+//!
 //! **The exchange.** The command connects to `127.0.0.1:<port>` only,
 //! names the Application in `Host`, and sends `POST /_vm/control/<what>`
 //! with the secret in the header [`SECRET_HEADER`] (never in the address)
 //! and what it asks as JSON ([`Sent`]). `vm dev` answers `200` with `{
 //! "code", "json", "text" }`: what the command prints and its exit code.
+//! Any other answer is not the command's: `404` and `421` (not that
+//! process's secret, or the Application renamed since the file was read)
+//! leave the command to go on alone, which finds the file again while it
+//! waits for the lock; the rest (`503`: stopping, or busy) end it,
+//! `failed`.
 //! What it sends is at most [`MAX_SENT_BYTES`], what it reads at most
 //! [`MAX_ANSWER_BYTES`]; the caller bounds the time.
 
 use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::Path;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -38,7 +50,7 @@ use rustix::fs::{FlockOperation, flock};
 use serde_json::{Value, json};
 use tokio::net::TcpStream;
 
-use super::super::project_tools::{Who, tool_failed};
+use super::super::project_tools::Who;
 use super::super::{Done, Ending};
 use super::postgres::Local;
 use super::{Reading, Wanted, hex};
@@ -49,13 +61,22 @@ const FILE: &str = "dev.json";
 /// The header the secret is sent in.
 pub(super) const SECRET_HEADER: &str = "x-vm-control";
 
-/// The most a command sends: a request's body (1 MiB) and its headers, in
-/// hex.
-pub(super) const MAX_SENT_BYTES: usize = 4 * 1024 * 1024;
+/// The most a command sends: everything of `vm request` given on its
+/// command line (the path, the headers, a body given with `--data`) and a
+/// body read from a file, the headers' values and the body in hex (twice
+/// their bytes), with the JSON around them. A command line holds at most 6
+/// MiB: Linux gives a program's arguments and environment together at most
+/// a quarter of the stack's limit and never more than three quarters of
+/// `_STK_LIM` (8 MiB), whatever the limit (`bprm_stack_limits` in
+/// `fs/exec.c`). So: 6 MiB of the command line in hex (12 MiB), a body of
+/// [`super::MAX_BODY_BYTES`] in hex (2 MiB), and 1 MiB for the rest.
+pub(super) const MAX_SENT_BYTES: usize = (6 * 2 + 2 + 1) * 1024 * 1024;
 
-/// The most of an answer read: what `vm request` prints of a response of 1
-/// MiB, twice (its JSON and its words), and the rest.
-const MAX_ANSWER_BYTES: usize = 16 * 1024 * 1024;
+/// The most of an answer read: what `vm request` prints of a response
+/// (of whose body 1 MiB is printed, its headers bounded by the
+/// installation's limits on a response), twice (its JSON and its words),
+/// escaped as JSON strings, and the rest.
+const MAX_ANSWER_BYTES: usize = 32 * 1024 * 1024;
 
 /// The most of the file read.
 const MAX_FILE_BYTES: u64 = 64 * 1024;
@@ -95,6 +116,21 @@ pub(super) struct Found {
     port: u16,
     application: String,
     secret: ControlSecret,
+}
+
+impl Found {
+    /// Its address: `http://<application>.localhost:<port>/`.
+    pub(super) fn address(&self) -> String {
+        format!("http://{}.localhost:{}/", self.application, self.port)
+    }
+
+    /// Whether `other` is the same file of the same `vm dev`: a rename
+    /// writes it again with another name.
+    fn same(&self, other: &Self) -> bool {
+        self.port == other.port
+            && self.application == other.application
+            && self.secret.matches(other.secret.0.as_bytes())
+    }
 }
 
 /// Writes the file of the `vm dev` that holds the project's lock.
@@ -145,11 +181,20 @@ pub(super) fn running(local: &Local) -> Option<Found> {
 
 /// The address of a running `vm dev`, as its file gives it.
 pub(super) fn address_of(local: &Local) -> Option<String> {
-    let found = running(local)?;
-    Some(format!(
-        "http://{}.localhost:{}/",
-        found.application, found.port
-    ))
+    running(local).map(|found| found.address())
+}
+
+/// The `vm dev` of the file, for a command that waits for the project's
+/// lock and has just found it held: no look at the lock (what holds it
+/// removed any file a killed `vm dev` left when it took it, and a `vm dev`
+/// writes its own only once it listens). Not one `tried` already, which
+/// did not answer.
+pub(super) fn found_while_waiting(local: &Local, tried: Option<&Found>) -> Option<Found> {
+    let found = read(local)?;
+    match tried {
+        Some(tried) if tried.same(&found) => None,
+        _ => Some(found),
+    }
 }
 
 fn read(local: &Local) -> Option<Found> {
@@ -228,39 +273,44 @@ pub(super) fn reading_body(reading: &Reading) -> Value {
 }
 
 /// Hands the command to the `vm dev` `found`, and answers what it printed:
-/// `None` when it could not be reached (the caller runs the command alone).
-/// When `vm dev` says the Application's name in the file is no longer its
-/// own (`421`), the file is read once more.
-pub(super) async fn forward(
-    project: &Path,
-    found: Found,
-    sent: Sent,
-    who: &Who,
-) -> Option<Result<Done, Ending>> {
-    let mut found = found;
-    for _ in 0..2 {
-        match exchange(&found, &sent).await {
-            Ok((StatusCode::OK, body)) => return Some(answered(&body, who)),
-            Ok((StatusCode::MISDIRECTED_REQUEST, _)) => {
-                found = running(&Local::of(project))?;
-            }
-            Ok((status, _)) => {
-                return Some(Err(tool_failed(
-                    "vm dev",
-                    &format!("answered {status} when asked to do the command"),
-                    who,
-                )));
-            }
-            Err(()) => return None,
-        }
+/// `None` when it did not answer it (the caller runs the command alone,
+/// which hands it over again should it find a `vm dev` while it waits for
+/// the project's lock): it could not be reached; `404`, the secret of the
+/// file is not that process's; `421`, the Application's name in the file
+/// is no longer its own (renamed since the file was read).
+pub(super) async fn forward(found: &Found, sent: &Sent, who: &Who) -> Option<Result<Done, Ending>> {
+    match exchange(found, sent).await {
+        Ok((StatusCode::OK, body)) => Some(answered(&body, who)),
+        Ok((StatusCode::NOT_FOUND | StatusCode::MISDIRECTED_REQUEST, _)) | Err(()) => None,
+        Ok((status, _)) => Some(Err(not_now(status, who))),
     }
-    None
+}
+
+/// An answer of `vm dev` that is not the command's: it is stopping, or busy
+/// for longer than the command may wait.
+fn not_now(status: StatusCode, who: &Who) -> Ending {
+    let command = who.command;
+    Ending::new(
+        1,
+        "failed",
+        format!(
+            "vm dev runs in this project and could not do {command} now (it answered {status}: it is stopping, or busy for longer than {command} may wait). Run {command} again"
+        ),
+    )
 }
 
 /// What `vm dev` sent back, as the command's result.
 fn answered(body: &[u8], who: &Who) -> Result<Done, Ending> {
-    let value: Value = serde_json::from_slice(body)
-        .map_err(|_| tool_failed("vm dev", "answered what is not the command's output", who))?;
+    let value: Value = serde_json::from_slice(body).map_err(|_| {
+        Ending::new(
+            1,
+            "failed",
+            format!(
+                "vm dev runs in this project and answered {} with what is not the command's output. Run {} again",
+                who.command, who.command
+            ),
+        )
+    })?;
     let code = value
         .get("code")
         .and_then(Value::as_u64)

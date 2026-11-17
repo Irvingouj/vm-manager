@@ -271,6 +271,13 @@ pub(super) struct State {
     pub ready: bool,
 }
 
+/// How waiting for the project's lock ended.
+pub(super) enum Taken<T> {
+    Lock(Lock),
+    /// What the caller turned to instead.
+    Other(T),
+}
+
 /// The lock of the project's local runs: held while the file is open; the
 /// kernel lets go of it when the process ends, however it ends.
 pub(super) struct Lock {
@@ -339,9 +346,17 @@ impl Local {
     }
 
     /// Takes the lock, trying every [`LOCK_POLL`] while another command
-    /// holds it (`waiting` is called once, then); the caller bounds the
-    /// wait.
-    pub(super) async fn lock(&self, waiting: impl FnOnce()) -> Result<Lock, String> {
+    /// holds it; the caller bounds the wait. While it is held, `other` is
+    /// asked at each try whether what holds it is something the caller
+    /// would rather turn to (a `vm dev` that now listens): if so, the wait
+    /// ends with that. `waiting` is called once, when the lock was found
+    /// held at two tries in a row: a command that only looks whether the
+    /// lock is held takes it for a moment, which is not worth a line.
+    pub(super) async fn lock<T>(
+        &self,
+        waiting: impl FnOnce(),
+        mut other: impl FnMut() -> Option<T>,
+    ) -> Result<Taken<T>, String> {
         let path = self.dir.join("lock");
         let file = OpenOptions::new()
             .read(true)
@@ -352,13 +367,18 @@ impl Local {
             .open(&path)
             .map_err(|e| format!("{} cannot be opened ({e})", path.display()))?;
         let mut waiting = Some(waiting);
+        let mut held_before = false;
         loop {
             match flock(&file, FlockOperation::NonBlockingLockExclusive) {
-                Ok(()) => return Ok(Lock { _file: file }),
+                Ok(()) => return Ok(Taken::Lock(Lock { _file: file })),
                 Err(rustix::io::Errno::WOULDBLOCK | rustix::io::Errno::INTR) => {
-                    if let Some(waiting) = waiting.take() {
+                    if let Some(found) = other() {
+                        return Ok(Taken::Other(found));
+                    }
+                    if held_before && let Some(waiting) = waiting.take() {
                         waiting();
                     }
+                    held_before = true;
                     tokio::time::sleep(LOCK_POLL).await;
                 }
                 Err(error) => return Err(format!("{} cannot be locked ({error})", path.display())),
@@ -727,12 +747,20 @@ impl Server {
         let mut last = String::new();
         for _ in 0..PORT_ATTEMPTS {
             let port = free_port()?;
+            // In append mode (`O_APPEND`), which Postgres inherits: each of
+            // its writes goes to the end of the file as it is at that
+            // moment, so emptying the file while it runs ([`trim_log`])
+            // makes its next line the first, not one after a hole of the
+            // size the file had. Checked by hand: with `vm dev` running,
+            // the file emptied by truncate(1), the next line Postgres wrote
+            // was the file's first (76 bytes, no NUL byte). Emptied here,
+            // so that a run starts it anew.
             let log = OpenOptions::new()
-                .write(true)
+                .append(true)
                 .create(true)
-                .truncate(true)
                 .mode(0o600)
                 .open(&log_path)
+                .and_then(|file| file.set_len(0).map(|()| file))
                 .map_err(|e| format!("{} cannot be written ({e})", log_path.display()))?;
             let log_too = log
                 .try_clone()
@@ -849,6 +877,19 @@ impl Drop for Server {
         if let Some(pid) = self.pid.take() {
             kill_process_group(pid, Signal::KILL).ok();
         }
+    }
+}
+
+/// Empties `postgres.log` of `local` once it is larger than
+/// [`crate::log::MAX_FILE_BYTES`], while the server writes it (see
+/// [`Server::start`] for why that is safe). It reads the file system: the
+/// caller runs it off the async workers.
+pub(super) fn trim_log(local: &Local) {
+    let path = local.dir.join("postgres.log");
+    let large = fs::symlink_metadata(&path)
+        .is_ok_and(|meta| meta.is_file() && meta.len() > crate::log::MAX_FILE_BYTES);
+    if large && let Ok(file) = OpenOptions::new().write(true).open(&path) {
+        file.set_len(0).ok();
     }
 }
 
