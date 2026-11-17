@@ -535,3 +535,43 @@ fn test_rows_lists_the_files_loaded_in_name_order_and_in_words_one_line_each() {
         );
     }
 }
+
+#[test]
+fn a_test_rows_file_that_is_a_link_or_a_folder_is_test_rows_failed() {
+    let board = Board::start("read", "read");
+    let elsewhere = board.local.machine.root().join("rows-elsewhere.sql");
+    fs::write(&elsewhere, TWO_INCIDENTS).unwrap();
+    fs::create_dir_all(board.dir().join("test-rows")).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, board.dir().join(DEVOPS_ROWS)).unwrap();
+    let run = board.request("/incidents", BUILDER, &[]);
+    run.json_error(1, "test-rows-failed");
+    assert_eq!(
+        run.json()["error"]["file"],
+        json!(DEVOPS_ROWS),
+        "expected a link not followed\n{}",
+        run.describe()
+    );
+    fs::remove_file(board.dir().join(DEVOPS_ROWS)).unwrap();
+    fs::create_dir_all(board.dir().join(DEVOPS_ROWS)).unwrap();
+    let run = board.request("/incidents", BUILDER, &[]);
+    run.json_error(1, "test-rows-failed");
+    assert_eq!(
+        run.json()["error"]["file"],
+        json!(DEVOPS_ROWS),
+        "expected a folder refused\n{}",
+        run.describe()
+    );
+}
+
+#[test]
+fn an_own_database_file_with_no_own_database_is_a_note_and_does_nothing() {
+    let local = Local::new();
+    let project = local_project(&local.machine, "no-own-board", &[]);
+    project.write(OWN_ROWS, "INSERT INTO notes (body) VALUES ('nowhere');\n");
+    let requested = local.request_ok(&project.dir, "/", OUTSIDER, &[]);
+    assert_eq!(requested.status(), 200, "{}", requested.describe());
+    let notes = requested.notes_for("test-rows-without-own-database");
+    assert_eq!(notes.len(), 1, "{}", requested.describe());
+    assert_eq!(notes[0]["file"], json!(OWN_ROWS), "{}", notes[0]);
+    assert_eq!(requested.test_rows(), json!([]));
+}

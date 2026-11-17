@@ -61,6 +61,16 @@ fn with_notes_and_rows(board: &Board) {
     );
 }
 
+/// The project's files and folders, without `.vm/` and `node_modules/`
+/// (neither the folders' contents nor their own times): what a reset must
+/// leave as it was.
+fn project_files(dir: &Path) -> Tree {
+    let mut tree = Tree::of_skipping(dir, &[".vm", "node_modules"]);
+    tree.0.remove(".vm");
+    tree.0.remove("node_modules");
+    tree
+}
+
 /// `vm local reset --project <dir> --json <extra>`.
 fn reset(local: &Local, dir: &Path, extra: &[&str]) -> Run {
     local.watch(dir);
@@ -122,7 +132,12 @@ fn reset_starts_the_local_databases_over_and_leaves_the_project_and_postgres_alo
     // A second local Version.
     let index = board.project.path("src/index.ts");
     let code = std::fs::read_to_string(&index).unwrap();
-    std::fs::write(&index, format!("{code}\n// a second Version\n")).unwrap();
+    let changed = code.replace(
+        "return new Response(\"slow\");",
+        "return new Response(\"slow, a second Version\");",
+    );
+    assert_ne!(code, changed, "the harness's own check");
+    std::fs::write(&index, changed).unwrap();
     assert_eq!(board.request_ok("/notes", BUILDER, &[]).version(), 2);
     let downloads = mirror.requests().len();
     assert!(
@@ -130,7 +145,7 @@ fn reset_starts_the_local_databases_over_and_leaves_the_project_and_postgres_alo
         "the harness's own check: Postgres was downloaded"
     );
     let postgres_before = Tree::of(&board.local.postgres_folder());
-    let project_before = Tree::of_skipping(board.dir(), &[".vm/local", "node_modules"]);
+    let project_before = project_files(board.dir());
 
     let body = reset_ok(&board.local, board.dir(), &[]);
     assert_eq!(body["application"], json!(APP));
@@ -163,10 +178,7 @@ fn reset_starts_the_local_databases_over_and_leaves_the_project_and_postgres_alo
         "expected the programs of Postgres in the user's own folder untouched"
     );
     assert_eq!(
-        project_before.differences(&Tree::of_skipping(
-            board.dir(),
-            &[".vm/local", "node_modules"]
-        )),
+        project_before.differences(&project_files(board.dir())),
         Vec::<String>::new(),
         "expected vm.dev.json, the test rows and every other file of the project untouched"
     );

@@ -258,6 +258,16 @@ impl<'a> Dev<'a> {
         running.wait(STOP_WAIT)
     }
 
+    /// Waits up to `limit` for it to end by itself (no signal); how it
+    /// ended (killed at `limit`).
+    pub fn wait_end(mut self, limit: Duration) -> Run {
+        let running = self
+            .running
+            .take()
+            .unwrap_or_else(|| panic!("the harness's own check: `vm dev` was already stopped"));
+        running.wait(limit)
+    }
+
     /// Kills it outright (`SIGKILL`), leaving what it started.
     pub fn kill(mut self) -> Run {
         let running = self

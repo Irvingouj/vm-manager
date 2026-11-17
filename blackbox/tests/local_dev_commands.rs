@@ -18,11 +18,14 @@
 
 use std::fs;
 use std::net::{Ipv4Addr, TcpListener};
-use std::time::Duration;
+use std::thread;
+use std::time::{Duration, Instant};
 
-use blackbox::dev::{Dev, hex64_runs, local_files_but_postgres, local_files_holding};
+use blackbox::dev::{Dev, free_port, hex64_runs, local_files_but_postgres, local_files_holding};
 use blackbox::generate::{Generated, generate};
-use blackbox::local::{APP, BUILDER, Board, OUTSIDER, Requested, handler, port_open};
+use blackbox::local::{
+    APP, BUILDER, Board, Local, OUTSIDER, Requested, handler, local_project, port_open,
+};
 use blackbox::project::{NOTES_SCHEMA_TS, is_running};
 use blackbox::tool::mode_of;
 use serde_json::json;
@@ -342,4 +345,151 @@ fn a_file_left_by_a_vm_dev_killed_outright_is_not_believed() {
     // And a new `vm dev` starts.
     let again = Dev::start(&board.local, board.dir(), APP);
     again.stop("INT").expect_code(0);
+}
+
+#[test]
+fn a_vm_request_started_while_vm_dev_is_starting_is_answered_as_soon_as_it_listens() {
+    let local = Local::new();
+    let mut answered_by_dev = 0;
+    for round in 0..3 {
+        let project = local_project(&local.machine, &format!("starting-board-{round}"), &[]);
+        let name = format!("starting-board-{round}");
+        let mut dev = Dev::spawn(&local, &project.dir, &name, free_port(), true);
+        let began = Instant::now();
+        let run = local.request(&project.dir, "/", OUTSIDER, &["--timeout", "60"]);
+        let requested = Requested::of(&run);
+        assert!(
+            began.elapsed() < Duration::from_secs(45),
+            "round {round}: expected the command answered well inside its 60 seconds, took {:?}",
+            began.elapsed()
+        );
+        assert_eq!(requested.status(), 200, "{}", requested.describe());
+        dev.wait_until_listening();
+        let id = requested.request_id();
+        if dev
+            .events("request")
+            .iter()
+            .any(|l| l["request_id"] == id.as_str())
+        {
+            answered_by_dev += 1;
+        }
+        dev.stop("INT").expect_code(0);
+    }
+    assert!(
+        answered_by_dev >= 1,
+        "the harness's own check: in none of three rounds did `vm dev` take the project's lock first"
+    );
+}
+
+#[test]
+fn a_second_vm_dev_started_while_the_first_is_starting_ends_already_running_without_waiting() {
+    let local = Local::new();
+    let project = local_project(&local.machine, "twice-board", &[]);
+    let mut first = Dev::spawn(&local, &project.dir, "twice-board", free_port(), true);
+    let mut second = Dev::spawn(&local, &project.dir, "twice-board", free_port(), true);
+    let deadline = Instant::now() + blackbox::local::LOCAL_TIMEOUT;
+    // Until one ends, or one says it listens; then the other has 15 seconds.
+    let mut listened: Option<Instant> = None;
+    let (ended, mut running) = loop {
+        if second.has_ended() {
+            break (second, first);
+        }
+        if first.has_ended() {
+            break (first, second);
+        }
+        if listened.is_none()
+            && (!first.events("listening").is_empty() || !second.events("listening").is_empty())
+        {
+            listened = Some(Instant::now());
+        }
+        if let Some(at) = listened {
+            assert!(
+                at.elapsed() < Duration::from_secs(15),
+                "expected the other `vm dev` to end already-running as soon as the first listens, not to wait for it to end"
+            );
+        }
+        assert!(
+            Instant::now() < deadline,
+            "expected one of the two `vm dev` to listen and the other to end already-running"
+        );
+        thread::sleep(Duration::from_millis(50));
+    };
+    let run = ended.wait_end(Duration::from_secs(5));
+    run.json_error(1, "already-running");
+    running.wait_until_listening();
+    running.stop("INT").expect_code(0);
+}
+
+/// `vm request /echo --as outsider` with 12 headers of 100,000 bytes and a
+/// `--data-file` of exactly 1 MiB, in the project `dir`.
+fn large_request(local: &Local, dir: &std::path::Path) -> blackbox::tool::Run {
+    let data = local.machine.root().join("one-mebibyte.txt");
+    fs::write(&data, "d".repeat(1_048_576)).unwrap();
+    let mut extra: Vec<String> = Vec::new();
+    for n in 0..12 {
+        extra.push("--header".to_owned());
+        extra.push(format!("x-large-{n}: {}", "h".repeat(100_000)));
+    }
+    extra.push("--data-file".to_owned());
+    extra.push(data.to_str().unwrap().to_owned());
+    extra.push("--timeout".to_owned());
+    extra.push("120".to_owned());
+    let refs: Vec<&str> = extra.iter().map(String::as_str).collect();
+    local.request(dir, "/echo", OUTSIDER, &refs)
+}
+
+#[test]
+fn a_large_vm_request_is_answered_by_vm_dev_as_it_is_alone() {
+    let local = Local::new();
+    let project = local_project(&local.machine, "large-request-board", &[]);
+    let alone = Requested::of(&large_request(&local, &project.dir));
+    let dev = Dev::start(&local, &project.dir, "large-request-board");
+    let run = large_request(&local, &project.dir);
+    assert_eq!(
+        run.code,
+        Some(0),
+        "expected the same large request answered by `vm dev`\n{}",
+        run.describe()
+    );
+    let served = Requested::of(&run);
+    assert_eq!(
+        served.status(),
+        alone.status(),
+        "expected the status it has alone"
+    );
+    assert_served_by(&dev, &served.request_id(), "the large vm request");
+    dev.stop("INT").expect_code(0);
+}
+
+/// This test takes about 35 seconds: the handler sleeps 33 seconds, past
+/// the 30 an installation gives a request.
+#[test]
+fn the_code_is_given_the_same_time_alone_and_under_vm_dev() {
+    let local = Local::new();
+    let alone_project = local_project(&local.machine, "time-alone-board", &[]);
+    let dev_project = local_project(&local.machine, "time-dev-board", &[]);
+    let dev = Dev::start(&local, &dev_project.dir, "time-dev-board");
+    let args = ["--timeout", "120"];
+    let (alone, under_dev) = thread::scope(|scope| {
+        let alone =
+            scope.spawn(|| local.request(&alone_project.dir, "/slow?ms=33000", OUTSIDER, &args));
+        let under_dev =
+            scope.spawn(|| local.request(&dev_project.dir, "/slow?ms=33000", OUTSIDER, &args));
+        (alone.join().unwrap(), under_dev.join().unwrap())
+    });
+    let alone = Requested::of(&alone);
+    let under_dev = Requested::of(&under_dev);
+    assert_ne!(
+        alone.status(),
+        200,
+        "expected the handler stopped at the 30 seconds an installation gives, not its own 200 after 33\n{}",
+        alone.describe()
+    );
+    assert_eq!(
+        under_dev.status(),
+        alone.status(),
+        "expected the same answer under `vm dev` as alone\n{}",
+        under_dev.describe()
+    );
+    dev.stop("INT").expect_code(0);
 }

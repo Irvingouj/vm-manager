@@ -453,3 +453,58 @@ fn the_instruction_file_names_vm_dev_and_vm_local_reset_and_says_what_test_rows_
         );
     }
 }
+
+#[test]
+fn vm_log_is_started_anew_once_past_16_mib_while_vm_dev_runs() {
+    let local = Local::new();
+    let project = project(&local);
+    let dev = Dev::start(&local, &project.dir, NAME);
+    let log = project.dir.join(".vm/local/vm.log");
+    let size = || fs::metadata(&log).map(|m| m.len()).unwrap_or(0);
+    let mut browser = dev.browser();
+    browser.choose(OUTSIDER);
+    // The longest path served, from about 50,000 bytes down.
+    let mut length = 50_000;
+    loop {
+        let path = format!("/{}", "p".repeat(length - 1));
+        if browser.get(&path).status == 200 {
+            break;
+        }
+        length /= 2;
+        assert!(
+            length > 1000,
+            "the harness's own check: no long path is served"
+        );
+    }
+    let limit: u64 = 17 * 1024 * 1024;
+    let path = format!("/{}", "p".repeat(length - 1));
+    // Paths enough for 24 MiB of them, each in at least one record.
+    let requests = 24 * 1024 * 1024 / length + 1;
+    let mut largest = 0;
+    let mut started_anew = false;
+    for n in 0..requests {
+        let response = browser.get(&path);
+        assert_eq!(response.status, 200, "request {n}\n{}", response.describe());
+        if n % 10 == 0 {
+            let now = size();
+            assert!(
+                now <= limit,
+                "expected vm.log at most 17 MiB while `vm dev` runs, it is {now} bytes after {n} requests"
+            );
+            if now < largest {
+                started_anew = true;
+            }
+            largest = largest.max(now);
+        }
+    }
+    let now = size();
+    assert!(
+        now <= limit,
+        "expected vm.log at most 17 MiB, it is {now} bytes"
+    );
+    assert!(
+        started_anew || now < largest,
+        "the harness's own check: more than 16 MiB was written into vm.log (largest seen {largest} bytes)"
+    );
+    dev.stop("INT").expect_code(0);
+}

@@ -781,3 +781,132 @@ fn only_requests_given_to_the_applications_code_have_a_request_line() {
     );
     dev.stop("INT").expect_code(0);
 }
+
+/// Fails unless `response` carries the headers of every answer of the
+/// local run's own.
+fn assert_locked_down(response: &Response, what: &str) {
+    assert!(
+        response
+            .header("cache-control")
+            .is_some_and(|c| c.to_lowercase().contains("no-store")),
+        "{what}: expected cache-control: no-store\n{}",
+        response.describe()
+    );
+    assert_eq!(
+        response
+            .header("x-content-type-options")
+            .map(str::to_lowercase)
+            .as_deref(),
+        Some("nosniff"),
+        "{what}: expected x-content-type-options: nosniff\n{}",
+        response.describe()
+    );
+    let policy = response
+        .header("content-security-policy")
+        .unwrap_or_else(|| {
+            panic!(
+                "{what}: expected a content-security-policy\n{}",
+                response.describe()
+            )
+        });
+    let directives: Vec<String> = policy
+        .split(';')
+        .map(|d| d.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|d| !d.is_empty())
+        .collect();
+    for wanted in [
+        "default-src 'none'",
+        "frame-ancestors 'none'",
+        "base-uri 'none'",
+        "form-action 'self'",
+    ] {
+        assert!(
+            directives.iter().any(|d| d == wanted),
+            "{what}: expected the directive {wanted:?} in {policy:?}"
+        );
+    }
+}
+
+#[test]
+fn the_local_runs_own_answers_carry_no_store_nosniff_and_a_content_security_policy() {
+    let local = Local::new();
+    let project = notes_project(&local);
+    let dev = Dev::start(&local, &project.dir, NAME);
+    let port = dev.port;
+    let mut browser = dev.browser();
+    let to_choice = browser.get("/notes");
+    assert_eq!(to_choice.status, 303);
+    assert_locked_down(&to_choice, "the 303 to the choice");
+    let mut api = dev.browser();
+    api.accept = "application/json".to_owned();
+    let unauthorized = api.get("/notes");
+    assert_eq!(unauthorized.status, 401);
+    assert_locked_down(&unauthorized, "the 401");
+    let page = browser.get("/_vm/test-user");
+    assert_eq!(page.status, 200);
+    assert_locked_down(&page, "the page");
+    let origin = browser.origin();
+    let unknown = browser.post_form("/_vm/test-user", &[("user", "nobody-here")], Some(&origin));
+    assert_eq!(unknown.status, 400);
+    assert_locked_down(&unknown, "the 400");
+    let refused = browser.post_form(
+        "/_vm/test-user",
+        &[("user", OUTSIDER)],
+        Some("http://evil.example"),
+    );
+    assert_eq!(refused.status, 403);
+    assert_locked_down(&refused, "the 403");
+    let chosen = browser.choose(OUTSIDER);
+    assert_locked_down(&chosen, "the 303 of choosing");
+    let mut loopback = Browser::new(dev.address(), &format!("127.0.0.1:{port}"));
+    let moved = loopback.get("/notes");
+    assert_eq!(moved.status, 307);
+    assert_locked_down(&moved, "the 307");
+    let mut other = Browser::new(dev.address(), &format!("evil.example:{port}"));
+    let misdirected = other.get("/notes");
+    assert_eq!(misdirected.status, 421);
+    assert_locked_down(&misdirected, "the 421");
+    let missing = browser.get("/_vm/nothing-here");
+    assert_eq!(missing.status, 404);
+    assert_locked_down(&missing, "the 404 under /_vm/");
+    dev.stop("INT").expect_code(0);
+}
+
+#[test]
+fn a_cookie_with_bytes_that_are_not_ascii_does_not_hide_the_chosen_user() {
+    let local = Local::new();
+    let project = notes_project(&local);
+    let dev = Dev::start(&local, &project.dir, NAME);
+    let one_line = dev
+        .request("/echo")
+        .header("Cookie", b"vm_test_user=outsider; name=Jos\xc3\xa9");
+    let two_lines = dev
+        .request("/echo")
+        .header("Cookie", "vm_test_user=outsider")
+        .header("Cookie", b"name=Jos\xc3\xa9");
+    for (what, request) in [
+        ("one Cookie line", one_line),
+        ("two Cookie lines", two_lines),
+    ] {
+        let response = request.send();
+        assert_eq!(
+            response.status,
+            200,
+            "{what}: expected the request given to the Application as the chosen User\n{}",
+            response.describe()
+        );
+        let echoed = response.json();
+        let cookie = echoed["headers"]["cookie"].as_str().unwrap_or_else(|| {
+            panic!("{what}: expected the other cookie given to the code, got {echoed}")
+        });
+        assert!(
+            cookie.contains("name=Jos"),
+            "{what}: expected the cookie `name` kept, got {cookie:?}"
+        );
+        assert!(
+            !cookie.contains("vm_test_user"),
+            "{what}: expected vm_test_user taken out, got {cookie:?}"
+        );
+    }
+    dev.stop("INT").expect_code(0);
+}

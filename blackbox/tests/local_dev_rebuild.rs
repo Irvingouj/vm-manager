@@ -72,21 +72,6 @@ fn a_change_of_the_code_is_served_at_the_next_request_and_said_in_a_rebuilt_line
     let mut browser = dev.browser();
     browser.choose(OUTSIDER);
     assert_eq!(browser.get("/").json(), json!({ "user": OUTSIDER }));
-    let said = dev.events("too-many-files");
-    assert_eq!(
-        said.len(),
-        1,
-        "expected `vm dev` to say once, when it starts, that the project has too many files\n{}",
-        dev.stdout()
-    );
-    assert_eq!(sorted_keys(&said[0]), ["event", "message"], "{}", said[0]);
-    assert!(
-        said[0]["message"]
-            .as_str()
-            .is_some_and(|m| !m.trim().is_empty()),
-        "{}",
-        said[0]
-    );
     change_code(&project, DEFAULT_ANSWER, CHANGED_ANSWER);
     let after = browser.get("/");
     assert_eq!(
@@ -105,10 +90,12 @@ fn a_change_of_the_code_is_served_at_the_next_request_and_said_in_a_rebuilt_line
     assert_eq!(
         sorted_keys(&rebuilt[0]),
         [
+            "application",
             "event",
             "migrations_applied",
             "standins",
             "test_rows",
+            "url",
             "version"
         ],
         "expected the `rebuilt` line with exactly its fields, got {}",
@@ -398,4 +385,82 @@ fn a_project_of_more_than_20000_entries_is_rebuilt_only_when_started_again() {
         "expected the change served once started again"
     );
     again.stop("INT").expect_code(0);
+}
+
+#[test]
+fn a_renamed_application_is_served_at_its_new_name_and_its_old_name_is_421() {
+    let local = Local::new();
+    let project = local_project(&local.machine, NAME, &[]);
+    let dev = Dev::start(&local, &project.dir, NAME);
+    let mut browser = dev.browser();
+    browser.choose(OUTSIDER);
+    assert_eq!(browser.get("/").status, 200);
+    let renamed = "renamed-board";
+    project.write("manifest.ts", &blackbox::local::declaring(renamed, &[]));
+    let old = browser.get("/");
+    assert_eq!(
+        old.status,
+        421,
+        "expected the request that found the new name answered 421 at the old one\n{}",
+        old.describe()
+    );
+    let rebuilt = dev.wait_for_line("a `rebuilt` line", Duration::from_secs(10), |l| {
+        l["event"] == "rebuilt"
+    });
+    assert_eq!(rebuilt["application"], json!(renamed), "{rebuilt}");
+    assert_eq!(
+        rebuilt["url"],
+        json!(format!("http://{renamed}.localhost:{}/", dev.port)),
+        "{rebuilt}"
+    );
+    let mut at_new =
+        blackbox::dev::Browser::new(dev.address(), &format!("{renamed}.localhost:{}", dev.port));
+    at_new.set_cookie("vm_test_user", OUTSIDER);
+    let served = at_new.get("/");
+    assert_eq!(served.status, 200, "{}", served.describe());
+    assert_eq!(served.json(), json!({ "user": OUTSIDER }));
+    let requested = blackbox::local::Requested::of(&local.request(
+        &project.dir,
+        "/",
+        OUTSIDER,
+        &["--timeout", "60"],
+    ));
+    assert_eq!(requested.body["application"], json!(renamed));
+    let id = requested.request_id();
+    assert!(
+        dev.events("request")
+            .iter()
+            .any(|l| l["request_id"] == id.as_str()),
+        "expected the tool's command to go on finding `vm dev` after the rename\n{}",
+        dev.stdout()
+    );
+    dev.stop("INT").expect_code(0);
+}
+
+#[test]
+fn a_project_grown_past_20000_entries_while_vm_dev_runs_is_said_once() {
+    let local = Local::new();
+    let project = local_project(&local.machine, NAME, &[]);
+    let dev = Dev::start(&local, &project.dir, NAME);
+    let mut browser = dev.browser();
+    browser.choose(OUTSIDER);
+    assert_eq!(browser.get("/").status, 200);
+    assert_eq!(dev.events("too-many-files"), Vec::<Value>::new());
+    let bulk = project.dir.join("bulk");
+    fs::create_dir_all(&bulk).unwrap();
+    for n in 0..20_001 {
+        fs::write(bulk.join(format!("{n}.txt")), "").unwrap();
+    }
+    for _ in 0..3 {
+        assert_eq!(browser.get("/").status, 200);
+    }
+    let said = dev.events("too-many-files");
+    assert_eq!(
+        said.len(),
+        1,
+        "expected `vm dev` to say once, at the request that found the project grown past 20,000 entries\n{}",
+        dev.stdout()
+    );
+    assert_eq!(sorted_keys(&said[0]), ["event", "message"], "{}", said[0]);
+    dev.stop("INT").expect_code(0);
 }
