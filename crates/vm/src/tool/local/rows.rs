@@ -173,7 +173,7 @@ pub(super) async fn load(
                     "reason": "test-rows-without-own-database",
                     "file": format!("{FOLDER}/{OWN_FILE}"),
                     "message": format!(
-                        "{FOLDER}/{OWN_FILE} holds rows for the own database, which {} does not have (it has no migrations): it is not loaded. Add a migration to have an own database, or remove the file",
+                        "{FOLDER}/{OWN_FILE} holds rows for the own database, and {} has no tables of its own there (the project has no migration): it is not loaded. Describe the tables in src/db/schema.ts and run vm generate to have them, or remove the file",
                         target.application
                     ),
                 }));

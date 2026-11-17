@@ -88,7 +88,7 @@ const PORT_ATTEMPTS: usize = 5;
 const POLL: Duration = Duration::from_millis(10);
 
 /// How often the lock is tried while another command holds it.
-const LOCK_POLL: Duration = Duration::from_millis(100);
+pub(super) const LOCK_POLL: Duration = Duration::from_millis(100);
 
 /// What is kept of a program's words.
 const WORDS_BYTES: usize = 16 * 1024;

@@ -126,7 +126,7 @@ impl Found {
 
     /// Whether `other` is the same file of the same `vm dev`: a rename
     /// writes it again with another name.
-    fn same(&self, other: &Self) -> bool {
+    pub(super) fn same(&self, other: &Self) -> bool {
         self.port == other.port
             && self.application == other.application
             && self.secret.matches(other.secret.0.as_bytes())

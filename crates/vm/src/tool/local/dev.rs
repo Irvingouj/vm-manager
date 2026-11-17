@@ -411,9 +411,19 @@ async fn start(base: &Base<'_>, progress: &Progress, held: &Held) -> Result<Star
     let packages = run::tools(base, progress).await?;
     let programs = run::programs(base, progress).await?;
     let local = Local::of(base.project);
-    if let Some(other) = run::lock_project(base, &local, progress, held, None).await? {
-        // Another one began to listen while this one waited for the lock.
-        return Err(already_running(&other.address()));
+    // Another one may begin to listen while this one waits for the lock.
+    // Its file is believed when it is still there, the same, one
+    // LOCK_POLL later: a file a killed `vm dev` left is removed by the
+    // next holder of the lock right after it takes the lock, so it cannot
+    // be seen twice that far apart, while a listening one's stays. A file
+    // seen once is not turned to again; the wait goes on.
+    let mut tried: Option<control::Found> = None;
+    while let Some(other) = run::lock_project(base, &local, progress, held, tried.as_ref()).await? {
+        tokio::time::sleep(postgres::LOCK_POLL).await;
+        if control::found_while_waiting(&local, None).is_some_and(|again| again.same(&other)) {
+            return Err(already_running(&other.address()));
+        }
+        tried = Some(other);
     }
     let pg = run::start_server(base, &programs, progress, held, false).await?;
     let live = Live::open(&pg, dev_size(), base.who).await?;
