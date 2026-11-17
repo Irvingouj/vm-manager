@@ -27,7 +27,7 @@ use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Semaphore, watch};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tokio::task::JoinSet;
 
 use crate::ingress::Ingress;
@@ -97,9 +97,10 @@ pub async fn serve_until<H: Handler>(
     // Every connection's task is owned here and reaped as it ends.
     let mut connections = JoinSet::new();
     // One accepting task per listener, owned here, each sending what it
-    // accepted through a channel of one: an accepted connection waits
-    // there until the loop below takes it.
-    let (accepted, mut incoming) = tokio::sync::mpsc::channel::<TcpStream>(1);
+    // accepted, with its permit, through a channel of one: an accepted
+    // connection waits there until the loop below takes it.
+    let (accepted, mut incoming) =
+        tokio::sync::mpsc::channel::<(TcpStream, OwnedSemaphorePermit)>(1);
     let mut accepting = JoinSet::new();
     for listener in listeners {
         let accepted = accepted.clone();
@@ -112,12 +113,10 @@ pub async fn serve_until<H: Handler>(
                 };
                 match listener.accept().await {
                     Ok((stream, _)) => {
-                        // The permit goes with the connection's task, which
-                        // the loop below makes: forget it here and give it
-                        // back there.
-                        permit.forget();
-                        if accepted.send(stream).await.is_err() {
-                            permits.add_permits(1);
+                        // The permit goes with the stream to the
+                        // connection's task, which holds it until it ends,
+                        // however it ends. Not sent: dropped here.
+                        if accepted.send((stream, permit)).await.is_err() {
                             return;
                         }
                     }
@@ -142,9 +141,8 @@ pub async fn serve_until<H: Handler>(
             () = &mut stop => break,
             Some(_) = connections.join_next(), if !connections.is_empty() => {}
             stream = incoming.recv() => {
-                let Some(stream) = stream else { break };
+                let Some((stream, permit)) = stream else { break };
                 let handler = Arc::clone(&handler);
-                let permits = Arc::clone(&permits);
                 let header_read = limits.header_read;
                 let connection_limit = limits.connection;
                 let mut stopped = stopped.clone();
@@ -169,7 +167,8 @@ pub async fn serve_until<H: Handler>(
                     })
                     .await
                     .ok();
-                    permits.add_permits(1);
+                    // Given back here, or when the task is dropped.
+                    drop(permit);
                 });
             }
         }
