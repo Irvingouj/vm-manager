@@ -38,7 +38,7 @@ vm serve --domain <domain> --listen <ip:port> [--stand-in-sign-in] [--administra
 
 ### Stand-in sign-in
 
-A development-only way for a caller to state who the User is. Real sessions replace it later without the rest of this file changing.
+A development-only way for a caller to state who the User is, for tests and the local run. Real sessions are in "Sign-in and sessions".
 
 - It does nothing unless the program was started with `--stand-in-sign-in`.
 - `x-vm-stand-in-user: <id>` states the User, exactly once. `x-vm-stand-in-groups: g1,g2` states their Groups; optional, at most once; entries are trimmed, empty ones dropped, repeats kept once.
@@ -1720,3 +1720,79 @@ From this ticket on the template's `AGENTS.md` names `vm dev` and `vm local rese
 - Windows, where the system does not resolve `*.localhost`: the ticket on the three systems.
 - The chosen test User is a cookie anyone on the machine can set: the local run holds test rows only, and listens on the loopback address only.
 - A change of a file is seen at the next request, not before: nothing is rebuilt while nobody asks.
+
+## Sign-in and sessions (ticket: OIDC sign-in and per-subdomain sessions)
+
+The platform is the OIDC relying party (ADR 0011, the answer of "Sign-in, sessions and Application URLs"). A session lives on the platform's side; a browser holds opaque cookies, one for the platform's sign-in address and one for each Application's address, none of them valid anywhere else. The stand-in sign-in stays for tests and the local run only.
+
+### Starting with OIDC
+
+```
+VM_OIDC_CLIENT_SECRET=<secret> \
+vm serve --domain <domain> --listen <ip:port> \
+         --oidc-issuer <URL> --oidc-client-id <id> \
+         [--oidc-groups-claim <name>] [--oidc-scopes "<scope> <scope> ..."] \
+         [--public-scheme <https|http>] [--public-port <n>] \
+         [--session-renewal <seconds>] [--session-lifetime <seconds>]
+```
+
+- `--oidc-issuer` is the identity provider's issuer, `https://...`; `http://` is taken only for a loopback host (`127.0.0.1`, `[::1]`, `localhost`). `--oidc-client-id` and `VM_OIDC_CLIENT_SECRET` (in the environment, never on the command line) are the platform's registration there. One without the others, an issuer that is not such a URL: the start-up fails as "Serving" says, naming what is missing. The secret is in no log and no message.
+- `--oidc-groups-claim` names the claim of the ID token that holds the person's Groups (`groups` without it): an array of strings, or one string (one Group). Absent, or of another shape: no Groups. Entries are trimmed, empty ones dropped, repeats kept once, the order kept; at most 1,000 Groups of at most 256 bytes each (more, or longer: the sign-in fails, below).
+- `--oidc-scopes` are the scopes asked for (`openid profile email offline_access` without it); `openid` is always among them.
+- `--public-scheme` and `--public-port` say how a browser reaches the installation, for the addresses the platform writes into redirects: `https` and `443` without them; with `--public-scheme http`, the port without `--public-port` is the one the program listens on. The platform's sign-in address is `<scheme>://auth.<domain>[:<port>]`, an Application's is `<scheme>://<application>.<domain>[:<port>]` (the port left out when it is the scheme's own). The redirect address registered at the identity provider is `<sign-in address>/callback`.
+- `--session-renewal` (1 to 86400 seconds; `600` without it) and `--session-lifetime` (60 to 2592000; `43200` without it): below.
+- **The stand-in is for tests and the local run.** `--stand-in-sign-in` together with `--oidc-issuer` is a start-up failure, and so is `--stand-in-sign-in` with a `--listen` address that is not a loopback address. The listening line says `"sign_in": "oidc" | "stand-in" | "none"` beside `stand_in_sign_in`.
+- The identity provider is not asked anything at start-up: the program starts with it unreachable. Its configuration (`<issuer>/.well-known/openid-configuration`) and its keys are fetched when first needed and kept for at most an hour (the keys are fetched again, at most once a minute, when a token names a key not among them). Every call to it ends within 10 seconds; its answers are read up to 1 MiB.
+
+### The way through sign-in
+
+1. **A request to an Application without a session there** (no cookie, or one that is not valid): a `GET` or `HEAD` whose `Accept` has `text/html` is answered `302` to `<sign-in address>/sign-in?application=<name>&next=<the path and query, percent-encoded>&state=<a value made for this browser>`, with a short-lived cookie holding that value on the Application's address; any other request is answered `401`, `text/plain`, and the Application's code is not run. (Checked where "Responses the program itself gives" has "Not signed in"; an unknown Application is `404` before.)
+2. **`GET <sign-in address>/sign-in`**. `application` is a known Application (else `404`), `next` begins with one `/` and not with `//` or `/\` (else it is `/`). With a valid platform session in this browser: `302` to `<the Application's address>/_vm/session?code=<a one-time code>&state=<as given>&next=<next>`. Without: `302` to the identity provider's authorization endpoint, an authorization-code request with PKCE (`S256`), `state` and `nonce`, the scopes above and the redirect address above.
+3. **`GET <sign-in address>/callback`** takes the provider's answer. The code is exchanged at the token endpoint (the client authenticated with `client_secret_basic`, or `client_secret_post` when the provider's configuration names only that); the ID token must be signed with `RS256` or `ES256` by a key of the provider's, and its `iss`, `aud`, `exp` and `nonce` must hold (30 seconds of clock difference are allowed). Then the User's record is made if this is the first time, a platform session begins, its cookie is set on the sign-in address, and the browser goes on as in 2. Anything else (a `state` this browser did not start, an `error` from the provider, a token that does not hold, too many Groups, a provider that does not answer): a page of the platform's own (`400`, or `502` when the provider did not answer or answered what it should not), saying what failed and giving a link to try again; no session begins, and nothing of a token is shown.
+4. **`GET <application address>/_vm/session`** takes the one-time code: it was made for this Application, is at most 60 seconds old, was not used before, and `state` is the value of this browser's cookie from 1 (else `400`, a page of the platform's own; nothing is set). Then the Application's own session cookie is set and the browser is sent (`302`) to `next`. This path is the platform's on every Application's address and never reaches Application code; every other path under `/_vm/` is the Application's, as before.
+
+- **One sign-in for all**: a browser that has a platform session goes through 1, 2 and 4 for a second Application without seeing the identity provider.
+- A redirect of the platform's never leaves the installation but in step 2's second case: `next` is only ever a path, `application` only ever a name.
+- At most 10 minutes may pass between 2 and 3. What the platform keeps of a sign-in under way is bounded (it is kept in the browser, or its count is capped; a sign-in that cannot be started is `503`).
+
+### The cookies
+
+- The platform session's cookie is set on the sign-in address only; an Application's on that Application's address only. Neither has a `Domain` attribute: **no cookie spans the wildcard domain.** Each is `HttpOnly; SameSite=Lax; Path=/`, and with `--public-scheme https` also `Secure` and named with the `__Host-` prefix (`__Host-vm-session`; `vm-session` with `http`). The cookie of step 1 is the same but for its name (`__Host-vm-sign-in` or `vm-sign-in`) and its age (10 minutes).
+- Their values are random (256 bits) and mean nothing: the platform database holds only their SHA-256.
+- **An Application's cookie is valid on that Application only.** Sent to another Application's address, or to the sign-in address, it is no session.
+- **Application code never sees them**: the platform's cookies (`vm-session`, `vm-sign-in`, with or without `__Host-`) are taken out of the `Cookie` header before the request reaches the code (other cookies stay, byte for byte; a header left empty is left out). Nor can it set them: a `Set-Cookie` of an Application's response that names one of them, or that has a `Domain` attribute (it would be sent to the other Applications), is dropped, and the program's log gets `{"event":"set-cookie-dropped","application","reason":"platform-name"|"domain"}`.
+
+### Whose request it is
+
+- A request with a valid Application session is given to the code as the session's User: `id` is the `sub` of the ID token, `groups` are the session's Groups. `x-vm-stand-in-*` headers mean nothing.
+- **A request from another origin is refused**, `403`, `text/plain`, the code not run, the Operation log untouched:
+  - a request whose method is not `GET`, `HEAD` or `OPTIONS`, when it has an `Origin` that is not the Application's address, or has no `Origin` and a `Sec-Fetch-Site` other than `same-origin` or `none`;
+  - a `GET` or `HEAD` whose `Sec-Fetch-Site` is `cross-site` or `same-site`, unless it is a navigation of the whole page (`Sec-Fetch-Mode: navigate` and `Sec-Fetch-Dest: document`);
+  - an `OPTIONS` with an `Origin` that is not the Application's address.
+  A request with neither header is no browser's and is taken as before. This holds with the stand-in sign-in too. So one Application's page cannot call another as the same User, cannot post a form to it, and cannot show it in a frame.
+- The check comes after the sign-in in "Responses the program itself gives": a request with no session is answered as in 1 whatever its origin.
+
+### Renewal and the end of a session
+
+- **Groups are read again at each renewal.** When a request finds its session last renewed more than `--session-renewal` ago, the platform first asks the identity provider with the session's refresh token (within 10 seconds; requests of the same session wait for the one renewal). A new ID token that holds: the session's Groups are those of the new token from that request on, in every Application. A refusal (`invalid_grant`: the person was disabled, or the token revoked), or an ID token of another `sub`: the session ends. A provider that does not answer: the request is answered `503` with `Retry-After`, the code not run; the Groups read before are never used past their time.
+- A session whose sign-in brought no refresh token ends at its first renewal.
+- A session ends, for every Application at once: at `--session-lifetime` after its sign-in; at a renewal as above; at sign-out. A request with an ended session is one without a session (1 above): a page goes through sign-in again, which the identity provider may answer without asking.
+- **Sign-out.** `GET <sign-in address>/sign-out` is a page with one button; `POST <sign-in address>/sign-out` (same origin, by the rule above) ends the platform session and every Application session made from it, clears the cookie, and answers a page saying so, and that the company's own sign-in may still be open. The identity provider is not told.
+- A User holds at most 20 sessions: the oldest ends when a twenty-first begins.
+
+### The User's record
+
+- Made at the first sign-in: the `sub` as `id`, with `name` and `email` from the ID token when it has them (each at most 256 bytes, else left out), and the time. `name` and `email` are brought up to date at each sign-in and renewal.
+- `GET <sign-in address>/me`: `200`, `application/json`, `{ "id", "name", "email", "groups", "first_sign_in", "session_started", "session_renewed" }` for this browser's platform session; `401` without one. Every other path of the sign-in address is `404`.
+
+### The harness
+
+The black-box harness has an identity provider of its own (`blackbox`, no product crate): an issuer on a loopback address with test people, their Groups, a signing key, and switches a test turns (a person's Groups changed, a person disabled, the provider not answering, a token signed with another key, no refresh token).
+
+### What this does not close
+
+- The tool's own sign-in (`vm sign-in`) still uses the stand-in: the ticket "The tool signs in through the browser". Until then an installation with OIDC has no way to make a tool credential; the tests deploy with the stand-in and start the program again with OIDC on the same platform database.
+- Whom an Application is shared with: the ticket on Contributors and sharing. Here every signed-in User may open every Application.
+- The Dashboard at `dashboard.<domain>`: its ticket; it signs in by the same way through.
+- Signing out at the identity provider, and being signed out by it (back-channel logout).
+- TLS: the program listens in plain HTTP behind what ends TLS (the ticket on installing).
