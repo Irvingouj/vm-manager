@@ -25,6 +25,7 @@ use blackbox::dev::{Dev, free_port, hex64_runs, local_files_but_postgres, local_
 use blackbox::generate::{Generated, generate};
 use blackbox::local::{
     APP, BUILDER, Board, Local, OUTSIDER, Requested, handler, local_project, port_open,
+    postmaster_of,
 };
 use blackbox::project::{NOTES_SCHEMA_TS, is_running};
 use blackbox::tool::mode_of;
@@ -347,37 +348,79 @@ fn a_file_left_by_a_vm_dev_killed_outright_is_not_believed() {
     again.stop("INT").expect_code(0);
 }
 
+/// How many rounds of the test below must start their command inside the
+/// window, and how many it may try for them.
+const STARTING_HITS: usize = 3;
+const STARTING_TRIES: usize = 8;
+
 #[test]
 fn a_vm_request_started_while_vm_dev_is_starting_is_answered_as_soon_as_it_listens() {
+    // `vm dev` is starting (it holds the project's lock and does not listen
+    // yet) from the moment the project's private Postgres listens, which a
+    // run starts only once it holds the lock, until its `listening` line.
+    // Each round is a project's first run, so that window holds the making
+    // of the local databases and the build. The command is started inside
+    // it: after the Postgres was seen, and before `vm dev` said it listens.
     let local = Local::new();
-    let mut answered_by_dev = 0;
-    for round in 0..3 {
-        let project = local_project(&local.machine, &format!("starting-board-{round}"), &[]);
-        let name = format!("starting-board-{round}");
-        let mut dev = Dev::spawn(&local, &project.dir, &name, free_port(), true);
-        let began = Instant::now();
-        let run = local.request(&project.dir, "/", OUTSIDER, &["--timeout", "60"]);
-        let requested = Requested::of(&run);
-        assert!(
-            began.elapsed() < Duration::from_secs(45),
-            "round {round}: expected the command answered well inside its 60 seconds, took {:?}",
-            began.elapsed()
-        );
-        assert_eq!(requested.status(), 200, "{}", requested.describe());
-        dev.wait_until_listening();
-        let id = requested.request_id();
-        if dev
-            .events("request")
-            .iter()
-            .any(|l| l["request_id"] == id.as_str())
-        {
-            answered_by_dev += 1;
+    let mut hits = 0;
+    let mut missed = Vec::new();
+    for round in 0..STARTING_TRIES {
+        if hits == STARTING_HITS {
+            break;
         }
+        let name = format!("starting-board-{round}");
+        let project = local_project(&local.machine, &name, &[]);
+        let mut dev = Dev::spawn(&local, &project.dir, &name, free_port(), true);
+        let deadline = Instant::now() + blackbox::local::LOCAL_TIMEOUT;
+        while postmaster_of(&project.dir).is_none_or(|p| !is_running(p.pid)) {
+            assert!(
+                !dev.has_ended() && Instant::now() < deadline,
+                "round {round}: expected the private Postgres of `vm dev` to listen while it starts\n{}",
+                dev.stdout()
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        let listened_before = !dev.events("listening").is_empty();
+        let began = Instant::now();
+        let running = local.spawn_request(&project.dir, "/", OUTSIDER, &WAIT);
+        let inside = !listened_before && dev.events("listening").is_empty();
+        let run = running.wait(Duration::from_secs(90));
+        let requested = Requested::of(&run);
+        let took = began.elapsed();
+        dev.wait_until_listening();
+        if !inside {
+            missed.push(round);
+            dev.stop("INT").expect_code(0);
+            continue;
+        }
+        hits += 1;
+        assert!(
+            took < Duration::from_secs(45),
+            "round {round}: expected the command answered well inside its 60 seconds, took {took:?}"
+        );
+        assert_eq!(
+            requested.status(),
+            200,
+            "round {round}\n{}",
+            requested.describe()
+        );
+        let id = requested.request_id();
+        assert!(
+            dev.events("request")
+                .iter()
+                .any(|l| l["request_id"] == id.as_str()),
+            "round {round}: a command started while `vm dev` was starting is answered by it as soon as it listens; it printed no `request` line for {id}\n{}",
+            dev.stdout()
+        );
         dev.stop("INT").expect_code(0);
     }
+    println!(
+        "the command was started while `vm dev` was starting in {hits} round(s); missed the window in {:?}",
+        missed
+    );
     assert!(
-        answered_by_dev >= 1,
-        "the harness's own check: in none of three rounds did `vm dev` take the project's lock first"
+        hits >= 1,
+        "the harness's own check: in none of {STARTING_TRIES} rounds was the command started while `vm dev` was starting (missed: {missed:?})"
     );
 }
 
