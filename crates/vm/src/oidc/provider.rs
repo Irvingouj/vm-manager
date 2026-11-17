@@ -162,7 +162,7 @@ impl Provider {
         if json.get("issuer").and_then(Value::as_str) != Some(self.settings.issuer.as_str()) {
             log_problem("configuration", "another-issuer", None);
             return Err(Problem::Unanswered(
-                "its configuration names another issuer than the one the platform was started with (--oidc-issuer)",
+                "its configuration names another issuer than the connection's",
             ));
         }
         let plain = self.settings.plain_http_allowed();

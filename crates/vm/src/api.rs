@@ -13,8 +13,15 @@
 //! from Ingress ([`SignedInWith`]).
 //!
 //! Resources, Grants and the Operation log are here too. A Platform
-//! administrator is a member of the Group named at start
-//! (`--administrators-group`); without one, no one is. A body that registers
+//! administrator is a member of the Group the OIDC connection in use names
+//! (crate::oidc::connection), or with the stand-in of the Group named at
+//! start (`--administrators-group`); without one, no one is.
+//!
+//! Connecting OIDC (`PUT /v1/oidc`, by a Platform administrator or with the
+//! setup credential, [`Caller::Setup`]), `GET /v1/oidc`, `GET
+//! /v1/installation` and `POST /v1/tool-sign-ins` (by anyone,
+//! [`Caller::Anyone`]) are here too; the work of the two that change
+//! anything is crate::oidc's. A body that registers
 //! a Resource holds a password, so no message about it repeats anything
 //! from it: its problems are told in fixed words.
 
@@ -34,9 +41,13 @@ use serde_json::{Value, json};
 
 use crate::app_logs::{self, Logs};
 use crate::log;
+use crate::oidc::Oidc;
+use crate::oidc::connection::{self as oidc_connection, By};
 use crate::oplog::{self, Ending, OperationLog};
+use crate::origin::Public;
 use crate::own_db::Migration;
 use crate::platform_db::DbError;
+use crate::platform_db::PlatformDatabase;
 use crate::registry::{
     ApplicationRecord, Created, DeclaredAccess, NameProblem, NewVersion, Registry, Resource, Sent,
     VersionRecord, WentBack, check_name,
@@ -45,8 +56,36 @@ use crate::resources::{
     self, Connection, GrantWritten, Login, NewResource, Registered, Resources, is_resource_name,
     level_of,
 };
+use crate::setup;
 use crate::structure;
 use crate::tool_credentials::{Digest, MakeError, ToolCredentials};
+
+/// Who a request is from.
+#[derive(Clone, Copy)]
+pub enum Caller<'a> {
+    /// A User, signed in so.
+    User(&'a User, SignedInWith),
+    /// Someone with a setup credential, by its SHA-256: only `PUT
+    /// /v1/oidc` takes it.
+    Setup(Digest),
+    /// Anyone: only `GET /v1/installation` and `POST /v1/tool-sign-ins`.
+    Anyone,
+}
+
+/// How the installation signs people in, as the API needs it.
+pub struct Signing {
+    /// The stand-in sign-in is on.
+    pub stand_in: bool,
+    /// With the stand-in, the Group whose members are Platform
+    /// administrators (`--administrators-group`).
+    pub administrators: Option<Arc<str>>,
+    /// OIDC, when the program has an installation's key and no stand-in.
+    pub oidc: Option<Arc<Oidc>>,
+    /// Where the setup credential and the connection are kept.
+    pub database: Arc<PlatformDatabase>,
+    /// How a browser reaches the installation.
+    pub public: Public,
+}
 use crate::user::User;
 
 /// How the request's User was signed in.
@@ -61,6 +100,10 @@ pub enum SignedInWith {
 /// The largest request body the API reads; past it the answer is `413`.
 pub const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 
+/// The largest body read of a request not signed in as a User (the setup
+/// credential's, and anyone's).
+pub const MAX_BODY_BYTES_NOT_SIGNED_IN: usize = 64 * 1024;
+
 /// The longest a client may take to send a request's body.
 const BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -72,7 +115,7 @@ pub struct Answer {
 
 impl Answer {
     /// `value` as JSON, written straight from what it borrows.
-    fn json(status: StatusCode, value: &impl Serialize) -> Self {
+    pub(crate) fn json(status: StatusCode, value: &impl Serialize) -> Self {
         match serde_json::to_vec(value) {
             Ok(body) => Self {
                 status,
@@ -89,7 +132,7 @@ impl Answer {
         }
     }
 
-    fn error(status: StatusCode, reason: &str, message: &str) -> Self {
+    pub(crate) fn error(status: StatusCode, reason: &str, message: &str) -> Self {
         Self::json(
             status,
             &json!({ "error": { "reason": reason, "message": message } }),
@@ -160,6 +203,12 @@ enum Route<'a> {
     ToolCredentials,
     /// `/v1/tool-credentials/current`
     CurrentToolCredential,
+    /// `/v1/oidc`
+    Oidc,
+    /// `/v1/installation`
+    Installation,
+    /// `/v1/tool-sign-ins`
+    ToolSignIns,
 }
 
 impl Route<'_> {
@@ -167,7 +216,7 @@ impl Route<'_> {
     fn for_administrators(&self, method: &Method) -> bool {
         match self {
             Self::Resources => method != Method::GET,
-            Self::Grants(_) | Self::OperationLog => true,
+            Self::Grants(_) | Self::OperationLog | Self::Oidc => true,
             _ => false,
         }
     }
@@ -197,6 +246,9 @@ impl<'a> Route<'a> {
             ["me"] => Some(Self::Me),
             ["tool-credentials"] => Some(Self::ToolCredentials),
             ["tool-credentials", "current"] => Some(Self::CurrentToolCredential),
+            ["oidc"] => Some(Self::Oidc),
+            ["installation"] => Some(Self::Installation),
+            ["tool-sign-ins"] => Some(Self::ToolSignIns),
             _ => None,
         }
     }
@@ -647,8 +699,7 @@ pub struct Api {
     logs: Arc<Logs>,
     credentials: Arc<ToolCredentials>,
     domain: Arc<str>,
-    /// The Group whose members are Platform administrators, if any.
-    administrators: Option<Arc<str>>,
+    signing: Signing,
 }
 
 impl Api {
@@ -659,7 +710,7 @@ impl Api {
         logs: Arc<Logs>,
         credentials: Arc<ToolCredentials>,
         domain: Arc<str>,
-        administrators: Option<Arc<str>>,
+        signing: Signing,
     ) -> Self {
         Self {
             registry,
@@ -668,26 +719,28 @@ impl Api {
             logs,
             credentials,
             domain,
-            administrators,
+            signing,
+        }
+    }
+
+    /// The Group whose members are Platform administrators now: the
+    /// connection's in use, else the stand-in's.
+    fn administrators(&self) -> Option<Arc<str>> {
+        match self.signing.oidc.as_ref().and_then(|o| o.connected()) {
+            Some(connected) => Some(Arc::clone(&connected.administrators)),
+            None => self.signing.administrators.as_ref().map(Arc::clone),
         }
     }
 
     fn is_administrator(&self, user: &User) -> bool {
-        self.administrators
-            .as_deref()
-            .is_some_and(|group| user.groups.iter().any(|g| g == group))
+        self.administrators()
+            .is_some_and(|group| user.groups.iter().any(|g| *g == *group))
     }
 
-    /// Answers one request of a signed-in `user`, signed in `with` a tool
-    /// credential or otherwise; `request` is its id.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "the parts of one request, each named"
-    )]
+    /// Answers one request of `caller`; `request` is its id.
     pub async fn handle<B>(
         &self,
-        user: &User,
-        with: SignedInWith,
+        caller: Caller<'_>,
         request: &str,
         method: &Method,
         path: &str,
@@ -698,9 +751,31 @@ impl Api {
         B: Body<Data = Bytes> + Send,
         B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     {
-        let read = Limited::new(body, MAX_BODY_BYTES).collect();
+        let route = Route::of(path);
+        // A setup credential is good for one thing only: nothing else is
+        // read of a request made with it.
+        if let Caller::Setup(_) = caller
+            && !(matches!(route, Some(Route::Oidc)) && method == Method::PUT)
+        {
+            return oidc_connection::setup_refused();
+        }
+        // Someone not signed in sends a short body, or none.
+        let signed_in = matches!(caller, Caller::User(..));
+        let limit = if signed_in {
+            MAX_BODY_BYTES
+        } else {
+            MAX_BODY_BYTES_NOT_SIGNED_IN
+        };
+        let read = Limited::new(body, limit).collect();
         let body = match tokio::time::timeout(BODY_READ_TIMEOUT, read).await {
             Ok(Ok(collected)) => collected.to_bytes(),
+            Ok(Err(_)) if !signed_in => {
+                return Answer::error(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "too-large",
+                    "the body is larger than 64 KiB: send what this path takes",
+                );
+            }
             Ok(Err(_)) => {
                 return Answer::error(
                     StatusCode::PAYLOAD_TOO_LARGE,
@@ -716,10 +791,20 @@ impl Api {
                 );
             }
         };
-        let Some(route) = Route::of(path) else {
+        let Some(route) = route else {
             return Answer::not_found(
-                "the API has no such path: its paths are /v1/me, /v1/tool-credentials, /v1/tool-credentials/current, /v1/applications, /v1/applications/<name>, /v1/applications/<name>/versions, /v1/applications/<name>/versions/<number>, /v1/applications/<name>/go-back, /v1/applications/<name>/logs, /v1/resources, /v1/resources/<name>, /v1/resources/<name>/grants, /v1/resources/<name>/structure and /v1/operation-log",
+                "the API has no such path: its paths are /v1/me, /v1/installation, /v1/tool-credentials, /v1/tool-credentials/current, /v1/tool-sign-ins, /v1/oidc, /v1/applications, /v1/applications/<name>, /v1/applications/<name>/versions, /v1/applications/<name>/versions/<number>, /v1/applications/<name>/go-back, /v1/applications/<name>/logs, /v1/resources, /v1/resources/<name>, /v1/resources/<name>/grants, /v1/resources/<name>/structure and /v1/operation-log",
             );
+        };
+        match route {
+            Route::Installation => return self.installation(method),
+            Route::ToolSignIns => return self.tool_sign_ins(method, &body).await,
+            _ => {}
+        }
+        let (user, with) = match caller {
+            Caller::User(user, with) => (user, with),
+            Caller::Setup(digest) => return self.connect_with_setup(digest, &body).await,
+            Caller::Anyone => return not_signed_in(),
         };
         if route.for_administrators(method) && !self.is_administrator(user) {
             return Answer::error(
@@ -743,8 +828,109 @@ impl Api {
             Route::Version(name, number) => self.version(method, name, number).await,
             Route::GoBack(name) => self.go_back(user, method, name, &body).await,
             Route::Logs(name) => self.logs(user, method, name, query).await,
+            Route::Oidc => self.oidc(user, method, &body).await,
+            Route::Installation | Route::ToolSignIns => Ok(not_signed_in()),
         };
         answer.unwrap_or_else(|error| Answer::unavailable(&error))
+    }
+
+    /// Why OIDC cannot be connected now, if it cannot: the stand-in first,
+    /// then no installation's key.
+    fn cannot_connect(&self) -> Option<Answer> {
+        if self.signing.stand_in {
+            return Some(Answer::error(
+                StatusCode::CONFLICT,
+                "stand-in-sign-in",
+                "this installation was started with --stand-in-sign-in, which cannot be on together with OIDC: start it without the stand-in to connect OIDC",
+            ));
+        }
+        if self.signing.oidc.is_none() {
+            return Some(Answer::error(
+                StatusCode::CONFLICT,
+                "no-secret-key",
+                "this installation was started without an installation's key (VM_SECRET_KEY), so it can keep no client secret: start it with one, then connect OIDC",
+            ));
+        }
+        None
+    }
+
+    /// `PUT /v1/oidc` with the setup credential: who asks first (`401` for
+    /// one that is not the live one, whatever else is wrong), then as for a
+    /// Platform administrator.
+    async fn connect_with_setup(&self, digest: Digest, body: &[u8]) -> Answer {
+        match setup::is_live(&self.signing.database, digest.bytes()).await {
+            Ok(true) => {}
+            Ok(false) => return oidc_connection::setup_refused(),
+            Err(error) => return Answer::unavailable(&error),
+        }
+        if let Some(refused) = self.cannot_connect() {
+            return refused;
+        }
+        match &self.signing.oidc {
+            Some(oidc) => oidc.connect(body, By::Setup(digest.bytes())).await,
+            None => oidc_connection::setup_refused(),
+        }
+    }
+
+    /// `GET` and `PUT /v1/oidc`, by a Platform administrator.
+    async fn oidc(&self, user: &User, method: &Method, body: &[u8]) -> Result<Answer, DbError> {
+        if method == Method::GET {
+            return Ok(match oidc_connection::read(&self.signing.database).await? {
+                Some(stored) => Answer::json(StatusCode::OK, &stored.view()),
+                None => Answer::not_found(
+                    "OIDC is not connected: a Platform administrator connects it with `vm admin connect-oidc`",
+                ),
+            });
+        }
+        if method != Method::PUT {
+            return Ok(Answer::method_not_allowed(method, "GET or PUT"));
+        }
+        if let Some(refused) = self.cannot_connect() {
+            return Ok(refused);
+        }
+        Ok(match &self.signing.oidc {
+            Some(oidc) => oidc.connect(body, By::User(&user.id)).await,
+            None => not_signed_in(),
+        })
+    }
+
+    /// `GET /v1/installation`, by anyone: how to sign in.
+    fn installation(&self, method: &Method) -> Answer {
+        if method != Method::GET {
+            return Answer::method_not_allowed(method, "GET");
+        }
+        let connected = self.signing.oidc.as_ref().and_then(|o| o.connected());
+        let (sign_in, address) = match connected {
+            Some(_) => (
+                "oidc",
+                Some(
+                    self.signing
+                        .public
+                        .origin(&format!("{}.{}", crate::oidc::AUTH_NAME, self.domain), None),
+                ),
+            ),
+            None if self.signing.stand_in => ("stand-in", None),
+            None => ("none", None),
+        };
+        Answer::json(
+            StatusCode::OK,
+            &json!({ "domain": &*self.domain, "sign_in": sign_in, "sign_in_address": address }),
+        )
+    }
+
+    /// `POST /v1/tool-sign-ins`, by anyone.
+    async fn tool_sign_ins(&self, method: &Method, body: &[u8]) -> Answer {
+        if method != Method::POST {
+            return Answer::method_not_allowed(method, "POST");
+        }
+        match &self.signing.oidc {
+            Some(oidc) => oidc.take_tool_sign_in(body).await,
+            None => Answer::error(
+                StatusCode::CONFLICT,
+                "sign-in-not-confirmed",
+                "no sign-in of the tool has been confirmed: this installation does not sign in through the browser",
+            ),
+        }
     }
 
     async fn applications(
@@ -1605,6 +1791,15 @@ struct StructureView<'a> {
 #[derive(Serialize)]
 struct EntriesView {
     entries: Vec<Value>,
+}
+
+/// `401`: not signed in, or with a credential that signs nobody in.
+fn not_signed_in() -> Answer {
+    Answer::error(
+        StatusCode::UNAUTHORIZED,
+        "not-signed-in",
+        "not signed in: sign in with `vm sign-in`, then ask again",
+    )
 }
 
 fn no_resource() -> Answer {

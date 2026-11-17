@@ -70,6 +70,7 @@ pub mod registry;
 pub mod resources;
 pub mod runner;
 pub mod server;
+pub mod setup;
 pub mod sign_in;
 pub mod statement;
 pub mod structure;

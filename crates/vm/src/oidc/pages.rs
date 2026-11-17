@@ -22,6 +22,14 @@ use hyper::{HeaderMap, Response, StatusCode};
 /// The policy of every answer of the platform's own here.
 const POLICY: &str = "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'";
 
+/// What the page of a sign-in of the tool with a port lets its form lead
+/// to besides: the redirect that follows the confirm, to the tool on this
+/// computer (browsers hold the redirects of a form's submission to
+/// `form-action` too).
+fn policy_with_port(port: u16) -> String {
+    format!("{POLICY} http://127.0.0.1:{port}")
+}
+
 const STYLE: &str = "body{font-family:system-ui,sans-serif;max-width:40rem;margin:3rem auto;padding:0 1rem;line-height:1.5}";
 
 /// How long a `503` asks to wait, in seconds.
@@ -170,6 +178,133 @@ pub fn unavailable(again: Option<&str>) -> Response<Full<Bytes>> {
 /// A JSON answer.
 pub fn json(body: String) -> Response<Full<Bytes>> {
     own(StatusCode::OK, "application/json", Bytes::from(body))
+}
+
+/// A sign-in of the tool that failed before it awaited an answer: what
+/// failed, and to run `vm sign-in` again. No link.
+pub fn tool_failed(status: StatusCode, what: &str) -> Response<Full<Bytes>> {
+    page(
+        status,
+        "The tool was not signed in",
+        &format!(
+            "<p>{}</p><p>To sign the tool in, run <code>vm sign-in</code> again on your computer.</p>",
+            escape(what)
+        ),
+    )
+}
+
+/// `POST /tool` for a sign-in of the tool that is over or not known: no
+/// form.
+pub fn tool_over() -> Response<Full<Bytes>> {
+    page(
+        StatusCode::BAD_REQUEST,
+        "This sign-in of the tool is over",
+        "<p>It was answered already, pushed out by a newer one, or ended after five wrong check codes or 10 minutes; or it was begun in another browser. Nothing was signed in.</p><p>To sign the tool in, run <code>vm sign-in</code> again on your computer.</p>",
+    )
+}
+
+/// `POST /tool` with a body that is not the page's form.
+pub fn tool_not_a_form() -> Response<Full<Bytes>> {
+    page(
+        StatusCode::BAD_REQUEST,
+        "Not the form of this page",
+        "<p>This address takes the answer of the page that asks whether to sign the tool in. Nothing was signed in.</p>",
+    )
+}
+
+/// Who is being signed in, as the page of a sign-in of the tool says it.
+pub struct Person<'a> {
+    pub id: &'a str,
+    pub name: Option<&'a str>,
+    pub email: Option<&'a str>,
+}
+
+/// The page of a sign-in of the tool awaiting an answer: who, on which
+/// machine, and one form that posts to `/tool`. `sign_in` is the value
+/// that names it; with a `port`, the form may lead to the tool on this
+/// computer, and without, it asks for the check code.
+pub fn tool_ask(
+    person: &Person<'_>,
+    machine: &str,
+    port: Option<u16>,
+    sign_in: &str,
+    wrong_code: bool,
+) -> Response<Full<Bytes>> {
+    let mut who = String::new();
+    if let Some(name) = person.name {
+        who.push_str(&format!("<strong>{}</strong>, ", escape(name)));
+    }
+    if let Some(email) = person.email {
+        who.push_str(&format!("{}, ", escape(email)));
+    }
+    who.push_str(&format!("id <code>{}</code>", escape(person.id)));
+    let machine = if machine.is_empty() {
+        "a machine that gave no name".to_owned()
+    } else {
+        format!("the machine <strong>{}</strong>", escape(machine))
+    };
+    let (where_, code) = match port {
+        Some(_) => (
+            "The tool is on this computer: once you confirm, this browser takes the sign-in to it.",
+            String::new(),
+        ),
+        None => (
+            "Type the check code the tool shows (eight letters and digits) to confirm.",
+            "<p><label>Check code <input type=\"text\" name=\"code\" autocomplete=\"off\" spellcheck=\"false\" maxlength=\"32\"></label></p>".to_owned(),
+        ),
+    };
+    let wrong = if wrong_code {
+        "<p><strong>That is not the check code the tool shows.</strong> Look at it again; after five wrong codes this sign-in ends.</p>"
+    } else {
+        ""
+    };
+    let body = format!(
+        "<p>The command-line tool <code>vm</code> on {machine} asks to be signed in as {who}.</p>\
+         <p><strong>Go on only if you ran <code>vm sign-in</code> yourself, just now.</strong> If someone sent you this address, do not sign in: whoever runs that tool would act as you.</p>\
+         <p>{where_}</p>{wrong}\
+         <form method=\"post\" action=\"/tool\">\
+         <input type=\"hidden\" name=\"sign_in\" value=\"{}\">{code}\
+         <p><button type=\"submit\" name=\"answer\" value=\"confirm\">Sign the tool in</button> \
+         <button type=\"submit\" name=\"answer\" value=\"decline\">Do not sign it in</button></p>\
+         </form>",
+        escape(sign_in)
+    );
+    let mut response = page(StatusCode::OK, "Sign the tool in?", &body);
+    if let Some(port) = port
+        && let Ok(policy) = HeaderValue::from_str(&policy_with_port(port))
+    {
+        response
+            .headers_mut()
+            .insert(CONTENT_SECURITY_POLICY, policy);
+    }
+    response
+}
+
+/// The confirm of a sign-in of the tool without a port: the tool takes it.
+pub fn tool_signed_in() -> Response<Full<Bytes>> {
+    page(
+        StatusCode::OK,
+        "The tool is signed in",
+        "<p>Go back to the tool: it finishes the sign-in on its own within a few seconds.</p>",
+    )
+}
+
+/// A sign-in of the tool declined.
+pub fn tool_declined() -> Response<Full<Bytes>> {
+    page(
+        StatusCode::OK,
+        "Nothing was signed in",
+        "<p>The tool was not signed in, and this sign-in is over. If you did mean to sign it in, run <code>vm sign-in</code> again.</p>",
+    )
+}
+
+/// `303` to `location`: after the form of a sign-in of the tool, a `GET`.
+pub fn see_other(location: &str) -> Response<Full<Bytes>> {
+    let mut response = redirect(location, Vec::new());
+    if response.status() == StatusCode::FOUND {
+        *response.status_mut() = StatusCode::SEE_OTHER;
+    }
+    response
 }
 
 /// `302` to `location`, setting these cookies.

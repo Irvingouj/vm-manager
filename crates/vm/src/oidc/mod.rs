@@ -23,12 +23,20 @@
 //! Then [`Oidc::user_of`] gives each request with an Application's cookie
 //! its User, the session renewed first when it is due.
 //!
-//! The parts: [`settings`] (what it was started with), [`secret`] (values
-//! that never print), [`http`] and [`provider`] (the calls to the identity
-//! provider, bounded), [`token`], [`seal`] (the refresh token at rest),
-//! [`under_way`], [`sessions`], [`pages`].
+//! OIDC is a connection kept in the platform database ([`connection`]),
+//! put in use when it is made and at start: every request takes the one in
+//! use when it begins. The tool signs in through the browser at `/tool`
+//! ([`tool`]), with an authorization of its own.
+//!
+//! The parts: [`key`] (the installation's key), [`connection`] (the
+//! connection and its settings, [`settings`]), [`secret`] (values that
+//! never print), [`http`] and [`provider`] (the calls to the identity
+//! provider, bounded), [`token`], [`seal`] (what is kept secret, at rest
+//! and in `state`), [`under_way`], [`sessions`], [`tool`], [`pages`].
 
+pub mod connection;
 pub mod http;
+pub mod key;
 pub mod pages;
 pub mod provider;
 pub mod seal;
@@ -36,27 +44,32 @@ pub mod secret;
 pub mod sessions;
 pub mod settings;
 pub mod token;
+pub mod tool;
 pub mod under_way;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use http_body_util::Full;
+use hyper::body::Body;
 use hyper::header::{ACCEPT, HeaderValue};
 use hyper::http::request::Parts;
 use hyper::{Method, Response, StatusCode};
-use url::form_urlencoded;
+use url::{Url, form_urlencoded};
 
 use crate::cookies;
 use crate::origin::{Public, from_another_origin};
 use crate::platform_db::PlatformDatabase;
 use crate::registry::{Registry, check_name};
-use provider::{Problem, Provider};
+use crate::tool_credentials::ToolCredentials;
+use connection::{Connected, Live};
+use key::InstallationKey;
+use provider::{Configuration, Problem, Tokens};
 use seal::{Sealer, Use};
 use secret::{Secret, digest, looks_random, s256, same};
-use sessions::{Current, Sessions, log_database};
-use settings::Settings;
-use under_way::{MAX_NEXT, MAX_STEP_ONE_STATE, NotTaken, States};
+use sessions::{Current, Outcome, Sessions, log_database};
+use under_way::{Begun, MAX_NEXT, MAX_STEP_ONE_STATE, NotTaken, Opened, States};
 
 /// How long the cookie of a sign-in under way lives, in seconds.
 pub const SIGN_IN_COOKIE_SECONDS: u64 = 600;
@@ -72,15 +85,37 @@ pub const SESSION_PATH: &str = "/_vm/session";
 
 type Answer = Response<Full<Bytes>>;
 
-/// OIDC sign-in, put together.
+/// OIDC sign-in, put together: what the program holds with an
+/// installation's key, connected or not.
 pub struct Oidc {
-    settings: Arc<Settings>,
-    provider: Arc<Provider>,
+    /// The connection in use, if any.
+    live: Arc<Live>,
     sessions: Sessions,
     states: States,
+    /// Seals the connection's client secret at rest.
+    client_secrets: Sealer,
+    database: Arc<PlatformDatabase>,
+    /// Where a sign-in of the tool makes its credential.
+    credentials: Arc<ToolCredentials>,
     registry: Arc<Registry>,
     domain: Arc<str>,
     public: Public,
+    /// How long a session lives from its sign-in.
+    lifetime: Duration,
+}
+
+/// What `Oidc::new` is made with besides the key.
+pub struct OidcParts {
+    pub database: Arc<PlatformDatabase>,
+    pub credentials: Arc<ToolCredentials>,
+    pub registry: Arc<Registry>,
+    pub domain: Arc<str>,
+    pub public: Public,
+    /// How long the Groups read are used before the provider is asked
+    /// again (`--session-renewal`).
+    pub renewal: Duration,
+    /// How long a session lives (`--session-lifetime`).
+    pub lifetime: Duration,
 }
 
 /// What a query string holds: the first value of each name.
@@ -145,34 +180,39 @@ fn asks_for_a_page(parts: &Parts) -> bool {
 }
 
 impl Oidc {
-    /// The error is a message for the operator.
-    pub fn new(
-        settings: Settings,
-        database: Arc<PlatformDatabase>,
-        registry: Arc<Registry>,
-        domain: Arc<str>,
-        public: Public,
-    ) -> Result<Self, String> {
-        let settings = Arc::new(settings);
-        let provider = Arc::new(Provider::new(Arc::clone(&settings))?);
-        let sealer = Sealer::new(&settings.client_secret, Use::RefreshTokens)?;
-        let states = States::new(&settings.client_secret)?;
+    /// Not connected yet: [`Oidc::take_stored`] or [`Oidc::connect`]
+    /// connects it. The error is a message for the operator.
+    pub fn new(key: &InstallationKey, with: OidcParts) -> Result<Self, String> {
+        let live = Arc::new(Live::default());
         let sessions = Sessions::new(
-            database,
-            Arc::clone(&provider),
-            sealer,
-            settings.renewal,
-            settings.lifetime,
+            Arc::clone(&with.database),
+            Arc::clone(&live),
+            Sealer::new(key, Use::RefreshTokens)?,
+            with.renewal,
+            with.lifetime,
         );
         Ok(Self {
-            settings,
-            provider,
+            live,
             sessions,
-            states,
-            registry,
-            domain,
-            public,
+            states: States::new(key)?,
+            client_secrets: Sealer::new(key, Use::ClientSecret)?,
+            database: with.database,
+            credentials: with.credentials,
+            registry: with.registry,
+            domain: with.domain,
+            public: with.public,
+            lifetime: with.lifetime,
         })
+    }
+
+    /// The connection in use, if any.
+    pub fn connected(&self) -> Option<Arc<Connected>> {
+        self.live.get()
+    }
+
+    /// The renewal of a tool credential from a sign-in, found due.
+    pub async fn renew_tool(&self, digest: [u8; 32]) -> Outcome {
+        self.sessions.renew_tool(digest).await
     }
 
     fn secure(&self) -> bool {
@@ -197,9 +237,48 @@ impl Oidc {
         cookies::set_cookie(
             cookies::session_name(self.secure()),
             value.expose(),
-            self.settings.lifetime.as_secs(),
+            self.lifetime.as_secs(),
             self.secure(),
         )
+    }
+
+    /// The value of this browser's cookie of the sign-in address, kept when
+    /// it is one the platform made, else a new one; `None` when the
+    /// operating system gives no randomness.
+    fn browser_value(&self, parts: &Parts) -> Option<String> {
+        let kept = cookies::find(&parts.headers, cookies::sign_in_name(self.secure()))
+            .filter(|v| looks_random(v))
+            .map(str::to_owned);
+        // Owned: the value is written into the cookie and hashed; once a
+        // sign-in, 43 bytes.
+        match kept {
+            Some(browser) => Some(browser),
+            None => Secret::random().map(|b| b.expose().to_owned()),
+        }
+    }
+
+    /// The provider's authorization endpoint for a sign-in begun so.
+    fn authorization(
+        &self,
+        connected: &Connected,
+        configuration: &Configuration,
+        begun: &Begun,
+        port: Option<u16>,
+    ) -> Url {
+        // Copied: the kept configuration's address, with this sign-in's
+        // query added; once a sign-in.
+        let mut authorization = configuration.authorization_endpoint.clone();
+        authorization
+            .query_pairs_mut()
+            .append_pair("response_type", "code")
+            .append_pair("client_id", &connected.settings.client_id)
+            .append_pair("redirect_uri", &self.callback(port))
+            .append_pair("scope", &connected.settings.scope())
+            .append_pair("state", begun.state.expose())
+            .append_pair("nonce", begun.nonce.expose())
+            .append_pair("code_challenge", &s256(&begun.verifier))
+            .append_pair("code_challenge_method", "S256");
+        authorization
     }
 
     fn sign_in_cookie(&self, value: &str, seconds: u64) -> Option<HeaderValue> {
@@ -260,21 +339,33 @@ impl Oidc {
     }
 
     /// Every request to the sign-in address.
-    pub async fn sign_in_address(&self, parts: &Parts, port: Option<u16>) -> Answer {
+    pub async fn sign_in_address<B>(&self, parts: &Parts, body: B, port: Option<u16>) -> Answer
+    where
+        B: Body<Data = Bytes> + Send,
+        B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
         if from_another_origin(&parts.method, &parts.headers, &self.auth_origin(port)) {
             return pages::plain(
                 StatusCode::FORBIDDEN,
                 "Refused: this request comes from another origin.\n",
             );
         }
+        let Some(connected) = self.connected() else {
+            return pages::not_found();
+        };
         let read = parts.method == Method::GET || parts.method == Method::HEAD;
+        let post = parts.method == Method::POST;
         match (parts.uri.path(), read) {
-            ("/sign-in", true) => self.sign_in(parts, port).await,
-            ("/callback", true) => self.callback_step(parts, port).await,
+            ("/sign-in", true) => self.sign_in(&connected, parts, port).await,
+            ("/callback", true) => self.callback_step(&connected, parts, port).await,
+            ("/tool", true) => self.tool_begin(&connected, parts, port).await,
+            ("/tool", false) if post => self.tool_answer(parts, body).await,
             ("/me", true) => self.me(parts).await,
             ("/sign-out", true) => pages::sign_out_form(),
-            ("/sign-out", false) if parts.method == Method::POST => self.sign_out(parts).await,
-            ("/sign-in" | "/callback" | "/me" | "/sign-out", _) => pages::method_not_allowed(),
+            ("/sign-out", false) if post => self.sign_out(parts).await,
+            ("/sign-in" | "/callback" | "/me" | "/sign-out" | "/tool", _) => {
+                pages::method_not_allowed()
+            }
             _ => pages::not_found(),
         }
     }
@@ -290,7 +381,7 @@ impl Oidc {
     }
 
     /// Step 2.
-    async fn sign_in(&self, parts: &Parts, port: Option<u16>) -> Answer {
+    async fn sign_in(&self, connected: &Connected, parts: &Parts, port: Option<u16>) -> Answer {
         let query = Query::of(parts);
         let Some(application) = query.get("application").filter(|a| check_name(a).is_ok()) else {
             return pages::failed(
@@ -320,7 +411,7 @@ impl Oidc {
             Current::Unavailable => return pages::unavailable(again),
             Current::None => {}
         }
-        let configuration = match self.provider.configuration(None).await {
+        let configuration = match connected.provider.configuration(None).await {
             Ok(configuration) => configuration,
             Err(problem) => {
                 return pages::failed(
@@ -333,16 +424,8 @@ impl Oidc {
                 );
             }
         };
-        let kept = cookies::find(&parts.headers, cookies::sign_in_name(self.secure()))
-            .filter(|v| looks_random(v))
-            .map(str::to_owned);
-        // Owned as in step 1: once a sign-in, 43 bytes.
-        let browser = match kept {
-            Some(browser) => browser,
-            None => match Secret::random() {
-                Some(browser) => browser.expose().to_owned(),
-                None => return pages::unavailable(again),
-            },
+        let Some(browser) = self.browser_value(parts) else {
+            return pages::unavailable(again);
         };
         // Through the provider, a long `next` is `/`: the `state` carries
         // it, and some providers cut a long `state`.
@@ -357,19 +440,7 @@ impl Oidc {
         else {
             return pages::unavailable(again);
         };
-        // Copied: the kept configuration's address, with this sign-in's
-        // query added; once a sign-in.
-        let mut authorization = configuration.authorization_endpoint.clone();
-        authorization
-            .query_pairs_mut()
-            .append_pair("response_type", "code")
-            .append_pair("client_id", &self.settings.client_id)
-            .append_pair("redirect_uri", &self.callback(port))
-            .append_pair("scope", &self.settings.scope())
-            .append_pair("state", begun.state.expose())
-            .append_pair("nonce", begun.nonce.expose())
-            .append_pair("code_challenge", &s256(&begun.verifier))
-            .append_pair("code_challenge_method", "S256");
+        let authorization = self.authorization(connected, &configuration, &begun, port);
         let cookie = self.sign_in_cookie(&browser, SIGN_IN_COOKIE_SECONDS);
         pages::redirect(authorization.as_str(), cookie.into_iter().collect())
     }
@@ -419,8 +490,13 @@ impl Oidc {
         pages::redirect(&location, cookies)
     }
 
-    /// Step 3.
-    async fn callback_step(&self, parts: &Parts, port: Option<u16>) -> Answer {
+    /// Step 3, for the sign-in of an Application or of the tool.
+    async fn callback_step(
+        &self,
+        connected: &Connected,
+        parts: &Parts,
+        port: Option<u16>,
+    ) -> Answer {
         let query = Query::of(parts);
         // Until the `state` opens, it is not known which Application the
         // sign-in was for: these pages link nowhere.
@@ -433,8 +509,8 @@ impl Oidc {
         };
         let browser =
             cookies::find(&parts.headers, cookies::sign_in_name(self.secure())).map(digest);
-        let pending = match self.states.open(state, browser.as_ref()) {
-            Ok(pending) => pending,
+        let opened = match self.states.open(state, browser.as_ref()) {
+            Ok(opened) => opened,
             Err(NotTaken::Unreadable) => {
                 return pages::failed(
                     StatusCode::BAD_REQUEST,
@@ -450,78 +526,40 @@ impl Oidc {
                 );
             }
         };
+        let pending = match opened {
+            Opened::Application(pending) => pending,
+            Opened::Tool(tool) => {
+                // The `state` opened with it, so it is there.
+                let Some(browser) = browser else {
+                    return pages::tool_over();
+                };
+                return match self
+                    .exchanged(connected, &query, &tool.verifier(), &tool.nonce(), port)
+                    .await
+                {
+                    Ok(tokens) => self.tool_awaiting(&tool, &browser, &tokens).await,
+                    Err((status, what)) => pages::tool_failed(status, &what),
+                };
+            }
+        };
         let again = format!(
             "{}{}",
             self.app_origin(&pending.application, port),
             pending.next
         );
         let again = Some(again.as_str());
-        if query
-            .get("iss")
-            .is_some_and(|iss| iss != self.settings.issuer)
-        {
-            return pages::failed(
-                StatusCode::BAD_REQUEST,
-                "The sign-in came back from another identity provider.",
-                again,
-            );
-        }
-        if let Some(error) = query.get("error") {
-            let shown = provider_error(error);
-            return pages::failed(
-                StatusCode::BAD_REQUEST,
-                &format!("The company's sign-in did not sign you in ({shown})."),
-                again,
-            );
-        }
-        let Some(code) = query.get("code").filter(|c| !c.is_empty()) else {
-            return pages::failed(
-                StatusCode::BAD_REQUEST,
-                "The sign-in came back without a code.",
-                again,
-            );
-        };
-        // Held as a secret from here; once a sign-in.
-        let code = Secret::from_text(code.to_owned());
-        let exchanged = self
-            .provider
-            .exchange(
-                &code,
+        let tokens = match self
+            .exchanged(
+                connected,
+                &query,
                 &pending.verifier(),
-                &self.callback(port),
                 &pending.nonce(),
+                port,
             )
-            .await;
-        let tokens = match exchanged {
+            .await
+        {
             Ok(tokens) => tokens,
-            Err(Problem::Unanswered(why)) => {
-                return pages::failed(
-                    StatusCode::BAD_GATEWAY,
-                    &format!("The company's sign-in could not be used: {why}."),
-                    again,
-                );
-            }
-            Err(Problem::NoIdToken) => {
-                return pages::failed(
-                    StatusCode::BAD_GATEWAY,
-                    "The company's sign-in answered without an ID token.",
-                    again,
-                );
-            }
-            Err(Problem::Refused) => {
-                return pages::failed(
-                    StatusCode::BAD_REQUEST,
-                    "The company's sign-in refused the code it gave.",
-                    again,
-                );
-            }
-            Err(Problem::Invalid(why)) => {
-                return pages::failed(
-                    StatusCode::BAD_REQUEST,
-                    &format!("The ID token does not hold: {why}."),
-                    again,
-                );
-            }
+            Err((status, what)) => return pages::failed(status, &what, again),
         };
         let Some(value) = Secret::random() else {
             return pages::unavailable(again);
@@ -551,6 +589,53 @@ impl Oidc {
             cookies,
         )
         .await
+    }
+
+    /// What came back at `/callback`, its code exchanged and the ID token
+    /// checked; else the status and the words of the page that says why.
+    async fn exchanged(
+        &self,
+        connected: &Connected,
+        query: &Query,
+        verifier: &Secret,
+        nonce: &Secret,
+        port: Option<u16>,
+    ) -> Result<Tokens, (StatusCode, String)> {
+        let refused = |what: &str| Err((StatusCode::BAD_REQUEST, what.to_owned()));
+        if query
+            .get("iss")
+            .is_some_and(|iss| iss != connected.settings.issuer)
+        {
+            return refused("The sign-in came back from another identity provider.");
+        }
+        if let Some(error) = query.get("error") {
+            let shown = provider_error(error);
+            return refused(&format!(
+                "The company's sign-in did not sign you in ({shown})."
+            ));
+        }
+        let Some(code) = query.get("code").filter(|c| !c.is_empty()) else {
+            return refused("The sign-in came back without a code.");
+        };
+        // Held as a secret from here; once a sign-in.
+        let code = Secret::from_text(code.to_owned());
+        let exchanged = connected
+            .provider
+            .exchange(&code, verifier, &self.callback(port), nonce)
+            .await;
+        match exchanged {
+            Ok(tokens) => Ok(tokens),
+            Err(Problem::Unanswered(why)) => Err((
+                StatusCode::BAD_GATEWAY,
+                format!("The company's sign-in could not be used: {why}."),
+            )),
+            Err(Problem::NoIdToken) => Err((
+                StatusCode::BAD_GATEWAY,
+                "The company's sign-in answered without an ID token.".to_owned(),
+            )),
+            Err(Problem::Refused) => refused("The company's sign-in refused the code it gave."),
+            Err(Problem::Invalid(why)) => refused(&format!("The ID token does not hold: {why}.")),
+        }
     }
 
     /// `GET /me`.

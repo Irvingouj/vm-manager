@@ -45,6 +45,17 @@
 //! The Groups read before are never used past their time: a provider that
 //! does not answer is [`Current::Unavailable`] for every request, and the
 //! session stays.
+//!
+//! **Tool credentials from a sign-in** (crate::oidc::tool) are renewed the
+//! same way, by the same tasks under the same bound ([`Subject::Tool`]):
+//! their own refresh token, sealed with their digest as the associated
+//! data; one that ends at a renewal is deleted and logged as
+//! `tool-credential-ended` with its reason only.
+//!
+//! Each renewal takes the connection in use when it runs
+//! (crate::oidc::connection::Live): after a new connection with the same
+//! issuer and client id, it is made with the new settings. With none in
+//! use it is [`Current::Unavailable`].
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -56,7 +67,8 @@ use tokio::task::JoinSet;
 use tokio::time::Instant;
 use tokio_postgres::{Client, Row};
 
-use super::provider::{Problem, Provider};
+use super::connection::Live;
+use super::provider::Problem;
 use super::seal::Sealer;
 use super::secret::Secret;
 use super::token::Claims;
@@ -120,29 +132,36 @@ pub struct TakenCode {
 
 /// What a renewal came to, for every request that waited for it.
 #[derive(Clone)]
-enum Outcome {
+pub enum Outcome {
     User(User),
     None,
     Unavailable,
 }
 
+/// What is renewed: a session, or a tool credential by its digest.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Subject {
+    Session(i64),
+    Tool([u8; 32]),
+}
+
 /// The renewal's work, shared with its tasks.
 struct Renewal {
     database: Arc<PlatformDatabase>,
-    provider: Arc<Provider>,
+    live: Arc<Live>,
     sealer: Sealer,
     renewal_seconds: i64,
-    /// The renewals under way, by session: where each one's outcome comes.
-    /// At most [`MAX_RENEWALS`]; an entry goes when its task ends, however
-    /// it ends ([`Entry`]).
-    under_way: Mutex<HashMap<i64, watch::Receiver<Option<Outcome>>>>,
+    /// The renewals under way, by what is renewed: where each one's
+    /// outcome comes. At most [`MAX_RENEWALS`]; an entry goes when its task
+    /// ends, however it ends ([`Entry`]).
+    under_way: Mutex<HashMap<Subject, watch::Receiver<Option<Outcome>>>>,
 }
 
 /// A task's entry in [`Renewal::under_way`], removed when the task ends
 /// (after its outcome is sent) or is ended.
 struct Entry {
     renewal: Arc<Renewal>,
-    session: i64,
+    subject: Subject,
 }
 
 impl Drop for Entry {
@@ -151,7 +170,7 @@ impl Drop for Entry {
             .under_way
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .remove(&self.session);
+            .remove(&self.subject);
     }
 }
 
@@ -183,7 +202,7 @@ fn found(row: &Row) -> Result<Found, DbError> {
 impl Sessions {
     pub fn new(
         database: Arc<PlatformDatabase>,
-        provider: Arc<Provider>,
+        live: Arc<Live>,
         sealer: Sealer,
         renewal: Duration,
         lifetime: Duration,
@@ -192,7 +211,7 @@ impl Sessions {
         Self {
             renewal: Arc::new(Renewal {
                 database: Arc::clone(&database),
-                provider,
+                live,
                 sealer,
                 renewal_seconds: seconds(renewal),
                 under_way: Mutex::new(HashMap::new()),
@@ -201,6 +220,18 @@ impl Sessions {
             lifetime_seconds: seconds(lifetime),
             tasks: Mutex::new(JoinSet::new()),
         }
+    }
+
+    /// `token` sealed with `bound` as the associated data; `None` when the
+    /// operating system gives no randomness.
+    pub fn seal_token(&self, token: &Secret, bound: &[u8; 32]) -> Option<Vec<u8>> {
+        self.renewal.sealer.seal(token, bound)
+    }
+
+    /// The token sealed in `sealed` with `bound`; `None` when it does not
+    /// open.
+    pub fn open_token(&self, sealed: &[u8], bound: &[u8; 32]) -> Option<Secret> {
+        self.renewal.sealer.open(sealed, bound)
     }
 
     /// Begins a platform session for the person of `claims`, under the
@@ -328,7 +359,16 @@ impl Sessions {
                 session: found.id,
                 user: found.user,
             },
-            Ok(Some(found)) => self.renew(found.id).await,
+            Ok(Some(found)) => match self.renew(Subject::Session(found.id)).await {
+                // Copied: each request that waited takes its own User; once
+                // a renewal per request, a name and the Groups.
+                Outcome::User(user) => Current::User {
+                    session: found.id,
+                    user,
+                },
+                Outcome::None => Current::None,
+                Outcome::Unavailable => Current::Unavailable,
+            },
             Ok(None) => Current::None,
             Err(error) => {
                 log_database(&error);
@@ -337,34 +377,40 @@ impl Sessions {
         }
     }
 
-    /// The outcome of the session's renewal: the one under way, or one
-    /// begun now (see the module's text).
-    async fn renew(&self, session: i64) -> Current {
+    /// The outcome of the renewal of a tool credential found due
+    /// (crate::tool_credentials): as a session's.
+    pub async fn renew_tool(&self, digest: [u8; 32]) -> Outcome {
+        self.renew(Subject::Tool(digest)).await
+    }
+
+    /// The outcome of the renewal: the one under way, or one begun now (see
+    /// the module's text).
+    async fn renew(&self, subject: Subject) -> Outcome {
         let (mut outcome, start) = {
             let mut under_way = self
                 .renewal
                 .under_way
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
-            if let Some(outcome) = under_way.get(&session) {
+            if let Some(outcome) = under_way.get(&subject) {
                 (outcome.clone(), None)
             } else if under_way.len() >= MAX_RENEWALS {
-                return Current::Unavailable;
+                return Outcome::Unavailable;
             } else {
                 let (sender, outcome) = watch::channel(None);
-                under_way.insert(session, outcome.clone());
+                under_way.insert(subject, outcome.clone());
                 (outcome, Some(sender))
             }
         };
         if let Some(sender) = start {
             let entry = Entry {
                 renewal: Arc::clone(&self.renewal),
-                session,
+                subject,
             };
             let mut tasks = self.tasks.lock().unwrap_or_else(PoisonError::into_inner);
             while tasks.try_join_next().is_some() {}
             tasks.spawn(async move {
-                let came = entry.renewal.run(session).await;
+                let came = entry.renewal.run(subject).await;
                 sender.send_replace(Some(came));
                 // The entry goes after the outcome is sent: a request that
                 // comes later reads the session anew.
@@ -373,18 +419,11 @@ impl Sessions {
         }
         let waited = tokio::time::timeout(RENEWAL_WAIT, outcome.wait_for(Option::is_some)).await;
         let Ok(Ok(came)) = waited else {
-            return Current::Unavailable;
+            return Outcome::Unavailable;
         };
-        match came.as_ref() {
-            // Copied: each request that waited takes its own User; once a
-            // renewal per request, a name and the Groups.
-            Some(Outcome::User(user)) => Current::User {
-                session,
-                user: user.clone(),
-            },
-            Some(Outcome::None) => Current::None,
-            Some(Outcome::Unavailable) | None => Current::Unavailable,
-        }
+        // Copied: each request that waited takes its own; once a renewal
+        // per request, a name and the Groups.
+        came.as_ref().map_or(Outcome::Unavailable, Outcome::clone)
     }
 
     /// Ends a session, and every Application session made from it.
@@ -545,7 +584,7 @@ impl Sessions {
 impl Renewal {
     /// One renewal, to its end: the provider asked at most once, every call
     /// ended by [`RENEWAL_LIMIT`] from now.
-    async fn run(&self, session: i64) -> Outcome {
+    async fn run(&self, session: Subject) -> Outcome {
         let deadline = Instant::now() + RENEWAL_LIMIT;
         let state = match self.renewal_state(session).await {
             Ok(Some(state)) => state,
@@ -567,7 +606,10 @@ impl Renewal {
                 .end_at_renewal(session, "unreadable-refresh-token")
                 .await;
         };
-        let tokens = match self.provider.refresh(&token, deadline).await {
+        let Some(connected) = self.live.get() else {
+            return Outcome::Unavailable;
+        };
+        let tokens = match connected.provider.refresh(&token, deadline).await {
             Ok(tokens) if tokens.claims.sub == state.user.id => tokens,
             Ok(_) => return self.end_at_renewal(session, "another-sub").await,
             Err(Problem::Unanswered(_)) => return Outcome::Unavailable,
@@ -597,12 +639,21 @@ impl Renewal {
         }
     }
 
-    async fn end_at_renewal(&self, session: i64, why: &'static str) -> Outcome {
-        log::record(
-            "session-ended",
-            json!({ "session": session, "reason": why }),
-        );
-        match end_session(&self.database, session).await {
+    async fn end_at_renewal(&self, subject: Subject, why: &'static str) -> Outcome {
+        let ended = match subject {
+            Subject::Session(session) => {
+                log::record(
+                    "session-ended",
+                    json!({ "session": session, "reason": why }),
+                );
+                end_session(&self.database, session).await
+            }
+            Subject::Tool(digest) => {
+                log::record("tool-credential-ended", json!({ "reason": why }));
+                end_tool_credential(&self.database, &digest).await
+            }
+        };
+        match ended {
             Ok(()) => Outcome::None,
             Err(error) => {
                 log_database(&error);
@@ -611,22 +662,33 @@ impl Renewal {
         }
     }
 
-    async fn renewal_state(&self, session: i64) -> Result<Option<RenewalState>, DbError> {
+    async fn renewal_state(&self, subject: Subject) -> Result<Option<RenewalState>, DbError> {
         let renewal = self.renewal_seconds;
         let row = self
             .database
             .pool()
-            .run(async |client: &mut Client| {
-                client
+            .run(async |client: &mut Client| match subject {
+                Subject::Session(session) => client
                     .query_opt(
                         "SELECT user_id, groups,
-                                renewed_at + $2::bigint * interval '1 second' <= now(),
-                                refresh_token, digest
-                         FROM sessions WHERE id = $1 AND ends_at > now()",
+                                    renewed_at + $2::bigint * interval '1 second' <= now(),
+                                    refresh_token, digest
+                             FROM sessions WHERE id = $1 AND ends_at > now()",
                         &[&session, &renewal],
                     )
                     .await
-                    .map_err(DbError::from)
+                    .map_err(DbError::from),
+                Subject::Tool(digest) => client
+                    .query_opt(
+                        "SELECT user_id, groups,
+                                    renewed_at + $2::bigint * interval '1 second' <= now(),
+                                    refresh_token, digest
+                             FROM tool_credentials
+                             WHERE digest = $1 AND expires_at > now() AND from_sign_in",
+                        &[&digest.as_slice(), &renewal],
+                    )
+                    .await
+                    .map_err(DbError::from),
             })
             .await?;
         let Some(row) = row else { return Ok(None) };
@@ -644,10 +706,11 @@ impl Renewal {
         }))
     }
 
-    /// Records a renewal; `false` when the session ended meanwhile.
+    /// Records a renewal; `false` when the session or the tool credential
+    /// ended meanwhile.
     async fn renewed(
         &self,
-        session: i64,
+        subject: Subject,
         claims: &Claims,
         refresh_token: Option<Vec<u8>>,
     ) -> Result<bool, DbError> {
@@ -655,16 +718,28 @@ impl Renewal {
             .pool()
             .run(async |client: &mut Client| {
                 let transaction = client.transaction().await.map_err(DbError::from)?;
-                let updated = transaction
-                    .execute(
-                        "UPDATE sessions
-                         SET groups = $2, renewed_at = now(),
-                             refresh_token = coalesce($3, refresh_token)
-                         WHERE id = $1 AND ends_at > now()",
-                        &[&session, &claims.groups, &refresh_token],
-                    )
-                    .await
-                    .map_err(DbError::from)?;
+                let updated = match subject {
+                    Subject::Session(session) => transaction
+                        .execute(
+                            "UPDATE sessions
+                             SET groups = $2, renewed_at = now(),
+                                 refresh_token = coalesce($3, refresh_token)
+                             WHERE id = $1 AND ends_at > now()",
+                            &[&session, &claims.groups, &refresh_token],
+                        )
+                        .await
+                        .map_err(DbError::from)?,
+                    Subject::Tool(digest) => transaction
+                        .execute(
+                            "UPDATE tool_credentials
+                             SET groups = $2, renewed_at = now(),
+                                 refresh_token = coalesce($3, refresh_token)
+                             WHERE digest = $1 AND expires_at > now()",
+                            &[&digest.as_slice(), &claims.groups, &refresh_token],
+                        )
+                        .await
+                        .map_err(DbError::from)?,
+                };
                 transaction
                     .execute(
                         "UPDATE users SET name = $2, email = $3, updated_at = now() WHERE id = $1",
@@ -686,6 +761,26 @@ async fn end_session(database: &PlatformDatabase, session: i64) -> Result<(), Db
         .run(async |client: &mut Client| {
             client
                 .execute("DELETE FROM sessions WHERE id = $1", &[&session])
+                .await
+                .map_err(DbError::from)
+        })
+        .await?;
+    Ok(())
+}
+
+/// Ends a tool credential at its renewal.
+async fn end_tool_credential(
+    database: &PlatformDatabase,
+    digest: &[u8; 32],
+) -> Result<(), DbError> {
+    database
+        .pool()
+        .run(async |client: &mut Client| {
+            client
+                .execute(
+                    "DELETE FROM tool_credentials WHERE digest = $1",
+                    &[&digest.as_slice()],
+                )
                 .await
                 .map_err(DbError::from)
         })

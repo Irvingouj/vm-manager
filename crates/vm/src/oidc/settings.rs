@@ -1,21 +1,19 @@
-//! What `vm serve` is started with for OIDC (blackbox/CONTRACT.md, "Sign-in
-//! and sessions: Starting with OIDC"), checked.
+//! The settings of the OIDC connection (blackbox/CONTRACT.md, "Connecting
+//! OIDC"; crate::oidc::connection), checked.
 
 use std::net::IpAddr;
-use std::time::Duration;
 
 use url::{Host, Url};
 
 use super::secret::ClientSecret;
 
-/// The scopes asked for without `--oidc-scopes`.
+/// The scopes asked for when the connection names none.
 pub const DEFAULT_SCOPES: &str = "openid profile email offline_access";
 
-/// The claim the Groups are read from without `--oidc-groups-claim`.
+/// The claim the Groups are read from when the connection names none.
 pub const DEFAULT_GROUPS_CLAIM: &str = "groups";
 
-/// The platform's registration at the identity provider, and how sessions
-/// are kept.
+/// The platform's registration at the identity provider.
 pub struct Settings {
     /// As given: what `iss` and the configuration's `issuer` must equal.
     pub issuer: String,
@@ -24,11 +22,6 @@ pub struct Settings {
     pub groups_claim: String,
     /// `openid` first, then the others given, each once.
     pub scopes: Vec<String>,
-    /// How long the Groups read are used before the provider is asked
-    /// again.
-    pub renewal: Duration,
-    /// How long a session lives from its sign-in.
-    pub lifetime: Duration,
 }
 
 impl Settings {

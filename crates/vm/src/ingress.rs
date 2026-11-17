@@ -2,11 +2,14 @@
 //!
 //! In order (blackbox/CONTRACT.md, "Responses the program itself gives"):
 //! a request id; the `Host`; a malformed stand-in sign-in ([`SignIn`]);
-//! then who the User is. On the platform's API (`api.<domain>`, [`Api`]) an
-//! `Authorization` header, when there is one, decides alone: a tool
-//! credential ([`ToolCredentials`]) that is alive signs its User in, and
-//! anything else is the `401` of anyone not signed in, whatever stand-in
-//! headers come with it. With OIDC ([`Oidc`]) the sign-in address
+//! then who the User is. On the platform's API (`api.<domain>`, [`Api`]),
+//! `GET /v1/installation` and `POST /v1/tool-sign-ins` are anyone's; else
+//! an `Authorization` header, when there is one, decides alone: a tool
+//! credential ([`ToolCredentials`]) that is alive signs its User in (its
+//! Groups read again first when it came from a sign-in and is due), a
+//! setup credential can only connect OIDC, and anything else is the `401`
+//! of anyone not signed in, whatever stand-in headers come with it. With
+//! OIDC connected ([`Oidc`]) the sign-in address
 //! (`auth.<domain>`) and every Application's `/_vm/session` are its, and
 //! on an Application's address (`<application>.<domain>`) only that
 //! Application's session cookie signs a request in; without, only the
@@ -31,18 +34,19 @@ use hyper::{HeaderMap, Request, Response, StatusCode};
 use openworkers_core::{HttpMethod, HttpRequest, RequestBody};
 use serde_json::json;
 
-use crate::api::{Answer, Api, SignedInWith};
+use crate::api::{Answer, Api, Caller, SignedInWith};
 use crate::app_logs::{Collected, Logs};
 use crate::cookies;
 use crate::gateway::Transactions;
 use crate::log;
-use crate::oidc::sessions::Current;
+use crate::oidc::sessions::{Current, Outcome as Renewed};
 use crate::oidc::{AUTH_NAME, Oidc, SESSION_PATH};
 use crate::origin::{Public, from_another_origin};
 use crate::registry::{Registry, check_name};
 use crate::runner::{InFlight, Outcome, RequestRunner};
 use crate::sign_in::{RESERVED_HEADER_PREFIX, SignIn, SignedIn, remove_reserved_headers};
-use crate::tool_credentials::{self, Presented, ToolCredentials};
+use crate::tool_credentials::{self, Digest, Presented, ToolCredentials};
+use crate::user::User;
 
 /// The header that names a request, in every answer and every record.
 pub const REQUEST_ID_HEADER: &str = "x-vm-request-id";
@@ -65,9 +69,9 @@ pub struct Ingress {
     pub registry: Arc<Registry>,
     pub api: Api,
     pub sign_in: Box<dyn SignIn>,
-    /// OIDC sign-in and sessions, when the program was started with it:
-    /// then it alone signs a request to an Application in, and the sign-in
-    /// address (`auth.<domain>`) is its.
+    /// OIDC sign-in and sessions, when the program has an installation's
+    /// key: once connected, it alone signs a request to an Application in,
+    /// and the sign-in address (`auth.<domain>`) is its.
     pub oidc: Option<Arc<Oidc>>,
     /// How a browser reaches the installation: the origin a request to an
     /// Application must come from.
@@ -133,34 +137,51 @@ impl Ingress {
             .and_then(|rest| rest.strip_suffix('.'))
             .filter(|name| !name.contains('.'));
         if name == Some(API_NAME) {
+            let anyone = matches!(parts.uri.path(), "/v1/installation" | "/v1/tool-sign-ins");
             // On the API an `Authorization` header decides alone; the
             // stand-in's headers beside it count for nothing.
-            let (user, with) = match tool_credentials::presented(&parts.headers) {
-                Presented::Absent => match stated {
-                    SignedIn::User(user) => (user, SignedInWith::Otherwise),
-                    SignedIn::NotSignedIn | SignedIn::Malformed(_) => {
-                        return finish(&known, not_signed_in());
+            let signed = if anyone {
+                Signed::Anyone
+            } else {
+                match tool_credentials::presented(&parts.headers) {
+                    Presented::Absent => match stated {
+                        SignedIn::User(user) => Signed::User(user, SignedInWith::Otherwise),
+                        SignedIn::NotSignedIn | SignedIn::Malformed(_) => {
+                            return finish(&known, not_signed_in());
+                        }
+                    },
+                    Presented::Present(None) => return finish(&known, not_signed_in()),
+                    Presented::Setup(digest) => Signed::Setup(digest),
+                    Presented::Present(Some(digest)) => {
+                        match self.credentials.user_of(digest).await {
+                            Ok(Some(found)) if !found.due => {
+                                Signed::User(found.user, SignedInWith::ToolCredential(digest))
+                            }
+                            Ok(Some(_)) => match self.renewed(digest).await {
+                                Ok(user) => {
+                                    Signed::User(user, SignedInWith::ToolCredential(digest))
+                                }
+                                Err(answer) => return finish(&known, *answer),
+                            },
+                            Ok(None) => return finish(&known, not_signed_in()),
+                            Err(error) => {
+                                let answer = Answer::unavailable(&error);
+                                return finish(&known, api_response(answer));
+                            }
+                        }
                     }
-                },
-                Presented::Present(None) => return finish(&known, not_signed_in()),
-                Presented::Present(Some(digest)) => match self.credentials.user_of(digest).await {
-                    Ok(Some(user)) => (user, SignedInWith::ToolCredential(digest)),
-                    Ok(None) => return finish(&known, not_signed_in()),
-                    Err(error) => {
-                        let answer = Answer::unavailable(&error);
-                        return finish(&known, api_response(answer));
-                    }
-                },
+                }
             };
-            let known = Known {
-                user: Some(&user.id),
-                ..known
+            let (caller, user) = match &signed {
+                Signed::User(user, with) => (Caller::User(user, *with), Some(user.id.as_str())),
+                Signed::Setup(digest) => (Caller::Setup(*digest), None),
+                Signed::Anyone => (Caller::Anyone, None),
             };
+            let known = Known { user, ..known };
             let answer = self
                 .api
                 .handle(
-                    &user,
-                    with,
+                    caller,
                     &id,
                     &parts.method,
                     parts.uri.path(),
@@ -170,10 +191,10 @@ impl Ingress {
                 .await;
             return finish(&known, api_response(answer));
         }
-        let user = match &self.oidc {
+        let user = match self.oidc.as_ref().filter(|o| o.connected().is_some()) {
             Some(oidc) => {
                 if name == Some(AUTH_NAME) {
-                    return finish(&known, oidc.sign_in_address(&parts, port).await);
+                    return finish(&known, oidc.sign_in_address(&parts, body, port).await);
                 }
                 if let Some(name) = name
                     && parts.uri.path() == SESSION_PATH
@@ -366,6 +387,34 @@ impl Ingress {
     }
 }
 
+/// Who a request to the API is from, once Ingress has looked.
+enum Signed {
+    User(User, SignedInWith),
+    Setup(Digest),
+    Anyone,
+}
+
+impl Ingress {
+    /// The User of a tool credential from a sign-in found due, its Groups
+    /// read again (crate::oidc::sessions); else the answer: `401` when it
+    /// ended, `503` when the provider (or the connection) cannot be asked.
+    async fn renewed(&self, digest: Digest) -> Result<User, Box<Response<Full<Bytes>>>> {
+        let outcome = match &self.oidc {
+            Some(oidc) => oidc.renew_tool(*digest.bytes()).await,
+            None => Renewed::Unavailable,
+        };
+        match outcome {
+            Renewed::User(user) => Ok(user),
+            Renewed::None => Err(Box::new(not_signed_in())),
+            Renewed::Unavailable => Err(Box::new(api_response(Answer::error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "unavailable",
+                "the company's sign-in cannot be asked for your Groups just now: try again shortly",
+            )))),
+        }
+    }
+}
+
 /// The `Host` without its port, in lower case, and its port; `None` when
 /// there is none.
 fn host_name(value: &HeaderValue) -> Option<(String, Option<u16>)> {
@@ -421,6 +470,12 @@ fn api_response(answer: Answer) -> Response<Full<Bytes>> {
         response
             .headers_mut()
             .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    }
+    if answer.status == StatusCode::SERVICE_UNAVAILABLE {
+        response.headers_mut().insert(
+            RETRY_AFTER,
+            HeaderValue::from_static(crate::oidc::pages::RETRY_AFTER_SECONDS),
+        );
     }
     response
 }

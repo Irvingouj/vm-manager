@@ -392,6 +392,73 @@ pub const STEPS: &[Step] = &[
         CREATE INDEX session_codes_made ON session_codes (made_at);
     ",
     },
+    Step {
+        number: 14,
+        name: "the OIDC connection, the setup credential, the tool's sign-ins",
+        sql: "
+        -- OIDC as a connection (crate::oidc::connection; blackbox/
+        -- CONTRACT.md, \"The tool signs in through the browser, and OIDC is
+        -- connected from the tool\"; ADR 0018). One row at most. The client
+        -- secret is sealed (AES-256-GCM, a key made from VM_SECRET_KEY for
+        -- this use alone): this table alone gives no secret.
+        CREATE TABLE oidc_connection (
+            id integer PRIMARY KEY CHECK (id = 1),
+            issuer text NOT NULL,
+            client_id text NOT NULL,
+            client_secret bytea NOT NULL,
+            groups_claim text NOT NULL,
+            scopes text[] NOT NULL,
+            administrators_group text NOT NULL,
+            connected_at timestamptz NOT NULL DEFAULT now(),
+            connected_by text NOT NULL,
+            -- One more at each connection, under the row's lock: the
+            -- running program takes a connection only over an older one.
+            generation bigint NOT NULL DEFAULT 1
+        );
+        -- The setup credential (crate::setup): only its SHA-256, and when it
+        -- ends. `vm setup` deletes every row before it makes one, so there
+        -- is one at most.
+        CREATE TABLE setup_credentials (
+            digest bytea PRIMARY KEY CHECK (length(digest) = 32),
+            expires_at timestamptz NOT NULL
+        );
+        -- A sign-in of the tool awaiting an answer (crate::oidc::tool),
+        -- made only once someone has signed in at the provider: the
+        -- SHA-256 of the page's `sign_in` value, of the browser's cookie of
+        -- the sign-in address, the challenge (32 bytes), the port, the
+        -- machine's name, who signed in, their Groups, their refresh token
+        -- sealed, the wrong check codes typed, and the SHA-256 of the
+        -- grant once confirmed with a port. At most 5 a User; every one
+        -- older than 10 minutes is deleted whenever one is made.
+        CREATE TABLE tool_sign_ins (
+            id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+            digest bytea NOT NULL UNIQUE CHECK (length(digest) = 32),
+            browser bytea NOT NULL CHECK (length(browser) = 32),
+            challenge bytea NOT NULL CHECK (length(challenge) = 32),
+            port integer CHECK (port BETWEEN 1024 AND 65535),
+            machine text NOT NULL,
+            user_id text NOT NULL,
+            name text,
+            email text,
+            groups text[] NOT NULL,
+            refresh_token bytea,
+            wrong_codes integer NOT NULL DEFAULT 0,
+            confirmed boolean NOT NULL DEFAULT false,
+            grant_digest bytea CHECK (length(grant_digest) = 32),
+            made_at timestamptz NOT NULL DEFAULT now()
+        );
+        CREATE INDEX tool_sign_ins_user ON tool_sign_ins (user_id, id);
+        CREATE INDEX tool_sign_ins_challenge ON tool_sign_ins (challenge);
+        CREATE INDEX tool_sign_ins_made ON tool_sign_ins (made_at);
+        -- A tool credential made by a sign-in through the browser is renewed
+        -- like a session: its refresh token sealed (bound to its digest),
+        -- when it was last renewed.
+        ALTER TABLE tool_credentials
+            ADD COLUMN refresh_token bytea,
+            ADD COLUMN renewed_at timestamptz NOT NULL DEFAULT now(),
+            ADD COLUMN from_sign_in boolean NOT NULL DEFAULT false;
+    ",
+    },
 ];
 
 /// The advisory lock every step's transaction takes first: "vm steps".

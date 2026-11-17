@@ -48,7 +48,7 @@ use super::{
     DOMAIN, DRAIN_WAIT, KEPT_VERSIONS, MAX_BODY_BYTES, NO_COMMIT, PLATFORM_WAIT, Progress, Stage,
     control, database_failed, local_state_failed, postgres_failed, rows,
 };
-use crate::api::{Api, read_version};
+use crate::api::{Api, Signing, read_version};
 use crate::app_logs::{self, Query, Writer};
 use crate::executor;
 use crate::gateway::PlatformGateway;
@@ -327,6 +327,13 @@ impl Live {
         )
         .await
         .map_err(|why| postgres_failed(&why, who.command))?;
+        // The local run has no sign-in of the tool through the browser, so
+        // no credential of it is ever renewed: the renewal is its lifetime.
+        let credentials = Arc::new(ToolCredentials::new(
+            Arc::clone(&database),
+            DEFAULT_LIFETIME,
+            DEFAULT_LIFETIME,
+        ));
         let ingress = Ingress {
             domain: Arc::from(DOMAIN),
             registry: Arc::clone(&registry),
@@ -335,20 +342,20 @@ impl Live {
                 Arc::clone(&resources),
                 Arc::clone(&log),
                 Arc::clone(&logs),
-                Arc::new(ToolCredentials::new(
-                    Arc::clone(&database),
-                    DEFAULT_LIFETIME,
-                )),
+                Arc::clone(&credentials),
                 Arc::from(DOMAIN),
-                None,
+                Signing {
+                    stand_in: false,
+                    administrators: None,
+                    oidc: None,
+                    database: Arc::clone(&database),
+                    public: Public::local(),
+                },
             ),
             sign_in: Box::new(LocalSignIn),
             oidc: None,
             public: Public::local(),
-            credentials: Arc::new(ToolCredentials::new(
-                Arc::clone(&database),
-                DEFAULT_LIFETIME,
-            )),
+            credentials,
             runner,
             logs,
             max_request_body_bytes: MAX_BODY_BYTES,

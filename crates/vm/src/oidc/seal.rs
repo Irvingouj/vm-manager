@@ -1,30 +1,37 @@
 //! Sealing with AES-256-GCM under a key derived with HKDF-SHA256 from the
-//! client secret (`VM_OIDC_CLIENT_SECRET`), which is never in the platform
-//! database. Each use has a key of its own, by its own HKDF salt
-//! ([`Use`]):
+//! installation's key (`VM_SECRET_KEY`, crate::oidc::key), which is never in
+//! the platform database. Each use has a key of its own, by its own HKDF
+//! salt ([`Use`]):
 //!
 //! - **A session's refresh token at rest** in the platform database. The
 //!   session's cookie digest is the associated data, so a sealed token
 //!   moved to another session's row does not open there.
+//!   A tool credential's refresh token likewise, its digest the associated
+//!   data; and one of a sign-in of the tool awaiting an answer, the digest
+//!   of its `sign_in` value.
 //! - **A sign-in under way**, carried in the `state` sent to the identity
 //!   provider (crate::oidc::under_way), the SHA-256 of the sign-in
-//!   address's cookie as the associated data.
+//!   address's cookie as the associated data; a sign-in of the tool under
+//!   way with a key of its own.
+//! - **The OIDC connection's client secret** at rest
+//!   (crate::oidc::connection), a fixed label's digest as the associated
+//!   data.
 //!
-//! So the platform database alone gives no refresh token; with the client
-//! secret too, one could also use the tokens directly at the provider, so
-//! the key adds nothing then. A new client secret leaves the sealed tokens
-//! unreadable: each session ends at its next renewal, and its browser
-//! signs in again.
+//! So a dump of the platform database gives no secret. Another key leaves
+//! everything sealed unreadable: the connection is not used until OIDC is
+//! connected again, and each session and tool credential ends at its next
+//! renewal. A new client secret changes nothing sealed.
 //!
 //! Sealed form: `1 || nonce (12 random bytes) || ciphertext || tag`; a
 //! random nonce for each sealing, which AES-GCM allows for far more than
-//! the 2^32 sealings one key could see here before a new client secret.
+//! the 2^32 sealings one key could see here.
 
 use ring::aead::{AES_256_GCM, Aad, LessSafeKey, NONCE_LEN, Nonce, UnboundKey};
 use ring::hkdf::{HKDF_SHA256, Salt};
 use ring::rand::{SecureRandom, SystemRandom};
 
-use super::secret::{ClientSecret, Secret};
+use super::key::InstallationKey;
+use super::secret::Secret;
 
 /// The first byte of the stored form.
 const FORM: u8 = 1;
@@ -34,6 +41,8 @@ const FORM: u8 = 1;
 pub enum Use {
     RefreshTokens,
     SignInState,
+    ToolSignInState,
+    ClientSecret,
 }
 
 impl Use {
@@ -41,6 +50,8 @@ impl Use {
         match self {
             Self::RefreshTokens => b"vm: refresh tokens at rest",
             Self::SignInState => b"vm: a sign-in under way",
+            Self::ToolSignInState => b"vm: a sign-in of the tool under way",
+            Self::ClientSecret => b"vm: the OIDC connection's client secret",
         }
     }
 }
@@ -52,10 +63,10 @@ pub struct Sealer {
 }
 
 impl Sealer {
-    /// The key derived from the client secret. The error is a message for
-    /// the operator.
-    pub fn new(secret: &ClientSecret, purpose: Use) -> Result<Self, String> {
-        let prk = Salt::new(HKDF_SHA256, purpose.salt()).extract(secret.expose().as_bytes());
+    /// The key of `purpose`, derived from the installation's key. The
+    /// error is a message for the operator.
+    pub fn new(key: &InstallationKey, purpose: Use) -> Result<Self, String> {
+        let prk = Salt::new(HKDF_SHA256, purpose.salt()).extract(key.expose());
         let okm = prk
             .expand(&[b"AES-256-GCM, form 1"], &AES_256_GCM)
             .map_err(|_| "a key for sealing cannot be derived".to_owned())?;
