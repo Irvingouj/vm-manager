@@ -151,7 +151,7 @@ When several apply, the first of these wins: `too-large`, `not-an-administrator`
 
 The creator is its first Contributor. A `description` of `null` is the same as none. Names are unique in the installation. `description` is null when none was given; `serving_version` is a number, or null before the first Version.
 
-`GET /v1/applications/<name>` answers `200` with the same object. In this ticket every signed-in User may read it; who may see an Application is settled by the ticket on Contributors and sharing.
+`GET /v1/applications/<name>` answers `200` with the same object. In this ticket every signed-in User may read it; from the ticket on Contributors and sharing on, only who can open it and Platform administrators ("Contributors and sharing", which also adds to the object).
 
 ### Versions
 
@@ -1115,7 +1115,7 @@ vm applications [--json]
 ```
 
 - `GET /v1/applications`, by any signed-in User: `{ "applications": [ { "name", "description", "address", "contributor": <bool>, "serving_version": <number or null> } ] }`, by name: the Applications the User contributes to or can open. `address` is `<name>.<domain>`.
-- **Until the ticket on Contributors and sharing says who can open an Application, the list holds the Applications the User is a Contributor of** (`contributor` true), and no other. That ticket adds the ones shared with them.
+- **Until the ticket on Contributors and sharing says who can open an Application, the list holds the Applications the User is a Contributor of** (`contributor` true), and no other. That ticket adds the ones shared with them ("Contributors and sharing").
 - `vm applications --json` prints the same object. Without `--json`, one block per Application: name, description, address, and whether a Version is serving.
 - With none: `{ "applications": [] }`, and in words that the User contributes to no Application yet.
 
@@ -1382,7 +1382,7 @@ Exit code `0`:
 ```
 
 - `created` is true when this deploy created the Application. `migrations_applied` are those this Version added. `pulled` has every declared Resource, by name; `files` are the ones the deploy changed.
-- **Who can see it**: `visible_to.contributors` are the Application's Contributors, by user id, as the installation answers them. In words: that the Application is live at its address as Version n, and that it is visible to its Contributors only, each by name, and to nobody else until it is shared. The words never say more than that (no Group, no "your team").
+- **Who can see it**: `visible_to.contributors` are the Application's Contributors, by user id, as the installation answers them. (From the ticket on Contributors and sharing on, `visible_to` is the object of "Contributors and sharing: The tool", and the words name whom the Application is shared with.) In words: that the Application is live at its address as Version n, and that it is visible to its Contributors only, each by name, and to nobody else until it is shared. The words never say more than that (no Group, no "your team").
 - When a structure changed: the words (and a note, reason `structure-updated`, with `resource` and `files`) say that the pulled definition was updated, that the Version was built against the new structure, and to commit those files.
 - **Warnings and notes** are the check's (`own-grant-below-declared`, `pulled-not-declared`); the deploy goes on. For a declared Resource the User holds no Grant on, the warning also says its structure could not be pulled again and the definition in the project was used. For one whose shared database did not answer, the warning is reason `structure-not-pulled`, with `resource`, and says the same.
 
@@ -1795,7 +1795,7 @@ The black-box harness has an identity provider of its own (`blackbox`, no produc
 ### What this does not close
 
 - The tool's own sign-in (`vm sign-in`) still uses the stand-in: the ticket "The tool signs in through the browser" (closed there).
-- Whom an Application is shared with: the ticket on Contributors and sharing. Here every signed-in User may open every Application.
+- Whom an Application is shared with: the ticket on Contributors and sharing ("Contributors and sharing: Opening an Application"). Until then every signed-in User may open every Application.
 - The Dashboard at `dashboard.<domain>`: its ticket; it signs in by the same way through.
 - Signing out at the identity provider, and being signed out by it (back-channel logout).
 - TLS: the program listens in plain HTTP behind what ends TLS (the ticket on installing).
@@ -1892,3 +1892,89 @@ The harness connects OIDC as an administrator would (`vm setup`, then the connec
 - Other commands for Platform administrators: the tickets on Resources and Grants in full and on what Platform administrators see.
 - A Platform administrator ending someone else's tool credential or session.
 - The tool still speaks plain HTTP to a loopback address (the ticket on installing brings HTTPS). The Dashboard: its ticket.
+
+## Contributors and sharing (ticket: Contributors and sharing: who may change and who may open an Application)
+
+An Application belongs to the company (ADR 0007). Two lists are kept for each: its **Contributors**, who may change and deploy it, and whom it is **shared with**, who may open it. Until it is shared it is visible to its Contributors alone. Sharing never widens anyone's access to a shared database: that stays with their Grants.
+
+### The two lists
+
+- An entry of the Contributors names a person or a Group: `{ "user": "<user id>" }` or `{ "group": "<Group>" }`. An entry of whom it is shared with is one of those, or `{ "everyone": true }`: every User who can sign in to the installation.
+- A user id and a Group are each 1 to 256 bytes with no control characters, compared exactly (as a Grant's Group). Nothing checks that such a person or Group exists: an Application can be shared with someone before their first sign-in.
+- **A User is a Contributor** of an Application when their id is among its Contributors or one of their Groups is. **A User can open** an Application when they are a Contributor of it, or it is shared with everyone, with them, or with one of their Groups. Their Groups are the ones their sign-in holds, as last read ("Sign-in and sessions: Renewal"): taken out of a Group at the identity provider, a person stops being a Contributor or stops being able to open at the next renewal.
+- The creator is the first Contributor (`{ "user": ... }`). The Contributors are never empty.
+- At most 100 Contributors and 1,000 entries of whom it is shared with.
+- Wherever this contract says "by a Contributor" or `not-a-contributor`, this is who is meant from this ticket on: sending a Version, going back, reading Versions and logs, deploying with the tool.
+
+### Opening an Application
+
+In "Responses the program itself gives", after the `404` of an address that is no known Application's and before the `404` of an Application with no serving Version:
+
+| Condition | Status |
+|---|---|
+| The Application is not shared with the User, and the User is not a Contributor of it | 403 |
+
+- The Application is not asked anything: none of its code runs, none of its files is given, whatever the path and the method. The `request` record has the Application's name, `version` null and `status` 403.
+- A `GET` or `HEAD` whose `Accept` has `text/html` is answered with a page of the platform's own (`text/html; charset=utf-8`, `cache-control: no-store`, the headers of the pages of "Sign-in and sessions"): it says that the Application of that name is not shared with the person, names whom they are signed in as (their id, and their name when the platform knows it), and says to ask one of the Application's Contributors to share it. It names no Contributor and nothing else of the Application. Any other request: `text/plain`, 1 to 200 bytes, saying the same in a sentence.
+- So someone signed in can learn that an Application of a name exists (`403` and not `404`), as they can from `name-taken`; nothing more.
+- It is decided at each request: sharing and unsharing take effect at the next one, with nothing to wait for and no sign-in again.
+- With OIDC the steps of a sign-in come first as they do now (a person without a session is sent to sign in before anything is said of the Application), and `/_vm/session` is answered whoever the code is for.
+- **The local run does not share**: `vm request` and `vm dev` serve every test User of the project, as before.
+- A User who opens an Application and holds no Grant on a Resource it uses is refused by that Resource exactly as before (`not-granted`, in the Operation log): being able to open gives nothing there.
+
+### On the platform's API
+
+The Application, wherever the API answers it (`POST /v1/applications`, `GET /v1/applications/<name>`, and the two requests below):
+
+```json
+{ "name": "incident-board", "description": "...", "address": "incident-board.<domain>",
+  "contributors": [ { "user": "<user id>", "name": "<name>" | null, "email": "<address>" | null,
+                      "added_by": "<user id>", "added_at": "<RFC 3339 time>" },
+                    { "group": "<Group>", "added_by": "...", "added_at": "..." } ],
+  "shared_with": [ { "user": ... }, { "group": ... }, { "everyone": true, "added_by": "...", "added_at": "..." } ],
+  "contributor": true, "serving_version": 3,
+  "created_by": "<user id>", "created_at": "<RFC 3339 time>" }
+```
+
+- `contributors` and `shared_with` are in the order they were added. `name` and `email` of a person are what the platform last read of them at a sign-in, null for someone who never signed in here (and always with the stand-in, which keeps no record of people). `contributor` says whether the asker is one.
+- `GET /v1/applications/<name>`: by whoever can open it, and by a Platform administrator. Anyone else: `403` `not-shared` (after `not-found`), the message saying to ask one of its Contributors. To someone who is neither a Contributor nor a Platform administrator, `shared_with` is null: they see who maintains it, not who else uses it.
+- `GET /v1/applications`: the Applications the User is a Contributor of (`contributor` true) and those they can open besides (`contributor` false), by name, each once; exactly those. An Application with no serving Version is listed like any other.
+- `POST /v1/applications/<name>/contributors` and `POST /v1/applications/<name>/sharing`, by a Contributor, with `{ "add": [ <entry>, ... ], "remove": [ <entry>, ... ] }` (each optional, together 1 to 100 entries): the change is made whole or not at all, and the answer is `200` with the Application as it is after.
+  - An entry is `{ "user": "<id>" }`, `{ "group": "<Group>" }`, for `sharing` also `{ "everyone": true }`, or **`{ "email": "<address>" }`**: the one person the platform knows by that email address (as last read at their sign-in; letter case ignored). The entry kept is that person's `{ "user": ... }`.
+  - Adding an entry that is there, and removing one that is not, change nothing and are not refused. The same entry in `add` and in `remove`: `400` `malformed`.
+  - Refusals, after the ones every request of the API has (`not-found`, `method-not-allowed`, `not-a-contributor`, `malformed`, in that order): `422` `unknown-email` (nobody who signed in here has that address: the message says to use their user id, which `vm whoami` shows them, or to ask them to sign in once), `409` `ambiguous-email` (more than one person has it: use the user id), `409` `last-contributor` (the change would leave no Contributor), `409` `too-many` (it would pass 100 Contributors or 1,000 entries of whom it is shared with). Each names the entry it is about and changes nothing.
+  - A Contributor may remove themselves when a Contributor is left. A Platform administrator who is not a Contributor is `not-a-contributor` here, as anyone.
+  - The log gets `{"event":"contributors-changed","application","by","added":[...],"removed":[...]}` or `{"event":"sharing-changed", ...}` with the entries as kept, when something changed.
+- Stopping the program and starting it again loses neither list.
+
+### The tool
+
+```
+vm show <application> [--json]
+vm share <application> (--user <id> | --email <address> | --group <Group> | --everyone)... [--json]
+vm unshare <application> (--user <id> | --email <address> | --group <Group> | --everyone)... [--json]
+vm contributors add <application> (--user <id> | --email <address> | --group <Group>)... [--json]
+vm contributors remove <application> (--user <id> | --email <address> | --group <Group>)... [--json]
+```
+
+- All need a sign-in (`4`) and name the Application on the command line. Each of `--user`, `--email` and `--group` may be given several times; none given (for the four that change something) is exit code `2`. The API's refusals keep their reasons: exit code `3` for `not-a-contributor`, `not-shared`, `not-found`, `unknown-email`, `ambiguous-email` and `last-contributor`, `1` for the rest.
+- **`vm show`** prints the Application as the API answers it. In words: its name, description, address, the serving Version, its Contributors and whom it is shared with (or, to someone who is not a Contributor, that only its Contributors see that list).
+- **The four that change something** print:
+
+  ```json
+  { "application": "incident-board", "address": "incident-board.<domain>",
+    "added": [ <entry>, ... ], "removed": [ <entry>, ... ],
+    "visible_to": { "contributors": [ <entry>, ... ], "shared_with": [ <entry>, ... ] } }
+  ```
+
+  `added` and `removed` are what this command changed (entries as kept: an `--email` shows as the person's `user`, with `name` and `email`), empty when everything was so already. In words: what changed, then **who can see the Application now, each by name**: every Contributor and everyone it is shared with, a person by their name and email when known and by their id, a Group as a Group, and `everyone` as everyone who can sign in to the installation; or that it is visible to its Contributors only. A person the platform has never seen sign in is said so beside their id (a mistyped id shows there).
+- **`vm deploy`**: `visible_to` is that same object from this ticket on (`contributors` were user ids before), and the words name whom it is shared with besides its Contributors, or say that it is visible to its Contributors only and that `vm share` shares it.
+- **`vm applications`** lists what `GET /v1/applications` answers: the Applications the User contributes to and those shared with them, saying which is which.
+- The instruction file of a new project (`AGENTS.md`) says that a deployed Application is visible to its Contributors only until it is shared, names `vm share`, `vm unshare`, `vm contributors add` and `vm show`, and says to tell the Builder who can see it after a deploy or a share, and to ask the Builder before sharing with everyone.
+
+### What this does not close
+
+- A Platform administrator changing the Contributors of an Application whose Contributors have all left (the ticket on what Platform administrators see lists every Application; taking one over is not built).
+- Sharing from the Dashboard, and the list there: the ticket on the Dashboard.
+- A record of who was removed and when, beyond the log's line: each entry says who added it and when; a removal leaves only the log.
+- Disabling and deleting an Application: their ticket.
