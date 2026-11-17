@@ -33,6 +33,8 @@ Run them from this folder. Each has `--help` and `--json` (one JSON object on st
 | `vm request <path> --as <user>` | runs the project on this machine and sends it one request as a test User of `vm.dev.json` |
 | `vm local operation-log` | the operations of those local requests, and what came of each |
 | `vm local change-history` | the changes those local requests made in the own database |
+| `vm dev` | keeps the project running on this machine for the Builder's browser, until interrupted |
+| `vm local reset` | starts the local databases over: empty, every migration applied again, test rows loaded |
 
 If a command says you are not signed in, ask the Builder to run `vm sign-in` (it needs their details), then run yours again.
 
@@ -69,7 +71,11 @@ A migration destroys data when it drops a table, a column or a schema, or change
 
 Try the Application before deploying with `vm request <path> --as <user>`: it builds the project as it is now (uncommitted changes too), runs it on this machine and prints the response. Try each page as `builder` (the Builder's own access) and as `outsider` (a test User of `vm.dev.json` in no Group, so every operation on a Resource is refused): the page must say so plainly rather than break. The output also has what the code printed, the errors it did not catch, and each operation's outcome with the reason of a refusal; `vm local operation-log` and `vm local change-history` show what the local requests did.
 
-The Resources there are empty stand-ins with the real structure: a list is empty, and a refusal is real. Nothing of the company's rows is on this machine. The Grants of `vm.dev.json` decide who may do what; `vm pull` copies the Builder's own Grant there, for the test User `builder`. Add test Users and Grants of your own there for the other Groups the Application serves. The rules are the same on this machine as after deploying.
+The Resources there are stand-ins with the real structure and none of the company's rows: a list is empty unless you give it test rows, and a refusal is real. The Grants of `vm.dev.json` decide who may do what; `vm pull` copies the Builder's own Grant there, for the test User `builder`. Add test Users and Grants of your own there for the other Groups the Application serves. The rules are the same on this machine as after deploying.
+
+Test rows are SQL files of the project, never deployed: `test-rows/<name>.sql` for the stand-in of a pulled Resource `<name>`, and `test-rows/own-database.sql` for the own database, mostly `INSERT` statements. Each is loaded when it changes (a stand-in emptied first; the own database made anew first). Run `vm local reset` to start the local databases over.
+
+For the Builder, run `vm dev` (where it can keep running, never as a step that must finish): it serves the project at `http://<name>.localhost:7480/` in their browser, where they choose the test User, and rebuilds it when the project changes. While it runs, your own `vm request` and `vm local` commands are answered by that `vm dev`, as fast as a page.
 
 ## Deploying
 
