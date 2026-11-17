@@ -24,7 +24,13 @@
 //! flag the thread looks at between pieces.
 //!
 //! What is left half done (the downloaded file, the half-unpacked folder) is
-//! removed whatever way the download ends ([`Leftover`]).
+//! removed whatever way the download ends ([`Leftover`]); the half-unpacked
+//! folder is removed by whichever of the command and the unpacking thread
+//! is last to let go of it, so never while the thread still writes in it.
+//! What a command killed outright left (it removed nothing) is removed by
+//! the next download once it is [`STALE_AFTER`] old ([`remove_stale`]): a
+//! download of its own ends within [`DOWNLOAD_TIMEOUT`] and its unpacking
+//! within [`UNPACK_TIMEOUT`], so anything older is no command's at work.
 
 use std::fs::{self, DirBuilder, File};
 use std::io::Read;
@@ -91,6 +97,13 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// The longest the answer's head, or any one piece of its body, may take.
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The longest unpacking may take; the thread looks at it between pieces.
+const UNPACK_TIMEOUT: Duration = Duration::from_secs(4 * 60);
+
+/// The age past which what a download left is no command's at work: above
+/// [`DOWNLOAD_TIMEOUT`] and [`UNPACK_TIMEOUT`] together.
+const STALE_AFTER: Duration = Duration::from_secs(15 * 60);
+
 /// Redirects followed.
 const MAX_REDIRECTS: usize = 5;
 
@@ -132,20 +145,85 @@ impl Archive {
 /// Removes, when dropped, what a download left half done; and tells the
 /// unpacking thread to stop.
 struct Leftover {
-    paths: Vec<PathBuf>,
-    stop: Arc<AtomicBool>,
+    jar: PathBuf,
+    unpacking: Arc<Unpacking>,
+}
+
+/// The half-unpacked folder, shared by the command and the unpacking
+/// thread: whichever lets go of it last removes it (unless it was renamed
+/// into its place). Shared as an `Arc`.
+struct Unpacking {
+    folder: PathBuf,
+    /// Set by the command when it lets go.
+    stop: AtomicBool,
+    /// Whether the thread has let go (or was never started). Held only
+    /// while it is read and set, and while the folder is removed.
+    thread_done: std::sync::Mutex<bool>,
+}
+
+impl Unpacking {
+    /// The thread lets go: it removes the folder if the command already
+    /// has.
+    fn thread_ends(&self) {
+        let mut done = self
+            .thread_done
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.stop.load(Ordering::SeqCst) {
+            fs::remove_dir_all(&self.folder).ok();
+        }
+        *done = true;
+    }
+
+    /// The command lets go: it removes the folder if the thread already
+    /// has (else the thread will, when it ends).
+    fn command_ends(&self) {
+        self.stop.store(true, Ordering::SeqCst);
+        let done = self
+            .thread_done
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *done {
+            fs::remove_dir_all(&self.folder).ok();
+        }
+    }
 }
 
 impl Drop for Leftover {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
         // Quick calls on files of this run's own; once per download.
-        for path in &self.paths {
-            if path.is_dir() {
-                fs::remove_dir_all(path).ok();
-            } else {
-                fs::remove_file(path).ok();
-            }
+        fs::remove_file(&self.jar).ok();
+        self.unpacking.command_ends();
+    }
+}
+
+/// Removes what downloads killed outright left in `folder`: each
+/// `.download-*` and `.unpacking-*` older than [`STALE_AFTER`].
+fn remove_stale(folder: &Path) {
+    let Ok(entries) = fs::read_dir(folder) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with(".download-") && !name.starts_with(".unpacking-") {
+            continue;
+        }
+        let Ok(meta) = entry.path().symlink_metadata() else {
+            continue;
+        };
+        let old = meta
+            .modified()
+            .ok()
+            .and_then(|m| m.elapsed().ok())
+            .is_some_and(|age| age > STALE_AFTER);
+        if !old {
+            continue;
+        }
+        if meta.is_dir() {
+            fs::remove_dir_all(entry.path()).ok();
+        } else {
+            fs::remove_file(entry.path()).ok();
         }
     }
 }
@@ -168,10 +246,18 @@ pub(super) async fn download(
     let tag: String = random.iter().map(|b| format!("{b:02x}")).collect();
     let jar = folder.join(format!(".download-{tag}.jar"));
     let unpacking = folder.join(format!(".unpacking-{tag}"));
-    let stop = Arc::new(AtomicBool::new(false));
+    // Quick: a few entries of the folder.
+    remove_stale(folder);
+    let shared = Arc::new(Unpacking {
+        // Paths copied once per download, not on a request's path.
+        folder: unpacking.clone(),
+        stop: AtomicBool::new(false),
+        // No thread yet: the command alone removes the folder.
+        thread_done: std::sync::Mutex::new(true),
+    });
     let _leftover = Leftover {
-        paths: vec![jar.clone(), unpacking.clone()],
-        stop: Arc::clone(&stop),
+        jar: jar.clone(),
+        unpacking: Arc::clone(&shared),
     };
     let url = format!("{}/{}", base.trim_end_matches('/'), archive.maven_path());
     let fetched = tokio::time::timeout(DOWNLOAD_TIMEOUT, fetch(&url, &jar))
@@ -188,12 +274,20 @@ pub(super) async fn download(
             archive.sha256
         ));
     }
-    let into = unpacking.clone();
     let from = jar.clone();
-    let stopping = Arc::clone(&stop);
-    tokio::task::spawn_blocking(move || unpack(&from, &into, &stopping))
-        .await
-        .map_err(|_| "the archive could not be unpacked (the unpacking stopped)".to_owned())??;
+    let thread = Arc::clone(&shared);
+    *shared
+        .thread_done
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = false;
+    let deadline = std::time::Instant::now() + UNPACK_TIMEOUT;
+    tokio::task::spawn_blocking(move || {
+        let unpacked = unpack(&from, &thread.folder, &thread.stop, deadline);
+        thread.thread_ends();
+        unpacked
+    })
+    .await
+    .map_err(|_| "the archive could not be unpacked (the unpacking stopped)".to_owned())??;
     let bin = unpacking.join("bin");
     for program in ["postgres", "initdb", "pg_ctl"] {
         if !bin.join(program).is_file() {
@@ -410,7 +504,12 @@ where
 }
 
 /// Unpacks the jar `jar` into `into` (see the module's text).
-fn unpack(jar: &Path, into: &Path, stop: &AtomicBool) -> Result<(), String> {
+fn unpack(
+    jar: &Path,
+    into: &Path,
+    stop: &AtomicBool,
+    deadline: std::time::Instant,
+) -> Result<(), String> {
     let refused = |why: &str| format!("the archive is refused: {why}");
     let file = File::open(jar).map_err(|e| format!("{} cannot be read ({e})", jar.display()))?;
     let mut zip =
@@ -437,8 +536,14 @@ fn unpack(jar: &Path, into: &Path, stop: &AtomicBool) -> Result<(), String> {
     let mut count = 0usize;
     let mut total: u64 = 0;
     for entry in entries {
-        if stop.load(Ordering::Relaxed) {
+        if stop.load(Ordering::SeqCst) {
             return Err("the unpacking was stopped".to_owned());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "the unpacking did not end within {} minutes",
+                UNPACK_TIMEOUT.as_secs() / 60
+            ));
         }
         let mut entry = entry.map_err(|e| refused(&format!("its tar cannot be read ({e})")))?;
         count = count.saturating_add(1);
