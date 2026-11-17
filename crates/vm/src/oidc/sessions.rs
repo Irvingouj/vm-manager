@@ -25,7 +25,8 @@
 //!   starts the task; every request of that session that comes before it
 //!   ends waits for it and takes its outcome (the User, no session, or
 //!   unavailable). The provider is asked once, also when it fails.
-//! - **Bounded.** At most [`MAX_RENEWALS`] sessions are being renewed at
+//! - **Bounded.** At most [`MAX_RENEWALS`] (256, a quarter of the
+//!   connections served at once) sessions are being renewed at
 //!   once; a request whose session's renewal cannot begin is
 //!   [`Current::Unavailable`] (`503`). Every call to the provider ends by
 //!   the renewal's deadline, [`RENEWAL_LIMIT`] after it began; a request
@@ -59,9 +60,9 @@ use super::provider::{Problem, Provider};
 use super::seal::Sealer;
 use super::secret::Secret;
 use super::token::Claims;
-use crate::log;
 use crate::platform_db::{DbError, PlatformDatabase, rfc3339};
 use crate::user::User;
+use crate::{log, server};
 
 /// The most sessions a User holds.
 pub const MAX_SESSIONS: i64 = 20;
@@ -80,7 +81,14 @@ pub const RENEWAL_LIMIT: Duration = Duration::from_secs(10);
 pub const RENEWAL_WAIT: Duration = Duration::from_secs(11);
 
 /// The most sessions being renewed at once.
-pub const MAX_RENEWALS: usize = 1024;
+///
+/// A quarter of the connections `vm serve` serves at once
+/// ([`server::CONNECTIONS`], from which it is derived). Each request
+/// waiting for a renewal holds its connection for up to [`RENEWAL_WAIT`];
+/// with a provider that does not answer, as many waiting requests as
+/// connections would leave none for anyone else, the signed-out included.
+/// A quarter leaves three quarters answered at once meanwhile.
+pub const MAX_RENEWALS: usize = server::CONNECTIONS / 4;
 
 /// A session found by a cookie.
 pub struct Found {

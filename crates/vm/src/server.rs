@@ -48,10 +48,16 @@ pub struct Limits {
     pub drain: Duration,
 }
 
+/// The connections `vm serve` serves at once ([`Limits::connections`] by
+/// default). The bound on sessions renewed at once
+/// (crate::oidc::sessions::MAX_RENEWALS) is a quarter of it, derived from
+/// it: raising one moves the other.
+pub const CONNECTIONS: usize = 1024;
+
 impl Default for Limits {
     fn default() -> Self {
         Self {
-            connections: 1024,
+            connections: CONNECTIONS,
             header_read: Duration::from_secs(10),
             connection: Duration::from_secs(60),
             drain: Duration::from_secs(10),
