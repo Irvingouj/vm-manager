@@ -30,22 +30,14 @@
 use std::thread;
 use std::time::{Duration, Instant};
 
-use blackbox::postgres::{Platform, PrivatePostgres};
+use blackbox::lost_answer::{HeldPostgres, QUICK, SETTLE};
 use blackbox::sharing::{
     TRACED, add, assert_cannot_open, assert_opens, create_unshared, keys, remove, share_ok, user,
 };
-use blackbox::sql::Sql;
 use blackbox::{Response, User, Vm, VmOptions, assert_api_error};
 use serde_json::{Value, json};
 
 const APP: &str = "board";
-
-/// How long the program may take to answer a request while the platform
-/// database holds commits: it does not wait for it.
-const QUICK: Duration = Duration::from_secs(2);
-/// How long the program has, once commits go through, to have read what
-/// became of the change.
-const SETTLE: Duration = Duration::from_secs(15);
 
 fn alice() -> User {
     User::new("alice").in_groups(&["staff"])
@@ -59,87 +51,16 @@ fn carol() -> User {
     User::new("carol")
 }
 
-/// A Postgres of the test's own, a platform database on it, and the
-/// program on that database with `board` made by alice.
-fn with_board(name: &str) -> (PrivatePostgres, VmOptions, Vm) {
-    let postgres = PrivatePostgres::start().unwrap();
-    // The harness's Postgres is started with `synchronous_commit=off`, for
-    // speed; a commit waits for a standby only with it on, so it is turned
-    // on for the role the program connects as (the superuser) before the
-    // program opens its first session.
-    superuser(&postgres).batch("ALTER ROLE CURRENT_USER SET synchronous_commit = on");
-    let platform = Platform::on(&postgres, name);
+/// A Postgres of the test's own whose commits can be held
+/// ([`HeldPostgres`]), a platform database on it, and the program on that
+/// database with `board` made by alice.
+fn with_board(name: &str) -> (HeldPostgres, VmOptions, Vm) {
+    let postgres = HeldPostgres::start();
+    let platform = postgres.platform(name);
     let options = VmOptions::new().stand_in_sign_in().platform(&platform);
     let vm = Vm::start(&options);
     create_unshared(&vm, &alice(), APP, TRACED);
     (postgres, options, vm)
-}
-
-/// The harness's superuser on that Postgres.
-fn superuser(postgres: &PrivatePostgres) -> Sql {
-    Sql::connect(&postgres.url("postgres")).unwrap()
-}
-
-/// How many lines of the server's log name `synchronous_standby_names`.
-fn reloads_seen(postgres: &PrivatePostgres) -> usize {
-    postgres
-        .server_log()
-        .lines()
-        .filter(|l| l.contains("synchronous_standby_names"))
-        .count()
-}
-
-/// Sets `synchronous_standby_names` (or resets it with `None`) and reloads,
-/// waiting until the server's log shows the server took it, and a little
-/// more for every server process to have taken it before its next command.
-fn set_standby(sql: &Sql, postgres: &PrivatePostgres, value: Option<&str>) {
-    let before = reloads_seen(postgres);
-    match value {
-        Some(value) => sql.batch(&format!(
-            "ALTER SYSTEM SET synchronous_standby_names = '{value}'"
-        )),
-        None => sql.batch("ALTER SYSTEM RESET synchronous_standby_names"),
-    };
-    sql.batch("SELECT pg_reload_conf()");
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while reloads_seen(postgres) == before {
-        assert!(
-            Instant::now() < deadline,
-            "expected the test Postgres to take the new configuration\n{}",
-            postgres.server_log()
-        );
-        thread::sleep(Duration::from_millis(20));
-    }
-    thread::sleep(Duration::from_millis(300));
-}
-
-/// Makes every commit that wrote something wait.
-fn hold_commits(sql: &Sql, postgres: &PrivatePostgres) {
-    set_standby(sql, postgres, Some("nobody"));
-}
-
-/// Lets commits through again, those waiting included.
-fn let_commits_through(sql: &Sql, postgres: &PrivatePostgres) {
-    set_standby(sql, postgres, None);
-}
-
-/// How many commits are waiting.
-fn commits_waiting(sql: &Sql) -> usize {
-    sql.value("SELECT count(*) FROM pg_stat_activity WHERE wait_event = 'SyncRep'")
-        .and_then(|n| n.parse().ok())
-        .unwrap_or(0)
-}
-
-/// Waits until at least one commit is waiting.
-fn wait_for_a_waiting_commit(sql: &Sql, context: &str) {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while commits_waiting(sql) == 0 {
-        assert!(
-            Instant::now() < deadline,
-            "{context}: expected the change's commit to be waiting at the test Postgres"
-        );
-        thread::sleep(Duration::from_millis(20));
-    }
 }
 
 /// `GET /hello` of `board` as this User, not a page; `None` when there is
@@ -263,19 +184,18 @@ fn an_unshare_whose_answer_is_lost_lets_the_person_in_never_again() {
     let (postgres, _options, vm) = with_board("vm_platform_lost_unshare");
     share_ok(&vm.api_as(&alice()), &vm, APP, &add(&[user("bob")]));
     assert_opens(&vm, &bob(), APP, "bob, shared with");
-    let sql = superuser(&postgres);
 
-    hold_commits(&sql, &postgres);
+    postgres.hold();
     change_lost(&vm, &remove(&[user("bob")]));
     assert!(
-        commits_waiting(&sql) > 0,
+        postgres.waiting() > 0,
         "expected the unshare's commit still on its way after its `503`"
     );
     // From that answer on: `503` for everyone, at once, bob and alice
     // alike.
     assert_503_for_a_while(&vm, &[bob(), alice()], "while the commit waits");
 
-    let_commits_through(&sql, &postgres);
+    postgres.let_through();
     settle(&vm, &bob(), &alice(), "once commits go through");
     let after = lists(&vm);
     assert_eq!(
@@ -298,13 +218,12 @@ fn an_unshare_whose_answer_is_lost_lets_the_person_in_never_again() {
 fn a_share_whose_answer_is_lost_is_not_refused_for_ever() {
     let (postgres, _options, vm) = with_board("vm_platform_lost_share");
     assert_cannot_open(&vm, &carol(), APP, "carol, not shared with");
-    let sql = superuser(&postgres);
 
-    hold_commits(&sql, &postgres);
+    postgres.hold();
     change_lost(&vm, &add(&[user("carol")]));
     assert_503_for_a_while(&vm, &[carol(), alice()], "while the commit waits");
 
-    let_commits_through(&sql, &postgres);
+    postgres.let_through();
     let deadline = Instant::now() + SETTLE;
     loop {
         let response = open_quickly(&vm, &carol(), "once commits go through");
@@ -332,9 +251,8 @@ fn a_program_started_while_an_unshare_is_on_its_way_never_lets_the_person_in() {
     let (postgres, options, vm) = with_board("vm_platform_lost_at_start");
     share_ok(&vm.api_as(&alice()), &vm, APP, &add(&[user("bob")]));
     assert_opens(&vm, &bob(), APP, "bob, shared with");
-    let sql = superuser(&postgres);
 
-    hold_commits(&sql, &postgres);
+    postgres.hold();
     // The unshare is sent; once its commit waits, the program is killed.
     let request = vm
         .api_as(&alice())
@@ -344,7 +262,7 @@ fn a_program_started_while_an_unshare_is_on_its_way_never_lets_the_person_in() {
         .timeout(Duration::from_secs(60));
     thread::scope(|scope| {
         let sending = scope.spawn(|| request.try_send());
-        wait_for_a_waiting_commit(&sql, "the unshare");
+        postgres.wait_for_waiting(1, "the unshare");
         drop(vm);
         // Whatever it got (most likely no answer at all).
         drop(sending.join());
@@ -366,10 +284,10 @@ fn a_program_started_while_an_unshare_is_on_its_way_never_lets_the_person_in() {
                 thread::sleep(Duration::from_millis(300));
             }
             assert!(
-                commits_waiting(&sql) > 0,
+                postgres.waiting() > 0,
                 "expected the unshare's commit still waiting"
             );
-            let_commits_through(&sql, &postgres);
+            postgres.let_through();
             settle(
                 &vm,
                 &bob(),
@@ -382,7 +300,7 @@ fn a_program_started_while_an_unshare_is_on_its_way_never_lets_the_person_in() {
             // It did not start while the commit waited: allowed. Once
             // commits go through, a program starts and serves by the lists
             // as the database has them.
-            let_commits_through(&sql, &postgres);
+            postgres.let_through();
             let vm = Vm::start(&options);
             settle(&vm, &bob(), &alice(), "started after commits go through");
             assert_eq!(lists(&vm)["shared_with"], json!([]));

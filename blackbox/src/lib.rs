@@ -77,7 +77,11 @@
 //!   makes an Application for a test (the fixtures [`Vm`] installs, the
 //!   helpers of [`api`], [`scenario`], [`own_database`], [`sdk`] and
 //!   [`transactions`]) shares it with everyone, since those tests are not
-//!   about who can open it.
+//!   about who can open it;
+//! - [`lost_answer`] is what the tests of a write whose answer is lost
+//!   share: a Postgres of the test's own whose commits the harness can make
+//!   wait and let through, and the `host-call` record that says what the
+//!   host decided while they wait.
 //!
 //! Every wait has a timeout, so a failing test fails within seconds and
 //! never hangs. Each test starts its own program on its own port, so tests
@@ -111,6 +115,7 @@ pub mod left_behind;
 pub mod local;
 pub mod log;
 pub mod logs;
+pub mod lost_answer;
 pub mod oidc;
 pub mod out_of_reach;
 pub mod own_database;
