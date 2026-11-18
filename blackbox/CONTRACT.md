@@ -1797,7 +1797,7 @@ The black-box harness has an identity provider of its own (`blackbox`, no produc
 
 - The tool's own sign-in (`vm sign-in`) still uses the stand-in: the ticket "The tool signs in through the browser" (closed there).
 - Whom an Application is shared with: the ticket on Contributors and sharing ("Contributors and sharing: Opening an Application"). Until then every signed-in User may open every Application.
-- The Dashboard at `dashboard.<domain>`: its ticket; it signs in by the same way through.
+- The Dashboard at `dashboard.<domain>`: its ticket; it signs in by the same way through ("The Dashboard: Signing in to it").
 - Signing out at the identity provider, and being signed out by it (back-channel logout).
 - TLS: the program listens in plain HTTP behind what ends TLS (the ticket on installing).
 - An identity provider whose certificate is signed by a company's own certificate authority: the program trusts the public roots compiled into it and no other (the ticket on installing).
@@ -1980,7 +1980,7 @@ vm contributors remove <application> (--user <id> | --email <address> | --group 
 ### What this does not close
 
 - A Platform administrator changing the Contributors of an Application whose Contributors have all left (the ticket on what Platform administrators see lists every Application; taking one over is not built).
-- Sharing from the Dashboard, and the list there: the ticket on the Dashboard.
+- Sharing from the Dashboard, and the list there: the ticket on the Dashboard ("The Dashboard").
 - A record of who was removed and when, beyond the log's line: each entry says who added it and when; a removal leaves only the log.
 - Disabling and deleting an Application: their ticket.
 
@@ -2013,3 +2013,77 @@ From that answer on, **the program never goes on deciding by what it held** whil
 
 - The Operation log and the Change history are written by the program and read from the platform database; they are not held in memory and are not part of this.
 - Sessions and tool credentials are read from the platform database at each use.
+
+## The Dashboard (ticket: The Dashboard)
+
+The first page an employee sees: the Applications they contribute to and those shared with them, what each one is, what of it will not work for them, and, for a Contributor, the sharing of it. The program serves it at **the Dashboard's address**, `<scheme>://dashboard.<domain>[:<port>]` (written as "Sign-in and sessions: Starting with OIDC" writes an Application's address). It is pages of the platform's own with links and forms and **no script**: it works in a browser that runs none.
+
+### Signing in to it
+
+- With OIDC the Dashboard is signed in to exactly as an Application is ("Sign-in and sessions: The way through sign-in"), with `dashboard` where the Application's name is. Step 1 on the Dashboard's address: a `GET` or `HEAD` whose `Accept` has `text/html` and that has no session there is answered `302` to `<sign-in address>/sign-in?application=dashboard&next=...&state=...`, any other request `401`, `text/plain`. Step 2: from this ticket on the sign-in address takes `dashboard` as it takes a known Application (never its `404`). Step 4 at `<the Dashboard's address>/_vm/session`. Its session cookie has the name and attributes of an Application's and is valid on the Dashboard's address only: an Application's cookie is no session there, and the Dashboard's is none on an Application's address, on the API or on the sign-in address. Renewal, the end of a session and sign-out are those of every Application session: `POST <sign-in address>/sign-out` ends the Dashboard's too.
+- With the stand-in: the `x-vm-stand-in-*` headers, as everywhere. With neither: "Not signed in", as everywhere.
+- A request from another origin is refused as "Sign-in and sessions: Whose request it is" says, with the Dashboard's address in place of the Application's: no other page, an Application's included, can share an Application in someone's name or read the Dashboard.
+- **Opening an Application from the Dashboard does not ask to sign in again.** An Application's link is its address; a browser with a platform session goes through steps 1, 2 and 4 there without the identity provider being asked ("One sign-in for all").
+- A request to the Dashboard has a `request` record like any other, with `application` and `version` null.
+
+### What it answers
+
+| Request | Answer |
+|---|---|
+| `GET /` | `200`, the list (below); `400` for a `page` that is not a whole number from 1 to 10000 |
+| `GET /applications/<name>` | `200`, one Application (below) |
+| `POST /applications/<name>/sharing` | a change of whom it is shared with (below) |
+| One of these paths with another method | `405`, with `allow` |
+| Any other path | `404` |
+
+- `HEAD` is answered as `GET`, without a body.
+- Every answer to someone signed in is a page of the platform's own, the refusals included: `text/html; charset=utf-8`, with the headers every such page has ("Contributors and sharing: Opening an Application": `cache-control: no-store`, `x-content-type-options: nosniff`, `referrer-policy: no-referrer`, a `content-security-policy` with `default-src 'none'` and `frame-ancestors 'none'`), and a policy that lets a form lead only to the Dashboard itself (`form-action 'self'`). No page has a `<script>`, an event-handler attribute or a `javascript:` address.
+- **Everything on a page that is not the platform's own text is escaped as HTML**, in text and in attributes alike: names, descriptions, Groups, user ids, people's names and emails, a Resource's contact. A description of `<script>alert(1)</script>` is shown as those characters.
+- Every page says whom the person is signed in as: an element with `data-vm-user="<user id>"`, whose text has their name when the platform knows it. With OIDC it has a link to `<sign-in address>/sign-out`; with the stand-in none.
+- While the platform database cannot be reached: `503` with `retry-after`, a page saying to try again shortly.
+
+Pages are read by people; the attributes named `data-vm-...` below are what a test (and a Coding agent) reads. The words beside them say the same.
+
+### The list (`GET /`)
+
+- **Exactly the Applications `GET /v1/applications` answers that User**: those they are a Contributor of, then those they can open besides, each group by name. So the Dashboard and `vm applications` show the same Applications to the same person, and say the same of each which of the two it is. An Application with no serving Version is listed like any other.
+- 100 Applications to a page. `?page=<n>` is the n-th page of that order (from 1; without it, the first). When there are more, the page has a link `a[data-vm-next]` to the next one, and from the second on a link `a[data-vm-previous]`. A page past the last is `200` with no Application. A page with no Application says so in words: on the first, that nothing is shared with the person yet and that an Application is made with the `vm` tool.
+- Each Application is one element with `data-vm-application="<name>"`, `data-vm-relation="contributor"` or `"shared"`, and `data-vm-serving="<the serving Version's number>"` or `"none"`. Inside it:
+  - its name, and its description when it has one, in an element with `data-vm-description`;
+  - when a Version serves: a link `a[data-vm-open]` whose `href` is the Application's address in full, with the path `/` (`<scheme>://<name>.<domain>[:<port>]/`). When none serves: no such link, and words saying that nothing is deployed yet;
+  - a link `a[data-vm-details]` to `/applications/<name>`;
+  - its Contributors, in the order of the list, the first 20: each an element with `data-vm-contributor="user"` or `"group"` and `data-vm-id="<user id or Group>"`, whose text is the person's name when the platform knows it (and their id), or the Group. When there are more than 20: an element with `data-vm-more-contributors="<how many more>"`;
+  - **the Resources its serving Version declares**, by name: each an element with `data-vm-resource="<name>"`, `data-vm-declared="<the declared level>"`, `data-vm-yours="structure" | "read" | "write" | "none" | "unknown"` (what `your_access` of `GET /v1/resources/<name>` says for that User; `none` for no Grant and for a Resource that is not registered; `unknown` while the program cannot tell, "A write whose answer is lost"), and `data-vm-standing`:
+
+    | `data-vm-standing` | When | What the words say |
+    |---|---|---|
+    | `enough` | The User holds at least the declared level | nothing more |
+    | `lower` | The User holds a Grant below the declared level | what they hold, that what needs more will be refused for them, and whom to ask |
+    | `none` | The User holds no Grant on it | that this part of the Application will be refused for them, and whom to ask |
+    | `not-registered` | No Resource of that name is registered | that no such Resource is registered, so this part works for nobody yet |
+    | `unknown` | The program cannot tell just now | that it cannot be told just now |
+
+    For `lower` and `none` the element has `data-vm-ask="<the Resource's contact>"` and its text shows that contact: **whom to ask**. The mark is in words, not in colour alone. An Application that declares no Resource, or that no Version serves, has no such element.
+- Nothing of an Application the person cannot open is on any page of theirs.
+
+### One Application (`GET /applications/<name>`)
+
+- By whoever can open it, and by a Platform administrator, as `GET /v1/applications/<name>`. Anyone else: `403`, a page saying that the Application of that name is not shared with them and to ask one of its Contributors, naming none (as its own address answers them). A name no Application has, or that none could have: `404`.
+- The Application as in the list, in an element with the same attributes, with **every** Contributor (no `data-vm-more-contributors`), its address, and the same Resources.
+- **To a Contributor and to a Platform administrator: whom it is shared with**, in the order of the list: each an element with `data-vm-shared="user" | "group" | "everyone"` and, for the first two, `data-vm-id`; a person with their name and email when known. When it is shared with nobody, words saying that only its Contributors can open it. To anyone else no such element, and words saying that only its Contributors see whom it is shared with.
+- **To a Contributor: the forms.** One `form[data-vm-form="share"]` and, beside each entry of whom it is shared with, one `form[data-vm-form="unshare"]`; each `method="post"` with `action="/applications/<name>/sharing"`. Someone who is not a Contributor gets no form. With `?changed=shared`, `?changed=unshared` or `?changed=nothing` the page has an element with `data-vm-notice` of that value saying so (what a change redirects to); any other `changed` is ignored.
+
+### Sharing from it (`POST /applications/<name>/sharing`)
+
+- The body is `application/x-www-form-urlencoded`, at most 4 KiB, with the fields `action` (`share` or `unshare`), `kind` (`email`, `user`, `group` or `everyone`) and `value` (the email address, user id or Group; surrounding white space dropped; not looked at for `everyone`). The share form has a `select` or radio buttons named `kind` with those four values and a text input named `value`; each unshare form has its three fields hidden, naming its entry (a person by `user`).
+- **It is the change `POST /v1/applications/<name>/sharing` makes** with that one entry in `add` (`share`) or in `remove` (`unshare`): by a Contributor, with the same rules, the same refusals and the same `sharing-changed` record. It takes effect as that change does: the person shared with finds the Application on their Dashboard and opens it at their next request, and after an unshare neither.
+- Made: `303` to `/applications/<name>?changed=shared` or `?changed=unshared`, or `?changed=nothing` when everything was so already.
+- Refused: a page with the status the API gives and an element with `data-vm-error="<the API's reason>"` whose text says what the API's message says, and a link `a[data-vm-back]` to `/applications/<name>`; nothing is changed. `404` `not-found`; `403` `not-a-contributor` (also for someone who cannot open it, as on the API); `400` `malformed` (another content type, a body over 4 KiB, a field missing or given twice, an `action` or `kind` that is none of those, a `value` the API would not take); `422` `unknown-email`; `409` `ambiguous-email`; `409` `too-many`; `503` `unavailable`.
+- A Contributor cannot take themselves off the Contributors here, and nobody is made a Contributor here: the Contributors are changed with the tool.
+
+### What this does not close
+
+- Changing the Contributors, creating, describing, disabling or deleting an Application from the Dashboard.
+- Searching the list.
+- What a Platform administrator sees of every Application: its ticket. Here an administrator's list is their own, as anyone's.
+- A Dashboard in another language than English.
