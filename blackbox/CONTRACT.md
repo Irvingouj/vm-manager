@@ -2107,6 +2107,7 @@ A local run that ends `postgres-failed` (exit code `1`; "The local loop: one req
   - `"cause"`: `"timed-out"`, `"connection"`, `"server"` or `"ended"`;
   - `"limit_seconds"`: a number, with `timed-out` only;
   - `"sqlstate"`: five characters, with `server` only.
+  A member that does not apply is left out, not `null`. When a step was tried more than once before the run gave up (a connection opened again and again), `limit_seconds` is the whole time the run gave the step, and the words say that time, not one try's.
 - Nothing of a password or a connection string is in any of them.
 - The exit code, the reason, and that nothing the run started is left running are unchanged.
 
