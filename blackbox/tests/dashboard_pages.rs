@@ -14,7 +14,9 @@
 
 use std::time::Duration;
 
-use blackbox::dashboard::{Dashboard, Page, create, deploy, form_body, stand_in_options, start};
+use blackbox::dashboard::{
+    Dashboard, Page, assert_refused, create, deploy, form_body, stand_in_options, start,
+};
 use blackbox::postgres::{Platform, PrivatePostgres};
 use blackbox::sharing::{add, assert_own_page_headers, contributors_ok, group, share_ok};
 use blackbox::{Request, User, Vm};
@@ -308,6 +310,22 @@ fn with_the_platform_database_stopped_a_page_is_503_with_retry_after() {
             page.describe()
         );
     }
+    // A change: `503` with `retry-after` and `data-vm-error="unavailable"`.
+    let change = dashboard
+        .form_request(
+            &Dashboard::sharing_target(APP),
+            &form_body(&[("action", "share"), ("kind", "user"), ("value", "bob")]),
+        )
+        .timeout(Duration::from_secs(40))
+        .send();
+    assert_refused(
+        change,
+        &dashboard.url("/"),
+        503,
+        "unavailable",
+        APP,
+        "a change of sharing while the platform database cannot be reached",
+    );
 }
 
 #[test]

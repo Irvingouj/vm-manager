@@ -21,15 +21,15 @@
 use blackbox::api::version_body;
 use blackbox::browser::{Browser, Step, describe_steps, query_param};
 use blackbox::dashboard::{
-    Page, api_message, assert_changed, assert_refused, error_text, oidc_page, oidc_post,
-    oidc_sign_in, oidc_url,
+    Page, assert_changed, assert_refusal_words, assert_refused, oidc_page, oidc_post, oidc_sign_in,
+    oidc_url,
 };
 use blackbox::oidc::Person;
 use blackbox::sessions::{
     ADA, GRACE, Installation, SESSION_COOKIE, SIGN_IN_COOKIE, ada, assert_platform_cookie, grace,
     the_set_cookie,
 };
-use blackbox::sharing::{TRACED, add, email, keys, user};
+use blackbox::sharing::{TRACED, add, keys, user};
 use blackbox::tool::bearer;
 use blackbox::{DOMAIN, Request, Response, fixture_bundle};
 use serde_json::{Value, json};
@@ -581,17 +581,10 @@ fn an_email_nobody_signed_in_with_is_422_and_one_two_people_signed_in_with_is_40
         let (action, body) = page.share_submission("email", address);
         let answer = oidc_post(&mut browser, &page, &action, &body);
         let refused = assert_refused(answer, &oidc_url(&at, "/"), status, reason, APP, address);
-        let api = post(
-            &at,
-            &credential,
-            &format!("/v1/applications/{APP}/sharing"),
-            &add(&[email(address)]),
-        );
-        let message = api_message(&api);
-        assert!(
-            !message.is_empty() && error_text(&refused).contains(&message),
-            "{address}: expected the element `data-vm-error` to say what the API's message says ({message:?}), got {:?}",
-            error_text(&refused)
+        assert_refusal_words(
+            &refused,
+            &[&[address], &["user id", "user ID"]],
+            &format!("{address}: {reason} names the address as given and says to use the user id"),
         );
     }
     assert!(

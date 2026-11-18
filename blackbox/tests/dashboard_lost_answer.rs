@@ -15,8 +15,10 @@
 
 use std::thread;
 
-use blackbox::dashboard::{Dashboard, assert_refused, create, deploy, form_body, stand_in_options};
-use blackbox::lost_answer::{HeldPostgres, LOST_WRITE_TIMEOUT};
+use blackbox::dashboard::{
+    Dashboard, Page, assert_refused, create, deploy, form_body, stand_in_options,
+};
+use blackbox::lost_answer::{HeldPostgres, LOST_WRITE_TIMEOUT, quickly};
 use blackbox::scenario::{CONTACT, Scenario, administrator};
 use blackbox::{User, Vm, assert_api_error};
 use serde_json::json;
@@ -73,7 +75,21 @@ fn while_a_grant_cannot_be_told_its_standing_is_unknown_and_then_what_the_databa
     assert_api_error(&lowered, 503, "unavailable");
     postgres.assert_waiting(1, "after the Grant's `503`");
 
-    let page = Dashboard::new(vm, &alice()).list();
+    // Answered `200` within the bound of the API's reading, never held
+    // until the write is settled.
+    let dashboard = Dashboard::new(vm, &alice());
+    let answer = quickly(
+        vm,
+        &dashboard.navigation("GET", "/"),
+        "the list while the Grants on crewdb cannot be told",
+    );
+    assert_eq!(
+        answer.status,
+        200,
+        "expected the list answered `200` all the same while the Grants on crewdb cannot be told\n{}",
+        answer.describe()
+    );
+    let page = Page::read(answer, dashboard.url("/"), "the list meanwhile");
     let board = page.listed(APP);
     let crewdb = board.resource("crewdb");
     assert_eq!(

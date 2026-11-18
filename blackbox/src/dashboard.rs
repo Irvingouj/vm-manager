@@ -914,9 +914,21 @@ pub fn assert_refused(
     let errors = page.errors();
     assert!(
         matches!(errors.as_slice(), [(r, text)] if r == reason && !text.is_empty()),
-        "{context}: expected one element `data-vm-error={reason:?}` saying what the API's message says, got {errors:?}\n{}",
+        "{context}: expected one element `data-vm-error={reason:?}` with words, got {errors:?}\n{}",
         page.describe()
     );
+    let text = error_text(&page);
+    assert!(
+        !text.contains("/v1/"),
+        "{context}: expected the words of the refusal to have no path of the API, they are {text:?}"
+    );
+    if status == 503 {
+        assert!(
+            page.response.header("retry-after").is_some(),
+            "{context}: expected `retry-after` on the `503`\n{}",
+            page.describe()
+        );
+    }
     let back = page.link("data-vm-back");
     assert!(
         back.as_ref()
@@ -937,30 +949,21 @@ pub fn error_text(page: &Page) -> String {
         .unwrap_or_default()
 }
 
-/// The `error.message` of an answer of the API, white space squashed.
-pub fn api_message(response: &Response) -> String {
-    let body: Value = serde_json::from_slice(response.body()).unwrap_or(json!({}));
-    body["error"]["message"]
-        .as_str()
-        .unwrap_or_default()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-/// Fails unless the refusal page's error says what the API's message
-/// says (the API's message, white space squashed, is in its text).
-pub fn assert_says_api_message(page: &Page, api: &Response, context: &str) {
-    let message = api_message(api);
-    assert!(
-        !message.is_empty(),
-        "the harness's own check, {context}: the API answered no message\n{}",
-        api.describe()
-    );
+/// Fails unless the words of a refusal's `data-vm-error` are for a person
+/// at a browser and name what the refusal is about: each of `named` is in
+/// them (any one of the alternatives of each), and no path of the API
+/// (`/v1/`) is.
+pub fn assert_refusal_words(page: &Page, named: &[&[&str]], context: &str) {
     let text = error_text(page);
+    for alternatives in named {
+        assert!(
+            alternatives.iter().any(|a| text.contains(a)),
+            "{context}: expected the words of the refusal to name {alternatives:?}, they are {text:?}"
+        );
+    }
     assert!(
-        text.contains(&message),
-        "{context}: expected the element `data-vm-error` to say what the API's message says ({message:?}), its text is {text:?}"
+        !text.contains("/v1/"),
+        "{context}: expected the words of the refusal to be for a person at a browser, with no path of the API, they are {text:?}"
     );
 }
 

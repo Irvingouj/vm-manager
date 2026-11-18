@@ -18,11 +18,11 @@
 )]
 
 use blackbox::dashboard::{
-    Dashboard, MAX_FORM_BODY, assert_changed, assert_refused, assert_says_api_message, create,
-    deploy, form_body, read_back, start,
+    Dashboard, MAX_FORM_BODY, assert_changed, assert_refusal_words, assert_refused, create, deploy,
+    form_body, read_back, start,
 };
 use blackbox::sharing::{
-    MAX_SHARED_WITH, add, assert_cannot_open, assert_opens, email, group, keys, share_ok, user,
+    MAX_SHARED_WITH, add, assert_cannot_open, assert_opens, group, keys, share_ok, user,
 };
 use blackbox::{Response, User, Vm};
 use serde_json::Value;
@@ -265,6 +265,35 @@ fn a_change_that_changes_nothing_leads_to_the_notice_nothing() {
 }
 
 #[test]
+fn for_everyone_the_value_may_be_left_out() {
+    let vm = with_board();
+    let dashboard = Dashboard::new(&vm, &alice());
+    let target = Dashboard::sharing_target(APP);
+    assert_changed(
+        &dashboard.post_form(
+            &target,
+            &form_body(&[("action", "share"), ("kind", "everyone")]),
+        ),
+        &dashboard.url("/"),
+        APP,
+        "shared",
+        "everyone, with no `value` field",
+    );
+    assert_eq!(shared_with(&vm), strings(&["everyone"]));
+    assert_changed(
+        &dashboard.post_form(
+            &target,
+            &form_body(&[("action", "unshare"), ("kind", "everyone")]),
+        ),
+        &dashboard.url("/"),
+        APP,
+        "unshared",
+        "unsharing everyone, with no `value` field",
+    );
+    assert!(shared_with(&vm).is_empty());
+}
+
+#[test]
 fn surrounding_white_space_of_the_value_is_dropped() {
     let vm = with_board();
     let dashboard = Dashboard::new(&vm, &alice());
@@ -451,11 +480,6 @@ fn a_form_that_is_not_such_a_form_is_400_malformed_and_changes_nothing() {
     );
 }
 
-/// The API's answer to the same change, for its message.
-fn api_answer(vm: &Vm, person: &User, application: &str, body: &Value) -> Response {
-    vm.api_as(person).change_sharing(application, body)
-}
-
 #[test]
 fn not_found_and_not_a_contributor_are_refused_as_the_api_refuses_them() {
     let vm = with_board();
@@ -471,10 +495,10 @@ fn not_found_and_not_a_contributor_are_refused_as_the_api_refuses_them() {
         "nope",
         "an Application of no name it has",
     );
-    assert_says_api_message(
+    assert_refusal_words(
         &page,
-        &api_answer(&vm, &alice(), "nope", &add(&[user("dave")])),
-        "not-found",
+        &[&["nope"]],
+        "not-found names the Application's name",
     );
 
     for (person, why) in [
@@ -490,10 +514,12 @@ fn not_found_and_not_a_contributor_are_refused_as_the_api_refuses_them() {
             APP,
             why,
         );
-        assert_says_api_message(
+        assert_refusal_words(
             &page,
-            &api_answer(&vm, &person, APP, &add(&[user("dave")])),
-            why,
+            &[&["Contributor", "contributor"]],
+            &format!(
+                "{why}: says only the Application's Contributors change whom it is shared with"
+            ),
         );
         assert!(
             !page.response.text().contains("alice"),
@@ -530,10 +556,10 @@ fn an_email_nobody_signed_in_with_is_422_unknown_email() {
         APP,
         "an email with the stand-in, which keeps no record of people",
     );
-    assert_says_api_message(
+    assert_refusal_words(
         &page,
-        &api_answer(&vm, &alice(), APP, &add(&[email(address)])),
-        "unknown-email",
+        &[&[address], &["user id", "user ID"]],
+        "unknown-email names the address as given and says to use the person's user id",
     );
     assert!(shared_with(&vm).is_empty());
 }
@@ -566,10 +592,10 @@ fn one_more_than_1000_entries_is_409_too_many() {
         APP,
         "a 1001st entry",
     );
-    assert_says_api_message(
+    assert_refusal_words(
         &page,
-        &api_answer(&vm, &alice(), APP, &add(&[group("one-more")])),
-        "too-many",
+        &[&["1,000", "1000"]],
+        "too-many names the bound of 1,000",
     );
     assert_eq!(
         shared_with(&vm).len(),
