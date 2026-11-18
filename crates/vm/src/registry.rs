@@ -443,9 +443,17 @@ pub struct ShownApplication {
     pub declared: Declared,
     /// How many Contributors it has.
     pub contributors_count: i64,
-    /// Its first Contributors, in the order of the list: what each names,
-    /// and a person's name as last read at their sign-in.
-    pub contributors: Vec<(Named, Option<String>)>,
+    /// Its first Contributors, in the order of the list.
+    pub contributors: Vec<ShownPerson>,
+}
+
+/// A Contributor as the Dashboard's list shows them: what the entry names,
+/// and a person's name and email as last read at their sign-in.
+#[derive(Debug)]
+pub struct ShownPerson {
+    pub named: Named,
+    pub name: Option<String>,
+    pub email: Option<String>,
 }
 
 /// Where a User stands with an Application, by its two lists.
@@ -1201,7 +1209,7 @@ impl Registry {
     /// what [`Registry::listed_for`] gives: the Resources its serving
     /// Version declares, how many Contributors it has, and its first
     /// `first` Contributors in the order of the list, a person with the
-    /// name the platform last read of them. One query, whatever the number
+    /// name and the email the platform last read of them. One query, whatever the number
     /// of names; at most `first` Contributors of each are read.
     pub async fn shown(
         &self,
@@ -1217,14 +1225,15 @@ impl Registry {
                         "SELECT a.name, v.declared_access,
                                 (SELECT count(*) FROM application_entries e
                                   WHERE e.application_id = a.id AND e.list = 'contributors'),
-                                c.kinds, c.names, c.people
+                                c.kinds, c.names, c.people, c.emails
                          FROM applications a
                          LEFT JOIN versions v ON v.application_id = a.id
                                              AND v.number = a.serving_version
                          CROSS JOIN LATERAL (
                             SELECT coalesce(array_agg(f.kind ORDER BY f.id), '{}') AS kinds,
                                    coalesce(array_agg(f.name ORDER BY f.id), '{}') AS names,
-                                   coalesce(array_agg(u.name ORDER BY f.id), '{}') AS people
+                                   coalesce(array_agg(u.name ORDER BY f.id), '{}') AS people,
+                                   coalesce(array_agg(u.email ORDER BY f.id), '{}') AS emails
                             FROM (SELECT e.id, e.kind, e.name FROM application_entries e
                                   WHERE e.application_id = a.id AND e.list = 'contributors'
                                   ORDER BY e.id LIMIT $2) f
@@ -1242,9 +1251,16 @@ impl Registry {
             let kinds: Vec<&str> = get(row, 3)?;
             let entries: Vec<String> = get(row, 4)?;
             let people: Vec<Option<String>> = get(row, 5)?;
+            let emails: Vec<Option<String>> = get(row, 6)?;
             let mut contributors = Vec::with_capacity(kinds.len());
-            for ((kind, name), person) in kinds.into_iter().zip(entries).zip(people) {
-                contributors.push((Named::of_stored(kind, name)?, person));
+            for (((kind, name), person), email) in
+                kinds.into_iter().zip(entries).zip(people).zip(emails)
+            {
+                contributors.push(ShownPerson {
+                    named: Named::of_stored(kind, name)?,
+                    name: person,
+                    email,
+                });
             }
             shown.insert(
                 get::<String>(row, 0)?,

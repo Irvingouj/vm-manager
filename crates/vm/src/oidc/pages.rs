@@ -3,13 +3,16 @@
 //! Application), its plain refusals and its redirects.
 //!
 //! **Every answer** carries `cache-control: no-store`,
-//! `x-content-type-options: nosniff`, `referrer-policy: no-referrer` and a
-//! `content-security-policy` that lets a page run no script, load nothing
-//! and be shown inside no other page ([`POLICY`]): [`own_headers`], which
-//! Ingress's own plain answers carry too. A page has no script. Everything on a page that is not
-//! the platform's own text (an Application's name, an address, a code of
-//! the provider's) is escaped as HTML ([`escape`]). Nothing of a token, a
-//! code or a secret is ever on a page.
+//! `x-content-type-options: nosniff`, `referrer-policy: same-origin` (no
+//! address of the platform's is told to another origin, and a form is sent
+//! with the page's real origin) and a `content-security-policy` that lets
+//! a page run no script, load nothing and be shown inside no other page
+//! ([`POLICY`]): [`own_headers`], which Ingress's own plain answers and
+//! the Dashboard's pages (crate::dashboard) carry too. A page has no
+//! script. Everything on a page that is not the platform's own text (an
+//! Application's name, an address, a code of the provider's) is escaped as
+//! HTML ([`escape`]). Nothing of a token, a code or a secret is ever on a
+//! page.
 
 use bytes::Bytes;
 use http_body_util::Full;
@@ -56,7 +59,7 @@ pub fn escape(text: &str) -> String {
 pub fn own_headers(headers: &mut HeaderMap) {
     headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
     headers.insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
-    headers.insert(REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
+    headers.insert(REFERRER_POLICY, HeaderValue::from_static("same-origin"));
     headers.insert(CONTENT_SECURITY_POLICY, HeaderValue::from_static(POLICY));
 }
 

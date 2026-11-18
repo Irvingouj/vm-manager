@@ -209,6 +209,7 @@ impl Ingress {
                 Err(error) => return self.unavailable(viewer, &error),
             }
         };
+        let records = viewer.records_people();
         let declared: BTreeSet<&str> = shown
             .values()
             .flat_map(|s| s.declared.keys().map(String::as_str))
@@ -221,11 +222,11 @@ impl Ingress {
                 pages::Block {
                     name: &listed.name,
                     description: listed.description.as_deref(),
-                    relation: Some(if listed.contributor {
+                    relation: if listed.contributor {
                         "contributor"
                     } else {
                         "shared"
-                    }),
+                    },
                     serving: listed.serving_version,
                     open: listed
                         .serving_version
@@ -235,8 +236,13 @@ impl Ingress {
                     contributors: shown.map_or_else(Vec::new, |s| {
                         s.contributors
                             .iter()
-                            .map(|(named, person)| {
-                                pages::Person::of(named, person.as_deref(), None)
+                            .map(|p| {
+                                pages::Person::of(
+                                    &p.named,
+                                    p.name.as_deref(),
+                                    p.email.as_deref(),
+                                    records,
+                                )
                             })
                             .collect()
                     }),
@@ -281,6 +287,7 @@ impl Ingress {
             Err(error) => return self.unavailable(viewer, &error),
         };
         let declared = shown.get(name).map(|s| &s.declared);
+        let records = viewer.records_people();
         let seen = self
             .seen(
                 user,
@@ -290,12 +297,14 @@ impl Ingress {
                     .collect(),
             )
             .await;
+        // A Platform administrator it is not shared with reads it, and is
+        // offered nothing that would be refused.
         let relation = if contributor {
-            Some("contributor")
+            "contributor"
         } else if opens {
-            Some("shared")
+            "shared"
         } else {
-            None
+            "none"
         };
         let block = pages::Block {
             name: &record.name,
@@ -304,6 +313,7 @@ impl Ingress {
             serving: record.serving_version,
             open: record
                 .serving_version
+                .filter(|_| opens)
                 .map(|_| self.open_address(&record.name, port)),
             address: Some(
                 self.public
@@ -313,7 +323,9 @@ impl Ingress {
             contributors: record
                 .contributors
                 .iter()
-                .map(|e| pages::Person::of(&e.named, e.name.as_deref(), e.email.as_deref()))
+                .map(|e| {
+                    pages::Person::of(&e.named, e.name.as_deref(), e.email.as_deref(), records)
+                })
                 .collect(),
             more_contributors: 0,
             declared,
@@ -323,7 +335,9 @@ impl Ingress {
             record
                 .shared_with
                 .iter()
-                .map(|e| pages::Person::of(&e.named, e.name.as_deref(), e.email.as_deref()))
+                .map(|e| {
+                    pages::Person::of(&e.named, e.name.as_deref(), e.email.as_deref(), records)
+                })
                 .collect()
         });
         pages::application(

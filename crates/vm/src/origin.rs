@@ -124,14 +124,29 @@ const SEC_FETCH_DEST: &str = "sec-fetch-dest";
 ///   `Origin`);
 /// - an `OPTIONS`: an `Origin` that is not `own`.
 ///
+/// **An `Origin` of `null` together with `Sec-Fetch-Site: same-origin` is
+/// `own`**, in all three: it is what a browser sends with a form posted
+/// from a page of this very origin whose referrer policy is `no-referrer`.
+/// So in the `GET` and `HEAD` branch it is taken as any request of the
+/// own origin is (`same-origin` is no other site; the navigation exception,
+/// which asks for no `Origin`, is not needed for it). `null` with any other
+/// `Sec-Fetch-Site`, or with none, stays another origin. `Sec-Fetch-Site`
+/// can be trusted for this, and only for this: a browser sets it itself (no
+/// page can), and says `same-origin` only when the page that made the
+/// request, and every redirect on the way, is of this very origin; a page
+/// with no origin (a sandboxed frame, a `data:` address) is `cross-site`.
+/// It tells nothing of a request that is no browser's, which may say
+/// anything, and such a request has no session of a browser to borrow.
+///
 /// A request with neither header is no browser's, and is taken.
 pub fn from_another_origin(method: &Method, headers: &HeaderMap, own: &str) -> bool {
     let origin = one(headers, &ORIGIN);
-    let foreign = origin.is_some_and(|o| !o.trim().eq_ignore_ascii_case(own));
     let site = one(headers, &HeaderName::from_static(SEC_FETCH_SITE));
     let is = |value: Option<&str>, wanted: &str| {
         value.is_some_and(|v| v.trim().eq_ignore_ascii_case(wanted))
     };
+    let null_of_own = is(origin, "null") && is(site, "same-origin");
+    let foreign = !null_of_own && origin.is_some_and(|o| !o.trim().eq_ignore_ascii_case(own));
     if *method == Method::OPTIONS {
         return foreign;
     }

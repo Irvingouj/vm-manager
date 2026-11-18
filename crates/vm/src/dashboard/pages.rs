@@ -1,6 +1,6 @@
 //! The Dashboard's pages: HTML of the platform's own, with the headers
 //! every page of the platform's own carries (crate::oidc::pages's
-//! `own_headers`: `no-store`, `nosniff`, `no-referrer`, and a policy with
+//! `own_headers`: `no-store`, `nosniff`, `same-origin`, and a policy with
 //! `default-src 'none'`, `frame-ancestors 'none'` and `form-action
 //! 'self'`), one small inline stylesheet, no script, no outside resource.
 //! Everything that is not the platform's own text is escaped as HTML
@@ -73,16 +73,47 @@ pub(crate) struct Viewer<'a> {
     pub sign_out: Option<String>,
 }
 
+impl Viewer<'_> {
+    /// Whether the platform keeps a record of people here: with OIDC (whose
+    /// pages link the sign-out); the stand-in keeps none.
+    pub fn records_people(&self) -> bool {
+        self.sign_out.is_some()
+    }
+}
+
 /// A person, a Group or everyone, as a page shows them.
 pub(crate) struct Person<'a> {
     named: &'a Named,
     name: Option<&'a str>,
     email: Option<&'a str>,
+    /// A person the platform has never seen: it keeps a record of people
+    /// (OIDC) and knows neither a name nor an email of them.
+    unseen: bool,
 }
 
 impl<'a> Person<'a> {
-    pub fn of(named: &'a Named, name: Option<&'a str>, email: Option<&'a str>) -> Self {
-        Self { named, name, email }
+    /// `records`: whether the platform keeps a record of people here
+    /// ([`Viewer::records_people`]).
+    pub fn of(
+        named: &'a Named,
+        name: Option<&'a str>,
+        email: Option<&'a str>,
+        records: bool,
+    ) -> Self {
+        let unseen =
+            records && matches!(named, Named::User(_)) && name.is_none() && email.is_none();
+        Self {
+            named,
+            name,
+            email,
+            unseen,
+        }
+    }
+
+    /// The attributes of a person's element beyond its kind and id:
+    /// `data-vm-unseen` for one never seen.
+    fn marks(&self) -> &'static str {
+        if self.unseen { " data-vm-unseen" } else { "" }
     }
 
     /// `user`, `group` or `everyone`, and the id or the Group.
@@ -94,8 +125,11 @@ impl<'a> Person<'a> {
         }
     }
 
-    /// The words: a person by name (and email when shown) and id, a Group
-    /// as a Group, everyone as everyone.
+    /// The words: a person by what is known of them (name, and email when
+    /// asked for or when there is no name) and id, or that they were not
+    /// seen signing in here yet, as the tool says it
+    /// (crate::tool::sharing's `entry_words`); a Group as a Group,
+    /// everyone as everyone.
     fn words(&self, with_email: bool) -> String {
         match self.named {
             Named::User(id) => {
@@ -103,10 +137,17 @@ impl<'a> Person<'a> {
                 if let Some(name) = self.name {
                     text.push_str(&format!("{} ", escape(name)));
                 }
-                if with_email && let Some(email) = self.email {
+                if (with_email || self.name.is_none())
+                    && let Some(email) = self.email
+                {
                     text.push_str(&format!("&lt;{}&gt; ", escape(email)));
                 }
                 text.push_str(&format!("<code>{}</code>", escape(id)));
+                if self.unseen {
+                    text.push_str(
+                        " <span class=\"muted\">(not seen signing in here yet: check the id)</span>",
+                    );
+                }
                 text
             }
             Named::Group(group) => format!("the Group <code>{}</code>", escape(group)),
@@ -119,9 +160,9 @@ impl<'a> Person<'a> {
 pub(crate) struct Block<'a> {
     pub name: &'a str,
     pub description: Option<&'a str>,
-    /// `contributor` or `shared`; none for a Platform administrator it is
-    /// not shared with.
-    pub relation: Option<&'static str>,
+    /// `contributor`, `shared`, or `none` for a Platform administrator it
+    /// is not shared with.
+    pub relation: &'static str,
     pub serving: Option<u64>,
     /// Its address with `/`, when a Version serves.
     pub open: Option<String>,
@@ -202,9 +243,8 @@ pub(crate) fn list(
     more: bool,
 ) -> Answer {
     let mut main = String::from("<h1>Your Applications</h1>");
-    let (mine, shared): (Vec<&Block<'_>>, Vec<&Block<'_>>) = blocks
-        .iter()
-        .partition(|b| b.relation == Some("contributor"));
+    let (mine, shared): (Vec<&Block<'_>>, Vec<&Block<'_>>) =
+        blocks.iter().partition(|b| b.relation == "contributor");
     for (heading, group) in [("You contribute to", mine), ("Shared with you", shared)] {
         if group.is_empty() {
             continue;
@@ -253,9 +293,7 @@ fn application_block(out: &mut String, block: &Block<'_>, level: u8) {
     out.push_str(&format!(
         "<article class=\"app\" data-vm-application=\"{name}\""
     ));
-    if let Some(relation) = block.relation {
-        out.push_str(&format!(" data-vm-relation=\"{relation}\""));
-    }
+    out.push_str(&format!(" data-vm-relation=\"{}\"", block.relation));
     match block.serving {
         Some(number) => {
             out.push_str(&format!(" data-vm-serving=\"{number}\">"));
@@ -275,7 +313,19 @@ fn application_block(out: &mut String, block: &Block<'_>, level: u8) {
                 escape(open)
             ));
         }
-        _ => out.push_str("<p class=\"muted\">Nothing is deployed yet: no Version serves it.</p>"),
+        (None, Some(number)) => {
+            out.push_str(&format!(
+                "<p class=\"muted\">Version {number} serves it.</p>"
+            ));
+        }
+        (_, None) => {
+            out.push_str("<p class=\"muted\">Nothing is deployed yet: no Version serves it.</p>")
+        }
+    }
+    if block.relation == "none" {
+        out.push_str(
+            "<p>You read this page as a Platform administrator. It is not shared with you, so you cannot open it: ask one of its Contributors to share it with you if you need to.</p>",
+        );
     }
     if let Some(address) = &block.address {
         out.push_str(&format!("<p>Address: <code>{}</code></p>", escape(address)));
@@ -289,8 +339,9 @@ fn application_block(out: &mut String, block: &Block<'_>, level: u8) {
     for person in &block.contributors {
         let (kind, id) = person.kind();
         out.push_str(&format!(
-            "<li data-vm-contributor=\"{kind}\" data-vm-id=\"{}\">{}</li>",
+            "<li data-vm-contributor=\"{kind}\" data-vm-id=\"{}\"{}>{}</li>",
             escape(id.unwrap_or_default()),
+            person.marks(),
             person.words(false)
         ));
     }
@@ -413,10 +464,7 @@ pub(crate) fn application(
                 if let Some(id) = id {
                     main.push_str(&format!(" data-vm-id=\"{}\"", escape(id)));
                 }
-                main.push_str(&format!(">{}", person.words(true)));
-                if kind == "user" && person.name.is_none() {
-                    main.push_str(" <span class=\"muted\">(has not signed in here)</span>");
-                }
+                main.push_str(&format!("{}>{}", person.marks(), person.words(true)));
                 if contributor {
                     main.push_str(&format!(
                         "<form data-vm-form=\"unshare\" method=\"post\" action=\"{action}\">\
