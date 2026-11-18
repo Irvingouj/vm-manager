@@ -76,6 +76,7 @@ use super::project_tools::{
     own_folder_failed, tool_failed,
 };
 use super::pull::Pull;
+use super::sharing::{entry_words, visible_to_words};
 use super::theirs::Theirs;
 use super::{
     Done, Ending, Output, get_signed_in, installation, not_success, project_of, read_kept, shaped,
@@ -263,15 +264,15 @@ fn maybe_live(reason: &str, why: &str) -> Ending {
 #[derive(Deserialize)]
 struct Application {
     address: String,
-    contributors: Vec<Contributor>,
+    /// Its Contributors, entries as the API answers them.
+    contributors: Vec<Value>,
+    /// Whom it is shared with: null to someone who is not a Contributor.
+    shared_with: Option<Vec<Value>>,
+    /// Whether the User is one of its Contributors.
+    contributor: bool,
     serving_version: Option<u64>,
     /// The highest-numbered Version, `None` when there is none.
     latest_version: Option<u64>,
-}
-
-#[derive(Deserialize)]
-struct Contributor {
-    user: String,
 }
 
 /// A Version's migrations as its record has them.
@@ -598,22 +599,30 @@ async fn application(kept: &Kept, manifest: &Manifest) -> Result<Option<Existing
         )?,
         StatusCode::NOT_FOUND => return Ok(None),
         StatusCode::UNAUTHORIZED => return Err(sign_in_expired(kept)),
+        // It exists, and the User cannot open it: none of its Contributors
+        // is named, as the API names none.
+        StatusCode::FORBIDDEN if refusal_is(&reply, "not-shared") => {
+            return Err(Ending::new(
+                3,
+                "not-a-contributor",
+                format!(
+                    "An Application named {name} exists on the installation and is not shared with you, so you cannot deploy to it. Choose another `name` in manifest.ts (it becomes the address), commit, then run vm deploy again; or, if that Application is meant to be this project, ask whoever maintains it to make you a Contributor. Nothing was built or sent"
+                ),
+            ));
+        }
         _ => return Err(not_success(kept.connect, &reply)),
     };
-    if !application
-        .contributors
-        .iter()
-        .any(|c| kept.user.is(&c.user))
-    {
-        let names: Vec<&str> = application
+    if !application.contributor {
+        let names: Vec<String> = application
             .contributors
             .iter()
-            .map(|c| c.user.as_str())
+            .map(|entry| entry_words(kept, entry))
             .collect();
-        return Err(Ending::theirs(
+        // The words of entries are escaped already ([`entry_words`]).
+        return Err(Ending::new(
             3,
             "not-a-contributor",
-            &format!(
+            format!(
                 "The installation already has an Application named {name}, and you are not one of its Contributors ({}), so you cannot deploy to it. Ask one of them to make you a Contributor, or choose another `name` in manifest.ts (it becomes the address), commit, then run vm deploy again; nothing was built or sent",
                 names.join(", ")
             ),
@@ -1163,6 +1172,17 @@ async fn create(ready: &Ready) -> Result<Application, Ending> {
     }
 }
 
+/// Whether `reply` is the API's refusal with this `reason`.
+fn refusal_is(reply: &client::Reply, reason: &str) -> bool {
+    reply
+        .json
+        .as_ref()
+        .and_then(|body| body.get("error"))
+        .and_then(|error| error.get("reason"))
+        .and_then(Value::as_str)
+        == Some(reason)
+}
+
 /// What `POST .../versions` answers.
 #[derive(Deserialize)]
 struct SentVersion {
@@ -1291,11 +1311,7 @@ pub(super) fn detailed_refusal(reason: &str, message: &str, fields: &[(&str, &st
 
 /// What a deploy that went live prints.
 fn deployed(ready: &Ready, application: &Application, created: bool, number: u64) -> Done {
-    let contributors: Vec<&str> = application
-        .contributors
-        .iter()
-        .map(|c| c.user.as_str())
-        .collect();
+    let shared_with = application.shared_with.as_deref().unwrap_or(&[]);
     let words = |text: &str| Theirs::from(text).to_string();
     let mut text = format!(
         "Deployed {}: it is live at {} as Version {number}",
@@ -1315,9 +1331,12 @@ fn deployed(ready: &Ready, application: &Application, created: bool, number: u64
             words(&ready.added.join(", "))
         ));
     }
-    text.push_str(&format!(
-        "It is visible to its Contributors only: {}. Nobody else can see it until it is shared.\n",
-        words(&contributors.join(", "))
+    text.push_str(&visible_to_words(
+        &ready.kept,
+        &ready.name,
+        &Theirs::from(application.address.as_str()),
+        &application.contributors,
+        shared_with,
     ));
     for (title, items) in [("Warnings", &ready.warnings), ("Notes", &ready.notes)] {
         if items.is_empty() {
@@ -1340,7 +1359,10 @@ fn deployed(ready: &Ready, application: &Application, created: bool, number: u64
             "migrations_applied": ready.added,
             "structures": ready.structures,
             "pulled": ready.pulled,
-            "visible_to": { "contributors": contributors },
+            "visible_to": {
+                "contributors": application.contributors,
+                "shared_with": shared_with,
+            },
             "warnings": ready.warnings,
             "notes": ready.notes,
         }),

@@ -78,8 +78,19 @@ enum Command {
     /// Every registered Resource: its description, your Access level, and
     /// whom to ask.
     Resources(tool::Output),
-    /// The Applications you contribute to: name, description, address.
+    /// The Applications you contribute to and those shared with you: name,
+    /// description, address, and which is which.
     Applications(tool::Output),
+    /// An Application: its address, serving Version, Contributors and whom
+    /// it is shared with.
+    Show(tool::ShowArgs),
+    /// Share the Application: let people, Groups or everyone signed in open
+    /// it (--user, --email, --group, --everyone; each as often as needed).
+    Share(tool::ChangeArgs<true>),
+    /// Stop sharing the Application with people, Groups or everyone.
+    Unshare(tool::ChangeArgs<true>),
+    /// Change who maintains the Application: vm contributors add|remove.
+    Contributors(tool::ContributorsArgs),
     /// Pull a Resource's structure into the project, as a typed Drizzle
     /// definition (resources/<name>/schema.ts) and its link
     /// (resources/<name>/index.ts).
@@ -209,6 +220,10 @@ fn main() -> ExitCode {
         Some(Command::Request(args)) => tool::run(tool::Command::Request(args)),
         Some(Command::Dev(args)) => tool::run(tool::Command::Dev(args)),
         Some(Command::Local(args)) => tool::run(tool::Command::Local(args)),
+        Some(Command::Show(args)) => tool::run(tool::Command::Show(args)),
+        Some(Command::Share(args)) => tool::run(tool::Command::Share(args)),
+        Some(Command::Unshare(args)) => tool::run(tool::Command::Unshare(args)),
+        Some(Command::Contributors(args)) => tool::run(tool::Command::Contributors(args)),
         None => {
             say_on_stderr(
                 "vm: name a command (see vm --help): vm sign-in ..., vm serve ..., or vm --version",

@@ -5,7 +5,8 @@
 //! connect-oidc` ([`admin`]), `vm sign-out`, `vm whoami`, `vm resources`, `vm
 //! applications`, `vm pull` ([`pull`]), `vm new` ([`new`]), `vm check`
 //! ([`check`]), `vm generate` ([`generate`]), `vm deploy` ([`deploy`]),
-//! `vm versions` and `vm go-back` ([`versions`]) and `vm logs` ([`logs`]),
+//! `vm versions` and `vm go-back` ([`versions`]), `vm logs` ([`logs`]),
+//! `vm show`, `vm share`, `vm unshare` and `vm contributors` ([`sharing`]),
 //! each with `--json`. Each command is one short run on one
 //! thread: a current-thread runtime, at most a few requests to the
 //! installation ([`client`]), the credential file ([`credential_file`]), and
@@ -51,6 +52,7 @@ mod logs;
 mod new;
 mod project_tools;
 mod pull;
+mod sharing;
 mod template;
 mod test_users;
 mod theirs;
@@ -66,6 +68,7 @@ pub use local::{
 pub use logs::LogsArgs;
 pub use new::NewArgs;
 pub use pull::PullArgs;
+pub use sharing::{ChangeArgs, ContributorsArgs, ContributorsCommand, ShowArgs};
 pub use versions::{GoBackArgs, VersionsArgs};
 
 use std::fs::{self, File, OpenOptions};
@@ -152,6 +155,10 @@ pub enum Command {
     Request(RequestArgs),
     Dev(DevArgs),
     Local(LocalArgs),
+    Show(ShowArgs),
+    Share(ChangeArgs<true>),
+    Unshare(ChangeArgs<true>),
+    Contributors(ContributorsArgs),
 }
 
 /// A message: the tool's own words, or the installation's (a refusal's
@@ -340,6 +347,9 @@ pub fn run(command: Command) -> ExitCode {
         Command::Request(args) => args.output.json,
         Command::Dev(args) => args.output.json,
         Command::Local(args) => args.json(),
+        Command::Show(args) => args.output.json,
+        Command::Share(args) | Command::Unshare(args) => args.json(),
+        Command::Contributors(args) => args.json(),
         Command::SignOut(o)
         | Command::Whoami(o)
         | Command::Resources(o)
@@ -370,6 +380,19 @@ pub fn run(command: Command) -> ExitCode {
                     Command::Request(args) => local::request(&args).await,
                     Command::Dev(args) => local::dev(&args).await,
                     Command::Local(args) => local::local(&args).await,
+                    Command::Show(args) => sharing::show(&args).await,
+                    Command::Share(args) => sharing::change(sharing::Change::Share, &args).await,
+                    Command::Unshare(args) => {
+                        sharing::change(sharing::Change::Unshare, &args).await
+                    }
+                    Command::Contributors(args) => match &args.command {
+                        ContributorsCommand::Add(args) => {
+                            sharing::change(sharing::Change::AddContributors, args).await
+                        }
+                        ContributorsCommand::Remove(args) => {
+                            sharing::change(sharing::Change::RemoveContributors, args).await
+                        }
+                    },
                 }
             });
             // A blocking task still running (a write to an output that
@@ -1064,7 +1087,7 @@ async fn applications() -> Result<Done, Ending> {
     if list.applications.is_empty() {
         say!(
             text,
-            "You contribute to no Application on {} yet. Create one with POST /v1/applications on the platform's API, or ask a Contributor of one to add you.",
+            "You contribute to no Application on {}, and none is shared with you yet. vm deploy creates one; to open or maintain another, ask one of its Contributors to share it with you or to add you.",
             kept.domain
         );
     }
@@ -1076,6 +1099,8 @@ async fn applications() -> Result<Done, Ending> {
         say!(text, "  Address: {}", a.address);
         if a.contributor {
             text.push_str("  You are a Contributor.\n");
+        } else {
+            text.push_str("  Shared with you: you can open it; its Contributors maintain it.\n");
         }
         match a.serving_version {
             Some(number) => {

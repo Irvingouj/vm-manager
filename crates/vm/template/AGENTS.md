@@ -21,7 +21,11 @@ Run them from this folder. Each has `--help` and `--json` (one JSON object on st
 | Command | What it does |
 |---|---|
 | `vm whoami` | who the Builder is signed in as, and their Groups |
-| `vm applications` | the Applications the Builder contributes to |
+| `vm applications` | the Applications the Builder contributes to, and those shared with them |
+| `vm show <name>` | the Application: its address, serving Version, Contributors and whom it is shared with |
+| `vm share <name> --user <id>` | lets people open it (`--email <address>`, `--group <Group>`, `--everyone`; each as often as needed) |
+| `vm unshare <name> --user <id>` | stops sharing it with them (the same options) |
+| `vm contributors add <name> --user <id>` | makes people or a Group Contributors, who can deploy it and change who sees it (`vm contributors remove` takes them off) |
 | `vm resources` | every company Resource, the Builder's access to it, and whom to ask |
 | `vm pull <name>` | writes `resources/<name>/` with that Resource's tables |
 | `vm generate` | writes the next migration from `src/db/schema.ts` into `migrations/`; stops before one that destroys data |
@@ -91,4 +95,8 @@ To debug, read `vm logs <name>`: one entry for each request the code handled, wi
 
 ## Telling the Builder who can see the Application
 
-A new Application is visible only to its Contributors until it is shared. After a deploy, tell the Builder who can see it from the tool's own output, the deploy's, which names the Contributors who can see it, and never from your own guess; if the tool did not say, tell the Builder you do not know yet rather than assume their team can see it.
+A deployed Application is visible to its Contributors only until it is shared. Its Contributors (at first, whoever deployed it first) open it, deploy it and decide who else sees it. `vm share <name>` shares it with people (`--user <id>`, or `--email <address>` for someone who has signed in here), Groups (`--group <Group>`) or everyone who can sign in; `vm unshare <name>` takes that back; `vm contributors add <name>` makes someone a Contributor; `vm show <name>` shows both lists.
+
+After a deploy or a share, tell the Builder who can see the Application from the tool's own output (the deploy's or the share's, which names each person, Group or everyone who can see it now), never from your own guess; if the tool did not say, tell the Builder you do not know yet rather than assume their team can see it. Share only with whom the Builder asked for, by the ids, addresses or Groups they gave.
+
+Sharing with everyone lets every person who can sign in to the installation open it: ask the Builder before you run `vm share <name> --everyone`, even when the data is not sensitive, and run it only once they say so.
