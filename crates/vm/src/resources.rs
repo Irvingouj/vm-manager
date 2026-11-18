@@ -246,6 +246,11 @@ enum Grants {
     /// since; `epoch` tells a read-back begun before this forgetting from
     /// one begun after.
     Unknown { seen: i64, epoch: u64 },
+    /// Taken out of memory ([`Resources::unregister`]): no Grant, and
+    /// final. Nothing forgets it, makes it known or installs into it, so a
+    /// write or a read-back that still holds it cannot bring it back into
+    /// [`Resources::unknown`].
+    LetGo,
 }
 
 impl Grants {
@@ -311,8 +316,10 @@ impl Resource {
     /// not know them.
     pub fn with_grants<T>(&self, decide: impl FnOnce(&[authz::Grant<'_>]) -> T) -> Option<T> {
         let grants = self.grants.read().unwrap_or_else(PoisonError::into_inner);
-        let Grants::Known(grants) = &*grants else {
-            return None;
+        let grants = match &*grants {
+            Grants::Known(grants) => grants,
+            Grants::LetGo => return Some(decide(&[])),
+            Grants::Unknown { .. } => return None,
         };
         let list: Vec<authz::Grant<'_>> = grants
             .iter()
@@ -328,7 +335,7 @@ impl Resource {
     pub fn grants_known(&self) -> bool {
         matches!(
             *self.grants.read().unwrap_or_else(PoisonError::into_inner),
-            Grants::Known(_)
+            Grants::Known(_) | Grants::LetGo
         )
     }
 
@@ -344,6 +351,7 @@ impl Resource {
                     .map(|(group, granted)| (group.clone(), granted.level))
                     .collect(),
             ),
+            Grants::LetGo => Some(Vec::new()),
             Grants::Unknown { .. } => None,
         }
     }
@@ -362,13 +370,17 @@ impl Resource {
                 }
             },
             Grants::Unknown { seen, .. } => *seen = (*seen).max(granted.revision),
+            Grants::LetGo => {}
         }
     }
 
     /// Forgets the Grants, as of `epoch`, keeping the highest revision
-    /// memory held as `seen`. `unknown` counts the Resources whose Grants
-    /// are forgotten: one more when these were known, changed under the
-    /// lock that changes them, so it is exact.
+    /// memory held as `seen`. `unknown` counts the Resources in memory
+    /// whose Grants are forgotten: one more when these were known, under
+    /// the lock that changes them. It is exact because every change in or
+    /// out of `Unknown` is made under that lock together with the count's
+    /// change, and a Resource taken out of memory is `LetGo` first (also
+    /// under it), which nothing forgets again.
     fn forget(&self, epoch: u64, unknown: &AtomicUsize) {
         let mut grants = self.grants.write().unwrap_or_else(PoisonError::into_inner);
         let seen = match &*grants {
@@ -377,26 +389,26 @@ impl Resource {
                 Grants::newest(known)
             }
             Grants::Unknown { seen, .. } => *seen,
+            Grants::LetGo => return,
         };
         *grants = Grants::Unknown { seen, epoch };
     }
 
-    /// For a Resource taken out of memory: its Grants held as known (and
-    /// none), so that `unknown` no longer counts it and no read-back makes
-    /// it known again.
+    /// For a Resource taken out of memory: `LetGo`, so that `unknown` no
+    /// longer counts it and nothing counts it again.
     fn let_go(&self, unknown: &AtomicUsize) {
         let mut grants = self.grants.write().unwrap_or_else(PoisonError::into_inner);
         if let Grants::Unknown { .. } = &*grants {
             unknown.fetch_sub(1, Ordering::SeqCst);
         }
-        *grants = Grants::Known(BTreeMap::new());
+        *grants = Grants::LetGo;
     }
 
     /// The epoch of the forgetting memory is in; `None` when it knows the
     /// Grants.
     fn forgotten_at(&self) -> Option<u64> {
         match &*self.grants.read().unwrap_or_else(PoisonError::into_inner) {
-            Grants::Known(_) => None,
+            Grants::Known(_) | Grants::LetGo => None,
             Grants::Unknown { epoch, .. } => Some(*epoch),
         }
     }
@@ -443,7 +455,9 @@ pub struct Resources {
     /// exact: it changes only on a change between known and forgotten,
     /// made under that Resource's `grants` lock in the same critical
     /// section ([`Resource::forget`], [`Resource::install_read`],
-    /// [`Resource::let_go`]).
+    /// [`Resource::let_go`]); a Resource taken out of memory is made
+    /// `LetGo` under that lock, and `LetGo` is never forgotten again, so a
+    /// write that still holds it cannot count it.
     unknown: AtomicUsize,
     /// The readings of what memory does not know (Applications and
     /// Grants), shared with crate::registry: at most [`READ_BACKS`].
