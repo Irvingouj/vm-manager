@@ -943,13 +943,16 @@ fn a_change_answers_what_it_added_and_removed_as_kept_in_the_order_added() {
     }
 }
 
-/// The reasons a reader of Versions is asked for, in order: the Versions,
-/// Version 1 (which exists) and Version 99 (which does not), and the
-/// Versions with a `?limit` that is good, bad and given twice.
-const VERSION_TARGETS: [&str; 6] = [
+/// What a reader of Versions is asked for, in order: the Versions,
+/// Version 1 (which exists), Version 99 (which does not), two `<number>`s
+/// that are no number, and the Versions with a `?limit` that is good, bad
+/// and given twice.
+const VERSION_TARGETS: [&str; 8] = [
     "/v1/applications/board/versions",
     "/v1/applications/board/versions/1",
     "/v1/applications/board/versions/99",
+    "/v1/applications/board/versions/abc",
+    "/v1/applications/board/versions/1.5",
     "/v1/applications/board/versions?limit=1",
     "/v1/applications/board/versions?limit=abc",
     "/v1/applications/board/versions?limit=1&limit=2",
@@ -982,6 +985,14 @@ fn versions_are_read_by_a_contributor_and_a_platform_administrator_and_by_nobody
         let one = reads.get_version(APP, 1);
         assert_eq!(one.status, 200, "{:?}\n{}", reader.id, one.describe());
         assert_api_error(&reads.get_version(APP, 99), 404, "not-found");
+        // A `<number>` that is no number: `not-found`, as before this
+        // ticket (api_errors).
+        for target in [
+            "/v1/applications/board/versions/abc",
+            "/v1/applications/board/versions/1.5",
+        ] {
+            assert_api_error(&reads.get(target), 404, "not-found");
+        }
         assert_api_error(
             &reads.get(&format!("/v1/applications/{APP}/versions?limit=abc")),
             400,
@@ -1002,12 +1013,15 @@ fn versions_are_read_by_a_contributor_and_a_platform_administrator_and_by_nobody
         for answer in &answers {
             assert_api_error(answer, 403, "not-a-contributor");
         }
-        assert_eq!(
-            answers[1].json(),
-            answers[2].json(),
-            "{:?}: Version 1, which exists, and Version 99, which does not, get the same answer",
-            reader.id
-        );
+        for other in &answers[2..5] {
+            assert_eq!(
+                answers[1].json(),
+                other.json(),
+                "{:?}: Version 1, which exists, Version 99, which does not, and a `<number>` that is no number get the same answer ({})",
+                reader.id,
+                other.request()
+            );
+        }
         // The `not-found` of the Application comes first ...
         for target in [
             "/v1/applications/nothing-here/versions",
