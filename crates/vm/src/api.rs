@@ -1387,14 +1387,16 @@ impl Api {
         number: Option<u64>,
     ) -> Result<Answer, DbError> {
         // Who may read is decided before anything is said of a Version,
-        // so that its `not-found` tells nobody else how many there are.
+        // so that its `not-found` tells nobody else how many there are:
+        // to them `method-not-allowed`, then `not-a-contributor`. To a
+        // reader, `not-found` comes first, as for any path.
         let Some(standing) = self.standing(name, user).await? else {
             return Ok(no_application());
         };
-        if method != Method::GET {
-            return Ok(Answer::method_not_allowed(method, "GET"));
-        }
         if !self.may_read(standing, user) {
+            if method != Method::GET {
+                return Ok(Answer::method_not_allowed(method, "GET"));
+            }
             return Ok(not_a_reader_of_versions());
         }
         let version = match number {
@@ -1406,6 +1408,9 @@ impl Api {
                 "no such Version: list the Application's Versions at /v1/applications/<name>/versions",
             ));
         };
+        if method != Method::GET {
+            return Ok(Answer::method_not_allowed(method, "GET"));
+        }
         Ok(Answer::json(StatusCode::OK, &VersionView::of(&version)))
     }
 
