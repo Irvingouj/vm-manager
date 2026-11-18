@@ -984,6 +984,24 @@ fn post_tool_from_another_origin_is_refused() {
 }
 
 #[test]
+fn the_confirmation_page_has_referrer_policy_same_origin_so_its_form_is_sent_with_its_origin() {
+    let at = installation();
+    for port in [Some(a_port()), None] {
+        let (_browser, page) = page_for(&at, ADA, &Challenge::fresh(), port);
+        assert_eq!(
+            page.response
+                .header("referrer-policy")
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase(),
+            "same-origin",
+            "the tool's confirmation page (port {port:?}): expected `referrer-policy: same-origin`, as every page of the platform's own from the ticket \"The Dashboard\" on\n{}",
+            shown(&page.response, &[])
+        );
+    }
+}
+
+#[test]
 fn the_page_s_form_is_sign_in_code_and_two_buttons_named_answer() {
     let at = installation();
     for port in [Some(a_port()), None] {
@@ -1041,7 +1059,7 @@ fn the_page_s_form_is_sign_in_code_and_two_buttons_named_answer() {
         let body = url::form_urlencoded::Serializer::new(String::new())
             .append_pair("sign_in", sign_in_value)
             .finish();
-        let request = browser.form_from(&page.url, &action, &body);
+        let request = browser.submit_form(&page.url, &page.response, &action, &body);
         let answer = browser.send(&action, &request);
         assert_eq!(
             answer.status,
@@ -1065,7 +1083,7 @@ fn a_sign_in_value_posted_from_another_browser_is_400_and_confirms_nothing() {
     let (body, action) = submission_of(&at, &page, Decision::Confirm);
     // A browser with no cookie of the sign-in address.
     let mut bare = at.browser();
-    let request = bare.form_from(&page.url, &action, &body);
+    let request = bare.submit_form(&page.url, &page.response, &action, &body);
     let answer = Step {
         url: action.clone(),
         response: bare.send(&action, &request),
@@ -1074,7 +1092,7 @@ fn a_sign_in_value_posted_from_another_browser_is_400_and_confirms_nothing() {
     // Another person's browser, with a sign-in of the tool of its own.
     let (mut grace_browser, _grace_page) =
         page_for(&at, GRACE, &Challenge::fresh(), Some(a_port()));
-    let request = grace_browser.form_from(&page.url, &action, &body);
+    let request = grace_browser.submit_form(&page.url, &page.response, &action, &body);
     let answer = Step {
         url: action.clone(),
         response: grace_browser.send(&action, &request),

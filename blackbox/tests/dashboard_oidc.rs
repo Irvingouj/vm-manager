@@ -24,10 +24,11 @@ use blackbox::dashboard::{
     Page, assert_changed, assert_refusal_words, assert_refused, oidc_page, oidc_post, oidc_sign_in,
     oidc_url,
 };
-use blackbox::oidc::Person;
+use blackbox::oidc::{Person, Provider};
+use blackbox::postgres::{Platform, PrivatePostgres};
 use blackbox::sessions::{
     ADA, GRACE, Installation, SESSION_COOKIE, SIGN_IN_COOKIE, ada, assert_platform_cookie, grace,
-    the_set_cookie,
+    oidc_options, the_set_cookie,
 };
 use blackbox::sharing::{TRACED, add, keys, user};
 use blackbox::tool::bearer;
@@ -345,13 +346,7 @@ fn the_dashboards_cookie_is_valid_on_the_dashboard_only() {
 fn signing_out_ends_the_dashboards_session() {
     let at = installation();
     let (mut browser, _) = signed_in(&at, ADA);
-    let address = at.auth_url("/sign-out");
-    let request = browser
-        .request("POST", &address)
-        .header("accept", "text/html")
-        .header("origin", at.auth_origin())
-        .header("content-type", "application/x-www-form-urlencoded");
-    let answer = browser.send(&address, &request);
+    let answer = at.sign_out(&mut browser).response;
     assert_eq!(answer.status, 200, "{}", answer.describe());
     assert_no_dashboard_session(&at, &mut browser, "after signing out");
 }
@@ -396,6 +391,23 @@ fn opening_an_application_from_the_dashboards_link_does_not_ask_the_identity_pro
     );
 }
 
+/// Someone who never signed in here, with an id that looks mistyped.
+const MISTYPED: &str = "00u-ada-typo";
+
+/// Fails unless `shown` is marked as a person the platform has never seen
+/// (`data-vm-unseen`, and words saying they were not seen signing in here
+/// yet and to check the id) when `unseen`, and has neither otherwise.
+fn assert_unseen(shown: &blackbox::dashboard::Shown, unseen: bool, context: &str) {
+    let text = shown.text.to_lowercase();
+    let words = text.contains("seen") && text.contains("check");
+    assert!(
+        shown.unseen == unseen && words == unseen,
+        "{context}: expected {} `data-vm-unseen` and {} words saying they were not seen signing in here yet and to check the id, got {shown:?}",
+        if unseen { "the attribute" } else { "no" },
+        if unseen { "the" } else { "no" },
+    );
+}
+
 #[test]
 fn people_are_shown_with_their_names_and_emails() {
     let at = installation();
@@ -406,7 +418,7 @@ fn people_are_shown_with_their_names_and_emails() {
         &at,
         &credential,
         &format!("/v1/applications/{APP}/contributors"),
-        &add(&[user(GRACE)]),
+        &add(&[user(GRACE), user(MISTYPED)]),
     )
     .expect_status(200);
     post(
@@ -417,23 +429,6 @@ fn people_are_shown_with_their_names_and_emails() {
     )
     .expect_status(200);
     let (mut browser, page) = signed_in(&at, ADA);
-    let board = page.listed(APP);
-    assert_eq!(
-        board.contributor_keys(),
-        vec![format!("user:{ADA}"), format!("user:{GRACE}")],
-        "{}",
-        page.describe()
-    );
-    for (shown, name) in board
-        .contributors
-        .iter()
-        .zip(["Ada Lovelace", "Grace Hopper"])
-    {
-        assert!(
-            shown.text.contains(name),
-            "expected a Contributor shown by their name {name:?}, got {shown:?}"
-        );
-    }
     let details = oidc_page(
         &at,
         &mut browser,
@@ -441,6 +436,44 @@ fn people_are_shown_with_their_names_and_emails() {
         200,
         "Ada at board",
     );
+    for (where_, listed) in [
+        ("the list", page.listed(APP)),
+        ("its page", details.listed(APP)),
+    ] {
+        let mut contributors = listed.contributor_keys();
+        contributors.sort();
+        let mut wanted = vec![
+            format!("user:{ADA}"),
+            format!("user:{GRACE}"),
+            format!("user:{MISTYPED}"),
+        ];
+        wanted.sort();
+        assert_eq!(contributors, wanted, "{where_}\n{}", page.describe());
+        for shown in &listed.contributors {
+            let id = shown.id.as_deref().unwrap_or_default();
+            let name = match id {
+                ADA => Some("Ada Lovelace"),
+                GRACE => Some("Grace Hopper"),
+                _ => None,
+            };
+            if let Some(name) = name {
+                assert!(
+                    shown.text.contains(name),
+                    "{where_}: expected a Contributor shown by their name {name:?}, got {shown:?}"
+                );
+            } else {
+                assert!(
+                    shown.text.contains(MISTYPED),
+                    "{where_}: expected someone who never signed in here shown by their id, got {shown:?}"
+                );
+            }
+            assert_unseen(
+                shown,
+                name.is_none(),
+                &format!("{where_}, Contributor {id}"),
+            );
+        }
+    }
     let shared = details.shared();
     assert_eq!(
         details.shared_keys(),
@@ -458,6 +491,8 @@ fn people_are_shown_with_their_names_and_emails() {
         "expected someone who never signed in here shown by their id, got {:?}",
         shared[1]
     );
+    assert_unseen(&shared[0], false, "shared with Twin A, who signed in");
+    assert_unseen(&shared[1], true, "shared with Hedy, who never signed in");
 }
 
 #[test]
@@ -624,4 +659,35 @@ fn a_form_on_an_applications_page_cannot_share_and_its_script_cannot_read_the_da
         "expected an Application's script refused reading the Dashboard\n{}",
         read.describe()
     );
+}
+
+#[test]
+fn with_the_platform_database_stopped_a_page_with_a_session_cookie_is_503_not_a_redirect() {
+    let mut postgres = PrivatePostgres::start().unwrap();
+    let platform = Platform::on(&postgres, "vm_platform_dashboard_oidc_stopped");
+    let at = Installation::from(
+        Provider::start(&people()),
+        &oidc_options().platform(&platform),
+    );
+    let (browser, _) = signed_in(&at, ADA);
+    postgres.stop();
+    for target in ["/", &format!("/applications/{APP}")] {
+        let answer = browser
+            .request("GET", &oidc_url(&at, target))
+            .header("accept", blackbox::browser::NAVIGATION_ACCEPT)
+            .header("sec-fetch-site", "none")
+            .header("sec-fetch-mode", "navigate")
+            .header("sec-fetch-dest", "document")
+            .timeout(std::time::Duration::from_secs(40))
+            .send();
+        assert!(
+            answer.status == 503
+                && answer.header("retry-after").is_some()
+                && answer
+                    .header("content-type")
+                    .is_some_and(|t| t.to_ascii_lowercase().starts_with("text/plain")),
+            "{target} with a session cookie while the platform database cannot be reached: expected `503`, `text/plain`, with `retry-after` (never a redirect to sign in again)\n{}",
+            answer.describe()
+        );
+    }
 }

@@ -176,32 +176,46 @@ impl<'a> Dashboard<'a> {
         )
     }
 
-    /// A form posted from the Dashboard's own page to `target`: the
-    /// navigation a browser makes, with `Origin` the Dashboard's and
-    /// `Sec-Fetch-Site: same-origin`, and this
-    /// `application/x-www-form-urlencoded` body.
+    /// A form posted from the Dashboard's own list to `target`, as a
+    /// browser submits it (see [`crate::browser::submitted`]): `Origin`
+    /// what the list's referrer policy makes it, `Sec-Fetch-Site:
+    /// same-origin`, and this `application/x-www-form-urlencoded` body.
     pub fn post_form(&self, target: &str, body: &str) -> Response {
         self.form_request(target, body).send()
     }
 
-    /// The request of [`Dashboard::post_form`], to add to.
+    /// The request of [`Dashboard::post_form`], to add to. It opens the
+    /// Dashboard's list first, to know the `Origin` its referrer policy
+    /// gives a form on it.
     pub fn form_request(&self, target: &str, body: &str) -> Request {
-        self.bare("POST", target)
-            .header("accept", NAVIGATION_ACCEPT)
-            .header("origin", self.origin())
-            .header("sec-fetch-site", "same-origin")
-            .header("sec-fetch-mode", "navigate")
-            .header("sec-fetch-dest", "document")
-            .header("content-type", "application/x-www-form-urlencoded")
-            .body(body)
+        let list = self.navigation("GET", "/").send();
+        self.form_request_from(&list, target, body)
+    }
+
+    /// The request a browser makes for a form of this page of the
+    /// Dashboard, posted to `target` with `body`.
+    pub fn form_request_from(&self, page: &Response, target: &str, body: &str) -> Request {
+        let origin = crate::browser::form_origin(&self.origin(), page);
+        crate::browser::submitted(
+            self.bare("POST", target)
+                .header("accept", NAVIGATION_ACCEPT),
+            &origin,
+            "same-origin",
+            body,
+        )
     }
 
     /// Shares the Application through the share form of its page, as a
     /// person fills it: `kind` chosen, `value` typed. The answer.
     pub fn share(&self, application: &str, kind: &str, value: &str) -> Response {
+        self.share_request(application, kind, value).send()
+    }
+
+    /// The request of [`Dashboard::share`], to add to.
+    pub fn share_request(&self, application: &str, kind: &str, value: &str) -> Request {
         let page = self.details(application);
         let (action, body) = page.share_submission(kind, value);
-        self.post_form(&crate::browser::target_of(&action), &body)
+        self.form_request_from(&page.response, &crate::browser::target_of(&action), &body)
     }
 
     /// Unshares the entry `kind` / `value` (a person by `user`) through
@@ -209,7 +223,8 @@ impl<'a> Dashboard<'a> {
     pub fn unshare(&self, application: &str, kind: &str, value: &str) -> Response {
         let page = self.details(application);
         let (action, body) = page.unshare_submission(kind, value);
-        self.post_form(&crate::browser::target_of(&action), &body)
+        self.form_request_from(&page.response, &crate::browser::target_of(&action), &body)
+            .send()
     }
 
     /// `/applications/<name>/sharing`.
@@ -280,7 +295,7 @@ pub fn oidc_sign_in(at: &Installation, browser: &mut Browser) -> (Vec<Step>, Pag
 /// Posts the form of `page` (its address `page.url`) to `action` with this
 /// body from the browser, as the browser posts a form of that page.
 pub fn oidc_post(browser: &mut Browser, page: &Page, action: &Url, body: &str) -> Response {
-    let request = browser.form_from(&page.url, action, body);
+    let request = browser.submit_form(&page.url, &page.response, action, body);
     browser.send(action, &request)
 }
 
@@ -313,6 +328,9 @@ pub struct Shown {
     pub kind: String,
     pub id: Option<String>,
     pub text: String,
+    /// Whether the element has `data-vm-unseen`: a person the platform
+    /// knows neither a name nor an email of.
+    pub unseen: bool,
 }
 
 impl Shown {
@@ -366,6 +384,7 @@ impl Listed {
                     kind: e.attr("data-vm-contributor").unwrap_or_default().to_owned(),
                     id: e.attr("data-vm-id").map(str::to_owned),
                     text: e.text(),
+                    unseen: e.has("data-vm-unseen"),
                 })
                 .collect(),
             more_contributors: element
@@ -733,6 +752,7 @@ impl Page {
                 kind: e.attr("data-vm-shared").unwrap_or_default().to_owned(),
                 id: e.attr("data-vm-id").map(str::to_owned),
                 text: e.text(),
+                unseen: e.has("data-vm-unseen"),
             })
             .collect()
     }

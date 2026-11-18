@@ -501,7 +501,35 @@ impl Installation {
                 form.fields
             ))
         });
-        let request = browser.form_from(&page.url, &action, &body);
+        let request = browser.submit_form(&page.url, &page.response, &action, &body);
+        let response = browser.send(&action, &request);
+        Step {
+            url: action,
+            response,
+        }
+    }
+
+    /// Signs this browser out as a person does: opens `<sign-in
+    /// address>/sign-out`, which must be a `200` page with one form that
+    /// posts to `/sign-out`, and submits it as a browser does
+    /// ([`Browser::submit_form`]). Returns the step of the `POST`.
+    pub fn sign_out(&self, browser: &mut Browser) -> Step {
+        let page = browser.open(&self.auth_url("/sign-out"));
+        let form = forms(&page.response.text()).into_iter().find_map(|form| {
+            let action = page.url.join(&form.action).ok()?;
+            let posts = form.method == "post"
+                && action.host_str() == Some(self.auth_host().as_str())
+                && action.path() == "/sign-out";
+            posts.then_some((form, action))
+        });
+        let Some((form, action)) = form.filter(|_| page.response.status == 200) else {
+            self.vm.fail(&format!(
+                "expected the sign-out page, `200` with a form that posts to /sign-out\n{}",
+                shown(&page.response, &[])
+            ));
+        };
+        let body = form.submission(Decision::Confirm, None).unwrap_or_default();
+        let request = browser.submit_form(&page.url, &page.response, &action, &body);
         let response = browser.send(&action, &request);
         Step {
             url: action,

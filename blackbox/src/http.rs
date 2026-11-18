@@ -71,6 +71,9 @@ pub struct Request {
     body: Vec<u8>,
     chunked: bool,
     timeout: Duration,
+    /// A `Content-Length` to send in place of the body's own (a body held
+    /// back: the request says more than it sends).
+    declared_length: Option<usize>,
 }
 
 impl Request {
@@ -86,6 +89,7 @@ impl Request {
             body: Vec::new(),
             chunked: false,
             timeout: REQUEST_TIMEOUT,
+            declared_length: None,
         }
     }
 
@@ -158,6 +162,15 @@ impl Request {
         self
     }
 
+    /// Says `Content-Length: <length>` whatever the body is: with a body
+    /// shorter than that, the rest is never sent, and the program waits for
+    /// it until its own limit.
+    #[must_use]
+    pub fn declare_length(mut self, length: usize) -> Self {
+        self.declared_length = Some(length);
+        self
+    }
+
     /// Allows this request longer than [`REQUEST_TIMEOUT`] (a large body).
     #[must_use]
     pub fn timeout(mut self, timeout: Duration) -> Self {
@@ -227,7 +240,9 @@ impl Request {
             wire.extend_from_slice(value);
             wire.extend_from_slice(b"\r\n");
         }
-        if self.chunked {
+        if let Some(length) = self.declared_length {
+            wire.extend_from_slice(format!("Content-Length: {length}\r\n").as_bytes());
+        } else if self.chunked {
             wire.extend_from_slice(b"Transfer-Encoding: chunked\r\n");
         } else if !self.body.is_empty() || self.method != "GET" {
             wire.extend_from_slice(format!("Content-Length: {}\r\n", self.body.len()).as_bytes());
@@ -363,6 +378,12 @@ impl Response {
             rest.to_vec()
         };
         Ok(response)
+    }
+
+    /// Parses an answer written by a unit test of the harness.
+    pub fn parse_for_tests(raw: &str) -> Self {
+        Self::parse_answer(raw.as_bytes(), "a test answer".to_owned(), false)
+            .unwrap_or_else(|e| panic!("{e}"))
     }
 
     /// The first value of a header, by name in any letter case.

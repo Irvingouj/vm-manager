@@ -22,7 +22,7 @@ use blackbox::dashboard::{Dashboard, Page, administrator, create, deploy, start}
 use blackbox::sharing::{
     add, assert_not_shared_page, contributors_ok, everyone, group, share_ok, user,
 };
-use blackbox::{User, Vm};
+use blackbox::{DOMAIN, User, Vm};
 
 const APP: &str = "board";
 const DESCRIPTION: &str = "secret-board-description";
@@ -278,6 +278,97 @@ fn a_platform_administrator_gets_the_page_and_whom_it_is_shared_with_and_no_form
         page.listed(APP).contributor_keys(),
         keys(&["user:alice", "group:staff"])
     );
+    // What they cannot do is not offered: no link to open it, relation
+    // `none`, the address as text, and words saying why.
+    let board = page.listed(APP);
+    assert_eq!(
+        board.relation.as_deref(),
+        Some("none"),
+        "expected `data-vm-relation=\"none\"` for a Platform administrator it is not shared with\n{}",
+        page.describe()
+    );
+    assert!(
+        board.open.is_empty(),
+        "expected no `a[data-vm-open]` for a Platform administrator who cannot open it, got {:?}\n{}",
+        board.open,
+        page.describe()
+    );
+    let address = format!("{APP}.{DOMAIN}");
+    assert!(
+        page.text().contains(&address),
+        "expected the address {address:?} still shown as text\n{}",
+        page.describe()
+    );
+    let text = page.text().to_lowercase();
+    assert!(
+        text.contains("administrator") && text.contains("not shared"),
+        "expected words saying they read it as a Platform administrator and that it is not shared with them, got {text:?}"
+    );
+}
+
+#[test]
+fn a_platform_administrator_who_can_open_it_is_shown_it_as_anyone() {
+    let vm = with_board();
+    let dashboard = Dashboard::new(&vm, &administrator());
+    let admin_id = dashboard.user.id.clone();
+    // Shared with the administrator: as anyone it is shared with.
+    share_ok(&vm.api_as(&alice()), &vm, APP, &add(&[user(&admin_id)]));
+    let page = dashboard.details(APP);
+    let board = page.listed(APP);
+    assert_eq!(
+        board.relation.as_deref(),
+        Some("shared"),
+        "expected a Platform administrator it is shared with to be shown it as anyone it is shared with\n{}",
+        page.describe()
+    );
+    assert_eq!(
+        board.open_href(),
+        Some(dashboard.open_href(APP)),
+        "expected the link to open it\n{}",
+        page.describe()
+    );
+    assert!(
+        !page.text().to_lowercase().contains("not shared"),
+        "expected no words saying it is not shared with them\n{}",
+        page.describe()
+    );
+    // A Contributor as well: as any Contributor, with the forms.
+    contributors_ok(&vm.api_as(&alice()), &vm, APP, &add(&[user(&admin_id)]));
+    let page = dashboard.details(APP);
+    let board = page.listed(APP);
+    assert_eq!(
+        board.relation.as_deref(),
+        Some("contributor"),
+        "expected a Platform administrator who is a Contributor to be shown it as a Contributor\n{}",
+        page.describe()
+    );
+    assert_eq!(board.open_href(), Some(dashboard.open_href(APP)));
+    page.share_form();
+}
+
+#[test]
+fn with_the_stand_in_nobody_is_marked_as_never_seen() {
+    let vm = with_board();
+    // `never-signed` and `ghost` never made a request here; the stand-in
+    // keeps no record of people, so neither is marked.
+    contributors_ok(&vm.api_as(&alice()), &vm, APP, &add(&[user("ghost")]));
+    share_four(&vm);
+    let dashboard = Dashboard::new(&vm, &alice());
+    for page in [dashboard.list(), dashboard.details(APP)] {
+        assert!(
+            page.root().with_attr("data-vm-unseen").is_empty(),
+            "expected no element `data-vm-unseen` with the stand-in\n{}",
+            page.describe()
+        );
+        let board = page.listed(APP);
+        for shown in board.contributors.iter().chain(page.shared().iter()) {
+            let text = shown.text.to_lowercase();
+            assert!(
+                !(text.contains("seen") || text.contains("check")),
+                "expected no words saying someone was not seen signing in, with the stand-in, got {shown:?}"
+            );
+        }
+    }
 }
 
 #[test]

@@ -676,6 +676,32 @@ impl Browser {
         request
     }
 
+    /// A form of a page of the platform's (or any page this browser read)
+    /// submitted as a browser submits it: the page at `page`, answered with
+    /// `page_response`, holds the form; it is posted to `action` with
+    /// `Origin` as [`form_origin`] says from the page's referrer policy,
+    /// `Sec-Fetch-Site` as the two relate (`same-origin` for a form of the
+    /// page's own address), `Sec-Fetch-Mode: navigate`, `Sec-Fetch-Dest:
+    /// document`, `Sec-Fetch-User: ?1`, and this
+    /// `application/x-www-form-urlencoded` body. Every harness that posts a
+    /// form it read from a page posts it so; [`Browser::form_from`] is for
+    /// a made-up page.
+    pub fn submit_form(
+        &self,
+        page: &Url,
+        page_response: &Response,
+        action: &Url,
+        body: &str,
+    ) -> Request {
+        submitted(
+            self.request("POST", action)
+                .header("accept", NAVIGATION_ACCEPT),
+            &form_origin(&origin_of(page), page_response),
+            relation(page, action),
+            body,
+        )
+    }
+
     /// A form on the page at `page` posted to `url`: a navigation with
     /// `Origin`, `Sec-Fetch-Site` as the two relate, and this
     /// `application/x-www-form-urlencoded` body.
@@ -688,6 +714,51 @@ impl Browser {
             .header("sec-fetch-dest", "document")
             .header("content-type", "application/x-www-form-urlencoded")
             .body(body)
+    }
+}
+
+/// `request` with what a browser adds to a form it submits (its `Accept`
+/// aside): `Origin`, the `Sec-Fetch-*` of a navigation the person made, and the
+/// body as `application/x-www-form-urlencoded`.
+pub fn submitted(request: Request, origin: &str, site: &str, body: &str) -> Request {
+    request
+        .header("origin", origin)
+        .header("sec-fetch-site", site)
+        .header("sec-fetch-mode", "navigate")
+        .header("sec-fetch-dest", "document")
+        .header("sec-fetch-user", "?1")
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(body)
+}
+
+/// The referrer policies a browser knows, by the names of the header.
+const REFERRER_POLICIES: [&str; 8] = [
+    "no-referrer",
+    "no-referrer-when-downgrade",
+    "same-origin",
+    "origin",
+    "strict-origin",
+    "origin-when-cross-origin",
+    "strict-origin-when-cross-origin",
+    "unsafe-url",
+];
+
+/// The `Origin` a browser sends with a form of a page whose origin is
+/// `page_origin` and which was answered with `page`: `null` when the
+/// page's referrer policy is `no-referrer` (as Firefox and Chromium do),
+/// else the page's origin. The policy is the last one the browser knows
+/// among the values of `referrer-policy`.
+pub fn form_origin(page_origin: &str, page: &Response) -> String {
+    let policy = page
+        .headers_named("referrer-policy")
+        .iter()
+        .flat_map(|v| v.split(','))
+        .map(|t| t.trim().to_ascii_lowercase())
+        .rfind(|t| REFERRER_POLICIES.contains(&t.as_str()));
+    if policy.as_deref() == Some("no-referrer") {
+        "null".to_owned()
+    } else {
+        page_origin.to_owned()
     }
 }
 
@@ -819,6 +890,36 @@ mod tests {
         );
         let dashed = parse_cookie_date("Wednesday, 21-Oct-15 07:28:00 GMT").unwrap();
         assert_eq!(date, dashed);
+    }
+
+    #[test]
+    fn a_form_of_a_no_referrer_page_is_sent_with_origin_null() {
+        let answer = |policy: &str| {
+            Response::parse_for_tests(&format!(
+                "HTTP/1.1 200 OK\r\n{policy}Content-Length: 0\r\n\r\n"
+            ))
+        };
+        let origin = "http://dashboard.vm.test:8080";
+        assert_eq!(
+            form_origin(origin, &answer("Referrer-Policy: no-referrer\r\n")),
+            "null"
+        );
+        assert_eq!(
+            form_origin(origin, &answer("referrer-policy: same-origin\r\n")),
+            origin
+        );
+        assert_eq!(form_origin(origin, &answer("")), origin);
+        assert_eq!(
+            form_origin(origin, &answer("referrer-policy: no-referrer, bogus\r\n")),
+            "null"
+        );
+        assert_eq!(
+            form_origin(
+                origin,
+                &answer("referrer-policy: no-referrer, strict-origin\r\n")
+            ),
+            origin
+        );
     }
 
     #[test]

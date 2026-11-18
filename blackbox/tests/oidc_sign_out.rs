@@ -26,6 +26,8 @@ fn two_applications() -> Installation {
     Installation::start(&[("honest", "honest.js"), ("ledger", "honest.js")])
 }
 
+/// A `POST` of the sign-out with this `Origin`, made up by the test (a
+/// form of another page); a person's sign-out is [`Installation::sign_out`].
 fn sign_out(at: &Installation, browser: &mut Browser, origin: Option<&str>) -> blackbox::Response {
     let page = at.auth_url("/sign-out");
     let mut request = browser
@@ -72,7 +74,7 @@ fn signing_out_ends_the_session_for_every_application_and_clears_the_cookie() {
     at.sign_in(&mut browser, "honest", "/");
     at.sign_in(&mut browser, "ledger", "/");
     let asked_before = at.provider.requests().len();
-    let answer = sign_out(&at, &mut browser, Some(&at.auth_origin()));
+    let answer = at.sign_out(&mut browser).response;
     assert_eq!(answer.status, 200, "{}", answer.describe());
     assert!(
         answer
@@ -153,6 +155,80 @@ fn a_sign_out_from_another_origin_is_refused_and_the_session_holds() {
     assert_eq!(at.user_seen(&mut browser, "honest")["id"], ADA);
 }
 
+/// A `POST` of the sign-out's form as a browser sends it from the
+/// sign-out page when that page's referrer policy is `no-referrer`:
+/// `Origin: null`, with this `Sec-Fetch-Site` (none when `None`).
+fn sign_out_with_origin_null(
+    at: &Installation,
+    browser: &mut Browser,
+    site: Option<&str>,
+) -> blackbox::Response {
+    let address = at.auth_url("/sign-out");
+    let mut request = browser
+        .request("POST", &address)
+        .header("accept", "text/html")
+        .header("origin", "null")
+        .header("sec-fetch-mode", "navigate")
+        .header("sec-fetch-dest", "document")
+        .header("sec-fetch-user", "?1")
+        .header("content-type", "application/x-www-form-urlencoded");
+    if let Some(site) = site {
+        request = request.header("sec-fetch-site", site);
+    }
+    browser.send(&address, &request)
+}
+
+#[test]
+fn origin_null_is_the_sign_in_address_s_own_only_with_sec_fetch_site_same_origin() {
+    let at = two_applications();
+    let mut browser = at.browser_as(ADA);
+    at.sign_in(&mut browser, "honest", "/");
+    for site in [Some("cross-site"), Some("same-site"), Some("none"), None] {
+        let answer = sign_out_with_origin_null(&at, &mut browser, site);
+        assert_eq!(
+            answer.status,
+            403,
+            "`Origin: null` with `Sec-Fetch-Site` {site:?}: expected refused\n{}",
+            answer.describe()
+        );
+        assert_eq!(
+            at.me(&mut browser).status,
+            200,
+            "still signed in after `Origin: null` with {site:?}"
+        );
+    }
+    let answer = sign_out_with_origin_null(&at, &mut browser, Some("same-origin"));
+    assert_eq!(
+        answer.status,
+        200,
+        "`Origin: null` with `Sec-Fetch-Site: same-origin` (a form of a `no-referrer` page of this origin): expected taken\n{}",
+        answer.describe()
+    );
+    at.assert_no_session(
+        &mut browser,
+        "honest",
+        "after the sign-out with `Origin: null`",
+    );
+}
+
+#[test]
+fn the_sign_out_page_has_referrer_policy_same_origin() {
+    let at = two_applications();
+    let mut browser = at.browser_as(ADA);
+    at.sign_in(&mut browser, "honest", "/");
+    let page = browser.open(&at.auth_url("/sign-out"));
+    assert_eq!(
+        page.response
+            .header("referrer-policy")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase(),
+        "same-origin",
+        "the sign-out page: expected `referrer-policy: same-origin`, as every page of the platform's own from the ticket \"The Dashboard\" on\n{}",
+        page.response.describe()
+    );
+}
+
 #[test]
 fn signing_out_in_one_browser_leaves_another_browsers_session() {
     let at = two_applications();
@@ -160,7 +236,7 @@ fn signing_out_in_one_browser_leaves_another_browsers_session() {
     let mut second = at.browser_as(ADA);
     at.sign_in(&mut first, "honest", "/");
     at.sign_in(&mut second, "honest", "/");
-    sign_out(&at, &mut first, Some(&at.auth_origin())).expect_status(200);
+    at.sign_out(&mut first).response.expect_status(200);
     at.assert_no_session(&mut first, "honest", "the browser that signed out");
     assert_eq!(at.user_seen(&mut second, "honest")["id"], ADA);
 }

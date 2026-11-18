@@ -15,9 +15,7 @@
 
 use std::thread;
 
-use blackbox::dashboard::{
-    Dashboard, Page, assert_refused, create, deploy, form_body, stand_in_options,
-};
+use blackbox::dashboard::{Dashboard, Page, assert_refused, create, deploy, stand_in_options};
 use blackbox::lost_answer::{HeldPostgres, LOST_WRITE_TIMEOUT, quickly};
 use blackbox::scenario::{CONTACT, Scenario, administrator};
 use blackbox::{User, Vm, assert_api_error};
@@ -131,15 +129,11 @@ fn a_change_of_sharing_whose_answer_is_lost_is_refused_503_unavailable() {
     let vm = Vm::start(&stand_in_options().platform(&platform));
     create(&vm, &alice(), APP, None);
     let dashboard = Dashboard::new(&vm, &alice());
-    dashboard.details(APP);
+    let request = dashboard
+        .share_request(APP, "user", "bob")
+        .timeout(LOST_WRITE_TIMEOUT);
 
     postgres.hold();
-    let request = dashboard
-        .form_request(
-            &Dashboard::sharing_target(APP),
-            &form_body(&[("action", "share"), ("kind", "user"), ("value", "bob")]),
-        )
-        .timeout(LOST_WRITE_TIMEOUT);
     let answer = thread::scope(|scope| {
         let answer = scope.spawn(move || request.try_send());
         postgres.wait_for_waiting(1, "the share");

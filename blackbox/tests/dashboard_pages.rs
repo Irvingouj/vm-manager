@@ -292,6 +292,13 @@ fn with_the_platform_database_stopped_a_page_is_503_with_retry_after() {
     deploy(&vm, &alice(), APP, &[]);
     let dashboard = Dashboard::new(&vm, &alice());
     dashboard.list();
+    // The form of a change, as the browser holds it before the stop.
+    let change = dashboard
+        .form_request(
+            &Dashboard::sharing_target(APP),
+            &form_body(&[("action", "share"), ("kind", "user"), ("value", "bob")]),
+        )
+        .timeout(Duration::from_secs(40));
     postgres.stop();
     for target in ["/", "/applications/board"] {
         let response = dashboard
@@ -311,15 +318,8 @@ fn with_the_platform_database_stopped_a_page_is_503_with_retry_after() {
         );
     }
     // A change: `503` with `retry-after` and `data-vm-error="unavailable"`.
-    let change = dashboard
-        .form_request(
-            &Dashboard::sharing_target(APP),
-            &form_body(&[("action", "share"), ("kind", "user"), ("value", "bob")]),
-        )
-        .timeout(Duration::from_secs(40))
-        .send();
     assert_refused(
-        change,
+        change.send(),
         &dashboard.url("/"),
         503,
         "unavailable",

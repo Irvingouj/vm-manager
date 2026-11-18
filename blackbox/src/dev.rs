@@ -403,11 +403,22 @@ impl Browser {
         self.send(&request)
     }
 
-    /// Chooses the test User `id` on `/_vm/test-user`, from its own origin;
-    /// fails the test unless it is answered `303`.
+    /// Chooses the test User `id` on `/_vm/test-user` as a person does:
+    /// opens the chooser's page and submits its form as a browser submits
+    /// it (`Origin` from the page's referrer policy,
+    /// [`crate::browser::form_origin`], and the `Sec-Fetch-*` of a form of
+    /// the same origin); fails the test unless it is answered `303`.
     pub fn choose(&mut self, id: &str) -> Response {
-        let origin = self.origin();
-        let response = self.post_form("/_vm/test-user", &[("user", id)], Some(&origin));
+        let page = self.get("/_vm/test-user");
+        let origin = crate::browser::form_origin(&self.origin(), &page);
+        let body = format!("user={}", percent_encode(id));
+        let request = crate::browser::submitted(
+            self.build("POST", "/_vm/test-user"),
+            &origin,
+            "same-origin",
+            &body,
+        );
+        let response = self.send(&request);
         assert_eq!(
             response.status,
             303,

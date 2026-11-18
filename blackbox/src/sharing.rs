@@ -483,7 +483,8 @@ pub fn assert_not_shared_page(
 
 /// Fails unless the answer has the headers of every page of the
 /// platform's own: `text/html; charset=utf-8`, `cache-control: no-store`,
-/// `x-content-type-options: nosniff`, `referrer-policy: no-referrer`, and
+/// `x-content-type-options: nosniff`, `referrer-policy: same-origin` (it
+/// was `no-referrer` until the ticket "The Dashboard"), and
 /// a `content-security-policy` with `default-src 'none'` and
 /// `frame-ancestors 'none'`.
 pub fn assert_own_page_headers(response: &Response, context: &str) {
@@ -499,10 +500,15 @@ pub fn assert_own_page_headers(response: &Response, context: &str) {
         "{context}: expected `text/html; charset=utf-8`, got\n{}",
         response.describe()
     );
+    assert_eq!(
+        header("referrer-policy").trim(),
+        "same-origin",
+        "{context}: expected `referrer-policy: same-origin`, as every page of the platform's own from the ticket \"The Dashboard\" on, got\n{}",
+        response.describe()
+    );
     for (name, wanted) in [
         ("cache-control", "no-store"),
         ("x-content-type-options", "nosniff"),
-        ("referrer-policy", "no-referrer"),
         ("content-security-policy", "default-src 'none'"),
         ("content-security-policy", "frame-ancestors 'none'"),
     ] {

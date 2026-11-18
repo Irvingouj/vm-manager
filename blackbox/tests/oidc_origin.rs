@@ -1,7 +1,8 @@
 //! A request from another origin is refused (CONTRACT.md, "Sign-in and
 //! sessions: Whose request it is"): each case of the rule, under OIDC and
 //! under the stand-in sign-in, the code not run and the Operation log
-//! untouched; and the rule comes after the sign-in.
+//! untouched; `Origin: null` with `Sec-Fetch-Site: same-origin` the
+//! Application's own; and the rule comes after the sign-in.
 //!
 //! Acceptance criterion: "A state-changing request from another origin is
 //! refused".
@@ -49,7 +50,32 @@ const CASES: &[Case] = &[
     // A method other than GET, HEAD, OPTIONS with an Origin that is not the
     // Application's address.
     refused("POST", &[("origin", "{other}")]),
+    // `Origin: null` is another origin unless `Sec-Fetch-Site` is
+    // `same-origin` (from the ticket "The Dashboard" on).
     refused("POST", &[("origin", "null")]),
+    refused(
+        "POST",
+        &[("origin", "null"), ("sec-fetch-site", "cross-site")],
+    ),
+    refused(
+        "POST",
+        &[("origin", "null"), ("sec-fetch-site", "same-site")],
+    ),
+    refused("POST", &[("origin", "null"), ("sec-fetch-site", "none")]),
+    refused(
+        "POST",
+        &[
+            ("origin", "null"),
+            ("sec-fetch-site", "cross-site"),
+            ("sec-fetch-mode", "navigate"),
+            ("sec-fetch-dest", "document"),
+        ],
+    ),
+    refused(
+        "GET",
+        &[("origin", "null"), ("sec-fetch-site", "cross-site")],
+    ),
+    refused("OPTIONS", &[("origin", "null")]),
     refused("POST", &[("origin", "{app-other-scheme}")]),
     refused("POST", &[("origin", "{app-other-port}")]),
     refused(
@@ -181,6 +207,30 @@ const CASES: &[Case] = &[
     allowed("GET", &[]),
     allowed("HEAD", &[]),
     allowed("OPTIONS", &[("origin", "{app}")]),
+    // A form of a `no-referrer` page of the Application's own, as a browser
+    // posts it: `Origin: null` with `Sec-Fetch-Site: same-origin`.
+    allowed(
+        "POST",
+        &[
+            ("origin", "null"),
+            ("sec-fetch-site", "same-origin"),
+            ("sec-fetch-mode", "navigate"),
+            ("sec-fetch-dest", "document"),
+            ("sec-fetch-user", "?1"),
+        ],
+    ),
+    allowed(
+        "POST",
+        &[("origin", "null"), ("sec-fetch-site", "same-origin")],
+    ),
+    allowed(
+        "GET",
+        &[("origin", "null"), ("sec-fetch-site", "same-origin")],
+    ),
+    allowed(
+        "OPTIONS",
+        &[("origin", "null"), ("sec-fetch-site", "same-origin")],
+    ),
     allowed("OPTIONS", &[]),
 ];
 

@@ -769,6 +769,85 @@ fn a_change_from_another_origin_is_refused_and_changes_nothing() {
     assert_eq!(shared_with(&vm), strings(&["everyone"]));
 }
 
+/// A change of sharing posted with `Origin: null`, as a browser posts a
+/// form of a `no-referrer` page, with this `Sec-Fetch-Site` (none when
+/// `None`).
+fn change_with_origin_null(dashboard: &Dashboard, body: &str, site: Option<&str>) -> Response {
+    let mut request = dashboard
+        .bare("POST", &Dashboard::sharing_target(APP))
+        .header("accept", "text/html")
+        .header("origin", "null")
+        .header("sec-fetch-mode", "navigate")
+        .header("sec-fetch-dest", "document")
+        .header("sec-fetch-user", "?1")
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(body);
+    if let Some(site) = site {
+        request = request.header("sec-fetch-site", site);
+    }
+    request.send()
+}
+
+#[test]
+fn a_change_with_origin_null_is_taken_only_with_sec_fetch_site_same_origin() {
+    let vm = with_board();
+    let dashboard = Dashboard::new(&vm, &alice());
+    let body = form_body(&[("action", "share"), ("kind", "everyone"), ("value", "")]);
+    for site in [Some("cross-site"), Some("same-site"), Some("none"), None] {
+        assert_other_origin(
+            &change_with_origin_null(&dashboard, &body, site),
+            &format!("`Origin: null` with `Sec-Fetch-Site` {site:?}"),
+        );
+    }
+    assert!(shared_with(&vm).is_empty(), "nothing was changed");
+    assert!(
+        sharing_records(&vm).is_empty(),
+        "no `sharing-changed` record"
+    );
+    assert_changed(
+        &change_with_origin_null(&dashboard, &body, Some("same-origin")),
+        &dashboard.url("/"),
+        APP,
+        "shared",
+        "`Origin: null` with `Sec-Fetch-Site: same-origin` (a form of a `no-referrer` page of the Dashboard's)",
+    );
+    assert_eq!(shared_with(&vm), strings(&["everyone"]));
+}
+
+#[test]
+fn a_change_whose_body_does_not_come_whole_within_10_seconds_is_408_timed_out() {
+    let vm = with_board();
+    let dashboard = Dashboard::new(&vm, &alice());
+    let page = dashboard.details(APP);
+    let (action, body) = page.share_submission("user", "bob");
+    // The headers say a body 64 bytes longer than the one sent, which
+    // never comes whole: the connection stays open with no more bytes.
+    let request = dashboard
+        .form_request_from(
+            &page.response,
+            &blackbox::browser::target_of(&action),
+            &body,
+        )
+        .declare_length(body.len() + 64)
+        .timeout(std::time::Duration::from_secs(30));
+    let started = std::time::Instant::now();
+    let answer = request.send();
+    let waited = started.elapsed();
+    assert_refused(
+        answer,
+        &dashboard.url("/"),
+        408,
+        "timed-out",
+        APP,
+        "a share whose body does not come whole",
+    );
+    assert!(
+        waited >= std::time::Duration::from_secs(9),
+        "expected the program to wait about 10 s for the body, it answered after {waited:?}"
+    );
+    assert!(shared_with(&vm).is_empty(), "nothing was changed");
+}
+
 #[test]
 fn not_signed_in_a_change_is_401() {
     let vm = with_board();
