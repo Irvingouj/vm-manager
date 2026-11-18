@@ -16,7 +16,6 @@
 
 use std::cell::Cell;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -367,10 +366,10 @@ impl BrowserCommand {
                 pid.display()
             ));
         }
-        fs::write(&script, text)
-            .unwrap_or_else(|e| panic!("cannot write {}: {e}", script.display()));
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o755))
-            .unwrap_or_else(|e| panic!("cannot make {} runnable: {e}", script.display()));
+        // Written so that the tool can start it at once, whatever other
+        // threads are starting ("Text file busy").
+        crate::program::write_program(&script, text.as_bytes())
+            .unwrap_or_else(|problem| panic!("cannot write {}: {problem}", script.display()));
         // What was opened before this command was made (an earlier
         // sign-in on the machine) is never a wait's to return.
         let before = fs::read_to_string(&opened)

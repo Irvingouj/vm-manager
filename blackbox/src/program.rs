@@ -179,3 +179,79 @@ fn drain(mut stream: impl Read + Send + 'static) -> thread::JoinHandle<String> {
         String::from_utf8_lossy(&kept).into_owned()
     })
 }
+
+/// How long `cp` may take to write one program of the harness's.
+const COPY_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Writes `bytes` to `path` as a program (mode `0755`) that can be started
+/// at once by this process, its children or the program under test,
+/// without "Text file busy" (CONTRACT.md, "The local run on a busy machine:
+/// The harness").
+///
+/// The race it closes: a file this process holds open for writing is
+/// inherited by every child another thread forks at that moment, until
+/// that child's `exec` closes it (the descriptor is close-on-exec); a start
+/// of the file meanwhile is `ETXTBSY`. So the program is never opened for
+/// writing by this process: the bytes go to a file beside it that is
+/// never started, a `cp` of the harness's (a child, whose descriptors no
+/// other child inherits) writes the program under a name of its own, and
+/// that is renamed into place. A rename and a `chmod` open nothing.
+pub fn write_program(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let source = beside(path, "source")?;
+    std::fs::write(&source, bytes)
+        .map_err(|e| format!("cannot write {}: {e}", source.display()))?;
+    let copied = copy_program(&source, path);
+    drop(std::fs::remove_file(&source));
+    copied
+}
+
+/// Copies the program `from` to `to` (mode `0755`), as
+/// [`write_program`] writes one: through a `cp` child, under a name of its
+/// own, renamed into place, so that `to` is never open for writing in this
+/// process. A program that was at `to` is replaced, not written over (one
+/// still running is not disturbed).
+pub fn copy_program(from: &Path, to: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    let partial = beside(to, "partial")?;
+    let mut command = Command::new("cp");
+    command.arg("--").arg(from).arg(&partial);
+    let finished = run_to_exit(command, COPY_TIMEOUT)?;
+    let done = if finished.status.is_some_and(|s| s.success()) {
+        std::fs::set_permissions(&partial, std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| format!("cannot make {} executable: {e}", partial.display()))
+            .and_then(|()| {
+                std::fs::rename(&partial, to).map_err(|e| {
+                    format!(
+                        "cannot rename {} to {}: {e}",
+                        partial.display(),
+                        to.display()
+                    )
+                })
+            })
+    } else {
+        Err(format!(
+            "`cp {} {}` ended {}: {}",
+            from.display(),
+            partial.display(),
+            finished.status_text(),
+            finished.stderr
+        ))
+    };
+    if done.is_err() {
+        drop(std::fs::remove_file(&partial));
+    }
+    done
+}
+
+/// A name beside `path`, in the same folder, that no other call of this
+/// process (nor another process) gives: `.<name>.<what>-<pid>-<n>`.
+fn beside(path: &Path, what: &str) -> Result<PathBuf, String> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let name = path
+        .file_name()
+        .ok_or_else(|| format!("{} names no file", path.display()))?
+        .to_string_lossy();
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    Ok(path.with_file_name(format!(".{name}.{what}-{}-{n}", std::process::id())))
+}

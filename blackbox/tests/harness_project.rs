@@ -318,3 +318,67 @@ fn harness_a_running_tool_is_signalled_and_waited_for() {
     );
     assert!(!is_running(pid));
 }
+
+/// CONTRACT.md, "The local run on a busy machine: The harness": a program
+/// the harness writes is never started while a child forked by another
+/// thread still holds it open for writing ("Text file busy"). Eight
+/// threads each write a new stand-in and start it at once, many times,
+/// while two more fork children without end: every start must succeed.
+#[test]
+fn harness_a_stand_in_written_while_other_threads_fork_starts_every_time() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    const WRITERS: usize = 8;
+    const ROUNDS: usize = 60;
+    let project = TempProject::new("harness-busy");
+    let done = Arc::new(AtomicBool::new(false));
+    let forkers: Vec<_> = (0..2)
+        .map(|_| {
+            let done = Arc::clone(&done);
+            std::thread::spawn(move || {
+                while !done.load(Ordering::Relaxed) {
+                    drop(run_to_exit(Command::new("true"), Duration::from_secs(10)));
+                }
+            })
+        })
+        .collect();
+    let writers: Vec<_> = (0..WRITERS)
+        .map(|writer| {
+            let root = project.path(&format!("writer-{writer}"));
+            std::thread::spawn(move || {
+                let mut failures = Vec::new();
+                for round in 0..ROUNDS {
+                    let dir = root.join(format!("round-{round}"));
+                    let said = format!("writer {writer} round {round}");
+                    let bin = stand_ins(&dir, &[("said", &format!("echo '{said}'"))]);
+                    let command = Command::new(bin.join("said"));
+                    match run_to_exit(command, Duration::from_secs(30)) {
+                        Ok(finished) if finished.stdout.trim() == said => {}
+                        Ok(finished) => failures.push(format!(
+                            "{said}: ended {} saying {:?}",
+                            finished.status_text(),
+                            finished.stdout
+                        )),
+                        Err(problem) => failures.push(format!("{said}: {problem}")),
+                    }
+                }
+                failures
+            })
+        })
+        .collect();
+    let failures: Vec<String> = writers
+        .into_iter()
+        .flat_map(|w| w.join().unwrap())
+        .collect();
+    done.store(true, Ordering::Relaxed);
+    for forker in forkers {
+        forker.join().unwrap();
+    }
+    assert!(
+        failures.is_empty(),
+        "expected every stand-in written to start, got {} failures:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}

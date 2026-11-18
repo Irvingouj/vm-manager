@@ -192,24 +192,10 @@ fn build_earlier(cache: &Path, kept: &Path) -> Result<(), String> {
         .filter(|m| m["reason"] == "compiler-artifact" && m["target"]["name"] == "vm")
         .find_map(|m| m["executable"].as_str().map(PathBuf::from))
         .ok_or("cargo built no `vm` executable")?;
-    let partial = cache.join(format!(
-        "vm-{EARLIER_COMMIT}.partial-{}",
-        std::process::id()
-    ));
-    std::fs::copy(&built, &partial).map_err(|e| {
-        format!(
-            "cannot copy {} to {}: {e}",
-            built.display(),
-            partial.display()
-        )
-    })?;
-    std::fs::rename(&partial, kept).map_err(|e| {
-        format!(
-            "cannot rename {} to {}: {e}",
-            partial.display(),
-            kept.display()
-        )
-    })
+    // Copied through a child, under a name of its own, and renamed into
+    // place: never open for writing in this process, so never "Text file
+    // busy" when it is started while other threads start children.
+    crate::program::copy_program(&built, kept)
 }
 
 /// Whether the program the harness starts now is the earlier one (the
@@ -276,21 +262,17 @@ pub fn with_both_programs(test: &str, body: impl FnOnce(&Programs)) {
     let script = dir.join("vm");
     std::fs::write(&select, "earlier")
         .unwrap_or_else(|e| panic!("cannot write {}: {e}", select.display()));
-    std::fs::write(
+    crate::program::write_program(
         &script,
         format!(
             "#!/bin/sh\n# Runs the earlier program or the one under test, as {select} says.\nif [ \"$(cat {select})\" = earlier ]; then exec {earlier} \"$@\"; fi\nexec {current} \"$@\"\n",
             select = quoted(&select),
             earlier = quoted(&earlier),
             current = quoted(&current),
-        ),
+        )
+        .as_bytes(),
     )
-    .unwrap_or_else(|e| panic!("cannot write {}: {e}", script.display()));
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
-            .unwrap_or_else(|e| panic!("cannot make {} executable: {e}", script.display()));
-    }
+    .unwrap_or_else(|problem| panic!("cannot write {}: {problem}", script.display()));
     let me =
         std::env::current_exe().unwrap_or_else(|e| panic!("cannot find this test binary: {e}"));
     let mut command = Command::new(me);

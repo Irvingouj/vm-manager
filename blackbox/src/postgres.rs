@@ -401,7 +401,7 @@ fn downloaded(major: u32) -> Result<PathBuf, String> {
     ));
     let unpacked = unpack(&archive, &unpacking).and_then(|()| {
         if has_all_three(&unpacking.join("bin")) {
-            Ok(())
+            programs_written_by_a_child(&unpacking.join("bin"))
         } else {
             Err(format!(
                 "the archive from {url} holds no bin/postgres, bin/initdb and bin/pg_ctl"
@@ -526,6 +526,26 @@ fn fetch(url: &str, limit: u64) -> Result<Vec<u8>, String> {
         .limit(limit)
         .read_to_vec()
         .map_err(|e| format!("cannot download {url}: {e}"))
+}
+
+/// Writes each program of `bin` again through
+/// [`crate::program::copy_program`]: the unpack wrote them in this process,
+/// and a child another thread forked meanwhile may still hold one open for
+/// writing, so that starting it would be "Text file busy". The copies were
+/// never open in this process.
+fn programs_written_by_a_child(bin: &Path) -> Result<(), String> {
+    // Listed first: the copies are renamed into this folder.
+    let programs: Vec<PathBuf> = fs::read_dir(bin)
+        .map_err(|e| format!("cannot list {}: {e}", bin.display()))?
+        .map(|entry| entry.map(|e| e.path()))
+        .collect::<Result<_, _>>()
+        .map_err(|e| format!("cannot list {}: {e}", bin.display()))?;
+    for path in programs {
+        if fs::symlink_metadata(&path).is_ok_and(|m| m.is_file()) {
+            crate::program::copy_program(&path, &path)?;
+        }
+    }
+    Ok(())
 }
 
 /// Unpacks zonky's jar: a zip holding one `.txz`, a tar compressed with xz.

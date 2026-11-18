@@ -26,7 +26,6 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime};
@@ -745,15 +744,15 @@ pub fn tar_member(file: &Path, member: &str) -> Result<String, String> {
 }
 
 /// A folder `dir` holding these programs, each a `/bin/sh` script with this
-/// body, executable: to be the whole of a `PATH`.
+/// body, executable: to be the whole of a `PATH`. Each is written by
+/// [`crate::program::write_program`], so that it can be started at once
+/// whatever other threads are starting.
 pub fn stand_ins(dir: &Path, programs: &[(&str, &str)]) -> PathBuf {
     fs::create_dir_all(dir).unwrap_or_else(|e| panic!("cannot make {}: {e}", dir.display()));
     for (name, body) in programs {
         let path = dir.join(name);
-        fs::write(&path, format!("#!/bin/sh\n{body}\n"))
-            .unwrap_or_else(|e| panic!("cannot write {}: {e}", path.display()));
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
-            .unwrap_or_else(|e| panic!("cannot make {} executable: {e}", path.display()));
+        crate::program::write_program(&path, format!("#!/bin/sh\n{body}\n").as_bytes())
+            .unwrap_or_else(|problem| panic!("cannot write {}: {problem}", path.display()));
     }
     dir.to_path_buf()
 }
