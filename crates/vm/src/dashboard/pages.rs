@@ -11,13 +11,15 @@
 //! person, and a Resource's standing is said in words with a sign, never in
 //! colour alone.
 //!
-//! **Size.** A page shows at most 100 Applications, each with at most 20
-//! Contributors (one Application's page: at most 100, and at most 1,000
-//! entries of whom it is shared with), each at most 256 bytes of id and
-//! 256 of name, at most six times longer once escaped; and the Resources
-//! each serving Version declares. So a list is bounded by about 100 × 20 ×
-//! 4 KiB (8 MiB) plus the declared Resources, and in practice a few
-//! hundred kilobytes.
+//! **Size.** Bounded by what a page shows: at most 100 Applications, each
+//! with at most 20 Contributors (one Application's page: at most 100, and
+//! at most 1,000 entries of whom it is shared with, each with its unshare
+//! form), each an id or Group of at most 256 bytes and a name and email of
+//! at most 256 each, at most six times longer once escaped (`&quot;`); and
+//! the Resources each serving Version declares. So about 10 MiB at worst
+//! for either page, plus the declared Resources; measured with ids of 15
+//! bytes: 222 KiB for 100 Applications of 30 Contributors, 401 KiB for one
+//! shared with 1,000 (/tmp/t44-bench/result.json).
 
 use std::collections::BTreeMap;
 
