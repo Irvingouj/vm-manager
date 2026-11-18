@@ -933,7 +933,7 @@ impl Api {
         }
         let answer = match route {
             Route::Resources => self.resources_route(user, method, &body).await,
-            Route::Resource(name) => Ok(self.resource(user, method, name)),
+            Route::Resource(name) => self.resource(user, method, name).await,
             Route::Me => Ok(self.me(user, method)),
             Route::ToolCredentials => Ok(self.make_credential(user, with, method, &body).await),
             Route::CurrentToolCredential => self.end_credential(with, method).await,
@@ -1520,12 +1520,18 @@ impl Api {
     ) -> Result<Answer, DbError> {
         if method == Method::GET {
             let all = self.resources.list();
-            let resources = ResourcesView {
-                resources: {
-                    let groups = groups_of(user);
-                    all.iter().map(|r| ResourceRead::of(r, &groups)).collect()
-                },
-            };
+            // Grants memory does not know now are read back, without
+            // waiting; the User's access to a Resource is never guessed.
+            let groups = groups_of(user);
+            let mut resources = Vec::with_capacity(all.len());
+            for resource in &all {
+                self.resources.read_back(resource).await;
+                match ResourceRead::of(resource, &groups) {
+                    Some(read) => resources.push(read),
+                    None => return Ok(grants_unknown(&resource.name)),
+                }
+            }
+            let resources = ResourcesView { resources };
             return Ok(Answer::json(StatusCode::OK, &resources));
         }
         if method != Method::POST {
@@ -1554,26 +1560,29 @@ impl Api {
         })
     }
 
-    fn resource(&self, user: &User, method: &Method, name: &str) -> Answer {
-        let Some(resource) = self.resources.get(name) else {
-            return no_resource();
+    async fn resource(&self, user: &User, method: &Method, name: &str) -> Result<Answer, DbError> {
+        let Some(resource) = self.resources.find(name).await? else {
+            return Ok(no_resource());
         };
-        if method == Method::GET {
-            Answer::json(
-                StatusCode::OK,
-                &ResourceRead::of(&resource, &groups_of(user)),
-            )
-        } else {
-            Answer::method_not_allowed(method, "GET")
+        if method != Method::GET {
+            return Ok(Answer::method_not_allowed(method, "GET"));
         }
+        self.resources.read_back(&resource).await;
+        Ok(match ResourceRead::of(&resource, &groups_of(user)) {
+            Some(read) => Answer::json(StatusCode::OK, &read),
+            None => grants_unknown(name),
+        })
     }
 
     async fn grants(&self, method: &Method, name: &str, body: &[u8]) -> Result<Answer, DbError> {
-        let Some(resource) = self.resources.get(name) else {
+        let Some(resource) = self.resources.find(name).await? else {
             return Ok(no_resource());
         };
         if method == Method::GET {
-            let grants = resource.grants();
+            self.resources.read_back(&resource).await;
+            let Some(grants) = resource.grants() else {
+                return Ok(grants_unknown(name));
+            };
             let view = GrantsView {
                 grants: grants
                     .iter()
@@ -1611,14 +1620,17 @@ impl Api {
     /// is sent to the shared database, and completed after; the pull
     /// (crate::structure) within its time and bytes.
     async fn structure(&self, user: &User, request: &str, method: &Method, name: &str) -> Answer {
-        let Some(resource) = self.resources.get(name) else {
-            return no_resource();
+        let resource = match self.resources.find(name).await {
+            Ok(Some(resource)) => resource,
+            Ok(None) => return no_resource(),
+            Err(error) => return Answer::unavailable(&error),
         };
         if method != Method::GET {
             return Answer::method_not_allowed(method, "GET");
         }
+        self.resources.read_back(&resource).await;
         let groups = groups_of(user);
-        let (decision, held) = resource.with_grants(|grants| {
+        let decided = resource.with_grants(|grants| {
             let decision = authz::decide(&authz::Question {
                 request_in_flight: true,
                 actor: authz::Actor::User,
@@ -1633,6 +1645,9 @@ impl Api {
             });
             (decision, authz::held(&groups, grants))
         });
+        let Some((decision, held)) = decided else {
+            return grants_unknown(name);
+        };
         if let authz::Decision::Refuse(_) = decision {
             if let Err(error) = self
                 .log
@@ -2069,13 +2084,26 @@ struct ResourceRead<'a> {
 
 impl<'a> ResourceRead<'a> {
     /// `groups`: the reader's, as [`groups_of`] gives them, once a request.
-    fn of(resource: &'a resources::Resource, groups: &[&str]) -> Self {
-        let held = resource.with_grants(|grants| authz::held(groups, grants));
-        Self {
+    /// `None` while memory does not know the Resource's Grants.
+    fn of(resource: &'a resources::Resource, groups: &[&str]) -> Option<Self> {
+        let held = resource.with_grants(|grants| authz::held(groups, grants))?;
+        Some(Self {
             face: ResourceView::of(resource),
             your_access: held.map(resources::level_name),
-        }
+        })
     }
+}
+
+/// `503` `unavailable`: the Grants on the Resource `name` are not known now
+/// (crate::resources), and nothing is said on a guess.
+fn grants_unknown(name: &str) -> Answer {
+    Answer::error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "unavailable",
+        &format!(
+            "the platform is finding out the Grants on the Resource {name} after a change of them whose answer was lost: try again shortly"
+        ),
+    )
 }
 
 /// The User's Groups as the Authorization decision takes them: borrowed,

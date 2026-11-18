@@ -10,10 +10,37 @@
 //! As with Applications and Versions (crate::registry), memory holds every
 //! Resource and Grant, and is changed only after the platform database has
 //! committed, so operations are decided from memory, also while the
-//! platform database cannot be reached. Each Grant carries a revision the
-//! database takes under the row's lock, and memory keeps the higher, so two
-//! writes of one Group's Grant leave memory as the database whatever order
-//! they report back in. A write whose answer is lost is read back.
+//! platform database cannot be reached. A write of a Grant is one
+//! transaction whose first statement takes the Resource's row lock in
+//! `FOR NO KEY UPDATE` (the weakest mode that conflicts with the `FOR SHARE`
+//! of a read-back; the `FOR KEY SHARE` a foreign key takes does not), held
+//! until its commit is done: so the writes of one Resource's Grants take
+//! turns, and each takes its revision (from one sequence) under that lock,
+//! so a Resource's revisions grow in the order its writes commit. Memory
+//! keeps the higher revision of each Group's Grant, so two writes leave
+//! memory as the database whatever order they report back in.
+//!
+//! A write of a Grant whose answer is lost may still be made after that
+//! answer (its commit on its way): its COMMIT is sent only once the row's
+//! lock is held, so if it lands at all it holds the lock from before the
+//! answer was lost until it has landed. Memory forgets the Resource's
+//! Grants at once ([`Grants::Unknown`]), reading nothing first; an
+//! operation that would come to the check of a Grant is then refused
+//! `grants-unknown` (crate::gateway), and the refused operation's own task,
+//! once it has answered, reads the Grants back ([`Resources::read_back`]):
+//! in one transaction, the row's share lock taken without waiting (so
+//! while the write is on its way this fails at once), then the Grants read
+//! in a second statement, whose snapshot is after the lock. The API's paths
+//! that show Grants try the same, and are `503` while it fails. A read-back
+//! begun before a forgetting (`epoch`) or that misses a revision reported
+//! since (`seen`) is not taken. At a start, Resources whose row a write
+//! holds are skipped and their Grants held as not known.
+//!
+//! A Resource registered whose answer is lost may be registered after
+//! that answer: nothing is kept of it. An API request that names a Resource
+//! memory does not hold reads it ([`Resources::find`]), so it is known from
+//! the next such request (registering it again, which is `name-taken`,
+//! included).
 //!
 //! A Resource's connection and logins are held as a [`Connection`], which
 //! never prints, and stored as the [`sealed`] module writes them, the one
@@ -24,13 +51,16 @@
 //! structure login (the Structure puller's, crate::structure). A pool
 //! connects on first use.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, PoisonError, RwLock};
+use std::time::Duration;
 
 use authz::AccessLevel;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Semaphore, SemaphorePermit};
+use tokio_postgres::error::SqlState;
 use tokio_postgres::types::FromSql;
 use tokio_postgres::{Client, Row};
 
@@ -205,6 +235,25 @@ struct Granted {
     revision: i64,
 }
 
+/// What memory holds of a Resource's Grants.
+#[derive(Debug)]
+enum Grants {
+    /// By Group.
+    Known(BTreeMap<String, Granted>),
+    /// Forgotten: a write of a Grant whose answer was lost may still land.
+    /// `seen` is the highest revision memory held or a write reported
+    /// since; `epoch` tells a read-back begun before this forgetting from
+    /// one begun after.
+    Unknown { seen: i64, epoch: u64 },
+}
+
+impl Grants {
+    /// The highest revision of `grants`, 0 for none.
+    fn newest(grants: &BTreeMap<String, Granted>) -> i64 {
+        grants.values().map(|g| g.revision).max().unwrap_or(0)
+    }
+}
+
 /// A registered Resource. Its public face is what every signed-in User may
 /// see; its connection is only in its pool.
 #[derive(Debug)]
@@ -219,8 +268,8 @@ pub struct Resource {
     pub created_at: String,
     /// One pool per login: a connection of one never serves the other.
     pools: Pools,
-    /// By Group. Held only for a lookup or a change, never across an await.
-    grants: RwLock<BTreeMap<String, Granted>>,
+    /// Held only for a lookup or a change, never across an await.
+    grants: RwLock<Grants>,
     /// The pulls of its structure running now: at most [`PULLS_AT_ONCE`].
     pulls: Semaphore,
 }
@@ -257,9 +306,13 @@ impl Resource {
     }
 
     /// Runs `decide` with the Grants on this Resource, as the Authorization
-    /// decision takes them.
-    pub fn with_grants<T>(&self, decide: impl FnOnce(&[authz::Grant<'_>]) -> T) -> T {
+    /// decision takes them; `None`, without running it, while memory does
+    /// not know them.
+    pub fn with_grants<T>(&self, decide: impl FnOnce(&[authz::Grant<'_>]) -> T) -> Option<T> {
         let grants = self.grants.read().unwrap_or_else(PoisonError::into_inner);
+        let Grants::Known(grants) = &*grants else {
+            return None;
+        };
         let list: Vec<authz::Grant<'_>> = grants
             .iter()
             .map(|(group, granted)| authz::Grant {
@@ -267,30 +320,80 @@ impl Resource {
                 level: granted.level,
             })
             .collect();
-        decide(&list)
+        Some(decide(&list))
     }
 
-    /// Each Group's Access level, by Group.
-    pub fn grants(&self) -> Vec<(String, AccessLevel)> {
+    /// Whether memory knows the Grants on this Resource now.
+    pub fn grants_known(&self) -> bool {
+        matches!(
+            *self.grants.read().unwrap_or_else(PoisonError::into_inner),
+            Grants::Known(_)
+        )
+    }
+
+    /// Each Group's Access level, by Group; `None` while memory does not
+    /// know them.
+    pub fn grants(&self) -> Option<Vec<(String, AccessLevel)>> {
         // Copied out so that the lock is not held while the answer is
         // written.
-        self.grants
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .iter()
-            .map(|(group, granted)| (group.clone(), granted.level))
-            .collect()
+        match &*self.grants.read().unwrap_or_else(PoisonError::into_inner) {
+            Grants::Known(grants) => Some(
+                grants
+                    .iter()
+                    .map(|(group, granted)| (group.clone(), granted.level))
+                    .collect(),
+            ),
+            Grants::Unknown { .. } => None,
+        }
     }
 
-    /// Takes `level` for `group` unless memory already has a later write.
+    /// Takes what a write committed: `level` for `group` unless memory
+    /// already has a later write; over forgotten Grants it only raises
+    /// `seen`, since a lost write may have gone further.
     fn install(&self, group: &str, granted: Granted) {
         let mut grants = self.grants.write().unwrap_or_else(PoisonError::into_inner);
-        match grants.get_mut(group) {
-            Some(current) if current.revision >= granted.revision => {}
-            Some(current) => *current = granted,
-            None => {
-                grants.insert(group.to_owned(), granted);
-            }
+        match &mut *grants {
+            Grants::Known(grants) => match grants.get_mut(group) {
+                Some(current) if current.revision >= granted.revision => {}
+                Some(current) => *current = granted,
+                None => {
+                    grants.insert(group.to_owned(), granted);
+                }
+            },
+            Grants::Unknown { seen, .. } => *seen = (*seen).max(granted.revision),
+        }
+    }
+
+    /// Forgets the Grants, as of `epoch`, keeping the highest revision
+    /// memory held as `seen`.
+    fn forget(&self, epoch: u64) {
+        let mut grants = self.grants.write().unwrap_or_else(PoisonError::into_inner);
+        let seen = match &*grants {
+            Grants::Known(known) => Grants::newest(known),
+            Grants::Unknown { seen, .. } => *seen,
+        };
+        *grants = Grants::Unknown { seen, epoch };
+    }
+
+    /// The epoch of the forgetting memory is in; `None` when it knows the
+    /// Grants.
+    fn forgotten_at(&self) -> Option<u64> {
+        match &*self.grants.read().unwrap_or_else(PoisonError::into_inner) {
+            Grants::Known(_) => None,
+            Grants::Unknown { epoch, .. } => Some(*epoch),
+        }
+    }
+
+    /// Takes what a read-back begun in the forgetting `epoch` read: only
+    /// if memory is still in that forgetting, and it holds every revision
+    /// reported since.
+    fn install_read(&self, read: BTreeMap<String, Granted>, began: u64) {
+        let mut grants = self.grants.write().unwrap_or_else(PoisonError::into_inner);
+        if let Grants::Unknown { seen, epoch } = &*grants
+            && *epoch == began
+            && *seen <= Grants::newest(&read)
+        {
+            *grants = Grants::Known(read);
         }
     }
 }
@@ -314,7 +417,19 @@ pub struct Resources {
     limits: executor::Limits,
     /// By name. Held only for a lookup or an insert, never across an await.
     all: RwLock<BTreeMap<String, Arc<Resource>>>,
+    /// The number of forgettings of Grants so far, each one's `epoch`.
+    forgotten: AtomicU64,
+    /// The read-backs of Grants under way: at most [`READ_BACKS`].
+    reading_back: Semaphore,
 }
+
+/// The most read-backs of Grants at once in the program; one more is not
+/// made (the Grants stay not known, and the next operation or request that
+/// finds them so tries again).
+const READ_BACKS: usize = 4;
+
+/// The longest a read-back of Grants may take.
+const READ_BACK_WAIT: Duration = Duration::from_secs(1);
 
 const RESOURCE_COLUMNS: &str = concat!(
     "r.id, r.name, r.description, r.owner, r.contact, r.connection, r.created_by, ",
@@ -324,50 +439,92 @@ const RESOURCE_COLUMNS: &str = concat!(
 impl Resources {
     /// Reads every Resource and Grant from the platform database. Each
     /// Resource's pool uses `limits`.
+    ///
+    /// In one transaction, every Resource's row share lock is taken
+    /// without waiting for the rows a write of a Grant holds (`SKIP
+    /// LOCKED`); then, in statements whose snapshot is after the locks, the
+    /// Resources and the Grants. The Grants of a Resource whose row was
+    /// skipped are held as not known: a write of them was on its way. So a
+    /// waiting write keeps neither the start nor the other Resources back.
     pub async fn load(
         database: Arc<PlatformDatabase>,
         limits: executor::Limits,
     ) -> Result<Self, DbError> {
-        let (resources, grants) = database
+        let (locked, resources, grants) = database
             .pool()
             .run(async |client: &mut Client| {
-                let resources = client
+                let transaction = client.transaction().await.map_err(DbError::from)?;
+                // Row locks only: nothing of this transaction must last, so
+                // its commit need not wait to be flushed or replicated.
+                transaction
+                    .batch_execute("SET LOCAL synchronous_commit = off")
+                    .await
+                    .map_err(DbError::from)?;
+                let locked = transaction
+                    .query("SELECT id FROM resources FOR SHARE SKIP LOCKED", &[])
+                    .await
+                    .map_err(DbError::from)?;
+                let resources = transaction
                     .query(
                         &format!("SELECT {RESOURCE_COLUMNS} FROM resources r ORDER BY r.name"),
                         &[],
                     )
                     .await
                     .map_err(DbError::from)?;
-                let grants = client
+                let grants = transaction
                     .query(
-                        "SELECT r.name, g.group_name, g.access, g.revision
-                         FROM grants g JOIN resources r ON r.id = g.resource_id",
+                        "SELECT g.resource_id, g.group_name, g.access, g.revision FROM grants g",
                         &[],
                     )
                     .await
                     .map_err(DbError::from)?;
-                Ok((resources, grants))
+                transaction.commit().await.map_err(DbError::from)?;
+                Ok((locked, resources, grants))
             })
             .await?;
+        let locked: HashSet<i64> = locked
+            .iter()
+            .map(|row| get::<i64>(row, 0))
+            .collect::<Result<_, _>>()?;
         let this = Self {
             database,
             limits,
             all: RwLock::new(BTreeMap::new()),
+            forgotten: AtomicU64::new(0),
+            reading_back: Semaphore::new(READ_BACKS),
         };
+        let mut read: BTreeMap<i64, BTreeMap<String, Granted>> = BTreeMap::new();
+        for row in &grants {
+            let id: i64 = get(row, 0)?;
+            let (group, granted) = granted_of(row, 1)?;
+            read.entry(id)
+                .or_default()
+                .insert(group.to_owned(), granted);
+        }
+        let mut unknown = Vec::new();
+        let mut all = BTreeMap::new();
         for row in &resources {
             let resource = this.resource_of(row)?;
-            this.all
-                .write()
-                .unwrap_or_else(PoisonError::into_inner)
-                .insert(resource.name.clone(), Arc::new(resource));
-        }
-        for row in &grants {
-            let name: &str = get(row, 0)?;
-            if let Some(resource) = this.get(name) {
-                let (group, granted) = granted_of(row, 1)?;
-                resource.install(group, granted);
+            let grants = read.remove(&resource.id).unwrap_or_default();
+            if locked.contains(&resource.id) {
+                *resource
+                    .grants
+                    .write()
+                    .unwrap_or_else(PoisonError::into_inner) = Grants::Known(grants);
+            } else {
+                let epoch = this.forgotten.fetch_add(1, Ordering::Relaxed);
+                resource.forget(epoch);
+                unknown.push(resource.name.clone());
             }
+            all.insert(resource.name.clone(), Arc::new(resource));
         }
+        if !unknown.is_empty() {
+            log::record(
+                "grants-unknown",
+                serde_json::json!({ "resources": unknown }),
+            );
+        }
+        *this.all.write().unwrap_or_else(PoisonError::into_inner) = all;
         Ok(this)
     }
 
@@ -384,7 +541,7 @@ impl Resources {
             contact: get(row, 4)?,
             created_by: get(row, 6)?,
             created_at: get(row, 7)?,
-            grants: RwLock::new(BTreeMap::new()),
+            grants: RwLock::new(Grants::Known(BTreeMap::new())),
             pulls: Semaphore::new(PULLS_AT_ONCE),
         })
     }
@@ -442,13 +599,18 @@ impl Resources {
             .await;
         let row = match inserted {
             Ok(Some(row)) => row,
-            Ok(None) => return Ok(Registered::NameTaken),
-            Err(error) => {
-                // The insert may have committed without its answer
-                // arriving: read again, so memory follows the database.
-                self.refresh(&new.name).await;
-                return Err(error);
+            Ok(None) => {
+                // Registered before, perhaps by a registration whose answer
+                // was lost: known from this answer on.
+                if let Err(error) = self.find(&new.name).await {
+                    unknown("resource-unknown", &new.name, &error);
+                }
+                return Ok(Registered::NameTaken);
             }
+            // The insert may still commit after this answer: nothing is
+            // kept of it, and the next request of the API that names it
+            // reads it (`find`).
+            Err(error) => return Err(error),
         };
         let resource = Arc::new(Resource {
             id: get(&row, 0)?,
@@ -459,7 +621,7 @@ impl Resources {
             owner: new.owner,
             contact: new.contact,
             created_by: by.to_owned(),
-            grants: RwLock::new(BTreeMap::new()),
+            grants: RwLock::new(Grants::Known(BTreeMap::new())),
             pulls: Semaphore::new(PULLS_AT_ONCE),
         });
         self.all
@@ -504,7 +666,10 @@ impl Resources {
     }
 
     /// Sets `group`'s Grant on `resource` to `level`, in the database and
-    /// then in memory, before this returns.
+    /// then in memory, before this returns. One transaction: the
+    /// Resource's row lock first (`FOR NO KEY UPDATE`, held until the
+    /// commit is done), then the Grant and its revision. When its answer
+    /// is lost the Resource's Grants are forgotten at once.
     pub async fn grant(
         &self,
         resource: &str,
@@ -519,7 +684,18 @@ impl Resources {
             .database
             .pool()
             .run(async |client: &mut Client| {
-                client
+                let transaction = client.transaction().await.map_err(DbError::from)?;
+                let locked = transaction
+                    .query_opt(
+                        "SELECT 1 FROM resources WHERE id = $1 FOR NO KEY UPDATE",
+                        &[&found.id],
+                    )
+                    .await
+                    .map_err(DbError::from)?;
+                if locked.is_none() {
+                    return Ok(None);
+                }
+                let row = transaction
                     .query_one(
                         "INSERT INTO grants (resource_id, group_name, access, revision)
                          VALUES ($1, $2, $3, nextval('grant_revisions'))
@@ -529,77 +705,171 @@ impl Resources {
                         &[&found.id, &group, &access],
                     )
                     .await
-                    .map_err(DbError::from)
+                    .map_err(DbError::from)?;
+                transaction.commit().await.map_err(DbError::from)?;
+                Ok(Some(row))
             })
             .await;
         match written {
-            Ok(row) => {
+            Ok(Some(row)) => {
                 let revision = get(&row, 0)?;
                 found.install(group, Granted { level, revision });
                 Ok(GrantWritten::Written)
             }
+            Ok(None) => Ok(GrantWritten::NoSuchResource),
             Err(error) => {
-                self.refresh_grants(&found).await;
+                // The commit may land after this answer: nothing is read
+                // now, which could be earlier than it.
+                let epoch = self.forgotten.fetch_add(1, Ordering::Relaxed);
+                found.forget(epoch);
+                log::record(
+                    "grants-unknown",
+                    serde_json::json!({ "resource": &found.name }),
+                );
                 Err(error)
             }
         }
     }
 
-    /// Reads the Resource `name` and its Grants into memory, if it is in
-    /// the database and not in memory.
-    async fn refresh(&self, name: &str) {
+    /// The Resource `name`: from memory, or else from the platform
+    /// database (a registration whose answer was lost, landed since), with
+    /// its Grants, read under its row's share lock taken without waiting,
+    /// and then held in memory. For the API's requests that name a
+    /// Resource; operations look in memory only.
+    pub async fn find(&self, name: &str) -> Result<Option<Arc<Resource>>, DbError> {
+        if let Some(found) = self.get(name) {
+            return Ok(Some(found));
+        }
+        if !is_resource_name(name) {
+            return Ok(None);
+        }
         let read = self
             .database
             .pool()
             .run(async |client: &mut Client| {
-                client
+                let transaction = client.transaction().await.map_err(DbError::from)?;
+                // Row locks only: nothing of this transaction must last.
+                transaction
+                    .batch_execute("SET LOCAL synchronous_commit = off")
+                    .await
+                    .map_err(DbError::from)?;
+                let found = transaction
                     .query_opt(
-                        &format!("SELECT {RESOURCE_COLUMNS} FROM resources r WHERE r.name = $1"),
+                        &format!(
+                            "SELECT {RESOURCE_COLUMNS} FROM resources r WHERE r.name = $1 FOR SHARE NOWAIT"
+                        ),
                         &[&name],
                     )
                     .await
-                    .map_err(DbError::from)
+                    .map_err(DbError::from)?;
+                let Some(found) = found else {
+                    return Ok(None);
+                };
+                let id: i64 = get(&found, 0)?;
+                let grants = transaction
+                    .query(
+                        "SELECT group_name, access, revision FROM grants WHERE resource_id = $1",
+                        &[&id],
+                    )
+                    .await
+                    .map_err(DbError::from)?;
+                transaction.commit().await.map_err(DbError::from)?;
+                Ok(Some((found, grants)))
             })
-            .await;
-        match read.and_then(|row| row.as_ref().map(|row| self.resource_of(row)).transpose()) {
-            Ok(Some(resource)) => {
-                let resource = Arc::new(resource);
-                self.all
-                    .write()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .entry(resource.name.clone())
-                    .or_insert_with(|| Arc::clone(&resource));
-            }
-            Ok(None) => {}
-            Err(error) => unknown("resource-unknown", name, &error),
-        }
+            .await?;
+        let Some((row, grants)) = read else {
+            return Ok(None);
+        };
+        let resource = self.resource_of(&row)?;
+        *resource
+            .grants
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = Grants::Known(grants_of(&grants)?);
+        let resource = Arc::new(resource);
+        let held = Arc::clone(
+            self.all
+                .write()
+                .unwrap_or_else(PoisonError::into_inner)
+                .entry(resource.name.clone())
+                .or_insert(resource),
+        );
+        Ok(Some(held))
     }
 
-    /// Reads `resource`'s Grants into memory.
-    async fn refresh_grants(&self, resource: &Resource) {
-        let read = self
+    /// Reads `resource`'s Grants back when memory does not know them, and
+    /// answers whether it knows them after. Never waits for the platform
+    /// database: at most [`READ_BACKS`] at once in the program (one more
+    /// is not made), each within [`READ_BACK_WAIT`], and not made while a
+    /// write of a Grant is on its way (the row is locked).
+    pub async fn read_back(&self, resource: &Resource) -> bool {
+        let Some(began) = resource.forgotten_at() else {
+            return true;
+        };
+        let Ok(_permit) = self.reading_back.try_acquire() else {
+            return false;
+        };
+        let read = tokio::time::timeout(READ_BACK_WAIT, self.grants_of(resource.id))
+            .await
+            .unwrap_or_else(|_| {
+                Err(DbError::timed_out(
+                    "reading a Resource's Grants back",
+                    READ_BACK_WAIT,
+                ))
+            });
+        match read {
+            Ok(Some(grants)) => resource.install_read(grants, began),
+            Ok(None) => {}
+            Err(error) => {
+                // A write on its way is no failure: it is waited out by
+                // trying again later.
+                if error.code() != Some(&SqlState::LOCK_NOT_AVAILABLE) {
+                    unknown("grants-unknown", &resource.name, &error);
+                }
+            }
+        }
+        resource.grants_known()
+    }
+
+    /// The Grants of the Resource `id`, never earlier than a write of
+    /// them: in one transaction, its row's share lock taken without
+    /// waiting (`NOWAIT`: a write holds the row's lock until its commit is
+    /// done, so while one is on its way this fails at once with
+    /// `lock_not_available`), then, in a second statement whose snapshot is
+    /// after the lock was got, the Grants. `None` for no such Resource.
+    async fn grants_of(&self, id: i64) -> Result<Option<BTreeMap<String, Granted>>, DbError> {
+        let rows = self
             .database
             .pool()
             .run(async |client: &mut Client| {
-                client
-                    .query(
-                        "SELECT group_name, access, revision FROM grants WHERE resource_id = $1",
-                        &[&resource.id],
+                let transaction = client.transaction().await.map_err(DbError::from)?;
+                // Row locks only: nothing of this transaction must last, so
+                // its commit need not wait to be flushed or replicated.
+                transaction
+                    .batch_execute("SET LOCAL synchronous_commit = off")
+                    .await
+                    .map_err(DbError::from)?;
+                let found = transaction
+                    .query_opt(
+                        "SELECT 1 FROM resources WHERE id = $1 FOR SHARE NOWAIT",
+                        &[&id],
                     )
                     .await
-                    .map_err(DbError::from)
+                    .map_err(DbError::from)?;
+                if found.is_none() {
+                    return Ok(None);
+                }
+                let rows = transaction
+                    .query(
+                        "SELECT group_name, access, revision FROM grants WHERE resource_id = $1",
+                        &[&id],
+                    )
+                    .await
+                    .map_err(DbError::from)?;
+                transaction.commit().await.map_err(DbError::from)?;
+                Ok(Some(rows))
             })
-            .await;
-        let installed = read.and_then(|rows| {
-            for row in &rows {
-                let (group, granted) = granted_of(row, 0)?;
-                resource.install(group, granted);
-            }
-            Ok(())
-        });
-        if let Err(error) = installed {
-            unknown("grants-unknown", &resource.name, &error);
-        }
+            .await?;
+        rows.as_deref().map(grants_of).transpose()
     }
 }
 
@@ -608,6 +878,17 @@ fn unknown(event: &str, resource: &str, error: &DbError) {
         event,
         serde_json::json!({ "resource": resource, "error": error.to_string() }),
     );
+}
+
+/// The Grants of rows `group_name, access, revision`, by Group.
+fn grants_of(rows: &[Row]) -> Result<BTreeMap<String, Granted>, DbError> {
+    let mut grants = BTreeMap::new();
+    for row in rows {
+        let (group, granted) = granted_of(row, 0)?;
+        // Copied: memory keeps its own Grants; once per Grant read back.
+        grants.insert(group.to_owned(), granted);
+    }
+    Ok(grants)
 }
 
 /// A Grant read from a row: group, access and revision from column `at` on.

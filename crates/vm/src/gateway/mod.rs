@@ -20,7 +20,11 @@
 //! 2. the Authorization decision ([`authz::decide`]), from the request in
 //!    flight, who it acts as, its target, and for a Resource the serving
 //!    Version's Declared access and the Resources and Grants in memory
-//!    (crate::resources), for the level the operation needs;
+//!    (crate::resources), for the level the operation needs. While memory
+//!    does not know a Resource's Grants (a write of them whose answer was
+//!    lost), it is asked with none, and where it would refuse `no-grant`
+//!    the operation is refused `grants-unknown`; that refusal's task, once
+//!    it has answered, reads the Grants back ([`Resources::read_back`]);
 //! 3. the statement without its values (crate::statement);
 //! 4. the rest runs as a task on the program's runtime, owned here: a
 //!    refused operation's Operation log entry is written whole and the
@@ -92,6 +96,9 @@ pub struct Refusal {
 pub const NO_REQUEST: &str = "no-request";
 /// An operation the host does not know.
 pub const UNKNOWN_OPERATION: &str = "unknown-operation";
+/// In place of the check of the Grant: memory does not know the Grants on
+/// the Resource now (crate::resources).
+pub const GRANTS_UNKNOWN: &str = "grants-unknown";
 /// The Operation log entry could not be written.
 pub const LOG_UNAVAILABLE: &str = "log-unavailable";
 /// The `host-call` record's reason for arguments that cannot be read. Not
@@ -120,6 +127,19 @@ impl Refusal {
             UNKNOWN_OPERATION,
             format!("the platform has no operation {operation:?} on env.VM"),
         )
+    }
+
+    /// The Grants on the Resource `name` are not known now: a write of
+    /// them whose answer was lost is being found out.
+    fn grants_unknown(name: &str) -> Self {
+        let mut refusal = Self::new(
+            GRANTS_UNKNOWN,
+            format!(
+                "the platform is finding out the Grants on the Resource {name:?} after a change of them whose answer was lost, so the operation was not run: try again shortly"
+            ),
+        );
+        refusal.details.insert("resource".into(), name.into());
+        refusal
     }
 
     /// `resource` is `None` on the own database.
@@ -643,11 +663,23 @@ impl PlatformGateway {
                         needed,
                     })
                 };
-                let decision = match &resource {
-                    Some(resource) => resource.with_grants(decide),
-                    None => decide(&[]),
+                // Grants memory does not know now: asked with none, so that
+                // the refusals checked before the Grant are given as ever,
+                // and `grants-unknown` in place of the Grant's.
+                let (decision, known) = match &resource {
+                    Some(resource) => match resource.with_grants(decide) {
+                        Some(decision) => (decision, true),
+                        None => (decide(&[]), false),
+                    },
+                    None => (decide(&[]), true),
                 };
                 let refusal = match decision {
+                    authz::Decision::Allow
+                    | authz::Decision::Refuse(authz::Reason::NoGrant { .. })
+                        if !known =>
+                    {
+                        Some(Refusal::grants_unknown(name))
+                    }
                     authz::Decision::Allow => None,
                     authz::Decision::Refuse(reason) => Some(Refusal::of(
                         reason,
@@ -716,6 +748,22 @@ impl PlatformGateway {
         Fut: Future<Output = Value> + Send + 'static,
     {
         let operations = Arc::clone(&self.operations);
+        // A refusal `grants-unknown`: once it is answered, its task reads
+        // the Resource's Grants back, so that the operations after it are
+        // decided by the Grants the database has once the write is
+        // settled.
+        let read_back = match (&work.refusal, &work.target) {
+            (
+                Some(refusal),
+                On::Resource {
+                    resource: Some(resource),
+                    ..
+                },
+            ) if refusal.reason == GRANTS_UNKNOWN => {
+                Some((Arc::clone(&self.resources), Arc::clone(resource)))
+            }
+            _ => None,
+        };
         let answer = async move {
             let permits = Arc::clone(&operations.permits);
             let Ok(Ok(permit)) = tokio::time::timeout(PERMIT_WAIT, permits.acquire_owned()).await
@@ -727,6 +775,9 @@ impl PlatformGateway {
                 // The Application may have stopped waiting; the entry is
                 // complete either way.
                 reply.send(task(work).await).ok();
+                if let Some((resources, resource)) = read_back {
+                    resources.read_back(&resource).await;
+                }
                 drop(permit);
             });
             match tokio::time::timeout(ANSWER_WAIT, answer).await {

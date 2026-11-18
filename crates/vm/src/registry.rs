@@ -5,18 +5,39 @@
 //! ([`Registry::create_application`], [`Registry::send_version`], and the
 //! reads), and Ingress's [`Registry::serving`], which answers from memory.
 //!
-//! Which Version serves is held in memory as well as in the database. One
-//! program serves an installation (ADR 0015), so the memory is the
-//! database's copy and is only ever changed after the database: a Version's
-//! transaction commits, then memory is changed, then the API answers `201`.
-//! So once the `201` has been received every new request finds the new
-//! Version, without a round trip to Postgres per request. A request
-//! already running holds an `Arc` of the Version it started on and finishes
-//! on it. Every change of what serves (a Version sent, a go-back) adds one
-//! to the Application's `serving_generation` in the same statement, under
-//! the row's lock; memory only ever moves to a higher generation, so two
-//! changes at once leave memory as the database's last one whatever order
-//! they report back in.
+//! What memory holds of each Application ([`Kept`]): which Version serves
+//! it and its two lists. One program serves an installation (ADR 0015), so
+//! memory is the database's copy and is only ever changed after the
+//! database: a write commits, then memory is changed, then the API answers.
+//! So once the answer has been received every new request finds what it
+//! wrote, without a round trip to Postgres per request. A request already
+//! running holds an `Arc` of the Version it started on and finishes on it.
+//!
+//! Every write of what serves (a Version sent, a go-back) and of the lists
+//! (a creation, a change of a list) is one transaction that holds the
+//! Application's row lock from its first statement that writes or locks
+//! until its commit is done, and adds one to the Application's
+//! `serving_generation` or `lists_generation` under it; memory only ever
+//! moves to a higher generation, so writes at once leave memory as the
+//! database's last whatever order they report back in.
+//!
+//! A write whose answer is lost may still be made after that answer (its
+//! commit on its way). Its COMMIT is sent only once the statement that
+//! takes the row's lock has answered, so if it lands at all it held the
+//! lock from before the answer was lost until it landed. So memory forgets
+//! the Application at once ([`Held::Unknown`]), reading nothing first that
+//! could be earlier than the write, and a request to it reads it back
+//! ([`Registry::read_back`]): in one transaction, the row's share lock
+//! taken without waiting (while the write is on its way this fails at once
+//! and the request is `503`), then, in a second statement whose snapshot is
+//! after the lock, the generations, the serving Version with its bundle,
+//! and the lists. A read-back begun before a forgetting (`epoch`), or that
+//! misses a generation a write reported since (`seen`), is not taken. At a
+//! start, Applications whose row a write holds are skipped and held as not
+//! known. Nothing is served or let in on a guess. Forgetting only ever
+//! replaces what memory holds of an Application, or adds one for an
+//! Application the database has, so memory holds at most one entry per
+//! Application.
 //!
 //! Who may change an Application and who may open it (blackbox/CONTRACT.md,
 //! "Contributors and sharing") is one table, `application_entries`: an
@@ -27,31 +48,15 @@
 //! list's bound checked, and the whole rolled back if either fails. A
 //! list holds at most [`MAX_CONTRIBUTORS`] or [`MAX_SHARED_WITH`] entries;
 //! a change past that is refused and changes nothing. The API asks the
-//! database whether a User is a Contributor (`is_contributor!`).
+//! database whether a User is a Contributor (`is_contributor!`). Who may
+//! open an Application is decided at each request from memory, like
+//! Grants (crate::resources).
 //!
-//! Who may open an Application is decided at each request from memory,
-//! like Grants (crate::resources) and the serving Version: [`Lists`] holds
-//! each Application's two lists, loaded at start and changed only after
-//! the platform database has committed and before the API answers. Every
-//! change that changes a list adds one to the Application's
-//! `lists_generation` under the row's lock, and memory keeps the higher,
-//! so changes at once leave memory as the database whatever order they
-//! report back in. A creation or a change whose answer is lost may still
-//! be made (its commit on its way), so memory forgets the Application's
-//! lists at once ([`Held::Unknown`]), and a request reads them back
-//! ([`Registry::read_back`]) under the Application's row share lock, taken
-//! without waiting: a change holds the row's lock until its commit is
-//! done, so a read-back is never earlier than a change it follows, and
-//! while one is on its way the request is `503` at once. At a start,
-//! Applications whose row a change holds are skipped and held as not
-//! known. Nobody is let in on a guess. Forgetting only ever replaces what
-//! memory holds of an Application, so memory holds at most one entry per
-//! Application.
-//!
-//! Going back ([`Registry::go_back`]) is one `UPDATE` that changes the
-//! serving Version only where it is still the one the caller saw: two
-//! go-backs from the same Version at once are serialised by the row's lock,
-//! and the second finds it changed and changes nothing.
+//! Going back ([`Registry::go_back`]) is one `UPDATE`, in a transaction of
+//! its own, that changes the serving Version only where it is still the one
+//! the caller saw: two go-backs from the same Version at once are
+//! serialised by the row's lock, and the second finds it changed and
+//! changes nothing.
 //!
 //! Sending a Version (blackbox/CONTRACT.md, "What happens when a Version is
 //! sent"): its migrations must continue the previous Version's (else
@@ -131,9 +136,6 @@ pub struct Serving {
     pub bundle: Arc<str>,
     /// Its Declared access.
     pub declared: Arc<Declared>,
-    /// The Application's `serving_generation` when this Version was made
-    /// the serving one: memory keeps the highest.
-    pub generation: i64,
 }
 
 /// The most Contributors an Application has.
@@ -239,26 +241,55 @@ impl Lists {
     }
 }
 
-/// What memory holds of an Application's lists.
+/// What memory holds of an Application it knows: its two lists and the
+/// Version that serves it, each as of the generation it was written or
+/// read at. Replaced whole, never changed in place.
+#[derive(Debug)]
+pub struct Kept {
+    lists: Arc<Lists>,
+    serving: Option<Arc<Serving>>,
+    /// The Application's `serving_generation` `serving` is of.
+    serving_generation: i64,
+}
+
+impl Kept {
+    /// Whether `user` may open it: a Contributor, or shared with them.
+    pub fn opens(&self, user: &User) -> bool {
+        self.lists.open_to(user)
+    }
+
+    /// The Version that serves it, if one does.
+    pub fn serving(&self) -> Option<&Arc<Serving>> {
+        self.serving.as_ref()
+    }
+}
+
+/// The generations a forgotten Application must be read back at, at
+/// least: the highest memory held or a write reported since.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Seen {
+    lists: i64,
+    serving: i64,
+}
+
+/// What memory holds of an Application.
 #[derive(Debug)]
 pub enum Held {
-    Known(Arc<Lists>),
-    /// Forgotten: a change's answer was lost and could not be read back.
-    /// `seen` is the highest generation reported since; `epoch` tells a
-    /// read-back begun before this forgetting from one begun after.
+    Known(Arc<Kept>),
+    /// Forgotten: a write's answer was lost and it could not be read back.
+    /// `epoch` tells a read-back begun before this forgetting from one
+    /// begun after.
     Unknown {
-        seen: i64,
+        seen: Seen,
         epoch: u64,
     },
 }
 
-/// Whether a User may open an Application, as memory has it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Opens {
-    Yes,
-    /// It is not shared with them, nor are they a Contributor.
-    No,
-    /// Memory does not know its lists now: they must be read back.
+/// An Application as memory has it now.
+#[derive(Debug)]
+pub enum Found {
+    Known(Arc<Kept>),
+    /// Memory does not know it now: it must be read back.
     NotKnown,
     /// Memory holds no Application of that name.
     NoSuchApplication,
@@ -595,59 +626,40 @@ pub enum Sent {
 pub struct Registry {
     database: Arc<PlatformDatabase>,
     own: Arc<OwnDatabases>,
-    /// The serving Version of every Application that has one, by name.
-    /// Held only for a lookup or an insert, never across an await.
-    serving: RwLock<HashMap<Arc<str>, Arc<Serving>>>,
-    /// Every Application's lists, by name: one entry per Application.
-    /// Held only for a lookup or an insert, never across an await.
-    lists: RwLock<HashMap<Arc<str>, Held>>,
+    /// What memory holds of every Application, by name: one entry per
+    /// Application. Held only for a lookup or an insert, never across an
+    /// await.
+    held: RwLock<HashMap<Arc<str>, Held>>,
     /// The number of forgettings so far, each one's `epoch`.
     forgotten: AtomicU64,
-    /// The read-backs of lists at requests under way: at most
-    /// [`READ_BACKS`].
+    /// The read-backs at requests under way: at most [`READ_BACKS`].
     reading_back: Semaphore,
 }
 
-/// The most read-backs of lists at requests at once in the program; a
-/// request that finds them all taken is `503` at once rather than wait.
+/// The most read-backs of Applications at requests at once in the
+/// program; a request that finds them all taken is `503` at once rather
+/// than wait.
 const READ_BACKS: usize = 4;
 
-/// The longest a request waits for a read-back of lists.
+/// The longest a request waits for a read-back of an Application.
 const READ_BACK_WAIT: Duration = Duration::from_secs(1);
 
 impl Registry {
-    /// Reads every serving Version from the platform database.
+    /// Reads every Application, its serving Version and its lists from the
+    /// platform database.
+    ///
+    /// In one transaction, every Application's row share lock is taken
+    /// without waiting for the rows a write holds (`SKIP LOCKED`); then, in
+    /// statements whose snapshot is after the locks, the generations, the
+    /// serving Versions and the lists. An Application whose row was skipped
+    /// is held as not known: a write of it was on its way; it is read back
+    /// at a request once the write is settled. So one Application's waiting
+    /// write keeps neither the start nor the others back.
     pub async fn load(
         database: Arc<PlatformDatabase>,
         own: Arc<OwnDatabases>,
     ) -> Result<Self, DbError> {
-        let rows = database
-            .pool()
-            .run(async |client: &mut Client| {
-                client
-                    .query(
-                        "SELECT a.name, v.number, v.bundle, v.declared_access, a.serving_generation
-                         FROM applications a
-                         JOIN versions v ON v.application_id = a.id AND v.number = a.serving_version",
-                        &[],
-                    )
-                    .await
-                    .map_err(DbError::from)
-            })
-            .await?;
-        let mut serving = HashMap::with_capacity(rows.len());
-        for row in &rows {
-            let version = serving_of(row)?;
-            serving.insert(Arc::clone(&version.application), Arc::new(version));
-        }
-        // Every Application's lists, each read under its row's share lock,
-        // so never while a change of them is on its way: the rows locked by
-        // a change are skipped (not waited for) and their lists held as not
-        // known, read back at a request once the change is settled. So one
-        // Application's waiting change keeps neither the start nor the
-        // others back.
-        let forgotten = AtomicU64::new(0);
-        let read = database
+        let (applications, entries) = database
             .pool()
             .run(async |client: &mut Client| {
                 let transaction = client.transaction().await.map_err(DbError::from)?;
@@ -661,98 +673,116 @@ impl Registry {
                     .query("SELECT id FROM applications FOR SHARE SKIP LOCKED", &[])
                     .await
                     .map_err(DbError::from)?;
-                // A second statement: its snapshot is after the locks.
-                let rows = transaction
+                let locked: Vec<i64> = locked
+                    .iter()
+                    .map(|row| get::<i64>(row, 0))
+                    .collect::<Result<_, _>>()?;
+                // Statements after the locks: their snapshots are later.
+                let applications = transaction
                     .query(
-                        "SELECT a.id, a.name, a.lists_generation, e.kind, e.name
+                        "SELECT a.id, a.name, a.lists_generation, a.serving_generation,
+                                a.id = ANY ($1), v.number, v.bundle, v.declared_access
                          FROM applications a
-                         LEFT JOIN application_entries e ON e.application_id = a.id",
-                        &[],
+                         LEFT JOIN versions v ON v.application_id = a.id
+                                             AND v.number = a.serving_version
+                                             AND a.id = ANY ($1)",
+                        &[&locked],
+                    )
+                    .await
+                    .map_err(DbError::from)?;
+                let entries = transaction
+                    .query(
+                        "SELECT application_id, kind, name FROM application_entries
+                         WHERE application_id = ANY ($1)",
+                        &[&locked],
                     )
                     .await
                     .map_err(DbError::from)?;
                 transaction.commit().await.map_err(DbError::from)?;
-                Ok((locked, rows))
+                Ok((applications, entries))
             })
             .await?;
-        let (locked, rows) = read;
-        let locked: HashSet<i64> = locked
-            .iter()
-            .map(|row| get::<i64>(row, 0))
-            .collect::<Result<_, _>>()?;
-        let mut known: HashMap<Arc<str>, Lists> = HashMap::new();
-        let mut unknown: HashSet<Arc<str>> = HashSet::new();
-        for row in &rows {
+        let mut lists: HashMap<i64, Lists> = HashMap::new();
+        for row in &entries {
+            lists
+                .entry(get(row, 0)?)
+                .or_default()
+                .add(&Named::of_stored(get(row, 1)?, get(row, 2)?)?);
+        }
+        let forgotten = AtomicU64::new(0);
+        let mut held = HashMap::with_capacity(applications.len());
+        let mut unknown = Vec::new();
+        for row in &applications {
             let id: i64 = get(row, 0)?;
-            let name: &str = get(row, 1)?;
-            if !locked.contains(&id) {
-                if !unknown.contains(name) {
-                    unknown.insert(Arc::from(name));
-                }
+            let name: Arc<str> = Arc::from(get::<&str>(row, 1)?);
+            if !get::<bool>(row, 4)? {
+                unknown.push(Arc::clone(&name));
+                let epoch = forgotten.fetch_add(1, Ordering::Relaxed);
+                let seen = Seen::default();
+                held.insert(name, Held::Unknown { seen, epoch });
                 continue;
             }
-            let lists = match known.get_mut(name) {
-                Some(lists) => lists,
-                None => known.entry(Arc::from(name)).or_default(),
+            let mut read = lists.remove(&id).unwrap_or_default();
+            read.generation = get(row, 2)?;
+            let kept = Kept {
+                lists: Arc::new(read),
+                serving: serving_at(&name, row, 5)?.map(Arc::new),
+                serving_generation: get(row, 3)?,
             };
-            lists.generation = get(row, 2)?;
-            if let Some(kind) = get::<Option<&str>>(row, 3)? {
-                lists.add(&Named::of_stored(kind, get(row, 4)?)?);
-            }
+            held.insert(name, Held::Known(Arc::new(kept)));
         }
         if !unknown.is_empty() {
             log::record(
-                "lists-unknown",
+                "application-unknown",
                 serde_json::json!({ "applications": unknown.iter().map(|n| &**n).collect::<Vec<_>>() }),
             );
-        }
-        let mut lists: HashMap<Arc<str>, Held> = known
-            .into_iter()
-            .map(|(name, lists)| (name, Held::Known(Arc::new(lists))))
-            .collect();
-        for name in unknown {
-            let epoch = forgotten.fetch_add(1, Ordering::Relaxed);
-            lists.insert(name, Held::Unknown { seen: 0, epoch });
         }
         Ok(Self {
             database,
             own,
-            serving: RwLock::new(serving),
-            lists: RwLock::new(lists),
+            held: RwLock::new(held),
             forgotten,
             reading_back: Semaphore::new(READ_BACKS),
         })
     }
 
-    /// Whether `user` may open `name`, from memory: no round trip, and the
-    /// lock is held for the lookups alone.
-    pub fn opens(&self, name: &str, user: &User) -> Opens {
+    /// The Application `name` as memory has it: no round trip, and the
+    /// lock is held for the lookup alone.
+    pub fn find(&self, name: &str) -> Found {
         match self
-            .lists
+            .held
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .get(name)
         {
-            None => Opens::NoSuchApplication,
-            Some(Held::Unknown { .. }) => Opens::NotKnown,
-            Some(Held::Known(lists)) if lists.open_to(user) => Opens::Yes,
-            Some(Held::Known(_)) => Opens::No,
+            None => Found::NoSuchApplication,
+            Some(Held::Unknown { .. }) => Found::NotKnown,
+            Some(Held::Known(kept)) => Found::Known(Arc::clone(kept)),
         }
     }
 
-    /// Reads `name`'s lists back from the platform database into memory,
-    /// for a request that found them not known (or not there, for an
-    /// Application that serves). `false` when there is no such
+    /// Whether `name` may be served: memory knows it to have a serving
+    /// Version, or does not know it now (it is read back at its request).
+    pub fn may_serve(&self, name: &str) -> bool {
+        match self.find(name) {
+            Found::Known(kept) => kept.serving.is_some(),
+            Found::NotKnown => true,
+            Found::NoSuchApplication => false,
+        }
+    }
+
+    /// Reads `name` back from the platform database into memory, for a
+    /// request that found it not known. `false` when there is no such
     /// Application. Never waits for the platform database: at most
     /// [`READ_BACKS`] at once in the program (one more is refused at once),
-    /// each within [`READ_BACK_WAIT`], and refused at once while a change
-    /// of the lists is on its way (the row is locked).
+    /// each within [`READ_BACK_WAIT`], and refused at once while a write of
+    /// it is on its way (the row is locked).
     pub async fn read_back(&self, name: &str) -> Result<bool, DbError> {
         let Ok(_permit) = self.reading_back.try_acquire() else {
-            return Err(DbError::unexpected("too many read-backs of lists at once"));
+            return Err(DbError::unexpected("too many read-backs at once"));
         };
         let began = match self
-            .lists
+            .held
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .get(name)
@@ -761,27 +791,26 @@ impl Registry {
             Some(Held::Known(_)) => Began::Known,
             Some(Held::Unknown { epoch, .. }) => Began::Unknown(*epoch),
         };
-        let read = tokio::time::timeout(READ_BACK_WAIT, self.lists_of(name))
+        let read = tokio::time::timeout(READ_BACK_WAIT, self.kept_of(name))
             .await
-            .map_err(|_| {
-                DbError::timed_out("reading an Application's lists back", READ_BACK_WAIT)
-            })?;
-        let Some(lists) = read? else {
+            .map_err(|_| DbError::timed_out("reading an Application back", READ_BACK_WAIT))?;
+        let Some(kept) = read? else {
             return Ok(false);
         };
-        self.install_read(name, lists, began);
+        self.install_read(name, kept, began);
         Ok(true)
     }
 
-    /// `name`'s lists from the platform database, never earlier than a
-    /// change of them: in one transaction, the Application's row share
-    /// lock taken without waiting (`NOWAIT`: a change holds the row's
-    /// lock until its commit is done, so while one is on its way this
-    /// fails at once with `lock_not_available`), then, in a second
-    /// statement whose snapshot is after the lock was got, the generation
-    /// and the entries. `None` for no such Application.
-    async fn lists_of(&self, name: &str) -> Result<Option<Lists>, DbError> {
-        let rows = self
+    /// `name` from the platform database, never earlier than a write of
+    /// it: in one transaction, the Application's row share lock taken
+    /// without waiting (`NOWAIT`: a write holds the row's lock until its
+    /// commit is done, so while one is on its way this fails at once with
+    /// `lock_not_available`), then, in a second statement whose snapshot
+    /// is after the lock was got, the generations, the serving Version
+    /// with its bundle, and the entries of both lists. `None` for no such
+    /// Application.
+    async fn kept_of(&self, name: &str) -> Result<Option<Kept>, DbError> {
+        let row = self
             .database
             .pool()
             .run(async |client: &mut Client| {
@@ -803,95 +832,170 @@ impl Registry {
                     return Ok(None);
                 };
                 let id: i64 = get(&found, 0)?;
-                let rows = transaction
-                    .query(
-                        "SELECT a.lists_generation, e.kind, e.name
+                let row = transaction
+                    .query_one(
+                        "SELECT a.lists_generation, a.serving_generation,
+                                v.number, v.bundle, v.declared_access,
+                                ARRAY(SELECT e.kind FROM application_entries e
+                                      WHERE e.application_id = a.id ORDER BY e.id),
+                                ARRAY(SELECT e.name FROM application_entries e
+                                      WHERE e.application_id = a.id ORDER BY e.id)
                          FROM applications a
-                         LEFT JOIN application_entries e ON e.application_id = a.id
+                         LEFT JOIN versions v ON v.application_id = a.id
+                                             AND v.number = a.serving_version
                          WHERE a.id = $1",
                         &[&id],
                     )
                     .await
                     .map_err(DbError::from)?;
                 transaction.commit().await.map_err(DbError::from)?;
-                Ok(Some(rows))
+                Ok(Some(row))
             })
             .await?;
-        let Some(rows) = rows else { return Ok(None) };
-        let mut lists = Lists::default();
-        for row in &rows {
-            lists.generation = get(row, 0)?;
-            if let Some(kind) = get::<Option<&str>>(row, 1)? {
-                lists.add(&Named::of_stored(kind, get(row, 2)?)?);
-            }
+        let Some(row) = row else { return Ok(None) };
+        let mut lists = Lists {
+            generation: get(&row, 0)?,
+            ..Lists::default()
+        };
+        let kinds: Vec<&str> = get(&row, 5)?;
+        let names: Vec<String> = get(&row, 6)?;
+        for (kind, named) in kinds.into_iter().zip(names) {
+            lists.add(&Named::of_stored(kind, named)?);
         }
-        Ok(Some(lists))
+        Ok(Some(Kept {
+            lists: Arc::new(lists),
+            serving: serving_at(name, &row, 2)?.map(Arc::new),
+            serving_generation: get(&row, 1)?,
+        }))
     }
 
-    /// Puts what a creation or a change committed into memory: over lists
-    /// of a lower generation; over forgotten lists it only raises `seen`,
-    /// since a lost change may have gone further (a request reads them
-    /// back).
-    fn install_changed(&self, name: &str, lists: Lists) {
-        let mut all = self.lists.write().unwrap_or_else(PoisonError::into_inner);
+    /// Puts into memory the lists a creation (`created`) or a change
+    /// committed: over lists of a lower generation; over a forgotten
+    /// Application it only raises `seen`, since a lost write may have gone
+    /// further. An Application memory does not hold that was not just
+    /// created (its creation's answer was lost) is held as not known: its
+    /// serving Version is read back at a request.
+    fn install_lists(&self, name: &str, lists: Lists, created: bool) {
+        let mut all = self.held.write().unwrap_or_else(PoisonError::into_inner);
         match all.get_mut(name) {
             None => {
-                all.insert(Arc::from(name), Held::Known(Arc::new(lists)));
+                let held = if created {
+                    Held::Known(Arc::new(Kept {
+                        lists: Arc::new(lists),
+                        serving: None,
+                        serving_generation: 0,
+                    }))
+                } else {
+                    Held::Unknown {
+                        seen: Seen {
+                            lists: lists.generation,
+                            serving: 0,
+                        },
+                        epoch: self.forgotten.fetch_add(1, Ordering::Relaxed),
+                    }
+                };
+                all.insert(Arc::from(name), held);
             }
-            Some(Held::Known(held)) => {
-                if held.generation < lists.generation {
-                    *held = Arc::new(lists);
+            Some(Held::Known(kept)) => {
+                if kept.lists.generation < lists.generation {
+                    *kept = Arc::new(Kept {
+                        lists: Arc::new(lists),
+                        serving: kept.serving.as_ref().map(Arc::clone),
+                        serving_generation: kept.serving_generation,
+                    });
                 }
             }
             Some(Held::Unknown { seen, .. }) => {
-                *seen = (*seen).max(lists.generation);
+                seen.lists = seen.lists.max(lists.generation);
             }
         }
     }
 
-    /// Puts what a request's read-back read into memory: over lists of a
-    /// lower generation; over forgotten lists only when they were
-    /// forgotten before the read began, and it is at least the highest
-    /// generation reported since.
-    fn install_read(&self, name: &str, lists: Lists, began: Began) {
-        let mut all = self.lists.write().unwrap_or_else(PoisonError::into_inner);
+    /// Puts into memory the Version a Version sent or a go-back made the
+    /// serving one, as of `generation`: over a lower generation; over a
+    /// forgotten Application it only raises `seen`. An Application memory
+    /// does not hold (its creation's answer was lost) is held as not known:
+    /// its lists are read back at a request.
+    fn install_serving(&self, name: &str, serving: Serving, generation: i64) {
+        let mut all = self.held.write().unwrap_or_else(PoisonError::into_inner);
+        match all.get_mut(name) {
+            None => {
+                let seen = Seen {
+                    lists: 0,
+                    serving: generation,
+                };
+                let epoch = self.forgotten.fetch_add(1, Ordering::Relaxed);
+                all.insert(Arc::from(name), Held::Unknown { seen, epoch });
+            }
+            Some(Held::Known(kept)) => {
+                if kept.serving_generation < generation {
+                    *kept = Arc::new(Kept {
+                        lists: Arc::clone(&kept.lists),
+                        serving: Some(Arc::new(serving)),
+                        serving_generation: generation,
+                    });
+                }
+            }
+            Some(Held::Unknown { seen, .. }) => {
+                seen.serving = seen.serving.max(generation);
+            }
+        }
+    }
+
+    /// Puts what a request's read-back read into memory: over a forgotten
+    /// Application only when it was forgotten before the read began, and
+    /// what was read is at least of the generations reported since; never
+    /// over one memory knows (its writes keep it).
+    fn install_read(&self, name: &str, kept: Kept, began: Began) {
+        let mut all = self.held.write().unwrap_or_else(PoisonError::into_inner);
         match all.get_mut(name) {
             None => {
                 if matches!(began, Began::Nothing) {
-                    all.insert(Arc::from(name), Held::Known(Arc::new(lists)));
+                    all.insert(Arc::from(name), Held::Known(Arc::new(kept)));
                 }
             }
-            Some(Held::Known(held)) => {
-                if held.generation < lists.generation {
-                    *held = Arc::new(lists);
-                }
-            }
+            Some(Held::Known(_)) => {}
             Some(held @ Held::Unknown { .. }) => {
                 if let (Held::Unknown { seen, epoch }, Began::Unknown(at)) = (&*held, began)
                     && *epoch == at
-                    && *seen <= lists.generation
+                    && seen.lists <= kept.lists.generation
+                    && seen.serving <= kept.serving_generation
                 {
-                    *held = Held::Known(Arc::new(lists));
+                    *held = Held::Known(Arc::new(kept));
                 }
             }
         }
     }
 
-    /// After a creation or a change whose answer was lost: it may still be
-    /// made (its commit on its way), so its lists are forgotten at once,
-    /// with nothing read first that could be earlier than it; requests read
-    /// them back once it is settled. A name memory does not hold is left
-    /// so (a lost creation): no marker is added.
-    fn after_lost(&self, name: &str) {
-        log::record("lists-unknown", serde_json::json!({ "application": name }));
+    /// After a write whose answer was lost: it may still be made (its
+    /// commit on its way), so the Application is forgotten at once, with
+    /// nothing read first that could be earlier than it; requests read it
+    /// back once it is settled. A name memory does not hold is held as not
+    /// known only when the database has the Application (`exists`: it was
+    /// found there before the write); a lost creation adds nothing.
+    fn after_lost(&self, name: &str, exists: bool) {
+        log::record(
+            "application-unknown",
+            serde_json::json!({ "application": name }),
+        );
         let epoch = self.forgotten.fetch_add(1, Ordering::Relaxed);
-        let mut all = self.lists.write().unwrap_or_else(PoisonError::into_inner);
-        if let Some(held) = all.get_mut(name) {
-            let seen = match held {
-                Held::Known(lists) => lists.generation,
-                Held::Unknown { seen, .. } => *seen,
-            };
-            *held = Held::Unknown { seen, epoch };
+        let mut all = self.held.write().unwrap_or_else(PoisonError::into_inner);
+        match all.get_mut(name) {
+            Some(held) => {
+                let seen = match held {
+                    Held::Known(kept) => Seen {
+                        lists: kept.lists.generation,
+                        serving: kept.serving_generation,
+                    },
+                    Held::Unknown { seen, .. } => *seen,
+                };
+                *held = Held::Unknown { seen, epoch };
+            }
+            None if exists => {
+                let seen = Seen::default();
+                all.insert(Arc::from(name), Held::Unknown { seen, epoch });
+            }
+            None => {}
         }
     }
 
@@ -913,38 +1017,19 @@ impl Registry {
         }
     }
 
-    /// The Version serving `name` now, if it has one. From memory.
-    pub fn serving(&self, name: &str) -> Option<Arc<Serving>> {
-        self.serving
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(name)
-            .map(Arc::clone)
-    }
-
-    /// The names of the Applications that have a serving Version, sorted.
+    /// The names of the Applications memory knows to have a serving
+    /// Version, sorted.
     pub fn serving_names(&self) -> Vec<Arc<str>> {
         let mut names: Vec<Arc<str>> = self
-            .serving
+            .held
             .read()
             .unwrap_or_else(PoisonError::into_inner)
-            .keys()
-            .map(Arc::clone)
+            .iter()
+            .filter(|(_, held)| matches!(held, Held::Known(kept) if kept.serving.is_some()))
+            .map(|(name, _)| Arc::clone(name))
             .collect();
         names.sort_unstable();
         names
-    }
-
-    /// Makes `version` the serving one in memory, unless memory already
-    /// holds a later change of what serves (a higher generation).
-    fn install(&self, version: Serving) {
-        let mut serving = self.serving.write().unwrap_or_else(PoisonError::into_inner);
-        let newer = serving
-            .get(&*version.application)
-            .is_none_or(|current| current.generation < version.generation);
-        if newer {
-            serving.insert(Arc::clone(&version.application), Arc::new(version));
-        }
     }
 
     /// Creates the Application `name`, with `creator` as its first
@@ -984,13 +1069,13 @@ impl Registry {
             Ok(created) => created,
             Err(error) => {
                 // It may have been made without the answer arriving.
-                self.after_lost(name);
+                self.after_lost(name, false);
                 return Err(error);
             }
         };
         Ok(match created {
             Some(application) => {
-                self.install_changed(name, Lists::of(&application));
+                self.install_lists(name, Lists::of(&application), true);
                 Created::Created(application)
             }
             None => Created::NameTaken,
@@ -1210,7 +1295,7 @@ impl Registry {
                 added,
                 removed,
             }) => {
-                self.install_changed(name, Lists::of(&application));
+                self.install_lists(name, Lists::of(&application), false);
                 Ok(Changed::Changed {
                     application,
                     added,
@@ -1219,8 +1304,9 @@ impl Registry {
             }
             Ok(refused) => Ok(refused),
             Err(error) => {
-                // The commit may have happened without its answer arriving.
-                self.after_lost(name);
+                // The commit may have happened without its answer arriving
+                // (the Application was found under its lock).
+                self.after_lost(name, true);
                 Err(error)
             }
         }
@@ -1438,53 +1524,22 @@ impl Registry {
             .await;
         match sent {
             Ok(Some((generation, record))) => {
-                self.install(Serving {
+                let serving = Serving {
                     application: Arc::from(name),
                     version: record.number,
                     bundle,
                     declared,
-                    generation,
-                });
+                };
+                self.install_serving(name, serving, generation);
                 Ok(Sent::Sent(record))
             }
             Ok(None) => Ok(Sent::Diverged),
             Err(error) => {
-                // The commit may have happened without its answer arriving:
-                // read again what serves, so memory follows the database.
-                self.refresh(name).await;
+                // The commit may land after this answer (its first
+                // statement took the row's lock): forgotten at once.
+                self.after_lost(name, true);
                 Err(error)
             }
-        }
-    }
-
-    /// Reads `name`'s serving Version from the database into memory.
-    async fn refresh(&self, name: &str) {
-        let row = self
-            .database
-            .pool()
-            .run(async |client: &mut Client| {
-                client
-                    .query_opt(
-                        "SELECT a.name, v.number, v.bundle, v.declared_access, a.serving_generation
-                         FROM applications a
-                         JOIN versions v ON v.application_id = a.id AND v.number = a.serving_version
-                         WHERE a.name = $1",
-                        &[&name],
-                    )
-                    .await
-                    .map_err(DbError::from)
-            })
-            .await;
-        match row.and_then(|row| row.as_ref().map(serving_of).transpose()) {
-            Ok(Some(version)) => self.install(version),
-            Ok(None) => {}
-            Err(error) => log::record(
-                "serving-version-unknown",
-                serde_json::json!({
-                    "application": name,
-                    "error": error.to_string(),
-                }),
-            ),
         }
     }
 
@@ -1496,7 +1551,10 @@ impl Registry {
     /// The switch is one statement: it changes the row only where
     /// `serving_version` is still `from`. Two at once with the same `from`
     /// take the row's lock in turn, and the second, re-reading the row,
-    /// finds `from` no longer serving and changes nothing.
+    /// finds `from` no longer serving and changes nothing. It runs in a
+    /// transaction of its own so that its COMMIT is sent only once it holds
+    /// the row's lock: a switch still waiting for the lock when its answer
+    /// is lost never lands, and one that lands after held the lock first.
     pub async fn go_back(&self, name: &str, from: u64, to: u64) -> Result<WentBack, DbError> {
         // A number no Version can have (Version numbers are `integer`): no
         // row matches, and the answer is what serves.
@@ -1506,7 +1564,8 @@ impl Registry {
             .database
             .pool()
             .run(async |client: &mut Client| {
-                client
+                let transaction = client.transaction().await.map_err(DbError::from)?;
+                let row = transaction
                     .query_opt(
                         "WITH switched AS (
                             UPDATE applications a
@@ -1525,15 +1584,17 @@ impl Registry {
                         &[&name, &from_stored, &to_stored],
                     )
                     .await
-                    .map_err(DbError::from)
+                    .map_err(DbError::from)?;
+                transaction.commit().await.map_err(DbError::from)?;
+                Ok(row)
             })
             .await;
         let row = match switched {
             Ok(row) => row,
             Err(error) => {
-                // The statement may have committed without its answer
-                // arriving: read again what serves, so memory follows.
-                self.refresh(name).await;
+                // The commit may land after this answer: forgotten at once
+                // (the API found the Application before).
+                self.after_lost(name, true);
                 return Err(error);
             }
         };
@@ -1547,13 +1608,13 @@ impl Registry {
             .filter(|m| !to_list.iter().any(|t| t.name == m.name))
             .map(|m| m.name)
             .collect();
-        self.install(Serving {
+        let serving = Serving {
             application: Arc::from(name),
             version: to,
             bundle: Arc::from(get::<&str>(&row, 1)?),
             declared: Arc::new(declared_of(&get::<Value>(&row, 2)?)),
-            generation: get(&row, 0)?,
-        });
+        };
+        self.install_serving(name, serving, get(&row, 0)?);
         Ok(WentBack::WentBack {
             migrations_not_undone,
         })
@@ -1881,14 +1942,20 @@ fn recorded_of(stored: Option<&Value>) -> Vec<Recorded> {
         .collect()
 }
 
-fn serving_of(row: &Row) -> Result<Serving, DbError> {
-    Ok(Serving {
-        application: Arc::from(get::<&str>(row, 0)?),
-        version: number_of(get(row, 1)?)?,
-        bundle: Arc::from(get::<&str>(row, 2)?),
-        declared: Arc::new(declared_of(&get::<Value>(row, 3)?)),
-        generation: get(row, 4)?,
-    })
+/// The serving Version of the Application `name` from the columns
+/// `number, bundle, declared_access` from `at` on; `None` when `number` is
+/// null (no Version serves, or it was not read).
+fn serving_at(name: &str, row: &Row, at: usize) -> Result<Option<Serving>, DbError> {
+    let Some(number) = get::<Option<i32>>(row, at)? else {
+        return Ok(None);
+    };
+    let bundle: &str = get(row, at + 1)?;
+    Ok(Some(Serving {
+        application: Arc::from(name),
+        version: number_of(number)?,
+        bundle: Arc::from(bundle),
+        declared: Arc::new(declared_of(&get::<Value>(row, at + 2)?)),
+    }))
 }
 
 fn get<'a, T: FromSql<'a>>(row: &'a Row, index: usize) -> Result<T, DbError> {

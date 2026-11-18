@@ -458,7 +458,7 @@ impl Oidc {
     ) -> Answer {
         let again = format!("{}{next}", self.app_origin(application, port));
         let again = Some(again.as_str());
-        if self.registry.serving(application).is_none() {
+        if !self.registry.may_serve(application) {
             let mut answer = pages::no_application(application);
             for cookie in cookies {
                 answer
