@@ -1311,6 +1311,7 @@ pub(super) fn detailed_refusal(reason: &str, message: &str, fields: &[(&str, &st
 
 /// What a deploy that went live prints.
 fn deployed(ready: &Ready, application: &Application, created: bool, number: u64) -> Done {
+    // A deploy is by a Contributor, to whom it is always answered.
     let shared_with = application.shared_with.as_deref().unwrap_or(&[]);
     let words = |text: &str| Theirs::from(text).to_string();
     let mut text = format!(
@@ -1336,7 +1337,7 @@ fn deployed(ready: &Ready, application: &Application, created: bool, number: u64
         &ready.name,
         &Theirs::from(application.address.as_str()),
         &application.contributors,
-        shared_with,
+        Some(shared_with),
     ));
     for (title, items) in [("Warnings", &ready.warnings), ("Notes", &ready.notes)] {
         if items.is_empty() {

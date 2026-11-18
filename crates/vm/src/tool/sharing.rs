@@ -3,15 +3,9 @@
 //! words of an Application's two lists, which `vm deploy` says too.
 //!
 //! `vm show` is `GET /v1/applications/<name>`, printed as it is answered.
-//! The four that change something read the Application first (`GET`),
-//! then send the change (`POST .../contributors` or `.../sharing`), whose
-//! answer is the Application as it is after. What this command changed is
-//! the difference of the two, kept to what it asked for: so a change by
-//! someone else in between is not claimed, and an entry asked that was so
-//! already is not shown as changed. When the first read is refused (the
-//! User cannot open the Application), the change is sent all the same, so
-//! that its own refusal (`not-a-contributor`, `not-found`) is the one
-//! reported.
+//! The four that change something are one request each (`POST
+//! .../contributors` or `.../sharing`), whose answer is the Application as
+//! it is after, with the entries this request `added` and `removed`.
 //!
 //! Entries are given on the command line in any order and mix
 //! (`--user`, `--email`, `--group`, and `--everyone` for the sharing);
@@ -71,7 +65,6 @@ impl ContributorsArgs {
 }
 
 /// One entry as given on the command line.
-#[derive(Clone)]
 enum Given {
     User(String),
     Email(String),
@@ -87,22 +80,6 @@ impl Given {
             Self::Email(address) => json!({ "email": address }),
             Self::Group(group) => json!({ "group": group }),
             Self::Everyone => json!({ "everyone": true }),
-        }
-    }
-
-    /// Whether `entry`, as the API answers it, is the one this asked for.
-    /// An email address names the person whose `email` it is, letter case
-    /// ignored.
-    fn names(&self, entry: &Value) -> bool {
-        let text = |key: &str| entry.get(key).and_then(Value::as_str);
-        match self {
-            Self::User(id) => text("user") == Some(id.as_str()),
-            Self::Group(group) => text("group") == Some(group.as_str()),
-            Self::Everyone => entry.get("everyone") == Some(&Value::Bool(true)),
-            Self::Email(address) => {
-                text("user").is_some()
-                    && text("email").is_some_and(|email| email.eq_ignore_ascii_case(address))
-            }
         }
     }
 }
@@ -373,8 +350,6 @@ pub(super) async fn change<const EVERYONE: bool>(
 ) -> Result<Done, Ending> {
     let name = args.application.as_str();
     let kept = signed_in_for(name)?;
-    // Refused or not, the change is sent: its own refusal is the one told.
-    let before = read(&kept, name).await?.ok();
     let entries: Vec<Value> = args.entries.iter().map(Given::json).collect();
     let body = if change.adds() {
         json!({ "add": entries })
@@ -397,40 +372,14 @@ pub(super) async fn change<const EVERYONE: bool>(
         StatusCode::UNAUTHORIZED => return Err(sign_in_expired(&kept)),
         _ => return Err(refused(&kept, &reply)),
     };
-    let key = change.path_list();
-    let was = list(before.as_ref().and_then(|b| b.get(key)));
-    let is = list(after.get(key));
-    let asked = |entry: &&Value| args.entries.iter().any(|given| given.names(entry));
-    let (added, removed): (Vec<&Value>, Vec<&Value>) = if change.adds() {
-        (
-            is.iter()
-                .filter(|e| !was.iter().any(|w| same_entry(w, e)))
-                .filter(asked)
-                .collect(),
-            Vec::new(),
-        )
-    } else {
-        (
-            Vec::new(),
-            was.iter()
-                .filter(|e| !is.iter().any(|i| same_entry(i, e)))
-                .filter(asked)
-                .collect(),
-        )
-    };
+    let added = list(after.get("added"));
+    let removed = list(after.get("removed"));
     let contributors = list(after.get("contributors"));
-    // Whom it is shared with is answered to Contributors only: someone who
-    // just took themselves off the Contributors has it from before.
+    // Null to someone who has just taken themselves off the Contributors.
     let shared_with = after
         .get("shared_with")
         .and_then(Value::as_array)
-        .or_else(|| {
-            before
-                .as_ref()
-                .and_then(|b| b.get("shared_with"))
-                .and_then(Value::as_array)
-        })
-        .map_or(&[][..], Vec::as_slice);
+        .map(Vec::as_slice);
     let address = after.get("address").and_then(Value::as_str).unwrap_or("");
     let mut text = String::new();
     let what = match change {
@@ -439,7 +388,7 @@ pub(super) async fn change<const EVERYONE: bool>(
         Change::AddContributors => format!("Added to the Contributors of {name}:"),
         Change::RemoveContributors => format!("Removed from the Contributors of {name}:"),
     };
-    let changed = if change.adds() { &added } else { &removed };
+    let changed = if change.adds() { added } else { removed };
     if changed.is_empty() {
         writeln!(
             text,
@@ -469,28 +418,6 @@ pub(super) async fn change<const EVERYONE: bool>(
         }),
         text,
     })
-}
-
-impl Change {
-    /// The member of the Application that is this change's list.
-    fn path_list(self) -> &'static str {
-        match self {
-            Self::Share | Self::Unshare => "shared_with",
-            Self::AddContributors | Self::RemoveContributors => "contributors",
-        }
-    }
-}
-
-/// Whether two entries as the API answers them name the same thing.
-fn same_entry(a: &Value, b: &Value) -> bool {
-    let named = |e: &Value| {
-        (
-            e.get("user").cloned(),
-            e.get("group").cloned(),
-            e.get("everyone").cloned(),
-        )
-    };
-    named(a) == named(b)
 }
 
 /// One entry in words: a person by their name and email when known, and
@@ -531,7 +458,7 @@ pub(super) fn visible_to_words(
     name: &str,
     address: &Theirs,
     contributors: &[Value],
-    shared_with: &[Value],
+    shared_with: Option<&[Value]>,
 ) -> String {
     let named = |entries: &[Value]| {
         entries
@@ -541,6 +468,16 @@ pub(super) fn visible_to_words(
             .join(", ")
     };
     let mut text = String::new();
+    let Some(shared_with) = shared_with else {
+        writeln!(
+            text,
+            "Who can see {} ({address}): its Contributors, {}, and whom it is shared with, which only its Contributors see.",
+            Theirs::from(name),
+            named(contributors),
+        )
+        .ok();
+        return text;
+    };
     if shared_with.is_empty() {
         writeln!(
             text,
