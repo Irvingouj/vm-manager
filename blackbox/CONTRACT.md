@@ -100,7 +100,7 @@ The SDK wraps this later; Application authors never write it by hand. Fixture Ap
 
 ### Refusal reasons
 
-Kebab-case strings, the same everywhere a refusal is reported (to Application code, in the log, later in the Operation log and in the tool's output). Known so far: `no-request`, `unknown-operation`, `not-own-database`, `not-declared`, `not-registered`, `declared-lower`, `no-grant`, `log-unavailable`.
+Kebab-case strings, the same everywhere a refusal is reported (to Application code, in the log, later in the Operation log and in the tool's output). Known so far: `no-request`, `unknown-operation`, `not-own-database`, `not-declared`, `not-registered`, `declared-lower`, `no-grant`, `log-unavailable`; and, from the ticket on a write whose answer is lost, `grants-unknown`.
 
 ## The platform database (ticket: Applications and their Versions live in the platform database)
 
@@ -233,12 +233,13 @@ Decided by the host from the request in flight, the serving Version's Declared a
 | `not-registered` | Declared, but no such Resource is registered | `resource` |
 | `declared-lower` | Declared at a level below what the operation needs | `resource`, `declared`, `needed` |
 | `no-grant` | No Group of the User holds a Grant at the level needed | `resource`, `user`, `needed`, `held` (the highest level the User's Groups hold, or null), `contact` |
+| `grants-unknown` | In place of the check of the Grant: the program cannot tell now which Grants are on the Resource ("A write whose answer is lost") | `resource` |
 | `log-unavailable` | The Operation log entry could not be written | `resource` |
 
 - `fix` is a sentence a Coding agent can act on. For `no-grant` it names the Resource's contact.
 - A User holds the highest level any of their Groups is granted. `structure` < `read` < `write`.
 - A Grant written or changed applies to every operation decided after it: from the next request at the latest, and also to the later operations of a request already in flight.
-- The program decides from what it holds in memory (Applications, Versions, Resources, Grants, and from the ticket on Contributors and sharing each Application's two lists), which it keeps exactly in step with the platform database it alone writes. So while the platform database cannot be reached, Applications are still routed and operations are still decided; what cannot be logged is refused.
+- The program decides from what it holds in memory (Applications, Versions, Resources, Grants, and from the ticket on Contributors and sharing each Application's two lists), which it keeps exactly in step with the platform database it alone writes. So while the platform database cannot be reached, Applications are still routed and operations are still decided; what cannot be logged is refused. What "in step" means when the answer of a write is lost: "A write whose answer is lost".
 - A refused or malformed operation sends nothing to the shared database.
 
 ## The Operation log (same ticket)
@@ -1982,3 +1983,32 @@ vm contributors remove <application> (--user <id> | --email <address> | --group 
 - Sharing from the Dashboard, and the list there: the ticket on the Dashboard.
 - A record of who was removed and when, beyond the log's line: each entry says who added it and when; a removal leaves only the log.
 - Disabling and deleting an Application: their ticket.
+
+## A write whose answer is lost (ticket: Review findings: a write whose answer is lost can land after its read-back)
+
+"The program decides from what it holds in memory, which it keeps exactly in step with the platform database it alone writes." This section says what that means when the program cannot tell what became of a write. It holds for everything the program holds in memory: an Application's two lists (already so, "Contributors and sharing: Opening an Application"), **which Version serves**, **a Resource's Grants**, and **the Resources**.
+
+### What can happen
+
+A request of the API that writes one of these and is answered `503` `unavailable` may or may not have been made, and may still be made after that answer: its commit was on its way when the program stopped waiting for the platform database. Nothing new is promised about the answer itself: it stays `503`, and asking again is safe (a Version sent again is `migrations-diverged` or a new Version as before; a go-back asked again is `serving-changed` when the first was made; a Grant set again is the same Grant; a Resource registered again is `name-taken`).
+
+### The rule
+
+From that answer on, **the program never goes on deciding by what it held** while it cannot tell what became of the write. It reads the platform database again only in a way that cannot be earlier than the write (a write that is still on its way is waited out, never read past), and until it has:
+
+| What was being written | Meanwhile | Once it is settled |
+|---|---|---|
+| Which Version serves (a Version sent, a go-back) | Every request to that Application's address is `503` with `retry-after`, as for lists not known: no Version of it is run on a guess | Requests are served by the Version the database says serves |
+| A Resource's Grant | Every operation on that Resource that would come to the check of a Grant is refused `grants-unknown` (the refusals checked before it, `no-request` to `declared-lower`, are given as ever), nothing is sent to the shared database, and its Operation log entry is written like any refusal's; a pull of its structure and `GET /v1/resources/<name>/grants` are `503` `unavailable`; in `GET /v1/resources` and `GET /v1/resources/<name>` the User's `access` to that Resource is not guessed: those answers are `503` `unavailable` too | Operations are decided by the Grants the database has |
+| A Resource being registered | The program does not know it: operations on it are `not-registered`, as before the request | The program knows it from the next request of the API that names it (registering it again answers `name-taken`, and from that answer on it is there for operations too); never only after a restart |
+
+- "Meanwhile" answers come at once: none waits for the platform database to settle, and a request is not held while another reads.
+- Other Applications and other Resources are not touched: they are served and decided as ever.
+- `grants-unknown` joins the reasons of "Refusal reasons"; its `fix` says that the platform is finding out the Resource's Grants after a change whose answer was lost, and to try again shortly.
+- **The same at a start**: the program does not serve an Application by a serving Version, or decide operations by Grants, read while a write of them was still on its way (from the program that ran before). It starts all the same; what was on its way is "meanwhile" above until settled.
+- Before the `503` of the write itself is answered, nothing has changed: the database does not hold the write yet, and the program decides by what it held, which is still right.
+
+### What this does not close
+
+- The Operation log and the Change history are written by the program and read from the platform database; they are not held in memory and are not part of this.
+- Sessions and tool credentials are read from the platform database at each use.
