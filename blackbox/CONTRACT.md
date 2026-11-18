@@ -2033,7 +2033,7 @@ The first page an employee sees: the Applications they contribute to and those s
 | `GET /` | `200`, the list (below); `400` for a `page` that is not a whole number from 1 to 10000 |
 | `GET /applications/<name>` | `200`, one Application (below) |
 | `POST /applications/<name>/sharing` | a change of whom it is shared with (below) |
-| One of these paths with another method | `405`, with `allow` |
+| One of these paths with another method | `405`, with `allow`: `GET, HEAD` for the first two, `POST` for the third |
 | Any other path | `404` |
 
 - `HEAD` is answered as `GET`, without a body.
@@ -2046,14 +2046,14 @@ Pages are read by people; the attributes named `data-vm-...` below are what a te
 
 ### The list (`GET /`)
 
-- **Exactly the Applications `GET /v1/applications` answers that User**: those they are a Contributor of, then those they can open besides, each group by name. So the Dashboard and `vm applications` show the same Applications to the same person, and say the same of each which of the two it is. An Application with no serving Version is listed like any other.
+- **Exactly the Applications `GET /v1/applications` answers that User**: those they are a Contributor of, then those they can open besides, each group by name (byte order, as the API's). So the Dashboard and `vm applications` show the same Applications to the same person, and say the same of each which of the two it is. An Application with no serving Version is listed like any other.
 - 100 Applications to a page. `?page=<n>` is the n-th page of that order (from 1; without it, the first). When there are more, the page has a link `a[data-vm-next]` to the next one, and from the second on a link `a[data-vm-previous]`. A page past the last is `200` with no Application. A page with no Application says so in words: on the first, that nothing is shared with the person yet and that an Application is made with the `vm` tool.
 - Each Application is one element with `data-vm-application="<name>"`, `data-vm-relation="contributor"` or `"shared"`, and `data-vm-serving="<the serving Version's number>"` or `"none"`. Inside it:
   - its name, and its description when it has one, in an element with `data-vm-description`;
   - when a Version serves: a link `a[data-vm-open]` whose `href` is the Application's address in full, with the path `/` (`<scheme>://<name>.<domain>[:<port>]/`). When none serves: no such link, and words saying that nothing is deployed yet;
   - a link `a[data-vm-details]` to `/applications/<name>`;
   - its Contributors, in the order of the list, the first 20: each an element with `data-vm-contributor="user"` or `"group"` and `data-vm-id="<user id or Group>"`, whose text is the person's name when the platform knows it (and their id), or the Group. When there are more than 20: an element with `data-vm-more-contributors="<how many more>"`;
-  - **the Resources its serving Version declares**, by name: each an element with `data-vm-resource="<name>"`, `data-vm-declared="<the declared level>"`, `data-vm-yours="structure" | "read" | "write" | "none" | "unknown"` (what `your_access` of `GET /v1/resources/<name>` says for that User; `none` for no Grant and for a Resource that is not registered; `unknown` while the program cannot tell, "A write whose answer is lost"), and `data-vm-standing`:
+  - **the Resources its serving Version declares**, by name: each an element with `data-vm-resource="<name>"`, `data-vm-declared="<the declared level>"`, `data-vm-yours="structure" | "read" | "write" | "none" | "unknown"` (what `your_access` of `GET /v1/resources/<name>` says for that User; `none` for no Grant and for a Resource that is not registered; `unknown` while the program cannot tell, "A write whose answer is lost": the page reads as `GET /v1/resources/<name>` does there, within the same bound, and is answered `200` all the same, never held until the write is settled), and `data-vm-standing`:
 
     | `data-vm-standing` | When | What the words say |
     |---|---|---|
@@ -2075,10 +2075,10 @@ Pages are read by people; the attributes named `data-vm-...` below are what a te
 
 ### Sharing from it (`POST /applications/<name>/sharing`)
 
-- The body is `application/x-www-form-urlencoded`, at most 4 KiB, with the fields `action` (`share` or `unshare`), `kind` (`email`, `user`, `group` or `everyone`) and `value` (the email address, user id or Group; surrounding white space dropped; not looked at for `everyone`). The share form has a `select` or radio buttons named `kind` with those four values and a text input named `value`; each unshare form has its three fields hidden, naming its entry (a person by `user`).
+- The body is `application/x-www-form-urlencoded`, at most 4 KiB, with the fields `action` (`share` or `unshare`), `kind` (`email`, `user`, `group` or `everyone`) and `value` (the email address, user id or Group; surrounding white space dropped; for `everyone` it is not looked at and may be left out). The share form has a `select` or radio buttons named `kind` with those four values and a text input named `value`; each unshare form has its three fields hidden, naming its entry (a person by `user`).
 - **It is the change `POST /v1/applications/<name>/sharing` makes** with that one entry in `add` (`share`) or in `remove` (`unshare`): by a Contributor, with the same rules, the same refusals and the same `sharing-changed` record. It takes effect as that change does: the person shared with finds the Application on their Dashboard and opens it at their next request, and after an unshare neither.
 - Made: `303` to `/applications/<name>?changed=shared` or `?changed=unshared`, or `?changed=nothing` when everything was so already.
-- Refused: a page with the status the API gives and an element with `data-vm-error="<the API's reason>"` whose text says what the API's message says, and a link `a[data-vm-back]` to `/applications/<name>`; nothing is changed. `404` `not-found`; `403` `not-a-contributor` (also for someone who cannot open it, as on the API); `400` `malformed` (another content type, a body over 4 KiB, a field missing or given twice, an `action` or `kind` that is none of those, a `value` the API would not take); `422` `unknown-email`; `409` `ambiguous-email`; `409` `too-many`; `503` `unavailable`.
+- Refused: a page with the status the API gives and an element with `data-vm-error="<the API's reason>"`, and a link `a[data-vm-back]` to `/applications/<name>`; nothing is changed. The element's text is for a person at a browser, not a Coding agent: it says what was refused and what to do, in the Dashboard's own words (no path of the API, no command's JSON). It names what the refusal is about: the Application's name for `not-found`; the address as given for `unknown-email` (saying that nobody who signed in here has it, and to use the person's user id or ask them to sign in once) and for `ambiguous-email` (to use the user id); the bound of 1,000 for `too-many`; for `not-a-contributor` it says that only the Application's Contributors change whom it is shared with, and names none of them; for `malformed` what was wrong with the form. `404` `not-found`; `403` `not-a-contributor` (also for someone who cannot open it, as on the API); `400` `malformed` (another content type, a body over 4 KiB, a field missing or given twice, an `action` or `kind` that is none of those, a `value` the API would not take); `422` `unknown-email`; `409` `ambiguous-email`; `409` `too-many`; `503` `unavailable` (with `retry-after`; also while the platform database cannot be reached: a change's `503` always has this element).
 - A Contributor cannot take themselves off the Contributors here, and nobody is made a Contributor here: the Contributors are changed with the tool.
 
 ### What this does not close
