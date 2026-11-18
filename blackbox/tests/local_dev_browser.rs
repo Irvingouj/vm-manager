@@ -713,8 +713,11 @@ fn on_an_installation_vm_test_user_is_a_path_like_any_other_given_to_the_code() 
     let board = Board::start("read", "read");
     init_repository(board.dir());
     commit_all(board.dir(), "A board");
-    Deployed::of(&deploy(&board.local.machine, board.dir(), &[]));
+    let deployed = Deployed::of(&deploy(&board.local.machine, board.dir(), &[]));
     let vm = &board.scenario.vm;
+    // Shared with everyone by its Contributor: this test is about the
+    // paths, not about who may open it ("Contributors and sharing").
+    blackbox::sharing::share_with_everyone_as_deployer(vm, &deployed);
     for path in ["/_vm/test-user", "/_vm/control/x", "/_vm/anything"] {
         let response = vm.get_as(&User::new(OUTSIDER), APP, path);
         assert_eq!(

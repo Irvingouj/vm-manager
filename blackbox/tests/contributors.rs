@@ -19,9 +19,9 @@ use blackbox::api::{marked_bundle, version_body};
 use blackbox::logs::{from_to, go_back, page};
 use blackbox::scenario::{ADMINISTRATORS, administrator};
 use blackbox::sharing::{
-    MAX_CONTRIBUTORS, MAX_ENTRIES_A_REQUEST, TRACED, add, add_remove, assert_application_members,
-    assert_entry, contributors_ok, create_unshared, entry_named, expected, group, keys, remove,
-    user,
+    MAX_CONTRIBUTORS, MAX_ENTRIES_A_REQUEST, TRACED, add, add_remove, as_read,
+    assert_application_members, assert_entry, assert_error_entries, contributors_ok,
+    create_unshared, entry_named, expected, group, keys, remove, user,
 };
 use blackbox::{User, Vm, VmOptions, assert_api_error};
 use serde_json::{Value, json};
@@ -134,7 +134,7 @@ fn a_contributor_adds_people_and_groups_in_the_order_added_with_who_and_when() {
     );
     assert_entry(entry_named(list, "user:dave"), "carol", None, None, "dave");
     assert_eq!(
-        after,
+        as_read(&after),
         read(&vm, &carol()),
         "the answer is the Application as it is after"
     );
@@ -268,13 +268,25 @@ fn the_last_contributor_cannot_be_removed() {
     let vm = with_board();
     let api = vm.api_as(&alice());
     let before = read(&vm, &alice());
+    let alices = entry_named(&before["contributors"], "user:alice").clone();
     for body in [
         remove(&[user("alice")]),
         add_remove(&[], &[user("alice")]),
-        remove(&[user("alice"), user("nobody")]),
+        // `nobody` is not there, so not something it would have removed.
+        remove(&[user("nobody"), user("alice")]),
     ] {
         let answer = api.change_contributors(APP, &body);
         assert_api_error(&answer, 409, "last-contributor");
+        assert_error_entries(
+            &answer,
+            &["user:alice"],
+            &format!("last-contributor for {body}"),
+        );
+        assert_eq!(
+            answer.json()["error"]["entries"][0],
+            alices,
+            "the entry it would have removed, as it is kept"
+        );
         let message = answer.json()["error"]["message"]
             .as_str()
             .unwrap_or_default()
@@ -288,6 +300,11 @@ fn the_last_contributor_cannot_be_removed() {
     contributors_ok(&api, &vm, APP, &add(&[group("finance")]));
     let both = api.change_contributors(APP, &remove(&[user("alice"), group("finance")]));
     assert_api_error(&both, 409, "last-contributor");
+    assert_error_entries(
+        &both,
+        &["user:alice", "group:finance"],
+        "last-contributor, two removed at once",
+    );
     let after = read(&vm, &alice());
     assert_eq!(
         keys(&after["contributors"]),
@@ -311,11 +328,22 @@ fn a_contributor_may_remove_themselves_while_one_is_left() {
     let vm = with_board();
     let api = vm.api_as(&alice());
     contributors_ok(&api, &vm, APP, &add(&[user("bob")]));
+    let alices = entry_named(&read(&vm, &alice())["contributors"], "user:alice").clone();
     let after = contributors_ok(&api, &vm, APP, &remove(&[user("alice")]));
     assert_eq!(keys(&after["contributors"]), expected(&["user:bob"]));
     assert_eq!(
         after["contributor"], false,
         "the answer is as the asker sees it after: alice is no longer a Contributor"
+    );
+    assert!(
+        after.get("shared_with").is_some_and(Value::is_null),
+        "the answer is as the asker sees it after: `shared_with` null, got {after}"
+    );
+    assert_eq!(after["added"], json!([]), "in {after}");
+    assert_eq!(
+        after["removed"],
+        json!([alices]),
+        "`removed` is her entry as it was kept"
     );
     assert_api_error(
         &api.change_contributors(APP, &add(&[user("alice")])),
@@ -376,13 +404,24 @@ fn at_most_a_hundred_contributors() {
         full["contributors"].as_array().map(Vec::len),
         Some(MAX_CONTRIBUTORS)
     );
-    for (body, name) in [
-        (add(&[user("one-more")]), "one-more"),
-        (add(&[group("finance")]), "finance"),
-        (add_remove(&[user("x1"), user("x2")], &[user("c00")]), "x"),
+    for (body, name, would_add) in [
+        (add(&[user("one-more")]), "one-more", vec!["user:one-more"]),
+        (add(&[group("finance")]), "finance", vec!["group:finance"]),
+        (
+            add_remove(&[user("x1"), user("x2")], &[user("c00")]),
+            "x",
+            vec!["user:x1", "user:x2"],
+        ),
+        // Already there, so not something it would have added.
+        (
+            add(&[user("c01"), user("one-more")]),
+            "one-more",
+            vec!["user:one-more"],
+        ),
     ] {
         let answer = api.change_contributors(APP, &body);
         assert_api_error(&answer, 409, "too-many");
+        assert_error_entries(&answer, &would_add, &format!("too-many for {body}"));
         let message = answer.json()["error"]["message"]
             .as_str()
             .unwrap_or_default()
@@ -394,7 +433,7 @@ fn at_most_a_hundred_contributors() {
     }
     assert_eq!(
         read(&vm, &alice()),
-        full,
+        as_read(&full),
         "a refused change changes nothing"
     );
     let swapped = contributors_ok(

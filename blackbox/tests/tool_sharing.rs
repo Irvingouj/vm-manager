@@ -16,15 +16,19 @@
     reason = "test code: a failed expectation is a failing test"
 )]
 
+use std::thread;
+use std::time::{Duration, Instant};
+
 use blackbox::deploy::{dana, deploy_in_words, deploy_ok, deploy_project, signed_in};
 use blackbox::project::{help_commands, new_project, paragraphs, squashed, vm_commands_in};
 use blackbox::scenario::ADMINISTRATORS;
 use blackbox::sessions::{ADA, GRACE, Installation, ada, grace};
 use blackbox::sharing::{
     MAX_ENTRIES_A_REQUEST, MAX_SHARED_WITH, TRACED, add, assert_change_printed, assert_opens,
-    contributors_ok, create_unshared, expected, group, keys, share_ok, tool_json, user,
+    contributors_ok, create_unshared, entry_named, expected, group, keys, share_ok, tool_json,
+    user,
 };
-use blackbox::tool::{Machine, bearer};
+use blackbox::tool::{Machine, Run, bearer};
 use blackbox::{User, Vm, VmOptions, fixture_bundle};
 use serde_json::{Value, json};
 
@@ -561,4 +565,198 @@ fn with_oidc_an_email_shows_as_the_person_and_an_id_never_seen_is_said_so() {
             || typo_line.contains("not seen"),
         "expected the words to say beside 00u-typo that the platform never saw them sign in, got {typo_line:?}\n{words}"
     );
+}
+
+/// The `request` records of the platform's API (`/v1/...`) made as `id`.
+fn api_requests_of(vm: &Vm, id: &str) -> Vec<Value> {
+    vm.records()
+        .into_iter()
+        .filter(|r| {
+            r["event"] == "request"
+                && r["user"] == id
+                && r["path"].as_str().is_some_and(|p| p.starts_with("/v1/"))
+        })
+        .collect()
+}
+
+/// Runs `vm <args> --json` as the machine's User (`id`) and fails unless
+/// it made exactly one request of the API, a `POST` to `path`, and no read
+/// of the Application; returns the run.
+fn run_as_one_request(vm: &Vm, machine: &Machine, id: &str, args: &[&str], path: &str) -> Run {
+    let before = api_requests_of(vm, id);
+    let posts = |records: &[Value]| {
+        records
+            .iter()
+            .filter(|r| r["method"] == "POST" && r["path"] == path)
+            .count()
+    };
+    let run = tool_json(machine, args);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut after = api_requests_of(vm, id);
+    while posts(&after) == posts(&before) {
+        assert!(
+            Instant::now() < deadline,
+            "expected a `request` record of `POST {path}` for `vm {}`\n{}",
+            args.join(" "),
+            run.describe()
+        );
+        thread::sleep(Duration::from_millis(50));
+        after = api_requests_of(vm, id);
+    }
+    let made = after.get(before.len()..).unwrap_or_default();
+    assert_eq!(
+        made.len(),
+        1,
+        "expected `vm {}` to be one request of the API, it made {made:?}",
+        args.join(" ")
+    );
+    assert!(
+        !made
+            .iter()
+            .any(|r| r["method"] == "GET" && r["path"] == format!("/v1/applications/{APP}")),
+        "expected `vm {}` not to read the Application first: {made:?}",
+        args.join(" ")
+    );
+    run
+}
+
+#[test]
+fn each_change_is_one_request_and_prints_what_the_api_answered_it_added_and_removed() {
+    let (vm, machine) = with_board();
+    let api = vm.api_as(&alice());
+    share_ok(&api, &vm, APP, &add(&[user("bob"), group("finance")]));
+    let sharing = format!("/v1/applications/{APP}/sharing");
+    let contributors = format!("/v1/applications/{APP}/contributors");
+
+    let run = run_as_one_request(
+        &vm,
+        &machine,
+        "alice",
+        &[
+            "share",
+            APP,
+            "--user",
+            "carol",
+            "--user",
+            "bob",
+            "--everyone",
+        ],
+        &sharing,
+    );
+    let printed = assert_change_printed(&run, APP);
+    let now = api.application(APP);
+    assert_eq!(
+        printed["added"],
+        json!([
+            entry_named(&now["shared_with"], "user:carol"),
+            entry_named(&now["shared_with"], "everyone")
+        ]),
+        "`added` is what the API answered: the entries as kept, not bob, who was there\n{}",
+        run.describe()
+    );
+    assert_eq!(printed["removed"], json!([]), "{}", run.describe());
+    assert_eq!(printed["visible_to"]["shared_with"], now["shared_with"]);
+    assert_eq!(printed["visible_to"]["contributors"], now["contributors"]);
+
+    let before = api.application(APP);
+    let run = run_as_one_request(
+        &vm,
+        &machine,
+        "alice",
+        &[
+            "unshare", APP, "--group", "finance", "--user", "zed", "--user", "bob",
+        ],
+        &sharing,
+    );
+    let printed = assert_change_printed(&run, APP);
+    assert_eq!(
+        printed["removed"],
+        json!([
+            entry_named(&before["shared_with"], "user:bob"),
+            entry_named(&before["shared_with"], "group:finance")
+        ]),
+        "`removed` is what the API answered: each as it was kept, in the order added\n{}",
+        run.describe()
+    );
+    assert_eq!(printed["added"], json!([]), "{}", run.describe());
+
+    let run = run_as_one_request(
+        &vm,
+        &machine,
+        "alice",
+        &["contributors", "add", APP, "--user", "bob"],
+        &contributors,
+    );
+    let printed = assert_change_printed(&run, APP);
+    let now = api.application(APP);
+    assert_eq!(
+        printed["added"],
+        json!([entry_named(&now["contributors"], "user:bob")]),
+        "{}",
+        run.describe()
+    );
+
+    // alice takes herself off: the API answers `shared_with` null to her
+    // now, and so does the tool, whose words say only its Contributors see
+    // whom it is shared with.
+    let alices = entry_named(&now["contributors"], "user:alice").clone();
+    let run = run_as_one_request(
+        &vm,
+        &machine,
+        "alice",
+        &["contributors", "remove", APP, "--user", "alice"],
+        &contributors,
+    );
+    let printed = assert_change_printed(&run, APP);
+    assert_eq!(printed["removed"], json!([alices]), "{}", run.describe());
+    assert!(
+        printed["visible_to"]["shared_with"].is_null(),
+        "expected `visible_to.shared_with` null for someone no longer a Contributor\n{}",
+        run.describe()
+    );
+    assert_eq!(
+        keys(&printed["visible_to"]["contributors"]),
+        expected(&["user:bob"])
+    );
+}
+
+#[test]
+fn in_words_a_contributor_who_took_themselves_off_is_told_only_contributors_see_whom_it_is_shared_with()
+ {
+    let (vm, machine) = with_board();
+    let api = vm.api_as(&alice());
+    contributors_ok(&api, &vm, APP, &add(&[user("bob")]));
+    share_ok(&api, &vm, APP, &add(&[group("night-shift")]));
+    let run = machine.run(&["contributors", "remove", APP, "--user", "alice"]);
+    let words = run.ok_text();
+    let lower = words.to_ascii_lowercase();
+    assert!(
+        words.contains("bob"),
+        "expected the words to name its Contributors\n{}",
+        run.describe()
+    );
+    assert!(
+        !words.contains("night-shift"),
+        "expected the words not to say whom it is shared with, which she no longer sees\n{}",
+        run.describe()
+    );
+    assert!(
+        lower.contains("only") && lower.contains("contributors"),
+        "expected the words to say only its Contributors see whom it is shared with\n{}",
+        run.describe()
+    );
+}
+
+#[test]
+fn vm_versions_is_exit_code_3_for_someone_it_is_only_shared_with() {
+    let (vm, machine) = with_board();
+    share_ok(&vm.api_as(&alice()), &vm, APP, &add(&[user("bob")]));
+    let bobs = signed_in_as(&vm, &bob());
+    assert_opens(&vm, &bob(), APP, "bob, shared with");
+    tool_json(&bobs, &["versions", APP]).json_error(3, "not-a-contributor");
+    bobs.run(&["versions", APP]).text_error(3);
+    // A Platform administrator who is not a Contributor reads them.
+    let admins = signed_in_as(&vm, &blackbox::scenario::administrator());
+    tool_json(&admins, &["versions", APP]).ok_json();
+    tool_json(&machine, &["versions", APP]).ok_json();
 }

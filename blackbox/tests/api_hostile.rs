@@ -247,8 +247,10 @@ fn fields_the_platform_sets_cannot_be_chosen_when_sending_a_version() {
             version["created_at"], "1999-01-01T00:00:00Z",
             "in {version}"
         );
+        // Read as its Contributor: alice may not read the Versions of
+        // mallory's Application, whatever their number.
         assert_api_error(
-            &vm.api_as(&alice()).get_version("mine", 99),
+            &vm.api_as(&mallory()).get_version("mine", 99),
             404,
             "not-found",
         );

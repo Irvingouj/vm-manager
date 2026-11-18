@@ -77,7 +77,9 @@ fn vm_versions_lists_each_version_with_its_commit_when_and_by_whom_and_which_ser
     let own = Own::start();
     with_versions(&own.vm, "board", 3);
     go_back(&own.vm.api_as(&alice()), "board", &from_to(3, None)).expect_status(200);
-    let machine = machine_as(&own.vm, &bob());
+    // Read by a Contributor: Versions are not for whom it is only shared
+    // with.
+    let machine = machine_as(&own.vm, &alice());
     let listed = machine.run(&["versions", "board", "--json"]).ok_json();
     assert_eq!(
         keys(&listed),

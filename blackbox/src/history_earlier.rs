@@ -212,6 +212,15 @@ fn build_earlier(cache: &Path, kept: &Path) -> Result<(), String> {
     })
 }
 
+/// Whether the program the harness starts now is the earlier one (the
+/// inner run of [`with_both_programs`] chose it). The earlier program knows
+/// nothing of sharing: the harness does not ask it to share what it makes.
+pub fn earlier_program_chosen() -> bool {
+    std::env::var_os(SELECT_VAR)
+        .and_then(|select| std::fs::read_to_string(select).ok())
+        .is_some_and(|which| which.trim() == "earlier")
+}
+
 /// The inner run's choice of program.
 pub struct Programs {
     select: PathBuf,

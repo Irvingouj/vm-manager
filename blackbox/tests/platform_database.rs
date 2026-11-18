@@ -28,11 +28,15 @@ fn bob() -> User {
     User::new("bob")
 }
 
-/// Everything the API says about an Application: its record, its list of
-/// Versions, and each Version's record.
+/// Everything the API says about an Application: its record (as bob, whom
+/// it is shared with, reads it), its list of Versions, and each Version's
+/// record (as its creator reads them).
 fn everything_about(vm: &Vm, name: &str) -> (Value, Vec<Value>, Vec<Value>) {
-    let api = vm.api_as(&bob());
-    let application = api.application(name);
+    let application = vm.api_as(&bob()).application(name);
+    // Versions are read by a Contributor ("Contributors and sharing: On the
+    // platform's API"): its creator.
+    let creator = User::new(application["created_by"].as_str().unwrap_or_default());
+    let api = vm.api_as(&creator);
     let listed = api.versions(name);
     let each = (1..=u64::try_from(listed.len()).unwrap())
         .map(|n| api.get_version(name, n).expect_status(200).json())

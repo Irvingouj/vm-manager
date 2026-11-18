@@ -259,13 +259,15 @@ fn a_user_who_created_another_application_is_not_a_contributor_of_this_one() {
         .create_with_bundle("theirs", &marked_bundle("theirs"));
     let mallory = vm.api_as(&User::new("mallory"));
     mallory.create_with_bundle("mine", &marked_bundle("mine"));
-    let before = state_of(&mallory, "theirs");
+    // Read as its Contributor: the Versions are not mallory's to read.
+    let owner = vm.api_as(&alice());
+    let before = state_of(&owner, "theirs");
     assert_api_error(
         &mallory.send_bundle("theirs", &marked_bundle("hijack")),
         403,
         "not-a-contributor",
     );
-    assert_eq!(state_of(&mallory, "theirs"), before);
+    assert_eq!(state_of(&owner, "theirs"), before);
     // And bob's attempt to take the name does not make him a Contributor.
     assert_api_error(
         &vm.api_as(&bob()).create_application("theirs"),
@@ -278,7 +280,7 @@ fn a_user_who_created_another_application_is_not_a_contributor_of_this_one() {
         403,
         "not-a-contributor",
     );
-    assert_eq!(state_of(&mallory, "theirs"), before);
+    assert_eq!(state_of(&owner, "theirs"), before);
 }
 
 #[test]

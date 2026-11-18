@@ -159,7 +159,10 @@ fn as_outsider_the_refusal_is_the_one_the_deployed_application_gives() {
     // The same bundle deployed, asked by a User with no Grant.
     init_repository(board.dir());
     commit_all(board.dir(), "A board that reads devops");
-    blackbox::deploy::Deployed::of(&deploy(&board.local.machine, board.dir(), &[]));
+    let made = blackbox::deploy::Deployed::of(&deploy(&board.local.machine, board.dir(), &[]));
+    // Shared with everyone by its Contributor: the refusal compared is the
+    // Resource's, not the 403 of who may open ("Contributors and sharing").
+    blackbox::sharing::share_with_everyone_as_deployer(&board.scenario.vm, &made);
     let deployed = board
         .scenario
         .vm

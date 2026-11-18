@@ -47,7 +47,7 @@ use blackbox::history_earlier::{
 use blackbox::history_op::{changes_of, history_call};
 use blackbox::out_of_reach::{WRITER, base_and, install_seeded, platform_role, start};
 use blackbox::own_database::{Migration, Own, OwnDatabase, own_execute};
-use blackbox::vm::VmOptions;
+use blackbox::vm::{INSTALLER, VmOptions};
 
 /// The Version 2 migration the earlier program runs: it changes rows.
 fn earlier_migration() -> Migration {
@@ -179,6 +179,10 @@ fn an_own_database_from_before_the_ticket_has_its_history_in_change_history_once
             // The program under test starts on what it left.
             programs.use_current();
             let own = Own::start_with(&VmOptions::new().platform(&platform));
+            assert_kept_by_its_creator_alone(&own);
+            // Shared now by its creator, so that the writes below, as
+            // WRITER, reach it.
+            own.api().share_with_everyone(APP);
             let mut failures = Vec::new();
             let found = vm_history_found_by(&db);
             if !found.is_empty() {
@@ -319,6 +323,47 @@ fn an_own_database_from_before_the_ticket_has_its_history_in_change_history_once
             );
             drop(own);
         },
+    );
+}
+
+/// CONTRACT.md, "Contributors and sharing: The two lists": an Application
+/// that was there before the ticket has its creator as its only
+/// Contributor (added by the creator at the Application's `created_at`),
+/// is shared with nobody, is opened by its creator and is `403` for anyone
+/// else, until the creator shares it.
+fn assert_kept_by_its_creator_alone(own: &Own) {
+    let application = own.api().application(APP);
+    blackbox::sharing::assert_application_members(&application, "an Application from before");
+    assert_eq!(
+        blackbox::sharing::keys(&application["contributors"]),
+        vec![format!("user:{INSTALLER}")],
+        "expected its creator as its only Contributor, in {application}"
+    );
+    let creator = &application["contributors"][0];
+    assert_eq!(creator["added_by"], INSTALLER, "in {application}");
+    assert_eq!(
+        creator["added_at"], application["created_at"],
+        "expected the creator's entry added at the Application's created_at, in {application}"
+    );
+    assert_eq!(
+        application["shared_with"],
+        json!([]),
+        "expected an Application from before shared with nobody, in {application}"
+    );
+    own.run(&User::new(INSTALLER), APP, &[]);
+    let other = own
+        .vm
+        .request(APP, "/")
+        .as_user(&User::new(WRITER))
+        .method("POST")
+        .json(&json!({ "calls": [] }))
+        .send();
+    blackbox::sharing::assert_not_shared_plain(
+        &own.vm,
+        &other,
+        APP,
+        WRITER,
+        "someone else, at an Application from before",
     );
 }
 

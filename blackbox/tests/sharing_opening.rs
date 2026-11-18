@@ -24,17 +24,21 @@
     reason = "test code: a failed expectation is a failing test"
 )]
 
+use std::time::{Duration, Instant};
+
 use blackbox::api::version_body_declaring;
+use blackbox::postgres::{Platform, PrivatePostgres};
 use blackbox::scenario::{
     ADMINISTRATORS, CONTACT, Expected, READERS, RESOURCE, Scenario, administrator, assert_entry,
     assert_refusal,
 };
+use blackbox::sessions::hrefs;
 use blackbox::sharing::{
     TRACED, add, assert_cannot_open, assert_not_shared_page, assert_not_shared_plain,
     assert_not_shared_record, assert_opens, assert_own_page_headers, contributors_ok,
     create_unshared, everyone, group, open, remove, share_ok, user,
 };
-use blackbox::{INSTALLER, User, Vm, VmOptions, fixture_bundle};
+use blackbox::{INSTALLER, Response, User, Vm, VmOptions, fixture_bundle};
 use serde_json::json;
 
 const APP: &str = "board";
@@ -65,7 +69,9 @@ fn dave() -> User {
 }
 
 fn erin() -> User {
-    User::new("erin").in_groups(&["Finance", "finance-team", " finance"])
+    // Near misses of `finance` that the stand-in's header keeps as they are
+    // (it trims, so a space around a Group is no near miss).
+    User::new("erin").in_groups(&["Finance", "finance-team", "xfinance", "financ"])
 }
 
 /// A program with `board` (`fixtures/honest.js`) made by alice and shared
@@ -86,7 +92,9 @@ fn a_new_application_is_opened_by_its_contributors_and_by_nobody_else() {
         dave(),
         administrator(),
         User::new("ALICE"),
-        User::new("alice ").in_groups(&["staff"]),
+        User::new("alice2").in_groups(&["staff"]),
+        User::new("xalice"),
+        User::new("alic"),
         User::new(INSTALLER),
     ] {
         assert_cannot_open(&vm, &other, APP, &format!("{other:?} on a new Application"));
@@ -301,6 +309,11 @@ fn a_browser_is_answered_with_a_page_of_the_platforms_own_naming_the_person_and_
                 "Description-only-its-Contributors-know",
             ],
             &format!("Accept {accept:?}"),
+        );
+        let html = response.text();
+        assert!(
+            hrefs(&html).is_empty() && !html.to_ascii_lowercase().contains("<a"),
+            "expected no link at all with the stand-in, which has no sign-out\n{html}"
         );
         assert_not_shared_record(&vm, &response, APP, "bob", "the page");
     }
@@ -560,4 +573,99 @@ fn someone_who_cannot_open_it_reaches_no_resource_through_it() {
         before,
         "expected no Operation log entry for a request the Application was never given"
     );
+}
+
+/// Sends this request with a timeout of 30 s, failing unless it is answered
+/// within 2 s and not with `503`.
+fn quickly(request: blackbox::http::Request, context: &str) -> Response {
+    let began = Instant::now();
+    let response = request.timeout(Duration::from_secs(30)).send();
+    let took = began.elapsed();
+    assert!(
+        took < Duration::from_secs(2),
+        "{context}: expected no wait for the platform database, this one took {took:?}"
+    );
+    assert_ne!(
+        response.status,
+        503,
+        "{context}: expected the lists held in memory to decide, got\n{}",
+        response.describe()
+    );
+    response
+}
+
+#[test]
+fn with_the_platform_database_stopped_whoever_could_open_still_opens_and_nobody_else() {
+    // The platform database on a Postgres of this test's own: stopping it
+    // leaves the program deciding from the lists it holds in memory.
+    let mut postgres = PrivatePostgres::start().unwrap();
+    let platform = Platform::on(&postgres, "vm_platform_sharing_stopped");
+    let vm = Vm::start(
+        &VmOptions::new()
+            .stand_in_sign_in()
+            .administrators_group(ADMINISTRATORS)
+            .platform(&platform),
+    );
+    create_unshared(&vm, &alice(), APP, TRACED);
+    create_unshared(&vm, &alice(), "open-to-all", TRACED);
+    let api = vm.api_as(&alice());
+    contributors_ok(&api, &vm, APP, &add(&[group("finance")]));
+    share_ok(&api, &vm, APP, &add(&[user("bob"), group("night-shift")]));
+    share_ok(&api, &vm, "open-to-all", &add(&[everyone()]));
+    let oscar = User::new("oscar").in_groups(&["night-shift"]);
+    let zed = User::new("zed");
+    let opening = |user: &User, application: &str, context: &str| {
+        let response = quickly(
+            vm.request(application, "/hello")
+                .as_user(user)
+                .header("accept", "application/json"),
+            context,
+        );
+        assert!(
+            response.status == 200 && response.text().contains(&format!("Hello, {}!", user.id)),
+            "{context}: expected {:?} to open {application:?}, got\n{}",
+            user.id,
+            response.describe()
+        );
+    };
+    let refused = |context: &str| {
+        let plain = quickly(
+            vm.request(APP, "/hello")
+                .as_user(&zed)
+                .header("accept", "application/json"),
+            context,
+        );
+        assert_not_shared_plain(&vm, &plain, APP, "zed", context);
+        let page = quickly(
+            vm.request(APP, "/")
+                .as_user(&zed)
+                .header("accept", "text/html"),
+            context,
+        );
+        assert_not_shared_page(
+            &page,
+            APP,
+            &["zed"],
+            &["alice", "finance", "night-shift"],
+            context,
+        );
+    };
+    // As before the stop, for comparison.
+    opening(&alice(), APP, "before the stop: a Contributor");
+    refused("before the stop");
+
+    postgres.stop();
+    for round in 0..3 {
+        let when = format!("platform database stopped, round {round}");
+        opening(&alice(), APP, &format!("{when}: a Contributor by id"));
+        opening(&carol(), APP, &format!("{when}: a Contributor by a Group"));
+        opening(&bob(), APP, &format!("{when}: shared with by id"));
+        opening(&oscar, APP, &format!("{when}: shared with by a Group"));
+        opening(
+            &zed,
+            "open-to-all",
+            &format!("{when}: shared with everyone"),
+        );
+        refused(&format!("{when}: someone it is not shared with"));
+    }
 }

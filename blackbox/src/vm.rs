@@ -345,7 +345,9 @@ impl Vm {
                 created.describe()
             ));
         }
-        api.share_with_everyone(name);
+        if !crate::history_earlier::earlier_program_chosen() {
+            api.share_with_everyone(name);
+        }
         let sent = api.send_version(name, &version_body(bundle));
         if sent.status != 201 {
             self.fail(&format!(

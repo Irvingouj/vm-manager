@@ -18,12 +18,16 @@
     reason = "test code: a failed expectation is a failing test"
 )]
 
+use std::sync::Barrier;
+use std::thread;
+
 use blackbox::api::assert_json_content_type;
 use blackbox::scenario::{ADMINISTRATORS, administrator};
 use blackbox::sharing::{
-    MAX_ENTRIES_A_REQUEST, MAX_SHARED_WITH, TRACED, add, add_remove, assert_application_members,
-    assert_cannot_open, assert_entry, assert_opens, contributors_ok, create_unshared, email,
-    entry_named, everyone, expected, group, keys, remove, share_ok, user,
+    MAX_ENTRIES_A_REQUEST, MAX_SHARED_WITH, TRACED, add, add_remove, as_read,
+    assert_application_members, assert_cannot_open, assert_entry, assert_error_email_entry,
+    assert_error_entries, assert_opens, contributors_ok, create_unshared, email, entry_named,
+    everyone, expected, group, keys, remove, share_ok, user,
 };
 use blackbox::{Response, User, Vm, VmOptions, assert_api_error};
 use serde_json::{Value, json};
@@ -215,7 +219,7 @@ fn sharing_keeps_each_entry_in_the_order_added_with_who_added_it_and_when() {
         "dave",
     );
     assert_eq!(
-        after,
+        as_read(&after),
         read(&vm, &alice()),
         "the answer is the Application as it is after"
     );
@@ -245,10 +249,10 @@ fn a_change_answers_the_application_as_it_is_after() {
             "expected `{field}` in the Application answered, got {body}"
         );
     }
-    assert_eq!(body, read(&vm, &alice()));
+    assert_eq!(as_read(&body), read(&vm, &alice()));
     let removed = share_ok(&api, &vm, APP, &remove(&[user("bob")]));
     assert_eq!(removed["shared_with"], json!([]));
-    assert_eq!(removed, read(&vm, &alice()));
+    assert_eq!(as_read(&removed), read(&vm, &alice()));
 }
 
 #[test]
@@ -601,6 +605,7 @@ fn an_email_nobody_signed_in_with_is_422_unknown_email_and_changes_nothing() {
     ] {
         let answer = api.change_sharing(APP, &body);
         assert_api_error(&answer, 422, "unknown-email");
+        assert_error_email_entry(&answer, "bob@example.test", &format!("{body}"));
         let message = answer.json()["error"]["message"]
             .as_str()
             .unwrap_or_default()
@@ -637,16 +642,28 @@ fn too_many_entries_is_409_too_many_and_changes_nothing() {
         full["shared_with"].as_array().map(Vec::len),
         Some(MAX_SHARED_WITH)
     );
-    for (body, names) in [
-        (add(&[user("one-more")]), vec!["one-more"]),
-        (add(&[everyone()]), vec!["everyone"]),
+    for (body, names, would_add) in [
+        (
+            add(&[user("one-more")]),
+            vec!["one-more"],
+            vec!["user:one-more"],
+        ),
+        (add(&[everyone()]), vec!["everyone"], vec!["everyone"]),
         (
             add_remove(&[user("x1"), user("x2")], &[user("p0-0")]),
             vec!["x1", "x2"],
+            vec!["user:x1", "user:x2"],
+        ),
+        // Already there, so not something it would have added.
+        (
+            add(&[user("p0-1"), user("one-more")]),
+            vec!["one-more"],
+            vec!["user:one-more"],
         ),
     ] {
         let answer = api.change_sharing(APP, &body);
         assert_api_error(&answer, 409, "too-many");
+        assert_error_entries(&answer, &would_add, &format!("too-many for {body}"));
         let message = answer.json()["error"]["message"]
             .as_str()
             .unwrap_or_default()
@@ -846,4 +863,329 @@ fn the_list_of_applications_is_exactly_those_contributed_to_and_those_shared_eac
     // Unshared: gone from the list at once.
     share_ok(&api, &vm, "d-everyone", &remove(&[everyone()]));
     assert_eq!(listed(&vm, &User::new("zed")), pairs(&[("e-both", false)]));
+}
+
+#[test]
+fn a_change_answers_what_it_added_and_removed_as_kept_in_the_order_added() {
+    let vm = with_board();
+    let api = vm.api_as(&alice());
+    for (path, first, second) in [
+        ("sharing", group("finance"), everyone()),
+        ("contributors", group("finance"), group("ops")),
+    ] {
+        let change = |body: &Value| {
+            if path == "sharing" {
+                share_ok(&api, &vm, APP, body)
+            } else {
+                contributors_ok(&api, &vm, APP, body)
+            }
+        };
+        let list = if path == "sharing" {
+            "shared_with"
+        } else {
+            "contributors"
+        };
+        // Added in the order the request gives them, as kept.
+        let made = change(&add(&[user("bob"), first.clone()]));
+        assert_eq!(
+            keys(&made["added"]),
+            expected(&["user:bob", "group:finance"]),
+            "{path}: `added` in the order added: {made}"
+        );
+        assert_eq!(made["removed"], json!([]), "{path}: {made}");
+        for entry in made["added"].as_array().unwrap() {
+            let key = blackbox::sharing::entry_key(entry).unwrap();
+            assert_eq!(
+                entry,
+                entry_named(&made[list], &key),
+                "{path}: each added entry as it is kept"
+            );
+            assert_entry(entry, "alice", None, None, &format!("{path}: added {key}"));
+        }
+        // Some there already, some new: only the new ones are `added`.
+        let more = change(&add(&[first.clone(), second.clone(), user("bob")]));
+        assert_eq!(
+            more["added"],
+            json!([entry_named(
+                &more[list],
+                &blackbox::sharing::entry_key(&second).unwrap()
+            )]),
+            "{path}: only what this request added: {more}"
+        );
+        assert_eq!(more["removed"], json!([]), "{path}: {more}");
+        // Everything so already: both empty.
+        let nothing = change(&add_remove(&[user("bob")], &[user("never-there")]));
+        assert_eq!(nothing["added"], json!([]), "{path}: {nothing}");
+        assert_eq!(nothing["removed"], json!([]), "{path}: {nothing}");
+        // Removed: each as it was kept, in the order they were added, not
+        // the order of the request; one not there is not in it.
+        let kept_bob = entry_named(&more[list], "user:bob").clone();
+        let kept_first = entry_named(&more[list], "group:finance").clone();
+        let removed = change(&add_remove(
+            &[user("dave")],
+            &[first.clone(), user("zed"), user("bob")],
+        ));
+        assert_eq!(
+            removed["removed"],
+            json!([kept_bob, kept_first]),
+            "{path}: `removed` holds the entries as they were kept, in the order they were added: {removed}"
+        );
+        assert_eq!(
+            keys(&removed["added"]),
+            expected(&["user:dave"]),
+            "{path}: {removed}"
+        );
+        assert_eq!(
+            as_read(&removed),
+            read(&vm, &alice()),
+            "{path}: beside `added` and `removed`, the Application as it is after"
+        );
+    }
+}
+
+/// The reasons a reader of Versions is asked for, in order: the Versions,
+/// Version 1 (which exists) and Version 99 (which does not), and the
+/// Versions with a `?limit` that is good, bad and given twice.
+const VERSION_TARGETS: [&str; 6] = [
+    "/v1/applications/board/versions",
+    "/v1/applications/board/versions/1",
+    "/v1/applications/board/versions/99",
+    "/v1/applications/board/versions?limit=1",
+    "/v1/applications/board/versions?limit=abc",
+    "/v1/applications/board/versions?limit=1&limit=2",
+];
+
+#[test]
+fn versions_are_read_by_a_contributor_and_a_platform_administrator_and_by_nobody_else() {
+    let vm = with_board();
+    let api = vm.api_as(&alice());
+    contributors_ok(&api, &vm, APP, &add(&[group("finance")]));
+    share_ok(&api, &vm, APP, &add(&[user("bob"), group("ops")]));
+    // A Contributor by id, a Contributor by a Group, and a Platform
+    // administrator who is not a Contributor.
+    for reader in [alice(), carol(), administrator()] {
+        let reads = vm.api_as(&reader);
+        let versions = reads.list_versions(APP);
+        assert_eq!(
+            versions.status,
+            200,
+            "{:?} reads the Versions\n{}",
+            reader.id,
+            versions.describe()
+        );
+        assert_eq!(
+            versions.json()["versions"].as_array().map(Vec::len),
+            Some(1),
+            "{}",
+            versions.describe()
+        );
+        let one = reads.get_version(APP, 1);
+        assert_eq!(one.status, 200, "{:?}\n{}", reader.id, one.describe());
+        assert_api_error(&reads.get_version(APP, 99), 404, "not-found");
+        assert_api_error(
+            &reads.get(&format!("/v1/applications/{APP}/versions?limit=abc")),
+            400,
+            "malformed",
+        );
+    }
+    // Someone it is shared with (by id, by a Group), and people who cannot
+    // open it at all: `not-a-contributor`, the same answer for a Version
+    // that exists and one that does not, whatever the `?limit`.
+    for reader in [
+        bob(),
+        User::new("oscar").in_groups(&["ops"]),
+        User::new("zed"),
+        User::new("ALICE").in_groups(&["staff"]),
+    ] {
+        let reads = vm.api_as(&reader);
+        let answers: Vec<Response> = VERSION_TARGETS.iter().map(|t| reads.get(t)).collect();
+        for answer in &answers {
+            assert_api_error(answer, 403, "not-a-contributor");
+        }
+        assert_eq!(
+            answers[1].json(),
+            answers[2].json(),
+            "{:?}: Version 1, which exists, and Version 99, which does not, get the same answer",
+            reader.id
+        );
+        // The `not-found` of the Application comes first ...
+        for target in [
+            "/v1/applications/nothing-here/versions",
+            "/v1/applications/nothing-here/versions/1",
+            "/v1/applications/nothing-here/versions?limit=abc",
+        ] {
+            assert_api_error(&reads.get(target), 404, "not-found");
+        }
+        // ... then `method-not-allowed`.
+        for (method, target) in [
+            ("PUT", "/v1/applications/board/versions"),
+            ("DELETE", "/v1/applications/board/versions"),
+            ("PUT", "/v1/applications/board/versions/1"),
+            ("DELETE", "/v1/applications/board/versions/99"),
+            ("POST", "/v1/applications/board/versions/1"),
+        ] {
+            let answer = reads.request(target).method(method).send();
+            assert_api_error(&answer, 405, "method-not-allowed");
+        }
+    }
+    // A Contributor removed stops reading them at the next request.
+    contributors_ok(&api, &vm, APP, &remove(&[group("finance")]));
+    assert_api_error(
+        &vm.api_as(&carol()).list_versions(APP),
+        403,
+        "not-a-contributor",
+    );
+}
+
+/// Whether this User may open the Application whose lists are these (as
+/// a Contributor reads them): a Contributor by id or by a Group, or shared
+/// with by id, by a Group or with everyone.
+fn may_open(application: &Value, id: &str, groups: &[&str]) -> bool {
+    let names = |list: &Value| {
+        keys(list).into_iter().any(|key| {
+            key == format!("user:{id}")
+                || key == "everyone"
+                || groups.iter().any(|g| key == format!("group:{g}"))
+        })
+    };
+    names(&application["contributors"]) || names(&application["shared_with"])
+}
+
+/// Everyone the changes at once name, with their Groups.
+const INVOLVED: [(&str, &[&str]); 11] = [
+    ("alice", &["staff"]),
+    ("bob", &[]),
+    ("carol", &["finance"]),
+    ("dave", &[]),
+    ("erin", &[]),
+    ("frank", &[]),
+    ("gina", &[]),
+    ("hank", &[]),
+    ("oscar", &["ops"]),
+    ("ian", &["eng"]),
+    ("quinn", &["qa"]),
+];
+
+/// Fails unless what the Application's address answers each person agrees
+/// with the lists `application` holds: opened when they hold them, the
+/// `403` otherwise; and a stranger in no Group is let in only through
+/// everyone.
+fn assert_opening_agrees(vm: &Vm, application: &Value, context: &str) {
+    let stranger: (&str, &[&str]) = ("zed", &[]);
+    for (id, groups) in INVOLVED.iter().chain([&stranger]) {
+        let person = User::new(id).in_groups(groups);
+        let ctx = format!(
+            "{context}: {id} {groups:?}, with contributors {} and shared_with {}",
+            application["contributors"], application["shared_with"]
+        );
+        if may_open(application, id, groups) {
+            assert_opens(vm, &person, APP, &ctx);
+        } else {
+            assert_cannot_open(vm, &person, APP, &ctx);
+        }
+    }
+}
+
+#[test]
+fn changes_made_at_once_leave_the_address_deciding_by_the_lists_the_api_answers() {
+    let vm = with_board();
+    let api = vm.api_as(&alice());
+    let changes: Vec<(&str, Value)> = vec![
+        // Different people and Groups at once.
+        ("sharing", add(&[user("bob")])),
+        ("sharing", add(&[group("finance")])),
+        ("sharing", add_remove(&[user("dave")], &[group("ops")])),
+        ("sharing", remove(&[user("erin")])),
+        ("contributors", add(&[user("gina")])),
+        // The same entry added and removed at once.
+        ("sharing", add(&[user("frank")])),
+        ("sharing", remove(&[user("frank")])),
+        ("sharing", add(&[group("eng")])),
+        ("sharing", remove(&[group("eng")])),
+        ("sharing", add(&[everyone()])),
+        ("sharing", remove(&[everyone()])),
+        ("contributors", add(&[user("hank")])),
+        ("contributors", remove(&[user("hank")])),
+        ("contributors", add(&[group("qa")])),
+        ("contributors", remove(&[group("qa")])),
+    ];
+    let mut answered: Vec<(usize, Value, Value)> = Vec::new();
+    for round in 0..3 {
+        // The same lists before each round.
+        share_ok(
+            &api,
+            &vm,
+            APP,
+            &add_remove(
+                &[group("ops"), user("erin"), group("eng")],
+                &[
+                    user("bob"),
+                    group("finance"),
+                    user("dave"),
+                    user("frank"),
+                    everyone(),
+                ],
+            ),
+        );
+        contributors_ok(
+            &api,
+            &vm,
+            APP,
+            &remove(&[user("gina"), user("hank"), group("qa")]),
+        );
+        let start = Barrier::new(changes.len());
+        let answers: Vec<(Value, Response)> = thread::scope(|scope| {
+            let handles: Vec<_> = changes
+                .iter()
+                .map(|(path, body)| {
+                    let (vm, start) = (&vm, &start);
+                    scope.spawn(move || {
+                        let request = vm
+                            .api_as(&alice())
+                            .request(&format!("/v1/applications/{APP}/{path}"))
+                            .method("POST")
+                            .json(body);
+                        start.wait();
+                        (body.clone(), request.send())
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        for (body, answer) in &answers {
+            assert_eq!(
+                answer.status,
+                200,
+                "round {round}: {body}\n{}",
+                answer.describe()
+            );
+            answered.push((round, body.clone(), answer.json()));
+        }
+        let lists = read(&vm, &alice());
+        assert_opening_agrees(&vm, &lists, &format!("round {round}, after the changes"));
+    }
+    let lists = read(&vm, &alice());
+    let vm = vm.restart();
+    let after = read(&vm, &alice());
+    assert_eq!(after, lists, "the lists after a restart");
+    assert_opening_agrees(&vm, &after, "after a restart");
+    // What each answer says it added and removed (checked last, so that a
+    // failure here does not hide whether the address agrees).
+    for (round, body, answer) in &answered {
+        blackbox::sharing::assert_change_answer_members(answer, &format!("round {round}"));
+        // Someone else's change at the same moment is never in them.
+        for (member, asked) in [("added", &body["add"]), ("removed", &body["remove"])] {
+            let asked: Vec<String> = if asked.is_null() {
+                Vec::new()
+            } else {
+                keys(asked)
+            };
+            for key in keys(&answer[member]) {
+                assert!(
+                    asked.contains(&key),
+                    "round {round}: `{member}` of {body} holds {key}, which it did not ask for: {answer}"
+                );
+            }
+        }
+    }
 }

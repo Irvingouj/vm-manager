@@ -20,10 +20,10 @@ use std::time::{Duration, Instant};
 use blackbox::api::version_body;
 use blackbox::browser::{Browser, Step, describe_steps};
 use blackbox::oidc::Person;
-use blackbox::sessions::{ADA, GRACE, Installation, ada, grace};
+use blackbox::sessions::{ADA, GRACE, Installation, ada, grace, hrefs};
 use blackbox::sharing::{
-    TRACED, add, assert_entry, assert_not_shared_page, assert_not_shared_plain, email, entry_named,
-    everyone, expected, group, keys, remove, user,
+    TRACED, add, add_remove, assert_entry, assert_error_email_entry, assert_not_shared_page,
+    assert_not_shared_plain, email, entry_named, everyone, expected, group, keys, remove, user,
 };
 use blackbox::tool::bearer;
 use blackbox::{Response, assert_api_error, fixture_bundle};
@@ -101,7 +101,9 @@ fn share_ok(at: &Installation, credential: &str, body: &Value) -> Value {
             answer.describe()
         ));
     }
-    answer.json()
+    let after = answer.json();
+    blackbox::sharing::assert_application_members(&after, "the answer to a change of sharing");
+    after
 }
 
 fn contributors(at: &Installation, credential: &str, body: &Value) -> Response {
@@ -154,6 +156,14 @@ fn the_page_after_a_sign_in_names_whom_they_are_signed_in_as_and_no_contributor(
         &[GRACE, "Grace Hopper"],
         &[ADA, "Ada Lovelace", "ada@example.test"],
         "Grace, signed in, at an Application not shared with her",
+    );
+    // One link, to the platform's sign-out, the whole address: the
+    // Application's own `/sign-out` is not the platform's.
+    assert_eq!(
+        hrefs(&page.text()),
+        vec![format!("{}/sign-out", at.auth_origin())],
+        "expected exactly one link, to `<sign-in address>/sign-out`\n{}",
+        page.text()
     );
     let records = at.vm.records_of(page);
     let record = &records.request;
@@ -311,6 +321,7 @@ fn an_email_of_someone_who_never_signed_in_is_422_unknown_email() {
     for address in ["hedy@example.test", "nobody@example.test"] {
         let answer = share(&at, &ada_credential, &add(&[user(GRACE), email(address)]));
         assert_api_error(&answer, 422, "unknown-email");
+        assert_error_email_entry(&answer, address, "unknown-email");
         let message = answer.json()["error"]["message"]
             .as_str()
             .unwrap_or_default()
@@ -319,11 +330,9 @@ fn an_email_of_someone_who_never_signed_in_is_422_unknown_email() {
             message.contains(address) && message.contains("vm whoami"),
             "expected the message to name the entry and say that `vm whoami` shows the user id, got {message:?}"
         );
-        assert_api_error(
-            &contributors(&at, &ada_credential, &add(&[email(address)])),
-            422,
-            "unknown-email",
-        );
+        let answer = contributors(&at, &ada_credential, &add(&[email(address)]));
+        assert_api_error(&answer, 422, "unknown-email");
+        assert_error_email_entry(&answer, address, "unknown-email, Contributors");
     }
     let read = get(&at, &ada_credential, &format!("/v1/applications/{APP}"));
     assert_eq!(
@@ -342,6 +351,7 @@ fn an_email_two_people_signed_in_with_is_409_ambiguous_email() {
     for address in ["twin@example.test", "TWIN@EXAMPLE.TEST"] {
         let answer = share(&at, &ada_credential, &add(&[email(address)]));
         assert_api_error(&answer, 409, "ambiguous-email");
+        assert_error_email_entry(&answer, address, "ambiguous-email");
         let message = answer.json()["error"]["message"]
             .as_str()
             .unwrap_or_default()
@@ -350,11 +360,9 @@ fn an_email_two_people_signed_in_with_is_409_ambiguous_email() {
             message.contains("twin@example.test") && message.contains("user id"),
             "expected the message to name the entry and say to use the user id, got {message:?}"
         );
-        assert_api_error(
-            &contributors(&at, &ada_credential, &add(&[email(address)])),
-            409,
-            "ambiguous-email",
-        );
+        let answer = contributors(&at, &ada_credential, &add(&[email(address)]));
+        assert_api_error(&answer, 409, "ambiguous-email");
+        assert_error_email_entry(&answer, address, "ambiguous-email, Contributors");
     }
     let read = get(&at, &ada_credential, &format!("/v1/applications/{APP}"));
     assert_eq!(read.json()["shared_with"], json!([]), "nothing was changed");
@@ -431,5 +439,55 @@ fn a_person_taken_out_of_a_group_at_the_provider_stops_being_a_contributor_at_th
         APP,
         GRACE,
         "Grace, no longer a Contributor by devops and not shared with",
+    );
+}
+
+#[test]
+fn the_same_person_by_id_and_by_email_in_add_and_remove_is_400_malformed_after_unknown_email() {
+    let at = installation(&[]);
+    let ada_credential = with_board(&at);
+    sign_in_refused(&at, GRACE);
+    share_ok(&at, &ada_credential, &add(&[user(GRACE)]));
+    let before = get(&at, &ada_credential, &format!("/v1/applications/{APP}")).json();
+    for (path, body) in [
+        (
+            "sharing",
+            add_remove(&[user(GRACE)], &[email("grace@example.test")]),
+        ),
+        (
+            "sharing",
+            add_remove(&[email("GRACE@example.test")], &[user(GRACE)]),
+        ),
+        (
+            "contributors",
+            add_remove(&[user(GRACE)], &[email("grace@example.test")]),
+        ),
+        (
+            "contributors",
+            add_remove(&[email("Grace@Example.Test")], &[user(GRACE)]),
+        ),
+    ] {
+        let target = format!("/v1/applications/{APP}/{path}");
+        assert_api_error(
+            &post(&at, &ada_credential, &target, &body),
+            400,
+            "malformed",
+        );
+        // With an address nobody signed in with beside it, `unknown-email`
+        // comes first: the emails are resolved before the same person is
+        // found on both sides.
+        let mut with_unknown = body.clone();
+        with_unknown["add"]
+            .as_array_mut()
+            .unwrap()
+            .push(email("nobody@example.test"));
+        let answer = post(&at, &ada_credential, &target, &with_unknown);
+        assert_api_error(&answer, 422, "unknown-email");
+        assert_error_email_entry(&answer, "nobody@example.test", &format!("{with_unknown}"));
+    }
+    assert_eq!(
+        get(&at, &ada_credential, &format!("/v1/applications/{APP}")).json(),
+        before,
+        "nothing was changed"
     );
 }

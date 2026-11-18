@@ -815,7 +815,12 @@ impl Own {
                 created.describe()
             ));
         }
-        self.api().share_with_everyone(name);
+        // The program at the earlier commit has no sharing (it is not
+        // asked); an Application it made is shared with nobody when the
+        // program under test takes over ("Contributors and sharing").
+        if !crate::history_earlier::earlier_program_chosen() {
+            self.api().share_with_everyone(name);
+        }
     }
 
     /// Sends a Version of `name`: [`FIXTURE`] as its bundle, nothing

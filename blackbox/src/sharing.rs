@@ -201,6 +201,65 @@ pub fn assert_application_members(application: &Value, context: &str) {
     }
 }
 
+/// Fails unless the answer to a change of either list (`200`) is the
+/// Application with both lists' entries as [`assert_application_members`]
+/// wants them, and `added` and `removed`, each a list of entries with their
+/// members (CONTRACT.md, "Contributors and sharing: On the platform's API").
+pub fn assert_change_answer_members(answer: &Value, context: &str) {
+    assert_application_members(answer, context);
+    for member in ["added", "removed"] {
+        assert!(
+            answer[member].is_array(),
+            "{context}: expected `{member}`, a list of entries, in the answer to a change, got {answer}"
+        );
+        assert_list_members(&answer[member], &format!("{context}: {member}"));
+    }
+}
+
+/// The Application of the answer to a change, without `added` and
+/// `removed`: what a read of it answers.
+pub fn as_read(answer: &Value) -> Value {
+    let mut application = answer.clone();
+    if let Some(object) = application.as_object_mut() {
+        object.remove("added");
+        object.remove("removed");
+    }
+    application
+}
+
+/// Fails unless the refusal has `error.entries`, the entries named by
+/// `wanted` (see [`entry_key`]) in that order, each with the members of an
+/// entry anywhere (CONTRACT.md: `last-contributor` has those it would have
+/// removed, `too-many` those it would have added).
+pub fn assert_error_entries(answer: &Response, wanted: &[&str], context: &str) {
+    let body = answer.json();
+    let entries = &body["error"]["entries"];
+    assert!(
+        entries.is_array(),
+        "{context}: expected `error.entries`, a list of entries, got\n{}",
+        answer.describe()
+    );
+    assert_list_members(entries, &format!("{context}: error.entries"));
+    assert_eq!(
+        keys(entries),
+        expected(wanted),
+        "{context}: expected `error.entries` to be the entries the refusal is about\n{}",
+        answer.describe()
+    );
+}
+
+/// Fails unless the refusal has `error.entry`, exactly the `{ "email": ... }`
+/// as given.
+pub fn assert_error_email_entry(answer: &Response, address: &str, context: &str) {
+    let body = answer.json();
+    assert_eq!(
+        body["error"]["entry"],
+        json!({ "email": address }),
+        "{context}: expected `error.entry` to be the entry as given\n{}",
+        answer.describe()
+    );
+}
+
 /// Creates `name` as `creator` and sends `fixtures/<file>` as its first
 /// Version, sharing it with nobody, failing the test with the program's log
 /// unless both are `201`.
@@ -235,7 +294,14 @@ pub fn share_ok(api: &Api<'_>, vm: &Vm, application: &str, body: &Value) -> Valu
         ));
     }
     let after = answer.json();
+    // `added` and `removed` are checked by the tests of the answer, not
+    // here, so that a test about something else is not stopped by them.
     assert_application_members(&after, "the answer to a change of sharing");
+    for member in ["added", "removed"] {
+        if after.get(member).is_some_and(Value::is_array) {
+            assert_list_members(&after[member], &format!("the answer to a change: {member}"));
+        }
+    }
     after
 }
 
@@ -251,7 +317,14 @@ pub fn contributors_ok(api: &Api<'_>, vm: &Vm, application: &str, body: &Value) 
         ));
     }
     let after = answer.json();
+    // `added` and `removed` are checked by the tests of the answer, not
+    // here, so that a test about something else is not stopped by them.
     assert_application_members(&after, "the answer to a change of the Contributors");
+    for member in ["added", "removed"] {
+        if after.get(member).is_some_and(Value::is_array) {
+            assert_list_members(&after[member], &format!("the answer to a change: {member}"));
+        }
+    }
     after
 }
 
@@ -450,7 +523,9 @@ pub fn tool_json(machine: &Machine, args: &[&str]) -> Run {
 
 /// Fails unless what one of the four commands that change a list printed
 /// (`--json`, exit code `0`) is exactly `{ application, address, added,
-/// removed, visible_to: { contributors, shared_with } }`; returns it.
+/// removed, visible_to: { contributors, shared_with } }`, with
+/// `visible_to.shared_with` a list or null (a Contributor who has just taken
+/// themselves off); returns it.
 pub fn assert_change_printed(run: &Run, application: &str) -> Value {
     let body = run.ok_json();
     let mut fields: Vec<&str> = body
@@ -482,12 +557,17 @@ pub fn assert_change_printed(run: &Run, application: &str) -> Value {
         "expected `visible_to` to be {{ contributors, shared_with }}\n{}",
         run.describe()
     );
-    for list in [
-        &body["added"],
-        &body["removed"],
-        &body["visible_to"]["contributors"],
-        &body["visible_to"]["shared_with"],
-    ] {
+    let shared_with = &body["visible_to"]["shared_with"];
+    let lists: Vec<&Value> = [
+        Some(&body["added"]),
+        Some(&body["removed"]),
+        Some(&body["visible_to"]["contributors"]),
+        (!shared_with.is_null()).then_some(shared_with),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    for list in lists {
         assert_list_members(list, &run.describe());
         assert!(
             list.as_array()
@@ -497,4 +577,23 @@ pub fn assert_change_printed(run: &Run, application: &str) -> Value {
         );
     }
     body
+}
+
+/// Shares an Application `vm deploy` just made with everyone, as its first
+/// Contributor (the one `visible_to.contributors` names), failing the test
+/// unless it is `200`: for tests of a deployed Application that are not
+/// about who can open it.
+pub fn share_with_everyone_as_deployer(vm: &Vm, deployed: &crate::deploy::Deployed) {
+    let deployer = deployed
+        .contributors
+        .first()
+        .and_then(|c| c["user"].as_str())
+        .unwrap_or_else(|| {
+            panic!(
+                "expected the deploy's visible_to to name its Contributor\n{}",
+                deployed.run.describe()
+            )
+        });
+    vm.api_as(&User::new(deployer))
+        .share_with_everyone(&deployed.application);
 }
