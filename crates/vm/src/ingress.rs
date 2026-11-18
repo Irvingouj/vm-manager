@@ -16,9 +16,9 @@
 //! [`SignIn`] counts. Then a request from another origin than the
 //! Application's own is refused ([`from_another_origin`]), whatever the
 //! sign-in; then the Dashboard's address (`dashboard.<domain>`, signed in
-//! to as an Application is) goes to crate::dashboard; then the Application as the registry holds it in memory
-//! ([`Registry::find`]; read back, or `503`, when memory does not know it
-//! now); then whether the User can open it (a Contributor, or someone it
+//! to as an Application is) goes to crate::dashboard; then the Application
+//! as the registry holds it in memory ([`Registry::find`]; read back, or
+//! `503`, when memory does not know it now); then whether the User can open it (a Contributor, or someone it
 //! is shared with), so that one it is not shared with gets the `403` of the
 //! platform's own before the Application is handed anything (the local run
 //! serves every test User and does not ask); then its serving Version is
