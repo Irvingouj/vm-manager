@@ -60,6 +60,9 @@ fn a_restart_keeps_applications_contributors_versions_and_the_serving_version() 
     vm.api_as(&bob())
         .create_with_bundle("ledger", &marked_bundle("ledger-1"));
     api.create_application("empty").expect_status(201);
+    // Shared with everyone, as the harness shares the other two, so that bob
+    // reads all three (this test is not about who can open them).
+    api.share_with_everyone("empty");
     let before: Vec<_> = ["board", "ledger", "empty"]
         .iter()
         .map(|name| everything_about(&vm, name))

@@ -295,9 +295,9 @@ impl Scenario {
         }
     }
 
-    /// Creates the Application `name` as [`INSTALLER`] and sends the fixture
-    /// `file` as its first Version, declaring these Resources as (name,
-    /// access level).
+    /// Creates the Application `name` as [`INSTALLER`], shares it with
+    /// everyone, and sends the fixture `file` as its first Version, declaring
+    /// these Resources as (name, access level).
     pub fn install(&self, name: &str, file: &str, declared: &[(&str, &str)]) {
         let api = self.vm.api_as(&User::new(INSTALLER));
         let created = api.create_application(name);
@@ -307,6 +307,7 @@ impl Scenario {
                 created.describe()
             ));
         }
+        api.share_with_everyone(name);
         let sent = api.send_version(
             name,
             &version_body_declaring(&fixture_bundle(file), declared),

@@ -15,6 +15,7 @@ use std::sync::Barrier;
 use std::thread;
 
 use blackbox::api::{assert_json_content_type, assert_recent_rfc3339};
+use blackbox::sharing::{assert_entry, keys};
 use blackbox::{DOMAIN, Response, User, Vm, VmOptions, assert_api_error};
 use serde_json::{Value, json};
 
@@ -42,9 +43,27 @@ fn assert_new_application(application: &Value, name: &str, creator: &str) {
         "expected the address <name>.<domain> in {application}"
     );
     assert_eq!(
-        application["contributors"],
-        json!([{ "user": creator }]),
+        keys(&application["contributors"]),
+        [format!("user:{creator}")],
         "expected the creator to be the only Contributor, in {application}"
+    );
+    // CONTRACT.md, "Contributors and sharing": the creator added
+    // themselves, and the stand-in knows no name or email.
+    assert_entry(
+        &application["contributors"][0],
+        creator,
+        None,
+        None,
+        "the creator as the first Contributor",
+    );
+    assert_eq!(
+        application["shared_with"],
+        json!([]),
+        "expected a new Application to be shared with nobody, in {application}"
+    );
+    assert_eq!(
+        application["contributor"], true,
+        "expected `contributor` true for its creator, in {application}"
     );
     assert!(
         application
@@ -99,19 +118,25 @@ fn the_description_is_optional_null_when_not_given_and_kept_exactly_as_given() {
 }
 
 #[test]
-fn every_signed_in_user_reads_the_same_application_as_was_created() {
+fn its_contributor_reads_the_same_application_as_was_created_and_nobody_else_reads_it() {
+    // CONTRACT.md, "Contributors and sharing": from that ticket on only who
+    // can open it (and a Platform administrator) reads it.
     let vm = vm();
     let created = vm.api_as(&alice()).create_application("board");
     created.expect_status(201);
-    for reader in [alice(), bob(), User::new("carol").in_groups(&["finance"])] {
-        let read = vm.api_as(&reader).get_application("board");
-        read.expect_status(200);
-        assert_json_content_type(&read);
-        assert_eq!(
-            read.json(),
-            created.json(),
-            "expected {} to read the same Application as was created",
-            reader.id
+    let read = vm.api_as(&alice()).get_application("board");
+    read.expect_status(200);
+    assert_json_content_type(&read);
+    assert_eq!(
+        read.json(),
+        created.json(),
+        "expected its creator to read the same Application as was created"
+    );
+    for reader in [bob(), User::new("carol").in_groups(&["finance"])] {
+        assert_api_error(
+            &vm.api_as(&reader).get_application("board"),
+            403,
+            "not-shared",
         );
     }
 }
@@ -264,14 +289,16 @@ fn a_name_may_start_with_a_digit() {
             response.describe()
         );
         assert_new_application(&response.json(), name, "alice");
-        let served_at = vm.get_as(&bob(), name, "/");
+        // Opened by its Contributor: someone else is refused before the
+        // `404` of no Version ("Contributors and sharing").
+        let served_at = vm.get_as(&alice(), name, "/");
         assert_eq!(
             served_at.status,
             404,
             "expected {name}.vm.test to be the Application's address (404: no Version yet), got\n{}",
             served_at.describe()
         );
-        assert_eq!(vm.records_of(&served_at).request["user"], "bob");
+        assert_eq!(vm.records_of(&served_at).request["user"], "alice");
     }
 }
 
@@ -344,8 +371,9 @@ fn a_taken_name_is_409_name_taken_and_the_application_is_unchanged() {
         }));
         assert_api_error(&again, 409, "name-taken");
     }
+    // Read by its Contributor: nobody else may read it until it is shared.
     assert_eq!(
-        vm.api_as(&bob()).application("board"),
+        vm.api_as(&alice()).application("board"),
         created.json(),
         "expected the Application to be unchanged by the refused attempts"
     );
@@ -389,7 +417,8 @@ fn when_users_race_for_a_name_exactly_one_wins() {
         for (_, response) in answers.iter().filter(|(_, r)| r.status != 201) {
             assert_api_error(response, 409, "name-taken");
         }
-        let application = vm.api_as(&bob()).application(&name);
+        // Read by the winner, its only Contributor.
+        let application = vm.api_as(&User::new(winners[0])).application(&name);
         assert_new_application(&application, &name, winners[0]);
     }
 }

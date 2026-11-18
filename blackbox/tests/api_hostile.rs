@@ -162,6 +162,7 @@ fn fields_the_platform_sets_cannot_be_chosen_when_creating_an_application() {
         "description": "innocent",
         "created_by": "alice",
         "contributors": [{ "user": "alice" }, { "user": "mallory" }, { "user": "eve" }],
+        "shared_with": [{ "everyone": true }],
         "serving_version": 7,
         "address": "api.vm.test",
         "created_at": "1999-01-01T00:00:00Z",
@@ -172,12 +173,20 @@ fn fields_the_platform_sets_cannot_be_chosen_when_creating_an_application() {
         response.describe()
     );
     {
-        let application = vm.api_as(&alice()).application("smuggled");
+        // Read by mallory, its creator: it is shared with nobody, so alice
+        // could not read it ("Contributors and sharing").
+        let application = vm.api_as(&mallory()).application("smuggled");
         assert_eq!(application["created_by"], "mallory", "in {application}");
         assert_eq!(
-            application["contributors"],
-            json!([{ "user": "mallory" }]),
+            blackbox::sharing::keys(&application["contributors"]),
+            ["user:mallory"],
             "in {application}"
+        );
+        assert_eq!(application["shared_with"], json!([]), "in {application}");
+        assert_api_error(
+            &vm.api_as(&alice()).get_application("smuggled"),
+            403,
+            "not-shared",
         );
         assert!(application["serving_version"].is_null(), "in {application}");
         assert_eq!(

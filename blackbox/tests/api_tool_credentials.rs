@@ -414,7 +414,10 @@ fn a_credential_of_one_user_never_answers_as_the_stand_in_beside_it() {
         .send();
     created.expect_status(201);
     assert_eq!(created.json()["created_by"], "alice");
-    assert_eq!(created.json()["contributors"], json!([{ "user": "alice" }]));
+    assert_eq!(
+        blackbox::sharing::keys(&created.json()["contributors"]),
+        ["user:alice"]
+    );
     let record = s.vm.records_of(&created).request;
     assert_eq!(record["user"], "alice", "{record}");
 }

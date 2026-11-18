@@ -405,8 +405,8 @@ impl Txs {
     }
 }
 
-/// Creates `name` as [`INSTALLER`] and sends [`FIXTURE`] as its first
-/// Version, declaring these Resources, with [`migrations`].
+/// Creates `name` as [`INSTALLER`], shares it with everyone, and sends
+/// [`FIXTURE`] as its first Version, declaring these Resources, with [`migrations`].
 pub fn install(vm: &Vm, name: &str, declared: &[(&str, &str)]) {
     let api = vm.api_as(&User::new(INSTALLER));
     let created = api.create_application(name);
@@ -416,6 +416,7 @@ pub fn install(vm: &Vm, name: &str, declared: &[(&str, &str)]) {
             created.describe()
         ));
     }
+    api.share_with_everyone(name);
     let sent = api
         .request(&format!("/v1/applications/{name}/versions"))
         .method("POST")

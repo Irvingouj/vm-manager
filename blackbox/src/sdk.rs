@@ -270,7 +270,8 @@ pub fn version_body_of(built: &Built) -> Value {
 }
 
 /// Creates the Application of `built` (with the Manifest's name and
-/// description) as [`INSTALLER`] and sends its Version, failing the test
+/// description) as [`INSTALLER`], shares it with everyone, and sends its
+/// Version, failing the test
 /// with the program's log unless both are `201`. Then gives its own
 /// database the TimeZone [`OWN_TIME_ZONE`] and the DateStyle `ISO, MDY`,
 /// before any request can open a connection to it, and returns it.
@@ -287,6 +288,7 @@ pub fn install(vm: &Vm, built: &Built) -> OwnDatabase {
             created.describe()
         ));
     }
+    api.share_with_everyone(&built.name);
     let sent = api
         .request(&format!("/v1/applications/{}/versions", built.name))
         .method("POST")

@@ -331,9 +331,11 @@ impl Vm {
         }
     }
 
-    /// Creates the Application `name` as [`INSTALLER`] and sends `bundle` as
-    /// a Version, failing the test with the program's log unless both are
-    /// answered `201`.
+    /// Creates the Application `name` as [`INSTALLER`], shares it with
+    /// everyone (the tests that use a fixture are not about who can open it;
+    /// those that are make their Applications themselves) and sends `bundle`
+    /// as a Version, failing the test with the program's log unless each is
+    /// done.
     pub fn install(&self, name: &str, bundle: &str) {
         let api = self.api_as(&User::new(INSTALLER));
         let created = api.create_application(name);
@@ -343,6 +345,7 @@ impl Vm {
                 created.describe()
             ));
         }
+        api.share_with_everyone(name);
         let sent = api.send_version(name, &version_body(bundle));
         if sent.status != 201 {
             self.fail(&format!(

@@ -48,6 +48,8 @@ fn keys(value: &Value) -> Vec<String> {
 fn with_versions(vm: &Vm, name: &str, n: u64) {
     let api = vm.api_as(&alice());
     api.create_application(name).expect_status(201);
+    // Shared with everyone: these tests are not about who can open it.
+    api.share_with_everyone(name);
     for i in 1..=n {
         api.send_version(
             name,
@@ -227,6 +229,8 @@ fn vm_versions_names_the_serving_version_also_when_its_line_is_not_printed() {
 fn vm_versions_of_an_application_with_no_version_says_vm_deploy_sends_the_first() {
     let own = Own::start();
     own.api().create_application("empty").expect_status(201);
+    // Shared with everyone: this test is not about who can open it.
+    own.api().share_with_everyone("empty");
     let machine = machine_as(&own.vm, &alice());
     assert_eq!(
         machine.run(&["versions", "empty", "--json"]).ok_json(),
@@ -368,6 +372,8 @@ fn vm_go_back_json_names_the_migrations_not_undone() {
 fn vm_go_back_with_nothing_before_the_serving_version_is_no_previous_version() {
     let own = Own::start();
     own.api().create_application("empty").expect_status(201);
+    // Shared with everyone: this test is not about who can open it.
+    own.api().share_with_everyone("empty");
     with_versions(&own.vm, "single", 1);
     let machine = machine_as(&own.vm, &alice());
     for name in ["empty", "single"] {

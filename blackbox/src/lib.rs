@@ -70,7 +70,14 @@
 //!   installation's key, `vm setup`, `vm admin connect-oidc`, `PUT
 //!   /v1/oidc`), and [`tool_sign_ins`] is what the tests of the tool's
 //!   sign-in through the browser share: a verifier and its challenge, the
-//!   forms of a page, and the harness's `BROWSER` command.
+//!   forms of a page, and the harness's `BROWSER` command;
+//! - [`sharing`] is what the tests of Contributors and sharing share: the
+//!   entries of the two lists, an Application shared with nobody, and the
+//!   `403` of someone it is not shared with. Every other way the harness
+//!   makes an Application for a test (the fixtures [`Vm`] installs, the
+//!   helpers of [`api`], [`scenario`], [`own_database`], [`sdk`] and
+//!   [`transactions`]) shares it with everyone, since those tests are not
+//!   about who can open it.
 //!
 //! Every wait has a timeout, so a failing test fails within seconds and
 //! never hangs. Each test starts its own program on its own port, so tests
@@ -117,6 +124,7 @@ pub mod sdk_history;
 pub mod server_log;
 pub mod sessions;
 pub mod shared_database;
+pub mod sharing;
 pub mod sql;
 pub mod structure;
 pub mod tool;

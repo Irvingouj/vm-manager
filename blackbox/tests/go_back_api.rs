@@ -51,6 +51,8 @@ fn start() -> Own {
 fn with_versions(vm: &Vm, name: &str, n: u64) {
     let api = vm.api_as(&alice());
     api.create_application(name).expect_status(201);
+    // Shared with everyone: these tests are not about who can open it.
+    api.share_with_everyone(name);
     for i in 1..=n {
         api.send_bundle(name, &marked_bundle(&format!("v{i}")))
             .expect_status(201);
@@ -176,6 +178,8 @@ fn the_version_gone_back_to_serves_with_its_own_declared_access() {
     let own = start();
     let api = own.api();
     api.create_application("board").expect_status(201);
+    // Shared with everyone: this test is not about who can open it.
+    api.share_with_everyone("board");
     let bundle = fixture_bundle("operations.js");
     api.send_version(
         "board",

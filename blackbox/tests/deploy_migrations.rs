@@ -762,7 +762,10 @@ fn an_application_this_deploy_created_stays_when_its_version_is_not_taken() {
     let api = vm.api_as(&dana());
     let application = api.application("stays-board");
     assert_eq!(application["serving_version"], Value::Null);
-    assert_eq!(application["contributors"], json!([{ "user": "dana" }]));
+    assert_eq!(
+        blackbox::sharing::keys(&application["contributors"]),
+        ["user:dana"]
+    );
     assert_eq!(api.versions("stays-board"), Vec::<Value>::new());
     let page = vm.get_as(&dana(), "stays-board", "/");
     assert_ne!(

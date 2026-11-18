@@ -28,6 +28,7 @@ use blackbox::project::{
     squashed, vm_commands_in,
 };
 use blackbox::sdk::run_tooling;
+use blackbox::sharing::keys;
 use blackbox::tool::Machine;
 use blackbox::{DOMAIN, Vm, VmOptions};
 use serde_json::json;
@@ -58,8 +59,25 @@ fn a_new_project_deploys_as_it_stands_and_a_signed_in_user_gets_its_page() {
 
     let run = deploy(&machine, &project.dir, &[]);
     let deployed = Deployed::of(&run);
+    // `visible_to` holds entries (CONTRACT.md, "Contributors and sharing:
+    // The tool"), whose fields beside the one that names them are not this
+    // test's: they are compared by what they name.
     assert_eq!(
-        deployed.body,
+        keys(&deployed.body["visible_to"]["contributors"]),
+        ["user:dana"],
+        "expected dana, the one who deployed, as its only Contributor\n{}",
+        run.describe()
+    );
+    assert_eq!(
+        deployed.shared_with,
+        Vec::<serde_json::Value>::new(),
+        "expected a new Application to be shared with nobody\n{}",
+        run.describe()
+    );
+    let mut body = deployed.body;
+    body["visible_to"] = json!(null);
+    assert_eq!(
+        body,
         json!({
             "application": name,
             "address": format!("{name}.{DOMAIN}"),
@@ -69,7 +87,7 @@ fn a_new_project_deploys_as_it_stands_and_a_signed_in_user_gets_its_page() {
             "migrations_applied": [],
             "structures": {},
             "pulled": [],
-            "visible_to": { "contributors": ["dana"] },
+            "visible_to": null,
             "warnings": [],
             "notes": [],
         }),
@@ -87,7 +105,7 @@ fn a_new_project_deploys_as_it_stands_and_a_signed_in_user_gets_its_page() {
     let api = vm.api_as(&dana());
     let application = api.application(name);
     assert_eq!(application["description"], manifest["description"]);
-    assert_eq!(application["contributors"], json!([{ "user": "dana" }]));
+    assert_eq!(keys(&application["contributors"]), ["user:dana"]);
     assert_eq!(application["created_by"], json!("dana"));
     assert_eq!(application["serving_version"], json!(1));
     // The Version: the commit, no structure, no migration.
@@ -121,7 +139,7 @@ fn a_new_project_deploys_as_it_stands_and_a_signed_in_user_gets_its_page() {
     assert_eq!(second.version, 2);
     assert!(!second.created, "expected `created` false the second time");
     assert_eq!(second.git_commit, second_commit);
-    assert_eq!(second.contributors, ["dana"]);
+    assert_eq!(keys(&json!(second.contributors)), ["user:dana"]);
     assert_eq!(second.migrations_applied, Vec::<String>::new());
     let page = vm.get_as(&dana(), name, "/");
     assert!(
@@ -143,13 +161,15 @@ fn visible_to_is_the_contributors_as_the_installation_answers_them() {
     init_repository(&project.dir);
     commit_all(&project.dir, "first");
     let deployed = Deployed::of(&deploy(&machine, &project.dir, &[]));
-    let answered: Vec<String> = vm.api_as(&dana()).application("seen-by")["contributors"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|c| c["user"].as_str().unwrap().to_owned())
-        .collect();
-    assert_eq!(deployed.contributors, answered);
+    let application = vm.api_as(&dana()).application("seen-by");
+    assert_eq!(
+        keys(&json!(deployed.contributors)),
+        keys(&application["contributors"])
+    );
+    assert_eq!(
+        keys(&json!(deployed.shared_with)),
+        keys(&application["shared_with"])
+    );
 }
 
 #[test]
@@ -180,17 +200,16 @@ fn in_words_it_says_where_it_is_live_and_that_only_its_contributors_see_it() {
         lower.contains("contributor") && lower.contains("only"),
         "expected the words to say it is visible to its Contributors only\n{text}"
     );
+    // From the ticket on Contributors and sharing on: Contributors only, and
+    // that `vm share` shares it.
     assert!(
-        lower.contains("shared")
-            && (lower.contains("nobody else") || lower.contains("no one else")),
-        "expected the words to say nobody else sees it until it is shared\n{text}"
+        flat.contains("vm share"),
+        "expected the words to say that `vm share` shares it\n{text}"
     );
-    for never in ["group", "team"] {
-        assert!(
-            !lower.contains(never),
-            "expected the words never to say more than the Contributors (no {never:?})\n{text}"
-        );
-    }
+    assert!(
+        !lower.contains("team"),
+        "expected the words never to say more than the Contributors (no \"team\")\n{text}"
+    );
     // A second deploy says Version 2.
     let index = project.dir.join("src/index.ts");
     let template = fs::read_to_string(&index).unwrap();

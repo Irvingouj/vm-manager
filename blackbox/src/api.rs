@@ -105,6 +105,36 @@ impl<'a> Api<'a> {
         self.get(&format!("/v1/applications/{name}"))
     }
 
+    /// `POST /v1/applications/<application>/sharing` with this body
+    /// (CONTRACT.md, "Contributors and sharing: On the platform's API").
+    pub fn change_sharing(&self, application: &str, body: &Value) -> Response {
+        self.post(&format!("/v1/applications/{application}/sharing"), body)
+    }
+
+    /// `POST /v1/applications/<application>/contributors` with this body.
+    pub fn change_contributors(&self, application: &str, body: &Value) -> Response {
+        self.post(
+            &format!("/v1/applications/{application}/contributors"),
+            body,
+        )
+    }
+
+    /// Shares `application` with everyone (`{ "add": [ { "everyone": true } ] }`),
+    /// failing the test with the program's log unless it is `200`. The
+    /// harness does this for every Application it makes for a test that is
+    /// not about who can open it (CONTRACT.md, "Contributors and sharing":
+    /// until it is shared an Application is its Contributors' alone).
+    pub fn share_with_everyone(&self, application: &str) {
+        let shared = self.change_sharing(application, &json!({ "add": [ { "everyone": true } ] }));
+        if shared.status != 200 {
+            self.vm.fail(&format!(
+                "expected `200` sharing {application:?} with everyone as its Contributor {:?}, got\n{}",
+                self.user.id,
+                shared.describe()
+            ));
+        }
+    }
+
     /// `GET /v1/applications/<application>/versions/<number>`.
     pub fn get_version(&self, application: &str, number: u64) -> Response {
         self.get(&format!("/v1/applications/{application}/versions/{number}"))
@@ -193,11 +223,12 @@ impl<'a> Api<'a> {
         })
     }
 
-    /// Creates `name` and sends `bundle` as its first Version declaring
-    /// these Resources as (name, access level), failing the test unless both
-    /// are `201`. Returns the Version's record.
+    /// Creates `name`, shares it with everyone, and sends `bundle` as its
+    /// first Version declaring these Resources as (name, access level),
+    /// failing the test unless each is done. Returns the Version's record.
     pub fn create_declaring(&self, name: &str, bundle: &str, declared: &[(&str, &str)]) -> Value {
         self.create_application(name).expect_status(201);
+        self.share_with_everyone(name);
         self.send_version(name, &version_body_declaring(bundle, declared))
             .expect_status(201)
             .json()
@@ -222,10 +253,12 @@ impl<'a> Api<'a> {
             .send()
     }
 
-    /// Creates `name` and sends `bundle` as its first Version, failing the
-    /// test unless both are `201`. Returns the Version's record.
+    /// Creates `name`, shares it with everyone, and sends `bundle` as its
+    /// first Version, failing the test unless each is done. Returns the
+    /// Version's record.
     pub fn create_with_bundle(&self, name: &str, bundle: &str) -> Value {
         self.create_application(name).expect_status(201);
+        self.share_with_everyone(name);
         self.send_bundle(name, bundle).expect_status(201).json()
     }
 

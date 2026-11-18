@@ -46,6 +46,8 @@ fn an_application_with_no_version_is_404_and_runs_no_code() {
     let vm = vm();
     let api = vm.api_as(&alice());
     api.create_application("board").expect_status(201);
+    // Shared with everyone: this test is not about who can open it.
+    api.share_with_everyone("board");
     assert!(api.application("board")["serving_version"].is_null());
     assert_eq!(api.versions("board"), Vec::<Value>::new());
     assert_api_error(&api.get_version("board", 1), 404, "not-found");
@@ -68,6 +70,8 @@ fn once_the_first_version_is_sent_requests_are_served_by_it() {
     let vm = vm();
     let api = vm.api_as(&alice());
     api.create_application("board").expect_status(201);
+    // Shared with everyone: this test is not about who can open it.
+    api.share_with_everyone("board");
     api.send_bundle("board", &marked_bundle("first"))
         .expect_status(201);
     assert_eq!(api.application("board")["serving_version"], 1);

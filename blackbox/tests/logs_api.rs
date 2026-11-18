@@ -238,6 +238,9 @@ fn a_request_no_application_code_was_given_has_no_entry() {
     anonymous.expect_status(401);
     let api = own.vm.api_as(&alice());
     api.create_application("empty").expect_status(201);
+    // Shared with everyone, so that bob's request is the `404` of no
+    // Version (this test is not about who can open it).
+    api.share_with_everyone("empty");
     let none = own.vm.get_as(&bob(), "empty", "/");
     none.expect_status(404);
     let served = quiet(&own.vm, "/after");

@@ -47,7 +47,10 @@ fn the_first_deploy_creates_the_application_with_the_manifests_description() {
     assert_eq!(deployed.version, 1);
     let application = vm.api_as(&dana()).application("created-board");
     assert_eq!(application["description"], json!(MANIFEST_DESCRIPTION));
-    assert_eq!(application["contributors"], json!([{ "user": "dana" }]));
+    assert_eq!(
+        blackbox::sharing::keys(&application["contributors"]),
+        ["user:dana"]
+    );
     assert_eq!(application["created_by"], json!("dana"));
     assert_eq!(application["serving_version"], json!(1));
     // The page answers.
@@ -111,8 +114,8 @@ fn a_name_taken_by_an_application_the_user_does_not_contribute_to_is_refused() {
             "{name}: expected no Version added"
         );
         assert_eq!(
-            erins.application(name)["contributors"],
-            json!([{ "user": "erin" }])
+            blackbox::sharing::keys(&erins.application(name)["contributors"]),
+            ["user:erin"]
         );
         assert_eq!(
             before.differences(&project_tree(&project.dir)),

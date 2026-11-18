@@ -805,7 +805,8 @@ impl Own {
         self.vm.api_as(&User::new(INSTALLER))
     }
 
-    /// Creates the Application `name`, failing unless `201`.
+    /// Creates the Application `name`, failing unless `201`, and shares it
+    /// with everyone.
     pub fn create(&self, name: &str) {
         let created = self.api().create_application(name);
         if created.status != 201 {
@@ -814,6 +815,7 @@ impl Own {
                 created.describe()
             ));
         }
+        self.api().share_with_everyone(name);
     }
 
     /// Sends a Version of `name`: [`FIXTURE`] as its bundle, nothing

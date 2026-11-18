@@ -388,7 +388,11 @@ pub struct Deployed {
     pub migrations_applied: Vec<String>,
     pub structures: Value,
     pub pulled: Vec<Value>,
-    pub contributors: Vec<String>,
+    /// `visible_to.contributors`: entries (CONTRACT.md, "Contributors and
+    /// sharing: The tool").
+    pub contributors: Vec<Value>,
+    /// `visible_to.shared_with`: entries.
+    pub shared_with: Vec<Value>,
     pub warnings: Vec<Value>,
     pub notes: Vec<Value>,
 }
@@ -412,7 +416,9 @@ impl Deployed {
     /// Fails unless the run ended with `0` and printed the object of
     /// CONTRACT.md's "What it prints", every field there with its type and
     /// no other: `address` is `<application>.<domain>`, `git_commit` 40 hex
-    /// digits, `visible_to` `{ "contributors": [ ... ] }`, each of
+    /// digits, `visible_to` `{ "contributors": [ <entry> ... ],
+    /// "shared_with": [ <entry> ... ] }` (CONTRACT.md, "Contributors and
+    /// sharing: The tool"), each of
     /// `warnings` and `notes` a `reason` and a `message`, `pulled` by
     /// resource name.
     pub fn of(run: &Run) -> Self {
@@ -504,21 +510,26 @@ impl Deployed {
         visible_keys.sort_unstable();
         assert_eq!(
             visible_keys,
-            ["contributors"],
-            "expected `visible_to` to be {{ contributors }}\n{}",
+            ["contributors", "shared_with"],
+            "expected `visible_to` to be {{ contributors, shared_with }}\n{}",
             describe()
         );
-        let contributors: Vec<String> = visible_to["contributors"]
-            .as_array()
-            .unwrap_or_else(|| {
-                panic!(
-                    "expected `visible_to.contributors` an array\n{}",
+        let entries = |key: &str| -> Vec<Value> {
+            let items = visible_to[key]
+                .as_array()
+                .unwrap_or_else(|| panic!("expected `visible_to.{key}` an array\n{}", describe()))
+                .clone();
+            for item in &items {
+                assert!(
+                    crate::sharing::entry_key(item).is_some(),
+                    "expected each of `visible_to.{key}` to be an entry ({{ user }}, {{ group }} or {{ everyone: true }}), got {item}\n{}",
                     describe()
-                )
-            })
-            .iter()
-            .map(|c| c.as_str().unwrap_or_default().to_owned())
-            .collect();
+                );
+            }
+            items
+        };
+        let contributors = entries("contributors");
+        let shared_with = entries("shared_with");
         let list = |key: &str| -> Vec<Value> {
             let items = body[key]
                 .as_array()
@@ -548,6 +559,7 @@ impl Deployed {
             structures,
             pulled,
             contributors,
+            shared_with,
             warnings,
             notes,
         }

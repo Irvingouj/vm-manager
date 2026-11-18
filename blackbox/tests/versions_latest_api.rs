@@ -65,8 +65,15 @@ fn latest_version_is_null_before_a_version_the_highest_number_after_and_above_se
     let after = api.application("board");
     assert_eq!(after["latest_version"], 4, "{after}");
     assert_eq!(after["serving_version"], 4, "{after}");
-    // Every signed-in User reads the same object.
-    assert_eq!(vm.api_as(&User::new("bob")).application("board"), after);
+    // Someone it is shared with reads the same Versions (CONTRACT.md,
+    // "Contributors and sharing": only who can open it reads it; to them
+    // `contributor` is false and `shared_with` null).
+    api.share_with_everyone("board");
+    let read = vm.api_as(&User::new("bob")).application("board");
+    assert_eq!(read["latest_version"], 4, "{read}");
+    assert_eq!(read["serving_version"], 4, "{read}");
+    assert_eq!(read["contributor"], false, "{read}");
+    assert!(read["shared_with"].is_null(), "{read}");
 }
 
 #[test]
