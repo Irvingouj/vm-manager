@@ -21,9 +21,9 @@
 use blackbox::api::assert_json_content_type;
 use blackbox::scenario::{ADMINISTRATORS, administrator};
 use blackbox::sharing::{
-    MAX_ENTRIES_A_REQUEST, MAX_SHARED_WITH, TRACED, add, add_remove, assert_cannot_open,
-    assert_entry, assert_opens, contributors_ok, create_unshared, email, entry_named, everyone,
-    expected, group, keys, remove, share_ok, user,
+    MAX_ENTRIES_A_REQUEST, MAX_SHARED_WITH, TRACED, add, add_remove, assert_application_members,
+    assert_cannot_open, assert_entry, assert_opens, contributors_ok, create_unshared, email,
+    entry_named, everyone, expected, group, keys, remove, share_ok, user,
 };
 use blackbox::{Response, User, Vm, VmOptions, assert_api_error};
 use serde_json::{Value, json};
@@ -73,7 +73,9 @@ fn read(vm: &Vm, reader: &User) -> Value {
         answer.describe()
     );
     assert_json_content_type(&answer);
-    answer.json()
+    let application = answer.json();
+    assert_application_members(&application, &format!("{APP} as {:?} reads it", reader.id));
+    application
 }
 
 #[test]
@@ -262,6 +264,27 @@ fn adding_what_is_there_and_removing_what_is_not_change_nothing_and_are_not_refu
         again["shared_with"], first["shared_with"],
         "adding entries that are there changes nothing: not the order, not who added them, not when"
     );
+    for key in ["user:bob", "group:finance"] {
+        assert_eq!(
+            entry_named(&again["shared_with"], key)["added_by"],
+            "alice",
+            "{key}, added again by carol, keeps alice as `added_by`"
+        );
+    }
+    // Added again after another entry: it keeps its place.
+    share_ok(&api, &vm, APP, &add(&[user("erin")]));
+    let kept = share_ok(&carols, &vm, APP, &add(&[user("erin"), user("bob")]));
+    assert_eq!(
+        keys(&kept["shared_with"]),
+        expected(&["user:bob", "group:finance", "user:erin"]),
+        "an entry added again keeps its place"
+    );
+    assert_eq!(
+        entry_named(&kept["shared_with"], "user:bob"),
+        entry_named(&first["shared_with"], "user:bob"),
+        "bob's entry, added again, is as it was kept the first time"
+    );
+    share_ok(&api, &vm, APP, &remove(&[user("erin")]));
     let not_there = share_ok(
         &carols,
         &vm,
@@ -282,8 +305,8 @@ fn adding_what_is_there_and_removing_what_is_not_change_nothing_and_are_not_refu
     let lines: Vec<Value> = sharing_records(&vm);
     assert_eq!(
         lines.len(),
-        lines_before + 1,
-        "expected a `sharing-changed` line only when something changed, got {lines:?}"
+        lines_before + 3,
+        "expected a `sharing-changed` line only when something changed (erin added, erin removed, dave added), got {lines:?}"
     );
 }
 
@@ -348,6 +371,13 @@ fn malformed_bodies() -> Vec<(String, Vec<u8>)> {
         json!({ "remove": [ { "user": null } ] }),
         json!([ { "user": "bob" } ]),
         json!("add"),
+        json!({ "other": [ { "user": "bob" } ] }),
+        json!({ "add": [ { "everyone": 1 } ] }),
+        json!({ "add": [ { "everyone": null } ] }),
+        json!({ "add": [ { "user": "bob", "email": "bob@example.test" } ] }),
+        json!({ "add": [ { "group": "finance", "email": "bob@example.test" } ] }),
+        json!({ "add": [ { "added_by": "alice" } ] }),
+        json!({ "remove": [ {} ] }),
     ];
     let mut bodies: Vec<(String, Vec<u8>)> = values
         .iter()
@@ -380,20 +410,25 @@ fn malformed_bodies_are_400_malformed_and_change_nothing() {
     let vm = with_board();
     let api = vm.api_as(&alice());
     let before = read(&vm, &alice());
-    for (what, body) in malformed_bodies() {
-        let answer = api.post_raw(&format!("/v1/applications/{APP}/sharing"), &body);
-        assert!(
-            answer.status == 400,
-            "expected `400 malformed` for {what}, got\n{}",
-            answer.describe()
-        );
-        assert_api_error(&answer, 400, "malformed");
+    for path in ["sharing", "contributors"] {
+        for (what, body) in malformed_bodies() {
+            let answer = api.post_raw(&format!("/v1/applications/{APP}/{path}"), &body);
+            assert!(
+                answer.status == 400,
+                "expected `400 malformed` for {what} on {path}, got\n{}",
+                answer.describe()
+            );
+            assert_api_error(&answer, 400, "malformed");
+        }
     }
-    assert_api_error(
-        &api.change_contributors(APP, &add(&[everyone()])),
-        400,
-        "malformed",
-    );
+    // `everyone` is no Contributor.
+    for body in [
+        add(&[everyone()]),
+        add(&[user("bob"), everyone()]),
+        remove(&[everyone()]),
+    ] {
+        assert_api_error(&api.change_contributors(APP, &body), 400, "malformed");
+    }
     assert_eq!(read(&vm, &alice()), before);
 }
 

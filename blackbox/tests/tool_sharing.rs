@@ -184,6 +184,16 @@ fn vm_unshare_prints_what_it_removed_and_bob_can_no_longer_open_it() {
         run.describe()
     );
     assert_eq!(printed["visible_to"]["shared_with"], json!([]));
+    // A removed entry is shown as it was kept: added by alice, through the
+    // API, before this command.
+    for key in ["user:bob", "everyone"] {
+        assert_eq!(
+            blackbox::sharing::entry_named(&printed["removed"], key)["added_by"],
+            "alice",
+            "{key} in `removed`\n{}",
+            run.describe()
+        );
+    }
     blackbox::sharing::assert_cannot_open(&vm, &bob(), APP, "bob, after `vm unshare`");
 }
 
@@ -524,6 +534,12 @@ fn with_oidc_an_email_shows_as_the_person_and_an_id_never_seen_is_said_so() {
     let grace_entry = blackbox::sharing::entry_named(added, &format!("user:{GRACE}"));
     assert_eq!(grace_entry["name"], "Grace Hopper", "{grace_entry}");
     assert_eq!(grace_entry["email"], "grace@example.test", "{grace_entry}");
+    assert_eq!(grace_entry["added_by"], ADA, "{grace_entry}");
+    let typo = blackbox::sharing::entry_named(added, "user:00u-typo");
+    assert!(
+        typo["name"].is_null() && typo["email"].is_null(),
+        "a person never seen has `name` and `email` null: {typo}"
+    );
     let words_run = machine.run(&["share", APP, "--user", "00u-typo"]);
     let words = words_run.ok_text();
     assert!(

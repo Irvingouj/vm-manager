@@ -4,10 +4,9 @@
 //! Contributor's machine goes live": someone who is not a Contributor
 //! cannot deploy to an existing Application).
 //!
-//! The API has no way yet to add a second Contributor to an Application
-//! (CONTRACT.md, "The platform's API: Applications": the creator is its
-//! first Contributor, and nothing adds another), so a second Contributor's
-//! deploy is not tested here.
+//! A deploy to a name whose Application the User is not a Contributor of
+//! names its Contributors only when the User can open it (CONTRACT.md,
+//! "Contributors and sharing: The tool").
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -80,48 +79,109 @@ fn a_later_change_of_the_description_is_not_sent() {
     );
 }
 
+/// Fails unless nothing the deploy printed, on either output, holds `id`.
+fn assert_not_named(run: &blackbox::tool::Run, id: &str, context: &str) {
+    for (whence, text) in run.texts() {
+        assert!(
+            !text.contains(id),
+            "{context}: expected {whence} to name no Contributor ({id:?})\n{}",
+            run.describe()
+        );
+    }
+}
+
+/// Fails unless a deploy to `name`, an Application dana is not a
+/// Contributor of, ended with `not-a-contributor` (exit code `3`) and
+/// built and sent nothing; returns the message of the run with `--json`
+/// and both runs.
+fn refused_deploy(
+    vm: &Vm,
+    machine: &Machine,
+    name: &str,
+) -> (String, blackbox::tool::Run, blackbox::tool::Run) {
+    let erins = vm.api_as(&erin());
+    let project = deploy_project(&format!("deploy-taken-{name}"), name);
+    let before = project_tree(&project.dir);
+    let versions = erins.versions(name);
+    let run = deploy(machine, &project.dir, &[]);
+    let message = run.json_error(3, "not-a-contributor");
+    let lower = message.to_lowercase();
+    assert!(
+        lower.contains("name") && message.contains("manifest.ts"),
+        "{name}: expected the message to say to choose another `name` in manifest.ts, got {message:?}"
+    );
+    assert!(
+        lower.contains("ask"),
+        "{name}: expected the message to say whom to ask, got {message:?}"
+    );
+    let words = deploy_in_words(machine, &project.dir, &[]);
+    words.text_error(3);
+    assert_eq!(
+        erins.versions(name),
+        versions,
+        "{name}: expected no Version added"
+    );
+    assert_eq!(
+        blackbox::sharing::keys(&erins.application(name)["contributors"]),
+        ["user:erin"]
+    );
+    assert_eq!(
+        before.differences(&project_tree(&project.dir)),
+        Vec::<String>::new()
+    );
+    (message, run, words)
+}
+
 #[test]
-fn a_name_taken_by_an_application_the_user_does_not_contribute_to_is_refused() {
+fn a_name_taken_by_an_application_not_shared_with_the_user_is_refused_naming_no_contributor() {
     let vm = vm();
     let machine = signed_in(&vm);
     let erins = vm.api_as(&erin());
-    // One with a Version, one created only.
-    erins.create_with_bundle("taken-board", &marked_bundle("erin's"));
+    // One with a Version, one created only; neither shared with dana
+    // (CONTRACT.md, "Contributors and sharing: The tool": the API answers
+    // dana `not-shared`).
+    erins.create_application("taken-board").expect_status(201);
+    erins
+        .send_bundle("taken-board", &marked_bundle("erin's"))
+        .expect_status(201);
     erins.create_application("bare-board").expect_status(201);
     for name in ["taken-board", "bare-board"] {
-        let project = deploy_project(&format!("deploy-taken-{name}"), name);
-        let before = project_tree(&project.dir);
-        let versions = erins.versions(name);
-        let run = deploy(&machine, &project.dir, &[]);
-        let message = run.json_error(3, "not-a-contributor");
-        assert!(
-            message.contains("erin"),
-            "{name}: expected the message to name its Contributors (erin), got {message:?}"
-        );
+        let (message, run, words) = refused_deploy(&vm, &machine, name);
         let lower = message.to_lowercase();
         assert!(
-            lower.contains("ask"),
-            "{name}: expected the message to say to ask one of them, got {message:?}"
+            lower.contains("exists") && lower.contains("not shared"),
+            "{name}: expected the message to say an Application of that name exists and is not shared with them, got {message:?}"
         );
-        assert!(
-            lower.contains("name") && message.contains("manifest.ts"),
-            "{name}: expected the message to say to choose another `name` in manifest.ts, got {message:?}"
-        );
-        deploy_in_words(&machine, &project.dir, &[]).text_error(3);
-        assert_eq!(
-            erins.versions(name),
-            versions,
-            "{name}: expected no Version added"
-        );
-        assert_eq!(
-            blackbox::sharing::keys(&erins.application(name)["contributors"]),
-            ["user:erin"]
-        );
-        assert_eq!(
-            before.differences(&project_tree(&project.dir)),
-            Vec::<String>::new()
-        );
+        assert_not_named(&run, "erin", name);
+        assert_not_named(&words, "erin", name);
     }
+}
+
+#[test]
+fn a_name_taken_by_an_application_shared_with_the_user_is_refused_naming_its_contributors() {
+    let vm = vm();
+    let machine = signed_in(&vm);
+    let erins = vm.api_as(&erin());
+    erins.create_application("taken-board").expect_status(201);
+    erins
+        .send_bundle("taken-board", &marked_bundle("erin's"))
+        .expect_status(201);
+    blackbox::sharing::share_ok(
+        &erins,
+        &vm,
+        "taken-board",
+        &blackbox::sharing::add(&[blackbox::sharing::user("dana")]),
+    );
+    let (message, _, words) = refused_deploy(&vm, &machine, "taken-board");
+    assert!(
+        message.contains("erin"),
+        "expected the message to name its Contributors (erin), got {message:?}"
+    );
+    assert!(
+        words.stderr.contains("erin"),
+        "expected the words to name its Contributors (erin)\n{}",
+        words.describe()
+    );
 }
 
 #[test]
@@ -252,5 +312,8 @@ fn the_application_comes_before_the_pull_and_the_checks() {
         ),
     );
     commit_all(&project.dir, "broken");
-    deploy(&machine, &project.dir, &[]).json_error(3, "not-a-contributor");
+    let run = deploy(&machine, &project.dir, &[]);
+    run.json_error(3, "not-a-contributor");
+    // Not shared with dana: the refusal names no Contributor.
+    assert_not_named(&run, "erin", "taken-board, not shared with dana");
 }

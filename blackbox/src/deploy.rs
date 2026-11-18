@@ -520,10 +520,9 @@ impl Deployed {
                 .unwrap_or_else(|| panic!("expected `visible_to.{key}` an array\n{}", describe()))
                 .clone();
             for item in &items {
-                assert!(
-                    crate::sharing::entry_key(item).is_some(),
-                    "expected each of `visible_to.{key}` to be an entry ({{ user }}, {{ group }} or {{ everyone: true }}), got {item}\n{}",
-                    describe()
+                crate::sharing::assert_entry_members(
+                    item,
+                    &format!("each of `visible_to.{key}`\n{}", describe()),
                 );
             }
             items

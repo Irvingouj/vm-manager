@@ -19,8 +19,9 @@ use blackbox::api::{marked_bundle, version_body};
 use blackbox::logs::{from_to, go_back, page};
 use blackbox::scenario::{ADMINISTRATORS, administrator};
 use blackbox::sharing::{
-    MAX_CONTRIBUTORS, MAX_ENTRIES_A_REQUEST, TRACED, add, add_remove, assert_entry,
-    contributors_ok, create_unshared, entry_named, expected, group, keys, remove, user,
+    MAX_CONTRIBUTORS, MAX_ENTRIES_A_REQUEST, TRACED, add, add_remove, assert_application_members,
+    assert_entry, contributors_ok, create_unshared, entry_named, expected, group, keys, remove,
+    user,
 };
 use blackbox::{User, Vm, VmOptions, assert_api_error};
 use serde_json::{Value, json};
@@ -54,7 +55,9 @@ fn with_board() -> Vm {
 }
 
 fn read(vm: &Vm, reader: &User) -> Value {
-    vm.api_as(reader).application(APP)
+    let application = vm.api_as(reader).application(APP);
+    assert_application_members(&application, &format!("{APP} as {:?} reads it", reader.id));
+    application
 }
 
 #[test]
@@ -74,7 +77,18 @@ fn the_creator_is_the_first_contributor_with_who_added_them_and_when() {
         None,
         "the creator, with the stand-in (no name, no email)",
     );
+    assert_application_members(&application, "the answer to POST /v1/applications");
+    assert_eq!(
+        entry_named(&application["contributors"], "user:alice")["added_at"],
+        application["created_at"],
+        "the creator's entry was added when the Application was created, in {application}"
+    );
     assert_eq!(application["contributor"], true);
+    assert_eq!(
+        read(&vm, &alice())["contributors"],
+        application["contributors"],
+        "the creator's entry is answered the same when read"
+    );
 }
 
 #[test]
@@ -124,6 +138,10 @@ fn a_contributor_adds_people_and_groups_in_the_order_added_with_who_and_when() {
         read(&vm, &carol()),
         "the answer is the Application as it is after"
     );
+    // Added again, by someone else: each keeps its place, `added_by` and
+    // `added_at`.
+    let again = contributors_ok(&carols, &vm, APP, &add(&[user("bob"), user("alice")]));
+    assert_eq!(again["contributors"], after["contributors"]);
     // Each of them is a Contributor now.
     for each in [
         bob(),

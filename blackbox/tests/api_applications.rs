@@ -56,6 +56,11 @@ fn assert_new_application(application: &Value, name: &str, creator: &str) {
         None,
         "the creator as the first Contributor",
     );
+    blackbox::sharing::assert_application_members(application, "a new Application");
+    assert_eq!(
+        application["contributors"][0]["added_at"], application["created_at"],
+        "the creator's entry was added at the Application's `created_at`, in {application}"
+    );
     assert_eq!(
         application["shared_with"],
         json!([]),

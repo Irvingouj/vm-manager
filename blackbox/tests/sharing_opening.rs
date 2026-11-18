@@ -31,8 +31,8 @@ use blackbox::scenario::{
 };
 use blackbox::sharing::{
     TRACED, add, assert_cannot_open, assert_not_shared_page, assert_not_shared_plain,
-    assert_not_shared_record, assert_opens, contributors_ok, create_unshared, everyone, group,
-    open, remove, share_ok, user,
+    assert_not_shared_record, assert_opens, assert_own_page_headers, contributors_ok,
+    create_unshared, everyone, group, open, remove, share_ok, user,
 };
 use blackbox::{INSTALLER, User, Vm, VmOptions, fixture_bundle};
 use serde_json::json;
@@ -316,13 +316,7 @@ fn a_head_that_asks_for_a_page_is_the_pages_403_without_a_body() {
         .header("accept", "text/html")
         .send();
     assert_eq!(response.status, 403, "{}", response.describe());
-    assert!(
-        response
-            .header("content-type")
-            .is_some_and(|t| t.to_ascii_lowercase().starts_with("text/html")),
-        "expected the HEAD of the page to say `text/html`, got\n{}",
-        response.describe()
-    );
+    assert_own_page_headers(&response, "HEAD of the page");
     assert!(
         response.body().is_empty(),
         "expected no body for HEAD, got\n{}",
@@ -378,13 +372,8 @@ fn none_of_its_code_runs_whatever_the_path_and_the_method() {
             }
             let response = request.send();
             let context = format!("{method} {path}");
-            if path == "/_vm/session" {
-                // The platform's own path with OIDC; with the stand-in the
-                // contract says nothing of its answer, only that it never
-                // reaches the Application's code.
-                vm.records_of(&response).assert_no_application_code_ran();
-                continue;
-            }
+            // `/_vm/session` too: with the stand-in it is the
+            // Application's own path, under the rule like any other.
             assert_eq!(
                 response.status,
                 403,

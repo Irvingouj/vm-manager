@@ -132,6 +132,75 @@ pub fn assert_entry(
     }
 }
 
+/// Fails unless this entry has exactly the members an entry is answered
+/// with wherever it is answered (CONTRACT.md, "Contributors and sharing:
+/// On the platform's API"): what it names (`user`, `group` or `everyone`),
+/// for a person `name` and `email` (each text or null), and `added_by`
+/// (text) and `added_at` (an RFC 3339 time).
+pub fn assert_entry_members(entry: &Value, context: &str) {
+    let key =
+        entry_key(entry).unwrap_or_else(|| panic!("{context}: expected an entry, got {entry}"));
+    let mut members: Vec<&str> = entry
+        .as_object()
+        .map(|o| o.keys().map(String::as_str).collect())
+        .unwrap_or_default();
+    members.sort_unstable();
+    let want: &[&str] = if key.starts_with("user:") {
+        &["added_at", "added_by", "email", "name", "user"]
+    } else if key.starts_with("group:") {
+        &["added_at", "added_by", "group"]
+    } else {
+        &["added_at", "added_by", "everyone"]
+    };
+    assert_eq!(
+        members, want,
+        "{context}: expected exactly the members of an entry, got {entry}"
+    );
+    for member in ["name", "email"] {
+        if let Some(value) = entry.get(member) {
+            assert!(
+                value.is_null() || value.is_string(),
+                "{context}: expected `{member}` text or null in {entry}"
+            );
+        }
+    }
+    assert!(
+        entry["added_by"].as_str().is_some_and(|b| !b.is_empty()),
+        "{context}: expected `added_by` a user id in {entry}"
+    );
+    let at = entry["added_at"].as_str().unwrap_or_default();
+    assert!(
+        crate::api::parse_rfc3339(at).is_some(),
+        "{context}: expected `added_at` an RFC 3339 time in {entry}"
+    );
+}
+
+/// [`assert_entry_members`] for each entry of a list, which must be an
+/// array.
+pub fn assert_list_members(list: &Value, context: &str) {
+    let items = list
+        .as_array()
+        .unwrap_or_else(|| panic!("{context}: expected a list of entries, got {list}"));
+    for entry in items {
+        assert_entry_members(entry, context);
+    }
+}
+
+/// Fails unless both lists of an Application's object have entries with
+/// their members (`shared_with` may be null: the asker is no Contributor).
+pub fn assert_application_members(application: &Value, context: &str) {
+    assert_list_members(
+        &application["contributors"],
+        &format!("{context}: contributors"),
+    );
+    if !application["shared_with"].is_null() {
+        assert_list_members(
+            &application["shared_with"],
+            &format!("{context}: shared_with"),
+        );
+    }
+}
+
 /// Creates `name` as `creator` and sends `fixtures/<file>` as its first
 /// Version, sharing it with nobody, failing the test with the program's log
 /// unless both are `201`.
@@ -165,7 +234,9 @@ pub fn share_ok(api: &Api<'_>, vm: &Vm, application: &str, body: &Value) -> Valu
             answer.describe()
         ));
     }
-    answer.json()
+    let after = answer.json();
+    assert_application_members(&after, "the answer to a change of sharing");
+    after
 }
 
 /// Changes the Contributors of `application` as `api`'s User, failing the
@@ -179,7 +250,9 @@ pub fn contributors_ok(api: &Api<'_>, vm: &Vm, application: &str, body: &Value) 
             answer.describe()
         ));
     }
-    answer.json()
+    let after = answer.json();
+    assert_application_members(&after, "the answer to a change of the Contributors");
+    after
 }
 
 /// A `GET /hello` of the Application as this User (not a page).
@@ -240,9 +313,14 @@ pub fn assert_not_shared_plain(
         "{context}: expected a body of 1 to 200 bytes, got {length}\n{}",
         response.describe()
     );
+    assert!(
+        response.text().contains(application),
+        "{context}: expected the sentence to name the Application {application:?}, got {:?}",
+        response.text()
+    );
     let text = response.text().to_ascii_lowercase();
     assert!(
-        text.contains("shared"),
+        text.contains("not shared"),
         "{context}: expected the sentence to say the Application is not shared with them, got {:?}",
         response.text()
     );
@@ -301,24 +379,7 @@ pub fn assert_not_shared_page(
         "{context}: expected the `403` page for {application:?}, got\n{}",
         response.describe()
     );
-    let content_type = response
-        .header("content-type")
-        .unwrap_or_default()
-        .to_ascii_lowercase()
-        .replace(' ', "");
-    assert_eq!(
-        content_type,
-        "text/html;charset=utf-8",
-        "{context}: expected `text/html; charset=utf-8`, got\n{}",
-        response.describe()
-    );
-    assert!(
-        response
-            .header("cache-control")
-            .is_some_and(|c| c.to_ascii_lowercase().contains("no-store")),
-        "{context}: expected `cache-control: no-store`, got\n{}",
-        response.describe()
-    );
+    assert_own_page_headers(response, context);
     let html = response.text();
     let lower = html.to_ascii_lowercase();
     assert!(
@@ -343,6 +404,39 @@ pub fn assert_not_shared_page(
         assert!(
             !html.contains(value),
             "{context}: expected the page to name no Contributor and nothing else of the Application, but it holds {value:?}\n{html}"
+        );
+    }
+}
+
+/// Fails unless the answer has the headers of every page of the
+/// platform's own: `text/html; charset=utf-8`, `cache-control: no-store`,
+/// `x-content-type-options: nosniff`, `referrer-policy: no-referrer`, and
+/// a `content-security-policy` with `default-src 'none'` and
+/// `frame-ancestors 'none'`.
+pub fn assert_own_page_headers(response: &Response, context: &str) {
+    let header = |name: &str| {
+        response
+            .header(name)
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+    };
+    assert_eq!(
+        header("content-type").replace(' ', ""),
+        "text/html;charset=utf-8",
+        "{context}: expected `text/html; charset=utf-8`, got\n{}",
+        response.describe()
+    );
+    for (name, wanted) in [
+        ("cache-control", "no-store"),
+        ("x-content-type-options", "nosniff"),
+        ("referrer-policy", "no-referrer"),
+        ("content-security-policy", "default-src 'none'"),
+        ("content-security-policy", "frame-ancestors 'none'"),
+    ] {
+        assert!(
+            header(name).contains(wanted),
+            "{context}: expected `{name}` with {wanted:?}, got\n{}",
+            response.describe()
         );
     }
 }
@@ -394,6 +488,7 @@ pub fn assert_change_printed(run: &Run, application: &str) -> Value {
         &body["visible_to"]["contributors"],
         &body["visible_to"]["shared_with"],
     ] {
+        assert_list_members(list, &run.describe());
         assert!(
             list.as_array()
                 .is_some_and(|items| items.iter().all(|e| entry_key(e).is_some())),
