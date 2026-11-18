@@ -26,8 +26,10 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio_postgres::Client;
 
+use super::super::Ending;
+use super::PgFailed;
 use super::postgres::{CONNECT_WAIT, HOST, Secret};
-use crate::platform_db::{Connection, DatabaseAddress, quote_identifier};
+use crate::platform_db::{Cause, Connection, DatabaseAddress, quote_identifier};
 
 use super::super::pull::STANDIN_FIRST_LINE;
 
@@ -179,14 +181,81 @@ fn database_of(resource: &str) -> String {
     format!("standin_{hex}")
 }
 
-async fn run(client: &Client, statement: &str) -> Result<(), String> {
+/// Why a statement of the superuser's or the owner's did not run: its
+/// cause, and the database's own message when it gave one.
+struct Refused {
+    cause: Cause,
+    said: Option<String>,
+}
+
+impl Refused {
+    fn of(error: &tokio_postgres::Error) -> Self {
+        Self {
+            cause: Cause::of(error),
+            said: Some(database_message(error)),
+        }
+    }
+
+    fn timed_out() -> Self {
+        Self {
+            cause: Cause::TimedOut(STATEMENT_WAIT),
+            said: None,
+        }
+    }
+
+    /// In words, for a warning.
+    fn words(&self) -> String {
+        match (&self.said, &self.cause) {
+            (Some(said), _) => said.clone(),
+            (None, Cause::TimedOut(limit)) => format!(
+                "it did not end within {} s",
+                crate::platform_db::seconds_text(*limit)
+            ),
+            (None, cause) => cause.name().to_owned(),
+        }
+    }
+
+    /// The local run's failure at `step` (`what`, in words).
+    fn failed(self, step: &'static str, what: String) -> PgFailed {
+        let failed = PgFailed::new(step, what, self.cause);
+        match self.said {
+            Some(said) => failed.said(said),
+            None => failed,
+        }
+    }
+}
+
+async fn run(client: &Client, statement: &str) -> Result<(), Refused> {
     match tokio::time::timeout(STATEMENT_WAIT, client.batch_execute(statement)).await {
         Ok(Ok(())) => Ok(()),
-        Ok(Err(error)) => Err(database_message(&error)),
-        Err(_) => Err(format!(
-            "it did not end within {} s",
-            STATEMENT_WAIT.as_secs()
-        )),
+        Ok(Err(error)) => Err(Refused::of(&error)),
+        Err(_) => Err(Refused::timed_out()),
+    }
+}
+
+/// Why a stand-in could not be made: the private Postgres's failure, or no
+/// randomness for a password.
+enum Stop {
+    Pg(PgFailed),
+    NoRandomness(String),
+}
+
+impl From<PgFailed> for Stop {
+    fn from(failed: PgFailed) -> Self {
+        Self::Pg(failed)
+    }
+}
+
+impl Stop {
+    fn ending(&self, resource: &str, command: &str) -> Ending {
+        match self {
+            Self::Pg(failed) => failed.ending(command),
+            Self::NoRandomness(why) => Ending::new(
+                1,
+                "failed",
+                format!("the stand-in of {resource} cannot be made: {why}. Run {command} again"),
+            ),
+        }
     }
 }
 
@@ -200,24 +269,32 @@ fn database_message(error: &tokio_postgres::Error) -> String {
 /// Makes (when its mark differs) and readies the stand-in of `file`; its
 /// warnings go to `warnings`. `superuser` is a session of the private
 /// Postgres's superuser on its maintenance database; `address` that
-/// session's address (another database is reached with it).
+/// session's address (another database is reached with it). The steps of
+/// a stand-in (`stand-in-...`) are named where they are made.
 pub(super) async fn ready(
     file: &StandinFile,
     superuser: &Client,
     address: &DatabaseAddress,
     warnings: &mut Vec<Value>,
-) -> Result<Standin, String> {
+    command: &str,
+) -> Result<Standin, Ending> {
+    ready_or_stop(file, superuser, address, warnings)
+        .await
+        .map_err(|stop| stop.ending(&file.resource, command))
+}
+
+async fn ready_or_stop(
+    file: &StandinFile,
+    superuser: &Client,
+    address: &DatabaseAddress,
+    warnings: &mut Vec<Value>,
+) -> Result<Standin, Stop> {
     let database = database_of(&file.resource);
     let owner = format!("{database}_owner");
     let reader = format!("{database}_read");
     let writer = format!("{database}_write");
     let quoted = |name: &str| quote_identifier(name);
-    let failed = |what: &str, why: String| {
-        format!(
-            "the stand-in of {} cannot be made: {what} failed ({why})",
-            file.resource
-        )
-    };
+    let of = |what: &str| format!("{what} of the stand-in of {}", file.resource);
     let marked = tokio::time::timeout(
         STATEMENT_WAIT,
         superuser.query_opt(
@@ -226,8 +303,8 @@ pub(super) async fn ready(
         ),
     )
     .await
-    .map_err(|_| failed("reading its mark", "no answer in time".to_owned()))?
-    .map_err(|e| failed("reading its mark", database_message(&e)))?;
+    .map_err(|_| Refused::timed_out().failed("stand-in-mark-read", of("reading the mark")))?
+    .map_err(|e| Refused::of(&e).failed("stand-in-mark-read", of("reading the mark")))?;
     let mark: Option<String> = marked.and_then(|row| row.try_get(0).ok());
     let made = mark.as_deref() != Some(file.mark.as_str());
     for role in [&owner, &reader, &writer] {
@@ -244,7 +321,7 @@ pub(super) async fn ready(
             ),
         )
         .await
-        .map_err(|why| failed("making its roles", why))?;
+        .map_err(|refused| refused.failed("stand-in-roles", of("making the roles")))?;
     }
     if made {
         for statement in [
@@ -264,12 +341,12 @@ pub(super) async fn ready(
         ] {
             run(superuser, &statement)
                 .await
-                .map_err(|why| failed("making its database", why))?;
+                .map_err(|refused| refused.failed("stand-in-create", of("making the database")))?;
         }
         make(file, &database, &owner, superuser, address, warnings).await?;
     }
-    let read = Secret::generate().map_err(|why| failed("a password", why))?;
-    let write = Secret::generate().map_err(|why| failed("a password", why))?;
+    let read = Secret::generate().map_err(Stop::NoRandomness)?;
+    let write = Secret::generate().map_err(Stop::NoRandomness)?;
     for (role, secret) in [(&reader, &read), (&writer, &write)] {
         run(
             superuser,
@@ -280,7 +357,12 @@ pub(super) async fn ready(
             ),
         )
         .await
-        .map_err(|why| failed("giving its logins their passwords", why))?;
+        .map_err(|refused| {
+            refused.failed(
+                "stand-in-logins",
+                of("giving their passwords to the logins"),
+            )
+        })?;
     }
     Ok(Standin {
         resource: file.resource.clone(),
@@ -301,15 +383,10 @@ async fn make(
     superuser: &Client,
     address: &DatabaseAddress,
     warnings: &mut Vec<Value>,
-) -> Result<(), String> {
-    let failed = |what: &str, why: String| {
-        format!(
-            "the stand-in of {} cannot be made: {what} failed ({why})",
-            file.resource
-        )
-    };
+) -> Result<(), Stop> {
+    let of = |what: &str| format!("{what} of the stand-in of {}", file.resource);
     let quoted = |name: &str| quote_identifier(name);
-    let secret = Secret::generate().map_err(|why| failed("a password", why))?;
+    let secret = Secret::generate().map_err(Stop::NoRandomness)?;
     run(
         superuser,
         &format!(
@@ -319,12 +396,12 @@ async fn make(
         ),
     )
     .await
-    .map_err(|why| failed("letting its owner log in", why))?;
+    .map_err(|refused| refused.failed("stand-in-owner-login", of("letting in the owner")))?;
     let as_owner = DatabaseAddress::new(HOST, address.port(), owner, secret.copy(), database);
     let made = async {
         let connection = Connection::open(&as_owner.config(CONNECT_WAIT), CONNECT_WAIT)
             .await
-            .map_err(|e| failed("connecting as its owner", e.to_string()))?;
+            .map_err(|e| PgFailed::db("stand-in-owner-connect", of("connecting as the owner"), &e))?;
         let client = connection.client();
         let Some(list) = statements(&file.text) else {
             warnings.push(json!({
@@ -340,7 +417,8 @@ async fn make(
             return Ok(());
         };
         for statement in list {
-            if let Err(error) = run(client, statement.text).await {
+            if let Err(refused) = run(client, statement.text).await {
+                let error = refused.words();
                 warnings.push(json!({
                     "reason": "stand-in-incomplete",
                     "resource": file.resource,
@@ -367,11 +445,14 @@ async fn make(
             reader = quoted(&format!("{database}_read")).replace('\'', "''"),
             writer = quoted(&format!("{database}_write")).replace('\'', "''"),
         );
-        run(client, &grants)
-            .await
-            .map_err(|why| failed("giving its logins their privileges", why))?;
+        run(client, &grants).await.map_err(|refused| {
+            refused.failed(
+                "stand-in-privileges",
+                of("giving their privileges to the logins"),
+            )
+        })?;
         drop(connection);
-        Ok::<(), String>(())
+        Ok::<(), PgFailed>(())
     }
     .await;
     // Whatever happened: the owner may not log in any more.
@@ -381,7 +462,9 @@ async fn make(
     )
     .await;
     made?;
-    closed.map_err(|why| failed("closing its owner's login", why))?;
+    closed.map_err(|refused| {
+        refused.failed("stand-in-owner-close", of("closing the owner's login"))
+    })?;
     run(
         superuser,
         &format!(
@@ -391,7 +474,7 @@ async fn make(
         ),
     )
     .await
-    .map_err(|why| failed("marking it", why))
+    .map_err(|refused| Stop::Pg(refused.failed("stand-in-mark", of("marking the database"))))
 }
 
 /// Removes every stand-in database, and every stand-in role, that no pulled
@@ -399,13 +482,18 @@ async fn make(
 /// are touched: `standin_` and 16 lower-case hex digits, and that with
 /// `_owner`, `_read` or `_write`; any other database or role is left as it
 /// is. `kept` are the stand-in databases of the pulled Resources.
-pub(super) async fn remove_others(superuser: &Client, kept: &[&str]) -> Result<(), String> {
-    let failed = |why: String| format!("a stand-in no longer pulled cannot be removed ({why})");
+pub(super) async fn remove_others(superuser: &Client, kept: &[&str]) -> Result<(), PgFailed> {
+    let failed = |refused: Refused| {
+        refused.failed(
+            "stand-in-remove",
+            "removing the stand-ins no longer pulled".to_owned(),
+        )
+    };
     let listed = |query: &'static str| async move {
         tokio::time::timeout(STATEMENT_WAIT, superuser.query(query, &[]))
             .await
-            .map_err(|_| failed("no answer in time".to_owned()))?
-            .map_err(|e| failed(database_message(&e)))
+            .map_err(|_| failed(Refused::timed_out()))?
+            .map_err(|e| failed(Refused::of(&e)))
             .map(|rows| {
                 rows.iter()
                     .filter_map(|row| row.try_get::<_, String>(0).ok())

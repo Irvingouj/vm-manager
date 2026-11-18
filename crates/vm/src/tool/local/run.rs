@@ -45,8 +45,8 @@ use super::postgres::{
 };
 use super::standins::{self, Standin};
 use super::{
-    DOMAIN, DRAIN_WAIT, KEPT_VERSIONS, MAX_BODY_BYTES, NO_COMMIT, PLATFORM_WAIT, Progress, Stage,
-    control, database_failed, local_state_failed, postgres_failed, rows,
+    DOMAIN, DRAIN_WAIT, KEPT_VERSIONS, MAX_BODY_BYTES, NO_COMMIT, PLATFORM_WAIT, PgFailed,
+    Progress, Stage, control, database_failed, local_state_failed, open_failed, rows,
 };
 use crate::api::{Api, Signing, read_version};
 use crate::app_logs::{self, Query, Writer};
@@ -259,16 +259,22 @@ pub(super) async fn start_server(
     local
         .initdb(programs, &state, base.own)
         .await
-        .map_err(|why| postgres_failed(&why, name))?;
+        .map_err(|failed| failed.ending(name))?;
     let server = Server::start(&local, programs)
         .await
-        .map_err(|why| postgres_failed(&why, name))?;
+        .map_err(|failed| failed.ending(name))?;
     let port = server.port;
     held.keep_server(server);
-    local
-        .set_up(&mut state, port)
-        .await
-        .map_err(|why| postgres_failed(&why, name))?;
+    if !state.ready {
+        local
+            .set_up(&state, port)
+            .await
+            .map_err(|failed| failed.ending(name))?;
+        state.ready = true;
+        local
+            .write_state(&state)
+            .map_err(|why| local_state_failed(&why, name))?;
+    }
     Ok(Pg { local, state, port })
 }
 
@@ -326,7 +332,7 @@ impl Live {
             },
         )
         .await
-        .map_err(|why| postgres_failed(&why, who.command))?;
+        .map_err(|error| open_failed(error, who.command))?;
         // The local run has no sign-in of the tool through the browser, so
         // no credential of it is ever renewed (the renewal is its lifetime).
         // Its program is never started with OIDC, and its own Postgres never
@@ -685,27 +691,47 @@ async fn standins_of(
     let ready = {
         let connection = Connection::open(&address.config(CONNECT_WAIT), CONNECT_WAIT)
             .await
-            .map_err(|e| database_failed(&e, name))?;
+            .map_err(|e| {
+                database_failed(
+                    "stand-in-connect",
+                    "connecting as its superuser to make the stand-ins",
+                    &e,
+                    name,
+                )
+            })?;
         let mut ready = Vec::with_capacity(pulled.files.len());
         for file in &pulled.files {
             ready.push(
-                standins::ready(file, connection.client(), &address, &mut said.warnings)
-                    .await
-                    .map_err(|why| postgres_failed(&why, name))?,
+                standins::ready(
+                    file,
+                    connection.client(),
+                    &address,
+                    &mut said.warnings,
+                    name,
+                )
+                .await?,
             );
         }
         let kept: Vec<&str> = ready.iter().map(|s| s.database.as_str()).collect();
         standins::remove_others(connection.client(), &kept)
             .await
-            .map_err(|why| postgres_failed(&why, name))?;
+            .map_err(|failed| failed.ending(name))?;
         ready
     };
     let resources = &live.resources;
+    let registering = |e: DbError| {
+        database_failed(
+            "stand-in-register",
+            "making the stand-ins the Resources of the run",
+            &e,
+            name,
+        )
+    };
     for resource in resources.list() {
         resources
             .unregister(&resource.name)
             .await
-            .map_err(|e| database_failed(&e, name))?;
+            .map_err(registering)?;
     }
     for standin in &ready {
         // Copied: the stand-in is kept (its write login loads its test
@@ -731,7 +757,7 @@ async fn standins_of(
                 BUILDER,
             )
             .await
-            .map_err(|e| database_failed(&e, name))?;
+            .map_err(registering)?;
     }
     for grant in &file.grants {
         let level = resources::level_of(&grant.access);
@@ -740,7 +766,7 @@ async fn standins_of(
                 resources
                     .grant(&grant.resource, &grant.group, level)
                     .await
-                    .map_err(|e| database_failed(&e, name))?;
+                    .map_err(registering)?;
             }
             _ => said.notes.push(json!({
                 "reason": "grant-without-resource",
@@ -766,7 +792,8 @@ async fn local_version(
     who: &Who,
 ) -> Result<(u64, Vec<String>), Ending> {
     let name = who.command;
-    let failed = |e: DbError| database_failed(&e, name);
+    let failed =
+        |e: DbError| database_failed("local-version", "making the local Version", &e, name);
     let registry = &live.registry;
     let latest = match registry.application(&manifest.name).await.map_err(failed)? {
         None => {
@@ -862,8 +889,8 @@ async fn local_version(
             message,
             ..
         } => Err(migration_refused(&migration, rule, &message, name)),
-        Sent::OwnDatabaseUnavailable { step, code } => {
-            Err(own_database_unavailable(step, code.as_deref(), name))
+        Sent::OwnDatabaseUnavailable { step, cause } => {
+            Err(own_database_unavailable(step, cause, name))
         }
         Sent::Busy | Sent::NoSuchApplication | Sent::NotAContributor => {
             Err(tool_failed(name, "could not make the local Version", who))
@@ -897,14 +924,19 @@ pub(super) fn migration_refused(migration: &str, rule: &str, message: &str, name
     )
 }
 
-pub(super) fn own_database_unavailable(step: &str, code: Option<&str>, name: &str) -> Ending {
-    postgres_failed(
-        &format!(
-            "the local own database could not be made ready ({step}{})",
-            code.map(|c| format!(", SQLSTATE {c}")).unwrap_or_default()
-        ),
-        name,
+/// The local own database could not be made ready: its step (the own
+/// database's own list, [`crate::own_db::steps`]) and why.
+pub(super) fn own_database_unavailable(
+    step: crate::own_db::Step,
+    cause: crate::platform_db::Cause,
+    name: &str,
+) -> Ending {
+    PgFailed::new(
+        step.name,
+        format!("making the local own database ready ({})", step.words),
+        cause,
     )
+    .ending(name)
 }
 
 /// The request a local command sends.
@@ -1026,11 +1058,14 @@ pub(super) async fn serve_and_collect(
     let (operations, entry) = if request_id.is_empty() {
         (Vec::new(), None)
     } else {
-        let operations = live
-            .log
-            .of_request(&request_id)
-            .await
-            .map_err(|e| database_failed(&e, name))?;
+        let operations = live.log.of_request(&request_id).await.map_err(|e| {
+            database_failed(
+                "request-records",
+                "reading what the request recorded",
+                &e,
+                name,
+            )
+        })?;
         let entry = app_logs::read(
             &live.database,
             application,
@@ -1042,7 +1077,14 @@ pub(super) async fn serve_and_collect(
             },
         )
         .await
-        .map_err(|e| database_failed(&e, name))?
+        .map_err(|e| {
+            database_failed(
+                "request-records",
+                "reading what the request recorded",
+                &e,
+                name,
+            )
+        })?
         .entries
         .first()
         .and_then(|entry| serde_json::to_value(entry).ok());

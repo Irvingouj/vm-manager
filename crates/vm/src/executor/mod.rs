@@ -48,6 +48,7 @@ use tokio::sync::{Semaphore, SemaphorePermit};
 use tokio::time::Instant;
 
 use crate::log;
+use crate::platform_db::Cause;
 pub use identity::{IdentityKey, RewriteToken, identity};
 use wire::{Connection, Exchange, WireError};
 
@@ -434,18 +435,25 @@ impl Pool {
     /// ended ([`Held`]), within the checkout wait, as [`Pool::run`] does. It
     /// holds one of the pool's permits until then. Nothing is sent yet.
     pub async fn checkout(&self, level: Level) -> Result<Held<'_>, Failure> {
+        self.checkout_or_cause(level)
+            .await
+            .map_err(|_| Failure::Unavailable)
+    }
+
+    /// [`Pool::checkout`], saying why it could not (the local run says it).
+    pub async fn checkout_or_cause(&self, level: Level) -> Result<Held<'_>, Cause> {
         if !self.levels.permit(level) {
             self.report("a transaction of a level this login is not for");
-            return Err(Failure::Unavailable);
+            return Err(Cause::Server(None));
         }
         let checkout = self.limits.checkout;
         let Ok(Ok(permit)) = tokio::time::timeout(checkout, self.permits.acquire()).await else {
             self.report("no connection was free in time");
-            return Err(Failure::Unavailable);
+            return Err(Cause::TimedOut(checkout));
         };
         let (connection, reused) = match self.take_idle() {
             Some(connection) => (connection, true),
-            None => (self.open().await.map_err(|()| Failure::Unavailable)?, false),
+            None => (self.open_or_cause().await?, false),
         };
         Ok(Held {
             pool: self,
@@ -462,6 +470,22 @@ impl Pool {
         Connection::open(&self.target, self.limits.connect)
             .await
             .map_err(|error| self.report(error.describe()))
+    }
+
+    /// [`Pool::open`], saying why it could not.
+    async fn open_or_cause(&self) -> Result<Connection, Cause> {
+        Connection::open(&self.target, self.limits.connect)
+            .await
+            .map_err(|error| {
+                self.report(error.describe());
+                match error {
+                    WireError::Io => Cause::Connection,
+                    WireError::TimedOut => Cause::TimedOut(self.limits.connect),
+                    WireError::Protocol | WireError::Refused | WireError::Unsupported => {
+                        Cause::Server(None)
+                    }
+                }
+            })
     }
 
     /// Ends the backend `process_id` from a connection of its own, as the
@@ -554,6 +578,17 @@ impl Held<'_> {
         isolation: Option<Isolation>,
         label: Label<'_>,
     ) -> Result<Duration, Failure> {
+        self.begin_or_cause(isolation, label)
+            .await
+            .map_err(|_| Failure::Unavailable)
+    }
+
+    /// [`Held::begin`], saying why it could not (the local run says it).
+    pub async fn begin_or_cause(
+        &mut self,
+        isolation: Option<Isolation>,
+        label: Label<'_>,
+    ) -> Result<Duration, Cause> {
         let begin = wire::Begin {
             level: self.level,
             isolation,
@@ -563,23 +598,27 @@ impl Held<'_> {
         let limit = self.pool.limits.statement;
         let started = Instant::now();
         let Some(connection) = self.connection.as_mut() else {
-            return Err(Failure::Unavailable);
+            return Err(Cause::Connection);
         };
         self.begun = true;
         let mut began = connection.begin_transaction(&begin, limit).await;
         if matches!(began, Err(Exchange::Stale)) && self.reused {
             self.connection = None;
-            let mut fresh = self.pool.open().await.map_err(|()| Failure::Unavailable)?;
+            let mut fresh = self.pool.open_or_cause().await?;
             began = fresh.begin_transaction(&begin, limit).await;
             self.connection = Some(fresh);
         }
         self.reused = false;
         match began {
             Ok(()) => Ok(started.elapsed()),
-            Err(_) => {
+            Err(exchange) => {
                 self.connection = None;
                 self.pool.report("a transaction could not be begun");
-                Err(Failure::Unavailable)
+                Err(match exchange {
+                    Exchange::TimedOut => Cause::TimedOut(limit),
+                    Exchange::Refused => Cause::Server(None),
+                    Exchange::Stale | Exchange::Failed => Cause::Connection,
+                })
             }
         }
     }

@@ -791,7 +791,8 @@ mod tests {
         let error = PlatformDatabase::open(&address, &testing::limits())
             .await
             .err()
-            .expect("opening must fail");
+            .expect("opening must fail")
+            .message;
         assert!(error.contains("newer program"), "{error}");
         assert!(error.contains(address.database()), "{error}");
     }

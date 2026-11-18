@@ -65,7 +65,18 @@ impl Connection {
         let (client, connection) = tokio::time::timeout(limit, config.connect(NoTls))
             .await
             .map_err(|_| DbError::timed_out("opening a connection", limit))?
-            .map_err(DbError::from)?;
+            .map_err(|error| {
+                // The socket's own connect timeout (the config's, the same
+                // limit) is that limit passing too, not a lost connection.
+                let socket_timed_out = std::error::Error::source(&error)
+                    .and_then(|source| source.downcast_ref::<std::io::Error>())
+                    .is_some_and(|io| io.kind() == std::io::ErrorKind::TimedOut);
+                if socket_timed_out {
+                    DbError::timed_out("opening a connection", limit)
+                } else {
+                    DbError::from(error)
+                }
+            })?;
         let task = tokio::spawn(async move {
             if let Err(error) = connection.await {
                 log::record(

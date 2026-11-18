@@ -647,11 +647,11 @@ pub enum Sent {
     /// Too many Versions are being sent at once in the program: nothing of
     /// this one was begun.
     Busy,
-    /// The own database could not be made ready or reached: a fixed
-    /// description of the step, and Postgres's SQLSTATE if it gave one.
+    /// The own database could not be made ready or reached: the step, and
+    /// why (with Postgres's SQLSTATE if it gave one).
     OwnDatabaseUnavailable {
-        step: &'static str,
-        code: Option<String>,
+        step: crate::own_db::Step,
+        cause: crate::platform_db::Cause,
     },
 }
 
@@ -1529,8 +1529,8 @@ impl Registry {
                     serving,
                 });
             }
-            Err(Problem::Unavailable { step, code }) => {
-                return Ok(Sent::OwnDatabaseUnavailable { step, code });
+            Err(Problem::Unavailable { step, cause }) => {
+                return Ok(Sent::OwnDatabaseUnavailable { step, cause });
             }
         }
         self.record(name, id, version, &sender.id).await

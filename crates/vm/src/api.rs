@@ -1415,10 +1415,10 @@ impl Api {
                     "unavailable",
                     "too many Versions are being applied at once on the platform: nothing of this one was applied; send it again shortly",
                 ),
-                Sent::OwnDatabaseUnavailable { step, code } => {
+                Sent::OwnDatabaseUnavailable { step, cause } => {
                     log::record(
                         "own-database-failed",
-                        json!({ "application": name, "step": step, "code": code }),
+                        json!({ "application": name, "step": step.words, "code": cause.sqlstate() }),
                     );
                     Answer::error(
                         StatusCode::SERVICE_UNAVAILABLE,

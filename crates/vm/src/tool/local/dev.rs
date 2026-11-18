@@ -814,7 +814,12 @@ impl Front {
                 state.session = Some(self.session(ctx, &base).await?);
             }
             let Some(session) = state.session.as_ref() else {
-                return Err(super::postgres_failed("it is not running", who.command));
+                return Err(super::PgFailed::new(
+                    "start",
+                    "starting it (it is not running)",
+                    crate::platform_db::Cause::Ended,
+                )
+                .ending(who.command));
             };
             run::bring_up(
                 &base,

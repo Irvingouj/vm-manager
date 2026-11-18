@@ -138,6 +138,10 @@ pub(super) enum Exchange {
     /// The connection failed before the server answered anything: probably
     /// closed while idle.
     Stale,
+    /// The server answered with an error (its SQLSTATE is not read).
+    Refused,
+    /// The begin did not end within its limit.
+    TimedOut,
     /// Anything else: the connection is not to be used again.
     Failed,
 }
@@ -385,7 +389,7 @@ impl Connection {
                             ..self.ended(Err(Failure::Unavailable), None, false)
                         };
                     }
-                    Ok(Err(Exchange::Failed)) | Err(_) => {
+                    Ok(Err(Exchange::Failed | Exchange::Refused | Exchange::TimedOut)) | Err(_) => {
                         return self.ended(Err(Failure::Unavailable), None, false);
                     }
                 };
@@ -565,7 +569,7 @@ impl Connection {
         };
         timeout(limit, exchange)
             .await
-            .map_err(|_| Exchange::Failed)?
+            .map_err(|_| Exchange::TimedOut)?
     }
 
     /// Begins a transaction at `level` and `isolation` with nothing else in
@@ -608,7 +612,7 @@ impl Connection {
                 Incoming::Message(Message::ReadyForQuery(body)) if !failed => {
                     return Ok(body.status());
                 }
-                Incoming::Message(Message::ReadyForQuery(_)) => return Err(Exchange::Failed),
+                Incoming::Message(Message::ReadyForQuery(_)) => return Err(Exchange::Refused),
                 Incoming::Message(Message::ErrorResponse(_)) | Incoming::Oversized { .. } => {
                     failed = true;
                 }

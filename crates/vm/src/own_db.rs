@@ -83,7 +83,7 @@ use crate::log;
 use crate::migration_text;
 use crate::oplog::WRITE_TIMEOUT;
 use crate::platform_db::{
-    Connection, DatabaseAddress, DbError, PlatformDatabase, quote_identifier,
+    Cause, Connection, DatabaseAddress, DbError, PlatformDatabase, quote_identifier,
 };
 
 mod history;
@@ -241,15 +241,12 @@ async fn read_key(client: &impl GenericClient) -> Result<IdentityKey, Problem> {
     let row: Row = client
         .query_one("SELECT k1, k2 FROM vm.keys", &[])
         .await
-        .map_err(|e| Problem::postgres("reading the own database's keys", &e))?;
+        .map_err(|e| Problem::postgres(steps::KEYS, &e))?;
     key_of(&row)
 }
 
 fn key_of(row: &Row) -> Result<IdentityKey, Problem> {
-    let unreadable = || Problem::Unavailable {
-        step: "reading the own database's keys",
-        code: None,
-    };
+    let unreadable = || Problem::internal(steps::KEYS);
     let k1: &[u8] = row.try_get(0).map_err(|_| unreadable())?;
     let k2: &[u8] = row.try_get(1).map_err(|_| unreadable())?;
     IdentityKey::from_parts(k1, k2).ok_or_else(unreadable)
@@ -314,13 +311,130 @@ pub enum Problem {
         message: String,
     },
     /// The own database could not be made ready or reached. `step` is a
-    /// fixed description, `code` Postgres's SQLSTATE if it gave one: never
-    /// Postgres's message, which could name a role beside the word
-    /// password.
-    Unavailable {
-        step: &'static str,
-        code: Option<String>,
-    },
+    /// fixed name and description, `cause` why, as it was seen (with
+    /// Postgres's SQLSTATE if it gave one): never Postgres's message, which
+    /// could name a role beside the word password.
+    Unavailable { step: Step, cause: Cause },
+}
+
+/// A step of making, readying or using an own database: a short fixed name
+/// (lower-case words joined by `-`, the same in every run) and what it
+/// does, in words. The names are the program's own list: those of the
+/// consts below, each documented by its words.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Step {
+    pub name: &'static str,
+    pub words: &'static str,
+}
+
+impl Step {
+    const fn new(name: &'static str, words: &'static str) -> Self {
+        Self { name, words }
+    }
+
+    /// The same step, said more precisely.
+    const fn said(self, words: &'static str) -> Self {
+        Self {
+            name: self.name,
+            words,
+        }
+    }
+}
+
+/// The steps of an own database (see [`Step`]).
+pub mod steps {
+    use super::Step;
+
+    pub const KEYS: Step = Step::new("own-database-keys", "reading the own database's keys");
+    pub const VERIFIERS: Step = Step::new(
+        "own-database-verifiers",
+        "deriving the own database's role verifiers",
+    );
+    pub const COMPARE: Step = Step::new(
+        "own-database-compare",
+        "comparing the own database's structure",
+    );
+    pub const CAPTURE: Step = Step::new("own-database-capture", "putting the capture back");
+    pub const CAPTURE_CHECK: Step = Step::new(
+        "own-database-capture-check",
+        "writing the capture-check entry",
+    );
+    pub const KEPT: Step = Step::new(
+        "own-database-kept",
+        "reading what is kept of the own database",
+    );
+    pub const STRUCTURE_KEEP: Step = Step::new(
+        "own-database-structure-keep",
+        "keeping the own database's structure",
+    );
+    pub const STRUCTURE_READ: Step = Step::new(
+        "own-database-structure-read",
+        "reading the own database's structure",
+    );
+    pub const NAME: Step = Step::new("own-database-name", "naming the own database");
+    pub const RECORD_READY: Step = Step::new(
+        "own-database-record-ready",
+        "recording the own database as ready",
+    );
+    pub const PASSWORDS: Step = Step::new(
+        "own-database-passwords",
+        "choosing the own database's passwords",
+    );
+    pub const ROLES: Step = Step::new("own-database-roles", "creating the own database's roles");
+    pub const CREATE: Step = Step::new("own-database-create", "creating the own database");
+    pub const OWNER: Step = Step::new(
+        "own-database-owner",
+        "giving the own database to its platform role",
+    );
+    pub const PRIVILEGES: Step = Step::new(
+        "own-database-privileges",
+        "setting up the own database's privileges",
+    );
+    pub const SCHEMA: Step = Step::new(
+        "own-database-schema",
+        "making sure of the platform's schema vm",
+    );
+    pub const SET_UP: Step = Step::new("own-database-set-up", "setting up the own database");
+    pub const TURN: Step = Step::new(
+        "own-database-turn",
+        "waiting for the own database's migrations to end",
+    );
+    pub const FORM: Step = Step::new("own-database-form", "bringing the own database to form");
+    pub const FORM_READ: Step =
+        Step::new("own-database-form-read", "reading the own database's form");
+    pub const FORM_RECORD: Step = Step::new(
+        "own-database-form-record",
+        "recording the own database's form",
+    );
+    pub const CONNECT: Step = Step::new(
+        "own-database-connect",
+        "connecting to the own database as its platform role",
+    );
+    pub const MIGRATION_ROLE_OPEN: Step = Step::new(
+        "own-database-migration-role-open",
+        "letting the migration role log in",
+    );
+    pub const MIGRATION_ROLE_CLOSE: Step = Step::new(
+        "own-database-migration-role-close",
+        "closing the migration role",
+    );
+    pub const MIGRATION_ROLE_SESSIONS: Step = Step::new(
+        "own-database-migration-role-sessions",
+        "ending the migration role's sessions",
+    );
+    pub const MIGRATION_CONNECT: Step = Step::new(
+        "own-database-migration-connect",
+        "connecting to the own database as its migration role",
+    );
+    pub const MIGRATIONS_RECORD: Step = Step::new(
+        "own-database-migrations-record",
+        "reading the record of migrations",
+    );
+    pub const MIGRATIONS_TEXT: Step = Step::new(
+        "own-database-migrations-text",
+        "reading the migrations' text",
+    );
+    pub const MIGRATE: Step = Step::new("own-database-migrate", "applying migrations");
 }
 
 impl Problem {
@@ -330,32 +444,41 @@ impl Problem {
             Self::Diverged => "the migrations diverged",
             Self::Failed { .. } => "a migration failed",
             Self::Refused { .. } => "a migration was refused",
-            Self::Unavailable { step, .. } => step,
+            Self::Unavailable { step, .. } => step.words,
         }
     }
 
-    fn unavailable(step: &'static str, error: &DbError) -> Self {
+    fn unavailable(step: Step, error: &DbError) -> Self {
         Self::Unavailable {
             step,
-            code: error.code().map(|c| c.code().to_owned()),
+            // Copied: a small value (an SQLSTATE at most), once per failure.
+            cause: error.cause().clone(),
         }
     }
 
-    fn postgres(step: &'static str, error: &tokio_postgres::Error) -> Self {
+    fn postgres(step: Step, error: &tokio_postgres::Error) -> Self {
         Self::Unavailable {
             step,
-            code: error.code().map(|c| c.code().to_owned()),
+            cause: Cause::of(error),
         }
     }
 
-    fn timed_out(step: &'static str) -> Self {
-        Self::Unavailable { step, code: None }
+    /// `limit` passed: the whole time `step` was given.
+    fn timed_out(step: Step, limit: Duration) -> Self {
+        Self::Unavailable {
+            step,
+            cause: Cause::TimedOut(limit),
+        }
     }
 
     /// Something that should not happen happened: `step` says what. Not a
-    /// timeout, not Postgres's refusal.
-    fn internal(step: &'static str) -> Self {
-        Self::Unavailable { step, code: None }
+    /// timeout, not Postgres's refusal: an answer the program did not
+    /// expect.
+    fn internal(step: Step) -> Self {
+        Self::Unavailable {
+            step,
+            cause: Cause::Server(None),
+        }
     }
 
     fn refused(migration: &Migration, rule: &'static str, message: String) -> Self {
@@ -403,14 +526,11 @@ async fn verifiers<const N: usize>(secrets: [&Secret; N]) -> Result<[String; N],
     // role change, not per operation.
     let owned: [Secret; N] = secrets.map(|s| Secret(s.0.clone()));
     let derived = tokio::task::spawn_blocking(move || owned.map(|s| s.verifier()));
-    tokio::time::timeout(VERIFIER_TIMEOUT, derived)
-        .await
-        .ok()
-        .and_then(Result::ok)
-        .ok_or(Problem::Unavailable {
-            step: "deriving the own database's role verifiers",
-            code: None,
-        })
+    match tokio::time::timeout(VERIFIER_TIMEOUT, derived).await {
+        Ok(Ok(verifiers)) => Ok(verifiers),
+        Ok(Err(_)) => Err(Problem::internal(steps::VERIFIERS)),
+        Err(_) => Err(Problem::timed_out(steps::VERIFIERS, VERIFIER_TIMEOUT)),
+    }
 }
 
 /// An own database that is ready.
@@ -909,21 +1029,30 @@ impl OwnDatabases {
     /// something else changed") at its first use in this run, and then
     /// with a write whenever the last comparison is [`COMPARE_EVERY`] old.
     pub async fn pool(&self, application: &str, write: bool) -> Option<Arc<executor::Pool>> {
-        let (key, known) = self.known(application)?;
-        let ready = match self.ensure_form(application, &known).await {
-            Ok(()) => self.identity_key(&known).await,
-            Err(problem) => Err(problem),
-        };
-        let identity = match ready {
-            Ok(identity) => identity,
+        match self.pool_or_problem(application, write).await {
+            Ok(pool) => pool,
             Err(problem) => {
                 log::record(
                     "own-database-unavailable",
                     serde_json::json!({ "application": application, "problem": problem.step() }),
                 );
-                return None;
+                None
             }
+        }
+    }
+
+    /// [`OwnDatabases::pool`], saying why it could not be had: `Ok(None)`
+    /// when the Application has no own database.
+    pub async fn pool_or_problem(
+        &self,
+        application: &str,
+        write: bool,
+    ) -> Result<Option<Arc<executor::Pool>>, Problem> {
+        let Some((key, known)) = self.known(application) else {
+            return Ok(None);
         };
+        self.ensure_form(application, &known).await?;
+        let identity = self.identity_key(&known).await?;
         if known.never_compared() {
             self.compare_logged(application, &known, Occasion::FirstUse)
                 .await;
@@ -932,16 +1061,16 @@ impl OwnDatabases {
                 .await;
         }
         if let Some(pool) = self.held(application) {
-            return Some(pool);
+            return Ok(Some(pool));
         }
+        let names = self.names(known.number)?;
         let mut pools = self.pools.lock().unwrap_or_else(PoisonError::into_inner);
         pools.clock = pools.clock.saturating_add(1);
         let now = pools.clock;
         if let Some(held) = pools.held.get_mut(application) {
             held.used = now;
-            return Some(Arc::clone(&held.pool));
+            return Ok(Some(Arc::clone(&held.pool)));
         }
-        let names = self.names(known.number).ok()?;
         // Copied: the pool owns its login, made once per pool, not per
         // operation.
         let target = Target::new(
@@ -977,7 +1106,7 @@ impl OwnDatabases {
                 used: now,
             },
         );
-        Some(pool)
+        Ok(Some(pool))
     }
 
     /// The pool held for `application`, marked as just used.
@@ -1001,7 +1130,7 @@ impl OwnDatabases {
             read_key(connection.client()).await
         })
         .await
-        .map_err(|_| Problem::timed_out("reading the own database's keys: it took too long"))??;
+        .map_err(|_| Problem::timed_out(steps::KEYS, SETUP_TIMEOUT))??;
         Ok(Arc::clone(known.key.get_or_init(|| Arc::new(read))))
     }
 
@@ -1043,9 +1172,7 @@ impl OwnDatabases {
         .await
         .unwrap_or_else(|_| {
             known.mark_compared();
-            Err(Problem::timed_out(
-                "comparing the own database's structure: it took too long",
-            ))
+            Err(Problem::timed_out(steps::COMPARE, SETUP_TIMEOUT))
         });
         if let Err(problem) = compared {
             log::record(
@@ -1093,15 +1220,15 @@ impl OwnDatabases {
                 .client_mut()
                 .transaction()
                 .await
-                .map_err(|e| Problem::postgres("putting the capture back", &e))?;
+                .map_err(|e| Problem::postgres(steps::CAPTURE, &e))?;
             let rows = transaction
                 .query("SELECT * FROM vm.restore_capture()", &[])
                 .await
-                .map_err(|e| Problem::postgres("putting the capture back", &e))?;
+                .map_err(|e| Problem::postgres(steps::CAPTURE, &e))?;
             transaction
                 .commit()
                 .await
-                .map_err(|e| Problem::postgres("putting the capture back", &e))?;
+                .map_err(|e| Problem::postgres(steps::CAPTURE, &e))?;
             rows.iter()
                 .filter_map(|row| row.try_get::<_, String>(0).ok())
                 .collect()
@@ -1162,14 +1289,14 @@ impl OwnDatabases {
             }),
         )
         .await
-        .map_err(|_| Problem::timed_out("writing the capture-check entry: it took too long"))?
-        .map_err(|e| Problem::unavailable("writing the capture-check entry", &e))?;
+        .map_err(|_| Problem::timed_out(steps::CAPTURE_CHECK, WRITE_TIMEOUT))?
+        .map_err(|e| Problem::unavailable(steps::CAPTURE_CHECK, &e))?;
         if kept == 1 {
             Ok(())
         } else {
-            Err(Problem::internal(
+            Err(Problem::internal(steps::CAPTURE_CHECK.said(
                 "writing the capture-check entry: what is kept was not written with it",
-            ))
+            )))
         }
     }
 
@@ -1189,12 +1316,15 @@ impl OwnDatabases {
                     .map_err(DbError::from)
             })
             .await
-            .map_err(|e| Problem::unavailable("reading what is kept of the own database", &e))?;
+            .map_err(|e| Problem::unavailable(steps::KEPT, &e))?;
         let Some(row) = row else {
             return Ok(None);
         };
-        let unreadable =
-            |_| Problem::internal("reading what is kept of the own database: not as written");
+        let unreadable = |_| {
+            Problem::internal(
+                steps::KEPT.said("reading what is kept of the own database: not as written"),
+            )
+        };
         let tables = structure_of(&row.try_get::<_, serde_json::Value>(0).map_err(unreadable)?);
         let pending = row
             .try_get::<_, Option<serde_json::Value>>(1)
@@ -1226,7 +1356,7 @@ impl OwnDatabases {
             })
             .await
             .map(|_| ())
-            .map_err(|e| Problem::unavailable("keeping the own database's structure", &e))
+            .map_err(|e| Problem::unavailable(steps::STRUCTURE_KEEP, &e))
     }
 
     /// Keeps `structure` as what `number`'s own database is once the
@@ -1255,7 +1385,7 @@ impl OwnDatabases {
             })
             .await
             .map(|_| ())
-            .map_err(|e| Problem::unavailable("keeping the own database's structure", &e))
+            .map_err(|e| Problem::unavailable(steps::STRUCTURE_KEEP, &e))
     }
 
     /// The migrations whose record is `record` were committed: what was
@@ -1276,7 +1406,7 @@ impl OwnDatabases {
             })
             .await
             .map(|_| ())
-            .map_err(|e| Problem::unavailable("keeping the own database's structure", &e))
+            .map_err(|e| Problem::unavailable(steps::STRUCTURE_KEEP, &e))
     }
 
     /// Keeps what `number`'s own database's structure is now, read as its
@@ -1305,10 +1435,9 @@ impl OwnDatabases {
             database,
         };
         if names.platform.len() > MAX_IDENTIFIER {
-            return Err(Problem::Unavailable {
-                step: "naming the own database: the platform database's name is too long for its own databases' names (at most 63 bytes with _app_<n>_platform)",
-                code: None,
-            });
+            return Err(Problem::internal(steps::NAME.said(
+                "naming the own database: the platform database's name is too long for its own databases' names (at most 63 bytes with _app_<n>_platform)",
+            )));
         }
         Ok(names)
     }
@@ -1336,7 +1465,7 @@ impl OwnDatabases {
                         .map_err(DbError::from)
                 })
                 .await
-                .map_err(|e| Problem::unavailable("recording the own database as ready", &e))?;
+                .map_err(|e| Problem::unavailable(steps::RECORD_READY, &e))?;
             known.in_form.store(true, Ordering::Release);
             log::record(
                 "own-database-created",
@@ -1391,7 +1520,7 @@ impl OwnDatabases {
                 Ok((known, row.try_get(2).map_err(DbError::from)?))
             })
             .await
-            .map_err(|e| Problem::unavailable("choosing the own database's passwords", &e))
+            .map_err(|e| Problem::unavailable(steps::PASSWORDS, &e))
     }
 
     /// The three roles, as the platform's role, with the stored passwords,
@@ -1451,7 +1580,7 @@ impl OwnDatabases {
                 transaction.commit().await.map_err(DbError::from)
             })
             .await
-            .map_err(|e| Problem::unavailable("creating the own database's roles", &e))
+            .map_err(|e| Problem::unavailable(steps::ROLES, &e))
     }
 
     /// `CREATE DATABASE`, from `template0` so that nothing is in it, owned
@@ -1482,7 +1611,7 @@ impl OwnDatabases {
             {
                 Ok(())
             }
-            Err(error) => Err(Problem::unavailable("creating the own database", &error)),
+            Err(error) => Err(Problem::unavailable(steps::CREATE, &error)),
         }
     }
 
@@ -1530,7 +1659,7 @@ impl OwnDatabases {
                 transaction.commit().await.map_err(DbError::from)
             })
             .await
-            .map_err(|e| Problem::unavailable("giving the own database to its platform role", &e))
+            .map_err(|e| Problem::unavailable(steps::OWNER, &e))
     }
 
     /// As the platform's role of the database, in it, in one transaction
@@ -1540,7 +1669,7 @@ impl OwnDatabases {
     /// owns (the earlier form) taken over; the platform's schema `vm` made
     /// sure of, and the grants in it.
     async fn set_up(&self, names: &Names, application: &str, known: &Known) -> Result<(), Problem> {
-        let step = "setting up the own database's privileges";
+        let step = steps::PRIVILEGES;
         tokio::time::timeout(SETUP_TIMEOUT, async {
             let mut connection = self.connect_platform(names, known).await?;
             let database = quote_identifier(&names.database);
@@ -1594,7 +1723,7 @@ impl OwnDatabases {
             transaction
                 .batch_execute(PLATFORM_SCHEMA)
                 .await
-                .map_err(|e| Problem::postgres("making sure of the platform's schema vm", &e))?;
+                .map_err(|e| Problem::postgres(steps::SCHEMA, &e))?;
             transaction
                 .batch_execute(&vm_grants(&owner, &runtime))
                 .await
@@ -1602,7 +1731,7 @@ impl OwnDatabases {
             transaction.commit().await.map_err(|e| fail(&e))
         })
         .await
-        .map_err(|_| Problem::timed_out("setting up the own database: it took too long"))?
+        .map_err(|_| Problem::timed_out(steps::SET_UP, SETUP_TIMEOUT))?
     }
 
     /// Brings the own database of `application` to [`FORM`] and closes its
@@ -1614,7 +1743,7 @@ impl OwnDatabases {
         }
         let _turn = tokio::time::timeout(SETUP_TIMEOUT, known.turn.lock())
             .await
-            .map_err(|_| Problem::timed_out("waiting for the own database's migrations to end"))?;
+            .map_err(|_| Problem::timed_out(steps::TURN, SETUP_TIMEOUT))?;
         // Each of its steps has a time limit of its own; the whole of it
         // too, so that the turn is never held past one.
         tokio::time::timeout(
@@ -1622,7 +1751,7 @@ impl OwnDatabases {
             self.ensure_form_in_turn(application, known),
         )
         .await
-        .map_err(|_| Problem::timed_out("bringing the own database to form: it took too long"))?
+        .map_err(|_| Problem::timed_out(steps::FORM, MIGRATION_TIMEOUT))?
     }
 
     /// [`Self::ensure_form`], its turn already held.
@@ -1646,11 +1775,10 @@ impl OwnDatabases {
                     .map_err(DbError::from)
             })
             .await
-            .map_err(|e| Problem::unavailable("reading the own database's form", &e))?
-            .ok_or(Problem::Unavailable {
-                step: "reading the own database's form: it is not ready",
-                code: None,
-            })?;
+            .map_err(|e| Problem::unavailable(steps::FORM_READ, &e))?
+            .ok_or(Problem::internal(
+                steps::FORM_READ.said("reading the own database's form: it is not ready"),
+            ))?;
         if facts.earlier() {
             self.roles(&names, known).await?;
             self.give_database(&names).await?;
@@ -1673,7 +1801,7 @@ impl OwnDatabases {
                         .map_err(DbError::from)
                 })
                 .await
-                .map_err(|e| Problem::unavailable("recording the own database's form", &e))?;
+                .map_err(|e| Problem::unavailable(steps::FORM_RECORD, &e))?;
             log::record(
                 "own-database-brought-to-form",
                 serde_json::json!({ "application": application, "database": names.database, "form": FORM }),
@@ -1682,9 +1810,7 @@ impl OwnDatabases {
         if facts.earlier() || facts.open() {
             tokio::time::timeout(CLOSE_TIMEOUT, self.close_owner(&names, known))
                 .await
-                .map_err(|_| {
-                    Problem::timed_out("closing the migration role: it took too long")
-                })??;
+                .map_err(|_| Problem::timed_out(steps::MIGRATION_ROLE_CLOSE, CLOSE_TIMEOUT))??;
         }
         known.in_form.store(true, Ordering::Release);
         Ok(())
@@ -1694,9 +1820,7 @@ impl OwnDatabases {
     async fn connect_platform(&self, names: &Names, known: &Known) -> Result<Connection, Problem> {
         self.connect(names, &names.platform, &known.platform_password, true)
             .await
-            .map_err(|e| {
-                Problem::unavailable("connecting to the own database as its platform role", &e)
-            })
+            .map_err(|e| Problem::unavailable(steps::CONNECT, &e))
     }
 
     /// A connection to the own database, logged in as `role`.
@@ -1762,7 +1886,7 @@ impl OwnDatabases {
                 transaction.commit().await.map_err(DbError::from)
             })
             .await
-            .map_err(|e| Problem::unavailable("letting the migration role log in", &e))?;
+            .map_err(|e| Problem::unavailable(steps::MIGRATION_ROLE_OPEN, &e))?;
         Ok(fresh)
     }
 
@@ -1784,7 +1908,7 @@ impl OwnDatabases {
                     .map_err(DbError::from)
             })
             .await
-            .map_err(|e| Problem::unavailable("closing the migration role", &e))?;
+            .map_err(|e| Problem::unavailable(steps::MIGRATION_ROLE_CLOSE, &e))?;
         let connection = self.connect_platform(names, known).await?;
         connection
             .client()
@@ -1794,7 +1918,7 @@ impl OwnDatabases {
                 &[&names.owner, &TERMINATE_WAIT_MS],
             )
             .await
-            .map_err(|e| Problem::postgres("ending the migration role's sessions", &e))?;
+            .map_err(|e| Problem::postgres(steps::MIGRATION_ROLE_SESSIONS, &e))?;
         Ok(())
     }
 
@@ -1820,7 +1944,7 @@ impl OwnDatabases {
         list: &[Migration],
     ) -> Result<(), Problem> {
         let deadline = Instant::now() + MIGRATION_TIMEOUT;
-        let timed_out = || Problem::timed_out("applying migrations: they did not finish in time");
+        let timed_out = || Problem::timed_out(steps::MIGRATE, MIGRATION_TIMEOUT);
         let _turn = tokio::time::timeout_at(deadline, known.turn.lock())
             .await
             .map_err(|_| timed_out())?;
@@ -1851,16 +1975,16 @@ impl OwnDatabases {
                     &[],
                 )
                 .await
-                .map_err(|e| Problem::postgres("reading the record of migrations", &e))?;
+                .map_err(|e| Problem::postgres(steps::MIGRATIONS_RECORD, &e))?;
             let mut applied = Vec::with_capacity(rows.len());
             for row in &rows {
                 applied.push(Recorded {
                     name: row
                         .try_get(0)
-                        .map_err(|e| Problem::postgres("reading the record of migrations", &e))?,
+                        .map_err(|e| Problem::postgres(steps::MIGRATIONS_RECORD, &e))?,
                     sha256: row
                         .try_get(1)
-                        .map_err(|e| Problem::postgres("reading the record of migrations", &e))?,
+                        .map_err(|e| Problem::postgres(steps::MIGRATIONS_RECORD, &e))?,
                 });
             }
             Ok::<_, Problem>((key, applied))
@@ -1903,7 +2027,8 @@ impl OwnDatabases {
             .await
             .unwrap_or_else(|_| {
                 Err(Problem::timed_out(
-                    "closing the migration role: it took too long",
+                    steps::MIGRATION_ROLE_CLOSE,
+                    CLOSE_TIMEOUT,
                 ))
             });
         if let Err(problem) = closed {
@@ -1959,9 +2084,9 @@ impl OwnDatabases {
                 }
             }
         }
-        Err(Problem::internal(
+        Err(Problem::internal(steps::MIGRATE.said(
             "applying migrations: the last run neither committed nor refused",
-        ))
+        )))
     }
 
     /// One run of [`Self::apply`], on a session of its own: committed, or
@@ -1990,17 +2115,15 @@ impl OwnDatabases {
     /// which only these statements carry, as a parameter.
     async fn run(&self, work: &Work<'_>, learnt: &Learnt, last: bool) -> Result<Ran, Problem> {
         let deadline = work.deadline;
-        let timed_out = || Problem::timed_out("applying migrations: they did not finish in time");
-        let unavailable = |e: &tokio_postgres::Error| Problem::postgres("applying migrations", e);
+        let timed_out = || Problem::timed_out(steps::MIGRATE, MIGRATION_TIMEOUT);
+        let unavailable = |e: &tokio_postgres::Error| Problem::postgres(steps::MIGRATE, e);
         let mut connection = tokio::time::timeout_at(
             deadline,
             self.connect(work.names, &work.names.owner, work.password, false),
         )
         .await
         .map_err(|_| timed_out())?
-        .map_err(|e| {
-            Problem::unavailable("connecting to the own database as its migration role", &e)
-        })?;
+        .map_err(|e| Problem::unavailable(steps::MIGRATION_CONNECT, &e))?;
         let cancel = connection.client().cancel_token();
         let client = connection.client_mut();
         let transaction = within(deadline, &cancel, client.transaction())
@@ -2038,10 +2161,9 @@ impl OwnDatabases {
         let skip = applied
             .len()
             .checked_sub(work.checked_from)
-            .ok_or(Problem::Unavailable {
-                step: "applying migrations: the record of migrations changed meanwhile",
-                code: None,
-            })?;
+            .ok_or(Problem::internal(steps::MIGRATE.said(
+                "applying migrations: the record of migrations changed meanwhile",
+            )))?;
         let pending = work.list.get(applied.len()..).unwrap_or_default();
         let plans = work.plans.get(skip..).unwrap_or_default();
         if pending.is_empty() {
@@ -2128,9 +2250,9 @@ impl OwnDatabases {
                 let (statement, line) = match planned {
                     Some(range) => {
                         let Some(statement) = migration.sql.get(range.clone()) else {
-                            return Err(Problem::internal(
+                            return Err(Problem::internal(steps::MIGRATE.said(
                                 "applying migrations: a statement's place in its migration was lost",
-                            ));
+                            )));
                         };
                         (
                             statement,
@@ -2309,9 +2431,9 @@ impl OwnDatabases {
                     "index-code" => "index-code",
                     "type-code" => "type-code",
                     _ => {
-                        return Err(Problem::internal(
+                        return Err(Problem::internal(steps::MIGRATE.said(
                             "applying migrations: a check answered a rule the program does not know",
-                        ));
+                        )));
                     }
                 };
                 return Err(Problem::refused(migration, rule, message));
@@ -2381,8 +2503,11 @@ impl OwnDatabases {
         .map_err(|e| unavailable(&e))?;
         let last = pending.last();
         for (index, migration) in pending.iter().enumerate() {
-            let position = i32::try_from(applied.len().saturating_add(index))
-                .map_err(|_| Problem::internal("applying migrations: more than 2^31 of them"))?;
+            let position = i32::try_from(applied.len().saturating_add(index)).map_err(|_| {
+                Problem::internal(
+                    steps::MIGRATE.said("applying migrations: more than 2^31 of them"),
+                )
+            })?;
             within(
                 deadline,
                 &cancel,
@@ -2413,10 +2538,9 @@ impl OwnDatabases {
                 },
             );
         if !as_written {
-            return Err(Problem::Unavailable {
-                step: "applying migrations: the record of migrations did not read back as written",
-                code: None,
-            });
+            return Err(Problem::internal(steps::MIGRATE.said(
+                "applying migrations: the record of migrations did not read back as written",
+            )));
         }
         // What the structure and the capture are once this commits, kept
         // in the platform database before the commit with the record it
@@ -2479,11 +2603,7 @@ impl OwnDatabases {
                 self.settle_pending(work.known.number, &record),
             )
             .await
-            .unwrap_or_else(|_| {
-                Err(Problem::timed_out(
-                    "keeping the own database's structure: it took too long",
-                ))
-            });
+            .unwrap_or_else(|_| Err(Problem::timed_out(steps::STRUCTURE_KEEP, CLOSE_TIMEOUT)));
             match settled {
                 Ok(()) => work.known.mark_compared(),
                 Err(problem) => log::record(
@@ -2575,8 +2695,7 @@ fn record_digest<'a>(record: impl Iterator<Item = (&'a str, &'a str)>) -> String
 /// The own database's record of migrations (its digest) and its structure,
 /// read together in one read-only snapshot.
 async fn read_structure(client: &mut Client) -> Result<(String, Structure), Problem> {
-    let fail =
-        |e: tokio_postgres::Error| Problem::postgres("reading the own database's structure", &e);
+    let fail = |e: tokio_postgres::Error| Problem::postgres(steps::STRUCTURE_READ, &e);
     let transaction = client
         .build_transaction()
         .isolation_level(tokio_postgres::IsolationLevel::RepeatableRead)
@@ -2725,10 +2844,9 @@ async fn plan(pending: &[Migration]) -> Result<Vec<Vec<Range<usize>>>, Problem> 
         }
         Ok(plans)
     });
-    parsed.await.map_err(|_| Problem::Unavailable {
-        step: "reading the migrations' text",
-        code: None,
-    })?
+    parsed
+        .await
+        .map_err(|_| Problem::internal(steps::MIGRATIONS_TEXT))?
 }
 
 /// The record of migrations as `vm.applied_migrations()` reads it: place,

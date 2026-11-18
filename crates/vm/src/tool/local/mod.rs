@@ -74,7 +74,7 @@ use super::test_users::TestUsersFile;
 use super::theirs::Theirs;
 use super::{Done, Ending, Output, project_of};
 use crate::oplog::OperationLog;
-use crate::platform_db::{DbError, PlatformDatabase};
+use crate::platform_db::{Cause, DbError, OpenError, PlatformDatabase, seconds_text};
 use crate::runner;
 use crate::sign_in::RESERVED_HEADER_PREFIX;
 use postgres::Local;
@@ -478,24 +478,133 @@ fn local_state_failed(why: &str, command: &str) -> Ending {
     )
 }
 
-fn postgres_failed(why: &str, command: &str) -> Ending {
-    Ending::new(
-        1,
-        "postgres-failed",
-        format!(
-            "The private Postgres of the local run failed: {why}. Its own words are in .vm/local/postgres.log. Run {command} again; vm local reset starts the local databases anew (their test rows are loaded again)"
-        ),
-    )
+/// What ended a local run `postgres-failed` (blackbox/CONTRACT.md, "The
+/// local run on a busy machine"): the step, a short fixed name of the
+/// program's own list (the same step the same name in every run; each name
+/// is documented by the words given with it where it is made), what the run
+/// was doing in words, the cause as it was seen where the failure was made,
+/// and what the program or Postgres said of it. Nothing of it holds a
+/// password or a connection string: the words are the program's own, or
+/// Postgres's message, which names roles and databases only.
+pub(super) struct PgFailed {
+    step: &'static str,
+    what: String,
+    cause: Cause,
+    said: Option<String>,
 }
 
-fn database_failed(error: &DbError, command: &str) -> Ending {
-    Ending::new(
-        1,
-        "postgres-failed",
-        format!(
-            "The private Postgres of the local run did not answer as it should ({error}). Run {command} again; vm local reset starts the local databases anew (their test rows are loaded again)"
+impl PgFailed {
+    pub(super) fn new(step: &'static str, what: impl Into<String>, cause: Cause) -> Self {
+        Self {
+            step,
+            what: what.into(),
+            cause,
+            said: None,
+        }
+    }
+
+    /// `error`, with its cause and its words.
+    pub(super) fn db(step: &'static str, what: impl Into<String>, error: &DbError) -> Self {
+        Self::new(step, what, error.cause().clone()).said(error.to_string())
+    }
+
+    /// `error`, which is Postgres's or the connection's.
+    pub(super) fn postgres(
+        step: &'static str,
+        what: impl Into<String>,
+        error: &tokio_postgres::Error,
+    ) -> Self {
+        let said = match error.as_db_error() {
+            Some(db) => format!("{}: {} ({})", db.severity(), db.message(), db.code().code()),
+            None => error.to_string(),
+        };
+        Self::new(step, what, Cause::of(error)).said(said)
+    }
+
+    /// The step did not end within `limit`, the whole time it was given.
+    pub(super) fn timed_out(step: &'static str, what: impl Into<String>, limit: Duration) -> Self {
+        Self::new(step, what, Cause::TimedOut(limit))
+    }
+
+    #[must_use]
+    pub(super) fn said(mut self, said: impl Into<String>) -> Self {
+        self.said = Some(said.into());
+        self
+    }
+
+    /// The ending: `postgres-failed`, its message in words, and with
+    /// `--json` `step`, `cause`, and `limit_seconds` or `sqlstate` when
+    /// they apply.
+    pub(super) fn ending(&self, command: &str) -> Ending {
+        let cause = match &self.cause {
+            Cause::TimedOut(limit) => format!("it did not end within {} s", seconds_text(*limit)),
+            Cause::Connection => "the connection to it could not be opened, or was lost".to_owned(),
+            Cause::Server(Some(code)) => format!("it refused (SQLSTATE {})", code.code()),
+            Cause::Server(None) => "it answered what the program did not expect".to_owned(),
+            Cause::Ended => "it did not start, or it ended".to_owned(),
+        };
+        let said = self
+            .said
+            .as_deref()
+            .map(|said| format!(" ({said})"))
+            .unwrap_or_default();
+        let message = format!(
+            "The private Postgres of the local run failed while {}: {cause}{said}. Its own words are in .vm/local/postgres.log. Run {command} again; vm local reset starts the local databases anew (their test rows are loaded again)",
+            self.what
+        );
+        let mut error = Map::new();
+        error.insert("reason".into(), json!("postgres-failed"));
+        error.insert("message".into(), json!(message));
+        error.insert("step".into(), json!(self.step));
+        error.insert("cause".into(), json!(self.cause.name()));
+        if let Some(limit) = self.cause.limit() {
+            let seconds = if limit.subsec_nanos() == 0 {
+                json!(limit.as_secs())
+            } else {
+                json!(limit.as_secs_f64())
+            };
+            error.insert("limit_seconds".into(), seconds);
+        }
+        if let Some(code) = self.cause.sqlstate() {
+            error.insert("sqlstate".into(), json!(code));
+        }
+        Ending {
+            code: 1,
+            reason: json!("postgres-failed"),
+            // Not printed: the detail is.
+            message: super::Said::Ours(String::new()),
+            detail: Some(Box::new(Done {
+                json: json!({ "error": Value::Object(error) }),
+                text: format!("{message}\n"),
+            })),
+        }
+    }
+}
+
+fn database_failed(step: &'static str, what: &str, error: &DbError, command: &str) -> Ending {
+    PgFailed::db(step, what, error).ending(command)
+}
+
+/// The platform database of the local run (and the parts on it) could not
+/// be opened: `postgres-failed` when Postgres is why, else `failed`.
+fn open_failed(error: OpenError, command: &str) -> Ending {
+    match error.cause {
+        Some(cause) => PgFailed::new(
+            "platform-database",
+            "opening the local platform database",
+            cause,
+        )
+        .said(error.message)
+        .ending(command),
+        None => Ending::new(
+            1,
+            "failed",
+            format!(
+                "{command} could not open the local platform database: {}. Run {command} again",
+                error.message
+            ),
         ),
-    )
+    }
 }
 
 /// The size of the parts of a command that serves one request: a few
@@ -848,7 +957,7 @@ async fn read_alone(
             },
         )
         .await
-        .map_err(|why| postgres_failed(&why, name))?,
+        .map_err(|error| open_failed(error, name))?,
     );
     let read = read_records(&database, reading, name).await;
     drop(database);
@@ -861,7 +970,8 @@ async fn read_records(
     reading: &Reading,
     name: &str,
 ) -> Result<Done, Ending> {
-    let failed = |e: DbError| database_failed(&e, name);
+    let failed =
+        |e: DbError| database_failed("local-records", "reading the local records", &e, name);
     match reading {
         Reading::OperationLog { limit } => {
             let entries = OperationLog::new(Arc::clone(database))

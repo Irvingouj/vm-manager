@@ -18,7 +18,7 @@ use crate::executor;
 use crate::gateway::{Gateway, PlatformGateway};
 use crate::oplog::OperationLog;
 use crate::own_db::OwnDatabases;
-use crate::platform_db::{self, DatabaseAddress, PlatformDatabase, PoolLimits};
+use crate::platform_db::{self, Cause, DatabaseAddress, OpenError, PlatformDatabase, PoolLimits};
 use crate::registry::Registry;
 use crate::resources::Resources;
 use crate::runner::{self, RequestRunner};
@@ -55,7 +55,7 @@ impl Platform {
     /// Assembles the parts on the platform database at `address`. The
     /// error is a message for whoever started the program; it never holds
     /// the password.
-    pub async fn open(address: &DatabaseAddress, limits: Limits) -> Result<Self, String> {
+    pub async fn open(address: &DatabaseAddress, limits: Limits) -> Result<Self, OpenError> {
         let Limits {
             pool,
             executor,
@@ -65,9 +65,12 @@ impl Platform {
         let started = tokio::time::timeout(start, async {
             let database = Arc::new(PlatformDatabase::open(address, &pool).await?);
             let unreadable = |e: platform_db::DbError| {
-                format!(
-                    "cannot read the Applications and Resources from the platform database \"{}\": {e}",
-                    address.database()
+                OpenError::of(
+                    &e,
+                    format!(
+                        "cannot read the Applications and Resources from the platform database \"{}\": {e}",
+                        address.database()
+                    ),
                 )
             };
             let own = Arc::new(
@@ -84,17 +87,20 @@ impl Platform {
             let resources = Resources::load(Arc::clone(&database), executor, read_backs)
                 .await
                 .map_err(unreadable)?;
-            Ok::<_, String>((database, own, registry, resources))
+            Ok::<_, OpenError>((database, own, registry, resources))
         })
         .await;
         let (database, own, registry, resources) = match started {
             Ok(started) => started?,
             Err(_) => {
-                return Err(format!(
-                    "the platform database \"{}\" on Postgres at {} was not ready within {} s",
-                    address.database(),
-                    address.server(),
-                    start.as_secs()
+                return Err(OpenError::new(
+                    Some(Cause::TimedOut(start)),
+                    format!(
+                        "the platform database \"{}\" on Postgres at {} was not ready within {} s",
+                        address.database(),
+                        address.server(),
+                        platform_db::seconds_text(start)
+                    ),
                 ));
             }
         };
@@ -117,7 +123,7 @@ impl Platform {
         ));
         let as_gateway: Arc<dyn Gateway> = Arc::clone(&gateway) as Arc<dyn Gateway>;
         let runner = RequestRunner::start(&runner, &as_gateway)
-            .map_err(|e| format!("cannot start the engine threads: {e}"))?;
+            .map_err(|e| OpenError::new(None, format!("cannot start the engine threads: {e}")))?;
         Ok(Self {
             database,
             own,

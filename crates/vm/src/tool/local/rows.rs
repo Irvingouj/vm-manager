@@ -59,10 +59,10 @@ use super::run::{
     read_failed,
 };
 use super::standins::{self, Standin};
-use super::{database_failed, postgres_failed};
+use super::{PgFailed, database_failed};
 use crate::executor::{Failure, Label, Level, Values};
 use crate::own_db::{Migration, Problem};
-use crate::platform_db::{Connection, DatabaseAddress, DbError, quote_identifier};
+use crate::platform_db::{Cause, Connection, DatabaseAddress, DbError, quote_identifier};
 
 /// The folder of the project's test rows.
 const FOLDER: &str = "test-rows";
@@ -86,16 +86,28 @@ const LOAD_WAIT: Duration = Duration::from_secs(120);
 /// before it is made anew.
 const SHIP_WAIT: Duration = Duration::from_secs(10);
 
+/// The ending of a statement of step `step` (`what`, in words) that did
+/// not end within `limit`, or that failed with `error`.
+fn timed_out(step: &'static str, what: &str, limit: Duration, name: &str) -> Ending {
+    PgFailed::timed_out(step, what, limit).ending(name)
+}
+
+fn refused(step: &'static str, what: &str, error: &tokio_postgres::Error, name: &str) -> Ending {
+    PgFailed::postgres(step, what, error).ending(name)
+}
+
 /// Makes the table of what was loaded last, unless it is there, on
-/// `memory` (the maintenance database, as the superuser).
+/// `memory` (the maintenance database, as the superuser). Step
+/// `test-rows-table`.
 async fn make_table(memory: &Connection, name: &str) -> Result<(), Ending> {
+    const WHAT: &str = "making the table of the test rows loaded";
     let statement = format!(
         "CREATE TABLE IF NOT EXISTS {TABLE} (target text PRIMARY KEY, database oid NOT NULL, sha256 text)"
     );
     tokio::time::timeout(STATEMENT_WAIT, memory.client().batch_execute(&statement))
         .await
-        .map_err(|_| postgres_failed("the table of test rows was not made in time", name))?
-        .map_err(|e| database_failed(&DbError::from(e), name))
+        .map_err(|_| timed_out("test-rows-table", WHAT, STATEMENT_WAIT, name))?
+        .map_err(|e| refused("test-rows-table", WHAT, &e, name))
 }
 
 /// Where test rows are loaded.
@@ -189,7 +201,13 @@ pub(super) async fn load(
             }));
         }
     }
-    let memory = open(&target.pg.superuser("postgres"), name).await?;
+    let memory = open(
+        &target.pg.superuser("postgres"),
+        "test-rows-connect",
+        "connecting as its superuser to load the test rows",
+        name,
+    )
+    .await?;
     make_table(&memory, name).await?;
     let mut loaded = Loaded {
         files: Vec::new(),
@@ -455,8 +473,10 @@ async fn split(file: &RowsFile, name: &str) -> Result<Vec<Owned>, Ending> {
     Ok(list)
 }
 
-/// The `oid` of `database`.
+/// The `oid` of `database`. Step `test-rows-database`.
 async fn database_oid(memory: &Connection, database: &str, name: &str) -> Result<u32, Ending> {
+    const STEP: &str = "test-rows-database";
+    const WHAT: &str = "finding the database the test rows are loaded into";
     let row = tokio::time::timeout(
         STATEMENT_WAIT,
         memory.client().query_opt(
@@ -465,21 +485,26 @@ async fn database_oid(memory: &Connection, database: &str, name: &str) -> Result
         ),
     )
     .await
-    .map_err(|_| {
-        postgres_failed(
-            "the private Postgres did not say in time which databases it has",
-            name,
-        )
-    })?
-    .map_err(|e| database_failed(&DbError::from(e), name))?;
+    .map_err(|_| timed_out(STEP, WHAT, STATEMENT_WAIT, name))?
+    .map_err(|e| refused(STEP, WHAT, &e, name))?;
     row.and_then(|row| row.try_get::<_, u32>(0).ok())
-        .ok_or_else(|| postgres_failed(&format!("the database {database} is not there"), name))
+        .ok_or_else(|| {
+            PgFailed::new(STEP, WHAT, Cause::Server(None))
+                .said(format!("the database {database} is not there"))
+                .ending(name)
+        })
 }
 
-async fn open(address: &DatabaseAddress, name: &str) -> Result<Connection, Ending> {
+/// A connection to `address`, at step `step` (`what`, in words).
+async fn open(
+    address: &DatabaseAddress,
+    step: &'static str,
+    what: &str,
+    name: &str,
+) -> Result<Connection, Ending> {
     Connection::open(&address.config(CONNECT_WAIT), CONNECT_WAIT)
         .await
-        .map_err(|e| database_failed(&e, name))
+        .map_err(|e| database_failed(step, what, &e, name))
 }
 
 /// What was loaded last into `key`.
@@ -492,8 +517,22 @@ async fn last(memory: &Connection, key: &str, name: &str) -> Result<Option<Last>
         ),
     )
     .await
-    .map_err(|_| postgres_failed("the record of test rows was not read in time", name))?
-    .map_err(|e| database_failed(&DbError::from(e), name))?;
+    .map_err(|_| {
+        timed_out(
+            "test-rows-record",
+            "reading the record of the test rows loaded",
+            STATEMENT_WAIT,
+            name,
+        )
+    })?
+    .map_err(|e| {
+        refused(
+            "test-rows-record",
+            "reading the record of the test rows loaded",
+            &e,
+            name,
+        )
+    })?;
     Ok(row.and_then(|row| {
         Some(Last {
             database: row.try_get(0).ok()?,
@@ -522,15 +561,17 @@ async fn remember(
         ),
     )
     .await
-    .map_err(|_| postgres_failed("the record of test rows was not written in time", name))?
-    .map_err(|e| database_failed(&DbError::from(e), name))?;
+    .map_err(|_| timed_out("test-rows-record", "writing the record of the test rows loaded", STATEMENT_WAIT, name))?
+    .map_err(|e| refused("test-rows-record", "writing the record of the test rows loaded", &e, name))?;
     Ok(())
 }
 
 /// Empties every table of the stand-in database `database` and starts its
 /// sequences and identities again, as the superuser.
 async fn empty(pg: &Pg, database: &str, name: &str) -> Result<(), Ending> {
-    let connection = open(&pg.superuser(database), name).await?;
+    const STEP: &str = "test-rows-empty";
+    const WHAT: &str = "emptying a stand-in";
+    let connection = open(&pg.superuser(database), STEP, WHAT, name).await?;
     let statement = "DO $$ DECLARE t text; BEGIN
         SELECT pg_catalog.string_agg(pg_catalog.format('%I.%I', n.nspname, c.relname), ', ')
           INTO t
@@ -542,8 +583,8 @@ async fn empty(pg: &Pg, database: &str, name: &str) -> Result<(), Ending> {
       END $$";
     tokio::time::timeout(LOAD_WAIT, connection.client().batch_execute(statement))
         .await
-        .map_err(|_| postgres_failed("a stand-in was not emptied in time", name))?
-        .map_err(|e| database_failed(&DbError::from(e), name))
+        .map_err(|_| timed_out(STEP, WHAT, LOAD_WAIT, name))?
+        .map_err(|e| refused(STEP, WHAT, &e, name))
 }
 
 /// The database's own message of `error`.
@@ -569,7 +610,13 @@ async fn load_standin(
         standin.write.1.copy(),
         &standin.database,
     );
-    let connection = open(&address, name).await?;
+    let connection = open(
+        &address,
+        "test-rows-connect",
+        "connecting as the stand-in's login that writes",
+        name,
+    )
+    .await?;
     let client = connection.client();
     let deadline = Instant::now() + LOAD_WAIT;
     let begin = format!(
@@ -642,7 +689,14 @@ async fn application_number(
                 .map(|row| row.and_then(|row| row.try_get::<_, i64>(0).ok()))
         })
         .await
-        .map_err(|e| database_failed(&e, name))
+        .map_err(|e| {
+            database_failed(
+                "test-rows-own-database",
+                "reading the Application's number",
+                &e,
+                name,
+            )
+        })
 }
 
 /// Runs `file`'s statements in one transaction of the own database's
@@ -652,11 +706,21 @@ async fn load_own(target: &Target<'_>, file: &RowsFile) -> Result<u64, Ending> {
     let name = target.who.command;
     let live = target.live;
     let list = split(file, name).await?;
-    let Some(pool) = live.own.pool(target.application, true).await else {
-        return Err(postgres_failed(
-            "the local own database cannot be reached to load its test rows",
-            name,
-        ));
+    const STEP: &str = "test-rows-own-database";
+    const WHAT: &str = "beginning to load the own database's test rows";
+    let pool = match live.own.pool_or_problem(target.application, true).await {
+        Ok(Some(pool)) => pool,
+        Ok(None) => {
+            return Err(PgFailed::new(STEP, WHAT, Cause::Server(None))
+                .said("the local own database is not there")
+                .ending(name));
+        }
+        Err(Problem::Unavailable { step, cause }) => {
+            return Err(own_database_unavailable(step, cause, name));
+        }
+        Err(_) => {
+            return Err(PgFailed::new(STEP, WHAT, Cause::Server(None)).ending(name));
+        }
     };
     let request = format!("test-rows-{}", uuid::Uuid::new_v4());
     let label = Label {
@@ -667,15 +731,12 @@ async fn load_own(target: &Target<'_>, file: &RowsFile) -> Result<u64, Ending> {
     };
     let deadline = Instant::now() + LOAD_WAIT;
     let mut held = pool
-        .checkout(Level::Write)
+        .checkout_or_cause(Level::Write)
         .await
-        .map_err(|_| postgres_failed("no connection to the local own database was free", name))?;
-    held.begin(None, label).await.map_err(|_| {
-        postgres_failed(
-            "the loading of the own database's test rows did not begin",
-            name,
-        )
-    })?;
+        .map_err(|cause| PgFailed::new(STEP, WHAT, cause).ending(name))?;
+    held.begin_or_cause(None, label)
+        .await
+        .map_err(|cause| PgFailed::new(STEP, WHAT, cause).ending(name))?;
     let mut rows: u64 = 0;
     for statement in &list {
         let outcome = held
@@ -740,9 +801,15 @@ async fn remake(
     tokio::time::timeout(SHIP_WAIT, own.ship_and_wait(target.application))
         .await
         .ok();
-    own.forget(target.application)
-        .await
-        .map_err(|e| database_failed(&e, name))?;
+    const STEP: &str = "test-rows-remake";
+    own.forget(target.application).await.map_err(|e| {
+        database_failed(
+            STEP,
+            "forgetting the own database to make it anew",
+            &e,
+            name,
+        )
+    })?;
     tokio::time::timeout(
         LOAD_WAIT,
         memory.client().batch_execute(&format!(
@@ -751,8 +818,15 @@ async fn remake(
         )),
     )
     .await
-    .map_err(|_| postgres_failed("the own database was not dropped in time", name))?
-    .map_err(|e| database_failed(&DbError::from(e), name))?;
+    .map_err(|_| {
+        timed_out(
+            STEP,
+            "dropping the own database to make it anew",
+            LOAD_WAIT,
+            name,
+        )
+    })?
+    .map_err(|e| refused(STEP, "dropping the own database to make it anew", &e, name))?;
     let problem = |problem: Problem| match problem {
         Problem::Failed {
             migration,
@@ -764,11 +838,11 @@ async fn remake(
             rule,
             message,
         } => migration_refused(&migration, rule, &message, name),
-        Problem::Unavailable { step, code } => {
-            own_database_unavailable(step, code.as_deref(), name)
-        }
+        Problem::Unavailable { step, cause } => own_database_unavailable(step, cause, name),
         Problem::Diverged => {
-            postgres_failed("the own database made anew has migrations already", name)
+            PgFailed::new(STEP, "making the own database anew", Cause::Server(None))
+                .said("the own database made anew has migrations already")
+                .ending(name)
         }
     };
     own.prepare(number, target.application, BUILDER, &[])
@@ -788,8 +862,14 @@ async fn remake(
                 .map_err(DbError::from)
         })
         .await
-        .map_err(|e| database_failed(&e, name))?;
-    let inside = open(&target.pg.superuser(database), name).await?;
+        .map_err(|e| database_failed(STEP, "reading where the Change history is", &e, name))?;
+    let inside = open(
+        &target.pg.superuser(database),
+        STEP,
+        "connecting to the own database made anew",
+        name,
+    )
+    .await?;
     tokio::time::timeout(
         STATEMENT_WAIT,
         inside.client().batch_execute(&format!(
@@ -797,8 +877,15 @@ async fn remake(
         )),
     )
     .await
-    .map_err(|_| postgres_failed("the own database made anew was not readied in time", name))?
-    .map_err(|e| database_failed(&DbError::from(e), name))?;
+    .map_err(|_| {
+        timed_out(
+            STEP,
+            "readying the own database made anew",
+            STATEMENT_WAIT,
+            name,
+        )
+    })?
+    .map_err(|e| refused(STEP, "readying the own database made anew", &e, name))?;
     drop(inside);
     own.prepare(number, target.application, BUILDER, target.migrations)
         .await

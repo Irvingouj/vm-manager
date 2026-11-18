@@ -37,8 +37,9 @@ use rustix::process::{Pid, Signal, kill_process, kill_process_group, test_kill_p
 use serde_json::{Value, json};
 
 use super::super::child::{self, Kept};
+use super::PgFailed;
 use super::download::{self, Archive};
-use crate::platform_db::{Connection, DatabaseAddress, DbError};
+use crate::platform_db::{Cause, Connection, DatabaseAddress};
 use tokio_postgres::error::SqlState;
 
 /// The variable naming a Postgres the Builder has.
@@ -453,20 +454,27 @@ impl Local {
     }
 
     /// Makes the data folder with initdb, unless it is there; then makes
-    /// `pg_hba.conf` its one line. `own` is the command's own folder.
+    /// `pg_hba.conf` its one line. `own` is the command's own folder. Its
+    /// step is `initdb`: making the data folder with initdb; it fails
+    /// `timed-out` past [`INITDB_WAIT`], else `ended` (initdb failed, or
+    /// what it needs could not be written).
     pub(super) async fn initdb(
         &self,
         programs: &Programs,
         state: &State,
         own: &Path,
-    ) -> Result<(), String> {
+    ) -> Result<(), PgFailed> {
+        const STEP: &str = "initdb";
+        const WHAT: &str = "making its data folder with initdb";
+        let ended = |said: String| PgFailed::new(STEP, WHAT, Cause::Ended).said(said);
         let data = self.data();
         if data.join("PG_VERSION").is_file() {
             return Ok(());
         }
         // A folder left without a cluster (a reset's, or an initdb that
         // failed) is emptied, not removed: initdb takes an empty folder.
-        empty_folder(&data).map_err(|e| format!("{} cannot be made anew ({e})", data.display()))?;
+        empty_folder(&data)
+            .map_err(|e| ended(format!("{} cannot be made anew ({e})", data.display())))?;
         // In the command's own folder (private, in TMPDIR), not the project.
         let password_file = own.join(".initdb-password");
         fs::remove_file(&password_file).ok();
@@ -478,10 +486,10 @@ impl Local {
             .and_then(|mut file| file.write_all(state.superuser.0.as_bytes()));
         if let Err(error) = written {
             fs::remove_file(&password_file).ok();
-            return Err(format!(
+            return Err(ended(format!(
                 "{} cannot be written ({error})",
                 password_file.display()
-            ));
+            )));
         }
         let pwfile = format!("--pwfile={}", password_file.display());
         let args: [&OsStr; 11] = [
@@ -510,18 +518,13 @@ impl Local {
         )
         .await;
         fs::remove_file(&password_file).ok();
-        let failed = |why: String| {
+        let failed = |failed: PgFailed| {
             fs::remove_dir_all(&data).ok();
-            why
+            failed
         };
         let ran = ran
-            .map_err(|_| {
-                failed(format!(
-                    "initdb did not end within {} s",
-                    INITDB_WAIT.as_secs()
-                ))
-            })?
-            .map_err(|e| failed(format!("initdb cannot be run ({e})")))?;
+            .map_err(|_| failed(PgFailed::timed_out(STEP, WHAT, INITDB_WAIT)))?
+            .map_err(|e| failed(ended(format!("initdb cannot be run ({e})"))))?;
         if !ran.status.success() {
             let words = ran.err.text();
             let first: Vec<&str> = words
@@ -529,13 +532,16 @@ impl Local {
                 .filter(|l| !l.trim().is_empty())
                 .take(4)
                 .collect();
-            return Err(failed(format!("initdb failed: {}", first.join(" / "))));
+            return Err(failed(ended(format!(
+                "initdb failed: {}",
+                first.join(" / ")
+            ))));
         }
         fs::write(
             data.join("pg_hba.conf"),
             format!("# Written by vm: password logins from {HOST} only.\nhost all all {HOST}/32 scram-sha-256\n"),
         )
-        .map_err(|e| failed(format!("pg_hba.conf cannot be written ({e})")))
+        .map_err(|e| failed(ended(format!("pg_hba.conf cannot be written ({e})"))))
     }
 
     /// The address of `database` as the superuser.
@@ -548,17 +554,16 @@ impl Local {
         DatabaseAddress::new(HOST, port, SUPERUSER, state.superuser.copy(), database)
     }
 
-    /// The first run's set-up, once the server is up: the platform's role.
-    pub(super) async fn set_up(&self, state: &mut State, port: u16) -> Result<(), String> {
-        if state.ready {
-            return Ok(());
-        }
+    /// The first run's set-up, once the server is up: the platform's role
+    /// (step `platform-role`: making the platform's role, as the
+    /// superuser). The caller records it done (`state.ready`).
+    pub(super) async fn set_up(&self, state: &State, port: u16) -> Result<(), PgFailed> {
+        const STEP: &str = "platform-role";
+        const WHAT: &str = "making the platform's role";
         let address = self.superuser_address(state, port, "postgres");
         let connection = Connection::open(&address.config(CONNECT_WAIT), CONNECT_WAIT)
             .await
-            .map_err(|e| {
-                format!("the private Postgres cannot be reached as its superuser ({e})")
-            })?;
+            .map_err(|e| PgFailed::db(STEP, "connecting as its superuser", &e))?;
         let verifier = state.platform.verifier();
         let statement = format!(
             "DO $$ BEGIN
@@ -570,11 +575,10 @@ impl Local {
         );
         tokio::time::timeout(CONNECT_WAIT, connection.client().batch_execute(&statement))
             .await
-            .map_err(|_| "the platform's role was not made in time".to_owned())?
-            .map_err(|e| format!("the platform's role cannot be made ({})", DbError::from(e)))?;
+            .map_err(|_| PgFailed::timed_out(STEP, WHAT, CONNECT_WAIT))?
+            .map_err(|e| PgFailed::postgres(STEP, WHAT, &e))?;
         drop(connection);
-        state.ready = true;
-        self.write_state(state)
+        Ok(())
     }
 
     /// Stops a server a run killed outright left running, once it has shown
@@ -712,6 +716,13 @@ fn empty_folder(folder: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Why a server started was not ready.
+enum Ready {
+    Ended(std::process::ExitStatus),
+    /// Not within [`READY_WAIT`].
+    TimedOut,
+}
+
 /// What a server named by a `postmaster.pid` showed itself to be.
 enum Answer {
     Ours,
@@ -742,11 +753,16 @@ pub(super) struct Server {
 
 impl Server {
     /// Starts the server on the data folder of `local`, on a free port.
-    pub(super) async fn start(local: &Local, programs: &Programs) -> Result<Self, String> {
+    /// Its step is `start`: starting it until it says it is ready; it
+    /// fails `timed-out` past [`READY_WAIT`], else `ended`.
+    pub(super) async fn start(local: &Local, programs: &Programs) -> Result<Self, PgFailed> {
+        const STEP: &str = "start";
+        const WHAT: &str = "starting";
+        let ended = |said: String| PgFailed::new(STEP, WHAT, Cause::Ended).said(said);
         let log_path = local.dir.join("postgres.log");
-        let mut last = String::new();
+        let mut last = ended(String::new());
         for _ in 0..PORT_ATTEMPTS {
-            let port = free_port()?;
+            let port = free_port().map_err(ended)?;
             // In append mode (`O_APPEND`), which Postgres inherits: each of
             // its writes goes to the end of the file as it is at that
             // moment, so emptying the file while it runs ([`trim_log`])
@@ -761,10 +777,10 @@ impl Server {
                 .mode(0o600)
                 .open(&log_path)
                 .and_then(|file| file.set_len(0).map(|()| file))
-                .map_err(|e| format!("{} cannot be written ({e})", log_path.display()))?;
+                .map_err(|e| ended(format!("{} cannot be written ({e})", log_path.display())))?;
             let log_too = log
                 .try_clone()
-                .map_err(|e| format!("{} cannot be written ({e})", log_path.display()))?;
+                .map_err(|e| ended(format!("{} cannot be written ({e})", log_path.display())))?;
             let mut command = tokio::process::Command::new(programs.program("postgres"));
             command
                 .arg("-D")
@@ -792,7 +808,7 @@ impl Server {
                 .kill_on_drop(true);
             let child = command
                 .spawn()
-                .map_err(|e| format!("postgres cannot be started ({e})"))?;
+                .map_err(|e| ended(format!("postgres cannot be started ({e})")))?;
             let pid = child
                 .id()
                 .and_then(|id| i32::try_from(id).ok())
@@ -800,7 +816,7 @@ impl Server {
             let mut server = Self { child, pid, port };
             match server.ready(local).await {
                 Ok(()) => return Ok(server),
-                Err(why) => {
+                Err(cause) => {
                     server.stop().await;
                     let log = fs::read_to_string(&log_path).unwrap_or_default();
                     let in_use = log.contains("could not bind") || log.contains("in use");
@@ -809,18 +825,32 @@ impl Server {
                         .filter(|l| l.contains("FATAL") || l.contains("ERROR"))
                         .take(3)
                         .collect();
-                    last = format!("{why}: {}", first.join(" / "));
+                    let said = match &cause {
+                        Ready::Ended(status) => {
+                            format!("postgres ended ({status}) before it was ready")
+                        }
+                        Ready::TimedOut => "postgres did not say it was ready".to_owned(),
+                    };
+                    let said = if first.is_empty() {
+                        said
+                    } else {
+                        format!("{said}: {}", first.join(" / "))
+                    };
+                    last = match cause {
+                        Ready::Ended(_) => ended(said),
+                        Ready::TimedOut => PgFailed::timed_out(STEP, WHAT, READY_WAIT).said(said),
+                    };
                     if !in_use {
                         break;
                     }
                 }
             }
         }
-        Err(format!("the private Postgres did not start ({last})"))
+        Err(last)
     }
 
     /// Waits until `postmaster.pid` says the server is ready.
-    async fn ready(&mut self, local: &Local) -> Result<(), String> {
+    async fn ready(&mut self, local: &Local) -> Result<(), Ready> {
         let pid_file = local.data().join("postmaster.pid");
         let deadline = tokio::time::Instant::now() + READY_WAIT;
         loop {
@@ -832,13 +862,10 @@ impl Server {
                 return Ok(());
             }
             if let Ok(Some(status)) = self.child.try_wait() {
-                return Err(format!("postgres ended ({status}) before it was ready"));
+                return Err(Ready::Ended(status));
             }
             if tokio::time::Instant::now() >= deadline {
-                return Err(format!(
-                    "postgres was not ready within {} s",
-                    READY_WAIT.as_secs()
-                ));
+                return Err(Ready::TimedOut);
             }
             tokio::time::sleep(POLL).await;
         }
