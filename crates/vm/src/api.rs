@@ -49,8 +49,9 @@ use crate::own_db::Migration;
 use crate::platform_db::DbError;
 use crate::platform_db::PlatformDatabase;
 use crate::registry::{
-    ApplicationRecord, Created, DeclaredAccess, NameProblem, NewVersion, Registry, Resource, Sent,
-    VersionRecord, WentBack, check_name,
+    ApplicationRecord, Asked, Change, Changed, Created, DeclaredAccess, Entry, List,
+    MAX_CONTRIBUTORS, MAX_SHARED_WITH, NameProblem, Named, NewVersion, Registry, Resource, Sent,
+    Standing, VersionRecord, WentBack, check_name,
 };
 use crate::resources::{
     self, Connection, GrantWritten, Login, NewResource, Registered, Resources, is_resource_name,
@@ -187,6 +188,10 @@ enum Route<'a> {
     GoBack(&'a str),
     /// `/v1/applications/<name>/logs`
     Logs(&'a str),
+    /// `/v1/applications/<name>/contributors`
+    Contributors(&'a str),
+    /// `/v1/applications/<name>/sharing`
+    Sharing(&'a str),
     /// `/v1/resources`
     Resources,
     /// `/v1/resources/<name>`
@@ -238,6 +243,8 @@ impl<'a> Route<'a> {
             }
             ["applications", name, "go-back"] => Some(Self::GoBack(name)),
             ["applications", name, "logs"] => Some(Self::Logs(name)),
+            ["applications", name, "contributors"] => Some(Self::Contributors(name)),
+            ["applications", name, "sharing"] => Some(Self::Sharing(name)),
             ["resources"] => Some(Self::Resources),
             ["resources", name] => Some(Self::Resource(name)),
             ["resources", name, "grants"] => Some(Self::Grants(name)),
@@ -528,6 +535,117 @@ fn read_go_back(body: &[u8]) -> Result<(u64, u64), String> {
     }
 }
 
+/// `POST /v1/applications/<name>/contributors`
+const CONTRIBUTORS_FORM: &str = r#"{ "add": [ { "user": "<user id>" } | { "group": "<Group>" } | { "email": "<address>" }, ... ], "remove": [ ... ] } (each optional, together 1 to 100 entries, no entry in both)"#;
+
+/// `POST /v1/applications/<name>/sharing`
+const SHARING_FORM: &str = r#"{ "add": [ { "user": "<user id>" } | { "group": "<Group>" } | { "everyone": true } | { "email": "<address>" }, ... ], "remove": [ ... ] } (each optional, together 1 to 100 entries, no entry in both)"#;
+
+/// The most entries one change of a list holds, `add` and `remove`
+/// together.
+const MAX_ENTRIES_A_CHANGE: usize = 100;
+
+/// The longest a user id, a Group or an email may be, in bytes.
+const MAX_ENTRY_BYTES: usize = 256;
+
+/// Whether `text` can be a user id, a Group or an email in an entry: 1 to
+/// 256 bytes, no control character.
+fn entry_text(text: &str) -> bool {
+    !text.is_empty() && text.len() <= MAX_ENTRY_BYTES && !text.chars().any(char::is_control)
+}
+
+/// One entry of a change: exactly one of `user`, `group`, `everyone` (for
+/// whom it is shared with only, and only `true`) and `email`; other keys
+/// are ignored.
+fn read_entry(value: &RawValue, list: List) -> Result<Asked, String> {
+    let entry = Object::read_value(value)?;
+    let text = |key: &str| -> Result<Option<String>, String> {
+        match entry.0.get(key) {
+            None => Ok(None),
+            Some(value) => {
+                let text: String = serde_json::from_str(value.get())
+                    .map_err(|_| format!("{key} is not a string"))?;
+                if entry_text(&text) {
+                    Ok(Some(text))
+                } else {
+                    Err(format!(
+                        "{key} is not 1 to {MAX_ENTRY_BYTES} bytes without control characters"
+                    ))
+                }
+            }
+        }
+    };
+    let user = text("user")?;
+    let group = text("group")?;
+    let email = text("email")?;
+    let everyone = match entry.0.get("everyone") {
+        None => false,
+        Some(value) if value.get() == "true" => true,
+        Some(_) => return Err("everyone is not true".into()),
+    };
+    if everyone && list == List::Contributors {
+        return Err("everyone cannot be a Contributor: name a person or a Group".into());
+    }
+    match (user, group, email, everyone) {
+        (Some(id), None, None, false) => Ok(Asked::Entry(Named::User(id))),
+        (None, Some(group), None, false) => Ok(Asked::Entry(Named::Group(group))),
+        (None, None, Some(email), false) => Ok(Asked::Email(email)),
+        (None, None, None, true) => Ok(Asked::Entry(Named::Everyone)),
+        (None, None, None, false) => {
+            Err("an entry names nothing: give user, group, email or everyone".into())
+        }
+        _ => Err(
+            "an entry names more than one thing: give one of user, group, email, everyone".into(),
+        ),
+    }
+}
+
+/// The body of a change of `list`: `add` and `remove`, each an array when
+/// given, at least one given, 1 to [`MAX_ENTRIES_A_CHANGE`] entries in all,
+/// none in both (an email compared letter case ignored).
+fn read_change(body: &[u8], list: List) -> Result<Change, String> {
+    let object = Object::read(body)?;
+    let mut lists: [Vec<Asked>; 2] = [Vec::new(), Vec::new()];
+    let mut given = false;
+    for (key, into) in ["add", "remove"].into_iter().zip(&mut lists) {
+        let Some(value) = object.0.get(key) else {
+            continue;
+        };
+        given = true;
+        let entries: Vec<&RawValue> = serde_json::from_str(value.get())
+            .map_err(|_| format!("{key} is not an array of entries"))?;
+        if entries.len() > MAX_ENTRIES_A_CHANGE {
+            return Err(format!(
+                "more than {MAX_ENTRIES_A_CHANGE} entries in one request"
+            ));
+        }
+        for (index, entry) in entries.into_iter().enumerate() {
+            into.push(read_entry(entry, list).map_err(|e| format!("{key}[{index}]: {e}"))?);
+        }
+    }
+    let [add, remove] = lists;
+    if !given {
+        return Err("neither add nor remove is given".into());
+    }
+    let count = add.len().saturating_add(remove.len());
+    if count == 0 {
+        return Err("no entry is given".into());
+    }
+    if count > MAX_ENTRIES_A_CHANGE {
+        return Err(format!(
+            "more than {MAX_ENTRIES_A_CHANGE} entries in one request"
+        ));
+    }
+    let same = |a: &Asked, b: &Asked| match (a, b) {
+        (Asked::Email(a), Asked::Email(b)) => a.to_lowercase() == b.to_lowercase(),
+        _ => a == b,
+    };
+    if add.iter().any(|a| remove.iter().any(|r| same(a, r))) {
+        return Err("the same entry is both in add and in remove".into());
+    }
+    Ok(Change { list, add, remove })
+}
+
 /// The parameters of `GET /v1/applications/<name>/logs`: `limit` (1 to
 /// 1000, written plainly; 100 without it), `after` (a cursor) and `request`,
 /// each at most once and percent-decoded; others are ignored. `None` for
@@ -793,7 +911,7 @@ impl Api {
         };
         let Some(route) = route else {
             return Answer::not_found(
-                "the API has no such path: its paths are /v1/me, /v1/installation, /v1/tool-credentials, /v1/tool-credentials/current, /v1/tool-sign-ins, /v1/oidc, /v1/applications, /v1/applications/<name>, /v1/applications/<name>/versions, /v1/applications/<name>/versions/<number>, /v1/applications/<name>/go-back, /v1/applications/<name>/logs, /v1/resources, /v1/resources/<name>, /v1/resources/<name>/grants, /v1/resources/<name>/structure and /v1/operation-log",
+                "the API has no such path: its paths are /v1/me, /v1/installation, /v1/tool-credentials, /v1/tool-credentials/current, /v1/tool-sign-ins, /v1/oidc, /v1/applications, /v1/applications/<name>, /v1/applications/<name>/versions, /v1/applications/<name>/versions/<number>, /v1/applications/<name>/go-back, /v1/applications/<name>/logs, /v1/applications/<name>/contributors, /v1/applications/<name>/sharing, /v1/resources, /v1/resources/<name>, /v1/resources/<name>/grants, /v1/resources/<name>/structure and /v1/operation-log",
             );
         };
         match route {
@@ -823,11 +941,19 @@ impl Api {
             Route::Structure(name) => Ok(self.structure(user, request, method, name).await),
             Route::OperationLog => self.operation_log(method, query).await,
             Route::Applications => self.applications(user, method, &body).await,
-            Route::Application(name) => self.application(method, name).await,
+            Route::Application(name) => self.application(user, method, name).await,
             Route::Versions(name) => self.versions(user, method, name, query, &body).await,
-            Route::Version(name, number) => self.version(method, name, number).await,
+            Route::Version(name, number) => self.version(user, method, name, number).await,
             Route::GoBack(name) => self.go_back(user, method, name, &body).await,
             Route::Logs(name) => self.logs(user, method, name, query).await,
+            Route::Contributors(name) => {
+                self.change_list(user, method, name, List::Contributors, &body)
+                    .await
+            }
+            Route::Sharing(name) => {
+                self.change_list(user, method, name, List::SharedWith, &body)
+                    .await
+            }
             Route::Oidc => self.oidc(user, method, &body).await,
             Route::Installation | Route::ToolSignIns => Ok(not_signed_in()),
         };
@@ -940,7 +1066,7 @@ impl Api {
         body: &[u8],
     ) -> Result<Answer, DbError> {
         if method == Method::GET {
-            let listed = self.registry.contributed_to(&user.id).await?;
+            let listed = self.registry.listed_for(user).await?;
             let view = ListedApplicationsView {
                 applications: listed
                     .iter()
@@ -948,7 +1074,7 @@ impl Api {
                         name: &a.name,
                         description: a.description.as_deref(),
                         address: format!("{}.{}", a.name, self.domain),
-                        contributor: true,
+                        contributor: a.contributor,
                         serving_version: a.serving_version,
                     })
                     .collect(),
@@ -985,7 +1111,7 @@ impl Api {
             .await?;
         Ok(match created {
             Created::Created(application) => {
-                Answer::json(StatusCode::CREATED, &self.view(&application))
+                Answer::json(StatusCode::CREATED, &self.view(&application, user))
             }
             Created::NameTaken => Answer::error(
                 StatusCode::CONFLICT,
@@ -995,14 +1121,148 @@ impl Api {
         })
     }
 
-    async fn application(&self, method: &Method, name: &str) -> Result<Answer, DbError> {
+    /// `GET /v1/applications/<name>`: by whoever can open it, and by a
+    /// Platform administrator (blackbox/CONTRACT.md, "Contributors and
+    /// sharing: On the platform's API").
+    async fn application(
+        &self,
+        user: &User,
+        method: &Method,
+        name: &str,
+    ) -> Result<Answer, DbError> {
         let Some(application) = self.find(name).await? else {
             return Ok(no_application());
         };
-        Ok(if method == Method::GET {
-            Answer::json(StatusCode::OK, &self.view(&application))
-        } else {
-            Answer::method_not_allowed(method, "GET")
+        if method != Method::GET {
+            return Ok(Answer::method_not_allowed(method, "GET"));
+        }
+        if !application.can_open(user) && !self.is_administrator(user) {
+            return Ok(not_shared());
+        }
+        Ok(Answer::json(StatusCode::OK, &self.view(&application, user)))
+    }
+
+    /// What `user` may do with `name`; `None` for no such Application,
+    /// also for a name no Application can have, without asking the
+    /// database.
+    async fn standing(&self, name: &str, user: &User) -> Result<Option<Standing>, DbError> {
+        if check_name(name).is_err() {
+            return Ok(None);
+        }
+        self.registry.standing(name, user).await
+    }
+
+    /// Whether `user` may read the Application's Versions: whoever
+    /// can open it, and a Platform administrator.
+    fn may_read(&self, standing: Standing, user: &User) -> bool {
+        standing.can_open || self.is_administrator(user)
+    }
+
+    /// `POST /v1/applications/<name>/contributors` and `.../sharing`
+    /// (blackbox/CONTRACT.md, "Contributors and sharing: On the platform's
+    /// API"): by a Contributor. Refused, in order: `not-found`,
+    /// `method-not-allowed`, `not-a-contributor`, `malformed`; then the
+    /// change's own refusals.
+    async fn change_list(
+        &self,
+        user: &User,
+        method: &Method,
+        name: &str,
+        list: List,
+        body: &[u8],
+    ) -> Result<Answer, DbError> {
+        let Some(standing) = self.standing(name, user).await? else {
+            return Ok(no_application());
+        };
+        if method != Method::POST {
+            return Ok(Answer::method_not_allowed(method, "POST"));
+        }
+        if !standing.contributor {
+            return Ok(not_a_contributor_of_lists());
+        }
+        let change = match read_change(body, list) {
+            Ok(change) => change,
+            Err(problem) => {
+                let form = match list {
+                    List::Contributors => CONTRIBUTORS_FORM,
+                    List::SharedWith => SHARING_FORM,
+                };
+                return Ok(Answer::malformed(&problem, form));
+            }
+        };
+        Ok(match self.registry.change(name, user, &change).await? {
+            Changed::Changed {
+                application,
+                added,
+                removed,
+            } => {
+                if !added.is_empty() || !removed.is_empty() {
+                    let event = match list {
+                        List::Contributors => "contributors-changed",
+                        List::SharedWith => "sharing-changed",
+                    };
+                    log::record(
+                        event,
+                        json!({
+                            "application": name,
+                            "by": &user.id,
+                            "added": added.iter().map(KeptView::of).collect::<Vec<_>>(),
+                            "removed": removed.iter().map(KeptView::of).collect::<Vec<_>>(),
+                        }),
+                    );
+                }
+                Answer::json(StatusCode::OK, &self.view(&application, user))
+            }
+            Changed::NoSuchApplication => no_application(),
+            Changed::NotAContributor => not_a_contributor_of_lists(),
+            Changed::UnknownEmail(email) => Answer::json(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                &json!({ "error": {
+                    "reason": "unknown-email",
+                    "message": format!(
+                        "nobody who signed in here has the email {email:?}: name the person by their user id instead (`vm whoami` shows it to them), or ask them to sign in once; nothing was changed"
+                    ),
+                    "entry": { "email": email },
+                } }),
+            ),
+            Changed::AmbiguousEmail(email) => Answer::json(
+                StatusCode::CONFLICT,
+                &json!({ "error": {
+                    "reason": "ambiguous-email",
+                    "message": format!(
+                        "more than one person who signed in here has the email {email:?}: name the one you mean by their user id (`vm whoami` shows it to them); nothing was changed"
+                    ),
+                    "entry": { "email": email },
+                } }),
+            ),
+            Changed::LastContributor(removed) => Answer::json(
+                StatusCode::CONFLICT,
+                &json!({ "error": {
+                    "reason": "last-contributor",
+                    "message": format!(
+                        "removing {} would leave the Application with no Contributor: add another Contributor first (or in the same request); nothing was changed",
+                        described(&removed)
+                    ),
+                    "entries": removed.iter().map(KeptView::of).collect::<Vec<_>>(),
+                } }),
+            ),
+            Changed::TooMany(added) => {
+                let (most, what) = match list {
+                    List::Contributors => (MAX_CONTRIBUTORS, "Contributors"),
+                    List::SharedWith => (MAX_SHARED_WITH, "entries of whom it is shared with"),
+                };
+                Answer::json(
+                    StatusCode::CONFLICT,
+                    &json!({ "error": {
+                        "reason": "too-many",
+                        "message": format!(
+                            "adding {} would give the Application more than {most} {what}: remove some in the same request, or share with a Group in place of many people; nothing was changed",
+                            described(&added)
+                        ),
+                        "entries": added.iter().map(KeptView::of).collect::<Vec<_>>(),
+                    } }),
+                )
+            }
         })
     }
 
@@ -1014,25 +1274,21 @@ impl Api {
         query: Option<&str>,
         body: &[u8],
     ) -> Result<Answer, DbError> {
+        let Some(standing) = self.standing(name, user).await? else {
+            return Ok(no_application());
+        };
         if method == Method::GET {
+            if !self.may_read(standing, user) {
+                return Ok(not_shared());
+            }
             let Some(limit) = versions_limit(query) else {
-                // Malformed; but an Application that is not there is that
-                // first.
-                return Ok(match self.find(name).await? {
-                    Some(_) => Answer::error(
-                        StatusCode::BAD_REQUEST,
-                        "malformed",
-                        "the parameters are not the ones asked for: ?limit is a whole number from 1 to 1000, at most once",
-                    ),
-                    None => no_application(),
-                });
+                return Ok(Answer::error(
+                    StatusCode::BAD_REQUEST,
+                    "malformed",
+                    "the parameters are not the ones asked for: ?limit is a whole number from 1 to 1000, at most once",
+                ));
             };
-            let versions = if check_name(name).is_ok() {
-                self.registry.versions(name, limit).await?
-            } else {
-                None
-            };
-            let Some(versions) = versions else {
+            let Some(versions) = self.registry.versions(name, limit).await? else {
                 return Ok(no_application());
             };
             let versions = VersionsView {
@@ -1041,27 +1297,17 @@ impl Api {
             return Ok(Answer::json(StatusCode::OK, &versions));
         }
         if method != Method::POST {
-            return Ok(match self.find(name).await? {
-                Some(_) => Answer::method_not_allowed(method, "GET or POST"),
-                None => no_application(),
-            });
+            return Ok(Answer::method_not_allowed(method, "GET or POST"));
         }
-        let contributor = if check_name(name).is_ok() {
-            self.registry.is_contributor(name, &user.id).await?
-        } else {
-            None
-        };
-        match contributor {
-            None => return Ok(no_application()),
-            Some(false) => return Ok(not_a_contributor()),
-            Some(true) => {}
+        if !standing.contributor {
+            return Ok(not_a_contributor());
         }
         let version = match read_version(body) {
             Ok(version) => version,
             Err(problem) => return Ok(Answer::malformed(&problem, VERSION_FORM)),
         };
         Ok(
-            match self.registry.send_version(name, version, &user.id).await? {
+            match self.registry.send_version(name, version, user).await? {
                 Sent::Sent(version) => {
                     Answer::json(StatusCode::CREATED, &VersionView::of(&version))
                 }
@@ -1123,10 +1369,13 @@ impl Api {
 
     async fn version(
         &self,
+        user: &User,
         method: &Method,
         name: &str,
         number: Option<u64>,
     ) -> Result<Answer, DbError> {
+        // Who may read it is asked only of an Application that has the
+        // Version: one that has not is `not-found` for anyone, as before.
         let version = match number {
             Some(number) if check_name(name).is_ok() => self.registry.version(name, number).await?,
             _ => None,
@@ -1136,11 +1385,16 @@ impl Api {
                 "no such Version: list the Application's Versions at /v1/applications/<name>/versions",
             ));
         };
-        Ok(if method == Method::GET {
-            Answer::json(StatusCode::OK, &VersionView::of(&version))
-        } else {
-            Answer::method_not_allowed(method, "GET")
-        })
+        if method != Method::GET {
+            return Ok(Answer::method_not_allowed(method, "GET"));
+        }
+        match self.standing(name, user).await? {
+            Some(standing) if self.may_read(standing, user) => {
+                Ok(Answer::json(StatusCode::OK, &VersionView::of(&version)))
+            }
+            Some(_) => Ok(not_shared()),
+            None => Ok(no_application()),
+        }
     }
 
     /// `POST /v1/applications/<name>/go-back` (blackbox/CONTRACT.md,
@@ -1153,18 +1407,13 @@ impl Api {
         name: &str,
         body: &[u8],
     ) -> Result<Answer, DbError> {
-        let contributor = if check_name(name).is_ok() {
-            self.registry.is_contributor(name, &user.id).await?
-        } else {
-            None
-        };
-        let Some(contributor) = contributor else {
+        let Some(standing) = self.standing(name, user).await? else {
             return Ok(no_application());
         };
         if method != Method::POST {
             return Ok(Answer::method_not_allowed(method, "POST"));
         }
-        if !contributor {
+        if !standing.contributor {
             return Ok(Answer::error(
                 StatusCode::FORBIDDEN,
                 "not-a-contributor",
@@ -1222,18 +1471,13 @@ impl Api {
         name: &str,
         query: Option<&str>,
     ) -> Result<Answer, DbError> {
-        let contributor = if check_name(name).is_ok() {
-            self.registry.is_contributor(name, &user.id).await?
-        } else {
-            None
-        };
-        let Some(contributor) = contributor else {
+        let Some(standing) = self.standing(name, user).await? else {
             return Ok(no_application());
         };
         if method != Method::GET {
             return Ok(Answer::method_not_allowed(method, "GET"));
         }
-        if !contributor && !self.is_administrator(user) {
+        if !standing.contributor && !self.is_administrator(user) {
             return Ok(Answer::error(
                 StatusCode::FORBIDDEN,
                 "not-a-contributor",
@@ -1597,16 +1841,19 @@ impl Api {
         self.registry.application(name).await
     }
 
-    fn view<'a>(&self, application: &'a ApplicationRecord) -> ApplicationView<'a> {
+    /// The Application as `asker` is answered it: whom it is shared with
+    /// only to a Contributor or a Platform administrator.
+    fn view<'a>(&self, application: &'a ApplicationRecord, asker: &User) -> ApplicationView<'a> {
+        let contributor = application.is_contributor(asker);
+        let sees_sharing = contributor || self.is_administrator(asker);
         ApplicationView {
             name: &application.name,
             description: application.description.as_deref(),
             address: format!("{}.{}", application.name, self.domain),
-            contributors: application
-                .contributors
-                .iter()
-                .map(|user| ContributorView { user })
-                .collect(),
+            contributors: application.contributors.iter().map(EntryView::of).collect(),
+            shared_with: sees_sharing
+                .then(|| application.shared_with.iter().map(EntryView::of).collect()),
+            contributor,
             serving_version: application.serving_version,
             latest_version: application.latest_version,
             created_by: &application.created_by,
@@ -1621,16 +1868,106 @@ struct ApplicationView<'a> {
     name: &'a str,
     description: Option<&'a str>,
     address: String,
-    contributors: Vec<ContributorView<'a>>,
+    contributors: Vec<EntryView<'a>>,
+    /// `None` (null) to someone who is neither a Contributor nor a
+    /// Platform administrator.
+    shared_with: Option<Vec<EntryView<'a>>>,
+    /// Whether the asker is a Contributor.
+    contributor: bool,
     serving_version: Option<u64>,
     latest_version: Option<u64>,
     created_by: &'a str,
     created_at: &'a str,
 }
 
+/// What an entry names: `user`, `group` or `everyone: true`, one of them.
 #[derive(Serialize)]
-struct ContributorView<'a> {
-    user: &'a str,
+struct NamedView<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    group: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    everyone: Option<bool>,
+}
+
+impl<'a> NamedView<'a> {
+    fn of(named: &'a Named) -> Self {
+        let (user, group, everyone) = match named {
+            Named::User(id) => (Some(id.as_str()), None, None),
+            Named::Group(group) => (None, Some(group.as_str()), None),
+            Named::Everyone => (None, None, Some(true)),
+        };
+        Self {
+            user,
+            group,
+            everyone,
+        }
+    }
+}
+
+/// An entry of a list as the API answers it: what it names; a person's
+/// `name` and `email` (each null when not known); who added it and when.
+#[derive(Serialize)]
+struct EntryView<'a> {
+    #[serde(flatten)]
+    named: NamedView<'a>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<Option<&'a str>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    email: Option<Option<&'a str>>,
+    added_by: &'a str,
+    added_at: &'a str,
+}
+
+impl<'a> EntryView<'a> {
+    fn of(entry: &'a Entry) -> Self {
+        let person = matches!(entry.named, Named::User(_));
+        Self {
+            named: NamedView::of(&entry.named),
+            name: person.then_some(entry.name.as_deref()),
+            email: person.then_some(entry.email.as_deref()),
+            added_by: &entry.added_by,
+            added_at: &entry.added_at,
+        }
+    }
+}
+
+/// An entry as kept, for the program's log: what it names, who added it
+/// and when; nothing of the person's record.
+#[derive(Serialize)]
+struct KeptView<'a> {
+    #[serde(flatten)]
+    named: NamedView<'a>,
+    added_by: &'a str,
+    added_at: &'a str,
+}
+
+impl<'a> KeptView<'a> {
+    fn of(entry: &'a Entry) -> Self {
+        Self {
+            named: NamedView::of(&entry.named),
+            added_by: &entry.added_by,
+            added_at: &entry.added_at,
+        }
+    }
+}
+
+/// Entries in a message: `the person <id>`, `the Group <Group>`,
+/// `everyone`, each quoted as JSON quotes it, joined by commas.
+fn described(entries: &[Entry]) -> String {
+    let mut text = String::new();
+    for (n, entry) in entries.iter().enumerate() {
+        if n > 0 {
+            text.push_str(", ");
+        }
+        match &entry.named {
+            Named::User(id) => text.push_str(&format!("the person {id:?}")),
+            Named::Group(group) => text.push_str(&format!("the Group {group:?}")),
+            Named::Everyone => text.push_str("everyone"),
+        }
+    }
+    text
 }
 
 /// A Version as the API answers it.
@@ -1816,6 +2153,25 @@ fn still_serves(serving: Option<u64>) -> String {
 
 fn no_application() -> Answer {
     Answer::not_found("no such Application: create it with POST /v1/applications")
+}
+
+/// `403` `not-shared`: the asker can neither open the Application nor is
+/// a Platform administrator. Names no Contributor.
+fn not_shared() -> Answer {
+    Answer::error(
+        StatusCode::FORBIDDEN,
+        "not-shared",
+        "this Application is not shared with you: ask one of its Contributors to share it with you",
+    )
+}
+
+/// `403` `not-a-contributor` on a list of the Application's.
+fn not_a_contributor_of_lists() -> Answer {
+    Answer::error(
+        StatusCode::FORBIDDEN,
+        "not-a-contributor",
+        "you are not a Contributor of this Application, and only its Contributors may change its Contributors and whom it is shared with: ask one of them",
+    )
 }
 
 fn not_a_contributor() -> Answer {

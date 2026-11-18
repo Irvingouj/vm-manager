@@ -18,6 +18,19 @@
 //! changes at once leave memory as the database's last one whatever order
 //! they report back in.
 //!
+//! Who may change an Application and who may open it (blackbox/CONTRACT.md,
+//! "Contributors and sharing") is one table, `application_entries`: an
+//! entry of the Contributors or of the sharing names a user id, a Group or
+//! (for the sharing) everyone. Whether a User is a Contributor or can open
+//! is one indexed `EXISTS` over it (`can_open!`, `is_contributor!`),
+//! asked at every request and never held in memory, so a change counts
+//! from the very next request. A change of a list ([`Registry::change`]) is
+//! one transaction under the Application's row lock: the emails resolved,
+//! the removals and additions made, then the last-Contributor rule and the
+//! list's bound checked, and the whole rolled back if either fails. A
+//! list holds at most [`MAX_CONTRIBUTORS`] or [`MAX_SHARED_WITH`] entries;
+//! a change past that is refused and changes nothing.
+//!
 //! Going back ([`Registry::go_back`]) is one `UPDATE` that changes the
 //! serving Version only where it is still the one the caller saw: two
 //! go-backs from the same Version at once are serialised by the row's lock,
@@ -39,11 +52,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio_postgres::types::FromSql;
-use tokio_postgres::{Client, Row};
+use tokio_postgres::{Client, GenericClient, Row};
 
 use crate::log;
 use crate::own_db::{Migration, NotToTheEnd, OwnDatabases, Problem, Recorded, continues};
 use crate::platform_db::{DbError, PlatformDatabase, rfc3339};
+use crate::user::User;
 
 /// Names that are the platform's own and can never be an Application's.
 pub const RESERVED_NAMES: [&str; 6] = ["api", "auth", "dashboard", "git", "admin", "www"];
@@ -102,13 +116,147 @@ pub struct Serving {
     pub generation: i64,
 }
 
+/// The most Contributors an Application has.
+pub const MAX_CONTRIBUTORS: i64 = 100;
+
+/// The most entries of whom an Application is shared with.
+pub const MAX_SHARED_WITH: i64 = 1000;
+
+/// SQL: whether the entry `e` (of `application_entries`) names the person
+/// whose id is `$user` and whose Groups are `$groups` (a `text[]`): them,
+/// one of their Groups, or everyone. Compared exactly, byte for byte.
+macro_rules! names_person {
+    ($user:literal, $groups:literal) => {
+        concat!(
+            "(e.kind = 'everyone' OR (e.kind = 'user' AND e.name = ",
+            $user,
+            ") OR (e.kind = 'group' AND e.name = ANY (",
+            $groups,
+            ")))"
+        )
+    };
+}
+
+/// SQL: whether that person can open the Application whose id is `$app`:
+/// an entry of either list names them (an entry of the Contributors never
+/// is `everyone`). One probe of the index `(application_id, kind, name,
+/// list)` for each kind.
+macro_rules! can_open {
+    ($app:literal, $user:literal, $groups:literal) => {
+        concat!(
+            "EXISTS (SELECT 1 FROM application_entries e WHERE e.application_id = ",
+            $app,
+            " AND ",
+            crate::registry::names_person!($user, $groups),
+            ")"
+        )
+    };
+}
+
+/// SQL: whether that person is a Contributor of the Application `$app`.
+macro_rules! is_contributor {
+    ($app:literal, $user:literal, $groups:literal) => {
+        concat!(
+            "EXISTS (SELECT 1 FROM application_entries e WHERE e.application_id = ",
+            $app,
+            " AND e.list = 'contributors' AND ",
+            crate::registry::names_person!($user, $groups),
+            ")"
+        )
+    };
+}
+
+pub(crate) use {can_open, names_person};
+
+/// Which of an Application's two lists.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum List {
+    /// Who may change and deploy it.
+    Contributors,
+    /// Who may open it.
+    SharedWith,
+}
+
+impl List {
+    /// The list's name in the platform database.
+    fn stored(self) -> &'static str {
+        match self {
+            Self::Contributors => "contributors",
+            Self::SharedWith => "shared_with",
+        }
+    }
+
+    /// The most entries it holds.
+    fn bound(self) -> i64 {
+        match self {
+            Self::Contributors => MAX_CONTRIBUTORS,
+            Self::SharedWith => MAX_SHARED_WITH,
+        }
+    }
+}
+
+/// What an entry of a list names.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Named {
+    /// A person, by their user id.
+    User(String),
+    /// A Group.
+    Group(String),
+    /// Every User who can sign in (shared with only).
+    Everyone,
+}
+
+impl Named {
+    /// The kind and the name as stored.
+    fn stored(&self) -> (&'static str, &str) {
+        match self {
+            Self::User(id) => ("user", id),
+            Self::Group(group) => ("group", group),
+            Self::Everyone => ("everyone", ""),
+        }
+    }
+
+    fn of_stored(kind: &str, name: String) -> Result<Self, DbError> {
+        match kind {
+            "user" => Ok(Self::User(name)),
+            "group" => Ok(Self::Group(name)),
+            "everyone" => Ok(Self::Everyone),
+            _ => Err(DbError::unexpected("an entry of a list of an unknown kind")),
+        }
+    }
+
+    /// Whether it names `user` (them, one of their Groups, or everyone).
+    pub fn names(&self, user: &User) -> bool {
+        match self {
+            Self::User(id) => *id == user.id,
+            Self::Group(group) => user.groups.iter().any(|g| g == group),
+            Self::Everyone => true,
+        }
+    }
+}
+
+/// An entry of one of an Application's lists, as kept.
+#[derive(Debug)]
+pub struct Entry {
+    pub named: Named,
+    /// A person's name and email as last read at their sign-in; `None` for
+    /// someone who never signed in here, and for a Group or everyone.
+    pub name: Option<String>,
+    pub email: Option<String>,
+    pub added_by: String,
+    /// RFC 3339, UTC.
+    pub added_at: String,
+}
+
 /// An Application as the registry reports it.
 #[derive(Debug)]
 pub struct ApplicationRecord {
     pub name: String,
     pub description: Option<String>,
-    /// User ids, in the order they became Contributors.
-    pub contributors: Vec<String>,
+    /// In the order they were added.
+    pub contributors: Vec<Entry>,
+    /// In the order they were added.
+    pub shared_with: Vec<Entry>,
     pub serving_version: Option<u64>,
     /// The highest-numbered Version; `None` when there is none.
     pub latest_version: Option<u64>,
@@ -117,12 +265,98 @@ pub struct ApplicationRecord {
     pub created_at: String,
 }
 
+impl ApplicationRecord {
+    /// Whether `user` is one of its Contributors (by their id or a Group).
+    pub fn is_contributor(&self, user: &User) -> bool {
+        self.contributors.iter().any(|e| e.named.names(user))
+    }
+
+    /// Whether `user` can open it: a Contributor, or shared with them.
+    pub fn can_open(&self, user: &User) -> bool {
+        self.is_contributor(user) || self.shared_with.iter().any(|e| e.named.names(user))
+    }
+}
+
 /// An Application as a list of them shows it.
 #[derive(Debug)]
 pub struct ListedApplication {
     pub name: String,
     pub description: Option<String>,
     pub serving_version: Option<u64>,
+    /// Whether the User the list is for is a Contributor of it.
+    pub contributor: bool,
+}
+
+/// Where a User stands with an Application, by its two lists.
+#[derive(Clone, Copy, Debug)]
+pub struct Standing {
+    pub contributor: bool,
+    pub can_open: bool,
+}
+
+/// Whether a request to an Application's address may be given to it
+/// (blackbox/CONTRACT.md, "Contributors and sharing: Opening an
+/// Application").
+#[derive(Clone, Debug)]
+pub enum Opening {
+    /// No Application has that name.
+    NoSuchApplication,
+    /// The User can open it.
+    Opens,
+    /// It is not shared with the User, nor are they a Contributor: their
+    /// name as last read, when the platform knows it, for the page that
+    /// says so.
+    NotShared { name: Option<String> },
+}
+
+impl Opening {
+    /// What a row of `opens` (null when there is no such Application) and
+    /// the User's name comes to.
+    pub(crate) fn of(opens: Option<bool>, name: Option<String>) -> Self {
+        match opens {
+            None => Self::NoSuchApplication,
+            Some(true) => Self::Opens,
+            Some(false) => Self::NotShared { name },
+        }
+    }
+}
+
+/// What is asked to be added or removed: an entry, or a person by the
+/// email the platform last read of them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Asked {
+    Entry(Named),
+    Email(String),
+}
+
+/// A change of one list: made whole or not at all.
+#[derive(Debug)]
+pub struct Change {
+    pub list: List,
+    pub add: Vec<Asked>,
+    pub remove: Vec<Asked>,
+}
+
+/// What a change of a list came to.
+#[derive(Debug)]
+pub enum Changed {
+    /// Made: the Application as it is after, and what was added and
+    /// removed (each as kept), in order. Both empty when nothing changed.
+    Changed {
+        application: ApplicationRecord,
+        added: Vec<Entry>,
+        removed: Vec<Entry>,
+    },
+    NoSuchApplication,
+    NotAContributor,
+    /// Nobody who signed in here has this email.
+    UnknownEmail(String),
+    /// More than one person has it.
+    AmbiguousEmail(String),
+    /// The change would leave no Contributor: the entries it removed.
+    LastContributor(Vec<Entry>),
+    /// The list would pass its bound: the entries it added.
+    TooMany(Vec<Entry>),
 }
 
 /// A Version as the registry reports it; the bundle itself is not in it.
@@ -351,51 +585,42 @@ impl Registry {
     }
 
     /// Creates the Application `name`, with `creator` as its first
-    /// Contributor. The name must have passed [`check_name`].
+    /// Contributor (added by them, when it was created), shared with
+    /// nobody. The name must have passed [`check_name`].
     pub async fn create_application(
         &self,
         name: &str,
         description: Option<&str>,
         creator: &str,
     ) -> Result<Created, DbError> {
-        let row = self
+        let created = self
             .database
             .pool()
             .run(async |client: &mut Client| {
-                client
+                let made = client
                     .query_opt(
-                        concat!(
-                            "WITH created AS (
-                                INSERT INTO applications (name, description, created_by)
-                                VALUES ($1, $2, $3)
-                                ON CONFLICT (name) DO NOTHING
-                                RETURNING id, name, description, created_by, created_at
-                            ), contributor AS (
-                                INSERT INTO contributors (application_id, user_id)
-                                SELECT id, $3 FROM created
-                            )
-                            SELECT name, description, created_by, ",
-                            rfc3339!("created_at"),
-                            " FROM created"
-                        ),
+                        "WITH created AS (
+                            INSERT INTO applications (name, description, created_by)
+                            VALUES ($1, $2, $3)
+                            ON CONFLICT (name) DO NOTHING
+                            RETURNING id, created_at
+                        )
+                        INSERT INTO application_entries
+                            (application_id, list, kind, name, added_by, added_at)
+                        SELECT id, 'contributors', 'user', $3, $3, created_at FROM created
+                        RETURNING application_id",
                         &[&name, &description, &creator],
                     )
                     .await
-                    .map_err(DbError::from)
+                    .map_err(DbError::from)?;
+                let Some(made) = made else { return Ok(None) };
+                record_of(client, Key::Id(get(&made, 0)?)).await
             })
             .await?;
-        let Some(row) = row else {
-            return Ok(Created::NameTaken);
-        };
-        Ok(Created::Created(ApplicationRecord {
-            name: get(&row, 0)?,
-            description: get(&row, 1)?,
-            contributors: vec![get(&row, 2)?],
-            serving_version: None,
-            latest_version: None,
-            created_by: get(&row, 2)?,
-            created_at: get(&row, 3)?,
-        }))
+        Ok(match created {
+            Some(application) => Created::Created(application),
+            None => Created::NameTaken,
+        })
     }
 
     /// Forgets the Versions of `name` older than its newest `keep`, in one
@@ -433,57 +658,33 @@ impl Registry {
             .await
     }
 
-    /// The Application `name`, if there is one.
+    /// The Application `name`, if there is one, with both its lists.
     pub async fn application(&self, name: &str) -> Result<Option<ApplicationRecord>, DbError> {
-        let row = self
-            .database
+        self.database
             .pool()
-            .run(async |client: &mut Client| {
-                client
-                    .query_opt(
-                        concat!(
-                            "SELECT a.name, a.description,
-                                coalesce((SELECT array_agg(c.user_id ORDER BY c.id)
-                                          FROM contributors c WHERE c.application_id = a.id),
-                                         '{}'::text[]),
-                                a.serving_version, a.created_by, ",
-                            rfc3339!("a.created_at"),
-                            ", (SELECT max(v.number) FROM versions v WHERE v.application_id = a.id)
-                              FROM applications a WHERE a.name = $1"
-                        ),
-                        &[&name],
-                    )
-                    .await
-                    .map_err(DbError::from)
-            })
-            .await?;
-        let Some(row) = row else { return Ok(None) };
-        Ok(Some(ApplicationRecord {
-            name: get(&row, 0)?,
-            description: get(&row, 1)?,
-            contributors: get(&row, 2)?,
-            serving_version: get::<Option<i32>>(&row, 3)?.map(number_of).transpose()?,
-            latest_version: get::<Option<i32>>(&row, 6)?.map(number_of).transpose()?,
-            created_by: get(&row, 4)?,
-            created_at: get(&row, 5)?,
-        }))
+            .run(async |client: &mut Client| record_of(client, Key::Name(name)).await)
+            .await
     }
 
-    /// The Applications `user` is a Contributor of, by name (compared byte
-    /// by byte, whatever the database's collation).
-    pub async fn contributed_to(&self, user: &str) -> Result<Vec<ListedApplication>, DbError> {
+    /// The Applications `user` is a Contributor of or can open, each once,
+    /// by name (compared byte by byte, whatever the database's collation).
+    pub async fn listed_for(&self, user: &User) -> Result<Vec<ListedApplication>, DbError> {
         let rows = self
             .database
             .pool()
             .run(async |client: &mut Client| {
                 client
                     .query(
-                        "SELECT a.name, a.description, a.serving_version
-                         FROM applications a
-                         JOIN contributors c ON c.application_id = a.id
-                         WHERE c.user_id = $1
-                         ORDER BY a.name COLLATE \"C\"",
-                        &[&user],
+                        concat!(
+                            "SELECT a.name, a.description, a.serving_version, ",
+                            is_contributor!("a.id", "$1", "$2"),
+                            " FROM applications a
+                              WHERE a.id IN (SELECT e.application_id FROM application_entries e
+                                             WHERE ",
+                            names_person!("$1", "$2"),
+                            ") ORDER BY a.name COLLATE \"C\""
+                        ),
+                        &[&user.id, &user.groups],
                     )
                     .await
                     .map_err(DbError::from)
@@ -495,30 +696,153 @@ impl Registry {
                     name: get(row, 0)?,
                     description: get(row, 1)?,
                     serving_version: get::<Option<i32>>(row, 2)?.map(number_of).transpose()?,
+                    contributor: get(row, 3)?,
                 })
             })
             .collect()
     }
 
-    /// Whether `user` is a Contributor of `name`; `None` when there is no
-    /// such Application.
-    pub async fn is_contributor(&self, name: &str, user: &str) -> Result<Option<bool>, DbError> {
+    /// What `user` may do with `name`; `None` when there is no such
+    /// Application. One query.
+    pub async fn standing(&self, name: &str, user: &User) -> Result<Option<Standing>, DbError> {
         let row = self
             .database
             .pool()
             .run(async |client: &mut Client| {
                 client
                     .query_opt(
-                        "SELECT EXISTS (SELECT 1 FROM contributors c
-                                        WHERE c.application_id = a.id AND c.user_id = $2)
-                         FROM applications a WHERE a.name = $1",
-                        &[&name, &user],
+                        concat!(
+                            "SELECT ",
+                            is_contributor!("a.id", "$2", "$3"),
+                            ", ",
+                            can_open!("a.id", "$2", "$3"),
+                            " FROM applications a WHERE a.name = $1"
+                        ),
+                        &[&name, &user.id, &user.groups],
                     )
                     .await
                     .map_err(DbError::from)
             })
             .await?;
-        row.map(|row| get(&row, 0)).transpose()
+        row.map(|row| {
+            Ok(Standing {
+                contributor: get(&row, 0)?,
+                can_open: get(&row, 1)?,
+            })
+        })
+        .transpose()
+    }
+
+    /// Whether a request of `user` to `name`'s address may be given to it,
+    /// asked at every such request: one query, by the Application's name
+    /// (its unique index) and then the index of its entries; the User's
+    /// name is read (by their id, the primary key) only when the answer is
+    /// no.
+    pub async fn opening(&self, name: &str, user: &User) -> Result<Opening, DbError> {
+        let row = self
+            .database
+            .pool()
+            .run(async |client: &mut Client| {
+                client
+                    .query_opt(
+                        concat!(
+                            "SELECT o.opens, CASE WHEN o.opens THEN NULL
+                                    ELSE (SELECT u.name FROM users u WHERE u.id = $2) END
+                             FROM applications a
+                             CROSS JOIN LATERAL (SELECT ",
+                            can_open!("a.id", "$2", "$3"),
+                            " AS opens) o WHERE a.name = $1"
+                        ),
+                        &[&name, &user.id, &user.groups],
+                    )
+                    .await
+                    .map_err(DbError::from)
+            })
+            .await?;
+        Ok(match row {
+            None => Opening::NoSuchApplication,
+            Some(row) => Opening::of(Some(get(&row, 0)?), get(&row, 1)?),
+        })
+    }
+
+    /// Changes one list of `name` as `by` asks, who must be a Contributor:
+    /// whole or not at all, in one transaction that holds the
+    /// Application's row lock from the start, so that two changes at once
+    /// take turns and the bounds and the last Contributor are checked on
+    /// the list as the change leaves it. Every entry asked by email is
+    /// resolved first; then what is removed, then what is added; then the
+    /// list is counted. Any refusal rolls everything back.
+    pub async fn change(&self, name: &str, by: &User, change: &Change) -> Result<Changed, DbError> {
+        let list = change.list.stored();
+        self.database
+            .pool()
+            .run(async |client: &mut Client| {
+                let transaction = client.transaction().await.map_err(DbError::from)?;
+                let found = transaction
+                    .query_opt(
+                        concat!(
+                            "SELECT a.id, ",
+                            is_contributor!("a.id", "$2", "$3"),
+                            " FROM applications a WHERE a.name = $1 FOR UPDATE OF a"
+                        ),
+                        &[&name, &by.id, &by.groups],
+                    )
+                    .await
+                    .map_err(DbError::from)?;
+                let Some(found) = found else {
+                    return Ok(Changed::NoSuchApplication);
+                };
+                let id: i64 = get(&found, 0)?;
+                if !get::<bool>(&found, 1)? {
+                    return Ok(Changed::NotAContributor);
+                }
+                let mut resolved: [Vec<Named>; 2] = [Vec::new(), Vec::new()];
+                for (asked, into) in [&change.add, &change.remove].into_iter().zip(&mut resolved) {
+                    into.reserve(asked.len());
+                    for one in asked {
+                        match one {
+                            Asked::Entry(named) => into.push(named.clone()),
+                            Asked::Email(email) => match person_of(&transaction, email).await? {
+                                Person::One(id) => into.push(Named::User(id)),
+                                Person::Nobody => {
+                                    return Ok(Changed::UnknownEmail(email.clone()));
+                                }
+                                Person::Several => {
+                                    return Ok(Changed::AmbiguousEmail(email.clone()));
+                                }
+                            },
+                        }
+                    }
+                }
+                let [add, remove] = resolved;
+                let removed = removed_from(&transaction, id, list, &remove).await?;
+                let added = added_to(&transaction, id, list, &add, &by.id).await?;
+                let counted = transaction
+                    .query_one(
+                        "SELECT count(*) FROM application_entries
+                         WHERE application_id = $1 AND list = $2",
+                        &[&id, &list],
+                    )
+                    .await
+                    .map_err(DbError::from)?;
+                let count: i64 = get(&counted, 0)?;
+                if change.list == List::Contributors && count == 0 {
+                    return Ok(Changed::LastContributor(removed));
+                }
+                if count > change.list.bound() {
+                    return Ok(Changed::TooMany(added));
+                }
+                let application = record_of(&transaction, Key::Id(id)).await?.ok_or_else(|| {
+                    DbError::unexpected("an Application gone while it was locked")
+                })?;
+                transaction.commit().await.map_err(DbError::from)?;
+                Ok(Changed::Changed {
+                    application,
+                    added,
+                    removed,
+                })
+            })
+            .await
     }
 
     /// Sends a Version of `name` as `sender`, who must be a Contributor. Its
@@ -534,12 +858,12 @@ impl Registry {
         self: &Arc<Self>,
         name: &str,
         version: NewVersion,
-        sender: &str,
+        sender: &User,
     ) -> Result<Sent, DbError> {
         let registry = Arc::clone(self);
         // Copied: the task owns what it works on; once per Version sent.
         let name = name.to_owned();
-        let sender = sender.to_owned();
+        let sender = sender.clone();
         self.own
             .to_the_end(async move { registry.send_version_here(&name, version, &sender).await })
             .await
@@ -554,7 +878,7 @@ impl Registry {
         &self,
         name: &str,
         version: NewVersion,
-        sender: &str,
+        sender: &User,
     ) -> Result<Sent, DbError> {
         let found = self
             .database
@@ -562,13 +886,15 @@ impl Registry {
             .run(async |client: &mut Client| {
                 client
                     .query_opt(
-                        "SELECT a.id, EXISTS (SELECT 1 FROM contributors c
-                                              WHERE c.application_id = a.id AND c.user_id = $2),
-                                (SELECT v.migrations FROM versions v WHERE v.application_id = a.id
-                                 ORDER BY v.number DESC LIMIT 1),
-                                a.serving_version
-                         FROM applications a WHERE a.name = $1",
-                        &[&name, &sender],
+                        concat!(
+                            "SELECT a.id, ",
+                            is_contributor!("a.id", "$2", "$3"),
+                            ", (SELECT v.migrations FROM versions v WHERE v.application_id = a.id
+                                ORDER BY v.number DESC LIMIT 1),
+                               a.serving_version
+                             FROM applications a WHERE a.name = $1"
+                        ),
+                        &[&name, &sender.id, &sender.groups],
                     )
                     .await
                     .map_err(DbError::from)
@@ -589,7 +915,7 @@ impl Registry {
         }
         match self
             .own
-            .prepare(id, name, sender, &version.migrations)
+            .prepare(id, name, &sender.id, &version.migrations)
             .await
         {
             // What the migrations changed is shipped to the Change history:
@@ -625,7 +951,7 @@ impl Registry {
                 return Ok(Sent::OwnDatabaseUnavailable { step, code });
             }
         }
-        self.record(name, id, version, sender).await
+        self.record(name, id, version, &sender.id).await
     }
 
     /// Records `version` as the next of the Application `id`, unless a
@@ -949,6 +1275,196 @@ impl Registry {
             .await?;
         row.as_ref().map(version_of).transpose()
     }
+}
+
+/// How an Application is looked up.
+#[derive(Clone, Copy)]
+enum Key<'a> {
+    Name(&'a str),
+    Id(i64),
+}
+
+/// The Application by `key`, with both its lists, read on `client` (a
+/// transaction's, to see what it changed): two queries.
+async fn record_of<C: GenericClient>(
+    client: &C,
+    key: Key<'_>,
+) -> Result<Option<ApplicationRecord>, DbError> {
+    macro_rules! application_where {
+        ($condition:literal) => {
+            concat!(
+                "SELECT a.id, a.name, a.description, a.serving_version, a.created_by, ",
+                rfc3339!("a.created_at"),
+                ", (SELECT max(v.number) FROM versions v WHERE v.application_id = a.id)
+                  FROM applications a WHERE ",
+                $condition
+            )
+        };
+    }
+    let row = match key {
+        Key::Name(name) => {
+            client
+                .query_opt(application_where!("a.name = $1"), &[&name])
+                .await
+        }
+        Key::Id(id) => {
+            client
+                .query_opt(application_where!("a.id = $1"), &[&id])
+                .await
+        }
+    }
+    .map_err(DbError::from)?;
+    let Some(row) = row else { return Ok(None) };
+    let id: i64 = get(&row, 0)?;
+    let rows = client
+        .query(
+            concat!(
+                "SELECT e.list, e.kind, e.name, u.name, u.email, e.added_by, ",
+                rfc3339!("e.added_at"),
+                " FROM application_entries e
+                  LEFT JOIN users u ON e.kind = 'user' AND u.id = e.name
+                  WHERE e.application_id = $1 ORDER BY e.id"
+            ),
+            &[&id],
+        )
+        .await
+        .map_err(DbError::from)?;
+    let mut contributors = Vec::new();
+    let mut shared_with = Vec::new();
+    for row in &rows {
+        let list: &str = get(row, 0)?;
+        let entry = entry_of(row, 1)?;
+        if list == List::Contributors.stored() {
+            contributors.push(entry);
+        } else {
+            shared_with.push(entry);
+        }
+    }
+    Ok(Some(ApplicationRecord {
+        name: get(&row, 1)?,
+        description: get(&row, 2)?,
+        contributors,
+        shared_with,
+        serving_version: get::<Option<i32>>(&row, 3)?.map(number_of).transpose()?,
+        latest_version: get::<Option<i32>>(&row, 6)?.map(number_of).transpose()?,
+        created_by: get(&row, 4)?,
+        created_at: get(&row, 5)?,
+    }))
+}
+
+/// An entry from the columns `kind, name, <person's name>, <person's
+/// email>, added_by, added_at` from `at` on.
+fn entry_of(row: &Row, at: usize) -> Result<Entry, DbError> {
+    let kind: &str = get(row, at)?;
+    Ok(Entry {
+        named: Named::of_stored(kind, get(row, at + 1)?)?,
+        name: get(row, at + 2)?,
+        email: get(row, at + 3)?,
+        added_by: get(row, at + 4)?,
+        added_at: get(row, at + 5)?,
+    })
+}
+
+/// Who the platform knows by an email.
+enum Person {
+    One(String),
+    Nobody,
+    Several,
+}
+
+/// The person whose email, as last read at their sign-in, is `email`,
+/// letter case ignored (by the index on `lower(email)`); at most two read.
+async fn person_of<C: GenericClient>(client: &C, email: &str) -> Result<Person, DbError> {
+    let rows = client
+        .query(
+            "SELECT id FROM users WHERE lower(email) = lower($1) ORDER BY id LIMIT 2",
+            &[&email],
+        )
+        .await
+        .map_err(DbError::from)?;
+    Ok(match rows.as_slice() {
+        [] => Person::Nobody,
+        [one] => Person::One(get(one, 0)?),
+        _ => Person::Several,
+    })
+}
+
+/// The kinds and the names of `entries`, as two arrays for `unnest`.
+fn arrays(entries: &[Named]) -> (Vec<&str>, Vec<&str>) {
+    entries.iter().map(Named::stored).unzip()
+}
+
+/// Removes `entries` (those there) from the list `list` of the Application
+/// `id`, in one statement; answers the entries removed, as they were kept,
+/// in the order they had been added.
+async fn removed_from<C: GenericClient>(
+    client: &C,
+    id: i64,
+    list: &str,
+    entries: &[Named],
+) -> Result<Vec<Entry>, DbError> {
+    if entries.is_empty() {
+        return Ok(Vec::new());
+    }
+    let (kinds, names) = arrays(entries);
+    let rows = client
+        .query(
+            concat!(
+                "WITH asked AS (SELECT * FROM unnest($3::text[], $4::text[]) AS t (kind, name)),
+                 gone AS (
+                    DELETE FROM application_entries e USING asked
+                    WHERE e.application_id = $1 AND e.list = $2
+                      AND e.kind = asked.kind AND e.name = asked.name
+                    RETURNING e.id, e.kind, e.name, e.added_by, e.added_at
+                 )
+                 SELECT g.kind, g.name, u.name, u.email, g.added_by, ",
+                rfc3339!("g.added_at"),
+                " FROM gone g LEFT JOIN users u ON g.kind = 'user' AND u.id = g.name
+                  ORDER BY g.id"
+            ),
+            &[&id, &list, &kinds, &names],
+        )
+        .await
+        .map_err(DbError::from)?;
+    rows.iter().map(|row| entry_of(row, 0)).collect()
+}
+
+/// Adds `entries` (those not there) to the list `list` of the Application
+/// `id`, as added by `by`, in one statement and in their order (an entry
+/// given twice is added once; one there keeps its row); answers the
+/// entries added, in order.
+async fn added_to<C: GenericClient>(
+    client: &C,
+    id: i64,
+    list: &str,
+    entries: &[Named],
+    by: &str,
+) -> Result<Vec<Entry>, DbError> {
+    if entries.is_empty() {
+        return Ok(Vec::new());
+    }
+    let (kinds, names) = arrays(entries);
+    let rows = client
+        .query(
+            concat!(
+                "WITH added AS (
+                    INSERT INTO application_entries (application_id, list, kind, name, added_by)
+                    SELECT $1, $2, t.kind, t.name, $5
+                    FROM unnest($3::text[], $4::text[]) WITH ORDINALITY AS t (kind, name, n)
+                    ORDER BY t.n
+                    ON CONFLICT (application_id, kind, name, list) DO NOTHING
+                    RETURNING id, kind, name, added_by, added_at
+                 )
+                 SELECT a.kind, a.name, u.name, u.email, a.added_by, ",
+                rfc3339!("a.added_at"),
+                " FROM added a LEFT JOIN users u ON a.kind = 'user' AND u.id = a.name
+                  ORDER BY a.id"
+            ),
+            &[&id, &list, &kinds, &names, &by],
+        )
+        .await
+        .map_err(DbError::from)?;
+    rows.iter().map(|row| entry_of(row, 0)).collect()
 }
 
 fn version_of(row: &Row) -> Result<VersionRecord, DbError> {

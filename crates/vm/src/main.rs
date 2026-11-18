@@ -400,6 +400,7 @@ fn run(serve: &Serve) -> Result<(), String> {
             runner,
             logs,
             max_request_body_bytes: 1024 * 1024,
+            decides_opening: true,
         });
         server::serve(listener, ingress, server::Limits::default()).await;
         drop(writer);

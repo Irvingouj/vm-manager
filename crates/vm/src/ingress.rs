@@ -15,7 +15,13 @@
 //! Application's session cookie signs a request in; without, only the
 //! [`SignIn`] counts. Then a request from another origin than the
 //! Application's own is refused ([`from_another_origin`]), whatever the
-//! sign-in; then the serving Version, which the Application registry holds
+//! sign-in; then whether the User can open the Application, decided at
+//! this request (a Contributor, or someone it is shared with: with OIDC the
+//! answer comes with the session's own query, with the stand-in it is one
+//! query, [`Registry::opening`]), so that one it is not shared with gets
+//! the `403` of the platform's own before the Application is handed
+//! anything (the local run serves every test User and does not ask); then
+//! the serving Version, which the Application registry holds
 //! in memory, is run by the Request runner, the platform's cookies taken
 //! out of the request and kept out of the answer ([`cookies`]). Its own
 //! refusals are short plain text. Every answer carries `x-vm-request-id`,
@@ -40,9 +46,9 @@ use crate::cookies;
 use crate::gateway::Transactions;
 use crate::log;
 use crate::oidc::sessions::{Current, Outcome as Renewed};
-use crate::oidc::{AUTH_NAME, Oidc, SESSION_PATH};
+use crate::oidc::{AUTH_NAME, Oidc, SESSION_PATH, asks_for_a_page, pages};
 use crate::origin::{Public, from_another_origin};
-use crate::registry::{Registry, check_name};
+use crate::registry::{Opening, Registry, check_name};
 use crate::runner::{InFlight, Outcome, RequestRunner};
 use crate::sign_in::{RESERVED_HEADER_PREFIX, SignIn, SignedIn, remove_reserved_headers};
 use crate::tool_credentials::{self, Digest, Presented, ToolCredentials};
@@ -84,6 +90,10 @@ pub struct Ingress {
     pub logs: Arc<Logs>,
     /// The largest request body read; past it the answer is 413.
     pub max_request_body_bytes: usize,
+    /// Whether a request is given to an Application only when its User can
+    /// open it (`vm serve`); the local run serves every test User of the
+    /// project.
+    pub decides_opening: bool,
 }
 
 /// What the request record knows.
@@ -191,6 +201,9 @@ impl Ingress {
                 .await;
             return finish(&known, api_response(answer));
         }
+        // With OIDC, whether the User may open the Application comes with
+        // their session, from the one query that finds it.
+        let mut decided = None;
         let user = match self.oidc.as_ref().filter(|o| o.connected().is_some()) {
             Some(oidc) => {
                 if name == Some(AUTH_NAME) {
@@ -208,7 +221,10 @@ impl Ingress {
                     None => Current::None,
                 };
                 match current {
-                    Current::User { user, .. } => user,
+                    Current::User { user, opening, .. } => {
+                        decided = opening;
+                        user
+                    }
                     Current::None => {
                         let answer = oidc
                             .not_signed_in(&parts, name, port)
@@ -245,6 +261,52 @@ impl Ingress {
                 ),
             );
         }
+        // Who can open the Application, decided at this request, before it
+        // is handed anything: an address that is no Application's is the
+        // `404`, one not shared with the User the `403`, and only then is
+        // the serving Version looked for.
+        if self.decides_opening
+            && let Some(name) = name.filter(|n| check_name(n).is_ok())
+        {
+            let opening = match decided {
+                Some(opening) => Ok(opening),
+                None => self.registry.opening(name, &user).await,
+            };
+            match opening {
+                Ok(Opening::Opens) => {}
+                Ok(Opening::NoSuchApplication) => {
+                    let known = Known {
+                        user: Some(&user.id),
+                        ..known
+                    };
+                    return finish(&known, no_application());
+                }
+                Ok(Opening::NotShared { name: person }) => {
+                    let known = Known {
+                        user: Some(&user.id),
+                        application: Some(name),
+                        ..known
+                    };
+                    let answer = if asks_for_a_page(&parts) {
+                        pages::not_shared(name, &user.id, person.as_deref())
+                    } else {
+                        not_shared(name)
+                    };
+                    return finish(&known, answer);
+                }
+                Err(error) => {
+                    log::record(
+                        "platform-database-failed",
+                        json!({ "error": error.to_string() }),
+                    );
+                    let known = Known {
+                        user: Some(&user.id),
+                        ..known
+                    };
+                    return finish(&known, unavailable());
+                }
+            }
+        }
         // From memory: no round trip to the platform database. The request
         // holds this Version until it ends, whatever is sent meanwhile.
         let Some(serving) = name.and_then(|name| self.registry.serving(name)) else {
@@ -252,13 +314,7 @@ impl Ingress {
                 user: Some(&user.id),
                 ..known
             };
-            return finish(
-                &known,
-                own(
-                    StatusCode::NOT_FOUND,
-                    "Not found: no Application at this address.\n",
-                ),
-            );
+            return finish(&known, no_application());
         };
         let in_flight = Arc::new(InFlight {
             request: Arc::clone(&id),
@@ -441,6 +497,27 @@ fn for_application(headers: &HeaderMap) -> HashMap<String, String> {
             .or_insert_with(|| value.into_owned());
     }
     joined
+}
+
+/// The `404` of an address that is no Application's, or of one with no
+/// serving Version.
+fn no_application() -> Response<Full<Bytes>> {
+    own(
+        StatusCode::NOT_FOUND,
+        "Not found: no Application at this address.\n",
+    )
+}
+
+/// The `403` of an Application not shared with the User, for a request
+/// that is not a page: one sentence naming the Application (a DNS label of
+/// at most 63 characters, so the body is at most 160 bytes), nothing of
+/// the User's.
+fn not_shared(application: &str) -> Response<Full<Bytes>> {
+    let mut response = own(StatusCode::FORBIDDEN, "");
+    *response.body_mut() = Full::new(Bytes::from(format!(
+        "The Application {application} is not shared with you: ask one of its Contributors to share it.\n"
+    )));
+    response
 }
 
 /// The `401` of anyone not signed in, whatever was asked for and however

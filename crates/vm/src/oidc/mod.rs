@@ -169,7 +169,7 @@ pub fn path_only(next: Option<&str>) -> String {
 
 /// Whether a request asks for a page: a `GET` or `HEAD` whose `Accept` has
 /// `text/html`.
-fn asks_for_a_page(parts: &Parts) -> bool {
+pub fn asks_for_a_page(parts: &Parts) -> bool {
     (parts.method == Method::GET || parts.method == Method::HEAD)
         && parts.headers.get_all(ACCEPT).iter().any(|a| {
             a.as_bytes()

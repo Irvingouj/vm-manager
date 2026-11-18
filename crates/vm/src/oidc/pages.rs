@@ -116,6 +116,30 @@ pub fn no_application(name: &str) -> Response<Full<Bytes>> {
     )
 }
 
+/// `403`: the Application is not shared with the person signed in. It names
+/// the Application and whom they are signed in as (their id, and their
+/// name when the platform knows it), all escaped, and no Contributor.
+pub fn not_shared(application: &str, id: &str, name: Option<&str>) -> Response<Full<Bytes>> {
+    let who = match name {
+        Some(name) => format!(
+            "<strong>{}</strong> (id <code>{}</code>)",
+            escape(name),
+            escape(id)
+        ),
+        None => format!("id <code>{}</code>", escape(id)),
+    };
+    page(
+        StatusCode::FORBIDDEN,
+        "This Application is not shared with you",
+        &format!(
+            "<p>The Application <code>{}</code> is not shared with you. You are signed in as {who}.</p>\
+             <p>To open it, ask one of its Contributors to share it with you.</p>\
+             <p><a href=\"/sign-out\">Sign out</a></p>",
+            escape(application)
+        ),
+    )
+}
+
 /// `404` of every other path of the sign-in address.
 pub fn not_found() -> Response<Full<Bytes>> {
     page(

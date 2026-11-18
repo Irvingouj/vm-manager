@@ -363,6 +363,7 @@ impl Live {
             runner,
             logs,
             max_request_body_bytes: MAX_BODY_BYTES,
+            decides_opening: false,
         };
         Ok(Self {
             database,
@@ -820,8 +821,14 @@ async fn local_version(
             .and_then(|(_, recorded)| recorded.get("name").and_then(Value::as_str))
             .map(str::to_owned)
     });
+    // The local run's Builder, in no Group: the Contributor who created
+    // the local Application.
+    let builder = crate::user::User {
+        id: BUILDER.to_owned(),
+        groups: Vec::new(),
+    };
     match registry
-        .send_version(&manifest.name, version, BUILDER)
+        .send_version(&manifest.name, version, &builder)
         .await
         .map_err(failed)?
     {

@@ -459,6 +459,51 @@ pub const STEPS: &[Step] = &[
             ADD COLUMN from_sign_in boolean NOT NULL DEFAULT false;
     ",
     },
+    Step {
+        number: 15,
+        name: "contributors and sharing",
+        sql: "
+        -- An Application's two lists (crate::registry; blackbox/CONTRACT.md,
+        -- \"Contributors and sharing\"): its Contributors, who may change and
+        -- deploy it, and whom it is shared with, who may open it. An entry
+        -- names a person (`user`, their id), a Group (`group`) or, shared
+        -- with only, every User (`everyone`, with an empty `name`). `id` is
+        -- the order entries were added in; an entry added again keeps its
+        -- row. Who added it and when are kept; a removal deletes the row.
+        -- The bounds (100 Contributors, 1,000 shared with, never no
+        -- Contributor) are checked by the program under the Application's
+        -- row lock, in the transaction of the change.
+        CREATE TABLE application_entries (
+            id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+            application_id bigint NOT NULL REFERENCES applications (id) ON DELETE CASCADE,
+            list text NOT NULL CHECK (list IN ('contributors', 'shared_with')),
+            kind text NOT NULL CHECK (kind IN ('user', 'group', 'everyone')),
+            name text NOT NULL,
+            added_by text NOT NULL,
+            added_at timestamptz NOT NULL DEFAULT now(),
+            CHECK ((kind = 'everyone') = (name = '')),
+            CHECK (kind <> 'everyone' OR list = 'shared_with'),
+            -- Also the index of who may open an Application, and who is its
+            -- Contributor, at each request: by the Application, then what an
+            -- entry names.
+            UNIQUE (application_id, kind, name, list)
+        );
+        -- The Applications a User contributes to or can open
+        -- (GET /v1/applications).
+        CREATE INDEX application_entries_named ON application_entries (kind, name);
+        -- Today's Contributors become people's entries, each added by the
+        -- Application's creator when it was created, in the order they were
+        -- added.
+        INSERT INTO application_entries (application_id, list, kind, name, added_by, added_at)
+            SELECT c.application_id, 'contributors', 'user', c.user_id, a.created_by, a.created_at
+            FROM contributors c JOIN applications a ON a.id = c.application_id
+            ORDER BY c.id;
+        DROP TABLE contributors;
+        -- A person named by the email the platform last read of them, letter
+        -- case ignored.
+        CREATE INDEX users_email ON users (lower(email));
+    ",
+    },
 ];
 
 /// The advisory lock every step's transaction takes first: "vm steps".
