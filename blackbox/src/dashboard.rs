@@ -607,7 +607,8 @@ pub struct Page {
 impl Page {
     /// Reads an answer as a page of the Dashboard, failing unless it is
     /// one: `text/html` with exactly one element `data-vm-user`. Also fails
-    /// unless it passes [`assert_page_rules`].
+    /// unless it passes [`assert_page_rules`] (the headers, no script, and
+    /// the viewport declared).
     pub fn read(response: Response, url: Url, context: &str) -> Self {
         let html_type = response
             .header("content-type")
@@ -867,6 +868,7 @@ pub fn assert_page_rules(response: &Response, context: &str) {
         "{context}: expected no `<script>` on a page of the Dashboard\n{html}"
     );
     let document = Document::parse(&html);
+    assert_viewport(&document, context, &html);
     for element in document.root().descendants() {
         for (name, value) in element.attributes() {
             assert!(
@@ -886,6 +888,45 @@ pub fn assert_page_rules(response: &Response, context: &str) {
             );
         }
     }
+}
+
+/// Fails unless the page declares, in exactly one `meta` element with
+/// `name="viewport"`, a `content` with `width=device-width` and
+/// `initial-scale=1` (CONTRACT.md, "The Dashboard: What it answers": a
+/// page is never wider than its window).
+fn assert_viewport(document: &Document, context: &str, html: &str) {
+    let viewports: Vec<Element<'_>> = document
+        .root()
+        .named("meta")
+        .into_iter()
+        .filter(|m| {
+            m.attr("name")
+                .is_some_and(|n| n.trim().eq_ignore_ascii_case("viewport"))
+        })
+        .collect();
+    let [viewport] = viewports.as_slice() else {
+        panic!(
+            "{context}: expected one `<meta name=\"viewport\">`, found {}\n{html}",
+            viewports.len()
+        );
+    };
+    let content = viewport.attr("content").unwrap_or_default();
+    let pairs: Vec<(String, String)> = content
+        .split([',', ';'])
+        .filter_map(|pair| {
+            let (key, value) = pair.split_once('=')?;
+            Some((
+                key.trim().to_ascii_lowercase(),
+                value.trim().to_ascii_lowercase(),
+            ))
+        })
+        .collect();
+    let has =
+        |key: &str, wanted: &dyn Fn(&str) -> bool| pairs.iter().any(|(k, v)| k == key && wanted(v));
+    assert!(
+        has("width", &|v| v == "device-width") && has("initial-scale", &|v| v == "1" || v == "1.0"),
+        "{context}: expected the viewport's `content` to have `width=device-width` and `initial-scale=1`, got {content:?}"
+    );
 }
 
 /// Fails unless the answer is the `303` of a change made, to
