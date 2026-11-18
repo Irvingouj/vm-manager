@@ -15,7 +15,8 @@
 //! Application's session cookie signs a request in; without, only the
 //! [`SignIn`] counts. Then a request from another origin than the
 //! Application's own is refused ([`from_another_origin`]), whatever the
-//! sign-in; then the Application as the registry holds it in memory
+//! sign-in; then the Dashboard's address (`dashboard.<domain>`, signed in
+//! to as an Application is) goes to crate::dashboard; then the Application as the registry holds it in memory
 //! ([`Registry::find`]; read back, or `503`, when memory does not know it
 //! now); then whether the User can open it (a Contributor, or someone it
 //! is shared with), so that one it is not shared with gets the `403` of the
@@ -43,10 +44,11 @@ use tokio_postgres::error::SqlState;
 use crate::api::{Answer, Api, Caller, SignedInWith};
 use crate::app_logs::{Collected, Logs};
 use crate::cookies;
+use crate::dashboard::DASHBOARD_NAME;
 use crate::gateway::Transactions;
 use crate::log;
 use crate::oidc::sessions::{Current, Outcome as Renewed};
-use crate::oidc::{AUTH_NAME, Oidc, SESSION_PATH, asks_for_a_page, pages};
+use crate::oidc::{AUTH_NAME, Oidc, SESSION_PATH, asks_for_a_page, pages, signs_in_to};
 use crate::origin::{Public, from_another_origin};
 use crate::registry::{Found, Registry, check_name};
 use crate::resources::{READ_BACK_WAIT, Resources};
@@ -68,7 +70,7 @@ pub struct GivenToCode;
 const API_NAME: &str = "api";
 
 /// The longest a client may take to send a request's body.
-const BODY_READ_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const BODY_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct Ingress {
     /// The installation's domain, in lower case.
@@ -240,7 +242,7 @@ impl Ingress {
                 }
                 // Only the Application's own cookie, and only on its own
                 // address, signs a request in.
-                let current = match name.filter(|n| check_name(n).is_ok()) {
+                let current = match name.filter(|n| signs_in_to(n)) {
                     Some(name) => oidc.user_of(&parts, name).await,
                     None => Current::None,
                 };
@@ -281,6 +283,15 @@ impl Ingress {
                     "Refused: this request comes from another origin than the Application's own.\n",
                 ),
             );
+        }
+        // The Dashboard (`vm serve`'s; the local run has none), past its
+        // sign-in and the origin rule, as an Application.
+        if self.decides_opening && name == Some(DASHBOARD_NAME) {
+            let known = Known {
+                user: Some(&user.id),
+                ..known
+            };
+            return finish(&known, self.dashboard(&parts, body, &user, port).await);
         }
         // The Application as memory holds it (no round trip to the
         // platform database): who can open it and which Version serves.

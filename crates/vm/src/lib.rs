@@ -38,6 +38,8 @@
 //!   its structure in numbered steps, a bounded pool.
 //! - [`registry`]: the Application registry: Applications, Contributors,
 //!   Versions, and the serving Version of each, held in memory too.
+//! - [`dashboard`]: the Dashboard at `dashboard.<domain>`: the list of a
+//!   person's Applications and the sharing of each, pages with no script.
 //! - [`api`]: the platform's API at `api.<domain>`: HTTP in, registry
 //!   calls, JSON out.
 //! - [`tool_credentials`]: the credentials the Builder's tool signs in to
@@ -55,6 +57,7 @@ pub mod api;
 pub mod app_logs;
 pub mod check;
 pub mod cookies;
+pub mod dashboard;
 pub mod executor;
 pub mod gateway;
 pub mod ingress;

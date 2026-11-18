@@ -49,7 +49,7 @@ use crate::own_db::Migration;
 use crate::platform_db::DbError;
 use crate::platform_db::PlatformDatabase;
 use crate::registry::{
-    ApplicationRecord, Asked, Change, Changed, Created, DeclaredAccess, Entry, List,
+    ApplicationRecord, Asked, Change, Changed, Created, DeclaredAccess, Entry, List, Listing,
     MAX_CONTRIBUTORS, MAX_SHARED_WITH, NameProblem, Named, NewVersion, Registry, Resource, Sent,
     Standing, VersionRecord, WentBack, check_name,
 };
@@ -546,11 +546,11 @@ const SHARING_FORM: &str = r#"{ "add": [ { "user": "<user id>" } | { "group": "<
 const MAX_ENTRIES_A_CHANGE: usize = 100;
 
 /// The longest a user id, a Group or an email may be, in bytes.
-const MAX_ENTRY_BYTES: usize = 256;
+pub(crate) const MAX_ENTRY_BYTES: usize = 256;
 
 /// Whether `text` can be a user id, a Group or an email in an entry: 1 to
 /// 256 bytes, no control character.
-fn entry_text(text: &str) -> bool {
+pub(crate) fn entry_text(text: &str) -> bool {
     !text.is_empty() && text.len() <= MAX_ENTRY_BYTES && !text.chars().any(char::is_control)
 }
 
@@ -809,6 +809,16 @@ impl<'a> Object<'a> {
     }
 }
 
+/// What a change of a list came to, for the API and the Dashboard alike.
+pub(crate) enum ListChanged {
+    NoSuchApplication,
+    NotAContributor,
+    /// The change could not be read: what was wrong.
+    Malformed(String),
+    /// Asked of the registry: made, or refused by its rules.
+    Made(Changed),
+}
+
 pub struct Api {
     registry: Arc<Registry>,
     resources: Arc<Resources>,
@@ -850,7 +860,7 @@ impl Api {
         }
     }
 
-    fn is_administrator(&self, user: &User) -> bool {
+    pub(crate) fn is_administrator(&self, user: &User) -> bool {
         self.administrators()
             .is_some_and(|group| user.groups.iter().any(|g| *g == *group))
     }
@@ -1066,7 +1076,7 @@ impl Api {
         body: &[u8],
     ) -> Result<Answer, DbError> {
         if method == Method::GET {
-            let listed = self.registry.listed_for(user).await?;
+            let listed = self.registry.listed_for(user, Listing::All).await?;
             let view = ListedApplicationsView {
                 applications: listed
                     .iter()
@@ -1163,7 +1173,8 @@ impl Api {
     /// (blackbox/CONTRACT.md, "Contributors and sharing: On the platform's
     /// API"): by a Contributor. Refused, in order: `not-found`,
     /// `method-not-allowed`, `not-a-contributor`, `malformed`; then the
-    /// change's own refusals.
+    /// change's own refusals ([`Api::list_changed`], which the Dashboard's
+    /// changes go through too).
     async fn change_list(
         &self,
         user: &User,
@@ -1178,47 +1189,32 @@ impl Api {
         if method != Method::POST {
             return Ok(Answer::method_not_allowed(method, "POST"));
         }
-        if !standing.contributor {
-            return Ok(not_a_contributor_of_lists());
-        }
         let form = match list {
             List::Contributors => CONTRIBUTORS_FORM,
             List::SharedWith => SHARING_FORM,
         };
-        let change = match read_change(body, list) {
-            Ok(change) => change,
-            Err(problem) => return Ok(Answer::malformed(&problem, form)),
+        let made = match self
+            .list_changed(user, name, standing, read_change(body, list))
+            .await?
+        {
+            ListChanged::NoSuchApplication => return Ok(no_application()),
+            ListChanged::NotAContributor => return Ok(not_a_contributor_of_lists()),
+            ListChanged::Malformed(problem) => return Ok(Answer::malformed(&problem, form)),
+            ListChanged::Made(made) => made,
         };
-        Ok(match self.registry.change(name, user, change).await? {
+        Ok(match made {
             Changed::Changed {
                 application,
                 added,
                 removed,
-            } => {
-                if !added.is_empty() || !removed.is_empty() {
-                    let event = match list {
-                        List::Contributors => "contributors-changed",
-                        List::SharedWith => "sharing-changed",
-                    };
-                    log::record(
-                        event,
-                        json!({
-                            "application": name,
-                            "by": &user.id,
-                            "added": added.iter().map(KeptView::of).collect::<Vec<_>>(),
-                            "removed": removed.iter().map(KeptView::of).collect::<Vec<_>>(),
-                        }),
-                    );
-                }
-                Answer::json(
-                    StatusCode::OK,
-                    &ChangedView {
-                        application: self.view(&application, user),
-                        added: added.iter().map(EntryView::of).collect(),
-                        removed: removed.iter().map(EntryView::of).collect(),
-                    },
-                )
-            }
+            } => Answer::json(
+                StatusCode::OK,
+                &ChangedView {
+                    application: self.view(&application, user),
+                    added: added.iter().map(EntryView::of).collect(),
+                    removed: removed.iter().map(EntryView::of).collect(),
+                },
+            ),
             Changed::SameInBoth(person) => Answer::malformed(
                 &format!(
                     "the person {person:?} is both in add and in remove (once by user id, once by email)"
@@ -1276,6 +1272,61 @@ impl Api {
                 )
             }
         })
+    }
+
+    /// A change of whom `name` is shared with, asked from the Dashboard
+    /// (crate::dashboard): the API's own rules and refusals, in its order
+    /// (`not-found`, `not-a-contributor`, `malformed`, then the change's).
+    pub(crate) async fn change_sharing(
+        &self,
+        user: &User,
+        name: &str,
+        change: Result<Change, String>,
+    ) -> Result<ListChanged, DbError> {
+        let Some(standing) = self.standing(name, user).await? else {
+            return Ok(ListChanged::NoSuchApplication);
+        };
+        self.list_changed(user, name, standing, change).await
+    }
+
+    /// The part of a change of a list after the Application was found: by
+    /// a Contributor, of a change that could be read; made by the registry
+    /// ([`Registry::change`]), and recorded in the program's log when it
+    /// changed something.
+    async fn list_changed(
+        &self,
+        user: &User,
+        name: &str,
+        standing: Standing,
+        change: Result<Change, String>,
+    ) -> Result<ListChanged, DbError> {
+        if !standing.contributor {
+            return Ok(ListChanged::NotAContributor);
+        }
+        let change = match change {
+            Ok(change) => change,
+            Err(problem) => return Ok(ListChanged::Malformed(problem)),
+        };
+        let list = change.list;
+        let made = self.registry.change(name, user, change).await?;
+        if let Changed::Changed { added, removed, .. } = &made
+            && (!added.is_empty() || !removed.is_empty())
+        {
+            let event = match list {
+                List::Contributors => "contributors-changed",
+                List::SharedWith => "sharing-changed",
+            };
+            log::record(
+                event,
+                json!({
+                    "application": name,
+                    "by": &user.id,
+                    "added": added.iter().map(KeptView::of).collect::<Vec<_>>(),
+                    "removed": removed.iter().map(KeptView::of).collect::<Vec<_>>(),
+                }),
+            );
+        }
+        Ok(ListChanged::Made(made))
     }
 
     async fn versions(

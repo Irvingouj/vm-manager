@@ -424,6 +424,30 @@ pub struct ListedApplication {
     pub contributor: bool,
 }
 
+/// Which of the Applications a User contributes to or can open
+/// [`Registry::listed_for`] reads.
+#[derive(Clone, Copy, Debug)]
+pub enum Listing {
+    /// Every one, by name (`GET /v1/applications`).
+    All,
+    /// Those they are a Contributor of first, then the others, each group
+    /// by name; `limit` of them from the `offset`-th on (the Dashboard).
+    Paged { limit: i64, offset: i64 },
+}
+
+/// What the Dashboard shows of an Application besides its place in a list
+/// ([`Registry::shown`]).
+#[derive(Debug)]
+pub struct ShownApplication {
+    /// What its serving Version declares; empty when none serves.
+    pub declared: Declared,
+    /// How many Contributors it has.
+    pub contributors_count: i64,
+    /// Its first Contributors, in the order of the list: what each names,
+    /// and a person's name as last read at their sign-in.
+    pub contributors: Vec<(Named, Option<String>)>,
+}
+
 /// Where a User stands with an Application, by its two lists.
 #[derive(Clone, Copy, Debug)]
 pub struct Standing {
@@ -553,7 +577,7 @@ impl DeclaredAccess {
 /// The Declared access as stored (`{ "resources": { name: { kind, access }
 /// } }`), read back. A Resource whose entry cannot be read is left out: it is
 /// then not declared, and so refused.
-fn declared_of(stored: &Value) -> Declared {
+pub(crate) fn declared_of(stored: &Value) -> Declared {
     let mut declared = Declared::new();
     if let Some(resources) = stored.get("resources").and_then(Value::as_object) {
         for (name, resource) in resources {
@@ -1127,8 +1151,18 @@ impl Registry {
     }
 
     /// The Applications `user` is a Contributor of or can open, each once,
-    /// by name (compared byte by byte, whatever the database's collation).
-    pub async fn listed_for(&self, user: &User) -> Result<Vec<ListedApplication>, DbError> {
+    /// by name (compared byte by byte, whatever the database's collation);
+    /// with [`Listing::Paged`], those they are a Contributor of first, and
+    /// one page of them. One query.
+    pub async fn listed_for(
+        &self,
+        user: &User,
+        listing: Listing,
+    ) -> Result<Vec<ListedApplication>, DbError> {
+        let (contributors_first, limit, offset) = match listing {
+            Listing::All => (false, None, 0_i64),
+            Listing::Paged { limit, offset } => (true, Some(limit), offset),
+        };
         let rows = self
             .database
             .pool()
@@ -1136,15 +1170,16 @@ impl Registry {
                 client
                     .query(
                         concat!(
-                            "SELECT a.name, a.description, a.serving_version, ",
+                            "SELECT name, description, serving_version, contributor FROM (
+                               SELECT a.name, a.description, a.serving_version, ",
                             is_contributor!("a.id", "$1", "$2"),
-                            " FROM applications a
+                            " AS contributor FROM applications a
                               WHERE a.id IN (SELECT e.application_id FROM application_entries e
                                              WHERE ",
                             names_person!("$1", "$2"),
-                            ") ORDER BY a.name COLLATE \"C\""
+                            ")) l ORDER BY $5 AND contributor DESC, name COLLATE \"C\" LIMIT $3 OFFSET $4"
                         ),
-                        &[&user.id, &user.groups],
+                        &[&user.id, &user.groups, &limit, &offset, &contributors_first],
                     )
                     .await
                     .map_err(DbError::from)
@@ -1160,6 +1195,69 @@ impl Registry {
                 })
             })
             .collect()
+    }
+
+    /// What the Dashboard shows of each of the Applications `names` besides
+    /// what [`Registry::listed_for`] gives: the Resources its serving
+    /// Version declares, how many Contributors it has, and its first
+    /// `first` Contributors in the order of the list, a person with the
+    /// name the platform last read of them. One query, whatever the number
+    /// of names; at most `first` Contributors of each are read.
+    pub async fn shown(
+        &self,
+        names: &[&str],
+        first: i64,
+    ) -> Result<HashMap<String, ShownApplication>, DbError> {
+        let rows = self
+            .database
+            .pool()
+            .run(async |client: &mut Client| {
+                client
+                    .query(
+                        "SELECT a.name, v.declared_access,
+                                (SELECT count(*) FROM application_entries e
+                                  WHERE e.application_id = a.id AND e.list = 'contributors'),
+                                c.kinds, c.names, c.people
+                         FROM applications a
+                         LEFT JOIN versions v ON v.application_id = a.id
+                                             AND v.number = a.serving_version
+                         CROSS JOIN LATERAL (
+                            SELECT coalesce(array_agg(f.kind ORDER BY f.id), '{}') AS kinds,
+                                   coalesce(array_agg(f.name ORDER BY f.id), '{}') AS names,
+                                   coalesce(array_agg(u.name ORDER BY f.id), '{}') AS people
+                            FROM (SELECT e.id, e.kind, e.name FROM application_entries e
+                                  WHERE e.application_id = a.id AND e.list = 'contributors'
+                                  ORDER BY e.id LIMIT $2) f
+                            LEFT JOIN users u ON f.kind = 'user' AND u.id = f.name
+                         ) c
+                         WHERE a.name = ANY ($1)",
+                        &[&names, &first],
+                    )
+                    .await
+                    .map_err(DbError::from)
+            })
+            .await?;
+        let mut shown = HashMap::with_capacity(rows.len());
+        for row in &rows {
+            let kinds: Vec<&str> = get(row, 3)?;
+            let entries: Vec<String> = get(row, 4)?;
+            let people: Vec<Option<String>> = get(row, 5)?;
+            let mut contributors = Vec::with_capacity(kinds.len());
+            for ((kind, name), person) in kinds.into_iter().zip(entries).zip(people) {
+                contributors.push((Named::of_stored(kind, name)?, person));
+            }
+            shown.insert(
+                get::<String>(row, 0)?,
+                ShownApplication {
+                    declared: get::<Option<Value>>(row, 1)?
+                        .map(|stored| declared_of(&stored))
+                        .unwrap_or_default(),
+                    contributors_count: get(row, 2)?,
+                    contributors,
+                },
+            );
+        }
+        Ok(shown)
     }
 
     /// What `user` may do with `name`; `None` when there is no such

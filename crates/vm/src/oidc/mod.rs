@@ -20,6 +20,10 @@
 //! 4. [`Oidc::session_step`], `<application address>/_vm/session`: the
 //!    one-time code used up, the Application's session cookie set.
 //!
+//! The Dashboard (`dashboard.<domain>`, crate::dashboard) is signed in to
+//! the same way, with `dashboard` where an Application's name is
+//! ([`signs_in_to`]); its session is an Application session of that name.
+//!
 //! Then [`Oidc::user_of`] gives each request with an Application's cookie
 //! its User, the session renewed first when it is due.
 //!
@@ -59,6 +63,7 @@ use hyper::{Method, Response, StatusCode};
 use url::{Url, form_urlencoded};
 
 use crate::cookies;
+use crate::dashboard::DASHBOARD_NAME;
 use crate::origin::{Public, from_another_origin};
 use crate::platform_db::PlatformDatabase;
 use crate::registry::{Registry, check_name};
@@ -165,6 +170,13 @@ pub fn path_only(next: Option<&str>) -> String {
         }
     }
     out
+}
+
+/// Whether a session can be had at the address of `name`: an Application's
+/// name (one could have), or the Dashboard's (crate::dashboard), which is
+/// signed in to exactly as an Application is.
+pub fn signs_in_to(name: &str) -> bool {
+    name == DASHBOARD_NAME || check_name(name).is_ok()
 }
 
 /// Whether a request asks for a page: a `GET` or `HEAD` whose `Accept` has
@@ -309,7 +321,7 @@ impl Oidc {
         application: Option<&str>,
         port: Option<u16>,
     ) -> Option<Answer> {
-        let application = application.filter(|a| check_name(a).is_ok())?;
+        let application = application.filter(|a| signs_in_to(a))?;
         if !asks_for_a_page(parts) {
             return None;
         }
@@ -383,7 +395,7 @@ impl Oidc {
     /// Step 2.
     async fn sign_in(&self, connected: &Connected, parts: &Parts, port: Option<u16>) -> Answer {
         let query = Query::of(parts);
-        let Some(application) = query.get("application").filter(|a| check_name(a).is_ok()) else {
+        let Some(application) = query.get("application").filter(|a| signs_in_to(a)) else {
             return pages::failed(
                 StatusCode::BAD_REQUEST,
                 "The address names no Application that could exist.",
@@ -458,7 +470,7 @@ impl Oidc {
     ) -> Answer {
         let again = format!("{}{next}", self.app_origin(application, port));
         let again = Some(again.as_str());
-        if !self.registry.may_serve(application) {
+        if application != DASHBOARD_NAME && !self.registry.may_serve(application) {
             let mut answer = pages::no_application(application);
             for cookie in cookies {
                 answer
