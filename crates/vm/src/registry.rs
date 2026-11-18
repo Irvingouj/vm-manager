@@ -21,15 +21,28 @@
 //! Who may change an Application and who may open it (blackbox/CONTRACT.md,
 //! "Contributors and sharing") is one table, `application_entries`: an
 //! entry of the Contributors or of the sharing names a user id, a Group or
-//! (for the sharing) everyone. Whether a User is a Contributor or can open
-//! is one indexed `EXISTS` over it (`can_open!`, `is_contributor!`),
-//! asked at every request and never held in memory, so a change counts
-//! from the very next request. A change of a list ([`Registry::change`]) is
+//! (for the sharing) everyone. A change of a list ([`Registry::change`]) is
 //! one transaction under the Application's row lock: the emails resolved,
 //! the removals and additions made, then the last-Contributor rule and the
 //! list's bound checked, and the whole rolled back if either fails. A
 //! list holds at most [`MAX_CONTRIBUTORS`] or [`MAX_SHARED_WITH`] entries;
-//! a change past that is refused and changes nothing.
+//! a change past that is refused and changes nothing. The API asks the
+//! database whether a User is a Contributor (`is_contributor!`).
+//!
+//! Who may open an Application is decided at each request from memory,
+//! like Grants (crate::resources) and the serving Version: [`Lists`] holds
+//! each Application's two lists, loaded at start and changed only after
+//! the platform database has committed and before the API answers. Every
+//! change that changes a list adds one to the Application's
+//! `lists_generation` under the row's lock, and memory keeps the higher,
+//! so changes at once leave memory as the database whatever order they
+//! report back in. A creation or a change whose answer is lost is read
+//! back in one statement (the generation and the entries one snapshot);
+//! if that fails too, memory forgets the Application's lists
+//! ([`Held::Unknown`]) and Ingress reads them back at its next request,
+//! answering `503` while it cannot: nobody is let in on a guess. Forgetting
+//! only ever replaces what memory holds of an Application, so memory holds
+//! at most one entry per Application.
 //!
 //! Going back ([`Registry::go_back`]) is one `UPDATE` that changes the
 //! serving Version only where it is still the one the caller saw: two
@@ -44,7 +57,8 @@
 //! that checks again, under the Application's row lock, that it continues
 //! the Version recorded last.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, PoisonError, RwLock};
 
 use authz::AccessLevel;
@@ -166,7 +180,91 @@ macro_rules! is_contributor {
     };
 }
 
-pub(crate) use {can_open, names_person};
+pub(crate) use names_person;
+
+/// An Application's two lists as memory holds them, for deciding who may
+/// open it: whom they name, both lists together, since either opens. At
+/// most 1,100 names (100 Contributors and 1,000 shared with) of at most
+/// 256 bytes each, so a few hundred kilobytes per Application at worst.
+/// Deciding costs a lookup for the User's id and one for each of their
+/// Groups, whatever the length of the lists.
+#[derive(Debug, Default)]
+pub struct Lists {
+    /// The Application's `lists_generation` this was read at.
+    generation: i64,
+    users: HashSet<String>,
+    groups: HashSet<String>,
+    everyone: bool,
+}
+
+impl Lists {
+    /// The lists of `record`, as of `generation`.
+    fn of(record: &ApplicationRecord) -> Self {
+        let mut lists = Self {
+            generation: record.generation,
+            ..Self::default()
+        };
+        for entry in record.contributors.iter().chain(&record.shared_with) {
+            lists.add(&entry.named);
+        }
+        lists
+    }
+
+    fn add(&mut self, named: &Named) {
+        match named {
+            // Copied: memory keeps its own lists; once per entry each time
+            // a list changes (at most 1,100), never at a request.
+            Named::User(id) => {
+                self.users.insert(id.clone());
+            }
+            Named::Group(group) => {
+                self.groups.insert(group.clone());
+            }
+            Named::Everyone => self.everyone = true,
+        }
+    }
+
+    /// Whether they name `user`: their id, one of their Groups, or
+    /// everyone.
+    fn open_to(&self, user: &User) -> bool {
+        self.everyone
+            || self.users.contains(&user.id)
+            || user.groups.iter().any(|g| self.groups.contains(g))
+    }
+}
+
+/// What memory holds of an Application's lists.
+#[derive(Debug)]
+pub enum Held {
+    Known(Arc<Lists>),
+    /// Forgotten: a change's answer was lost and could not be read back.
+    /// `seen` is the highest generation reported since; `epoch` tells a
+    /// read-back begun before this forgetting from one begun after.
+    Unknown {
+        seen: i64,
+        epoch: u64,
+    },
+}
+
+/// Whether a User may open an Application, as memory has it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Opens {
+    Yes,
+    /// It is not shared with them, nor are they a Contributor.
+    No,
+    /// Memory does not know its lists now: they must be read back.
+    NotKnown,
+    /// Memory holds no Application of that name.
+    NoSuchApplication,
+}
+
+/// What memory held when a read-back began.
+#[derive(Clone, Copy)]
+enum Began {
+    Nothing,
+    Known,
+    Unknown(u64),
+}
 
 /// Which of an Application's two lists.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -251,6 +349,8 @@ pub struct Entry {
 /// An Application as the registry reports it.
 #[derive(Debug)]
 pub struct ApplicationRecord {
+    /// The generation of its lists (`lists_generation`).
+    pub generation: i64,
     pub name: String,
     pub description: Option<String>,
     /// In the order they were added.
@@ -294,33 +394,6 @@ pub struct Standing {
     pub can_open: bool,
 }
 
-/// Whether a request to an Application's address may be given to it
-/// (blackbox/CONTRACT.md, "Contributors and sharing: Opening an
-/// Application").
-#[derive(Clone, Debug)]
-pub enum Opening {
-    /// No Application has that name.
-    NoSuchApplication,
-    /// The User can open it.
-    Opens,
-    /// It is not shared with the User, nor are they a Contributor: their
-    /// name as last read, when the platform knows it, for the page that
-    /// says so.
-    NotShared { name: Option<String> },
-}
-
-impl Opening {
-    /// What a row of `opens` (null when there is no such Application) and
-    /// the User's name comes to.
-    pub(crate) fn of(opens: Option<bool>, name: Option<String>) -> Self {
-        match opens {
-            None => Self::NoSuchApplication,
-            Some(true) => Self::Opens,
-            Some(false) => Self::NotShared { name },
-        }
-    }
-}
-
 /// What is asked to be added or removed: an entry, or a person by the
 /// email the platform last read of them.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -343,7 +416,7 @@ pub enum Changed {
     /// Made: the Application as it is after, and what was added and
     /// removed (each as kept), in order. Both empty when nothing changed.
     Changed {
-        application: ApplicationRecord,
+        application: Box<ApplicationRecord>,
         added: Vec<Entry>,
         removed: Vec<Entry>,
     },
@@ -353,6 +426,9 @@ pub enum Changed {
     UnknownEmail(String),
     /// More than one person has it.
     AmbiguousEmail(String),
+    /// The same person in `add` and in `remove`, once the emails are
+    /// resolved: by their id on one side and by email on the other.
+    SameInBoth(String),
     /// The change would leave no Contributor: the entries it removed.
     LastContributor(Vec<Entry>),
     /// The list would pass its bound: the entries it added.
@@ -516,6 +592,11 @@ pub struct Registry {
     /// The serving Version of every Application that has one, by name.
     /// Held only for a lookup or an insert, never across an await.
     serving: RwLock<HashMap<Arc<str>, Arc<Serving>>>,
+    /// Every Application's lists, by name: one entry per Application.
+    /// Held only for a lookup or an insert, never across an await.
+    lists: RwLock<HashMap<Arc<str>, Held>>,
+    /// The number of forgettings so far, each one's `epoch`.
+    forgotten: AtomicU64,
 }
 
 impl Registry {
@@ -543,11 +624,205 @@ impl Registry {
             let version = serving_of(row)?;
             serving.insert(Arc::clone(&version.application), Arc::new(version));
         }
+        // Every Application's lists, in one statement: one snapshot.
+        let rows = database
+            .pool()
+            .run(async |client: &mut Client| {
+                client
+                    .query(
+                        "SELECT a.name, a.lists_generation, e.kind, e.name
+                         FROM applications a
+                         LEFT JOIN application_entries e ON e.application_id = a.id",
+                        &[],
+                    )
+                    .await
+                    .map_err(DbError::from)
+            })
+            .await?;
+        let mut all: HashMap<Arc<str>, Lists> = HashMap::new();
+        for row in &rows {
+            let name: &str = get(row, 0)?;
+            let lists = match all.get_mut(name) {
+                Some(lists) => lists,
+                None => all.entry(Arc::from(name)).or_default(),
+            };
+            lists.generation = get(row, 1)?;
+            if let Some(kind) = get::<Option<&str>>(row, 2)? {
+                lists.add(&Named::of_stored(kind, get(row, 3)?)?);
+            }
+        }
+        let lists = all
+            .into_iter()
+            .map(|(name, lists)| (name, Held::Known(Arc::new(lists))))
+            .collect();
         Ok(Self {
             database,
             own,
             serving: RwLock::new(serving),
+            lists: RwLock::new(lists),
+            forgotten: AtomicU64::new(0),
         })
+    }
+
+    /// Whether `user` may open `name`, from memory: no round trip, and the
+    /// lock is held for the lookups alone.
+    pub fn opens(&self, name: &str, user: &User) -> Opens {
+        match self
+            .lists
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(name)
+        {
+            None => Opens::NoSuchApplication,
+            Some(Held::Unknown { .. }) => Opens::NotKnown,
+            Some(Held::Known(lists)) if lists.open_to(user) => Opens::Yes,
+            Some(Held::Known(_)) => Opens::No,
+        }
+    }
+
+    /// Reads `name`'s lists back from the platform database into memory,
+    /// for a request that found them not known (or not there, for an
+    /// Application that serves). `false` when there is no such
+    /// Application.
+    pub async fn read_back(&self, name: &str) -> Result<bool, DbError> {
+        let began = match self
+            .lists
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(name)
+        {
+            None => Began::Nothing,
+            Some(Held::Known(_)) => Began::Known,
+            Some(Held::Unknown { epoch, .. }) => Began::Unknown(*epoch),
+        };
+        let Some(lists) = self.lists_of(name).await? else {
+            return Ok(false);
+        };
+        self.install_read(name, lists, began);
+        Ok(true)
+    }
+
+    /// `name`'s lists from the platform database, in one statement (the
+    /// generation and the entries one snapshot); `None` for no such
+    /// Application.
+    async fn lists_of(&self, name: &str) -> Result<Option<Lists>, DbError> {
+        let rows = self
+            .database
+            .pool()
+            .run(async |client: &mut Client| {
+                client
+                    .query(
+                        "SELECT a.lists_generation, e.kind, e.name
+                         FROM applications a
+                         LEFT JOIN application_entries e ON e.application_id = a.id
+                         WHERE a.name = $1",
+                        &[&name],
+                    )
+                    .await
+                    .map_err(DbError::from)
+            })
+            .await?;
+        let mut lists: Option<Lists> = None;
+        for row in &rows {
+            let held = lists.get_or_insert_with(Lists::default);
+            held.generation = get(row, 0)?;
+            if let Some(kind) = get::<Option<&str>>(row, 1)? {
+                held.add(&Named::of_stored(kind, get(row, 2)?)?);
+            }
+        }
+        Ok(lists)
+    }
+
+    /// Puts what a creation or a change committed into memory: over lists
+    /// of a lower generation; over forgotten lists it only raises `seen`,
+    /// since a lost change may have gone further (a request reads them
+    /// back).
+    fn install_changed(&self, name: &str, lists: Lists) {
+        let mut all = self.lists.write().unwrap_or_else(PoisonError::into_inner);
+        match all.get_mut(name) {
+            None => {
+                all.insert(Arc::from(name), Held::Known(Arc::new(lists)));
+            }
+            Some(Held::Known(held)) => {
+                if held.generation < lists.generation {
+                    *held = Arc::new(lists);
+                }
+            }
+            Some(Held::Unknown { seen, .. }) => {
+                *seen = (*seen).max(lists.generation);
+            }
+        }
+    }
+
+    /// Puts what a request's read-back read into memory: over lists of a
+    /// lower generation; over forgotten lists only when they were
+    /// forgotten before the read began, and it is at least the highest
+    /// generation reported since.
+    fn install_read(&self, name: &str, lists: Lists, began: Began) {
+        let mut all = self.lists.write().unwrap_or_else(PoisonError::into_inner);
+        match all.get_mut(name) {
+            None => {
+                if matches!(began, Began::Nothing) {
+                    all.insert(Arc::from(name), Held::Known(Arc::new(lists)));
+                }
+            }
+            Some(Held::Known(held)) => {
+                if held.generation < lists.generation {
+                    *held = Arc::new(lists);
+                }
+            }
+            Some(held @ Held::Unknown { .. }) => {
+                if let (Held::Unknown { seen, epoch }, Began::Unknown(at)) = (&*held, began)
+                    && *epoch == at
+                    && *seen <= lists.generation
+                {
+                    *held = Held::Known(Arc::new(lists));
+                }
+            }
+        }
+    }
+
+    /// After a creation or a change whose answer was lost: its lists read
+    /// back; when that fails too, forgotten, if memory holds them (a name
+    /// memory does not hold is left so: no marker is added).
+    async fn after_lost(&self, name: &str) {
+        match self.lists_of(name).await {
+            Ok(Some(lists)) => self.install_changed(name, lists),
+            Ok(None) => {}
+            Err(error) => {
+                log::record(
+                    "lists-unknown",
+                    serde_json::json!({ "application": name, "error": error.to_string() }),
+                );
+                let epoch = self.forgotten.fetch_add(1, Ordering::Relaxed);
+                let mut all = self.lists.write().unwrap_or_else(PoisonError::into_inner);
+                if let Some(held) = all.get_mut(name) {
+                    let seen = match held {
+                        Held::Known(lists) => lists.generation,
+                        Held::Unknown { seen, .. } => *seen,
+                    };
+                    *held = Held::Unknown { seen, epoch };
+                }
+            }
+        }
+    }
+
+    /// The name the platform last read of the person `id` at a sign-in.
+    pub async fn person_name(&self, id: &str) -> Result<Option<String>, DbError> {
+        let row = self
+            .database
+            .pool()
+            .run(async |client: &mut Client| {
+                client
+                    .query_opt("SELECT name FROM users WHERE id = $1", &[&id])
+                    .await
+                    .map_err(DbError::from)
+            })
+            .await?;
+        match row {
+            Some(row) => get(&row, 0),
+            None => Ok(None),
+        }
     }
 
     /// The Version serving `name` now, if it has one. From memory.
@@ -616,9 +891,20 @@ impl Registry {
                 let Some(made) = made else { return Ok(None) };
                 record_of(client, Key::Id(get(&made, 0)?)).await
             })
-            .await?;
+            .await;
+        let created = match created {
+            Ok(created) => created,
+            Err(error) => {
+                // It may have been made without the answer arriving.
+                self.after_lost(name).await;
+                return Err(error);
+            }
+        };
         Ok(match created {
-            Some(application) => Created::Created(application),
+            Some(application) => {
+                self.install_changed(name, Lists::of(&application));
+                Created::Created(application)
+            }
             None => Created::NameTaken,
         })
     }
@@ -733,38 +1019,6 @@ impl Registry {
         .transpose()
     }
 
-    /// Whether a request of `user` to `name`'s address may be given to it,
-    /// asked at every such request: one query, by the Application's name
-    /// (its unique index) and then the index of its entries; the User's
-    /// name is read (by their id, the primary key) only when the answer is
-    /// no.
-    pub async fn opening(&self, name: &str, user: &User) -> Result<Opening, DbError> {
-        let row = self
-            .database
-            .pool()
-            .run(async |client: &mut Client| {
-                client
-                    .query_opt(
-                        concat!(
-                            "SELECT o.opens, CASE WHEN o.opens THEN NULL
-                                    ELSE (SELECT u.name FROM users u WHERE u.id = $2) END
-                             FROM applications a
-                             CROSS JOIN LATERAL (SELECT ",
-                            can_open!("a.id", "$2", "$3"),
-                            " AS opens) o WHERE a.name = $1"
-                        ),
-                        &[&name, &user.id, &user.groups],
-                    )
-                    .await
-                    .map_err(DbError::from)
-            })
-            .await?;
-        Ok(match row {
-            None => Opening::NoSuchApplication,
-            Some(row) => Opening::of(Some(get(&row, 0)?), get(&row, 1)?),
-        })
-    }
-
     /// Changes one list of `name` as `by` asks, who must be a Contributor:
     /// whole or not at all, in one transaction that holds the
     /// Application's row lock from the start, so that two changes at once
@@ -772,9 +1026,12 @@ impl Registry {
     /// the list as the change leaves it. Every entry asked by email is
     /// resolved first; then what is removed, then what is added; then the
     /// list is counted. Any refusal rolls everything back.
-    pub async fn change(&self, name: &str, by: &User, change: &Change) -> Result<Changed, DbError> {
+    pub async fn change(&self, name: &str, by: &User, change: Change) -> Result<Changed, DbError> {
         let list = change.list.stored();
-        self.database
+        let bound = change.list.bound();
+        let contributors = change.list == List::Contributors;
+        let changed = self
+            .database
             .pool()
             .run(async |client: &mut Client| {
                 let transaction = client.transaction().await.map_err(DbError::from)?;
@@ -797,24 +1054,30 @@ impl Registry {
                     return Ok(Changed::NotAContributor);
                 }
                 let mut resolved: [Vec<Named>; 2] = [Vec::new(), Vec::new()];
-                for (asked, into) in [&change.add, &change.remove].into_iter().zip(&mut resolved) {
+                for (asked, into) in [change.add, change.remove].into_iter().zip(&mut resolved) {
                     into.reserve(asked.len());
                     for one in asked {
                         match one {
-                            Asked::Entry(named) => into.push(named.clone()),
-                            Asked::Email(email) => match person_of(&transaction, email).await? {
+                            Asked::Entry(named) => into.push(named),
+                            Asked::Email(email) => match person_of(&transaction, &email).await? {
                                 Person::One(id) => into.push(Named::User(id)),
-                                Person::Nobody => {
-                                    return Ok(Changed::UnknownEmail(email.clone()));
-                                }
-                                Person::Several => {
-                                    return Ok(Changed::AmbiguousEmail(email.clone()));
-                                }
+                                Person::Nobody => return Ok(Changed::UnknownEmail(email)),
+                                Person::Several => return Ok(Changed::AmbiguousEmail(email)),
                             },
                         }
                     }
                 }
                 let [add, remove] = resolved;
+                // The same entry on both sides can only come of an email
+                // (the API refuses it otherwise): a person by their id on
+                // one side and by email on the other. At most 100 by 100.
+                let mut add = add;
+                if let Some(at) = add.iter().position(|a| remove.contains(a)) {
+                    return Ok(Changed::SameInBoth(match add.swap_remove(at) {
+                        Named::User(name) | Named::Group(name) => name,
+                        Named::Everyone => "everyone".to_owned(),
+                    }));
+                }
                 let removed = removed_from(&transaction, id, list, &remove).await?;
                 let added = added_to(&transaction, id, list, &add, &by.id).await?;
                 let counted = transaction
@@ -826,23 +1089,53 @@ impl Registry {
                     .await
                     .map_err(DbError::from)?;
                 let count: i64 = get(&counted, 0)?;
-                if change.list == List::Contributors && count == 0 {
+                if contributors && count == 0 {
                     return Ok(Changed::LastContributor(removed));
                 }
-                if count > change.list.bound() {
+                if count > bound {
                     return Ok(Changed::TooMany(added));
+                }
+                if !added.is_empty() || !removed.is_empty() {
+                    transaction
+                        .execute(
+                            "UPDATE applications SET lists_generation = lists_generation + 1
+                             WHERE id = $1",
+                            &[&id],
+                        )
+                        .await
+                        .map_err(DbError::from)?;
                 }
                 let application = record_of(&transaction, Key::Id(id)).await?.ok_or_else(|| {
                     DbError::unexpected("an Application gone while it was locked")
                 })?;
                 transaction.commit().await.map_err(DbError::from)?;
                 Ok(Changed::Changed {
-                    application,
+                    application: Box::new(application),
                     added,
                     removed,
                 })
             })
-            .await
+            .await;
+        match changed {
+            Ok(Changed::Changed {
+                application,
+                added,
+                removed,
+            }) => {
+                self.install_changed(name, Lists::of(&application));
+                Ok(Changed::Changed {
+                    application,
+                    added,
+                    removed,
+                })
+            }
+            Ok(refused) => Ok(refused),
+            Err(error) => {
+                // The commit may have happened without its answer arriving.
+                self.after_lost(name).await;
+                Err(error)
+            }
+        }
     }
 
     /// Sends a Version of `name` as `sender`, who must be a Contributor. Its
@@ -1295,7 +1588,8 @@ async fn record_of<C: GenericClient>(
             concat!(
                 "SELECT a.id, a.name, a.description, a.serving_version, a.created_by, ",
                 rfc3339!("a.created_at"),
-                ", (SELECT max(v.number) FROM versions v WHERE v.application_id = a.id)
+                ", (SELECT max(v.number) FROM versions v WHERE v.application_id = a.id),
+                   a.lists_generation
                   FROM applications a WHERE ",
                 $condition
             )
@@ -1341,6 +1635,7 @@ async fn record_of<C: GenericClient>(
         }
     }
     Ok(Some(ApplicationRecord {
+        generation: get(&row, 7)?,
         name: get(&row, 1)?,
         description: get(&row, 2)?,
         contributors,

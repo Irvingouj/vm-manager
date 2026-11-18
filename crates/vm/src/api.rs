@@ -1152,10 +1152,11 @@ impl Api {
         self.registry.standing(name, user).await
     }
 
-    /// Whether `user` may read the Application's Versions: whoever
-    /// can open it, and a Platform administrator.
+    /// Whether `user` may read the Application's Versions: a Contributor,
+    /// and a Platform administrator, as for its logs. Someone it is only
+    /// shared with uses it and does not read how it is made.
     fn may_read(&self, standing: Standing, user: &User) -> bool {
-        standing.can_open || self.is_administrator(user)
+        standing.contributor || self.is_administrator(user)
     }
 
     /// `POST /v1/applications/<name>/contributors` and `.../sharing`
@@ -1180,17 +1181,15 @@ impl Api {
         if !standing.contributor {
             return Ok(not_a_contributor_of_lists());
         }
+        let form = match list {
+            List::Contributors => CONTRIBUTORS_FORM,
+            List::SharedWith => SHARING_FORM,
+        };
         let change = match read_change(body, list) {
             Ok(change) => change,
-            Err(problem) => {
-                let form = match list {
-                    List::Contributors => CONTRIBUTORS_FORM,
-                    List::SharedWith => SHARING_FORM,
-                };
-                return Ok(Answer::malformed(&problem, form));
-            }
+            Err(problem) => return Ok(Answer::malformed(&problem, form)),
         };
-        Ok(match self.registry.change(name, user, &change).await? {
+        Ok(match self.registry.change(name, user, change).await? {
             Changed::Changed {
                 application,
                 added,
@@ -1211,8 +1210,21 @@ impl Api {
                         }),
                     );
                 }
-                Answer::json(StatusCode::OK, &self.view(&application, user))
+                Answer::json(
+                    StatusCode::OK,
+                    &ChangedView {
+                        application: self.view(&application, user),
+                        added: added.iter().map(EntryView::of).collect(),
+                        removed: removed.iter().map(EntryView::of).collect(),
+                    },
+                )
             }
+            Changed::SameInBoth(person) => Answer::malformed(
+                &format!(
+                    "the person {person:?} is both in add and in remove (once by user id, once by email)"
+                ),
+                form,
+            ),
             Changed::NoSuchApplication => no_application(),
             Changed::NotAContributor => not_a_contributor_of_lists(),
             Changed::UnknownEmail(email) => Answer::json(
@@ -1243,7 +1255,7 @@ impl Api {
                         "removing {} would leave the Application with no Contributor: add another Contributor first (or in the same request); nothing was changed",
                         described(&removed)
                     ),
-                    "entries": removed.iter().map(KeptView::of).collect::<Vec<_>>(),
+                    "entries": removed.iter().map(EntryView::of).collect::<Vec<_>>(),
                 } }),
             ),
             Changed::TooMany(added) => {
@@ -1259,7 +1271,7 @@ impl Api {
                             "adding {} would give the Application more than {most} {what}: remove some in the same request, or share with a Group in place of many people; nothing was changed",
                             described(&added)
                         ),
-                        "entries": added.iter().map(KeptView::of).collect::<Vec<_>>(),
+                        "entries": added.iter().map(EntryView::of).collect::<Vec<_>>(),
                     } }),
                 )
             }
@@ -1279,7 +1291,7 @@ impl Api {
         };
         if method == Method::GET {
             if !self.may_read(standing, user) {
-                return Ok(not_shared());
+                return Ok(not_a_reader_of_versions());
             }
             let Some(limit) = versions_limit(query) else {
                 return Ok(Answer::error(
@@ -1374,27 +1386,27 @@ impl Api {
         name: &str,
         number: Option<u64>,
     ) -> Result<Answer, DbError> {
-        // Who may read it is asked only of an Application that has the
-        // Version: one that has not is `not-found` for anyone, as before.
+        // Who may read is decided before anything is said of a Version,
+        // so that its `not-found` tells nobody else how many there are.
+        let Some(standing) = self.standing(name, user).await? else {
+            return Ok(no_application());
+        };
+        if method != Method::GET {
+            return Ok(Answer::method_not_allowed(method, "GET"));
+        }
+        if !self.may_read(standing, user) {
+            return Ok(not_a_reader_of_versions());
+        }
         let version = match number {
-            Some(number) if check_name(name).is_ok() => self.registry.version(name, number).await?,
-            _ => None,
+            Some(number) => self.registry.version(name, number).await?,
+            None => None,
         };
         let Some(version) = version else {
             return Ok(Answer::not_found(
                 "no such Version: list the Application's Versions at /v1/applications/<name>/versions",
             ));
         };
-        if method != Method::GET {
-            return Ok(Answer::method_not_allowed(method, "GET"));
-        }
-        match self.standing(name, user).await? {
-            Some(standing) if self.may_read(standing, user) => {
-                Ok(Answer::json(StatusCode::OK, &VersionView::of(&version)))
-            }
-            Some(_) => Ok(not_shared()),
-            None => Ok(no_application()),
-        }
+        Ok(Answer::json(StatusCode::OK, &VersionView::of(&version)))
     }
 
     /// `POST /v1/applications/<name>/go-back` (blackbox/CONTRACT.md,
@@ -1880,6 +1892,16 @@ struct ApplicationView<'a> {
     created_at: &'a str,
 }
 
+/// The answer of a change of a list: the Application as it is after, and
+/// the entries this request added and removed, as kept.
+#[derive(Serialize)]
+struct ChangedView<'a> {
+    #[serde(flatten)]
+    application: ApplicationView<'a>,
+    added: Vec<EntryView<'a>>,
+    removed: Vec<EntryView<'a>>,
+}
+
 /// What an entry names: `user`, `group` or `everyone: true`, one of them.
 #[derive(Serialize)]
 struct NamedView<'a> {
@@ -2171,6 +2193,15 @@ fn not_a_contributor_of_lists() -> Answer {
         StatusCode::FORBIDDEN,
         "not-a-contributor",
         "you are not a Contributor of this Application, and only its Contributors may change its Contributors and whom it is shared with: ask one of them",
+    )
+}
+
+/// `403` `not-a-contributor` on reading Versions.
+fn not_a_reader_of_versions() -> Answer {
+    Answer::error(
+        StatusCode::FORBIDDEN,
+        "not-a-contributor",
+        "you are not a Contributor of this Application, and only its Contributors (and Platform administrators) read its Versions: ask one of them",
     )
 }
 

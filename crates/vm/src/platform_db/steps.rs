@@ -483,11 +483,15 @@ pub const STEPS: &[Step] = &[
             added_at timestamptz NOT NULL DEFAULT now(),
             CHECK ((kind = 'everyone') = (name = '')),
             CHECK (kind <> 'everyone' OR list = 'shared_with'),
-            -- Also the index of who may open an Application, and who is its
-            -- Contributor, at each request: by the Application, then what an
-            -- entry names.
+            -- An entry once; also the index of whether a User is a
+            -- Contributor: by the Application, then what an entry names.
             UNIQUE (application_id, kind, name, list)
         );
+        -- The generation of the two lists: added to, under the row's lock,
+        -- by every change that changes one. The program holds the lists in
+        -- memory and keeps the higher generation, so changes at once leave
+        -- memory as the database whatever order they report back in.
+        ALTER TABLE applications ADD COLUMN lists_generation bigint NOT NULL DEFAULT 0;
         -- The Applications a User contributes to or can open
         -- (GET /v1/applications).
         CREATE INDEX application_entries_named ON application_entries (kind, name);

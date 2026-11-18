@@ -15,12 +15,13 @@
 //! Application's session cookie signs a request in; without, only the
 //! [`SignIn`] counts. Then a request from another origin than the
 //! Application's own is refused ([`from_another_origin`]), whatever the
-//! sign-in; then whether the User can open the Application, decided at
-//! this request (a Contributor, or someone it is shared with: with OIDC the
-//! answer comes with the session's own query, with the stand-in it is one
-//! query, [`Registry::opening`]), so that one it is not shared with gets
-//! the `403` of the platform's own before the Application is handed
-//! anything (the local run serves every test User and does not ask); then
+//! sign-in; then whether the User can open the Application (a
+//! Contributor, or someone it is shared with), decided at this request
+//! from the lists the registry holds in memory ([`Registry::opens`]; read
+//! back, or `503`, when memory does not know them), so that one it is not
+//! shared with gets the `403` of the platform's own before the Application
+//! is handed anything (the local run serves every test User and does not
+//! ask); then
 //! the serving Version, which the Application registry holds
 //! in memory, is run by the Request runner, the platform's cookies taken
 //! out of the request and kept out of the answer ([`cookies`]). Its own
@@ -48,7 +49,7 @@ use crate::log;
 use crate::oidc::sessions::{Current, Outcome as Renewed};
 use crate::oidc::{AUTH_NAME, Oidc, SESSION_PATH, asks_for_a_page, pages};
 use crate::origin::{Public, from_another_origin};
-use crate::registry::{Opening, Registry, check_name};
+use crate::registry::{Opens, Registry, check_name};
 use crate::runner::{InFlight, Outcome, RequestRunner};
 use crate::sign_in::{RESERVED_HEADER_PREFIX, SignIn, SignedIn, remove_reserved_headers};
 use crate::tool_credentials::{self, Digest, Presented, ToolCredentials};
@@ -107,6 +108,29 @@ struct Known<'a> {
 }
 
 impl Ingress {
+    /// The `403` page of an Application not shared with `id`. With OIDC
+    /// the person's name is read for it (when that fails, the page shows
+    /// the id alone) and it links to the sign-in address's sign-out; the
+    /// stand-in keeps no record of people and has no sign-out.
+    async fn not_shared_page(
+        &self,
+        application: &str,
+        id: &str,
+        port: Option<u16>,
+    ) -> Response<Full<Bytes>> {
+        if self.oidc.as_ref().is_some_and(|o| o.connected().is_some()) {
+            let name = self.registry.person_name(id).await.ok().flatten();
+            let sign_out = format!(
+                "{}/sign-out",
+                self.public
+                    .origin(&format!("{AUTH_NAME}.{}", self.domain), port)
+            );
+            pages::not_shared(application, id, name.as_deref(), Some(&sign_out))
+        } else {
+            pages::not_shared(application, id, None, None)
+        }
+    }
+
     /// Answers one request: off the wire (`vm serve`, whose body is
     /// [`hyper::body::Incoming`]) or handed over in the process (the local
     /// run's).
@@ -201,9 +225,6 @@ impl Ingress {
                 .await;
             return finish(&known, api_response(answer));
         }
-        // With OIDC, whether the User may open the Application comes with
-        // their session, from the one query that finds it.
-        let mut decided = None;
         let user = match self.oidc.as_ref().filter(|o| o.connected().is_some()) {
             Some(oidc) => {
                 if name == Some(AUTH_NAME) {
@@ -221,10 +242,7 @@ impl Ingress {
                     None => Current::None,
                 };
                 match current {
-                    Current::User { user, opening, .. } => {
-                        decided = opening;
-                        user
-                    }
+                    Current::User { user, .. } => user,
                     Current::None => {
                         let answer = oidc
                             .not_signed_in(&parts, name, port)
@@ -261,49 +279,62 @@ impl Ingress {
                 ),
             );
         }
-        // Who can open the Application, decided at this request, before it
-        // is handed anything: an address that is no Application's is the
-        // `404`, one not shared with the User the `403`, and only then is
-        // the serving Version looked for.
+        // Who can open the Application, decided at this request from
+        // memory, before it is handed anything: one not shared with the User
+        // is the `403`, and only then is the serving Version looked for.
         if self.decides_opening
             && let Some(name) = name.filter(|n| check_name(n).is_ok())
         {
-            let opening = match decided {
-                Some(opening) => Ok(opening),
-                None => self.registry.opening(name, &user).await,
+            let mut opens = self.registry.opens(name, &user);
+            // Lists memory does not hold now, of an Application that has
+            // them: read back, and nobody let in on a guess meanwhile.
+            let read_back = match opens {
+                Opens::NotKnown => true,
+                Opens::NoSuchApplication => self.registry.serving(name).is_some(),
+                Opens::Yes | Opens::No => false,
             };
-            match opening {
-                Ok(Opening::Opens) => {}
-                Ok(Opening::NoSuchApplication) => {
+            if read_back {
+                opens = match self.registry.read_back(name).await {
+                    // Still not held (a forgetting while it was read): not
+                    // known, never a guess.
+                    Ok(_) => match self.registry.opens(name, &user) {
+                        Opens::NoSuchApplication if self.registry.serving(name).is_some() => {
+                            Opens::NotKnown
+                        }
+                        opens => opens,
+                    },
+                    Err(error) => {
+                        log::record(
+                            "platform-database-failed",
+                            json!({ "error": error.to_string() }),
+                        );
+                        Opens::NotKnown
+                    }
+                };
+            }
+            match opens {
+                // No such Application: the serving Version decides, a `404`.
+                Opens::Yes | Opens::NoSuchApplication => {}
+                Opens::NotKnown => {
                     let known = Known {
                         user: Some(&user.id),
+                        application: Some(name),
                         ..known
                     };
-                    return finish(&known, no_application());
+                    return finish(&known, lists_unknown());
                 }
-                Ok(Opening::NotShared { name: person }) => {
+                Opens::No => {
                     let known = Known {
                         user: Some(&user.id),
                         application: Some(name),
                         ..known
                     };
                     let answer = if asks_for_a_page(&parts) {
-                        pages::not_shared(name, &user.id, person.as_deref())
+                        self.not_shared_page(name, &user.id, port).await
                     } else {
                         not_shared(name)
                     };
                     return finish(&known, answer);
-                }
-                Err(error) => {
-                    log::record(
-                        "platform-database-failed",
-                        json!({ "error": error.to_string() }),
-                    );
-                    let known = Known {
-                        user: Some(&user.id),
-                        ..known
-                    };
-                    return finish(&known, unavailable());
                 }
             }
         }
@@ -506,6 +537,20 @@ fn no_application() -> Response<Full<Bytes>> {
         StatusCode::NOT_FOUND,
         "Not found: no Application at this address.\n",
     )
+}
+
+/// The `503` of a request to an Application whose lists the program does
+/// not know now and cannot read back.
+fn lists_unknown() -> Response<Full<Bytes>> {
+    let mut response = own(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Unavailable: who may open this Application cannot be checked just now. Try again shortly.\n",
+    );
+    response.headers_mut().insert(
+        RETRY_AFTER,
+        HeaderValue::from_static(crate::oidc::pages::RETRY_AFTER_SECONDS),
+    );
+    response
 }
 
 /// The `403` of an Application not shared with the User, for a request

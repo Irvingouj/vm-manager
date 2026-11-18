@@ -118,8 +118,14 @@ pub fn no_application(name: &str) -> Response<Full<Bytes>> {
 
 /// `403`: the Application is not shared with the person signed in. It names
 /// the Application and whom they are signed in as (their id, and their
-/// name when the platform knows it), all escaped, and no Contributor.
-pub fn not_shared(application: &str, id: &str, name: Option<&str>) -> Response<Full<Bytes>> {
+/// name when the platform knows it), all escaped, and no Contributor;
+/// with OIDC one link, to the sign-in address's sign-out (`sign_out`).
+pub fn not_shared(
+    application: &str,
+    id: &str,
+    name: Option<&str>,
+    sign_out: Option<&str>,
+) -> Response<Full<Bytes>> {
     let who = match name {
         Some(name) => format!(
             "<strong>{}</strong> (id <code>{}</code>)",
@@ -133,9 +139,12 @@ pub fn not_shared(application: &str, id: &str, name: Option<&str>) -> Response<F
         "This Application is not shared with you",
         &format!(
             "<p>The Application <code>{}</code> is not shared with you. You are signed in as {who}.</p>\
-             <p>To open it, ask one of its Contributors to share it with you.</p>\
-             <p><a href=\"/sign-out\">Sign out</a></p>",
-            escape(application)
+             <p>To open it, ask one of its Contributors to share it with you.</p>{}",
+            escape(application),
+            sign_out.map_or_else(String::new, |address| format!(
+                "<p>Signed in as the wrong person? <a href=\"{}\">Sign out</a></p>",
+                escape(address)
+            )),
         ),
     )
 }

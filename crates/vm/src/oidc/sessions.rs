@@ -73,7 +73,6 @@ use super::seal::Sealer;
 use super::secret::Secret;
 use super::token::Claims;
 use crate::platform_db::{DbError, PlatformDatabase, rfc3339};
-use crate::registry::Opening;
 use crate::user::User;
 use crate::{log, server};
 
@@ -109,21 +108,12 @@ pub struct Found {
     pub user: User,
     /// Whether it is due for renewal.
     pub due: bool,
-    /// For an Application's session: whether its User may open the
-    /// Application, decided in the same query by the session's Groups.
-    pub opening: Option<Opening>,
 }
 
 /// What a request's session comes to.
 pub enum Current {
-    /// A session, its User as they are now; for an Application's session
-    /// not renewed by this request, whether they may open the Application
-    /// (`None`: not decided, since their Groups were read again).
-    User {
-        session: i64,
-        user: User,
-        opening: Option<Opening>,
-    },
+    /// A session, its User as they are now.
+    User { session: i64, user: User },
     /// None (none at all, ended, or ended at this renewal).
     None,
     /// It cannot be known now: the platform database or the provider did
@@ -206,7 +196,6 @@ fn found(row: &Row) -> Result<Found, DbError> {
             groups: row.try_get(2).map_err(&bad)?,
         },
         due: row.try_get(3).map_err(&bad)?,
-        opening: None,
     })
 }
 
@@ -337,10 +326,7 @@ impl Sessions {
     }
 
     /// The session of an Application's cookie, if it is that Application's
-    /// and its platform session has not ended; and, in the same query,
-    /// whether its User may open the Application by the session's Groups
-    /// (crate::registry, "Contributors and sharing: Opening an
-    /// Application"), with their name as last read when they may not.
+    /// and its platform session has not ended.
     pub async fn application(
         &self,
         digest: &[u8; 32],
@@ -353,35 +339,17 @@ impl Sessions {
             .run(async |client: &mut Client| {
                 client
                     .query_opt(
-                        concat!(
-                            "SELECT s.id, s.user_id, s.groups,
-                                    s.renewed_at + $3::bigint * interval '1 second' <= now(),
-                                    o.opens,
-                                    CASE WHEN o.opens THEN NULL
-                                         ELSE (SELECT u.name FROM users u WHERE u.id = s.user_id)
-                                    END
-                             FROM application_sessions a JOIN sessions s ON s.id = a.session_id
-                             LEFT JOIN LATERAL (
-                                 SELECT ",
-                            crate::registry::can_open!("app.id", "s.user_id", "s.groups"),
-                            " AS opens FROM applications app WHERE app.name = a.application
-                             ) o ON true
-                             WHERE a.digest = $1 AND a.application = $2 AND s.ends_at > now()"
-                        ),
+                        "SELECT s.id, s.user_id, s.groups,
+                                s.renewed_at + $3::bigint * interval '1 second' <= now()
+                         FROM application_sessions a JOIN sessions s ON s.id = a.session_id
+                         WHERE a.digest = $1 AND a.application = $2 AND s.ends_at > now()",
                         &[&digest.as_slice(), &application, &renewal],
                     )
                     .await
                     .map_err(DbError::from)
             })
             .await?;
-        let Some(row) = row else { return Ok(None) };
-        let bad = unexpected("a session");
-        let mut found = found(&row)?;
-        found.opening = Some(Opening::of(
-            row.try_get(4).map_err(&bad)?,
-            row.try_get(5).map_err(&bad)?,
-        ));
-        Ok(Some(found))
+        row.as_ref().map(found).transpose()
     }
 
     /// The session as it is now: renewed first when it is due.
@@ -390,7 +358,6 @@ impl Sessions {
             Ok(Some(found)) if !found.due => Current::User {
                 session: found.id,
                 user: found.user,
-                opening: found.opening,
             },
             Ok(Some(found)) => match self.renew(Subject::Session(found.id)).await {
                 // Copied: each request that waited takes its own User; once
@@ -398,7 +365,6 @@ impl Sessions {
                 Outcome::User(user) => Current::User {
                     session: found.id,
                     user,
-                    opening: None,
                 },
                 Outcome::None => Current::None,
                 Outcome::Unavailable => Current::Unavailable,
