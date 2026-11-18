@@ -252,17 +252,87 @@ fn someone_it_is_shared_with_sees_who_maintains_it_and_not_whom_else_it_is_share
     );
 }
 
+/// Fails unless `page` shows `board` to a Platform administrator who
+/// cannot open it as the contract says: relation `none`, no link to open
+/// it, the address as text, words saying they read it as a Platform
+/// administrator and that it is not shared with them; and no form.
+fn assert_administrator_cannot_open(page: &Page, context: &str) {
+    let board = page.listed(APP);
+    assert_eq!(
+        board.relation.as_deref(),
+        Some("none"),
+        "{context}: expected `data-vm-relation=\"none\"` for a Platform administrator who cannot open it\n{}",
+        page.describe()
+    );
+    assert!(
+        board.open.is_empty(),
+        "{context}: expected no `a[data-vm-open]` for a Platform administrator who cannot open it, got {:?}\n{}",
+        board.open,
+        page.describe()
+    );
+    let address = format!("{APP}.{DOMAIN}");
+    assert!(
+        page.text().contains(&address),
+        "{context}: expected the address {address:?} still shown as text\n{}",
+        page.describe()
+    );
+    let text = page.text().to_lowercase();
+    assert!(
+        text.contains("administrator") && text.contains("not shared"),
+        "{context}: expected words saying they read it as a Platform administrator and that it is not shared with them, got {text:?}"
+    );
+    assert!(
+        page.forms().is_empty(),
+        "{context}: expected no form for a Platform administrator who is not a Contributor\n{}",
+        page.describe()
+    );
+    assert_eq!(
+        board.contributor_keys(),
+        keys(&["user:alice", "group:staff"]),
+        "{context}"
+    );
+}
+
 #[test]
 fn a_platform_administrator_gets_the_page_and_whom_it_is_shared_with_and_no_form() {
     let vm = with_board();
-    let page = Dashboard::new(&vm, &administrator()).details(APP);
+    let dashboard = Dashboard::new(&vm, &administrator());
+
+    // Shared with nobody: they cannot open it.
+    let page = dashboard.details(APP);
     assert!(
         page.shared().is_empty() && page.text().to_lowercase().contains("only"),
         "shared with nobody: expected words saying only its Contributors can open it\n{}",
         page.describe()
     );
-    share_four(&vm);
-    let page = Dashboard::new(&vm, &administrator()).details(APP);
+    assert_administrator_cannot_open(&page, "shared with nobody");
+
+    // Shared with a person and a Group they are not in: still they cannot
+    // open it, and they see whom it is shared with.
+    share_ok(
+        &vm.api_as(&alice()),
+        &vm,
+        APP,
+        &add(&[user("bob"), group("finance")]),
+    );
+    let page = dashboard.details(APP);
+    assert_eq!(
+        page.shared_keys(),
+        keys(&["user:bob", "group:finance"]),
+        "expected a Platform administrator to see whom it is shared with\n{}",
+        page.describe()
+    );
+    assert_administrator_cannot_open(&page, "shared with bob and finance, not with them");
+
+    // Shared with everyone: now they can open it, and are shown it as
+    // anyone it is shared with.
+    share_ok(
+        &vm.api_as(&alice()),
+        &vm,
+        APP,
+        &add(&[everyone(), user("never-signed")]),
+    );
+    let page = dashboard.details(APP);
     assert_eq!(
         page.shared_keys(),
         keys(&FOUR),
@@ -274,35 +344,22 @@ fn a_platform_administrator_gets_the_page_and_whom_it_is_shared_with_and_no_form
         "expected no form for a Platform administrator who is not a Contributor\n{}",
         page.describe()
     );
-    assert_eq!(
-        page.listed(APP).contributor_keys(),
-        keys(&["user:alice", "group:staff"])
-    );
-    // What they cannot do is not offered: no link to open it, relation
-    // `none`, the address as text, and words saying why.
     let board = page.listed(APP);
     assert_eq!(
         board.relation.as_deref(),
-        Some("none"),
-        "expected `data-vm-relation=\"none\"` for a Platform administrator it is not shared with\n{}",
+        Some("shared"),
+        "shared with everyone: expected a Platform administrator shown it as anyone it is shared with\n{}",
         page.describe()
     );
-    assert!(
-        board.open.is_empty(),
-        "expected no `a[data-vm-open]` for a Platform administrator who cannot open it, got {:?}\n{}",
-        board.open,
+    assert_eq!(
+        board.open_href(),
+        Some(dashboard.open_href(APP)),
+        "shared with everyone: expected the link to open it\n{}",
         page.describe()
     );
-    let address = format!("{APP}.{DOMAIN}");
-    assert!(
-        page.text().contains(&address),
-        "expected the address {address:?} still shown as text\n{}",
-        page.describe()
-    );
-    let text = page.text().to_lowercase();
-    assert!(
-        text.contains("administrator") && text.contains("not shared"),
-        "expected words saying they read it as a Platform administrator and that it is not shared with them, got {text:?}"
+    assert_eq!(
+        board.contributor_keys(),
+        keys(&["user:alice", "group:staff"])
     );
 }
 
