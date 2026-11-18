@@ -391,6 +391,7 @@ fn run(serve: &Serve) -> Result<(), String> {
             }),
         );
         let ingress = Arc::new(Ingress {
+            resources: Arc::clone(&resources),
             api: Api::new(
                 Arc::clone(&registry),
                 resources,

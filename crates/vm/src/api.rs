@@ -1524,8 +1524,10 @@ impl Api {
             // waiting; the User's access to a Resource is never guessed.
             let groups = groups_of(user);
             let mut resources = Vec::with_capacity(all.len());
+            // One limit for all of this request's readings.
+            let deadline = tokio::time::Instant::now() + resources::READ_BACK_WAIT;
             for resource in &all {
-                self.resources.read_back(resource).await;
+                self.resources.read_back(resource, deadline).await;
                 match ResourceRead::of(resource, &groups) {
                     Some(read) => resources.push(read),
                     None => return Ok(grants_unknown(&resource.name)),
@@ -1567,7 +1569,12 @@ impl Api {
         if method != Method::GET {
             return Ok(Answer::method_not_allowed(method, "GET"));
         }
-        self.resources.read_back(&resource).await;
+        self.resources
+            .read_back(
+                &resource,
+                tokio::time::Instant::now() + resources::READ_BACK_WAIT,
+            )
+            .await;
         Ok(match ResourceRead::of(&resource, &groups_of(user)) {
             Some(read) => Answer::json(StatusCode::OK, &read),
             None => grants_unknown(name),
@@ -1579,7 +1586,12 @@ impl Api {
             return Ok(no_resource());
         };
         if method == Method::GET {
-            self.resources.read_back(&resource).await;
+            self.resources
+                .read_back(
+                    &resource,
+                    tokio::time::Instant::now() + resources::READ_BACK_WAIT,
+                )
+                .await;
             let Some(grants) = resource.grants() else {
                 return Ok(grants_unknown(name));
             };
@@ -1628,7 +1640,12 @@ impl Api {
         if method != Method::GET {
             return Answer::method_not_allowed(method, "GET");
         }
-        self.resources.read_back(&resource).await;
+        self.resources
+            .read_back(
+                &resource,
+                tokio::time::Instant::now() + resources::READ_BACK_WAIT,
+            )
+            .await;
         let groups = groups_of(user);
         let decided = resource.with_grants(|grants| {
             let decision = authz::decide(&authz::Question {

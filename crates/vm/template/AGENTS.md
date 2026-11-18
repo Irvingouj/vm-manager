@@ -58,6 +58,7 @@ A refused operation throws `Refused` (import it from `@vm/sdk`), with `refusal.r
 
 - `not-declared` or `declared-lower`: fix `manifest.ts`.
 - `no-grant`: the User lacks access. This is working as intended. Do not work around it: no other Resource used as a substitute, no copying of data into the own database to get past it, no hard-coded or mocked data. Where some Users will lack access, catch `Refused` and show them a clear message, and tell the Builder who needs which Grant.
+- `grants-unknown` or `log-unavailable`: nothing in the project is wrong. The platform could not decide the operation (it is finding out the Resource's Grants after a change of them) or record it in the Operation log just then, and the same request works again shortly. There is nothing to fix in the code and nothing to code around: at most, catch `Refused` and tell the User to try again in a moment.
 
 **If `vm pull` is refused because the Builder holds no Grant, stop and tell the Builder.** Say which Resource the request needs, what for, and whom to ask (the refusal names them). Getting access means a person adds the Builder to a Group; you cannot do it. Do not invent the Resource's tables, mock its data, or quietly drop the feature that needs it. If the rest of the request is useful without it, ask the Builder whether to build that part now.
 

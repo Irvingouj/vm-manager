@@ -49,6 +49,7 @@ use crate::oidc::sessions::{Current, Outcome as Renewed};
 use crate::oidc::{AUTH_NAME, Oidc, SESSION_PATH, asks_for_a_page, pages};
 use crate::origin::{Public, from_another_origin};
 use crate::registry::{Found, Registry, check_name};
+use crate::resources::{READ_BACK_WAIT, Resources};
 use crate::runner::{InFlight, Outcome, RequestRunner};
 use crate::sign_in::{RESERVED_HEADER_PREFIX, SignIn, SignedIn, remove_reserved_headers};
 use crate::tool_credentials::{self, Digest, Presented, ToolCredentials};
@@ -73,6 +74,9 @@ pub struct Ingress {
     /// The installation's domain, in lower case.
     pub domain: Arc<str>,
     pub registry: Arc<Registry>,
+    /// The Resources and their Grants: a request reads back the Grants
+    /// memory does not know on the Resources its serving Version declares.
+    pub resources: Arc<Resources>,
     pub api: Api,
     pub sign_in: Box<dyn SignIn>,
     /// OIDC sign-in and sessions, when the program has an installation's
@@ -283,12 +287,16 @@ impl Ingress {
         // Memory that does not know it now (a write whose answer was lost)
         // reads it back, and nothing is served on a guess meanwhile.
         let application = name.filter(|n| check_name(n).is_ok());
+        // All the readings of this request share one limit, from the first.
+        let mut deadline: Option<tokio::time::Instant> = None;
         let mut found = match application {
             Some(name) => self.registry.find(name),
             None => Found::NoSuchApplication,
         };
         if let (Found::NotKnown, Some(name)) = (&found, application) {
-            found = match self.registry.read_back(name).await {
+            let until =
+                *deadline.get_or_insert_with(|| tokio::time::Instant::now() + READ_BACK_WAIT);
+            found = match self.registry.read_back(name, until).await {
                 // Still not held (a forgetting while it was read): not
                 // known, never a guess.
                 Ok(_) => self.registry.find(name),
@@ -350,6 +358,23 @@ impl Ingress {
             };
             return finish(&known, no_application());
         };
+        // The Grants memory does not know on the Resources this Version
+        // declares are read back before any of its code runs, so that once a
+        // write of them is settled the next request's operations are decided
+        // by the Grants the database has. With nothing forgotten this costs
+        // one atomic load. Readings not done in time leave those Grants not
+        // known: their operations are refused `grants-unknown`.
+        if self.resources.any_grants_unknown() {
+            let until =
+                *deadline.get_or_insert_with(|| tokio::time::Instant::now() + READ_BACK_WAIT);
+            for declared in serving.declared.keys() {
+                if let Some(resource) = self.resources.get(declared)
+                    && !resource.grants_known()
+                {
+                    self.resources.read_back(&resource, until).await;
+                }
+            }
+        }
         let in_flight = Arc::new(InFlight {
             request: Arc::clone(&id),
             user,

@@ -53,13 +53,14 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, PoisonError, RwLock};
 use std::time::Duration;
 
 use authz::AccessLevel;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Semaphore, SemaphorePermit};
+use tokio::time::Instant;
 use tokio_postgres::error::SqlState;
 use tokio_postgres::types::FromSql;
 use tokio_postgres::{Client, Row};
@@ -365,14 +366,30 @@ impl Resource {
     }
 
     /// Forgets the Grants, as of `epoch`, keeping the highest revision
-    /// memory held as `seen`.
-    fn forget(&self, epoch: u64) {
+    /// memory held as `seen`. `unknown` counts the Resources whose Grants
+    /// are forgotten: one more when these were known, changed under the
+    /// lock that changes them, so it is exact.
+    fn forget(&self, epoch: u64, unknown: &AtomicUsize) {
         let mut grants = self.grants.write().unwrap_or_else(PoisonError::into_inner);
         let seen = match &*grants {
-            Grants::Known(known) => Grants::newest(known),
+            Grants::Known(known) => {
+                unknown.fetch_add(1, Ordering::SeqCst);
+                Grants::newest(known)
+            }
             Grants::Unknown { seen, .. } => *seen,
         };
         *grants = Grants::Unknown { seen, epoch };
+    }
+
+    /// For a Resource taken out of memory: its Grants held as known (and
+    /// none), so that `unknown` no longer counts it and no read-back makes
+    /// it known again.
+    fn let_go(&self, unknown: &AtomicUsize) {
+        let mut grants = self.grants.write().unwrap_or_else(PoisonError::into_inner);
+        if let Grants::Unknown { .. } = &*grants {
+            unknown.fetch_sub(1, Ordering::SeqCst);
+        }
+        *grants = Grants::Known(BTreeMap::new());
     }
 
     /// The epoch of the forgetting memory is in; `None` when it knows the
@@ -387,13 +404,15 @@ impl Resource {
     /// Takes what a read-back begun in the forgetting `epoch` read: only
     /// if memory is still in that forgetting, and it holds every revision
     /// reported since.
-    fn install_read(&self, read: BTreeMap<String, Granted>, began: u64) {
+    /// `unknown` is one less when they become known, under the same lock.
+    fn install_read(&self, read: BTreeMap<String, Granted>, began: u64, unknown: &AtomicUsize) {
         let mut grants = self.grants.write().unwrap_or_else(PoisonError::into_inner);
         if let Grants::Unknown { seen, epoch } = &*grants
             && *epoch == began
             && *seen <= Grants::newest(&read)
         {
             *grants = Grants::Known(read);
+            unknown.fetch_sub(1, Ordering::SeqCst);
         }
     }
 }
@@ -419,17 +438,33 @@ pub struct Resources {
     all: RwLock<BTreeMap<String, Arc<Resource>>>,
     /// The number of forgettings of Grants so far, each one's `epoch`.
     forgotten: AtomicU64,
-    /// The read-backs of Grants under way: at most [`READ_BACKS`].
-    reading_back: Semaphore,
+    /// How many Resources in memory have their Grants forgotten now: one
+    /// atomic load tells a request whether it has any to read back. Kept
+    /// exact: it changes only on a change between known and forgotten,
+    /// made under that Resource's `grants` lock in the same critical
+    /// section ([`Resource::forget`], [`Resource::install_read`],
+    /// [`Resource::let_go`]).
+    unknown: AtomicUsize,
+    /// The readings of what memory does not know (Applications and
+    /// Grants), shared with crate::registry: at most [`READ_BACKS`].
+    reading_back: Arc<Semaphore>,
 }
 
-/// The most read-backs of Grants at once in the program; one more is not
-/// made (the Grants stay not known, and the next operation or request that
-/// finds them so tries again).
-const READ_BACKS: usize = 4;
+/// The most readings of what memory does not know (an Application, a
+/// Resource's Grants) at once in the program; one more is not made (what
+/// it was for stays not known: a request gets the "meanwhile" answers, and
+/// the next one tries again).
+pub const READ_BACKS: usize = 4;
 
-/// The longest a read-back of Grants may take.
-const READ_BACK_WAIT: Duration = Duration::from_secs(1);
+/// The longest the readings of one request (or one operation's, or one
+/// API request's) may take together.
+pub const READ_BACK_WAIT: Duration = Duration::from_secs(1);
+
+/// The program's one bound on readings at once ([`READ_BACKS`]), given to
+/// the registry and the Resources.
+pub fn read_backs() -> Arc<Semaphore> {
+    Arc::new(Semaphore::new(READ_BACKS))
+}
 
 const RESOURCE_COLUMNS: &str = concat!(
     "r.id, r.name, r.description, r.owner, r.contact, r.connection, r.created_by, ",
@@ -449,6 +484,7 @@ impl Resources {
     pub async fn load(
         database: Arc<PlatformDatabase>,
         limits: executor::Limits,
+        reading_back: Arc<Semaphore>,
     ) -> Result<Self, DbError> {
         let (locked, resources, grants) = database
             .pool()
@@ -491,7 +527,8 @@ impl Resources {
             limits,
             all: RwLock::new(BTreeMap::new()),
             forgotten: AtomicU64::new(0),
-            reading_back: Semaphore::new(READ_BACKS),
+            unknown: AtomicUsize::new(0),
+            reading_back,
         };
         let mut read: BTreeMap<i64, BTreeMap<String, Granted>> = BTreeMap::new();
         for row in &grants {
@@ -513,7 +550,7 @@ impl Resources {
                     .unwrap_or_else(PoisonError::into_inner) = Grants::Known(grants);
             } else {
                 let epoch = this.forgotten.fetch_add(1, Ordering::Relaxed);
-                resource.forget(epoch);
+                resource.forget(epoch, &this.unknown);
                 unknown.push(resource.name.clone());
             }
             all.insert(resource.name.clone(), Arc::new(resource));
@@ -658,10 +695,14 @@ impl Resources {
                 Ok(removed > 0)
             })
             .await?;
-        self.all
+        let gone = self
+            .all
             .write()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(name);
+        if let Some(gone) = gone {
+            gone.let_go(&self.unknown);
+        }
         Ok(removed)
     }
 
@@ -721,7 +762,7 @@ impl Resources {
                 // The commit may land after this answer: nothing is read
                 // now, which could be earlier than it.
                 let epoch = self.forgotten.fetch_add(1, Ordering::Relaxed);
-                found.forget(epoch);
+                found.forget(epoch, &self.unknown);
                 log::record(
                     "grants-unknown",
                     serde_json::json!({ "resource": &found.name }),
@@ -796,19 +837,29 @@ impl Resources {
         Ok(Some(held))
     }
 
+    /// Whether memory has forgotten the Grants of any Resource now: one
+    /// atomic load, no lock.
+    pub fn any_grants_unknown(&self) -> bool {
+        self.unknown.load(Ordering::SeqCst) > 0
+    }
+
     /// Reads `resource`'s Grants back when memory does not know them, and
     /// answers whether it knows them after. Never waits for the platform
-    /// database: at most [`READ_BACKS`] at once in the program (one more
-    /// is not made), each within [`READ_BACK_WAIT`], and not made while a
-    /// write of a Grant is on its way (the row is locked).
-    pub async fn read_back(&self, resource: &Resource) -> bool {
+    /// database: at most [`READ_BACKS`] readings at once in the program
+    /// (one more is not made), done by `deadline` (the caller's, shared by
+    /// all its readings), and not made while a write of a Grant is on its
+    /// way (the row is locked).
+    pub async fn read_back(&self, resource: &Resource, deadline: Instant) -> bool {
         let Some(began) = resource.forgotten_at() else {
             return true;
         };
+        if Instant::now() >= deadline {
+            return false;
+        }
         let Ok(_permit) = self.reading_back.try_acquire() else {
             return false;
         };
-        let read = tokio::time::timeout(READ_BACK_WAIT, self.grants_of(resource.id))
+        let read = tokio::time::timeout_at(deadline, self.grants_of(resource.id))
             .await
             .unwrap_or_else(|_| {
                 Err(DbError::timed_out(
@@ -817,7 +868,7 @@ impl Resources {
                 ))
             });
         match read {
-            Ok(Some(grants)) => resource.install_read(grants, began),
+            Ok(Some(grants)) => resource.install_read(grants, began, &self.unknown),
             Ok(None) => {}
             Err(error) => {
                 // A write on its way is no failure: it is waited out by

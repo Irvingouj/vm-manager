@@ -341,6 +341,7 @@ impl Live {
         let ingress = Ingress {
             domain: Arc::from(DOMAIN),
             registry: Arc::clone(&registry),
+            resources: Arc::clone(&resources),
             api: Api::new(
                 Arc::clone(&registry),
                 Arc::clone(&resources),

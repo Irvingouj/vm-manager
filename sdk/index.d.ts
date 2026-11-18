@@ -68,6 +68,7 @@ export type Refusal =
       readonly held: AccessLevel | null;
       readonly contact: string;
     }
+  | { readonly reason: "grants-unknown"; readonly resource: string }
   | { readonly reason: "log-unavailable"; readonly resource?: string };
 
 /**

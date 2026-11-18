@@ -76,7 +76,7 @@ use crate::executor::{Failure, Held, Isolation, Label, Level, Outcome, Param, Po
 use crate::log;
 use crate::oplog::{Ending, Entry, OperationLog};
 use crate::own_db::{HistoryRead, OwnDatabases};
-use crate::resources::{Resource, Resources, level_name};
+use crate::resources::{READ_BACK_WAIT, Resource, Resources, level_name};
 use crate::runner::InFlight;
 use crate::statement;
 
@@ -776,7 +776,8 @@ impl PlatformGateway {
                 // complete either way.
                 reply.send(task(work).await).ok();
                 if let Some((resources, resource)) = read_back {
-                    resources.read_back(&resource).await;
+                    let deadline = tokio::time::Instant::now() + READ_BACK_WAIT;
+                    resources.read_back(&resource, deadline).await;
                 }
                 drop(permit);
             });

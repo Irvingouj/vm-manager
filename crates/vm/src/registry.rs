@@ -69,13 +69,13 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, PoisonError, RwLock};
-use std::time::Duration;
 
 use authz::AccessLevel;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
+use tokio::time::Instant;
 use tokio_postgres::types::FromSql;
 use tokio_postgres::{Client, GenericClient, Row};
 
@@ -632,17 +632,11 @@ pub struct Registry {
     held: RwLock<HashMap<Arc<str>, Held>>,
     /// The number of forgettings so far, each one's `epoch`.
     forgotten: AtomicU64,
-    /// The read-backs at requests under way: at most [`READ_BACKS`].
-    reading_back: Semaphore,
+    /// The readings of what memory does not know under way, shared with
+    /// crate::resources: at most [`crate::resources::READ_BACKS`] in the
+    /// program. A request that finds them all taken is `503` at once.
+    reading_back: Arc<Semaphore>,
 }
-
-/// The most read-backs of Applications at requests at once in the
-/// program; a request that finds them all taken is `503` at once rather
-/// than wait.
-const READ_BACKS: usize = 4;
-
-/// The longest a request waits for a read-back of an Application.
-const READ_BACK_WAIT: Duration = Duration::from_secs(1);
 
 impl Registry {
     /// Reads every Application, its serving Version and its lists from the
@@ -658,6 +652,7 @@ impl Registry {
     pub async fn load(
         database: Arc<PlatformDatabase>,
         own: Arc<OwnDatabases>,
+        reading_back: Arc<Semaphore>,
     ) -> Result<Self, DbError> {
         let (applications, entries) = database
             .pool()
@@ -742,7 +737,7 @@ impl Registry {
             own,
             held: RwLock::new(held),
             forgotten,
-            reading_back: Semaphore::new(READ_BACKS),
+            reading_back,
         })
     }
 
@@ -774,10 +769,11 @@ impl Registry {
     /// Reads `name` back from the platform database into memory, for a
     /// request that found it not known. `false` when there is no such
     /// Application. Never waits for the platform database: at most
-    /// [`READ_BACKS`] at once in the program (one more is refused at once),
-    /// each within [`READ_BACK_WAIT`], and refused at once while a write of
-    /// it is on its way (the row is locked).
-    pub async fn read_back(&self, name: &str) -> Result<bool, DbError> {
+    /// [`crate::resources::READ_BACKS`] readings at once in the program
+    /// (one more is refused at once), done by `deadline` (the request's,
+    /// shared by all its readings), and refused at once while a write of it
+    /// is on its way (the row is locked).
+    pub async fn read_back(&self, name: &str, deadline: Instant) -> Result<bool, DbError> {
         let Ok(_permit) = self.reading_back.try_acquire() else {
             return Err(DbError::unexpected("too many read-backs at once"));
         };
@@ -791,9 +787,14 @@ impl Registry {
             Some(Held::Known(_)) => Began::Known,
             Some(Held::Unknown { epoch, .. }) => Began::Unknown(*epoch),
         };
-        let read = tokio::time::timeout(READ_BACK_WAIT, self.kept_of(name))
+        let read = tokio::time::timeout_at(deadline, self.kept_of(name))
             .await
-            .map_err(|_| DbError::timed_out("reading an Application back", READ_BACK_WAIT))?;
+            .map_err(|_| {
+                DbError::timed_out(
+                    "reading an Application back",
+                    crate::resources::READ_BACK_WAIT,
+                )
+            })?;
         let Some(kept) = read? else {
             return Ok(false);
         };
@@ -1585,12 +1586,32 @@ impl Registry {
                     )
                     .await
                     .map_err(DbError::from)?;
+                // What the switch answered is read before the commit: a
+                // failure to read it is then a switch not made.
+                let Some(row) = row else {
+                    transaction.commit().await.map_err(DbError::from)?;
+                    return Ok(None);
+                };
+                let to_list = recorded_of(get::<Option<Value>>(&row, 3)?.as_ref());
+                let latest = recorded_of(get::<Option<Value>>(&row, 4)?.as_ref());
+                let migrations_not_undone: Vec<String> = latest
+                    .into_iter()
+                    .filter(|m| !to_list.iter().any(|t| t.name == m.name))
+                    .map(|m| m.name)
+                    .collect();
+                let serving = Serving {
+                    application: Arc::from(name),
+                    version: to,
+                    bundle: Arc::from(get::<&str>(&row, 1)?),
+                    declared: Arc::new(declared_of(&get::<Value>(&row, 2)?)),
+                };
+                let generation: i64 = get(&row, 0)?;
                 transaction.commit().await.map_err(DbError::from)?;
-                Ok(row)
+                Ok(Some((serving, generation, migrations_not_undone)))
             })
             .await;
-        let row = match switched {
-            Ok(row) => row,
+        let switched = match switched {
+            Ok(switched) => switched,
             Err(error) => {
                 // The commit may land after this answer: forgotten at once
                 // (the API found the Application before).
@@ -1598,23 +1619,10 @@ impl Registry {
                 return Err(error);
             }
         };
-        let Some(row) = row else {
+        let Some((serving, generation, migrations_not_undone)) = switched else {
             return self.not_gone_back(name, from).await;
         };
-        let to_list = recorded_of(get::<Option<Value>>(&row, 3)?.as_ref());
-        let latest = recorded_of(get::<Option<Value>>(&row, 4)?.as_ref());
-        let migrations_not_undone = latest
-            .into_iter()
-            .filter(|m| !to_list.iter().any(|t| t.name == m.name))
-            .map(|m| m.name)
-            .collect();
-        let serving = Serving {
-            application: Arc::from(name),
-            version: to,
-            bundle: Arc::from(get::<&str>(&row, 1)?),
-            declared: Arc::new(declared_of(&get::<Value>(&row, 2)?)),
-        };
-        self.install_serving(name, serving, get(&row, 0)?);
+        self.install_serving(name, serving, generation);
         Ok(WentBack::WentBack {
             migrations_not_undone,
         })

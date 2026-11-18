@@ -75,10 +75,13 @@ impl Platform {
                     .await
                     .map_err(unreadable)?,
             );
-            let registry = Registry::load(Arc::clone(&database), Arc::clone(&own))
-                .await
-                .map_err(unreadable)?;
-            let resources = Resources::load(Arc::clone(&database), executor)
+            // One bound on readings of what memory does not know, for both.
+            let read_backs = crate::resources::read_backs();
+            let registry =
+                Registry::load(Arc::clone(&database), Arc::clone(&own), Arc::clone(&read_backs))
+                    .await
+                    .map_err(unreadable)?;
+            let resources = Resources::load(Arc::clone(&database), executor, read_backs)
                 .await
                 .map_err(unreadable)?;
             Ok::<_, String>((database, own, registry, resources))
