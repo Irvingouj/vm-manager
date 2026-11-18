@@ -2094,3 +2094,22 @@ Pages are read by people; the attributes named `data-vm-...` below are what a te
 - Searching the list.
 - What a Platform administrator sees of every Application: its ticket. Here an administrator's list is their own, as anyone's.
 - A Dashboard in another language than English.
+
+## The local run on a busy machine (ticket: The local run's private Postgres passes its time limits under the gate's load, and the refusal does not say which limit)
+
+A local run that ends `postgres-failed` (exit code `1`; "The local loop: one request as a test User") says **what happened to which step**, so that a failure on a busy machine is read from the command's own output and not guessed.
+
+### What `postgres-failed` says
+
+- The message keeps what it has (the step in words, `.vm/local/postgres.log`, what to run next) and says the cause in words: that the step did not end within its limit, with the limit in seconds; or that the connection to the private Postgres could not be opened or was lost; or that the server refused, with its SQLSTATE; or that the private Postgres did not start or ended.
+- With `--json` the `error` object has, beside `reason` and `message`:
+  - `"step"`: a short fixed name of what the run was doing, the same for the same step in every run (lower-case words joined by `-`, for instance `own-database-create`, `own-database-connect`, `stand-in-create`, `start`; the program's own list, each documented by its message);
+  - `"cause"`: `"timed-out"`, `"connection"`, `"server"` or `"ended"`;
+  - `"limit_seconds"`: a number, with `timed-out` only;
+  - `"sqlstate"`: five characters, with `server` only.
+- Nothing of a password or a connection string is in any of them.
+- The exit code, the reason, and that nothing the run started is left running are unchanged.
+
+### The harness
+
+- A program the harness writes for a test to start (a stand-in `node`, a stand-in tool) is never started while it is still open for writing in any thread's child: "Text file busy" is the harness's own race, not the program's, and no test may fail by it.
