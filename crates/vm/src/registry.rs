@@ -36,13 +36,17 @@
 //! change that changes a list adds one to the Application's
 //! `lists_generation` under the row's lock, and memory keeps the higher,
 //! so changes at once leave memory as the database whatever order they
-//! report back in. A creation or a change whose answer is lost is read
-//! back in one statement (the generation and the entries one snapshot);
-//! if that fails too, memory forgets the Application's lists
-//! ([`Held::Unknown`]) and Ingress reads them back at its next request,
-//! answering `503` while it cannot: nobody is let in on a guess. Forgetting
-//! only ever replaces what memory holds of an Application, so memory holds
-//! at most one entry per Application.
+//! report back in. A creation or a change whose answer is lost may still
+//! be made (its commit on its way), so memory forgets the Application's
+//! lists at once ([`Held::Unknown`]), and a request reads them back
+//! ([`Registry::read_back`]) under the Application's row share lock, taken
+//! without waiting: a change holds the row's lock until its commit is
+//! done, so a read-back is never earlier than a change it follows, and
+//! while one is on its way the request is `503` at once. At a start,
+//! Applications whose row a change holds are skipped and held as not
+//! known. Nobody is let in on a guess. Forgetting only ever replaces what
+//! memory holds of an Application, so memory holds at most one entry per
+//! Application.
 //!
 //! Going back ([`Registry::go_back`]) is one `UPDATE` that changes the
 //! serving Version only where it is still the one the caller saw: two
@@ -60,11 +64,13 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, PoisonError, RwLock};
+use std::time::Duration;
 
 use authz::AccessLevel;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use tokio::sync::Semaphore;
 use tokio_postgres::types::FromSql;
 use tokio_postgres::{Client, GenericClient, Row};
 
@@ -597,7 +603,17 @@ pub struct Registry {
     lists: RwLock<HashMap<Arc<str>, Held>>,
     /// The number of forgettings so far, each one's `epoch`.
     forgotten: AtomicU64,
+    /// The read-backs of lists at requests under way: at most
+    /// [`READ_BACKS`].
+    reading_back: Semaphore,
 }
+
+/// The most read-backs of lists at requests at once in the program; a
+/// request that finds them all taken is `503` at once rather than wait.
+const READ_BACKS: usize = 4;
+
+/// The longest a request waits for a read-back of lists.
+const READ_BACK_WAIT: Duration = Duration::from_secs(1);
 
 impl Registry {
     /// Reads every serving Version from the platform database.
@@ -624,43 +640,87 @@ impl Registry {
             let version = serving_of(row)?;
             serving.insert(Arc::clone(&version.application), Arc::new(version));
         }
-        // Every Application's lists, in one statement: one snapshot.
-        let rows = database
+        // Every Application's lists, each read under its row's share lock,
+        // so never while a change of them is on its way: the rows locked by
+        // a change are skipped (not waited for) and their lists held as not
+        // known, read back at a request once the change is settled. So one
+        // Application's waiting change keeps neither the start nor the
+        // others back.
+        let forgotten = AtomicU64::new(0);
+        let read = database
             .pool()
             .run(async |client: &mut Client| {
-                client
+                let transaction = client.transaction().await.map_err(DbError::from)?;
+                // Row locks only: nothing of this transaction must last, so
+                // its commit need not wait to be flushed or replicated.
+                transaction
+                    .batch_execute("SET LOCAL synchronous_commit = off")
+                    .await
+                    .map_err(DbError::from)?;
+                let locked = transaction
+                    .query("SELECT id FROM applications FOR SHARE SKIP LOCKED", &[])
+                    .await
+                    .map_err(DbError::from)?;
+                // A second statement: its snapshot is after the locks.
+                let rows = transaction
                     .query(
-                        "SELECT a.name, a.lists_generation, e.kind, e.name
+                        "SELECT a.id, a.name, a.lists_generation, e.kind, e.name
                          FROM applications a
                          LEFT JOIN application_entries e ON e.application_id = a.id",
                         &[],
                     )
                     .await
-                    .map_err(DbError::from)
+                    .map_err(DbError::from)?;
+                transaction.commit().await.map_err(DbError::from)?;
+                Ok((locked, rows))
             })
             .await?;
-        let mut all: HashMap<Arc<str>, Lists> = HashMap::new();
+        let (locked, rows) = read;
+        let locked: HashSet<i64> = locked
+            .iter()
+            .map(|row| get::<i64>(row, 0))
+            .collect::<Result<_, _>>()?;
+        let mut known: HashMap<Arc<str>, Lists> = HashMap::new();
+        let mut unknown: HashSet<Arc<str>> = HashSet::new();
         for row in &rows {
-            let name: &str = get(row, 0)?;
-            let lists = match all.get_mut(name) {
+            let id: i64 = get(row, 0)?;
+            let name: &str = get(row, 1)?;
+            if !locked.contains(&id) {
+                if !unknown.contains(name) {
+                    unknown.insert(Arc::from(name));
+                }
+                continue;
+            }
+            let lists = match known.get_mut(name) {
                 Some(lists) => lists,
-                None => all.entry(Arc::from(name)).or_default(),
+                None => known.entry(Arc::from(name)).or_default(),
             };
-            lists.generation = get(row, 1)?;
-            if let Some(kind) = get::<Option<&str>>(row, 2)? {
-                lists.add(&Named::of_stored(kind, get(row, 3)?)?);
+            lists.generation = get(row, 2)?;
+            if let Some(kind) = get::<Option<&str>>(row, 3)? {
+                lists.add(&Named::of_stored(kind, get(row, 4)?)?);
             }
         }
-        let lists = all
+        if !unknown.is_empty() {
+            log::record(
+                "lists-unknown",
+                serde_json::json!({ "applications": unknown.iter().map(|n| &**n).collect::<Vec<_>>() }),
+            );
+        }
+        let mut lists: HashMap<Arc<str>, Held> = known
             .into_iter()
             .map(|(name, lists)| (name, Held::Known(Arc::new(lists))))
             .collect();
+        for name in unknown {
+            let epoch = forgotten.fetch_add(1, Ordering::Relaxed);
+            lists.insert(name, Held::Unknown { seen: 0, epoch });
+        }
         Ok(Self {
             database,
             own,
             serving: RwLock::new(serving),
             lists: RwLock::new(lists),
-            forgotten: AtomicU64::new(0),
+            forgotten,
+            reading_back: Semaphore::new(READ_BACKS),
         })
     }
 
@@ -683,8 +743,14 @@ impl Registry {
     /// Reads `name`'s lists back from the platform database into memory,
     /// for a request that found them not known (or not there, for an
     /// Application that serves). `false` when there is no such
-    /// Application.
+    /// Application. Never waits for the platform database: at most
+    /// [`READ_BACKS`] at once in the program (one more is refused at once),
+    /// each within [`READ_BACK_WAIT`], and refused at once while a change
+    /// of the lists is on its way (the row is locked).
     pub async fn read_back(&self, name: &str) -> Result<bool, DbError> {
+        let Ok(_permit) = self.reading_back.try_acquire() else {
+            return Err(DbError::unexpected("too many read-backs of lists at once"));
+        };
         let began = match self
             .lists
             .read()
@@ -695,42 +761,71 @@ impl Registry {
             Some(Held::Known(_)) => Began::Known,
             Some(Held::Unknown { epoch, .. }) => Began::Unknown(*epoch),
         };
-        let Some(lists) = self.lists_of(name).await? else {
+        let read = tokio::time::timeout(READ_BACK_WAIT, self.lists_of(name))
+            .await
+            .map_err(|_| {
+                DbError::timed_out("reading an Application's lists back", READ_BACK_WAIT)
+            })?;
+        let Some(lists) = read? else {
             return Ok(false);
         };
         self.install_read(name, lists, began);
         Ok(true)
     }
 
-    /// `name`'s lists from the platform database, in one statement (the
-    /// generation and the entries one snapshot); `None` for no such
-    /// Application.
+    /// `name`'s lists from the platform database, never earlier than a
+    /// change of them: in one transaction, the Application's row share
+    /// lock taken without waiting (`NOWAIT`: a change holds the row's
+    /// lock until its commit is done, so while one is on its way this
+    /// fails at once with `lock_not_available`), then, in a second
+    /// statement whose snapshot is after the lock was got, the generation
+    /// and the entries. `None` for no such Application.
     async fn lists_of(&self, name: &str) -> Result<Option<Lists>, DbError> {
         let rows = self
             .database
             .pool()
             .run(async |client: &mut Client| {
-                client
+                let transaction = client.transaction().await.map_err(DbError::from)?;
+                // Row locks only: nothing of this transaction must last, so
+                // its commit need not wait to be flushed or replicated.
+                transaction
+                    .batch_execute("SET LOCAL synchronous_commit = off")
+                    .await
+                    .map_err(DbError::from)?;
+                let found = transaction
+                    .query_opt(
+                        "SELECT id FROM applications WHERE name = $1 FOR SHARE NOWAIT",
+                        &[&name],
+                    )
+                    .await
+                    .map_err(DbError::from)?;
+                let Some(found) = found else {
+                    return Ok(None);
+                };
+                let id: i64 = get(&found, 0)?;
+                let rows = transaction
                     .query(
                         "SELECT a.lists_generation, e.kind, e.name
                          FROM applications a
                          LEFT JOIN application_entries e ON e.application_id = a.id
-                         WHERE a.name = $1",
-                        &[&name],
+                         WHERE a.id = $1",
+                        &[&id],
                     )
                     .await
-                    .map_err(DbError::from)
+                    .map_err(DbError::from)?;
+                transaction.commit().await.map_err(DbError::from)?;
+                Ok(Some(rows))
             })
             .await?;
-        let mut lists: Option<Lists> = None;
+        let Some(rows) = rows else { return Ok(None) };
+        let mut lists = Lists::default();
         for row in &rows {
-            let held = lists.get_or_insert_with(Lists::default);
-            held.generation = get(row, 0)?;
+            lists.generation = get(row, 0)?;
             if let Some(kind) = get::<Option<&str>>(row, 1)? {
-                held.add(&Named::of_stored(kind, get(row, 2)?)?);
+                lists.add(&Named::of_stored(kind, get(row, 2)?)?);
             }
         }
-        Ok(lists)
+        Ok(Some(lists))
     }
 
     /// Puts what a creation or a change committed into memory: over lists
@@ -782,28 +877,21 @@ impl Registry {
         }
     }
 
-    /// After a creation or a change whose answer was lost: its lists read
-    /// back; when that fails too, forgotten, if memory holds them (a name
-    /// memory does not hold is left so: no marker is added).
-    async fn after_lost(&self, name: &str) {
-        match self.lists_of(name).await {
-            Ok(Some(lists)) => self.install_changed(name, lists),
-            Ok(None) => {}
-            Err(error) => {
-                log::record(
-                    "lists-unknown",
-                    serde_json::json!({ "application": name, "error": error.to_string() }),
-                );
-                let epoch = self.forgotten.fetch_add(1, Ordering::Relaxed);
-                let mut all = self.lists.write().unwrap_or_else(PoisonError::into_inner);
-                if let Some(held) = all.get_mut(name) {
-                    let seen = match held {
-                        Held::Known(lists) => lists.generation,
-                        Held::Unknown { seen, .. } => *seen,
-                    };
-                    *held = Held::Unknown { seen, epoch };
-                }
-            }
+    /// After a creation or a change whose answer was lost: it may still be
+    /// made (its commit on its way), so its lists are forgotten at once,
+    /// with nothing read first that could be earlier than it; requests read
+    /// them back once it is settled. A name memory does not hold is left
+    /// so (a lost creation): no marker is added.
+    fn after_lost(&self, name: &str) {
+        log::record("lists-unknown", serde_json::json!({ "application": name }));
+        let epoch = self.forgotten.fetch_add(1, Ordering::Relaxed);
+        let mut all = self.lists.write().unwrap_or_else(PoisonError::into_inner);
+        if let Some(held) = all.get_mut(name) {
+            let seen = match held {
+                Held::Known(lists) => lists.generation,
+                Held::Unknown { seen, .. } => *seen,
+            };
+            *held = Held::Unknown { seen, epoch };
         }
     }
 
@@ -896,7 +984,7 @@ impl Registry {
             Ok(created) => created,
             Err(error) => {
                 // It may have been made without the answer arriving.
-                self.after_lost(name).await;
+                self.after_lost(name);
                 return Err(error);
             }
         };
@@ -1132,7 +1220,7 @@ impl Registry {
             Ok(refused) => Ok(refused),
             Err(error) => {
                 // The commit may have happened without its answer arriving.
-                self.after_lost(name).await;
+                self.after_lost(name);
                 Err(error)
             }
         }

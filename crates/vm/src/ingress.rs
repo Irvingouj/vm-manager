@@ -40,6 +40,7 @@ use hyper::header::{CONTENT_TYPE, HOST, HeaderName, HeaderValue, RETRY_AFTER, SE
 use hyper::{HeaderMap, Request, Response, StatusCode};
 use openworkers_core::{HttpMethod, HttpRequest, RequestBody};
 use serde_json::json;
+use tokio_postgres::error::SqlState;
 
 use crate::api::{Answer, Api, Caller, SignedInWith};
 use crate::app_logs::{Collected, Logs};
@@ -304,10 +305,14 @@ impl Ingress {
                         opens => opens,
                     },
                     Err(error) => {
-                        log::record(
-                            "platform-database-failed",
-                            json!({ "error": error.to_string() }),
-                        );
+                        // A change on its way is no failure: it is waited
+                        // out by asking again at a later request.
+                        if error.code() != Some(&SqlState::LOCK_NOT_AVAILABLE) {
+                            log::record(
+                                "platform-database-failed",
+                                json!({ "error": error.to_string() }),
+                            );
+                        }
                         Opens::NotKnown
                     }
                 };
