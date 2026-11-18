@@ -357,8 +357,28 @@ impl Vm {
         }
     }
 
+    /// Starts `vm serve` with the stand-in sign-in's options as given and no
+    /// fixture Applications, and waits up to `within` for its `listening`
+    /// record: `Err` (the program ended, its log in the message) when it
+    /// does not listen by then, for a test in which not starting is allowed.
+    pub fn try_start(options: &VmOptions, within: Duration) -> Result<Self, String> {
+        let platform = options.platform.clone().unwrap_or_else(Platform::fresh);
+        Self::try_launch(options, &platform, within)
+    }
+
     /// Starts `vm serve` and waits for its `listening` record.
     fn launch(options: &VmOptions, platform: &Platform) -> Self {
+        Self::try_launch(options, platform, START_TIMEOUT)
+            .unwrap_or_else(|message| panic!("{message}"))
+    }
+
+    /// Starts `vm serve` and waits up to `within` for its `listening`
+    /// record.
+    fn try_launch(
+        options: &VmOptions,
+        platform: &Platform,
+        within: Duration,
+    ) -> Result<Self, String> {
         let args = options.args();
         let command_line = format!(
             "VM_DATABASE_URL=<{} on the test Postgres> {} {}",
@@ -381,7 +401,7 @@ impl Vm {
         let stderr = child.stderr.take().expect("the child's stderr is piped");
         let mut process = ProcessGuard(child);
         let log = LogCollector::spawn(stderr);
-        let found = log.wait_for(START_TIMEOUT, |lines| {
+        let found = log.wait_for(within, |lines| {
             lines.iter().enumerate().find_map(|(at, line)| {
                 line.record
                     .as_ref()
@@ -393,7 +413,7 @@ impl Vm {
             Ok(found) => found,
             Err(failure) => {
                 let why = match failure {
-                    WaitFailure::TimedOut => format!("did not write it within {START_TIMEOUT:?}"),
+                    WaitFailure::TimedOut => format!("did not write it within {within:?}"),
                     WaitFailure::Overflowed => "wrote too many lines first".to_owned(),
                     WaitFailure::Ended => {
                         let status = process
@@ -412,18 +432,20 @@ impl Vm {
                 // the reader sees the end of the stream at once.
                 drop(process);
                 drop(log);
-                panic!("{message}");
+                return Err(message);
             }
         };
-        let address = listening["address"]
+        let Some(address) = listening["address"]
             .as_str()
             .and_then(|a| a.parse::<SocketAddr>().ok())
-            .unwrap_or_else(|| {
-                panic!(
-                    "expected the `listening` record to hold an ip:port `address`, got {listening}"
-                )
-            });
-        Self {
+        else {
+            drop(process);
+            drop(log);
+            return Err(format!(
+                "expected the `listening` record to hold an ip:port `address`, got {listening}"
+            ));
+        };
+        Ok(Self {
             process,
             log,
             address,
@@ -436,7 +458,7 @@ impl Vm {
                 applications: Vec::new(),
                 ..options.clone()
             },
-        }
+        })
     }
 
     /// The platform database this program was started against.

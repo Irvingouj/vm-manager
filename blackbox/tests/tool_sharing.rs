@@ -583,6 +583,15 @@ fn api_requests_of(vm: &Vm, id: &str) -> Vec<Value> {
 /// it made exactly one request of the API, a `POST` to `path`, and no read
 /// of the Application; returns the run.
 fn run_as_one_request(vm: &Vm, machine: &Machine, id: &str, args: &[&str], path: &str) -> Run {
+    // Every request the harness made as `id` before has its record in the
+    // log once this one's is: each is written before its answer, so in
+    // the order they were made.
+    let marker = vm.api_as(&User::new(id)).me();
+    marker.expect_status(200);
+    let marker_id = marker.request_id();
+    vm.wait_for_record("the `request` record of the harness's own request", |r| {
+        r["event"] == "request" && r["request"] == marker_id.as_str()
+    });
     let before = api_requests_of(vm, id);
     let posts = |records: &[Value]| {
         records

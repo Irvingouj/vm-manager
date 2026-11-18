@@ -261,7 +261,6 @@ fn adding_what_is_there_and_removing_what_is_not_change_nothing_and_are_not_refu
     let api = vm.api_as(&alice());
     contributors_ok(&api, &vm, APP, &add(&[user("carol")]));
     let first = share_ok(&api, &vm, APP, &add(&[user("bob"), group("finance")]));
-    let lines_before = sharing_records(&vm).len();
     let carols = vm.api_as(&User::new("carol"));
     let again = share_ok(&carols, &vm, APP, &add(&[user("bob"), group("finance")]));
     assert_eq!(
@@ -302,15 +301,26 @@ fn adding_what_is_there_and_removing_what_is_not_change_nothing_and_are_not_refu
         expected(&["user:bob", "group:finance", "user:dave"]),
         "an entry given twice is kept once"
     );
-    // Nothing changed by the two requests in between: no line for them.
+    // Nothing changed by the requests in between: no line for them. The
+    // line of adding dave, the last change, is written after the lines of
+    // every request before it; once it is in, all of theirs are.
     vm.wait_for_record("the `sharing-changed` record of adding dave", |r| {
         r["event"] == "sharing-changed" && r["added"].to_string().contains("dave")
     });
     let lines: Vec<Value> = sharing_records(&vm);
+    let changed: Vec<(Vec<String>, Vec<String>)> = lines
+        .iter()
+        .map(|l| (keys(&l["added"]), keys(&l["removed"])))
+        .collect();
     assert_eq!(
-        lines.len(),
-        lines_before + 3,
-        "expected a `sharing-changed` line only when something changed (erin added, erin removed, dave added), got {lines:?}"
+        changed,
+        vec![
+            (expected(&["user:bob", "group:finance"]), Vec::new()),
+            (expected(&["user:erin"]), Vec::new()),
+            (Vec::new(), expected(&["user:erin"])),
+            (expected(&["user:dave"]), Vec::new()),
+        ],
+        "expected a `sharing-changed` line only when something changed (bob and finance added, erin added, erin removed, dave added), got {lines:?}"
     );
 }
 
