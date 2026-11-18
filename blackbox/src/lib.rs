@@ -81,7 +81,12 @@
 //! - [`lost_answer`] is what the tests of a write whose answer is lost
 //!   share: a Postgres of the test's own whose commits the harness can make
 //!   wait and let through, and the `host-call` record that says what the
-//!   host decided while they wait.
+//!   host decided while they wait;
+//! - [`dashboard`] is what the tests of the Dashboard share: its address,
+//!   requests to it as a User, its pages read into what their `data-vm-...`
+//!   attributes say, its forms filled as a person fills them, and the rules
+//!   every page of it keeps; [`page`] is the harness's own small reader of
+//!   HTML it reads them with.
 //!
 //! Every wait has a timeout, so a failing test fails within seconds and
 //! never hangs. Each test starts its own program on its own port, so tests
@@ -98,6 +103,7 @@ pub mod api;
 pub mod browser;
 pub mod changed_outside;
 pub mod connection;
+pub mod dashboard;
 pub mod deploy;
 pub mod dev;
 pub mod expect;
@@ -119,6 +125,7 @@ pub mod lost_answer;
 pub mod oidc;
 pub mod out_of_reach;
 pub mod own_database;
+pub mod page;
 pub mod postgres;
 pub mod program;
 pub mod project;
