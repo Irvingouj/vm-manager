@@ -117,6 +117,23 @@ impl HeldPostgres {
         }
     }
 
+    /// Waits until no commit is waiting any more: every write that was on
+    /// its way has landed. The harness's own check fails otherwise.
+    pub fn wait_until_none_waiting(&self, context: &str) {
+        let deadline = Instant::now() + SEEN_WITHIN;
+        loop {
+            let now = self.waiting();
+            if now == 0 {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the harness's own check, {context}: expected no commit waiting at the test Postgres within {SEEN_WITHIN:?} once commits go through, {now} are"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     /// Fails (as the harness's own check) unless at least `at_least`
     /// commits are waiting now.
     pub fn assert_waiting(&self, at_least: usize, context: &str) {

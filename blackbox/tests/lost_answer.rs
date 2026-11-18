@@ -19,13 +19,18 @@
 //!
 //! While commits are held the Operation log entry of an operation cannot
 //! be written either: the host's decision is seen in its `host-call`
-//! record, written at the moment of the call, and the operation's answer
-//! once commits go through (its entry then written).
+//! record, written at the moment of the call, and the operation is
+//! answered with its own refusal once the program stops waiting for the
+//! entry, commits still held. Once commits go through, the tests wait until
+//! no commit is waiting and ask nothing meanwhile: the first request to an
+//! Application, and the first operation on a Resource, must already be
+//! decided by what the database has ("When the program finds out").
 //!
 //! These tests are slow by nature: each waits once for the program's 20 s
 //! limit (the writes of a test are sent together and wait together), then
-//! a few seconds for what was written to be settled. Each takes about
-//! half a minute; they run in parallel.
+//! for the program to stop waiting for the entries of the operations made
+//! meanwhile (they are sent together too). Each takes about half a minute;
+//! they run in parallel.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -35,12 +40,11 @@
 )]
 
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use blackbox::api::{marked_bundle, version_body};
 use blackbox::lost_answer::{
-    HeldPostgres, LOST_WRITE_TIMEOUT, SETTLE, assert_503_retry, host_call_of, host_call_refused,
-    quickly,
+    HeldPostgres, LOST_WRITE_TIMEOUT, assert_503_retry, host_call_of, host_call_refused, quickly,
 };
 use blackbox::scenario::{
     CONTACT, Scenario, administrator, assert_executed, assert_refusal, assert_rows, op,
@@ -119,11 +123,6 @@ fn answer_of(vm: &Vm, response: &Response, context: &str) -> Value {
 fn call(vm: &Vm, user: &User, application: &str, call: &Value, context: &str) -> Value {
     let response = call_request(vm, user, application, call).send();
     answer_of(vm, &response, context)
-}
-
-/// The refusal's reason in a host's answer, if it is a refusal.
-fn reason_of(answer: &Value) -> Option<&str> {
-    answer["refused"]["refusal"]["reason"].as_str()
 }
 
 /// Fails unless `answer` is the `grants-unknown` refusal for `resource`, as
@@ -228,73 +227,51 @@ fn host_call_allowed(vm: &Vm, user: &str) -> Result<(), String> {
 // Grants
 // ---------------------------------------------------------------------------
 
-/// Once commits go through: writes on [`LOWERED`] as `user` until one is
-/// refused `no-grant` with `held` `read`, within [`SETTLE`]; meanwhile each
-/// is refused `grants-unknown`, never allowed. Returns the markers of the
-/// writes (none of which may reach the shared database).
-fn settle_lowered(vm: &Vm, user: &User, context: &str) -> Vec<String> {
-    let deadline = Instant::now() + SETTLE;
-    let mut markers = Vec::new();
-    loop {
-        let m = marker("lowered-settling");
-        let answer = call(
-            vm,
-            user,
-            "board",
-            &op("execute", &insert(LOWERED, &m)),
-            context,
-        );
-        markers.push(m);
-        match reason_of(&answer) {
-            Some("no-grant") => {
-                assert_refusal(
-                    &answer,
-                    "no-grant",
-                    &no_grant(LOWERED, user, "write", Some("read")),
-                    context,
-                );
-                return markers;
-            }
-            Some("grants-unknown") => {}
-            _ => panic!(
-                "{context}: expected a write on {LOWERED:?} refused (`grants-unknown` until the lowered Grant is settled, then `no-grant`), never allowed by the Grant as it was, got {answer}"
-            ),
-        }
-        assert!(
-            Instant::now() < deadline,
-            "{context}: expected the lowered Grant settled within {SETTLE:?} once commits went through, a write still refused {answer}"
-        );
-        thread::sleep(Duration::from_millis(200));
-    }
+/// Once the lowered Grant's write is settled (no commit waiting), the
+/// first write on [`LOWERED`] as `user`: refused `no-grant` with `held`
+/// `read`, never `grants-unknown` ("When the program finds out") and never
+/// allowed by the Grant as it was. Returns its marker (which may not reach
+/// the shared database).
+fn first_on_lowered(vm: &Vm, user: &User, context: &str) -> String {
+    let m = marker("lowered-settled-first");
+    let answer = call(
+        vm,
+        user,
+        "board",
+        &op("execute", &insert(LOWERED, &m)),
+        context,
+    );
+    assert_refusal(
+        &answer,
+        "no-grant",
+        &no_grant(LOWERED, user, "write", Some("read")),
+        &format!(
+            "{context}: the first write on {LOWERED:?} once its Grant's write is settled, decided by the Grant the database has"
+        ),
+    );
+    m
 }
 
-/// Once commits go through: writes on [`RAISED`] as `user` until one is
-/// allowed, within [`SETTLE`].
-fn settle_raised(vm: &Vm, user: &User, context: &str) {
-    let deadline = Instant::now() + SETTLE;
-    loop {
-        let m = marker("raised-settling");
-        let answer = call(
-            vm,
-            user,
-            "board",
-            &op("execute", &insert(RAISED, &m)),
-            context,
-        );
-        if answer["ok"].is_object() {
-            assert_executed(&answer, &["body"], &json!([[m]]), 1, context);
-            return;
-        }
-        assert!(
-            matches!(reason_of(&answer), Some("grants-unknown" | "no-grant")),
-            "{context}: expected a write on {RAISED:?} allowed once settled, refused only meanwhile, got {answer}"
-        );
-        assert!(
-            Instant::now() < deadline,
-            "{context}: expected a write on {RAISED:?} allowed within {SETTLE:?} once commits went through (the Grant raised to `write`), still refused: {answer}"
-        );
-        thread::sleep(Duration::from_millis(200));
-    }
+/// Once the raised Grant's write is settled, the first write on
+/// [`RAISED`] as `user`: allowed.
+fn first_on_raised(vm: &Vm, user: &User, context: &str) {
+    let m = marker("raised-settled-first");
+    let answer = call(
+        vm,
+        user,
+        "board",
+        &op("execute", &insert(RAISED, &m)),
+        context,
+    );
+    assert_executed(
+        &answer,
+        &["body"],
+        &json!([[m]]),
+        1,
+        &format!(
+            "{context}: the first write on {RAISED:?} once its Grant's write is settled, decided by the Grant the database has"
+        ),
+    );
 }
 
 #[test]
@@ -460,9 +437,9 @@ fn a_grant_changed_whose_answer_is_lost_never_leaves_the_old_level_deciding() {
             host_call_refused(vm, "crew-outsider-read", "not-declared"),
             host_call_allowed(vm, "crew-unchanged-write"),
         ];
-        // The operations' entries wait with every other commit; once
-        // commits go through they are written and the operations answered.
-        postgres.let_through();
+        // The operations' entries wait with every other commit, and
+        // still do when the program stops waiting for them: each operation
+        // is answered then, commits still held, with its own refusal.
         let answers: Vec<Result<Response, String>> =
             sending.into_iter().map(|h| h.join().unwrap()).collect();
         (decided, answers)
@@ -477,7 +454,7 @@ fn a_grant_changed_whose_answer_is_lost_never_leaves_the_old_level_deciding() {
         .map(|(answer, (user, _, _))| {
             let response = answer.unwrap_or_else(|e| {
                 vm.fail(&format!(
-                    "{:?}'s call made meanwhile: no answer ({e})",
+                    "{:?}'s call made meanwhile: no answer within {LOST_WRITE_TIMEOUT:?}, commits still held ({e})",
                     user.id
                 ))
             });
@@ -488,9 +465,25 @@ fn a_grant_changed_whose_answer_is_lost_never_leaves_the_old_level_deciding() {
             )
         })
         .collect();
-    assert_grants_unknown(&answers[0], LOWERED, "a write on `lowered` meanwhile");
-    assert_grants_unknown(&answers[1], LOWERED, "a read on `lowered` meanwhile");
-    assert_grants_unknown(&answers[2], RAISED, "a write on `raised` meanwhile");
+    assert!(
+        postgres.waiting() > 0,
+        "the harness's own check: expected commits still held when the operations made meanwhile were answered"
+    );
+    assert_grants_unknown(
+        &answers[0],
+        LOWERED,
+        "a write on `lowered` meanwhile, answered while its entry cannot be written",
+    );
+    assert_grants_unknown(
+        &answers[1],
+        LOWERED,
+        "a read on `lowered` meanwhile, answered while its entry cannot be written",
+    );
+    assert_grants_unknown(
+        &answers[2],
+        RAISED,
+        "a write on `raised` meanwhile, answered while its entry cannot be written",
+    );
     assert_refusal(
         &answers[3],
         "declared-lower",
@@ -503,24 +496,40 @@ fn a_grant_changed_whose_answer_is_lost_never_leaves_the_old_level_deciding() {
         &json!({ "resource": LOWERED }),
         "a read on `lowered` by an Application declaring nothing, meanwhile",
     );
-    assert_executed(
+    // Allowed as ever (its `host-call` record), and like any allowed
+    // operation whose entry cannot be written, refused `log-unavailable`.
+    assert_refusal(
         &answers[5],
-        &["body"],
-        &json!([[unchanged_write]]),
-        1,
-        "a write on the untouched Resource meanwhile, decided as ever",
+        "log-unavailable",
+        &json!({ "resource": UNCHANGED }),
+        "a write on the untouched Resource meanwhile, its entry not written",
     );
-    s.db.assert_received(&unchanged_write, "the write on the untouched Resource");
-    let mut refused = vec![lowered_write, raised_write, viewer_write];
-    assert_none_sent(&s.db, &refused, "operations refused meanwhile");
+    let mut refused = vec![lowered_write, raised_write, viewer_write, unchanged_write];
+    assert_none_sent(&s.db, &refused, "operations made meanwhile");
 
-    // Once commits go through: decided by the Grants the database has.
-    refused.extend(settle_lowered(
+    // Commits go through; once every write has landed, and with nothing
+    // asked of the program about these Resources meanwhile, the first
+    // operation on each is decided by the Grant the database has.
+    postgres.let_through();
+    postgres.wait_until_none_waiting("once commits go through");
+    let settled = crew("crew-settled");
+    refused.push(first_on_lowered(vm, &settled, "once commits go through"));
+    first_on_raised(vm, &settled, "once commits go through");
+    let m = marker("unchanged-settled");
+    let answer = call(
         vm,
-        &crew("crew-settled"),
-        "once commits go through",
-    ));
-    settle_raised(vm, &crew("crew-settled"), "once commits go through");
+        &settled,
+        "board",
+        &op("execute", &insert(UNCHANGED, &m)),
+        "the untouched Resource, settled",
+    );
+    assert_executed(
+        &answer,
+        &["body"],
+        &json!([[m]]),
+        1,
+        "a write on the untouched Resource, decided as ever",
+    );
     assert_eq!(
         grants(vm, LOWERED),
         crew_holds("read"),
@@ -659,32 +668,32 @@ fn assert_served(response: &Response, application: &str, number: u64, context: &
     );
 }
 
-/// Once commits go through: asks `application` until it is served, within
-/// [`SETTLE`], each answer meanwhile being the `503` with `retry-after` and
-/// never Version `never` (the one that served before the write); then the
-/// Version that serves is the one the API says serves, for several
-/// requests.
-fn settle_serving(vm: &Vm, application: &str, never: u64, context: &str) {
-    let deadline = Instant::now() + SETTLE;
-    loop {
-        let response = quickly(vm, &visit(vm, application), context);
-        assert_ne!(
-            served_marker(&response).as_deref(),
-            Some(version_marker(application, never).as_str()),
-            "{context}: {application:?} was served by Version {never}, which served before the write whose answer was lost, while the program cannot tell or the database says another serves"
-        );
-        if response.status == 200 {
-            break;
-        }
-        assert_503_retry(&response, context);
-        assert!(
-            Instant::now() < deadline,
-            "{context}: expected {application:?} served within {SETTLE:?} once commits went through, got\n{}",
-            response.describe()
-        );
-        thread::sleep(Duration::from_millis(200));
-    }
+/// Once the write is settled (no commit waiting): the **first** request to
+/// `application` is served, never by Version `never` (the one that served
+/// before the write), and by the Version the API says serves; so are the
+/// next ones.
+fn served_once_settled(vm: &Vm, application: &str, never: u64, context: &str) {
+    let first = quickly(vm, &visit(vm, application), context);
+    assert_ne!(
+        served_marker(&first).as_deref(),
+        Some(version_marker(application, never).as_str()),
+        "{context}: {application:?} was served by Version {never}, which served before the write whose answer was lost"
+    );
+    assert_eq!(
+        first.status,
+        200,
+        "{context}: expected the first request to {application:?} once the write is settled served, got\n{}",
+        first.describe()
+    );
     let serving = serving_version(vm, application);
+    assert_served(
+        &first,
+        application,
+        serving,
+        &format!(
+            "{context}, the first request: the API says Version {serving} serves, so must the address"
+        ),
+    );
     for round in 0..5 {
         let response = quickly(vm, &visit(vm, application), context);
         assert_served(
@@ -757,8 +766,9 @@ fn a_go_back_or_a_version_whose_answer_is_lost_never_leaves_another_version_serv
     }
 
     postgres.let_through();
-    settle_serving(&vm, "board", 2, "the go-back, once commits go through");
-    settle_serving(
+    postgres.wait_until_none_waiting("once commits go through");
+    served_once_settled(&vm, "board", 2, "the go-back, once commits go through");
+    served_once_settled(
         &vm,
         "ledger",
         2,
@@ -886,11 +896,11 @@ fn a_resource_registered_whose_answer_is_lost_is_known_without_a_restart() {
 // A start while writes are on their way
 // ---------------------------------------------------------------------------
 
-/// Once commits go through, for a program started meanwhile or after:
-/// `site` is served by the Version the database says serves and never by
+/// Once commits go through, for a program started meanwhile or after: the
+/// first request to `site` is served by the Version the database says serves and never by
 /// Version 2 (gone back from).
 fn settle_site(vm: &Vm, context: &str) {
-    settle_serving(vm, "site", 2, context);
+    served_once_settled(vm, "site", 2, context);
     assert_eq!(
         serving_version(vm, "site"),
         1,
@@ -898,11 +908,12 @@ fn settle_site(vm: &Vm, context: &str) {
     );
 }
 
-/// Once commits go through, for a program started meanwhile or after: a
-/// write on [`LOWERED`] is refused `no-grant` (never allowed by the Grant
-/// as it was). Returns the markers of the writes refused.
+/// Once commits go through, for a program started meanwhile or after: the
+/// first write on [`LOWERED`] is refused `no-grant` (never `grants-unknown`,
+/// never allowed by the Grant as it was). Returns the markers of the writes
+/// refused.
 fn settle_grant(vm: &Vm, context: &str) -> Vec<String> {
-    let refused = settle_lowered(vm, &crew("crew-settled"), context);
+    let refused = vec![first_on_lowered(vm, &crew("crew-settled"), context)];
     assert_eq!(
         grants(vm, LOWERED),
         crew_holds("read"),
@@ -999,11 +1010,23 @@ fn a_program_started_while_writes_are_on_their_way_never_decides_by_what_it_read
                 );
                 let sending = scope.spawn(move || request.try_send());
                 let decided = host_call_refused(&vm, "crew-at-start", "grants-unknown");
-                postgres.assert_waiting(2, "before commits go through");
-                postgres.let_through();
+                // Answered while commits are still held, once the program
+                // stops waiting for its entry.
                 (decided, sending.join().unwrap())
             });
             refused.push(meanwhile);
+            postgres.assert_waiting(
+                2,
+                "when the operation made meanwhile was answered, before commits go through",
+            );
+            let answer = answer.unwrap_or_else(|e| {
+                vm.fail(&format!(
+                    "no answer within {LOST_WRITE_TIMEOUT:?}, commits still held ({e})"
+                ))
+            });
+            let answer = answer_of(&vm, &answer, "started meanwhile");
+            postgres.let_through();
+            postgres.wait_until_none_waiting("once commits go through");
             // The serving Version first, so that its fault is seen apart
             // from the Grant's.
             settle_site(&vm, "started meanwhile, once commits go through");
@@ -1011,11 +1034,10 @@ fn a_program_started_while_writes_are_on_their_way_never_decides_by_what_it_read
                 &[decided],
                 "started while the lowered Grant was on its way, the host decided",
             );
-            let answer = answer.unwrap_or_else(|e| vm.fail(&format!("no answer ({e})")));
             assert_grants_unknown(
-                &answer_of(&vm, &answer, "started meanwhile"),
+                &answer,
                 LOWERED,
-                "a write on `lowered` by a program started while its Grant was on its way",
+                "a write on `lowered` by a program started while its Grant was on its way, answered while its entry cannot be written",
             );
             refused.extend(settle_grant(
                 &vm,
@@ -1027,6 +1049,7 @@ fn a_program_started_while_writes_are_on_their_way_never_decides_by_what_it_read
             // commits go through, a program starts and decides by what the
             // database has.
             postgres.let_through();
+            postgres.wait_until_none_waiting("once commits go through");
             let vm = Vm::start(&options);
             settle_site(&vm, "started after commits go through");
             refused.extend(settle_grant(&vm, "started after commits go through"));

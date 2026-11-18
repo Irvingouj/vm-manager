@@ -452,3 +452,30 @@ fn a_new_project_installed_by_npm_outside_the_repository_passes_the_check() {
         "expected the check to write nothing in the project"
     );
 }
+
+#[test]
+fn agents_md_says_grants_unknown_and_log_unavailable_are_nothing_to_fix() {
+    // CONTRACT.md, "A write whose answer is lost": the template's AGENTS.md
+    // names both beside the other reasons and says of both that nothing in
+    // the project is wrong and the same request works again shortly.
+    let text = agents_md();
+    for reason in ["grants-unknown", "log-unavailable"] {
+        assert!(
+            text.contains(reason),
+            "expected AGENTS.md to name the refusal reason `{reason}`\n{text}"
+        );
+    }
+    let rule = paragraphs(&text)
+        .into_iter()
+        .find(|p| p.contains("grants-unknown") && p.contains("log-unavailable"));
+    let rule = rule.unwrap_or_else(|| {
+        panic!("expected a paragraph of AGENTS.md saying what `grants-unknown` and `log-unavailable` mean\n{text}")
+    });
+    let lower = squashed(&rule).to_lowercase();
+    for word in ["nothing", "again"] {
+        assert!(
+            lower.contains(word),
+            "expected the paragraph on `grants-unknown` and `log-unavailable` to say {word:?} (nothing in the project is wrong; the same request works again shortly), got\n{rule}"
+        );
+    }
+}

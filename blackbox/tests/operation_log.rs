@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use blackbox::postgres::PrivatePostgres;
 use blackbox::scenario::{
-    Expected, READERS, RESOURCE, Scenario, administrator, assert_entry, assert_refusal,
+    CONTACT, Expected, READERS, RESOURCE, Scenario, administrator, assert_entry, assert_refusal,
     assert_rows, lines,
 };
 use blackbox::shared_database::{find_standalone, token};
@@ -411,4 +411,56 @@ fn when_the_entry_cannot_be_written_the_query_is_refused_and_nothing_is_sent() {
     );
     thread::sleep(Duration::from_millis(500));
     s.db.assert_not_received(&marker, "a query whose entry could not be written");
+}
+
+#[test]
+fn a_refused_query_whose_entry_cannot_be_written_keeps_its_reason() {
+    // CONTRACT.md, "The Operation log": an operation refused for another
+    // reason than its entry keeps that reason when the entry cannot be
+    // written, and the program's log has an `operation-log-failed` record.
+    let mut platform_postgres = PrivatePostgres::start().unwrap();
+    let platform = Platform::on(&platform_postgres, "vm_platform_refusal_kept");
+    let s = Scenario::start_with(&VmOptions::new().platform(&platform));
+    s.register(RESOURCE);
+    s.grant(RESOURCE, READERS, "read");
+    s.install("board", "query.js", &[(RESOURCE, "read")]);
+    let nina = User::new("nina");
+    let (_, answer) = s.query(
+        &nina,
+        "board",
+        &ask("select 'refused-while-all-is-well' as probe"),
+    );
+    assert_refusal(
+        &answer,
+        "no-grant",
+        &json!({ "resource": RESOURCE, "user": "nina", "needed": "read", "held": null, "contact": CONTACT }),
+        "the harness's own check: nina holds no Grant",
+    );
+
+    platform_postgres.stop();
+    let marker = format!("refused-after-the-stop-{}", token());
+    let response =
+        s.vm.request("board", "/")
+            .as_user(&nina)
+            .method("POST")
+            .json(&json!({ "calls": [ask(&format!("select '{marker}' as probe"))] }))
+            .timeout(Duration::from_secs(30))
+            .send();
+    assert_eq!(
+        response.status,
+        200,
+        "expected the Application to answer, with the host's refusal, got\n{}",
+        response.describe()
+    );
+    assert_refusal(
+        &response.json()["answers"][0],
+        "no-grant",
+        &json!({ "resource": RESOURCE, "user": "nina", "needed": "read", "held": null, "contact": CONTACT }),
+        "a query refused `no-grant` whose Operation log entry cannot be written keeps its reason",
+    );
+    s.vm.wait_for_record("an `operation-log-failed` record", |r| {
+        r["event"].as_str() == Some("operation-log-failed")
+    });
+    thread::sleep(Duration::from_millis(500));
+    s.db.assert_not_received(&marker, "a refused query whose entry could not be written");
 }
