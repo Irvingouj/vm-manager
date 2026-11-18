@@ -38,12 +38,14 @@ use crate::user::User;
 type Answer = Response<Full<Bytes>>;
 
 /// One small stylesheet: the system's fonts, a width that reads on a
-/// laptop and a phone, a dark scheme, a visible focus.
+/// laptop and a phone, a dark scheme, a visible focus. Any text breaks
+/// anywhere it must and no control is wider than its box, so a page holds
+/// to its window whatever names, addresses or ids it is given.
 const STYLE: &str = "\
 :root{color-scheme:light dark;--fg:#1c1c21;--bg:#fff;--muted:#5d5d68;--line:#d9d9e0;--card:#f6f6f9;--accent:#0b57d0;--on-accent:#fff;--warn:#a1340f}\
 @media (prefers-color-scheme:dark){:root{--fg:#e9e9ee;--bg:#141417;--muted:#a6a6b1;--line:#35353d;--card:#1d1d22;--accent:#8ab4f8;--on-accent:#0b1b33;--warn:#ffb595}}\
 *{box-sizing:border-box}\
-body{margin:0;font:1rem/1.5 system-ui,-apple-system,\"Segoe UI\",Roboto,sans-serif;color:var(--fg);background:var(--bg)}\
+body{margin:0;font:1rem/1.5 system-ui,-apple-system,\"Segoe UI\",Roboto,sans-serif;color:var(--fg);background:var(--bg);overflow-wrap:anywhere}\
 header,main{max-width:46rem;margin:0 auto;padding:1rem}\
 header{display:flex;flex-wrap:wrap;gap:.25rem 1rem;align-items:baseline;border-bottom:1px solid var(--line)}\
 header p{margin:0;flex:1;color:var(--muted)}\
@@ -58,9 +60,8 @@ ul{padding-left:1.25rem}ul.apps{list-style:none;padding:0}\
 .muted{color:var(--muted)}\
 .mark{font-weight:600}.lower .mark,.none .mark,.error{color:var(--warn)}\
 .notice,.error{padding:.5rem .75rem;border-left:4px solid currentColor;background:var(--card)}\
-code{overflow-wrap:anywhere}\
 li form{display:inline;margin-left:.5rem}\
-button,input,select{font:inherit}\
+button,input,select{font:inherit;max-width:100%}\
 form.share label{display:block;font-weight:600}\
 form.share input,form.share select{width:100%;max-width:24rem;margin-bottom:.5rem}\
 nav{display:flex;gap:1rem}";
