@@ -2136,7 +2136,7 @@ The program is `vibe`: one binary, built as the package `vibe` (`cargo build -p 
 - the tool's folders: `vibe/` in the user's configuration folder and in the user's data folder, on each system where `vm/` was;
 - every environment variable the program reads, `VIBE_...` where it was `VM_...`, and the harness's own (`VIBE_BIN`, `VIBE_TEST_PG_BIN`, `VIBE_TEST_PG_VERSION`).
 
-The platform's own names inside are not the command's and stay: the schema `vm` of an own database and everything in it, the settings `vm.ctx` and `vm.actor`, the marks `data-vm-...` of the platform's pages, the headers `x-vm-...`, the cookies' names, the error codes `VM...`, the SDK's package `@vm/sdk`, the bytes a check code is derived from.
+The platform's own names inside are not the command's and stay: the schema `vm` of an own database and everything in it, the settings `vm.ctx` and `vm.actor`, the marks `data-vm-...` of the platform's pages, the headers `x-vm-...`, the cookies' names, the paths under `/_vm/` that the platform serves on an Application's address (`/_vm/test-user`), the error codes `VM...`, the SDK's package `@vm/sdk`, the bytes a check code is derived from.
 
 Nothing is kept for the old name (nothing was installed anywhere):
 
