@@ -50,6 +50,8 @@
 //!   requests' path, and read through the API.
 //! - [`log`]: the program's log, one JSON record per line.
 //! - [`server`]: the listening socket and the connections.
+//! - [`own_tls`]: the program serving HTTPS itself: its certificate and
+//!   key, checked at start and looked at again when they change.
 //! - [`platform`]: the parts above put together, for `vibe serve` and for
 //!   the local run alike.
 
@@ -67,6 +69,7 @@ pub mod oidc;
 pub mod oplog;
 pub mod origin;
 pub mod own_db;
+pub mod own_tls;
 pub mod platform;
 pub mod platform_db;
 pub mod registry;

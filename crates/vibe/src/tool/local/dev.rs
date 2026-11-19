@@ -325,7 +325,7 @@ pub(in super::super) async fn dev(args: &DevArgs) -> Result<Done, Ending> {
         let mut stopped = stop.subscribe();
         tokio::join!(
             stopper(&mut signals, &stop),
-            server::serve_until(listeners, Arc::clone(&front), limits, async move {
+            server::serve_until(listeners, Arc::clone(&front), limits, None, async move {
                 drop(stopped.wait_for(Option::is_some).await);
             }),
             jobs(&front, &ctx, jobs_rx, &stop),

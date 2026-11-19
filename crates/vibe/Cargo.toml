@@ -38,6 +38,9 @@ rustix.workspace = true
 rustls.workspace = true
 tokio-rustls.workspace = true
 webpki-roots.workspace = true
+# The certificate the program serves itself: its names and dates
+# (src/own_tls.rs).
+x509-parser.workspace = true
 # OIDC sign-in (src/oidc): ID tokens' RS256 and ES256 signatures, the
 # refresh token sealed at rest (AES-256-GCM, HKDF), randomness; base64url
 # for JWS and JWKS; the issuer's and the endpoints' URLs and their query

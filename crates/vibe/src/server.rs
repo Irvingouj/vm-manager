@@ -9,6 +9,12 @@
 //! (about 400 KiB, at most 100 headers); a connection open at most
 //! [`Limits::connection`]. A request's body is the handler's to bound.
 //!
+//! **TLS** ([`Tls`]): when the program serves TLS itself, each accepted
+//! connection's handshake is made in its own task, holding its permit like
+//! any other connection, and is ended with the connection when it is not
+//! finished within [`Tls::handshake`]. Bytes that are no handshake end it
+//! at once, with no HTTP answer.
+//!
 //! **Stopping** ([`serve_until`]): when its `stop` future ends, no
 //! connection is accepted any more, every connection is asked to end once
 //! the request it serves is answered, and those still open after
@@ -26,9 +32,11 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::{TokioIo, TokioTimer};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tokio::task::JoinSet;
+use tokio_rustls::TlsAcceptor;
 
 use crate::ingress::Ingress;
 use crate::log;
@@ -65,6 +73,14 @@ impl Default for Limits {
     }
 }
 
+/// The program's own TLS on every listener.
+pub struct Tls {
+    /// Its configuration, shared by every connection.
+    pub acceptor: TlsAcceptor,
+    /// The longest a handshake may take from the connection's accept.
+    pub handshake: Duration,
+}
+
 /// What answers each request.
 pub trait Handler: Send + Sync + 'static {
     fn handle(
@@ -82,9 +98,10 @@ impl Handler for Ingress {
     }
 }
 
-/// Serves until the process ends.
-pub async fn serve(listener: TcpListener, ingress: Arc<Ingress>, limits: Limits) {
-    serve_until(vec![listener], ingress, limits, std::future::pending()).await;
+/// Serves until the process ends: HTTPS when `tls` is given, plain HTTP
+/// otherwise.
+pub async fn serve(listener: TcpListener, ingress: Arc<Ingress>, limits: Limits, tls: Option<Tls>) {
+    serve_until(vec![listener], ingress, limits, tls, std::future::pending()).await;
 }
 
 /// Serves on every listener until `stop` ends, then stops (see the
@@ -93,6 +110,7 @@ pub async fn serve_until<H: Handler>(
     listeners: Vec<TcpListener>,
     handler: Arc<H>,
     limits: Limits,
+    tls: Option<Tls>,
     stop: impl Future<Output = ()>,
 ) {
     // Bound: `limits.connections` connections at once, over every
@@ -108,6 +126,8 @@ pub async fn serve_until<H: Handler>(
     let (accepted, mut incoming) =
         tokio::sync::mpsc::channel::<(TcpStream, OwnedSemaphorePermit)>(1);
     let mut accepting = JoinSet::new();
+    // Shared by every connection's task.
+    let tls = tls.map(Arc::new);
     for listener in listeners {
         let accepted = accepted.clone();
         let permits = Arc::clone(&permits);
@@ -151,28 +171,23 @@ pub async fn serve_until<H: Handler>(
                 let handler = Arc::clone(&handler);
                 let header_read = limits.header_read;
                 let connection_limit = limits.connection;
-                let mut stopped = stopped.clone();
+                let stopped = stopped.clone();
+                let tls = tls.as_ref().map(Arc::clone);
                 connections.spawn(async move {
-                    let service = service_fn(move |request| {
-                        let handler = Arc::clone(&handler);
-                        async move { Ok::<_, Infallible>(handler.handle(request).await) }
-                    });
-                    let mut builder = http1::Builder::new();
-                    builder.timer(TokioTimer::new()).header_read_timeout(header_read);
-                    let connection = builder.serve_connection(TokioIo::new(stream), service);
-                    tokio::pin!(connection);
-                    // A connection past its time is dropped; a client that
-                    // went away needs nothing more.
-                    tokio::time::timeout(connection_limit, async {
-                        tokio::select! {
-                            _ = connection.as_mut() => return,
-                            _ = stopped.wait_for(|stop| *stop) => {}
+                    let served = Connection { handler, header_read, connection_limit, stopped };
+                    match tls {
+                        None => served.serve(stream).await,
+                        Some(tls) => {
+                            // A handshake not finished in time, or that
+                            // fails, ends the connection: the stream is
+                            // dropped, which closes it.
+                            if let Ok(Ok(stream)) =
+                                tokio::time::timeout(tls.handshake, tls.acceptor.accept(stream)).await
+                            {
+                                served.serve(stream).await;
+                            }
                         }
-                        connection.as_mut().graceful_shutdown();
-                        connection.as_mut().await.ok();
-                    })
-                    .await
-                    .ok();
+                    }
                     // Given back here, or when the task is dropped.
                     drop(permit);
                 });
@@ -190,5 +205,47 @@ pub async fn serve_until<H: Handler>(
     if drained.is_err() {
         // Those still open are dropped with their tasks.
         connections.shutdown().await;
+    }
+}
+
+/// What one connection is served with.
+struct Connection<H> {
+    handler: Arc<H>,
+    header_read: Duration,
+    connection_limit: Duration,
+    stopped: watch::Receiver<bool>,
+}
+
+impl<H: Handler> Connection<H> {
+    /// Serves HTTP/1.1 on `io` until the client is done, the connection's
+    /// time is over, or the server stops.
+    async fn serve<S>(mut self, io: S)
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let handler = self.handler;
+        let service = service_fn(move |request| {
+            let handler = Arc::clone(&handler);
+            async move { Ok::<_, Infallible>(handler.handle(request).await) }
+        });
+        let mut builder = http1::Builder::new();
+        builder
+            .timer(TokioTimer::new())
+            .header_read_timeout(self.header_read);
+        let connection = builder.serve_connection(TokioIo::new(io), service);
+        tokio::pin!(connection);
+        // A connection past its time is dropped; a client that went away
+        // needs nothing more.
+        let stopped = &mut self.stopped;
+        tokio::time::timeout(self.connection_limit, async {
+            tokio::select! {
+                _ = connection.as_mut() => return,
+                _ = stopped.wait_for(|stop| *stop) => {}
+            }
+            connection.as_mut().graceful_shutdown();
+            connection.as_mut().await.ok();
+        })
+        .await
+        .ok();
     }
 }

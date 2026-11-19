@@ -73,6 +73,12 @@ liblzma = { version = "0.4", default-features = false, features = ["static"] }
 ring = "0.17"
 base64 = "0.22"
 url = "2"
+# The program serving TLS itself (crates/vibe/src/own_tls.rs): the
+# certificate's DNS names (subject alternative names) and its validity, read
+# from its DER. rustls and rustls-webpki do not expose them. Already in the
+# tree at this version through rcgen (the harness's certificates); no
+# feature of it is used (no verification: rustls does that).
+x509-parser = { version = "0.18", default-features = false }
 
 # Lints are set here once; every crate of ours inherits them with
 # `[lints] workspace = true`. See "Rust rules" in AGENTS.md, and clippy.toml.

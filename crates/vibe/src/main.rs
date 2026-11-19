@@ -34,7 +34,7 @@ use vibe::runner;
 use vibe::sign_in::{NoSignIn, SignIn, StandInSignIn};
 use vibe::tool;
 use vibe::tool_credentials::{DEFAULT_LIFETIME, ToolCredentials, Unchecked};
-use vibe::{log, server, setup};
+use vibe::{log, own_tls, server, setup};
 
 #[derive(Parser)]
 #[command(
@@ -280,6 +280,23 @@ fn run(serve: &Serve) -> Result<(), String> {
             serve.listen
         ));
     }
+    // The program's own TLS (crate::own_tls): both files or neither, checked
+    // here, before anything else is started.
+    let own_tls = match own_tls::Files::from_environment()? {
+        None => None,
+        Some(_) if serve.public_scheme == Scheme::Http => {
+            return Err(format!(
+                "--public-scheme http cannot be given with {} and {}: with them the program serves HTTPS itself; leave --public-scheme out (https), or unset the two to serve plain HTTP",
+                own_tls::CERT_VARIABLE,
+                own_tls::KEY_VARIABLE
+            ));
+        }
+        Some(files) => {
+            let loaded = own_tls::load(&files, &domain)?;
+            loaded.log();
+            Some((files, loaded))
+        }
+    };
     let key = InstallationKey::from_environment()?;
     let address = database_address()?;
     let sign_in: Box<dyn SignIn> = if serve.stand_in_sign_in {
@@ -342,6 +359,27 @@ fn run(serve: &Serve) -> Result<(), String> {
             },
         ));
         let domain: Arc<str> = Arc::from(domain);
+        // The pair in use, the configuration built on it once, and the task
+        // that looks at the files, owned here.
+        let mut watching = tokio::task::JoinSet::new();
+        let tls = match own_tls {
+            None => None,
+            Some((files, loaded)) => {
+                let in_use = own_tls::InUse::new(&loaded);
+                let config = own_tls::server_config(&in_use)?;
+                watching.spawn(own_tls::watch(
+                    files,
+                    Arc::clone(&domain),
+                    in_use,
+                    loaded.digest(),
+                ));
+                Some(server::Tls {
+                    acceptor: tokio_rustls::TlsAcceptor::from(config),
+                    handshake: own_tls::HANDSHAKE_LIMIT,
+                })
+            }
+        };
+        let serves_tls = tls.is_some();
         let listener = TcpListener::bind(serve.listen)
             .await
             .map_err(|e| format!("cannot listen on {}: {e}", serve.listen))?;
@@ -402,6 +440,7 @@ fn run(serve: &Serve) -> Result<(), String> {
                 "applications": serving,
                 "stand_in_sign_in": sign_in.is_stand_in(),
                 "sign_in": sign_in_name,
+                "tls": serves_tls,
             }),
         );
         let ingress = Arc::new(Ingress {
@@ -432,7 +471,8 @@ fn run(serve: &Serve) -> Result<(), String> {
             max_request_body_bytes: 1024 * 1024,
             decides_opening: true,
         });
-        server::serve(listener, ingress, server::Limits::default()).await;
+        server::serve(listener, ingress, server::Limits::default(), tls).await;
+        watching.shutdown().await;
         drop(writer);
         Ok(())
     })
