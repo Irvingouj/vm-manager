@@ -147,6 +147,77 @@ fn a_vm_local_that_is_not_a_folder_is_local_state() {
     assert_nothing_left(&local, "local-state");
 }
 
+/// Fails unless `run` ended `local-state` (exit code `1`) as CONTRACT.md
+/// says of a `.vm/local/` that cannot be used ("The local loop: one request
+/// as a test User", the three more ways it ends; "The local run on a busy
+/// machine": only a failure of the private Postgres is `postgres-failed`):
+/// the message names `.vm/local` and says that removing it starts the local
+/// databases anew, and the `error` has no `step` and no `cause`.
+fn assert_local_state_not_postgres(run: &blackbox::tool::Run, context: &str) {
+    let message = run.json_error(1, "local-state");
+    assert!(
+        message.contains(".vm/local") && message.to_lowercase().contains("remov"),
+        "{context}: expected the message to say that removing .vm/local/ starts the local databases anew, got {message:?}"
+    );
+    let error = &run.json()["error"];
+    for member in ["step", "cause"] {
+        assert!(
+            error.get(member).is_none(),
+            "{context}: expected no `{member}` in a local-state error (not a failure of the private Postgres), got {error:#}"
+        );
+    }
+}
+
+/// A new project whose `.vm/local/<name>` is made by `make` before its
+/// first run.
+fn project_with(local: &Local, name: &str, make: impl FnOnce(&Path)) -> blackbox::sdk::TempProject {
+    let project = local_project(&local.machine, name, &[]);
+    let dir = project.dir.join(".vm/local");
+    fs::create_dir_all(&dir).unwrap();
+    make(&dir);
+    project
+}
+
+#[test]
+fn a_postgres_log_that_is_a_folder_is_local_state() {
+    let local = Local::new();
+    let project = project_with(&local, "log-folder-board", |dir| {
+        fs::create_dir(dir.join("postgres.log")).unwrap();
+    });
+    let run = local.request(&project.dir, "/", OUTSIDER, &[]);
+    assert_local_state_not_postgres(&run, "postgres.log a folder");
+    assert_nothing_left(&local, "postgres.log a folder");
+}
+
+#[test]
+fn a_postgres_data_folder_that_is_a_file_is_local_state() {
+    let local = Local::new();
+    let project = project_with(&local, "data-file-board", |dir| {
+        fs::write(dir.join("postgres"), "not a folder\n").unwrap();
+    });
+    let run = local.request(&project.dir, "/", OUTSIDER, &[]);
+    assert_local_state_not_postgres(&run, "postgres a file");
+    assert_nothing_left(&local, "postgres a file");
+}
+
+#[test]
+fn vm_dev_with_a_postgres_log_that_is_a_folder_is_local_state() {
+    let local = Local::new();
+    let project = project_with(&local, "dev-log-folder", |dir| {
+        fs::create_dir(dir.join("postgres.log")).unwrap();
+    });
+    let dev = blackbox::dev::Dev::spawn(
+        &local,
+        &project.dir,
+        "dev-log-folder",
+        blackbox::dev::free_port(),
+        true,
+    );
+    let run = dev.wait_end(Duration::from_secs(200));
+    assert_local_state_not_postgres(&run, "vm dev, postgres.log a folder");
+    assert_nothing_left(&local, "vm dev, postgres.log a folder");
+}
+
 #[test]
 fn a_private_postgres_that_does_not_start_is_postgres_failed_naming_its_log() {
     let local = Local::new();
