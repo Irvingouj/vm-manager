@@ -231,6 +231,81 @@ fn a_data_folder_without_postgres_data_that_cannot_be_made_anew_is_local_state()
 }
 
 #[test]
+fn a_data_folder_left_without_postgres_data_by_a_failed_initdb_that_cannot_be_made_anew_is_local_state()
+ {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let real = blackbox::local::local_postgres_bin();
+    let probe = Local::new();
+    let failing = blackbox::project::stand_ins(
+        &probe.machine.root().join("failing-initdb"),
+        &[
+            ("postgres", &format!("exec '{real}/postgres' \"$@\"")),
+            ("initdb", "echo 'a stand-in initdb that fails' >&2\nexit 1"),
+            ("pg_ctl", &format!("exec '{real}/pg_ctl' \"$@\"")),
+        ],
+    );
+    let local = Local::new().with_bin(failing.to_str().unwrap());
+    let project = local_project(&local.machine, "initdb-failed-board", &[]);
+    // A first run whose initdb fails: what a next run needs is left in
+    // .vm/local/, and no Postgres data.
+    let first = local.request(&project.dir, "/", OUTSIDER, &[]);
+    first.json_error(1, "postgres-failed");
+    let error = &first.json()["error"];
+    assert_eq!(
+        error["step"].as_str(),
+        Some("initdb"),
+        "{}",
+        first.describe()
+    );
+    assert_eq!(
+        error["cause"].as_str(),
+        Some("ended"),
+        "{}",
+        first.describe()
+    );
+    let local_dir = project.dir.join(".vm/local");
+    let data = local_dir.join("postgres");
+    if !data.exists() {
+        fs::create_dir(&data).unwrap();
+        fs::set_permissions(&data, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    assert!(
+        !data.join("PG_VERSION").exists(),
+        "the harness's own check: no Postgres data after a failed initdb"
+    );
+    let kept = data.join("kept");
+    fs::create_dir_all(&kept).unwrap();
+    fs::write(kept.join("file"), "cannot be removed\n").unwrap();
+    if fs::metadata(&kept).unwrap().uid() == 0 {
+        eprintln!(
+            "this test runs as root, for whom a folder of mode 0500 does not stop a removal: the case cannot be provoked here"
+        );
+        return;
+    }
+    fs::set_permissions(&kept, fs::Permissions::from_mode(0o500)).unwrap();
+    // The second run with the real programs.
+    let run = local.request_with_env(
+        &project.dir,
+        "/",
+        OUTSIDER,
+        &[],
+        &[("VM_LOCAL_POSTGRES_BIN", real.as_str())],
+    );
+    // Given back before anything is asserted.
+    if kept.exists() {
+        fs::set_permissions(&kept, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    assert_local_state_not_postgres(
+        &run,
+        "a data folder a failed initdb left, that cannot be made anew",
+    );
+    assert_nothing_left(
+        &local,
+        "a data folder a failed initdb left, that cannot be made anew",
+    );
+}
+
+#[test]
 fn vm_dev_with_a_postgres_log_that_is_a_folder_is_local_state() {
     let local = Local::new();
     let project = project_with(&local, "dev-log-folder", |dir| {
