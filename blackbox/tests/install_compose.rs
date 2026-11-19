@@ -17,8 +17,8 @@
 use blackbox::DOMAIN;
 use blackbox::connection::SecretKey;
 use blackbox::install::{
-    COMPOSE, DOCKER_WAIT, Install, OWN_POSTGRES, OWN_PROXY, free_port, image, read_deploy_file,
-    tag_of,
+    COMPOSE, DOCKER_WAIT, Install, OWN_POSTGRES, OWN_PROXY, UP_WAIT, free_port, image,
+    read_deploy_file, tag_of,
 };
 use blackbox::shared_database::token;
 use blackbox::tls::Authority;
@@ -244,6 +244,83 @@ fn without_postgres_password_the_bundled_postgres_does_not_start_and_vibe_is_nev
 #[ignore = "needs Docker and a built image: scripts/install-gate.sh"]
 fn with_an_empty_postgres_password_the_bundled_postgres_does_not_start_and_vibe_is_never_started() {
     assert_postgres_asks_for_its_password(Some("POSTGRES_PASSWORD="));
+}
+
+/// The state of the `postgres` service's container: `(its id, State)`.
+fn postgres_state(install: &Install) -> (String, Value) {
+    let id = install
+        .containers()
+        .into_iter()
+        .find(|(service, _)| service == "postgres")
+        .map(|(_, id)| id)
+        .unwrap_or_else(|| install.fail("expected a postgres container"));
+    let state = install.inspect(&id)["State"].clone();
+    (id, state)
+}
+
+#[test]
+#[ignore = "needs Docker and a built image: scripts/install-gate.sh"]
+fn postgres_password_taken_out_of_a_made_postgres_leaves_it_never_healthy_and_its_health_check_says_so()
+ {
+    use std::time::{Duration, Instant};
+    let mut install = with_required(&[COMPOSE]);
+    install.write_env();
+    // The bundled Postgres made and healthy with the password.
+    install.compose_ok(&["up", "-d", "--wait", "postgres"], UP_WAIT);
+    let (before, state) = postgres_state(&install);
+    assert_eq!(
+        state["Health"]["Status"], "healthy",
+        "expected the bundled Postgres healthy with POSTGRES_PASSWORD set: {state}"
+    );
+
+    // The value taken out of the .env; postgres started again alone.
+    install.unset("POSTGRES_PASSWORD");
+    install.write_env();
+    install.compose_ok(&["up", "-d", "--no-deps", "postgres"], DOCKER_WAIT);
+
+    // Within 30 s its health check's output names POSTGRES_PASSWORD; it is
+    // never healthy meanwhile, nor over 10 s more.
+    let named_by = Instant::now() + Duration::from_secs(30);
+    let mut named_at: Option<Instant> = None;
+    let mut last: Value;
+    loop {
+        let (id, state) = postgres_state(&install);
+        let status = state["Health"]["Status"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        if id != before || named_at.is_some() {
+            assert_ne!(
+                status, "healthy",
+                "expected the Postgres started again without POSTGRES_PASSWORD never healthy: {state}"
+            );
+        }
+        let named = state["Health"]["Log"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|entry| {
+                entry["Output"]
+                    .as_str()
+                    .is_some_and(|o| o.contains("POSTGRES_PASSWORD"))
+            });
+        let now = Instant::now();
+        if named && named_at.is_none() {
+            named_at = Some(now);
+        }
+        last = state;
+        match named_at {
+            None if now >= named_by => install.fail(&format!(
+                "expected the health check's output (docker inspect: State.Health.Log[].Output) of the Postgres started again without POSTGRES_PASSWORD to name it within 30 s; its state: {last}"
+            )),
+            Some(at) if now.duration_since(at) >= Duration::from_secs(10) => break,
+            _ => std::thread::sleep(Duration::from_millis(500)),
+        }
+    }
+    assert_ne!(
+        last["Health"]["Status"], "healthy",
+        "expected the Postgres never healthy: {last}"
+    );
 }
 
 #[test]
