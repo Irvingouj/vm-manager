@@ -47,17 +47,17 @@ pub fn grace() -> Person {
 }
 
 /// The options of a program on which OIDC can be connected: a fresh
-/// installation's key in `VM_SECRET_KEY`, and `--public-scheme http` so the
+/// installation's key in `VIBE_SECRET_KEY`, and `--public-scheme http` so the
 /// browser can follow every redirect.
 pub fn oidc_options() -> VmOptions {
     VmOptions::new()
         .args_extra(&["--public-scheme", "http"])
-        .env("VM_SECRET_KEY", SecretKey::fresh().expose())
+        .env("VIBE_SECRET_KEY", SecretKey::fresh().expose())
 }
 
 /// A provider and a program signed in through it: started with an
 /// installation's key, then connected as an administrator would connect it
-/// (`vm setup`, then `vm admin connect-oidc` with the setup credential).
+/// (`vibe setup`, then `vibe admin connect-oidc` with the setup credential).
 pub struct Installation {
     // The program first, so that it ends before the provider does.
     pub vm: Vm,
@@ -74,7 +74,7 @@ impl Installation {
     }
 
     /// As [`Installation::start`] with these people and more arguments of
-    /// `vm serve` (`--session-renewal 2`, say).
+    /// `vibe serve` (`--session-renewal 2`, say).
     pub fn start_with(applications: &[(&str, &str)], people: &[Person], more: &[&str]) -> Self {
         Self::start_connected(applications, people, more, |c| c)
     }
@@ -127,7 +127,7 @@ impl Installation {
     }
 
     /// Makes this connection as an administrator who has no sign-in yet
-    /// would: `vm setup` beside the platform database, then `vm admin
+    /// would: `vibe setup` beside the platform database, then `vibe admin
     /// connect-oidc --json` with the setup credential, which must end with
     /// `0`. Returns what it printed.
     pub fn connect(&self, connection: &Connection) -> Value {
@@ -137,14 +137,14 @@ impl Installation {
         let hidden = hide(&run, &[setup.expose(), connection.secret().expose()]);
         if hidden.code != Some(0) {
             self.vm.fail(&format!(
-                "expected `vm admin connect-oidc` with the setup credential to end with 0\n{}",
+                "expected `vibe admin connect-oidc` with the setup credential to end with 0\n{}",
                 hidden.describe()
             ));
         }
         hidden.json()
     }
 
-    /// `PUT /v1/oidc` with a fresh setup credential (`vm setup`) and this
+    /// `PUT /v1/oidc` with a fresh setup credential (`vibe setup`) and this
     /// connection's body.
     pub fn connect_through_the_api(&self, connection: &Connection) -> Response {
         let setup = setup_credential(self.vm.platform());
@@ -155,7 +155,7 @@ impl Installation {
     pub fn key(&self) -> Option<SecretKey> {
         self.vm
             .options()
-            .env_value("VM_SECRET_KEY")
+            .env_value("VIBE_SECRET_KEY")
             .map(SecretKey::of)
     }
 
@@ -173,8 +173,8 @@ impl Installation {
     pub fn restarted_with_key(self, key: Option<&SecretKey>) -> Self {
         let options = self.vm.options().clone();
         let options = match key {
-            Some(key) => options.env("VM_SECRET_KEY", key.expose()),
-            None => options.without_env("VM_SECRET_KEY"),
+            Some(key) => options.env("VIBE_SECRET_KEY", key.expose()),
+            None => options.without_env("VIBE_SECRET_KEY"),
         };
         self.restarted_with(&options)
     }
@@ -617,7 +617,7 @@ impl Installation {
         (credential, body)
     }
 
-    /// The arguments of `vm sign-in` to this installation through the
+    /// The arguments of `vibe sign-in` to this installation through the
     /// browser, with these more (`--json`, `--timeout 10`, ...).
     pub fn sign_in_args(&self, more: &[&str]) -> Vec<String> {
         let mut args = vec![
@@ -631,7 +631,7 @@ impl Installation {
         args
     }
 
-    /// Starts `vm sign-in` with these more arguments on `machine`, with
+    /// Starts `vibe sign-in` with these more arguments on `machine`, with
     /// these environment variables, and returns at once.
     pub fn spawn_sign_in(
         &self,
@@ -645,7 +645,7 @@ impl Installation {
     }
 
     /// Signs the tool on `machine` in as this person through the browser,
-    /// as a Builder does: `vm sign-in --json` with the harness's `BROWSER`;
+    /// as a Builder does: `vibe sign-in --json` with the harness's `BROWSER`;
     /// the person's browser opens what the tool opened, goes through the
     /// provider, confirms, and is sent to the tool, which must answer it
     /// `200` and end with `0`. Returns what the tool printed.
@@ -657,7 +657,7 @@ impl Installation {
             let stderr = running.stderr_so_far();
             drop(running);
             self.vm.fail(&format!(
-                "expected `vm sign-in` to open the browser with BROWSER within {OPEN_TIMEOUT:?}; it wrote on standard error:\n{}",
+                "expected `vibe sign-in` to open the browser with BROWSER within {OPEN_TIMEOUT:?}; it wrote on standard error:\n{}",
                 crate::connection::masked(&stderr, &[])
             ));
         };
@@ -687,7 +687,7 @@ impl Installation {
         }
         if run.code != Some(0) {
             self.vm.fail(&format!(
-                "expected `vm sign-in` through the browser to end with 0\n{}",
+                "expected `vibe sign-in` through the browser to end with 0\n{}",
                 run.describe()
             ));
         }

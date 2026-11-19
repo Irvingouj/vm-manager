@@ -2,7 +2,7 @@
 //! (CONTRACT.md, "The tool signs in through the browser, and OIDC is
 //! connected from the tool: Starting, from this ticket on" and "The
 //! installation's key"; "Sign-in and sessions: Starting with OIDC" for what
-//! stays): the options of `vm serve` for OIDC are gone, the program uses
+//! stays): the options of `vibe serve` for OIDC are gone, the program uses
 //! the connection its platform database holds, the stand-in and
 //! `--administrators-group` are kept to tests and the local run, the
 //! installation's key and what happens without it or with another, the
@@ -39,9 +39,9 @@ const SECRET: &str = "start-up-secret-Qm7Vt2Lx9";
 
 const LISTEN: [&str; 2] = ["--listen", "127.0.0.1:0"];
 
-/// Runs `vm serve --domain <domain> --listen 127.0.0.1:0 <args>` on this
-/// platform database (a fresh one when `None`), with `VM_SECRET_KEY` set to
-/// `key` or unset and `VM_OIDC_CLIENT_SECRET` set to [`SECRET`], to its
+/// Runs `vibe serve --domain <domain> --listen 127.0.0.1:0 <args>` on this
+/// platform database (a fresh one when `None`), with `VIBE_SECRET_KEY` set to
+/// `key` or unset and `VIBE_OIDC_CLIENT_SECRET` set to [`SECRET`], to its
 /// exit.
 fn serve(platform: Option<&Platform>, args: &[&str], key: Option<&str>) -> Finished {
     let fresh;
@@ -57,11 +57,11 @@ fn serve(platform: Option<&Platform>, args: &[&str], key: Option<&str>) -> Finis
         .args(["serve", "--domain", DOMAIN])
         .args(LISTEN)
         .args(args)
-        .env_remove("VM_SECRET_KEY")
-        .env("VM_OIDC_CLIENT_SECRET", SECRET)
-        .env("VM_DATABASE_URL", platform.url());
+        .env_remove("VIBE_SECRET_KEY")
+        .env("VIBE_OIDC_CLIENT_SECRET", SECRET)
+        .env("VIBE_DATABASE_URL", platform.url());
     if let Some(key) = key {
-        command.env("VM_SECRET_KEY", key);
+        command.env("VIBE_SECRET_KEY", key);
     }
     run_to_exit(command, EXIT_TIMEOUT).unwrap()
 }
@@ -82,7 +82,7 @@ fn assert_start_fails(case: &str, finished: &Finished, named: &[&str], hidden: &
     );
     assert!(
         finished.status.is_some_and(|s| !s.success()),
-        "expected `vm serve` to exit non-zero by itself within {EXIT_TIMEOUT:?}\n{shown}"
+        "expected `vibe serve` to exit non-zero by itself within {EXIT_TIMEOUT:?}\n{shown}"
     );
     assert!(
         !finished.stderr.contains("\"listening\""),
@@ -114,7 +114,7 @@ fn the_oidc_options_of_serve_are_gone_and_each_is_exit_code_2() {
         assert_eq!(
             finished.status.and_then(|s| s.code()),
             Some(2),
-            "expected `vm serve {option} {value}` to be exit code 2, like any option it does not have\nexit: {}\nstandard error:\n{}",
+            "expected `vibe serve {option} {value}` to be exit code 2, like any option it does not have\nexit: {}\nstandard error:\n{}",
             finished.status_text(),
             finished.stderr.replace(SECRET, "<SECRET>")
         );
@@ -126,9 +126,9 @@ fn the_oidc_options_of_serve_are_gone_and_each_is_exit_code_2() {
 fn the_client_secret_in_the_environment_of_serve_is_not_looked_at() {
     for options in [
         VmOptions::new().stand_in_sign_in(),
-        VmOptions::new().env("VM_SECRET_KEY", SecretKey::fresh().expose()),
+        VmOptions::new().env("VIBE_SECRET_KEY", SecretKey::fresh().expose()),
     ] {
-        let vm = Vm::start(&options.env("VM_OIDC_CLIENT_SECRET", SECRET));
+        let vm = Vm::start(&options.env("VIBE_OIDC_CLIENT_SECRET", SECRET));
         let listening = vm.listening();
         assert_ne!(
             listening["sign_in"], "oidc",
@@ -203,7 +203,7 @@ fn the_stand_in_on_a_platform_database_that_holds_a_connection_is_a_start_up_fai
     // stand-in.
     let started = Vm::start(
         &VmOptions::new()
-            .env("VM_SECRET_KEY", key.expose())
+            .env("VIBE_SECRET_KEY", key.expose())
             .platform(&platform),
     );
     assert_eq!(started.listening()["sign_in"], "oidc");
@@ -241,7 +241,7 @@ fn the_administrators_group_without_the_stand_in_is_a_start_up_failure_naming_co
         assert_start_fails(
             "--administrators-group without --stand-in-sign-in",
             &finished,
-            &["--administrators-group", "vm admin connect-oidc"],
+            &["--administrators-group", "vibe admin connect-oidc"],
             &[key.unwrap_or_default()],
         );
     }
@@ -262,9 +262,9 @@ fn a_malformed_installation_key_is_a_start_up_failure_that_never_shows_it() {
         let began = Instant::now();
         let finished = serve(None, &[], Some(value));
         assert_start_fails(
-            &format!("VM_SECRET_KEY {case}"),
+            &format!("VIBE_SECRET_KEY {case}"),
             &finished,
-            &["VM_SECRET_KEY"],
+            &["VIBE_SECRET_KEY"],
             &[value],
         );
         assert!(began.elapsed() <= EXIT_TIMEOUT, "{case}: within 15 seconds");
@@ -273,7 +273,7 @@ fn a_malformed_installation_key_is_a_start_up_failure_that_never_shows_it() {
 
 #[test]
 fn a_key_of_32_random_bytes_in_base64_is_taken() {
-    let vm = Vm::start(&VmOptions::new().env("VM_SECRET_KEY", SecretKey::fresh().expose()));
+    let vm = Vm::start(&VmOptions::new().env("VIBE_SECRET_KEY", SecretKey::fresh().expose()));
     assert_eq!(vm.listening()["sign_in"], "none", "{}", vm.listening());
 }
 
@@ -371,8 +371,8 @@ fn the_stand_in_on_an_address_that_is_not_loopback_is_a_start_up_failure() {
         command
             .args(["serve", "--domain", DOMAIN, "--listen", listen])
             .arg("--stand-in-sign-in")
-            .env_remove("VM_SECRET_KEY")
-            .env("VM_DATABASE_URL", platform.url());
+            .env_remove("VIBE_SECRET_KEY")
+            .env("VIBE_DATABASE_URL", platform.url());
         let finished = run_to_exit(command, EXIT_TIMEOUT).unwrap();
         assert_start_fails(
             &format!("--stand-in-sign-in with --listen {listen}"),

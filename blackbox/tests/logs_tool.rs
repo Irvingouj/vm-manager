@@ -1,4 +1,4 @@
-//! `vm logs` (CONTRACT.md, "Versions, going back, and logs: The commands";
+//! `vibe logs` (CONTRACT.md, "Versions, going back, and logs: The commands";
 //! ticket "Versions: list them, go back to the previous one, read logs":
 //! logs show, per request, the User, the Version, what was printed and any
 //! uncaught error with its stack; they can be followed live and filtered by
@@ -24,7 +24,7 @@ use blackbox::tool::{Broken, Machine, Running};
 use blackbox::{INSTALLER, Response, User, Vm, VmOptions};
 use serde_json::{Value, json};
 
-/// How long a test waits for `vm logs --follow` to print what it expects.
+/// How long a test waits for `vibe logs --follow` to print what it expects.
 const FOLLOW_WAIT: Duration = Duration::from_secs(15);
 
 /// The Contributor of every Application these tests make.
@@ -133,7 +133,7 @@ fn vm_logs_request_after_and_limit_are_the_apis() {
         assert_eq!(
             (&printed["entries"], &printed["next"]),
             (&json!(want.entries), &json!(want.next)),
-            "expected `vm {}` to print what the API answers {query}",
+            "expected `vibe {}` to print what the API answers {query}",
             command.join(" ")
         );
     }
@@ -368,11 +368,11 @@ fn wait_for_output(running: &mut Running, what: &str, done: impl Fn(&str) -> boo
         }
         assert!(
             !running.has_ended(),
-            "expected `vm logs --follow` to go on running while waiting for {what}; it ended, having printed\n{out}"
+            "expected `vibe logs --follow` to go on running while waiting for {what}; it ended, having printed\n{out}"
         );
         assert!(
             Instant::now() < deadline,
-            "expected `vm logs --follow` to print {what} within {FOLLOW_WAIT:?}, it printed\n{out}"
+            "expected `vibe logs --follow` to print {what} within {FOLLOW_WAIT:?}, it printed\n{out}"
         );
         thread::sleep(Duration::from_millis(100));
     }
@@ -462,7 +462,7 @@ fn vm_logs_follow_ends_with_0_on_sigterm_and_sighup_too() {
         assert_eq!(
             run.code,
             Some(0),
-            "expected `vm logs --follow` to end with 0 on SIG{signal}\n{}",
+            "expected `vibe logs --follow` to end with 0 on SIG{signal}\n{}",
             run.describe()
         );
     }
@@ -516,7 +516,7 @@ fn vm_logs_follow_ends_with_4_when_the_sign_in_ends() {
     assert_eq!(
         run.code,
         Some(4),
-        "expected `vm logs --follow` to end with 4 once its credential expired (6 s)\n{}",
+        "expected `vibe logs --follow` to end with 4 once its credential expired (6 s)\n{}",
         run.describe()
     );
 }
@@ -547,7 +547,7 @@ fn a_standard_output_closed_before_it_starts_ends_vm_logs_follow_with_1() {
             assert_eq!(
                 run.code,
                 Some(1),
-                "expected `vm {}` with standard output {broken:?} to end with 1 (`output-closed`)\n{}",
+                "expected `vibe {}` with standard output {broken:?} to end with 1 (`output-closed`)\n{}",
                 args.join(" "),
                 run.describe()
             );
@@ -595,7 +595,7 @@ fn a_reader_that_goes_away_while_it_runs_ends_vm_logs_follow_with_1_at_the_next_
         });
         received.recv_timeout(FOLLOW_WAIT).unwrap_or_else(|_| {
             panic!(
-                "expected `vm {}` to print a first line within {FOLLOW_WAIT:?}",
+                "expected `vibe {}` to print a first line within {FOLLOW_WAIT:?}",
                 args.join(" ")
             )
         });
@@ -607,7 +607,7 @@ fn a_reader_that_goes_away_while_it_runs_ends_vm_logs_follow_with_1_at_the_next_
             thread::sleep(Duration::from_millis(1500));
             assert!(
                 !running.has_ended(),
-                "expected `vm {}` to go on running until it prints again",
+                "expected `vibe {}` to go on running until it prints again",
                 args.join(" ")
             );
         }
@@ -616,7 +616,7 @@ fn a_reader_that_goes_away_while_it_runs_ends_vm_logs_follow_with_1_at_the_next_
         assert_eq!(
             run.code,
             Some(1),
-            "expected `vm {}` to end with 1 (`output-closed`) once the next entry found no reader\n{}",
+            "expected `vibe {}` to end with 1 (`output-closed`) once the next entry found no reader\n{}",
             args.join(" "),
             run.describe()
         );

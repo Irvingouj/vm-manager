@@ -1,12 +1,12 @@
-//! `vm dev`: the command, where it listens, what it prints, how it ends,
+//! `vibe dev`: the command, where it listens, what it prints, how it ends,
 //! the help and the instruction file (CONTRACT.md, "The local loop, kept
 //! running: the browser, test rows and reset": "The command", "The
 //! instruction file"; ticket "Local loop in the browser, with test rows,
 //! reset and working offline").
 //!
-//! A project made by `vm new` declaring nothing, with the harness's handler
+//! A project made by `vibe new` declaring nothing, with the harness's handler
 //! (`blackbox/src/local.rs`, `handler`: any path it does not know answers
-//! `{ user }`). Each `vm dev` listens on a port the system gave as free.
+//! `{ user }`). Each `vibe dev` listens on a port the system gave as free.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -72,19 +72,19 @@ fn it_listens_on_the_loopback_address_only_and_says_so_in_its_first_json_line() 
     let found = listeners(dev.port);
     assert!(
         found.iter().any(|l| l.address == "127.0.0.1"),
-        "expected `vm dev` to listen on 127.0.0.1:{}, found {found:?}",
+        "expected `vibe dev` to listen on 127.0.0.1:{}, found {found:?}",
         dev.port
     );
     assert!(
         found
             .iter()
             .all(|l| l.address == "127.0.0.1" || l.address == "::1"),
-        "expected `vm dev` to listen on the loopback address only, found {found:?}"
+        "expected `vibe dev` to listen on the loopback address only, found {found:?}"
     );
     if has_ipv6_loopback() {
         assert!(
             found.iter().any(|l| l.address == "::1"),
-            "expected `vm dev` to listen on ::1 too, which this machine has; found {found:?}"
+            "expected `vibe dev` to listen on ::1 too, which this machine has; found {found:?}"
         );
         let v6 = SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, dev.port));
         assert!(
@@ -180,7 +180,7 @@ fn sigint_sigterm_and_sighup_each_end_it_with_exit_code_0_and_nothing_left_runni
         assert_eq!(
             run.code,
             Some(0),
-            "{signal}: expected `vm dev` to end with exit code 0\n{}",
+            "{signal}: expected `vibe dev` to end with exit code 0\n{}",
             run.describe()
         );
         assert!(
@@ -256,7 +256,7 @@ fn a_port_outside_1_to_65535_is_exit_code_2() {
         );
     }
     assert!(
-        !project.dir.join(".vm/local").exists(),
+        !project.dir.join(".vibe/local").exists(),
         "expected nothing made for a command line refused"
     );
 }
@@ -273,7 +273,7 @@ fn a_second_vm_dev_in_the_same_project_is_already_running_at_once_giving_the_fir
     let message = second.json_error(1, "already-running");
     assert!(
         began.elapsed() < Duration::from_secs(15),
-        "expected the second `vm dev` to end at once, took {:?}",
+        "expected the second `vibe dev` to end at once, took {:?}",
         began.elapsed()
     );
     assert!(
@@ -300,7 +300,7 @@ fn failures_before_it_listens_are_those_of_vm_request_and_nothing_listens() {
     assert!(!port_open(port), "expected nothing listening on {port}");
 
     let project = project(&local);
-    fs::write(project.dir.join("vm.dev.json"), "{ \"users\": 7 }\n").unwrap();
+    fs::write(project.dir.join("vibe.dev.json"), "{ \"users\": 7 }\n").unwrap();
     let args = dev_args(&project.dir, port, true);
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     local.watch(&project.dir);
@@ -328,7 +328,7 @@ fn a_closed_output_ends_it_with_output_closed_and_nothing_left_running() {
     while !port_open(port) {
         assert!(
             !running.has_ended() && Instant::now() < deadline,
-            "expected `vm dev` to listen on {port}"
+            "expected `vibe dev` to listen on {port}"
         );
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -354,7 +354,7 @@ fn a_closed_output_ends_it_with_output_closed_and_nothing_left_running() {
     assert_eq!(
         run.code,
         Some(1),
-        "expected a closed output to end `vm dev` with exit code 1, as `vm logs --follow` ends\n{}",
+        "expected a closed output to end `vibe dev` with exit code 1, as `vibe logs --follow` ends\n{}",
         run.describe()
     );
     assert!(
@@ -373,14 +373,14 @@ fn the_help_lists_dev_and_local_reset_with_their_options() {
     let commands = help_commands(&help.stdout);
     assert!(
         commands.iter().any(|c| c == "dev"),
-        "expected `vm --help` to list `dev`, got {commands:?}"
+        "expected `vibe --help` to list `dev`, got {commands:?}"
     );
     let dev = local.machine.run(&["dev", "--help"]);
     dev.expect_code(0);
     for option in ["--port", "--project", "--json"] {
         assert!(
             dev.stdout.contains(option),
-            "expected `vm dev --help` to name {option}, got\n{}",
+            "expected `vibe dev --help` to name {option}, got\n{}",
             dev.stdout
         );
     }
@@ -390,7 +390,7 @@ fn the_help_lists_dev_and_local_reset_with_their_options() {
         help_commands(&local_help.stdout)
             .iter()
             .any(|c| c == "reset"),
-        "expected `vm local --help` to list `reset`, got\n{}",
+        "expected `vibe local --help` to list `reset`, got\n{}",
         local_help.stdout
     );
     let reset = local.machine.run(&["local", "reset", "--help"]);
@@ -398,7 +398,7 @@ fn the_help_lists_dev_and_local_reset_with_their_options() {
     for option in ["--project", "--timeout", "--json"] {
         assert!(
             reset.stdout.contains(option),
-            "expected `vm local reset --help` to name {option}, got\n{}",
+            "expected `vibe local reset --help` to name {option}, got\n{}",
             reset.stdout
         );
     }
@@ -413,25 +413,25 @@ fn the_instruction_file_names_vm_dev_and_vm_local_reset_and_says_what_test_rows_
     let commands = vm_commands_in(&text);
     assert!(
         commands.iter().any(|c| c == "dev"),
-        "expected AGENTS.md to name `vm dev` in code, got {commands:?}"
+        "expected AGENTS.md to name `vibe dev` in code, got {commands:?}"
     );
     let code = squashed(&code_in(&text).join("\n"));
     assert!(
-        code.contains("vm local reset"),
-        "expected AGENTS.md to name `vm local reset` in code\n{text}"
+        code.contains("vibe local reset"),
+        "expected AGENTS.md to name `vibe local reset` in code\n{text}"
     );
     let paragraphs: Vec<String> = paragraphs(&text).iter().map(|p| squashed(p)).collect();
     assert!(
-        paragraphs.iter().any(|p| p.contains("vm dev")
+        paragraphs.iter().any(|p| p.contains("vibe dev")
             && p.contains(".localhost:7480")
             && p.to_lowercase().contains("browser")),
-        "expected a paragraph saying that `vm dev` serves the project at http://<name>.localhost:7480/ for the Builder's browser\n{text}"
+        "expected a paragraph saying that `vibe dev` serves the project at http://<name>.localhost:7480/ for the Builder's browser\n{text}"
     );
     assert!(
         paragraphs
             .iter()
-            .any(|p| p.contains("vm dev") && p.contains("vm request")),
-        "expected AGENTS.md to say that the agent's own `vm request` is answered by `vm dev` while it runs\n{text}"
+            .any(|p| p.contains("vibe dev") && p.contains("vibe request")),
+        "expected AGENTS.md to say that the agent's own `vibe request` is answered by `vibe dev` while it runs\n{text}"
     );
     assert!(
         paragraphs
@@ -449,7 +449,7 @@ fn the_instruction_file_names_vm_dev_and_vm_local_reset_and_says_what_test_rows_
     for command in commands {
         assert!(
             listed.contains(&command),
-            "AGENTS.md names `vm {command}`, which `vm --help` does not list"
+            "AGENTS.md names `vibe {command}`, which `vibe --help` does not list"
         );
     }
 }
@@ -459,7 +459,7 @@ fn vm_log_is_started_anew_once_past_16_mib_while_vm_dev_runs() {
     let local = Local::new();
     let project = project(&local);
     let dev = Dev::start(&local, &project.dir, NAME);
-    let log = project.dir.join(".vm/local/vm.log");
+    let log = project.dir.join(".vibe/local/vibe.log");
     let size = || fs::metadata(&log).map(|m| m.len()).unwrap_or(0);
     let mut browser = dev.browser();
     browser.choose(OUTSIDER);
@@ -489,7 +489,7 @@ fn vm_log_is_started_anew_once_past_16_mib_while_vm_dev_runs() {
             let now = size();
             assert!(
                 now <= limit,
-                "expected vm.log at most 17 MiB while `vm dev` runs, it is {now} bytes after {n} requests"
+                "expected vibe.log at most 17 MiB while `vibe dev` runs, it is {now} bytes after {n} requests"
             );
             if now < largest {
                 started_anew = true;
@@ -500,11 +500,11 @@ fn vm_log_is_started_anew_once_past_16_mib_while_vm_dev_runs() {
     let now = size();
     assert!(
         now <= limit,
-        "expected vm.log at most 17 MiB, it is {now} bytes"
+        "expected vibe.log at most 17 MiB, it is {now} bytes"
     );
     assert!(
         started_anew || now < largest,
-        "the harness's own check: more than 16 MiB was written into vm.log (largest seen {largest} bytes)"
+        "the harness's own check: more than 16 MiB was written into vibe.log (largest seen {largest} bytes)"
     );
     dev.stop("INT").expect_code(0);
 }

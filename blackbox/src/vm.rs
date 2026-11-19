@@ -1,4 +1,4 @@
-//! A running `vm serve` (CONTRACT.md, "Serving"): started on a free port
+//! A running `vibe serve` (CONTRACT.md, "Serving"): started on a free port
 //! against a platform database on the harness's Postgres, with chosen
 //! fixture Applications installed through the platform's API, and ended when
 //! the handle is dropped, also when the test panics.
@@ -55,7 +55,7 @@ pub fn fixture_bundle(file: &str) -> String {
         .unwrap_or_else(|e| panic!("cannot read the fixture {}: {e}", path.display()))
 }
 
-/// How to start `vm serve`: "this program, with these fixture
+/// How to start `vibe serve`: "this program, with these fixture
 /// Applications".
 #[derive(Clone, Debug)]
 pub struct VmOptions {
@@ -74,7 +74,7 @@ pub struct VmOptions {
 }
 
 /// An environment variable for the program. Its value may be a secret
-/// (`VM_OIDC_CLIENT_SECRET`), so `Debug` shows only its name.
+/// (`VIBE_OIDC_CLIENT_SECRET`), so `Debug` shows only its name.
 #[derive(Clone)]
 struct EnvVar {
     name: String,
@@ -212,7 +212,7 @@ impl VmOptions {
         .stand_in_sign_in()
     }
 
-    /// The `vm` arguments for these options. `VM_DATABASE_URL` goes in the
+    /// The `vibe` arguments for these options. `VIBE_DATABASE_URL` goes in the
     /// environment, never here.
     pub fn args(&self) -> Vec<String> {
         let mut args = vec![
@@ -249,7 +249,7 @@ impl Drop for ProcessGuard {
     }
 }
 
-/// A running `vm serve`. Dropping it ends the process.
+/// A running `vibe serve`. Dropping it ends the process.
 pub struct Vm {
     // Fields drop in this order: the process ends first, so that the log
     // reader sees the end of the stream and can be joined.
@@ -268,7 +268,7 @@ pub struct Vm {
 }
 
 impl Vm {
-    /// Starts `vm serve` with these options, waits for its `listening`
+    /// Starts `vibe serve` with these options, waits for its `listening`
     /// record, and installs the fixture Applications through the platform's
     /// API. Fails the test with the program's log if any of it goes wrong.
     ///
@@ -357,7 +357,7 @@ impl Vm {
         }
     }
 
-    /// Starts `vm serve` with the stand-in sign-in's options as given and no
+    /// Starts `vibe serve` with the stand-in sign-in's options as given and no
     /// fixture Applications, and waits up to `within` for its `listening`
     /// record: `Err` (the program ended, its log in the message) when it
     /// does not listen by then, for a test in which not starting is allowed.
@@ -366,13 +366,13 @@ impl Vm {
         Self::try_launch(options, &platform, within)
     }
 
-    /// Starts `vm serve` and waits for its `listening` record.
+    /// Starts `vibe serve` and waits for its `listening` record.
     fn launch(options: &VmOptions, platform: &Platform) -> Self {
         Self::try_launch(options, platform, START_TIMEOUT)
             .unwrap_or_else(|message| panic!("{message}"))
     }
 
-    /// Starts `vm serve` and waits up to `within` for its `listening`
+    /// Starts `vibe serve` and waits up to `within` for its `listening`
     /// record.
     fn try_launch(
         options: &VmOptions,
@@ -381,17 +381,17 @@ impl Vm {
     ) -> Result<Self, String> {
         let args = options.args();
         let command_line = format!(
-            "VM_DATABASE_URL=<{} on the test Postgres> {} {}",
+            "VIBE_DATABASE_URL=<{} on the test Postgres> {} {}",
             platform.name(),
             vm_binary().display(),
             args.join(" ")
         );
         let mut child = Command::new(vm_binary())
             .args(&args)
-            .env("VM_DATABASE_URL", platform.url())
-            .env_remove("VM_OIDC_CLIENT_SECRET")
-            .env_remove("VM_SECRET_KEY")
-            .env_remove("VM_SETUP_CREDENTIAL")
+            .env("VIBE_DATABASE_URL", platform.url())
+            .env_remove("VIBE_OIDC_CLIENT_SECRET")
+            .env_remove("VIBE_SECRET_KEY")
+            .env_remove("VIBE_SETUP_CREDENTIAL")
             .envs(options.env.iter().map(|e| (&e.name, &e.value)))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -424,7 +424,7 @@ impl Vm {
                     }
                 };
                 let message = format!(
-                    "expected `vm serve` to write a `listening` record, but it {why}.\ncommand: {command_line}\nits standard error:\n{}\nthe last {POSTGRES_LOG_LINES_SHOWN} lines of the test Postgres's server log:\n{}",
+                    "expected `vibe serve` to write a `listening` record, but it {why}.\ncommand: {command_line}\nits standard error:\n{}\nthe last {POSTGRES_LOG_LINES_SHOWN} lines of the test Postgres's server log:\n{}",
                     log.tail(LOG_LINES_SHOWN),
                     crate::postgres::shared_log_tail(POSTGRES_LOG_LINES_SHOWN)
                 );

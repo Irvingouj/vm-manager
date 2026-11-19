@@ -1,4 +1,4 @@
-//! What `vm check` needs, what it leaves, and how it ends (CONTRACT.md, "A
+//! What `vibe check` needs, what it leaves, and how it ends (CONTRACT.md, "A
 //! project: the template, creating one and checking one: Checking a
 //! project"; "The tool: Every command"; ticket "The project template, and
 //! creating and checking a project": the check has a JSON form and uses
@@ -45,7 +45,7 @@ fn not_signed_in_is_exit_code_4() {
     let before = Tree::of(&project.dir);
     check(&machine, &project.dir).json_error(4, "not-signed-in");
     let message = check_in_words(&machine, &project.dir).text_error(4);
-    assert!(message.contains("vm sign-in"), "{message:?}");
+    assert!(message.contains("vibe sign-in"), "{message:?}");
     assert_eq!(
         before.differences(&Tree::of(&project.dir)),
         Vec::<String>::new()
@@ -316,10 +316,10 @@ fn the_installations_text_is_printed_as_any_text_not_the_tools_own() {
         json!(contact),
         "with --json the text parses to the original"
     );
-    assert_no_raw_control(&run.stdout, "`vm check --json`");
+    assert_no_raw_control(&run.stdout, "`vibe check --json`");
 
     let words = check_in_words(&machine, &project.dir).ok_text();
-    assert_no_raw_control(&words, "`vm check` in words");
+    assert_no_raw_control(&words, "`vibe check` in words");
     let escaped = escapes_in(&words);
     for c in [0x1b, 0x202e, 0xa] {
         assert!(
@@ -343,10 +343,10 @@ fn the_projects_text_is_printed_as_any_text_not_the_tools_own() {
         problem["file"].as_str().is_some_and(|f| f.ends_with(odd)),
         "expected the file's name, parsed, as it is: {problem}"
     );
-    assert_no_raw_control(&run.stdout, "`vm check --json`");
+    assert_no_raw_control(&run.stdout, "`vibe check --json`");
 
     let words = check_in_words(&machine, &project.dir).text_error(1);
-    assert_no_raw_control(&words, "`vm check` in words");
+    assert_no_raw_control(&words, "`vibe check` in words");
     assert!(
         escapes_in(&words).contains(&0x1b),
         "expected the escape character of the file's name printed as \\u{{1b}}, got\n{}",

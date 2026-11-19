@@ -1,6 +1,6 @@
 //! Connecting OIDC (CONTRACT.md, "The tool signs in through the browser,
 //! and OIDC is connected from the tool: Connecting OIDC" and "The
-//! installation's key"): `vm admin connect-oidc` with the setup credential
+//! installation's key"): `vibe admin connect-oidc` with the setup credential
 //! or the tool's own, `PUT /v1/oidc` and what it refuses, the provider
 //! asked before a connection is taken, the connection taking effect at once,
 //! a connection made over an earlier one, `GET /v1/oidc`, `GET
@@ -172,14 +172,14 @@ fn afterwards_the_setup_credential_no_longer_works() {
     );
     let message = again.json_error(3, "setup-credential-refused");
     assert!(
-        message.contains("vm setup"),
-        "expected the message to say to run `vm setup` again, got {message:?}"
+        message.contains("vibe setup"),
+        "expected the message to say to run `vibe setup` again, got {message:?}"
     );
     let in_words = hide(
         &connect_with_setup(&machine, &at.vm, &setup, &connection, false),
         &secrets,
     );
-    assert!(in_words.text_error(3).contains("vm setup"));
+    assert!(in_words.text_error(3).contains("vibe setup"));
     let through_the_api = put_oidc(&at.vm, Some(setup.expose()), &connection.body());
     assert_eq!(
         through_the_api.status,
@@ -256,15 +256,15 @@ fn connect_oidc_takes_the_client_secret_from_its_environment_only() {
     let machine = Machine::new();
     let args = connect_args(at.vm.address(), &connection, true);
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let without = machine.run_with_env(&refs, &[("VM_SETUP_CREDENTIAL", setup.expose())]);
+    let without = machine.run_with_env(&refs, &[("VIBE_SETUP_CREDENTIAL", setup.expose())]);
     hide(&without, &[setup.expose()]).expect_code(2);
     let mut on_the_line = refs.clone();
     on_the_line.extend(["--client-secret", "on-the-command-line-Lq0"]);
     let given = machine.run_with_env(
         &on_the_line,
         &[
-            ("VM_SETUP_CREDENTIAL", setup.expose()),
-            ("VM_OIDC_CLIENT_SECRET", connection.secret().expose()),
+            ("VIBE_SETUP_CREDENTIAL", setup.expose()),
+            ("VIBE_OIDC_CLIENT_SECRET", connection.secret().expose()),
         ],
     );
     hide(&given, &[setup.expose(), connection.secret().expose()]).expect_code(2);
@@ -320,8 +320,8 @@ fn with_the_setup_credential_domain_and_a_loopback_connect_are_required() {
         let run = machine.run_with_env(
             &refs,
             &[
-                ("VM_SETUP_CREDENTIAL", setup.expose()),
-                ("VM_OIDC_CLIENT_SECRET", connection.secret().expose()),
+                ("VIBE_SETUP_CREDENTIAL", setup.expose()),
+                ("VIBE_OIDC_CLIENT_SECRET", connection.secret().expose()),
             ],
         );
         let run = hide(&run, &[setup.expose(), connection.secret().expose()]);
@@ -339,12 +339,12 @@ fn with_the_tool_s_own_credential_domain_and_connect_are_exit_code_2() {
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let run = machine.run_with_env(
         &refs,
-        &[("VM_OIDC_CLIENT_SECRET", connection.secret().expose())],
+        &[("VIBE_OIDC_CLIENT_SECRET", connection.secret().expose())],
     );
     hide(&run, &[connection.secret().expose()]).expect_code(2);
 }
 
-/// `vm admin connect-oidc` with the tool's own credential: no `--domain`,
+/// `vibe admin connect-oidc` with the tool's own credential: no `--domain`,
 /// no `--connect`, no setup credential.
 fn connect_as_signed_in(machine: &Machine, connection: &Connection) -> blackbox::tool::Run {
     let mut args = vec!["admin".to_owned(), "connect-oidc".to_owned()];
@@ -353,7 +353,7 @@ fn connect_as_signed_in(machine: &Machine, connection: &Connection) -> blackbox:
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let run = machine.run_with_env(
         &refs,
-        &[("VM_OIDC_CLIENT_SECRET", connection.secret().expose())],
+        &[("VIBE_OIDC_CLIENT_SECRET", connection.secret().expose())],
     );
     hide(&run, &[connection.secret().expose()])
 }

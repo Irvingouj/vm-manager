@@ -1,12 +1,12 @@
-//! The tool's own local commands while `vm dev` runs in the project
+//! The tool's own local commands while `vibe dev` runs in the project
 //! (CONTRACT.md, "The local loop, kept running: the browser, test rows and
 //! reset": "The tool's own commands while it runs"; ticket "Local loop in
 //! the browser, with test rows, reset and working offline").
 //!
-//! A command answered by `vm dev` starts no Postgres of its own: the one
-//! `vm dev` runs is the same before and after, and the request it sent is
-//! among `vm dev`'s `request` lines. Each command is given `--timeout 60`,
-//! so that one that waited for `vm dev` to end instead would end
+//! A command answered by `vibe dev` starts no Postgres of its own: the one
+//! `vibe dev` runs is the same before and after, and the request it sent is
+//! among `vibe dev`'s `request` lines. Each command is given `--timeout 60`,
+//! so that one that waited for `vibe dev` to end instead would end
 //! `request-timed-out`.
 #![allow(
     clippy::unwrap_used,
@@ -45,12 +45,12 @@ fn board_with_notes() -> Board {
     board
 }
 
-/// Fails unless `vm dev` served the request `id` (a `request` line).
+/// Fails unless `vibe dev` served the request `id` (a `request` line).
 fn assert_served_by(dev: &Dev, id: &str, context: &str) {
     let served = dev.events("request").iter().any(|l| l["request_id"] == id);
     assert!(
         served,
-        "{context}: expected the request {id} served by `vm dev` (one of its `request` lines)\n{}",
+        "{context}: expected the request {id} served by `vibe dev` (one of its `request` lines)\n{}",
         dev.stdout()
     );
 }
@@ -81,11 +81,11 @@ fn vm_request_is_answered_by_it_as_the_user_as_names_whatever_the_browser_chose(
     );
     assert_eq!(requested.body["migrations_applied"], json!([]));
     assert_eq!(requested.test_rows(), json!([]));
-    assert_served_by(&dev, &requested.request_id(), "vm request");
+    assert_served_by(&dev, &requested.request_id(), "vibe request");
     let now = dev.postmaster();
     assert_eq!(
         now.pid, postgres.pid,
-        "expected no second Postgres: the command was answered by `vm dev`"
+        "expected no second Postgres: the command was answered by `vibe dev`"
     );
     assert!(is_running(postgres.pid));
     // The browser's choice is its own.
@@ -127,7 +127,7 @@ fn what_a_request_while_it_runs_rebuilt_is_in_the_output_of_vm_request() {
         requested.json()["incidents"],
         json!([{ "id": 1, "title": "Printer on fire" }])
     );
-    assert_served_by(&dev, &requested.request_id(), "vm request");
+    assert_served_by(&dev, &requested.request_id(), "vibe request");
     dev.stop("INT").expect_code(0);
 }
 
@@ -248,7 +248,7 @@ fn the_file_that_finds_it_is_0600_and_its_secret_is_in_no_output_log_or_page() {
     );
     assert!(
         !found.is_empty(),
-        "expected a file of .vm/local/ holding the port {} of `vm dev`",
+        "expected a file of .vibe/local/ holding the port {} of `vibe dev`",
         dev.port
     );
     for file in &found {
@@ -267,13 +267,13 @@ fn the_file_that_finds_it_is_0600_and_its_secret_is_in_no_output_log_or_page() {
         !holding_port.is_empty(),
         "expected a secret of 64 lower-case hex digits in the file that holds the port, {found:?}"
     );
-    // Every such run of the files of .vm/local/ but Postgres's own: the
+    // Every such run of the files of .vibe/local/ but Postgres's own: the
     // secret, and the private Postgres's passwords when written so.
     let secrets: Vec<String> = local_files_but_postgres(board.dir(), &postgres.data)
         .iter()
         .flat_map(|f| hex64_runs(&fs::read(f).unwrap()))
         .collect();
-    // What a run shows: pages, answers, `vm request`, the records.
+    // What a run shows: pages, answers, `vibe request`, the records.
     let mut seen: Vec<(String, String)> = Vec::new();
     let mut browser = dev.browser();
     seen.push(("the page".to_owned(), browser.get("/_vm/test-user").text()));
@@ -294,8 +294,8 @@ fn the_file_that_finds_it_is_0600_and_its_secret_is_in_no_output_log_or_page() {
     let run = dev.stop("INT");
     run.expect_code(0);
     seen.extend(run.texts());
-    for log in ["vm.log", "postgres.log"] {
-        let path = board.dir().join(".vm/local").join(log);
+    for log in ["vibe.log", "postgres.log"] {
+        let path = board.dir().join(".vibe/local").join(log);
         seen.push((
             log.to_owned(),
             String::from_utf8_lossy(&fs::read(&path).unwrap_or_default()).into_owned(),
@@ -305,7 +305,7 @@ fn the_file_that_finds_it_is_0600_and_its_secret_is_in_no_output_log_or_page() {
         for (whence, text) in &seen {
             assert!(
                 !text.contains(secret.as_str()),
-                "expected the secret of the file that finds `vm dev` in no output, log or page; {whence} holds it"
+                "expected the secret of the file that finds `vibe dev` in no output, log or page; {whence} holds it"
             );
         }
     }
@@ -334,7 +334,7 @@ fn a_file_left_by_a_vm_dev_killed_outright_is_not_believed() {
     );
     assert!(
         impostor.accept().is_err(),
-        "expected no connection to the port a killed `vm dev` left in its file"
+        "expected no connection to the port a killed `vibe dev` left in its file"
     );
     drop(impostor);
     assert!(!port_open(port));
@@ -343,7 +343,7 @@ fn a_file_left_by_a_vm_dev_killed_outright_is_not_believed() {
         left.is_empty(),
         "expected nothing left running after the command, found {left:#?}"
     );
-    // And a new `vm dev` starts.
+    // And a new `vibe dev` starts.
     let again = Dev::start(&board.local, board.dir(), APP);
     again.stop("INT").expect_code(0);
 }
@@ -355,12 +355,12 @@ const STARTING_TRIES: usize = 8;
 
 #[test]
 fn a_vm_request_started_while_vm_dev_is_starting_is_answered_as_soon_as_it_listens() {
-    // `vm dev` is starting (it holds the project's lock and does not listen
+    // `vibe dev` is starting (it holds the project's lock and does not listen
     // yet) from the moment the project's private Postgres listens, which a
     // run starts only once it holds the lock, until its `listening` line.
     // Each round is a project's first run, so that window holds the making
     // of the local databases and the build. The command is started inside
-    // it: after the Postgres was seen, and before `vm dev` said it listens.
+    // it: after the Postgres was seen, and before `vibe dev` said it listens.
     let local = Local::new();
     let mut hits = 0;
     let mut missed = Vec::new();
@@ -375,7 +375,7 @@ fn a_vm_request_started_while_vm_dev_is_starting_is_answered_as_soon_as_it_liste
         while postmaster_of(&project.dir).is_none_or(|p| !is_running(p.pid)) {
             assert!(
                 !dev.has_ended() && Instant::now() < deadline,
-                "round {round}: expected the private Postgres of `vm dev` to listen while it starts\n{}",
+                "round {round}: expected the private Postgres of `vibe dev` to listen while it starts\n{}",
                 dev.stdout()
             );
             thread::sleep(Duration::from_millis(10));
@@ -409,18 +409,18 @@ fn a_vm_request_started_while_vm_dev_is_starting_is_answered_as_soon_as_it_liste
             dev.events("request")
                 .iter()
                 .any(|l| l["request_id"] == id.as_str()),
-            "round {round}: a command started while `vm dev` was starting is answered by it as soon as it listens; it printed no `request` line for {id}\n{}",
+            "round {round}: a command started while `vibe dev` was starting is answered by it as soon as it listens; it printed no `request` line for {id}\n{}",
             dev.stdout()
         );
         dev.stop("INT").expect_code(0);
     }
     println!(
-        "the command was started while `vm dev` was starting in {hits} round(s); missed the window in {:?}",
+        "the command was started while `vibe dev` was starting in {hits} round(s); missed the window in {:?}",
         missed
     );
     assert!(
         hits >= 1,
-        "the harness's own check: in none of {STARTING_TRIES} rounds was the command started while `vm dev` was starting (missed: {missed:?})"
+        "the harness's own check: in none of {STARTING_TRIES} rounds was the command started while `vibe dev` was starting (missed: {missed:?})"
     );
 }
 
@@ -448,12 +448,12 @@ fn a_second_vm_dev_started_while_the_first_is_starting_ends_already_running_with
         if let Some(at) = listened {
             assert!(
                 at.elapsed() < Duration::from_secs(15),
-                "expected the other `vm dev` to end already-running as soon as the first listens, not to wait for it to end"
+                "expected the other `vibe dev` to end already-running as soon as the first listens, not to wait for it to end"
             );
         }
         assert!(
             Instant::now() < deadline,
-            "expected one of the two `vm dev` to listen and the other to end already-running"
+            "expected one of the two `vibe dev` to listen and the other to end already-running"
         );
         thread::sleep(Duration::from_millis(50));
     };
@@ -463,7 +463,7 @@ fn a_second_vm_dev_started_while_the_first_is_starting_ends_already_running_with
     running.stop("INT").expect_code(0);
 }
 
-/// `vm request /echo --as outsider` with 12 headers of 100,000 bytes and a
+/// `vibe request /echo --as outsider` with 12 headers of 100,000 bytes and a
 /// `--data-file` of exactly 1 MiB, in the project `dir`.
 fn large_request(local: &Local, dir: &std::path::Path) -> blackbox::tool::Run {
     let data = local.machine.root().join("one-mebibyte.txt");
@@ -491,7 +491,7 @@ fn a_large_vm_request_is_answered_by_vm_dev_as_it_is_alone() {
     assert_eq!(
         run.code,
         Some(0),
-        "expected the same large request answered by `vm dev`\n{}",
+        "expected the same large request answered by `vibe dev`\n{}",
         run.describe()
     );
     let served = Requested::of(&run);
@@ -500,7 +500,7 @@ fn a_large_vm_request_is_answered_by_vm_dev_as_it_is_alone() {
         alone.status(),
         "expected the status it has alone"
     );
-    assert_served_by(&dev, &served.request_id(), "the large vm request");
+    assert_served_by(&dev, &served.request_id(), "the large vibe request");
     dev.stop("INT").expect_code(0);
 }
 
@@ -531,7 +531,7 @@ fn the_code_is_given_the_same_time_alone_and_under_vm_dev() {
     assert_eq!(
         under_dev.status(),
         alone.status(),
-        "expected the same answer under `vm dev` as alone\n{}",
+        "expected the same answer under `vibe dev` as alone\n{}",
         under_dev.describe()
     );
     dev.stop("INT").expect_code(0);

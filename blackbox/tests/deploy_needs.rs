@@ -1,7 +1,7 @@
-//! How `vm deploy` ends, what it leaves, and the rules of every command
+//! How `vibe deploy` ends, what it leaves, and the rules of every command
 //! (CONTRACT.md, "Deploying: The command": the project, `node`, the
 //! packages, the folder of its own in `TMPDIR`, the process groups and an
-//! interruption as for `vm check`; `--timeout`, 300 seconds without it,
+//! interruption as for `vibe check`; `--timeout`, 300 seconds without it,
 //! `deploy-timed-out`; "A project: Checking a project" for what holds as
 //! for the check; "The tool: Every command").
 #![allow(
@@ -291,7 +291,7 @@ fn not_signed_in_is_exit_code_4_and_the_message_says_to_sign_in() {
     let machine = Machine::new();
     let project = deploy_project("deploy-not-signed-in", "unsigned-board");
     let message = deploy(&machine, &project.dir, &[]).json_error(4, "not-signed-in");
-    assert!(message.contains("vm sign-in"), "{message:?}");
+    assert!(message.contains("vibe sign-in"), "{message:?}");
     let path = tool_path(&machine);
     machine
         .run_into_files(

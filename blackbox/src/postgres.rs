@@ -1,12 +1,12 @@
 //! The harness's private Postgres (CONTRACT.md, "How the tests get a
 //! Postgres"), and the platform databases the programs under test get on it.
 //!
-//! The binaries come from the directory `VM_TEST_PG_BIN` names, else from a
+//! The binaries come from the directory `VIBE_TEST_PG_BIN` names, else from a
 //! Postgres found on the machine, else from zonky's prebuilt binaries on
 //! Maven Central, downloaded once to a per-user cache and checked against
 //! the SHA-256 pinned here and published beside them
 //! (`docs/research/local-postgres-without-docker.md`). No Docker, no
-//! administrator rights. `VM_TEST_PG_VERSION` (16, 17 or 18; default 18)
+//! administrator rights. `VIBE_TEST_PG_VERSION` (16, 17 or 18; default 18)
 //! chooses the version: a Postgres on the machine is used only if it is
 //! exactly that version (at least 18 when the variable is unset), and the
 //! download is of that version.
@@ -40,14 +40,14 @@ use sha2::{Digest, Sha256};
 
 use crate::program::run_to_exit;
 
-/// The Postgres major version the harness runs when `VM_TEST_PG_VERSION`
+/// The Postgres major version the harness runs when `VIBE_TEST_PG_VERSION`
 /// does not say.
 pub const DEFAULT_MAJOR: u32 = 18;
 
-/// The major versions `VM_TEST_PG_VERSION` may choose.
+/// The major versions `VIBE_TEST_PG_VERSION` may choose.
 pub const MAJORS: [u32; 3] = [16, 17, 18];
 
-/// The Postgres major version the harness wants: `VM_TEST_PG_VERSION` (16,
+/// The Postgres major version the harness wants: `VIBE_TEST_PG_VERSION` (16,
 /// 17 or 18), else [`DEFAULT_MAJOR`]. Any other value fails the test that
 /// asks, saying what is allowed.
 pub fn wanted_major() -> u32 {
@@ -58,9 +58,9 @@ pub fn wanted_major() -> u32 {
     }
 }
 
-/// The version `VM_TEST_PG_VERSION` chooses, if it is set.
+/// The version `VIBE_TEST_PG_VERSION` chooses, if it is set.
 fn chosen_major() -> Result<Option<u32>, String> {
-    let Some(value) = std::env::var_os("VM_TEST_PG_VERSION") else {
+    let Some(value) = std::env::var_os("VIBE_TEST_PG_VERSION") else {
         return Ok(None);
     };
     let text = value.to_string_lossy();
@@ -73,7 +73,7 @@ fn chosen_major() -> Result<Option<u32>, String> {
         .filter(|major| MAJORS.contains(major))
         .map(Some)
         .ok_or_else(|| {
-            format!("VM_TEST_PG_VERSION is {text:?}: it must be one of {MAJORS:?}, or unset for {DEFAULT_MAJOR}")
+            format!("VIBE_TEST_PG_VERSION is {text:?}: it must be one of {MAJORS:?}, or unset for {DEFAULT_MAJOR}")
         })
 }
 
@@ -202,7 +202,7 @@ pub const SUPERUSER: &str = "vm_test";
 /// Where the binaries came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Origin {
-    /// The directory `VM_TEST_PG_BIN` names.
+    /// The directory `VIBE_TEST_PG_BIN` names.
     Variable,
     /// A Postgres installed on the machine.
     OnTheMachine,
@@ -252,7 +252,7 @@ pub fn binaries() -> &'static Binaries {
 
 fn find_binaries() -> Result<Binaries, String> {
     let chosen = chosen_major()?;
-    if let Some(dir) = std::env::var_os("VM_TEST_PG_BIN") {
+    if let Some(dir) = std::env::var_os("VIBE_TEST_PG_BIN") {
         let bin = PathBuf::from(dir);
         return if has_all_three(&bin) {
             Ok(Binaries {
@@ -261,7 +261,7 @@ fn find_binaries() -> Result<Binaries, String> {
             })
         } else {
             Err(format!(
-                "VM_TEST_PG_BIN names {}, which does not hold postgres, initdb and pg_ctl",
+                "VIBE_TEST_PG_BIN names {}, which does not hold postgres, initdb and pg_ctl",
                 bin.display()
             ))
         };
@@ -280,7 +280,7 @@ fn find_binaries() -> Result<Binaries, String> {
 }
 
 /// A directory on the machine with all three binaries: of exactly the
-/// version `VM_TEST_PG_VERSION` chose, or, when it is unset, of a Postgres
+/// version `VIBE_TEST_PG_VERSION` chose, or, when it is unset, of a Postgres
 /// at least [`DEFAULT_MAJOR`]. On `PATH`, or where packages and installers
 /// put them.
 fn on_the_machine(chosen: Option<u32>) -> Option<PathBuf> {
@@ -334,7 +334,7 @@ pub fn cache_dir() -> Result<PathBuf, String> {
     } else if let Some(local) = std::env::var_os("LOCALAPPDATA").filter(|v| !v.is_empty()) {
         PathBuf::from(local)
     } else {
-        return Err("no per-user cache directory: set HOME, or set VM_TEST_PG_BIN".to_owned());
+        return Err("no per-user cache directory: set HOME, or set VIBE_TEST_PG_BIN".to_owned());
     };
     Ok(base.join("vm-blackbox"))
 }
@@ -351,7 +351,7 @@ fn downloaded(major: u32) -> Result<PathBuf, String> {
         .map(|(_, version, _, _, platform, sha256)| (*version, *platform, *sha256))
         .ok_or_else(|| {
             format!(
-                "no prebuilt Postgres {major} is known for {} {}: install Postgres {major} or set VM_TEST_PG_BIN",
+                "no prebuilt Postgres {major} is known for {} {}: install Postgres {major} or set VIBE_TEST_PG_BIN",
                 std::env::consts::OS,
                 std::env::consts::ARCH
             )
@@ -696,7 +696,7 @@ impl fmt::Debug for PrivatePostgres {
 /// Where an instance's files go: memory (`/dev/shm`) when the machine has
 /// it, else the temporary directory. On a disk, the instance's writes wait
 /// behind whatever else is being written out, and right after a large build
-/// that made the first connections to it take seconds: `vm serve` then gave
+/// that made the first connections to it take seconds: `vibe serve` then gave
 /// up at start ("opening a connection took longer than 5000 ms").
 fn scratch_dir() -> PathBuf {
     let memory = Path::new("/dev/shm");
@@ -1059,7 +1059,7 @@ pub fn for_shared_databases() -> &'static PrivatePostgres {
 }
 
 /// A platform database on the shared Postgres: the name a program is given
-/// in `VM_DATABASE_URL`. A fresh one does not exist until the program
+/// in `VIBE_DATABASE_URL`. A fresh one does not exist until the program
 /// creates it.
 #[derive(Clone)]
 pub struct Platform {
@@ -1094,7 +1094,7 @@ impl Platform {
 
     /// A fresh name on the shared Postgres, for a role of its own that is
     /// not a superuser and may only create databases and roles (`LOGIN
-    /// CREATEDB CREATEROLE`): what CONTRACT.md says `VM_DATABASE_URL`'s role
+    /// CREATEDB CREATEROLE`): what CONTRACT.md says `VIBE_DATABASE_URL`'s role
     /// needs ("The Application's own database: What it looks like in
     /// Postgres"). The platform database does not exist until the program
     /// creates it.
@@ -1119,13 +1119,13 @@ impl Platform {
         &self.name
     }
 
-    /// The role `VM_DATABASE_URL` names: the superuser, or the limited role
+    /// The role `VIBE_DATABASE_URL` names: the superuser, or the limited role
     /// of [`Platform::fresh_with_limited_role`].
     pub fn role(&self) -> &str {
         &self.role
     }
 
-    /// The value for `VM_DATABASE_URL`. It holds the password: never print it.
+    /// The value for `VIBE_DATABASE_URL`. It holds the password: never print it.
     pub fn url(&self) -> &str {
         &self.url
     }

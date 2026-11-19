@@ -5,7 +5,7 @@
 //! loop starts and serves).
 //!
 //! The project is pulled while the installation runs; then the tool signs
-//! out, the installation is stopped, and `VM_LOCAL_POSTGRES_MIRROR` names an
+//! out, the installation is stopped, and `VIBE_LOCAL_POSTGRES_MIRROR` names an
 //! address where nothing listens. The last test goes further: every command
 //! runs in a network namespace of its own that has the loopback interface
 //! and nothing else (`unshare`, as the user, no administrator rights), so
@@ -57,7 +57,7 @@ fn cut_off(board: Board) -> (Local, TempProject) {
     (local.with_mirror(&refusing_mirror()), project)
 }
 
-/// `vm dev` serves the browser and the tool's own commands, then stops.
+/// `vibe dev` serves the browser and the tool's own commands, then stops.
 fn assert_dev_serves(local: &Local, project: &TempProject) {
     let dev = Dev::start(local, &project.dir, APP);
     let mut browser = dev.browser();
@@ -120,7 +120,7 @@ fn signed_out_with_the_installation_stopped_and_the_mirror_refusing_the_local_lo
     assert_eq!(
         holds_postgres_programs(&local.postgres_folder()),
         Vec::<std::path::PathBuf>::new(),
-        "expected nothing downloaded: VM_LOCAL_POSTGRES_BIN names a Postgres"
+        "expected nothing downloaded: VIBE_LOCAL_POSTGRES_BIN names a Postgres"
     );
 }
 
@@ -283,7 +283,7 @@ fn with_no_network_but_the_loopback_the_local_commands_and_vm_dev_work() {
     let browser = read(&out, "browser.http");
     assert!(
         browser.starts_with("HTTP/1.1 200"),
-        "expected `vm dev` to serve the browser with no network but the loopback, got\n{browser}\n`vm dev` printed:\n{}\n{}",
+        "expected `vibe dev` to serve the browser with no network but the loopback, got\n{browser}\n`vibe dev` printed:\n{}\n{}",
         read(&out, "dev.out"),
         read(&out, "dev.err")
     );
@@ -294,7 +294,7 @@ fn with_no_network_but_the_loopback_the_local_commands_and_vm_dev_work() {
     assert_eq!(
         read(&out, "dev.code").trim(),
         "0",
-        "expected `vm dev` to end with 0 on SIGTERM\n{}\n{}",
+        "expected `vibe dev` to end with 0 on SIGTERM\n{}\n{}",
         read(&out, "dev.out"),
         read(&out, "dev.err")
     );

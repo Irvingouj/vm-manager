@@ -98,13 +98,13 @@ fn args(owned: &[String], json: bool) -> Vec<&str> {
     args
 }
 
-/// Fails unless `message` gives the whole `vm sign-in` command with this
+/// Fails unless `message` gives the whole `vibe sign-in` command with this
 /// installation.
 fn assert_says_sign_in_again_to(message: &str, vm_address: &str) {
-    for part in ["vm sign-in", "--domain", DOMAIN, "--connect", vm_address] {
+    for part in ["vibe sign-in", "--domain", DOMAIN, "--connect", vm_address] {
         assert!(
             message.contains(part),
-            "expected the message to give the whole `vm sign-in` command with the installation it was signed in to ({part:?} missing), got {message:?}"
+            "expected the message to give the whole `vibe sign-in` command with the installation it was signed in to ({part:?} missing), got {message:?}"
         );
     }
 }
@@ -202,7 +202,7 @@ fn whoami_asks_the_installation() {
     }
     assert!(
         count() > before,
-        "expected `vm whoami` to ask the installation: no new `request` record of alice's"
+        "expected `vibe whoami` to ask the installation: no new `request` record of alice's"
     );
 }
 
@@ -323,11 +323,11 @@ fn a_missing_credential_says_to_sign_in() {
             .run(&[command, "--json"])
             .json_error(4, "not-signed-in");
         assert!(
-            message.contains("vm sign-in"),
-            "expected the message to say to run `vm sign-in`, got {message:?}"
+            message.contains("vibe sign-in"),
+            "expected the message to say to run `vibe sign-in`, got {message:?}"
         );
         let words = machine.run(&[command]).text_error(4);
-        assert!(words.contains("vm sign-in"), "{words:?}");
+        assert!(words.contains("vibe sign-in"), "{words:?}");
     }
 }
 

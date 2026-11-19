@@ -4,8 +4,8 @@
 //! send a request as a test User": a schema change followed by a generated
 //! migration is applied on the next run).
 //!
-//! A project made by `vm new` declaring no Resource, whose own database has
-//! `notes` (its first migration made by `vm generate`), and whose handler
+//! A project made by `vibe new` declaring no Resource, whose own database has
+//! `notes` (its first migration made by `vibe generate`), and whose handler
 //! writes and reads notes as the User (`/notes`).
 #![allow(
     clippy::unwrap_used,
@@ -30,7 +30,7 @@ use serde_json::json;
 
 const NAME: &str = "notes-board";
 
-/// `vm generate --name <name>` on the project, which must generate one
+/// `vibe generate --name <name>` on the project, which must generate one
 /// migration; its name.
 fn generated(local: &Local, dir: &Path, extra: &[&str]) -> String {
     Generated::made(&generate(&local.machine, dir, extra), dir).name
@@ -153,7 +153,7 @@ fn a_migration_that_destroys_data_is_applied_with_no_question() {
     );
 }
 
-/// Writes `sql` into a new empty migration `<number>_<name>` made by `vm
+/// Writes `sql` into a new empty migration `<number>_<name>` made by `vibe
 /// generate --empty`; its name.
 fn hand_written(local: &Local, dir: &Path, name: &str, sql: &str) -> String {
     let made = generated(local, dir, &["--empty", "--name", name]);
@@ -289,10 +289,10 @@ fn migrations_that_no_longer_begin_with_what_the_local_database_has_are_diverged
         "expected the message to name the migration, got {message:?}"
     );
     assert!(
-        message.contains(".vm/local"),
-        "expected the message to say that removing .vm/local/ starts the local databases anew, got {message:?}"
+        message.contains(".vibe/local"),
+        "expected the message to say that removing .vibe/local/ starts the local databases anew, got {message:?}"
     );
-    fs::remove_dir_all(project.dir.join(".vm/local")).unwrap();
+    fs::remove_dir_all(project.dir.join(".vibe/local")).unwrap();
     let anew = local.request_ok(&project.dir, "/notes", OUTSIDER, &[]);
     assert_eq!(anew.migrations_applied(), [again], "{}", anew.describe());
     assert_eq!(

@@ -49,7 +49,7 @@ use blackbox::{DOMAIN, Response, Vm, VmOptions, assert_api_error};
 use serde_json::{Value, json};
 use url::Url;
 
-/// How long a test waits for a run of `vm sign-in` to end once it should.
+/// How long a test waits for a run of `vibe sign-in` to end once it should.
 const END_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn installation() -> Installation {
@@ -95,7 +95,7 @@ fn shown_address_and_code(
         }
         assert!(
             Instant::now() < deadline,
-            "expected `vm sign-in` to write an address of {}/tool and a check code (XXXX-XXXX) on standard error within {timeout:?}; it wrote:\n{}",
+            "expected `vibe sign-in` to write an address of {}/tool and a check code (XXXX-XXXX) on standard error within {timeout:?}; it wrote:\n{}",
             at.auth_origin(),
             masked(&stderr, &[])
         );
@@ -107,7 +107,7 @@ fn shown_address_and_code(
 fn opened(opener: &BrowserCommand, running: &Running) -> Url {
     let opened = opener.wait_opened(OPEN_TIMEOUT).unwrap_or_else(|| {
         panic!(
-            "expected `vm sign-in` to open the browser with BROWSER within {OPEN_TIMEOUT:?}; it wrote:\n{}",
+            "expected `vibe sign-in` to open the browser with BROWSER within {OPEN_TIMEOUT:?}; it wrote:\n{}",
             masked(&running.stderr_so_far(), &[])
         )
     });
@@ -471,7 +471,7 @@ fn the_tool_waits_at_most_its_timeout_then_says_sign_in_not_finished_and_keeps_n
         "expected the message to give the address again ({address}), got {message:?}"
     );
     assert!(
-        message.contains("vm sign-in"),
+        message.contains("vibe sign-in"),
         "expected the message to say to run the command again, got {message:?}"
     );
     assert_nothing_kept(&machine, "after sign-in-not-finished");
@@ -512,8 +512,8 @@ fn an_installation_without_oidc_refuses_the_sign_in_saying_how_to_connect_it() {
     let run = machine.run_with_env(&refs, &[(name, value.as_str())]);
     let message = run.json_error(3, "sign-in-refused");
     assert!(
-        message.contains("vm admin connect-oidc"),
-        "expected the message to say a Platform administrator connects OIDC with `vm admin connect-oidc`, got {message:?}"
+        message.contains("vibe admin connect-oidc"),
+        "expected the message to say a Platform administrator connects OIDC with `vibe admin connect-oidc`, got {message:?}"
     );
     assert!(opener.opened().is_empty(), "no browser opened");
     assert_nothing_kept(&machine, "after sign-in-refused");
@@ -1449,8 +1449,8 @@ fn the_instruction_file_says_to_run_vm_sign_in_and_what_sign_in_not_finished_mea
     new_project(&machine, "instructed", &dir);
     let text = std::fs::read_to_string(dir.join("AGENTS.md")).unwrap();
     assert!(
-        text.contains("vm sign-in"),
-        "expected AGENTS.md to name `vm sign-in`\n{text}"
+        text.contains("vibe sign-in"),
+        "expected AGENTS.md to name `vibe sign-in`\n{text}"
     );
     assert!(
         text.contains("sign-in-not-finished"),
@@ -1459,7 +1459,7 @@ fn the_instruction_file_says_to_run_vm_sign_in_and_what_sign_in_not_finished_mea
     let lower = text.to_ascii_lowercase();
     assert!(
         lower.contains("browser"),
-        "expected AGENTS.md to say `vm sign-in` opens the Builder's browser\n{text}"
+        "expected AGENTS.md to say `vibe sign-in` opens the Builder's browser\n{text}"
     );
 }
 

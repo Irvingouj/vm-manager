@@ -1,4 +1,4 @@
-//! What `vm check` finds (CONTRACT.md, "A project: the template, creating
+//! What `vibe check` finds (CONTRACT.md, "A project: the template, creating
 //! one and checking one: Checking a project"; ticket "The project
 //! template, and creating and checking a project": the check fails, each
 //! with a message naming the fix, for a Manifest that is not a plain
@@ -81,7 +81,7 @@ const NOT_LITERAL: &str = r#"import { defineManifest } from "@vm/sdk";
 const n = "checked";
 export default defineManifest({
   name: n,
-  description: "A project for the tests of vm check.",
+  description: "A project for the tests of vibe check.",
   resources: {},
 });
 "#;
@@ -91,7 +91,7 @@ export default defineManifest({
 const WRONG_SHAPE: &str = r#"import { defineManifest } from "@vm/sdk";
 export default defineManifest({
   name: "checked",
-  description: "A project for the tests of vm check.",
+  description: "A project for the tests of vibe check.",
   resources: { devops: { kind: "postgres", access: "structure" } },
 });
 "#;
@@ -272,8 +272,8 @@ fn a_declared_resource_that_is_not_pulled_fails_and_gives_the_command() {
         let problem = report.problem("resources", "resource-not-pulled");
         let message = problem["message"].as_str().unwrap();
         assert!(
-            message.contains("vm pull devops"),
-            "{case}: expected the message to give the command `vm pull devops`, got {message:?}"
+            message.contains("vibe pull devops"),
+            "{case}: expected the message to give the command `vibe pull devops`, got {message:?}"
         );
     }
 }
@@ -292,10 +292,10 @@ fn a_resource_file_the_tool_did_not_write_is_named_and_to_be_moved_away() {
         let problem = report.problem("resources", "resource-not-pulled");
         let message = problem["message"].as_str().unwrap();
         assert!(
-            message.contains("vm pull devops")
+            message.contains("vibe pull devops")
                 && message.contains(&format!("resources/devops/{file}"))
                 && message.to_lowercase().contains("move"),
-            "expected the message to name resources/devops/{file}, say it is to be moved away first, and give `vm pull devops`, got {message:?}"
+            "expected the message to name resources/devops/{file}, say it is to be moved away first, and give `vibe pull devops`, got {message:?}"
         );
     }
 }
@@ -326,8 +326,8 @@ fn a_schema_changed_without_a_migration_fails_and_says_how_to_generate_one() {
     let problem = report.problem("migrations", "migrations-behind");
     let message = problem["message"].as_str().unwrap();
     assert!(
-        message.contains("src/db/schema.ts") && message.contains("vm generate"),
-        "expected the message to say src/db/schema.ts changed since the last migration and to generate one with the command `vm generate`, got {message:?}"
+        message.contains("src/db/schema.ts") && message.contains("vibe generate"),
+        "expected the message to say src/db/schema.ts changed since the last migration and to generate one with the command `vibe generate`, got {message:?}"
     );
 }
 
@@ -563,7 +563,7 @@ fn a_pulled_resource_the_manifest_does_not_declare_is_a_note() {
     let (_vm, machine) = signed_in();
     let project = checked_project("check-undeclared");
     pulled_by_hand(&project, "inventory");
-    // A folder whose schema.ts was not written by `vm pull` is no pulled
+    // A folder whose schema.ts was not written by `vibe pull` is no pulled
     // Resource.
     project.write("resources/mine/schema.ts", "export const mine = 1;\n");
     let report = Report::passed(&check(&machine, &project.dir));

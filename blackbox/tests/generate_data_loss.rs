@@ -7,7 +7,7 @@
 //!
 //! Each test starts from a project whose first migration `drizzle-kit`
 //! made by hand, changes `src/db/schema.ts` in the one way it is about, and
-//! runs `vm generate` on a machine that is not signed in.
+//! runs `vibe generate` on a machine that is not signed in.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -30,7 +30,7 @@ use blackbox::sdk::TempProject;
 use blackbox::tool::Machine;
 use serde_json::Value;
 
-/// Runs `vm generate` on `project` (its schema already changed) with
+/// Runs `vibe generate` on `project` (its schema already changed) with
 /// `--json` and in words; fails unless both stop for data that would be
 /// lost and nothing is written. Returns what `--json` printed and the words.
 fn stopped(machine: &Machine, project: &TempProject) -> (DataLoss, String) {

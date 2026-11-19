@@ -5,7 +5,7 @@
 //! the Application's response; the output names who can see the
 //! Application, its Contributors, by name; the Version records the commit).
 //!
-//! A project made by `vm new` under the repository's `target/` (so that its
+//! A project made by `vibe new` under the repository's `target/` (so that its
 //! packages resolve from the root's `node_modules`, as if installed), in a
 //! repository of its own, committed, deployed by a machine signed in as
 //! dana.
@@ -201,10 +201,10 @@ fn in_words_it_says_where_it_is_live_and_that_only_its_contributors_see_it() {
         "expected the words to say it is visible to its Contributors only\n{text}"
     );
     // From the ticket on Contributors and sharing on: Contributors only, and
-    // that `vm share` shares it.
+    // that `vibe share` shares it.
     assert!(
-        flat.contains("vm share"),
-        "expected the words to say that `vm share` shares it\n{text}"
+        flat.contains("vibe share"),
+        "expected the words to say that `vibe share` shares it\n{text}"
     );
     assert!(
         !lower.contains("team"),
@@ -231,14 +231,14 @@ fn vm_help_lists_deploy_and_its_own_help_names_its_options() {
     let commands = help_commands(&help.stdout);
     assert!(
         commands.iter().any(|c| c == "deploy"),
-        "expected `vm --help` to list `deploy`, got {commands:?}"
+        "expected `vibe --help` to list `deploy`, got {commands:?}"
     );
     let own = machine.run(&["deploy", "--help"]);
     own.expect_code(0);
     for option in ["--project", "--allow-data-loss", "--timeout", "--json"] {
         assert!(
             own.stdout.contains(option),
-            "expected `vm deploy --help` to name {option}\n{}",
+            "expected `vibe deploy --help` to name {option}\n{}",
             own.describe()
         );
     }
@@ -257,13 +257,13 @@ fn agents_md_names_vm_deploy_and_how_a_deploy_goes() {
     let commands = vm_commands_in(&text);
     assert!(
         commands.iter().any(|c| c == "deploy"),
-        "expected AGENTS.md to name `vm deploy` in code, got {commands:?}\n{text}"
+        "expected AGENTS.md to name `vibe deploy` in code, got {commands:?}\n{text}"
     );
     let listed = help_commands(&machine.run(&["--help"]).stdout);
     for command in &commands {
         assert!(
             listed.contains(command),
-            "expected every `vm <command>` of AGENTS.md to be one `vm --help` lists; {command:?} is not ({listed:?})"
+            "expected every `vibe <command>` of AGENTS.md to be one `vibe --help` lists; {command:?} is not ({listed:?})"
         );
     }
     let flat = squashed(&text).to_lowercase();
@@ -309,7 +309,7 @@ fn agents_md_names_vm_deploy_and_how_a_deploy_goes() {
         code_in(&text).iter().any(|c| c
             .split_whitespace()
             .collect::<Vec<_>>()
-            .starts_with(&["vm", "deploy"])),
-        "expected `vm deploy` in a code span"
+            .starts_with(&["vibe", "deploy"])),
+        "expected `vibe deploy` in a code span"
     );
 }

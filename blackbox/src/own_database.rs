@@ -206,9 +206,9 @@ pub fn literal(text: &str) -> String {
     format!("'{}'", text.replace('\'', "''"))
 }
 
-/// The comment CONTRACT.md gives an own database: `vm application <name>`.
+/// The comment CONTRACT.md gives an own database: `vibe application <name>`.
 pub fn comment_of(application: &str) -> String {
-    format!("vm application {application}")
+    format!("vibe application {application}")
 }
 
 /// Every database on the shared Postgres named `<p>_app_<digits>` for this
@@ -249,13 +249,19 @@ pub struct OwnDatabase {
 
 impl OwnDatabase {
     /// The own database of `application` of the program on `platform`, if
-    /// there is one: the database `<p>_app_<n>` whose comment is `vm
+    /// there is one: the database `<p>_app_<n>` whose comment is `vibe
     /// application <name>`. Fails if there are several.
     pub fn find(platform: &Platform, application: &str) -> Option<Self> {
         let comment = comment_of(application);
+        // The program at `history_earlier::EARLIER_COMMIT` was still called
+        // `vm` and commented its own databases `vm application <name>`; such
+        // a database is found by that comment too, but only in a run that
+        // has that earlier program at hand (`with_both_programs`).
+        let earlier = crate::history_earlier::in_run_with_earlier_program()
+            .then(|| crate::history_earlier::earlier_comment_of(application));
         let found: Vec<String> = own_databases_of(platform)
             .into_iter()
-            .filter(|(_, c)| *c == comment)
+            .filter(|(_, c)| *c == comment || earlier.as_ref() == Some(c))
             .map(|(name, _)| name)
             .collect();
         match found.as_slice() {

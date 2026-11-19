@@ -1,10 +1,10 @@
-//! `vm local operation-log` and `vm local change-history` (CONTRACT.md,
+//! `vibe local operation-log` and `vibe local change-history` (CONTRACT.md,
 //! "The local loop: one request as a test User: Reading what was recorded
 //! locally"; ticket "Local loop: run the Application on the Builder's
 //! machine and send a request as a test User": the local Operation log and
 //! Change history can be read with the tool).
 //!
-//! A project made by `vm new` declaring `devops` (pulled), whose own
+//! A project made by `vibe new` declaring `devops` (pulled), whose own
 //! database has `notes`, and whose handler reads `devops` and writes notes.
 #![allow(
     clippy::unwrap_used,
@@ -80,7 +80,7 @@ fn a_project_that_never_ran_has_empty_records_and_nothing_is_made_or_downloaded(
         Vec::<Value>::new()
     );
     assert!(
-        !project.dir.join(".vm/local").exists(),
+        !project.dir.join(".vibe/local").exists(),
         "expected nothing made in the project"
     );
     assert!(

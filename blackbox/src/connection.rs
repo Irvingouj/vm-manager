@@ -1,7 +1,7 @@
 //! Connecting OIDC as an administrator would (CONTRACT.md, "The tool signs
 //! in through the browser, and OIDC is connected from the tool"): the
-//! installation's key (`VM_SECRET_KEY`), the setup credential `vm setup`
-//! prints, and the connection made with `vm admin connect-oidc` or `PUT
+//! installation's key (`VIBE_SECRET_KEY`), the setup credential `vibe setup`
+//! prints, and the connection made with `vibe admin connect-oidc` or `PUT
 //! /v1/oidc`.
 //!
 //! The key, the setup credential and the client secret are types that never
@@ -50,7 +50,7 @@ impl SecretKey {
         Self(value.to_owned())
     }
 
-    /// The value, for `VM_SECRET_KEY` and for looking for it where it must
+    /// The value, for `VIBE_SECRET_KEY` and for looking for it where it must
     /// not be. Never print it.
     pub fn expose(&self) -> &str {
         &self.0
@@ -63,7 +63,7 @@ impl fmt::Debug for SecretKey {
     }
 }
 
-/// A setup credential `vm setup` printed. Never printed again.
+/// A setup credential `vibe setup` printed. Never printed again.
 #[derive(Clone)]
 pub struct SetupCredential(String);
 
@@ -73,7 +73,7 @@ impl SetupCredential {
         Self(value.to_owned())
     }
 
-    /// The value, for `VM_SETUP_CREDENTIAL` and `Authorization`. Never
+    /// The value, for `VIBE_SETUP_CREDENTIAL` and `Authorization`. Never
     /// print it.
     pub fn expose(&self) -> &str {
         &self.0
@@ -130,7 +130,7 @@ pub fn shown(response: &Response, secrets: &[&str]) -> String {
     masked(&response.describe(), secrets)
 }
 
-/// Runs `vm setup <args>` with `VM_DATABASE_URL` naming this platform
+/// Runs `vibe setup <args>` with `VIBE_DATABASE_URL` naming this platform
 /// database (or unset), to its exit.
 pub fn run_setup(database_url: Option<&str>, args: &[&str]) -> Finished {
     let mut all = vec!["setup"];
@@ -138,7 +138,7 @@ pub fn run_setup(database_url: Option<&str>, args: &[&str]) -> Finished {
     run_vm_to_exit(all, database_url)
 }
 
-/// `vm setup --json` against this platform database, which must end with
+/// `vibe setup --json` against this platform database, which must end with
 /// `0`; returns the setup credential it printed.
 pub fn setup_credential(platform: &Platform) -> SetupCredential {
     let finished = run_setup(Some(platform.url()), &["--json"]);
@@ -152,25 +152,25 @@ pub fn setup_credential(platform: &Platform) -> SetupCredential {
     };
     assert!(
         finished.status.is_some_and(|s| s.success()),
-        "expected `vm setup --json` to end with 0\n{}",
+        "expected `vibe setup --json` to end with 0\n{}",
         shown()
     );
     let printed: Value = serde_json::from_str(&finished.stdout).unwrap_or_else(|e| {
         panic!(
-            "expected `vm setup --json` to print one JSON object ({e})\n{}",
+            "expected `vibe setup --json` to print one JSON object ({e})\n{}",
             shown()
         )
     });
     let credential = printed["setup_credential"].as_str().unwrap_or_else(|| {
         panic!(
-            "expected `setup_credential` in what `vm setup --json` printed\n{}",
+            "expected `setup_credential` in what `vibe setup --json` printed\n{}",
             shown()
         )
     });
     SetupCredential::of(credential)
 }
 
-/// A connection to make: what `vm admin connect-oidc` and `PUT /v1/oidc`
+/// A connection to make: what `vibe admin connect-oidc` and `PUT /v1/oidc`
 /// take.
 #[derive(Clone, Debug)]
 pub struct Connection {
@@ -238,7 +238,7 @@ impl Connection {
         &self.client_secret
     }
 
-    /// The options of `vm admin connect-oidc` that say the connection
+    /// The options of `vibe admin connect-oidc` that say the connection
     /// (`--issuer`, `--client-id`, `--administrators-group`, and
     /// `--groups-claim` and `--scopes` when given).
     pub fn tool_args(&self) -> Vec<String> {
@@ -279,7 +279,7 @@ impl Connection {
     }
 }
 
-/// The arguments of `vm admin connect-oidc` with the setup credential, to
+/// The arguments of `vibe admin connect-oidc` with the setup credential, to
 /// the program at `address`: `--domain`, `--connect`, the connection's
 /// options, and `--json` when asked.
 pub fn connect_args(address: SocketAddr, connection: &Connection, json: bool) -> Vec<String> {
@@ -298,9 +298,9 @@ pub fn connect_args(address: SocketAddr, connection: &Connection, json: bool) ->
     args
 }
 
-/// Runs `vm admin connect-oidc` on `machine` with the setup credential in
-/// `VM_SETUP_CREDENTIAL` and the client secret in `VM_OIDC_CLIENT_SECRET`,
-/// to the program `vm`; `json` adds `--json`. The run is returned as it
+/// Runs `vibe admin connect-oidc` on `machine` with the setup credential in
+/// `VIBE_SETUP_CREDENTIAL` and the client secret in `VIBE_OIDC_CLIENT_SECRET`,
+/// to the program `vibe`; `json` adds `--json`. The run is returned as it
 /// is: hide it ([`hide`]) before showing it.
 pub fn connect_with_setup(
     machine: &Machine,
@@ -314,8 +314,8 @@ pub fn connect_with_setup(
     machine.run_with_env(
         &refs,
         &[
-            ("VM_SETUP_CREDENTIAL", setup.expose()),
-            ("VM_OIDC_CLIENT_SECRET", connection.secret().expose()),
+            ("VIBE_SETUP_CREDENTIAL", setup.expose()),
+            ("VIBE_OIDC_CLIENT_SECRET", connection.secret().expose()),
         ],
     )
 }

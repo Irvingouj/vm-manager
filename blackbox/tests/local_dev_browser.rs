@@ -1,4 +1,4 @@
-//! `vm dev` in a browser: which requests it serves, and choosing the test
+//! `vibe dev` in a browser: which requests it serves, and choosing the test
 //! User (CONTRACT.md, "The local loop, kept running: the browser, test rows
 //! and reset": "Which requests it serves", "Choosing the test User"; ticket
 //! "Local loop in the browser, with test rows, reset and working offline":
@@ -223,7 +223,7 @@ fn paths_under_vm_other_than_the_page_are_404_and_never_the_applications() {
     dev.stop("INT").expect_code(0);
 }
 
-/// `vm.dev.json` with four Users, each in Groups whose Grants on `devops`
+/// `vibe.dev.json` with four Users, each in Groups whose Grants on `devops`
 /// give one access, and a Grant on a Resource that is not pulled.
 fn many_users() -> Value {
     json!({

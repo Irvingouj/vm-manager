@@ -8,7 +8,7 @@
 //!
 //! Each project has an own table `notes` (`id`, `body`, `title`) made by
 //! its first migration and two rows put in by a second, hand-written one
-//! (`vm generate --empty`): so that once the first Version serves, the rows
+//! (`vibe generate --empty`): so that once the first Version serves, the rows
 //! are there.
 #![allow(
     clippy::unwrap_used,
@@ -44,7 +44,7 @@ fn vm() -> Vm {
 const SEED: &str = "INSERT INTO \"notes\" (\"body\", \"title\") VALUES ('first', 'kept title'), ('second', NULL);\n";
 
 /// Writes `sql` into a new empty migration of the project named `name`
-/// (`vm generate --empty --name <name>`); returns its tag.
+/// (`vibe generate --empty --name <name>`); returns its tag.
 fn hand_written(machine: &Machine, project: &TempProject, name: &str, sql: &str) -> String {
     let made = Generated::made(
         &generate(machine, &project.dir, &["--empty", "--name", name]),
@@ -54,7 +54,7 @@ fn hand_written(machine: &Machine, project: &TempProject, name: &str, sql: &str)
     made.name
 }
 
-/// Changes the own schema to `schema` and runs `vm generate` (with these
+/// Changes the own schema to `schema` and runs `vibe generate` (with these
 /// arguments), which must generate a migration; its tag.
 fn generated(machine: &Machine, project: &TempProject, schema: &str, extra: &[&str]) -> Generated {
     project.write("src/db/schema.ts", schema);
@@ -568,7 +568,7 @@ fn a_widening_type_change_is_not_asked_about() {
         "widening-board",
         "integer(\"amount\")",
     );
-    // `vm generate` writes a widening without --allow-data-loss.
+    // `vibe generate` writes a widening without --allow-data-loss.
     let widening = generated(
         &machine,
         &project,

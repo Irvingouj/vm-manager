@@ -6,7 +6,7 @@
 //! error, that).
 //!
 //! Each test makes the private Postgres of a first local run fail one way,
-//! from outside: `VM_LOCAL_POSTGRES_BIN` names a folder of the harness's own
+//! from outside: `VIBE_LOCAL_POSTGRES_BIN` names a folder of the harness's own
 //! programs, `initdb` the harness's real one, and `postgres` one that
 //! answers `--version` as the real one does and otherwise
 //!
@@ -109,7 +109,7 @@ impl Failing {
         password
     }
 
-    /// `vm request / --as outsider --json`, which must end `postgres-failed`;
+    /// `vibe request / --as outsider --json`, which must end `postgres-failed`;
     /// what it printed and its `error`.
     fn request_json(&self) -> (Run, Value) {
         let run = self
@@ -121,7 +121,7 @@ impl Failing {
         (run, error)
     }
 
-    /// `vm request / --as outsider`, in words, which must end with `1`;
+    /// `vibe request / --as outsider`, in words, which must end with `1`;
     /// what it printed and its message.
     fn request_words(&self) -> (Run, String) {
         let run = self
@@ -229,12 +229,12 @@ fn assert_cause(error: &Value, cause: &str) {
     }
 }
 
-/// Fails unless `message` names `.vm/local/postgres.log`, as it did
+/// Fails unless `message` names `.vibe/local/postgres.log`, as it did
 /// before.
 fn assert_names_log(message: &str, context: &str) {
     assert!(
-        message.contains(".vm/local/postgres.log"),
-        "{context}: expected the message to keep naming .vm/local/postgres.log, got {message:?}"
+        message.contains(".vibe/local/postgres.log"),
+        "{context}: expected the message to keep naming .vibe/local/postgres.log, got {message:?}"
     );
 }
 
@@ -396,6 +396,6 @@ fn vm_dev_that_fails_before_it_listens_says_the_same() {
     assert_step_shape(&error);
     assert_cause(&error, "server");
     assert_eq!(error["sqlstate"].as_str(), Some("25006"));
-    failing.assert_nothing_left("vm dev");
+    failing.assert_nothing_left("vibe dev");
     failing.assert_no_secret(&[&run]);
 }

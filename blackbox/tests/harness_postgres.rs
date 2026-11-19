@@ -116,13 +116,13 @@ fn the_postgres_runs_the_version_asked_for() {
         shared.start_took,
     );
     if binaries.origin == Origin::Variable {
-        eprintln!("VM_TEST_PG_BIN chose the binaries: their version is the caller's choice");
+        eprintln!("VIBE_TEST_PG_BIN chose the binaries: their version is the caller's choice");
         return;
     }
     assert_eq!(
         number / 10_000,
         postgres::wanted_major(),
-        "expected the Postgres major version VM_TEST_PG_VERSION asks for (or {} when unset)",
+        "expected the Postgres major version VIBE_TEST_PG_VERSION asks for (or {} when unset)",
         postgres::DEFAULT_MAJOR
     );
 }

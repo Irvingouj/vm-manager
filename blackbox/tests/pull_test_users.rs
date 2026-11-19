@@ -1,4 +1,4 @@
-//! The Builder's own Grant copied into `vm.dev.json` by `vm pull`
+//! The Builder's own Grant copied into `vibe.dev.json` by `vibe pull`
 //! (CONTRACT.md, "The local loop: one request as a test User: What a pull
 //! writes, from this ticket on", "The test Users file"; ticket "Local loop:
 //! run the Application on the Builder's machine and send a request as a
@@ -38,7 +38,7 @@ export default defineManifest({
 "#;
 
 /// A project directory on the machine with a `manifest.ts` and no
-/// `vm.dev.json`.
+/// `vibe.dev.json`.
 fn bare_project(machine: &Machine, name: &str) -> PathBuf {
     let dir = machine.root().join(name);
     fs::create_dir_all(&dir).unwrap();
@@ -72,7 +72,7 @@ fn assert_two_spaces_a_level(text: &str) {
         let indent = line.len() - line.trim_start_matches(' ').len();
         assert!(
             !line.trim_start_matches(' ').starts_with('\t'),
-            "expected no tab in vm.dev.json\n{text}"
+            "expected no tab in vibe.dev.json\n{text}"
         );
         if let Some((before, opened)) = previous
             && opened
@@ -82,7 +82,7 @@ fn assert_two_spaces_a_level(text: &str) {
                 assert_eq!(
                     indent,
                     before + 2,
-                    "expected two spaces a level in vm.dev.json, at {line:?}\n{text}"
+                    "expected two spaces a level in vibe.dev.json, at {line:?}\n{text}"
                 );
             }
         }
@@ -100,7 +100,7 @@ fn a_pull_makes_vm_dev_json_when_it_is_not_there_with_outsider_and_the_builders_
     let printed = pull(&machine, &dir).ok_json();
     assert_eq!(
         printed["test_users"],
-        json!({ "file": "vm.dev.json", "changed": true, "grant": builder_grant("read") }),
+        json!({ "file": "vibe.dev.json", "changed": true, "grant": builder_grant("read") }),
         "expected `test_users` to say the file changed and which Grant was copied, got {printed}"
     );
     let file = dev_json(&dir);
@@ -115,7 +115,7 @@ fn a_pull_makes_vm_dev_json_when_it_is_not_there_with_outsider_and_the_builders_
         vec![builder_grant("read")],
         "expected the Builder's own Grant, and no other, got {file}"
     );
-    assert_two_spaces_a_level(&fs::read_to_string(dir.join("vm.dev.json")).unwrap());
+    assert_two_spaces_a_level(&fs::read_to_string(dir.join("vibe.dev.json")).unwrap());
 }
 
 #[test]
@@ -140,7 +140,7 @@ fn a_new_projects_file_keeps_what_it_had_and_gains_the_builder_and_the_grant() {
         "expected outsider kept, as it was and where it was, and the builder added after it, got {after}"
     );
     assert_eq!(grants_of(&after), vec![builder_grant("read")], "{after}");
-    assert_two_spaces_a_level(&fs::read_to_string(dir.join("vm.dev.json")).unwrap());
+    assert_two_spaces_a_level(&fs::read_to_string(dir.join("vibe.dev.json")).unwrap());
 }
 
 #[test]
@@ -155,13 +155,13 @@ fn pulling_again_with_the_same_access_writes_nothing_and_says_so() {
     let printed = pull(&machine, &dir).ok_json();
     assert_eq!(
         printed["test_users"],
-        json!({ "file": "vm.dev.json", "changed": false, "grant": builder_grant("read") }),
+        json!({ "file": "vibe.dev.json", "changed": false, "grant": builder_grant("read") }),
         "{printed}"
     );
     assert_eq!(
         before.differences(&Tree::of(&dir)),
         Vec::<String>::new(),
-        "expected vm.dev.json written only when something changed: bytes and modification time as they were"
+        "expected vibe.dev.json written only when something changed: bytes and modification time as they were"
     );
 }
 
@@ -177,7 +177,7 @@ fn a_changed_access_replaces_the_grant_that_group_had_on_the_resource() {
     assert_eq!(printed["your_access"], json!("structure"));
     assert_eq!(
         printed["test_users"],
-        json!({ "file": "vm.dev.json", "changed": true, "grant": builder_grant("structure") }),
+        json!({ "file": "vibe.dev.json", "changed": true, "grant": builder_grant("structure") }),
         "{printed}"
     );
     assert_eq!(
@@ -240,7 +240,7 @@ fn everything_else_in_the_file_is_kept() {
         "expected the builder's Grant on {STOCK} replaced by the one held now, got {after}"
     );
     assert_eq!(grants.len(), 3, "{after}");
-    assert_two_spaces_a_level(&fs::read_to_string(dir.join("vm.dev.json")).unwrap());
+    assert_two_spaces_a_level(&fs::read_to_string(dir.join("vibe.dev.json")).unwrap());
 }
 
 #[test]
@@ -271,11 +271,11 @@ fn a_file_that_cannot_be_read_ends_the_pull_before_anything_is_written() {
         ),
     ] {
         let dir = bare_project(&machine, &format!("broken-{}", case.replace(' ', "-")));
-        fs::write(dir.join("vm.dev.json"), &text).unwrap();
+        fs::write(dir.join("vibe.dev.json"), &text).unwrap();
         let before = Tree::of(&dir);
         let message = pull(&machine, &dir).json_error(1, "test-users-file");
         assert!(
-            message.contains("vm.dev.json"),
+            message.contains("vibe.dev.json"),
             "{case}: expected the message to name the file, got {message:?}"
         );
         if let Some(word) = named {
@@ -287,7 +287,7 @@ fn a_file_that_cannot_be_read_ends_the_pull_before_anything_is_written() {
         assert_eq!(
             before.differences(&Tree::of(&dir)),
             Vec::<String>::new(),
-            "{case}: expected nothing written: no resources/, vm.dev.json as it was"
+            "{case}: expected nothing written: no resources/, vibe.dev.json as it was"
         );
     }
 }

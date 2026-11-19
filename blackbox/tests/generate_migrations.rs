@@ -4,8 +4,8 @@
 //! platform's migrator applies; nothing is generated when the schema has
 //! not changed; the command has a JSON form).
 //!
-//! Every `vm generate` here runs on a machine that is not signed in: the
-//! command needs no sign-in. A second machine, signed in, runs `vm check`
+//! Every `vibe generate` here runs on a machine that is not signed in: the
+//! command needs no sign-in. A second machine, signed in, runs `vibe check`
 //! where a test says the check finds `migrations/` in step.
 #![allow(
     clippy::unwrap_used,
@@ -31,7 +31,7 @@ use blackbox::tool::{Machine, Run};
 use blackbox::{User, Vm, VmOptions};
 use serde_json::Value;
 
-/// A program and a machine signed in to it, for `vm check`.
+/// A program and a machine signed in to it, for `vibe check`.
 fn checker() -> (Vm, Machine) {
     let vm = Vm::start(&VmOptions::new().stand_in_sign_in());
     let machine = Machine::new();
@@ -39,7 +39,7 @@ fn checker() -> (Vm, Machine) {
     (vm, machine)
 }
 
-/// Fails unless `vm check` finds the project clean and `vm generate` then
+/// Fails unless `vibe check` finds the project clean and `vibe generate` then
 /// generates nothing and writes nothing (bytes, modification times, the
 /// set of files).
 fn assert_in_step(machine: &Machine, checking: &Machine, dir: &std::path::Path) {

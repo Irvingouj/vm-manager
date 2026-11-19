@@ -215,7 +215,7 @@ fn the_command_line_comes_first_then_the_project_then_the_sign_in() {
     let plain = not_signed.root().join("plain");
     write_checked(&plain);
     let message = deploy(&not_signed, &plain, &[]).json_error(4, "not-signed-in");
-    assert!(message.contains("vm sign-in"), "{message:?}");
+    assert!(message.contains("vibe sign-in"), "{message:?}");
 }
 
 #[test]

@@ -1,4 +1,4 @@
-//! `vm new <name> [--directory <directory>] [--json]` (CONTRACT.md, "A
+//! `vibe new <name> [--directory <directory>] [--json]` (CONTRACT.md, "A
 //! project: the template, creating one and checking one: Creating a
 //! project"; ticket "The project template, and creating and checking a
 //! project": one command creates a project from the template). What it
@@ -19,7 +19,7 @@ use blackbox::project::{Tree, help_commands, new_args, stand_ins, template_files
 use blackbox::tool::{Broken, Machine, Run, set_mode};
 use serde_json::{Value, json};
 
-/// Fails unless what `vm new --json` printed is the contract's object for
+/// Fails unless what `vibe new --json` printed is the contract's object for
 /// a project made in `dir` with this name, and the files it lists are the
 /// files there.
 fn assert_printed(printed: &Value, name: &str, dir: &Path) {
@@ -289,7 +289,7 @@ fn it_needs_no_sign_in_and_runs_no_npm_no_git_and_no_node() {
         .collect();
     assert!(
         ran.is_empty(),
-        "expected `vm new` to run nothing, it ran {ran:?}"
+        "expected `vibe new` to run nothing, it ran {ran:?}"
     );
 
     // With nothing at all on the PATH.
@@ -380,7 +380,7 @@ fn vm_help_lists_new_and_check() {
     for command in ["new", "check"] {
         assert!(
             commands.iter().any(|c| c == command),
-            "expected `vm --help` to list `{command}`, got {commands:?}\n{}",
+            "expected `vibe --help` to list `{command}`, got {commands:?}\n{}",
             help.describe()
         );
     }

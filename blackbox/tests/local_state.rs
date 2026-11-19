@@ -1,11 +1,11 @@
-//! The project's local state, `.vm/local/`, as an outsider can see it
+//! The project's local state, `.vibe/local/`, as an outsider can see it
 //! (CONTRACT.md, "The local loop: one request as a test User": "The
 //! command", the paragraph of the three more ways it ends; "What a run
 //! does", step 2; ticket "Local loop: run the Application on the Builder's
 //! machine and send a request as a test User").
 //!
 //! A new project declaring nothing; each test warms it with one run first,
-//! so that the private Postgres's data folder, `.vm/local/postgres/`, is
+//! so that the private Postgres's data folder, `.vibe/local/postgres/`, is
 //! there.
 #![allow(
     clippy::unwrap_used,
@@ -66,7 +66,7 @@ fn a_stale_postmaster_pid_is_not_believed_and_the_process_it_names_is_left_alone
     let local = Local::new();
     let project = local_project(&local.machine, "stale-board", &[]);
     warm(&local, &project.dir);
-    let data = project.dir.join(".vm/local/postgres");
+    let data = project.dir.join(".vibe/local/postgres");
     assert!(data.is_dir(), "the harness's own check: {}", data.display());
     let mut bystander = Bystander::start();
     let started = SystemTime::now()
@@ -105,23 +105,23 @@ fn a_stale_postmaster_pid_is_not_believed_and_the_process_it_names_is_left_alone
 fn vm_log_and_postgres_log_are_started_anew_by_every_run() {
     let local = Local::new();
     let project = local_project(&local.machine, "log-board", &[]);
-    let vm_log = project.dir.join(".vm/local/vm.log");
-    let postgres_log = project.dir.join(".vm/local/postgres.log");
+    let vm_log = project.dir.join(".vibe/local/vibe.log");
+    let postgres_log = project.dir.join(".vibe/local/postgres.log");
     let first = warm(&local, &project.dir);
     let after_first = fs::read_to_string(&vm_log).unwrap();
     assert!(
         after_first.contains(&first),
-        "expected the program's log of the run, with the record of its request ({first}), in .vm/local/vm.log\n{after_first}"
+        "expected the program's log of the run, with the record of its request ({first}), in .vibe/local/vibe.log\n{after_first}"
     );
     let second = warm(&local, &project.dir);
     let after_second = fs::read_to_string(&vm_log).unwrap();
     assert!(
         after_second.contains(&second),
-        "expected the second run's request ({second}) in vm.log\n{after_second}"
+        "expected the second run's request ({second}) in vibe.log\n{after_second}"
     );
     assert!(
         !after_second.contains(&first),
-        "expected vm.log started anew: the first run's request ({first}) no longer in it\n{after_second}"
+        "expected vibe.log started anew: the first run's request ({first}) no longer in it\n{after_second}"
     );
     let words = fs::read_to_string(&postgres_log).unwrap();
     assert_eq!(
@@ -135,29 +135,29 @@ fn vm_log_and_postgres_log_are_started_anew_by_every_run() {
 fn a_vm_local_that_is_not_a_folder_is_local_state() {
     let local = Local::new();
     let project = local_project(&local.machine, "plain-board", &[]);
-    fs::create_dir_all(project.dir.join(".vm")).unwrap();
-    fs::write(project.dir.join(".vm/local"), "not a folder\n").unwrap();
+    fs::create_dir_all(project.dir.join(".vibe")).unwrap();
+    fs::write(project.dir.join(".vibe/local"), "not a folder\n").unwrap();
     let message = local
         .request(&project.dir, "/", OUTSIDER, &[])
         .json_error(1, "local-state");
     assert!(
-        message.contains(".vm/local") && message.to_lowercase().contains("remov"),
-        "expected the message to say that removing .vm/local/ starts the local databases anew, got {message:?}"
+        message.contains(".vibe/local") && message.to_lowercase().contains("remov"),
+        "expected the message to say that removing .vibe/local/ starts the local databases anew, got {message:?}"
     );
     assert_nothing_left(&local, "local-state");
 }
 
 /// Fails unless `run` ended `local-state` (exit code `1`) as CONTRACT.md
-/// says of a `.vm/local/` that cannot be used ("The local loop: one request
+/// says of a `.vibe/local/` that cannot be used ("The local loop: one request
 /// as a test User", the three more ways it ends; "The local run on a busy
 /// machine": only a failure of the private Postgres is `postgres-failed`):
-/// the message names `.vm/local` and says that removing it starts the local
+/// the message names `.vibe/local` and says that removing it starts the local
 /// databases anew, and the `error` has no `step` and no `cause`.
 fn assert_local_state_not_postgres(run: &blackbox::tool::Run, context: &str) {
     let message = run.json_error(1, "local-state");
     assert!(
-        message.contains(".vm/local") && message.to_lowercase().contains("remov"),
-        "{context}: expected the message to say that removing .vm/local/ starts the local databases anew, got {message:?}"
+        message.contains(".vibe/local") && message.to_lowercase().contains("remov"),
+        "{context}: expected the message to say that removing .vibe/local/ starts the local databases anew, got {message:?}"
     );
     let error = &run.json()["error"];
     for member in ["step", "cause"] {
@@ -168,11 +168,11 @@ fn assert_local_state_not_postgres(run: &blackbox::tool::Run, context: &str) {
     }
 }
 
-/// A new project whose `.vm/local/<name>` is made by `make` before its
+/// A new project whose `.vibe/local/<name>` is made by `make` before its
 /// first run.
 fn project_with(local: &Local, name: &str, make: impl FnOnce(&Path)) -> blackbox::sdk::TempProject {
     let project = local_project(&local.machine, name, &[]);
-    let dir = project.dir.join(".vm/local");
+    let dir = project.dir.join(".vibe/local");
     fs::create_dir_all(&dir).unwrap();
     make(&dir);
     project
@@ -210,7 +210,7 @@ fn a_data_folder_without_postgres_data_that_cannot_be_made_anew_is_local_state()
         fs::create_dir_all(&kept).unwrap();
         fs::write(kept.join("file"), "cannot be removed\n").unwrap();
     });
-    let kept = project.dir.join(".vm/local/postgres/kept");
+    let kept = project.dir.join(".vibe/local/postgres/kept");
     if fs::metadata(&kept).unwrap().uid() == 0 {
         eprintln!(
             "this test runs as root, for whom a folder of mode 0500 does not stop a removal: the case cannot be provoked here"
@@ -247,7 +247,7 @@ fn a_data_folder_left_without_postgres_data_by_a_failed_initdb_that_cannot_be_ma
     let local = Local::new().with_bin(failing.to_str().unwrap());
     let project = local_project(&local.machine, "initdb-failed-board", &[]);
     // A first run whose initdb fails: what a next run needs is left in
-    // .vm/local/, and no Postgres data.
+    // .vibe/local/, and no Postgres data.
     let first = local.request(&project.dir, "/", OUTSIDER, &[]);
     first.json_error(1, "postgres-failed");
     let error = &first.json()["error"];
@@ -263,7 +263,7 @@ fn a_data_folder_left_without_postgres_data_by_a_failed_initdb_that_cannot_be_ma
         "{}",
         first.describe()
     );
-    let local_dir = project.dir.join(".vm/local");
+    let local_dir = project.dir.join(".vibe/local");
     let data = local_dir.join("postgres");
     if !data.exists() {
         fs::create_dir(&data).unwrap();
@@ -289,7 +289,7 @@ fn a_data_folder_left_without_postgres_data_by_a_failed_initdb_that_cannot_be_ma
         "/",
         OUTSIDER,
         &[],
-        &[("VM_LOCAL_POSTGRES_BIN", real.as_str())],
+        &[("VIBE_LOCAL_POSTGRES_BIN", real.as_str())],
     );
     // Given back before anything is asserted.
     if kept.exists() {
@@ -319,8 +319,8 @@ fn vm_dev_with_a_postgres_log_that_is_a_folder_is_local_state() {
         true,
     );
     let run = dev.wait_end(Duration::from_secs(200));
-    assert_local_state_not_postgres(&run, "vm dev, postgres.log a folder");
-    assert_nothing_left(&local, "vm dev, postgres.log a folder");
+    assert_local_state_not_postgres(&run, "vibe dev, postgres.log a folder");
+    assert_nothing_left(&local, "vibe dev, postgres.log a folder");
 }
 
 #[test]
@@ -330,7 +330,7 @@ fn a_private_postgres_that_does_not_start_is_postgres_failed_naming_its_log() {
     warm(&local, &project.dir);
     let mut conf = fs::OpenOptions::new()
         .append(true)
-        .open(project.dir.join(".vm/local/postgres/postgresql.conf"))
+        .open(project.dir.join(".vibe/local/postgres/postgresql.conf"))
         .unwrap();
     conf.write_all(b"\nthis is not a setting at all\n").unwrap();
     drop(conf);
@@ -338,10 +338,10 @@ fn a_private_postgres_that_does_not_start_is_postgres_failed_naming_its_log() {
         .request(&project.dir, "/", OUTSIDER, &[])
         .json_error(1, "postgres-failed");
     assert!(
-        message.contains(".vm/local/postgres.log"),
-        "expected the message to name .vm/local/postgres.log, got {message:?}"
+        message.contains(".vibe/local/postgres.log"),
+        "expected the message to name .vibe/local/postgres.log, got {message:?}"
     );
-    let words = fs::read_to_string(project.dir.join(".vm/local/postgres.log")).unwrap();
+    let words = fs::read_to_string(project.dir.join(".vibe/local/postgres.log")).unwrap();
     assert!(
         words.contains("postgresql.conf"),
         "expected postgres.log to hold Postgres's own complaint about its configuration\n{words}"

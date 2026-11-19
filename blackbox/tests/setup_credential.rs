@@ -1,7 +1,7 @@
 //! The setup credential (CONTRACT.md, "The tool signs in through the
 //! browser, and OIDC is connected from the tool: The setup credential"):
-//! `vm setup` prints it once, the platform database keeps only its digest,
-//! it is good for one connection and nothing else, a second `vm setup` ends
+//! `vibe setup` prints it once, the platform database keeps only its digest,
+//! it is good for one connection and nothing else, a second `vibe setup` ends
 //! the first one's, and its failures are those of a start-up.
 //!
 //! Acceptance criterion: "With the setup credential, a Platform
@@ -66,7 +66,7 @@ fn vm_setup_with_json_prints_the_setup_credential_and_when_it_expires() {
     let finished = run_setup(Some(platform.url()), &["--json"]);
     assert!(
         finished.status.is_some_and(|s| s.success()),
-        "expected `vm setup --json` to end with 0\n{}",
+        "expected `vibe setup --json` to end with 0\n{}",
         described(&finished)
     );
     assert!(
@@ -112,7 +112,7 @@ fn vm_setup_with_json_prints_the_setup_credential_and_when_it_expires() {
     assert_ne!(
         again.expose(),
         credential,
-        "two runs of `vm setup` make two credentials"
+        "two runs of `vibe setup` make two credentials"
     );
 }
 
@@ -140,7 +140,7 @@ fn without_json_the_credential_alone_is_on_standard_output_and_what_to_do_with_i
     );
     assert!(
         finished.stderr.contains("connect-oidc"),
-        "expected standard error to say to connect OIDC with `vm admin connect-oidc`\n{}",
+        "expected standard error to say to connect OIDC with `vibe admin connect-oidc`\n{}",
         described(&finished)
     );
 }
@@ -158,7 +158,7 @@ fn the_platform_database_keeps_only_the_credential_s_digest() {
 
 #[test]
 fn vm_setup_works_whether_the_program_is_running_or_not() {
-    // Never started: `vm setup` makes the platform database and its
+    // Never started: `vibe setup` makes the platform database and its
     // structure itself.
     let platform = Platform::fresh();
     let before = setup_credential(&platform);
@@ -172,7 +172,7 @@ fn vm_setup_works_whether_the_program_is_running_or_not() {
     assert_eq!(
         answer.status,
         200,
-        "the credential of a `vm setup` run before the program ever started\n{}",
+        "the credential of a `vibe setup` run before the program ever started\n{}",
         shown(&answer, &[provider.client_secret().expose()])
     );
     // Running: as every Installation of the harness connects.
@@ -186,7 +186,7 @@ fn vm_setup_works_whether_the_program_is_running_or_not() {
     assert_eq!(
         answer.status,
         200,
-        "the credential of a `vm setup` run while the program runs\n{}",
+        "the credential of a `vibe setup` run while the program runs\n{}",
         shown(&answer, &[at.provider.client_secret().expose()])
     );
 }
@@ -263,7 +263,7 @@ fn a_second_vm_setup_ends_the_first_one_s_credential() {
     assert_eq!(
         with_first.status,
         401,
-        "the first credential, after a second `vm setup`\n{}",
+        "the first credential, after a second `vibe setup`\n{}",
         shown(&with_first, &[secret.expose()])
     );
     let with_second = put_oidc(&at.vm, Some(second.expose()), &body);
@@ -283,7 +283,7 @@ fn vm_setup_is_the_way_back_in_after_a_connection() {
     assert_eq!(
         again.status,
         200,
-        "a new `vm setup` connects again over a connection\n{}",
+        "a new `vibe setup` connects again over a connection\n{}",
         shown(&again, &[at.provider.client_secret().expose()])
     );
     assert_eq!(again.json()["administrators_group"], "finance");
@@ -320,11 +320,11 @@ fn vm_setup_failures_are_those_of_a_start_up_and_never_show_a_password() {
         closed.port()
     );
     for (case, url, named) in [
-        ("no VM_DATABASE_URL", None, Some("VM_DATABASE_URL")),
+        ("no VIBE_DATABASE_URL", None, Some("VIBE_DATABASE_URL")),
         (
-            "a VM_DATABASE_URL that cannot be parsed",
+            "a VIBE_DATABASE_URL that cannot be parsed",
             Some("not a url"),
-            Some("VM_DATABASE_URL"),
+            Some("VIBE_DATABASE_URL"),
         ),
         (
             "a Postgres that cannot be reached",

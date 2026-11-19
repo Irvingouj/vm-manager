@@ -5,7 +5,7 @@
 //! files are loaded into the stand-ins and the own database, and loading is
 //! repeatable).
 //!
-//! Seen through `vm request` alone: the Application reads the stand-in of
+//! Seen through `vibe request` alone: the Application reads the stand-in of
 //! `devops` as builder (`/incidents`, `/devops-notes`, `/columns`) and its
 //! own `notes` (`/notes`); `test_rows` of the output says what each run
 //! loaded.

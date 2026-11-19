@@ -772,7 +772,7 @@ fn with_public(more: &[&str]) -> Installation {
     let provider = Provider::start(&[ada()]);
     let options = VmOptions::new()
         .args_extra(more)
-        .env("VM_SECRET_KEY", SecretKey::fresh().expose())
+        .env("VIBE_SECRET_KEY", SecretKey::fresh().expose())
         .application("honest", "honest.js");
     Installation::from(provider, &options)
 }

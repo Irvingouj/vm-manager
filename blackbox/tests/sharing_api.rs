@@ -625,8 +625,8 @@ fn an_email_nobody_signed_in_with_is_422_unknown_email_and_changes_nothing() {
             "expected the refusal to name the entry it is about, got {message:?}"
         );
         assert!(
-            message.contains("vm whoami") && message.to_ascii_lowercase().contains("sign in"),
-            "expected the message to say to use their user id, which `vm whoami` shows, or to ask them to sign in once, got {message:?}"
+            message.contains("vibe whoami") && message.to_ascii_lowercase().contains("sign in"),
+            "expected the message to say to use their user id, which `vibe whoami` shows, or to ask them to sign in once, got {message:?}"
         );
     }
     assert_eq!(

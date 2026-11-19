@@ -50,7 +50,7 @@ fn ready() -> (Scenario, Machine) {
     (scenario, machine)
 }
 
-/// `vm pull <resource> --project <dir> --json` on `machine`, which must end
+/// `vibe pull <resource> --project <dir> --json` on `machine`, which must end
 /// with `0`.
 fn pull_into(machine: &Machine, dir: &Path, resource: &str) -> Value {
     machine
@@ -136,7 +136,7 @@ fn a_standin_sql_missing_while_the_structure_is_unchanged_stays_missing_after_a_
     );
     assert!(
         !standin.exists(),
-        "expected a missing standin.sql left missing by a deploy's pull of an unchanged structure (`vm pull` writes it)"
+        "expected a missing standin.sql left missing by a deploy's pull of an unchanged structure (`vibe pull` writes it)"
     );
     assert_eq!(
         before.differences(&project_tree(&project.dir)),
@@ -229,14 +229,14 @@ fn a_structure_changed_so_the_code_still_type_checks_is_written_and_built_agains
         .batch("ALTER TABLE incidents ADD COLUMN region text");
     let new = fingerprint_now(&scenario, &dana(), "devops");
     assert_ne!(new, old, "the harness's own check");
-    // vm.dev.json says other than a pull would write (the Builder's Grant
+    // vibe.dev.json says other than a pull would write (the Builder's Grant
     // at `write`, dana holding `read`): a deploy never touches it.
     let mut test_users = blackbox::local::dev_json(&project.dir);
     test_users["grants"] = json!([{ "group": "builder", "resource": "devops", "access": "write" }]);
     blackbox::local::write_dev_json(&project.dir, &test_users);
     commit_all(&project.dir, "the Builder's Grant at write");
-    let dev_json_before = fs::read(project.dir.join("vm.dev.json")).unwrap();
-    let dev_json_written = fs::metadata(project.dir.join("vm.dev.json"))
+    let dev_json_before = fs::read(project.dir.join("vibe.dev.json")).unwrap();
+    let dev_json_written = fs::metadata(project.dir.join("vibe.dev.json"))
         .unwrap()
         .modified()
         .unwrap();
@@ -259,17 +259,17 @@ fn a_structure_changed_so_the_code_still_type_checks_is_written_and_built_agains
         "expected the stand-in rewritten with the new column"
     );
     assert_eq!(
-        fs::read(project.dir.join("vm.dev.json")).unwrap(),
+        fs::read(project.dir.join("vibe.dev.json")).unwrap(),
         dev_json_before,
-        "expected vm.dev.json byte for byte as it was: a deploy's pull never touches it"
+        "expected vibe.dev.json byte for byte as it was: a deploy's pull never touches it"
     );
     assert_eq!(
-        fs::metadata(project.dir.join("vm.dev.json"))
+        fs::metadata(project.dir.join("vibe.dev.json"))
             .unwrap()
             .modified()
             .unwrap(),
         dev_json_written,
-        "expected vm.dev.json not written again"
+        "expected vibe.dev.json not written again"
     );
     assert_eq!(
         deployed.structures,
@@ -317,8 +317,8 @@ fn a_structure_changed_so_the_code_still_type_checks_is_written_and_built_agains
         "expected the updated definition and stand-in left for the Contributor to commit\n{left}"
     );
     assert!(
-        !left.contains("vm.dev.json"),
-        "expected vm.dev.json not among the changes\n{left}"
+        !left.contains("vibe.dev.json"),
+        "expected vibe.dev.json not among the changes\n{left}"
     );
 
     // In words: the definition updated, the Version built against it, to

@@ -2,7 +2,7 @@
 //! working offline" share (CONTRACT.md, "The local loop, kept running: the
 //! browser, test rows and reset"):
 //!
-//! - [`Dev`], a `vm dev` of a [`Local`] machine started on a port the
+//! - [`Dev`], a `vibe dev` of a [`Local`] machine started on a port the
 //!   system gave as free, its `--json` lines read as they come, stopped by a
 //!   signal, and ended by its guard (a `SIGTERM`, then a kill) when a test
 //!   fails before it stops it;
@@ -27,11 +27,11 @@ use crate::http::{Request, Response};
 use crate::local::{LOCAL_TIMEOUT, Local, Postmaster, postmaster_of};
 use crate::tool::{Run, Running};
 
-/// How long the harness gives one request to `vm dev`: a request that finds
+/// How long the harness gives one request to `vibe dev`: a request that finds
 /// the project changed waits for a build.
 pub const DEV_REQUEST_TIMEOUT: Duration = Duration::from_secs(150);
 
-/// How long `vm dev` is given to end after a signal.
+/// How long `vibe dev` is given to end after a signal.
 pub const STOP_WAIT: Duration = Duration::from_secs(60);
 
 /// A port that nothing listens on at this moment, as the system gives one.
@@ -56,18 +56,18 @@ pub fn json_lines(text: &str) -> Vec<Value> {
         .filter(|l| !l.trim().is_empty())
         .map(|line| {
             let value: Value = serde_json::from_str(line).unwrap_or_else(|e| {
-                panic!("expected each line of `vm dev --json` a JSON object ({e}), got {line:?}")
+                panic!("expected each line of `vibe dev --json` a JSON object ({e}), got {line:?}")
             });
             assert!(
                 value.is_object(),
-                "expected each line of `vm dev --json` a JSON object, got {line:?}"
+                "expected each line of `vibe dev --json` a JSON object, got {line:?}"
             );
             value
         })
         .collect()
 }
 
-/// A `vm dev` that runs. See the module's text.
+/// A `vibe dev` that runs. See the module's text.
 pub struct Dev<'a> {
     pub local: &'a Local,
     pub dir: PathBuf,
@@ -77,7 +77,7 @@ pub struct Dev<'a> {
     running: Option<Running>,
 }
 
-/// The arguments of `vm dev --project <dir> --port <port> [--json]`.
+/// The arguments of `vibe dev --project <dir> --port <port> [--json]`.
 pub fn dev_args(dir: &Path, port: u16, json: bool) -> Vec<String> {
     let mut args = vec![
         "dev".to_owned(),
@@ -95,7 +95,7 @@ pub fn dev_args(dir: &Path, port: u16, json: bool) -> Vec<String> {
 }
 
 impl<'a> Dev<'a> {
-    /// Starts `vm dev --json` on a free port in the project `dir`, whose
+    /// Starts `vibe dev --json` on a free port in the project `dir`, whose
     /// Application is named `application`, and waits for its `listening`
     /// line. Fails the test, saying how it ended, unless it listens.
     pub fn start(local: &'a Local, dir: &Path, application: &str) -> Self {
@@ -115,7 +115,7 @@ impl<'a> Dev<'a> {
         dev
     }
 
-    /// Starts `vm dev` and returns at once, before it listens.
+    /// Starts `vibe dev` and returns at once, before it listens.
     pub fn spawn(local: &'a Local, dir: &Path, application: &str, port: u16, json: bool) -> Self {
         local.watch(dir);
         let args = dev_args(dir, port, json);
@@ -134,15 +134,15 @@ impl<'a> Dev<'a> {
     fn running(&self) -> &Running {
         self.running
             .as_ref()
-            .unwrap_or_else(|| panic!("the harness's own check: `vm dev` was already stopped"))
+            .unwrap_or_else(|| panic!("the harness's own check: `vibe dev` was already stopped"))
     }
 
-    /// Whether `vm dev` has ended.
+    /// Whether `vibe dev` has ended.
     pub fn has_ended(&mut self) -> bool {
         self.running.as_mut().is_none_or(Running::has_ended)
     }
 
-    /// The process id of `vm dev`.
+    /// The process id of `vibe dev`.
     pub fn pid(&self) -> u32 {
         self.running().pid()
     }
@@ -182,7 +182,7 @@ impl<'a> Dev<'a> {
             if self.has_ended() || Instant::now() >= deadline {
                 let run = self.running.take().map(|r| r.wait(Duration::from_secs(5)));
                 panic!(
-                    "expected `vm dev` to say that it listens at {}\n{}",
+                    "expected `vibe dev` to say that it listens at {}\n{}",
                     self.url(),
                     run.map_or_else(String::new, |r| r.describe())
                 );
@@ -205,7 +205,7 @@ impl<'a> Dev<'a> {
             }
             assert!(
                 Instant::now() < deadline,
-                "expected `vm dev` to print {what} within {limit:?}, it printed:\n{}",
+                "expected `vibe dev` to print {what} within {limit:?}, it printed:\n{}",
                 self.stdout()
             );
             thread::sleep(Duration::from_millis(50));
@@ -242,7 +242,7 @@ impl<'a> Dev<'a> {
     pub fn postmaster(&self) -> Postmaster {
         postmaster_of(&self.dir).unwrap_or_else(|| {
             panic!(
-                "expected the Postgres of `vm dev` to listen while it runs, under .vm/local/\n{}",
+                "expected the Postgres of `vibe dev` to listen while it runs, under .vibe/local/\n{}",
                 self.stdout()
             )
         })
@@ -253,7 +253,7 @@ impl<'a> Dev<'a> {
         let running = self
             .running
             .take()
-            .unwrap_or_else(|| panic!("the harness's own check: `vm dev` was already stopped"));
+            .unwrap_or_else(|| panic!("the harness's own check: `vibe dev` was already stopped"));
         running.signal(signal);
         running.wait(STOP_WAIT)
     }
@@ -264,7 +264,7 @@ impl<'a> Dev<'a> {
         let running = self
             .running
             .take()
-            .unwrap_or_else(|| panic!("the harness's own check: `vm dev` was already stopped"));
+            .unwrap_or_else(|| panic!("the harness's own check: `vibe dev` was already stopped"));
         running.wait(limit)
     }
 
@@ -273,7 +273,7 @@ impl<'a> Dev<'a> {
         let running = self
             .running
             .take()
-            .unwrap_or_else(|| panic!("the harness's own check: `vm dev` was already stopped"));
+            .unwrap_or_else(|| panic!("the harness's own check: `vibe dev` was already stopped"));
         running.signal("KILL");
         running.wait(Duration::from_secs(30))
     }
@@ -585,11 +585,11 @@ pub fn has_ipv6_loopback() -> bool {
     })
 }
 
-/// The files of `.vm/local/` of the project in `dir`, outside the data
-/// folder of its Postgres (when `data` names it) and but for `vm.log` and
+/// The files of `.vibe/local/` of the project in `dir`, outside the data
+/// folder of its Postgres (when `data` names it) and but for `vibe.log` and
 /// `postgres.log`, whose bytes hold `needle`.
 pub fn local_files_holding(dir: &Path, data: Option<&Path>, needle: &[u8]) -> Vec<PathBuf> {
-    let local = dir.join(".vm").join("local");
+    let local = dir.join(".vibe").join("local");
     let data = data.and_then(|d| fs::canonicalize(d).ok());
     crate::local::files_holding(&local, needle)
         .into_iter()
@@ -598,13 +598,13 @@ pub fn local_files_holding(dir: &Path, data: Option<&Path>, needle: &[u8]) -> Ve
             let inside_data = data
                 .as_ref()
                 .is_some_and(|d| fs::canonicalize(f).is_ok_and(|c| c.starts_with(d)));
-            !inside_data && name != "vm.log" && name != "postgres.log"
+            !inside_data && name != "vibe.log" && name != "postgres.log"
         })
         .collect()
 }
 
 /// The runs of exactly 64 lower-case hex digits in `bytes` (a run of more
-/// is not one): what the secret of the file that finds `vm dev` is, and
+/// is not one): what the secret of the file that finds `vibe dev` is, and
 /// what a password written the same way would be.
 pub fn hex64_runs(bytes: &[u8]) -> Vec<String> {
     bytes
@@ -614,12 +614,12 @@ pub fn hex64_runs(bytes: &[u8]) -> Vec<String> {
         .collect()
 }
 
-/// Every file of `.vm/local/` of the project in `dir` but those of its
-/// Postgres (inside `data`, and `postgres.log`) and `vm.log`.
+/// Every file of `.vibe/local/` of the project in `dir` but those of its
+/// Postgres (inside `data`, and `postgres.log`) and `vibe.log`.
 pub fn local_files_but_postgres(dir: &Path, data: &Path) -> Vec<PathBuf> {
     let data = fs::canonicalize(data).ok();
     let mut files = Vec::new();
-    crate::local::every_file(&dir.join(".vm").join("local"), &mut files);
+    crate::local::every_file(&dir.join(".vibe").join("local"), &mut files);
     files
         .into_iter()
         .filter(|f| {
@@ -627,7 +627,7 @@ pub fn local_files_but_postgres(dir: &Path, data: &Path) -> Vec<PathBuf> {
             let inside_data = data
                 .as_ref()
                 .is_some_and(|d| fs::canonicalize(f).is_ok_and(|c| c.starts_with(d)));
-            !inside_data && name != "vm.log" && name != "postgres.log"
+            !inside_data && name != "vibe.log" && name != "postgres.log"
         })
         .collect()
 }

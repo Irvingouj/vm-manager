@@ -1,5 +1,5 @@
 //! Deploying after going back (CONTRACT.md, "Versions, going back, and
-//! logs: Deploying after going back"): `vm deploy` compares the project
+//! logs: Deploying after going back"): `vibe deploy` compares the project
 //! with the Application's latest Version, not the serving one, since its
 //! migrations are the ones applied.
 //!
@@ -67,7 +67,7 @@ fn own(vm: &Vm, name: &str) -> OwnDatabase {
         .unwrap_or_else(|| panic!("expected an own database for {name:?}"))
 }
 
-/// `vm go-back <name> --json`, which must end with `0`.
+/// `vibe go-back <name> --json`, which must end with `0`.
 fn go_back(machine: &Machine, name: &str) -> Value {
     machine.run(&["go-back", name, "--json"]).ok_json()
 }

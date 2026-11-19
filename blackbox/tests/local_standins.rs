@@ -189,8 +189,8 @@ fn a_resource_pulled_before_this_ticket_has_no_standin_and_its_operations_are_no
         warnings[0]["message"]
             .as_str()
             .unwrap()
-            .contains("vm pull devops"),
-        "expected the warning to say to run `vm pull devops` again, got {}",
+            .contains("vibe pull devops"),
+        "expected the warning to say to run `vibe pull devops` again, got {}",
         warnings[0]
     );
     assert_eq!(

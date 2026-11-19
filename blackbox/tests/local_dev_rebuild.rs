@@ -1,10 +1,10 @@
-//! `vm dev` serves the project as it is now (CONTRACT.md, "The local loop,
+//! `vibe dev` serves the project as it is now (CONTRACT.md, "The local loop,
 //! kept running: the browser, test rows and reset": "The project as it is
 //! now", and "Test rows": a file that fails is answered with the local
 //! run's page until it is corrected; ticket "Local loop in the browser, with
 //! test rows, reset and working offline").
 //!
-//! A `vm dev --json` runs while the test changes the project; what it
+//! A `vibe dev --json` runs while the test changes the project; what it
 //! rebuilt is read from its `rebuilt` and `rebuild-failed` lines.
 #![allow(
     clippy::unwrap_used,
@@ -183,7 +183,7 @@ fn vm_dev_json_edited_while_it_runs_decides_the_next_request() {
     assert_eq!(
         allowed.status,
         200,
-        "expected the Grant added to vm.dev.json to decide the next request\n{}",
+        "expected the Grant added to vibe.dev.json to decide the next request\n{}",
         allowed.describe()
     );
     dev.stop("INT").expect_code(0);
@@ -264,12 +264,12 @@ fn a_project_that_does_not_build_is_answered_500_with_the_reason_and_message_unt
         plain.contains("build-failed"),
         "expected the reason\n{page}"
     );
-    // The message is the one `vm request` gives (answered by `vm dev`).
+    // The message is the one `vibe request` gives (answered by `vibe dev`).
     let run = local.request(&project.dir, "/", OUTSIDER, &["--timeout", "60"]);
     let message = run.json_error(1, "build-failed");
     assert!(
         plain.contains(&message),
-        "expected the page to give the message `vm request` gives, {message:?}\n{page}"
+        "expected the page to give the message `vibe request` gives, {message:?}\n{page}"
     );
     let line = dev.wait_for_line("a `rebuild-failed` line", Duration::from_secs(10), |l| {
         l["event"] == "rebuild-failed"
@@ -351,7 +351,7 @@ fn a_project_of_more_than_20000_entries_is_rebuilt_only_when_started_again() {
     assert_eq!(
         said.len(),
         1,
-        "expected `vm dev` to say once, when it starts, that the project has too many files\n{}",
+        "expected `vibe dev` to say once, when it starts, that the project has too many files\n{}",
         dev.stdout()
     );
     assert_eq!(sorted_keys(&said[0]), ["event", "message"], "{}", said[0]);
@@ -431,7 +431,7 @@ fn a_renamed_application_is_served_at_its_new_name_and_its_old_name_is_421() {
         dev.events("request")
             .iter()
             .any(|l| l["request_id"] == id.as_str()),
-        "expected the tool's command to go on finding `vm dev` after the rename\n{}",
+        "expected the tool's command to go on finding `vibe dev` after the rename\n{}",
         dev.stdout()
     );
     dev.stop("INT").expect_code(0);
@@ -458,7 +458,7 @@ fn a_project_grown_past_20000_entries_while_vm_dev_runs_is_said_once() {
     assert_eq!(
         said.len(),
         1,
-        "expected `vm dev` to say once, at the request that found the project grown past 20,000 entries\n{}",
+        "expected `vibe dev` to say once, at the request that found the project grown past 20,000 entries\n{}",
         dev.stdout()
     );
     assert_eq!(sorted_keys(&said[0]), ["event", "message"], "{}", said[0]);

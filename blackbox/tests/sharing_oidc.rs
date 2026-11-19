@@ -327,8 +327,8 @@ fn an_email_of_someone_who_never_signed_in_is_422_unknown_email() {
             .unwrap_or_default()
             .to_owned();
         assert!(
-            message.contains(address) && message.contains("vm whoami"),
-            "expected the message to name the entry and say that `vm whoami` shows the user id, got {message:?}"
+            message.contains(address) && message.contains("vibe whoami"),
+            "expected the message to name the entry and say that `vibe whoami` shows the user id, got {message:?}"
         );
         let answer = contributors(&at, &ada_credential, &add(&[email(address)]));
         assert_api_error(&answer, 422, "unknown-email");

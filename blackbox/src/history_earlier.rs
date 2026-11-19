@@ -16,10 +16,10 @@
 //!   clears the cache.
 //!
 //! The harness starts every program with [`crate::program::vm_binary`],
-//! which is fixed for the whole test process (`VM_BIN`, read once). So the
+//! which is fixed for the whole test process (`VIBE_BIN`, read once). So the
 //! test runs itself again ([`with_both_programs`]): the outer process gets
 //! both binaries, writes a small script that runs one or the other, and
-//! starts its own test binary again for that one test with `VM_BIN` naming
+//! starts its own test binary again for that one test with `VIBE_BIN` naming
 //! the script. The inner process chooses, before each start, which program
 //! the script runs ([`Programs::use_earlier`], [`Programs::use_current`]);
 //! everything else (the harness's Postgres, [`crate::own_database::Own`],
@@ -40,7 +40,7 @@ pub const EARLIER_COMMIT: &str = "81f7016";
 
 /// The environment variable that tells the inner run where the script
 /// reads which program to run; set only in the inner run.
-const SELECT_VAR: &str = "VM_BLACKBOX_T62_SELECT";
+const SELECT_VAR: &str = "VIBE_BLACKBOX_T62_SELECT";
 
 /// How long building the earlier program may take (a cold build compiles
 /// the execution core).
@@ -207,6 +207,20 @@ pub fn earlier_program_chosen() -> bool {
         .is_some_and(|which| which.trim() == "earlier")
 }
 
+/// Whether this process is the inner run of [`with_both_programs`]: the
+/// earlier program may have made what the harness looks at.
+pub fn in_run_with_earlier_program() -> bool {
+    std::env::var_os(SELECT_VAR).is_some()
+}
+
+/// The comment the earlier program, still called `vm`, gave an own
+/// database (CONTRACT.md as it was at [`EARLIER_COMMIT`]). The program
+/// under test gives `vibe application <name>`
+/// ([`crate::own_database::comment_of`]).
+pub fn earlier_comment_of(application: &str) -> String {
+    format!("vm application {application}")
+}
+
 /// The inner run's choice of program.
 pub struct Programs {
     select: PathBuf,
@@ -242,7 +256,7 @@ fn quoted(path: &Path) -> String {
 /// Runs `body` with both programs at hand. In the outer run (the test as
 /// cargo starts it) this gets both binaries, writes the script, runs this
 /// test (`test`, its name as libtest knows it) again in a process of its
-/// own with `VM_BIN` naming the script, and fails unless that run passed
+/// own with `VIBE_BIN` naming the script, and fails unless that run passed
 /// it. In that inner run it calls `body`, which starts the program it
 /// chose before each start; the earlier one first.
 pub fn with_both_programs(test: &str, body: impl FnOnce(&Programs)) {
@@ -259,13 +273,16 @@ pub fn with_both_programs(test: &str, body: impl FnOnce(&Programs)) {
     let dir = std::env::temp_dir().join(format!("vm-blackbox-t62-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("cannot make {}: {e}", dir.display()));
     let select = dir.join("select");
-    let script = dir.join("vm");
+    let script = dir.join("vibe");
     std::fs::write(&select, "earlier")
         .unwrap_or_else(|e| panic!("cannot write {}: {e}", select.display()));
     crate::program::write_program(
         &script,
         format!(
-            "#!/bin/sh\n# Runs the earlier program or the one under test, as {select} says.\nif [ \"$(cat {select})\" = earlier ]; then exec {earlier} \"$@\"; fi\nexec {current} \"$@\"\n",
+            // The earlier program is still called `vm` and reads
+            // `VM_DATABASE_URL` (the only variable of its contract); the
+            // harness sets `VIBE_DATABASE_URL`, so the script hands it on.
+            "#!/bin/sh\n# Runs the earlier program or the one under test, as {select} says.\nif [ \"$(cat {select})\" = earlier ]; then\n  if [ -n \"${{VIBE_DATABASE_URL+set}}\" ]; then VM_DATABASE_URL=\"$VIBE_DATABASE_URL\"; export VM_DATABASE_URL; else unset VM_DATABASE_URL; fi\n  exec {earlier} \"$@\"\nfi\nexec {current} \"$@\"\n",
             select = quoted(&select),
             earlier = quoted(&earlier),
             current = quoted(&current),
@@ -278,7 +295,7 @@ pub fn with_both_programs(test: &str, body: impl FnOnce(&Programs)) {
     let mut command = Command::new(me);
     command
         .args([test, "--exact", "--nocapture", "--test-threads=1"])
-        .env("VM_BIN", &script)
+        .env("VIBE_BIN", &script)
         .env(SELECT_VAR, &select);
     let finished = run_to_exit(command, INNER_TIMEOUT);
     drop(std::fs::remove_dir_all(&dir));

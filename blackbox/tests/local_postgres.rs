@@ -7,7 +7,7 @@
 //! own folder).
 //!
 //! Nothing here reaches the Internet: the archive is served by a mirror of
-//! the harness's own on 127.0.0.1 (`VM_LOCAL_POSTGRES_MIRROR`), holding
+//! the harness's own on 127.0.0.1 (`VIBE_LOCAL_POSTGRES_MIRROR`), holding
 //! zonky's real archive of Postgres 18.6.0, which the harness fetched once
 //! into its cache. The project is a new one, declaring nothing.
 #![allow(
@@ -40,7 +40,7 @@ fn page_ok(local: &Local, dir: &Path) {
 /// message naming both variables.
 fn assert_unavailable(run: &blackbox::tool::Run, context: &str) {
     let message = run.json_error(1, "postgres-unavailable");
-    for variable in ["VM_LOCAL_POSTGRES_MIRROR", "VM_LOCAL_POSTGRES_BIN"] {
+    for variable in ["VIBE_LOCAL_POSTGRES_MIRROR", "VIBE_LOCAL_POSTGRES_BIN"] {
         assert!(
             message.contains(variable),
             "{context}: expected the message to name {variable}, got {message:?}"
@@ -112,7 +112,7 @@ fn without_an_absolute_xdg_data_home_the_folder_is_in_home() {
             .with_data_home(data_home.clone());
         let project = local_project(&local.machine, "pg-home", &[]);
         page_ok(&local, &project.dir);
-        let folder = local.machine.home().join(".local/share/vm/postgres");
+        let folder = local.machine.home().join(".local/share/vibe/postgres");
         assert!(
             !holds_postgres_programs(&folder).is_empty(),
             "{data_home:?}: expected Postgres downloaded into {}",
@@ -121,7 +121,7 @@ fn without_an_absolute_xdg_data_home_the_folder_is_in_home() {
         assert_eq!(mode_of(&folder), 0o700, "{data_home:?}");
         assert!(
             !local.machine.cwd().join("relative").exists()
-                && !local.data_home_dir().join("vm").exists(),
+                && !local.data_home_dir().join("vibe").exists(),
             "{data_home:?}: expected nothing in a relative XDG_DATA_HOME"
         );
     }
@@ -147,7 +147,7 @@ fn a_download_that_fails_is_postgres_unavailable_and_leaves_nothing_that_looks_c
             "/",
             OUTSIDER,
             &[],
-            &[("VM_LOCAL_POSTGRES_MIRROR", url.as_str())],
+            &[("VIBE_LOCAL_POSTGRES_MIRROR", url.as_str())],
         );
         assert_unavailable(&run, case);
         assert_eq!(
@@ -172,7 +172,7 @@ fn a_download_that_fails_is_postgres_unavailable_and_leaves_nothing_that_looks_c
         "/",
         OUTSIDER,
         &[],
-        &[("VM_LOCAL_POSTGRES_MIRROR", good.base_url().as_str())],
+        &[("VIBE_LOCAL_POSTGRES_MIRROR", good.base_url().as_str())],
     );
     blackbox::local::Requested::of(&run);
     assert_eq!(good.requests(), vec![archive_path()]);
@@ -199,7 +199,7 @@ fn a_postgres_the_builder_has_is_used_and_nothing_is_downloaded() {
     page_ok(&local, &project.dir);
     assert!(
         mirror.requests().is_empty(),
-        "expected nothing downloaded with VM_LOCAL_POSTGRES_BIN, got {:?}",
+        "expected nothing downloaded with VIBE_LOCAL_POSTGRES_BIN, got {:?}",
         mirror.requests()
     );
     assert!(
@@ -239,11 +239,11 @@ esac"#;
         let run = local.request(&project.dir, "/", OUTSIDER, &[]);
         let message = run.json_error(1, "postgres-unavailable");
         assert!(
-            message.contains("VM_LOCAL_POSTGRES_BIN"),
-            "{case}: expected the message to name VM_LOCAL_POSTGRES_BIN, got {message:?}"
+            message.contains("VIBE_LOCAL_POSTGRES_BIN"),
+            "{case}: expected the message to name VIBE_LOCAL_POSTGRES_BIN, got {message:?}"
         );
         assert!(
-            !project.dir.join(".vm/local").exists() || local.processes().is_empty(),
+            !project.dir.join(".vibe/local").exists() || local.processes().is_empty(),
             "{case}"
         );
     }

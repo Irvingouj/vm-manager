@@ -1,4 +1,4 @@
-//! Getting the `vm` binary (CONTRACT.md, "How the tests get the program"),
+//! Getting the `vibe` binary (CONTRACT.md, "How the tests get the program"),
 //! and running it to its exit with a timeout.
 
 use std::ffi::OsStr;
@@ -21,26 +21,26 @@ pub const EXIT_TIMEOUT: Duration = Duration::from_secs(15);
 /// The most bytes kept from one stream of a program run to its exit.
 const MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 
-/// The `vm` binary: `VM_BIN` when set, otherwise the one `cargo build -p vm
-/// --bin vm` produces, built once per test binary (cargo makes the builds of
+/// The `vibe` binary: `VIBE_BIN` when set, otherwise the one `cargo build -p vibe
+/// --bin vibe` produces, built once per test binary (cargo makes the builds of
 /// several test binaries wait for each other, and all but the first are
 /// no-ops).
 pub fn vm_binary() -> &'static Path {
     static BINARY: OnceLock<Result<PathBuf, String>> = OnceLock::new();
     match BINARY.get_or_init(find_or_build) {
         Ok(path) => path,
-        Err(problem) => panic!("cannot get the vm program: {problem}"),
+        Err(problem) => panic!("cannot get the vibe program: {problem}"),
     }
 }
 
 fn find_or_build() -> Result<PathBuf, String> {
-    if let Some(path) = std::env::var_os("VM_BIN") {
+    if let Some(path) = std::env::var_os("VIBE_BIN") {
         let path = PathBuf::from(path);
         return if path.is_file() {
             Ok(path)
         } else {
             Err(format!(
-                "VM_BIN names {}, which is not a file",
+                "VIBE_BIN names {}, which is not a file",
                 path.display()
             ))
         };
@@ -54,15 +54,15 @@ fn find_or_build() -> Result<PathBuf, String> {
     command.current_dir(workspace).args([
         "build",
         "-p",
-        "vm",
+        "vibe",
         "--bin",
-        "vm",
+        "vibe",
         "--message-format=json-render-diagnostics",
     ]);
     let finished = run_to_exit(command, BUILD_TIMEOUT)?;
     if !finished.status.is_some_and(|s| s.success()) {
         return Err(format!(
-            "`cargo build -p vm --bin vm` failed ({}):\n{}",
+            "`cargo build -p vibe --bin vibe` failed ({}):\n{}",
             finished.status_text(),
             finished.stderr
         ));
@@ -71,9 +71,9 @@ fn find_or_build() -> Result<PathBuf, String> {
         .stdout
         .lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        .filter(|m| m["reason"] == "compiler-artifact" && m["target"]["name"] == "vm")
+        .filter(|m| m["reason"] == "compiler-artifact" && m["target"]["name"] == "vibe")
         .find_map(|m| m["executable"].as_str().map(PathBuf::from))
-        .ok_or_else(|| "cargo built no `vm` executable".to_owned())
+        .ok_or_else(|| "cargo built no `vibe` executable".to_owned())
 }
 
 /// The `blackbox` crate's directory in the checkout being tested: the value
@@ -104,8 +104,8 @@ impl Finished {
     }
 }
 
-/// Runs `vm` with these arguments until it exits by itself, killing it at
-/// [`EXIT_TIMEOUT`]. `VM_DATABASE_URL` is set to `database_url`, or unset
+/// Runs `vibe` with these arguments until it exits by itself, killing it at
+/// [`EXIT_TIMEOUT`]. `VIBE_DATABASE_URL` is set to `database_url`, or unset
 /// when it is `None`, whatever the test's own environment holds.
 pub fn run_vm_to_exit<I, S>(args: I, database_url: Option<&str>) -> Finished
 where
@@ -113,9 +113,9 @@ where
     S: AsRef<OsStr>,
 {
     let mut command = Command::new(vm_binary());
-    command.args(args).env_remove("VM_DATABASE_URL");
+    command.args(args).env_remove("VIBE_DATABASE_URL");
     if let Some(url) = database_url {
-        command.env("VM_DATABASE_URL", url);
+        command.env("VIBE_DATABASE_URL", url);
     }
     run_to_exit(command, EXIT_TIMEOUT)
         .unwrap_or_else(|problem| panic!("cannot run {}: {problem}", vm_binary().display()))

@@ -44,7 +44,7 @@ fn help_lists_the_five_exit_codes_and_what_each_means() {
         assert!(
             text.lines()
                 .any(|line| holds_number(line, code) && line.contains(meaning)),
-            "expected `vm --help` to list the exit code {code} with its meaning ({meaning:?}) on one line, got\n{}",
+            "expected `vibe --help` to list the exit code {code} with its meaning ({meaning:?}) on one line, got\n{}",
             help.describe()
         );
     }
@@ -92,15 +92,15 @@ fn without_json_results_are_text_on_standard_output_and_errors_on_standard_error
         let text = machine.run(&[command]).ok_text();
         assert!(
             serde_json::from_str::<serde_json::Value>(&text).is_err(),
-            "expected words from `vm {command}` without --json, got JSON:\n{text}"
+            "expected words from `vibe {command}` without --json, got JSON:\n{text}"
         );
     }
     machine.run(&["sign-out"]).ok_text();
     for command in SIGNED_IN_COMMANDS {
         let message = machine.run(&[command]).text_error(4);
         assert!(
-            message.contains("vm sign-in"),
-            "expected the message to say to run `vm sign-in`, got {message:?}"
+            message.contains("vibe sign-in"),
+            "expected the message to say to run `vibe sign-in`, got {message:?}"
         );
     }
 }
@@ -297,7 +297,7 @@ fn an_answer_of_5xx_keeps_the_apis_reason_and_ends_with_1() {
             .run(&[command, "--json"])
             .json_error(1, "unavailable");
         assert!(
-            !message.contains("vm sign-in"),
+            !message.contains("vibe sign-in"),
             "expected a signed-in Builder not to be told to sign in again while the platform database is down, got {message:?}"
         );
         machine.run(&[command]).text_error(1);

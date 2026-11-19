@@ -1,4 +1,4 @@
-// Written by hand, until `vm pull` writes it: the part of the structure of
+// Written by hand, until `vibe pull` writes it: the part of the structure of
 // the fixture database `stock` (blackbox/src/structure.rs) that this
 // project uses, with the export names and column keys CONTRACT.md promises
 // ("Pulling a Resource's structure: The definition"). The tests pull the

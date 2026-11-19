@@ -4,7 +4,7 @@
 //! first and last acceptance criteria).
 //!
 //! The database is there after the first Version, with or without
-//! migrations, named `<p>_app_<n>` and commented `vm application <name>`,
+//! migrations, named `<p>_app_<n>` and commented `vibe application <name>`,
 //! with its two roles; the migrations' tables are there and owned by the
 //! owner role. Application code reads and writes rows as the User and as
 //! the Application; the Operation log says which, with `own_database` true,
@@ -60,7 +60,7 @@ fn the_first_version_creates_the_own_database_named_and_commented_as_the_contrac
             db.name
         )),
         vec![vec![Some(comment_of("board"))]],
-        "expected the own database's comment to be `vm application board`"
+        "expected the own database's comment to be `vibe application board`"
     );
     for role in [&db.owner, &db.runtime] {
         assert!(

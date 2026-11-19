@@ -40,11 +40,11 @@ fn harness_the_checked_project_type_checks_and_its_manifest_reads() {
         manifest.json().unwrap(),
         json!({
             "name": CHECKED,
-            "description": "A project for the tests of vm check.",
+            "description": "A project for the tests of vibe check.",
             "declared_access": { "resources": {} }
         })
     );
-    // With files written as `vm pull` writes them, it still type-checks.
+    // With files written as `vibe pull` writes them, it still type-checks.
     pulled_by_hand(&project, "inventory");
     let checked = type_check(&project.dir);
     assert_eq!(checked.code, Some(0), "{}", checked.describe());
@@ -289,7 +289,7 @@ fn harness_a_stand_in_node_says_it_is_node_20() {
 #[test]
 fn harness_a_running_tool_is_signalled_and_waited_for() {
     use blackbox::tool::{Machine, NotAnInstallation, Pretender};
-    // `vm sign-in` to a listener that never answers waits up to 30 s.
+    // `vibe sign-in` to a listener that never answers waits up to 30 s.
     let silent = NotAnInstallation::pretending(Pretender::Silent);
     let machine = Machine::new();
     let address = silent.address().to_string();

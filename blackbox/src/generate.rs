@@ -1,7 +1,7 @@
 //! What the tests of "Generate migrations, stopping before data is lost"
 //! share (CONTRACT.md, "Generating migrations"):
 //!
-//! - `vm generate` run on a [`Machine`] ([`generate_args`], [`generate`],
+//! - `vibe generate` run on a [`Machine`] ([`generate_args`], [`generate`],
 //!   [`generate_in_words`]) and what it printed read with its shape checked:
 //!   a migration generated ([`Generated::made`]), nothing to generate
 //!   ([`Generated::nothing`]), a stop for data that would be lost
@@ -35,8 +35,8 @@ use crate::project::{
 use crate::sdk::{TOOLING_TIMEOUT, TempProject, Tooled, repository_root};
 use crate::tool::{Machine, Run};
 
-/// How long a `vm generate` may take before the harness gives up: as for
-/// `vm check`, below the command's own 300 s.
+/// How long a `vibe generate` may take before the harness gives up: as for
+/// `vibe check`, below the command's own 300 s.
 pub const GENERATE_TIMEOUT: Duration = CHECK_TIMEOUT;
 
 /// The words the contract gives the message of `data-loss` (and AGENTS.md
@@ -44,7 +44,7 @@ pub const GENERATE_TIMEOUT: Duration = CHECK_TIMEOUT;
 pub const UNLESS_SAID: &str =
     "unless the Builder has already clearly said that this data may be lost";
 
-/// `vm generate --project <dir> --json`, and these arguments after.
+/// `vibe generate --project <dir> --json`, and these arguments after.
 pub fn generate_args<'a>(dir: &'a str, extra: &[&'a str]) -> Vec<&'a str> {
     let mut args = vec!["generate", "--project", dir, "--json"];
     args.extend_from_slice(extra);
@@ -55,7 +55,7 @@ fn utf8(dir: &Path) -> &str {
     dir.to_str().unwrap_or_else(|| panic!("not UTF-8: {dir:?}"))
 }
 
-/// Runs `vm generate --project <dir> --json <extra>` on this machine.
+/// Runs `vibe generate --project <dir> --json <extra>` on this machine.
 pub fn generate(machine: &Machine, dir: &Path, extra: &[&str]) -> Run {
     generate_with_env(machine, dir, extra, &[])
 }
@@ -70,14 +70,14 @@ pub fn generate_with_env(
     machine.run_into_files(&generate_args(utf8(dir), extra), env, GENERATE_TIMEOUT)
 }
 
-/// Runs `vm generate --project <dir> <extra>` (in words) on this machine.
+/// Runs `vibe generate --project <dir> <extra>` (in words) on this machine.
 pub fn generate_in_words(machine: &Machine, dir: &Path, extra: &[&str]) -> Run {
     let mut args = vec!["generate", "--project", utf8(dir)];
     args.extend_from_slice(extra);
     machine.run_into_files(&args, &[], GENERATE_TIMEOUT)
 }
 
-/// What `vm generate --json` printed when it generated a migration.
+/// What `vibe generate --json` printed when it generated a migration.
 #[derive(Clone, Debug)]
 pub struct Generated {
     pub run: Run,
@@ -215,7 +215,7 @@ pub fn number_of(name: &str) -> Option<&str> {
         .then_some(number)
 }
 
-/// What `vm generate --json` printed when it stopped for data that would
+/// What `vibe generate --json` printed when it stopped for data that would
 /// be lost.
 #[derive(Clone, Debug)]
 pub struct DataLoss {
@@ -648,7 +648,7 @@ pub fn statements_of(sql: &str) -> Vec<String> {
 /// A project of the harness's own ([`checked_project`]) whose own schema
 /// is `first`, with its migration made by the root's `drizzle-kit` by hand
 /// ([`generate_migrations`]): one `.sql` file. Then a test changes the
-/// schema and runs `vm generate`.
+/// schema and runs `vibe generate`.
 pub fn project_with(label: &str, first: &str) -> TempProject {
     let project = checked_project(label);
     project.write("src/db/schema.ts", first);
@@ -689,12 +689,12 @@ pub fn files_and_bytes(dir: &Path) -> std::collections::BTreeMap<String, Vec<u8>
 }
 
 /// Fails unless a message of `migrations-unreadable` gives, as its fix,
-/// the command `vm generate` for the migrations the schema then needs, and
+/// the command `vibe generate` for the migrations the schema then needs, and
 /// never `drizzle-kit` run by hand.
 pub fn assert_unreadable_fix_names_vm_generate(message: &str) {
     assert!(
-        message.contains("vm generate"),
-        "expected the fix of migrations-unreadable to name `vm generate`, got {message:?}"
+        message.contains("vibe generate"),
+        "expected the fix of migrations-unreadable to name `vibe generate`, got {message:?}"
     );
     for by_hand in [
         "drizzle-kit generate",

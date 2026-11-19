@@ -1,9 +1,9 @@
-//! The tool (CONTRACT.md, "The tool"): the same `vm` program run as a
+//! The tool (CONTRACT.md, "The tool"): the same `vibe` program run as a
 //! command on a Builder's machine, here a temporary directory of the test's
 //! own standing for that machine's home, so that nothing the tests do ever
 //! touches the real home.
 //!
-//! - [`Machine`] runs `vm <command>` with `HOME` and `XDG_CONFIG_HOME`
+//! - [`Machine`] runs `vibe <command>` with `HOME` and `XDG_CONFIG_HOME`
 //!   pointed into its directory, an environment that holds nothing else of
 //!   the test's (only `PATH`, and what the test adds on purpose), a time
 //!   limit on every run, and keeps what the run printed and how it ended;
@@ -159,12 +159,12 @@ impl Machine {
     }
 
     /// The folder CONTRACT.md says the credential is kept in:
-    /// `$XDG_CONFIG_HOME/vm/` when that is absolute, else
-    /// `$HOME/.config/vm/`.
+    /// `$XDG_CONFIG_HOME/vibe/` when that is absolute, else
+    /// `$HOME/.config/vibe/`.
     pub fn credential_dir(&self) -> PathBuf {
         match self.config_home {
-            ConfigHome::Absolute => self.absolute_config_home().join("vm"),
-            ConfigHome::Unset | ConfigHome::Relative(_) => self.home.join(".config").join("vm"),
+            ConfigHome::Absolute => self.absolute_config_home().join("vibe"),
+            ConfigHome::Unset | ConfigHome::Relative(_) => self.home.join(".config").join("vibe"),
         }
     }
 
@@ -240,12 +240,12 @@ impl Machine {
         }
     }
 
-    /// Runs `vm <args>` on this machine.
+    /// Runs `vibe <args>` on this machine.
     pub fn run(&self, args: &[&str]) -> Run {
         self.run_with_env(args, &[])
     }
 
-    /// Runs `vm <args>` on this machine with these environment variables
+    /// Runs `vibe <args>` on this machine with these environment variables
     /// added.
     pub fn run_with_env(&self, args: &[&str], env: &[(&str, &str)]) -> Run {
         let command = self.command(args, env, None);
@@ -261,7 +261,7 @@ impl Machine {
         }
     }
 
-    /// Runs `vm <args>` on this machine with these environment variables
+    /// Runs `vibe <args>` on this machine with these environment variables
     /// added, its standard output and error written to files rather than
     /// pipes, killed at `timeout`. For a run that may leave a process of
     /// its own behind: a pipe held open by such a process would keep a
@@ -281,7 +281,7 @@ impl Machine {
         self.spawn_into_files(cwd, args, env).wait(timeout)
     }
 
-    /// Starts `vm <args>` on this machine in `cwd`, with these environment
+    /// Starts `vibe <args>` on this machine in `cwd`, with these environment
     /// variables added and its output written to files, and returns at
     /// once: the test may signal it ([`Running::signal`]) and then waits
     /// for it ([`Running::wait`]). Killed if dropped while running.
@@ -311,7 +311,7 @@ impl Machine {
         }
     }
 
-    /// Starts `vm <args>` on this machine with its standard output a pipe
+    /// Starts `vibe <args>` on this machine with its standard output a pipe
     /// whose reading end the test holds (and may drop while it runs), its
     /// standard error written to a file; returns at once. The [`Run`] that
     /// [`Running::wait`] gives has an empty standard output.
@@ -338,7 +338,7 @@ impl Machine {
         let child = command
             .spawn()
             .unwrap_or_else(|e| panic!("cannot run the tool: {e}"));
-        // The parent's copy of the writing end goes, so that only `vm`
+        // The parent's copy of the writing end goes, so that only `vibe`
         // holds it.
         drop(command);
         (
@@ -352,7 +352,7 @@ impl Machine {
         )
     }
 
-    /// Runs `vm <args>` on this machine with its standard output or error
+    /// Runs `vibe <args>` on this machine with its standard output or error
     /// broken before it can write anything; `stdout` of the [`Run`] is
     /// empty, and so is `stderr` when standard error is closed.
     pub fn run_broken(&self, args: &[&str], broken: Broken) -> Run {
@@ -456,7 +456,7 @@ impl Machine {
         command
     }
 
-    /// `vm sign-in` to `vm` as this User, with `--json`, which must end
+    /// `vibe sign-in` to `vibe` as this User, with `--json`, which must end
     /// with `0`; returns what it printed.
     pub fn sign_in(&self, vm: &Vm, user: &User) -> Value {
         let args = sign_in_args(vm.address(), user);
@@ -506,7 +506,7 @@ fn collect_files(dir: &Path, found: &mut Vec<PathBuf>) {
     }
 }
 
-/// The arguments of `vm sign-in` to the program at `address` as this User
+/// The arguments of `vibe sign-in` to the program at `address` as this User
 /// (without `--json`).
 pub fn sign_in_args(address: SocketAddr, user: &User) -> Vec<String> {
     let mut args = vec![
@@ -550,7 +550,7 @@ pub fn credential_like_runs(bytes: &[u8]) -> Vec<String> {
         .collect()
 }
 
-/// A request to the platform's API of `vm`, signed in with this tool
+/// A request to the platform's API of `vibe`, signed in with this tool
 /// credential only.
 pub fn bearer(vm: &Vm, target: &str, credential: &str) -> Request {
     vm.api_request(target).bearer(credential)
@@ -616,12 +616,12 @@ pub struct Running {
 }
 
 impl Running {
-    /// The process id of `vm`.
+    /// The process id of `vibe`.
     pub fn pid(&self) -> u32 {
         self.child.id()
     }
 
-    /// Sends `signal` (`INT`, `TERM`, `HUP`, ...) to `vm` alone, with the
+    /// Sends `signal` (`INT`, `TERM`, `HUP`, ...) to `vibe` alone, with the
     /// `kill` program.
     pub fn signal(&self, signal: &str) {
         let mut command = Command::new("kill");
@@ -638,24 +638,24 @@ impl Running {
         );
     }
 
-    /// What `vm` has written on its standard output so far, while it runs.
+    /// What `vibe` has written on its standard output so far, while it runs.
     pub fn stdout_so_far(&self) -> String {
         let bytes = fs::read(self.outputs.join("stdout")).unwrap_or_default();
         String::from_utf8_lossy(&bytes).into_owned()
     }
 
-    /// What `vm` has written on its standard error so far, while it runs.
+    /// What `vibe` has written on its standard error so far, while it runs.
     pub fn stderr_so_far(&self) -> String {
         let bytes = fs::read(self.outputs.join("stderr")).unwrap_or_default();
         String::from_utf8_lossy(&bytes).into_owned()
     }
 
-    /// Whether `vm` has ended.
+    /// Whether `vibe` has ended.
     pub fn has_ended(&mut self) -> bool {
         matches!(self.child.try_wait(), Ok(Some(_)))
     }
 
-    /// Waits for `vm` to end, at most `timeout` (then kills it), and
+    /// Waits for `vibe` to end, at most `timeout` (then kills it), and
     /// returns what it printed and how it ended.
     pub fn wait(mut self, timeout: Duration) -> Run {
         let deadline = Instant::now() + timeout;
@@ -709,7 +709,7 @@ impl Run {
     /// The run as text, for failure messages.
     pub fn describe(&self) -> String {
         format!(
-            "`vm {}` ended with {} after {:?}\nstandard output:\n{}\nstandard error:\n{}",
+            "`vibe {}` ended with {} after {:?}\nstandard output:\n{}\nstandard error:\n{}",
             self.args.join(" "),
             self.code
                 .map_or_else(|| "no exit code".to_owned(), |c| format!("exit code {c}")),
@@ -721,7 +721,7 @@ impl Run {
 
     /// Both outputs, labelled, for searches.
     pub fn texts(&self) -> Vec<(String, String)> {
-        let command = format!("`vm {}`", self.args.join(" "));
+        let command = format!("`vibe {}`", self.args.join(" "));
         vec![
             (
                 format!("the standard output of {command}"),

@@ -189,7 +189,7 @@ pub fn it_made_platform() -> Platform {
     platform
 }
 
-/// Runs `vm serve` against `platform` until it exits by itself (killed at
+/// Runs `vibe serve` against `platform` until it exits by itself (killed at
 /// [`crate::program::EXIT_TIMEOUT`]).
 pub fn serve_to_exit(platform: &Platform) -> Finished {
     run_vm_to_exit(

@@ -14,7 +14,7 @@
 //! required columns, an enum's labels as a union, the unsupported columns
 //! typed `unknown`). Each test copies it into a temporary project under the
 //! repository's `target/`, removes the hand-written `resources/stock/`,
-//! pulls with `vm pull` into the copy, and runs `tsc` over the copy.
+//! pulls with `vibe pull` into the copy, and runs `tsc` over the copy.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,

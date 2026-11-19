@@ -32,7 +32,7 @@ use blackbox::tool::{Machine, Run};
 
 /// Fails unless the message gives what the contract says: that
 /// `drizzle-kit` cannot tell a rename from a removal and an addition, and
-/// the three steps, naming `vm generate --empty` and the `UPDATE` that
+/// the three steps, naming `vibe generate --empty` and the `UPDATE` that
 /// copies the values; with no stack and no path of the command's own
 /// folder in `tmp`.
 fn assert_question_message(message: &str, tmp: &std::path::Path) {
@@ -43,16 +43,16 @@ fn assert_question_message(message: &str, tmp: &std::path::Path) {
         "expected the message to say drizzle-kit cannot tell a rename from a removal and an addition, got {message:?}"
     );
     assert!(
-        flat.contains("vm generate --empty"),
-        "expected the message to name `vm generate --empty`, got {message:?}"
+        flat.contains("vibe generate --empty"),
+        "expected the message to name `vibe generate --empty`, got {message:?}"
     );
     assert!(
         flat.contains("UPDATE"),
         "expected the message to give the statement that copies the values (UPDATE ... SET <new> = <old>), got {message:?}"
     );
     assert!(
-        flat.matches("vm generate").count() >= 3,
-        "expected each of the three steps followed by `vm generate`, got {message:?}"
+        flat.matches("vibe generate").count() >= 3,
+        "expected each of the three steps followed by `vibe generate`, got {message:?}"
     );
     assert!(
         flat.contains("src/db/schema.ts"),

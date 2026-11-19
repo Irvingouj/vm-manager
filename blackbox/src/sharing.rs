@@ -520,7 +520,7 @@ pub fn assert_own_page_headers(response: &Response, context: &str) {
     }
 }
 
-/// `vm <args...> --json` on this machine.
+/// `vibe <args...> --json` on this machine.
 pub fn tool_json(machine: &Machine, args: &[&str]) -> Run {
     let mut all = args.to_vec();
     all.push("--json");
@@ -585,7 +585,7 @@ pub fn assert_change_printed(run: &Run, application: &str) -> Value {
     body
 }
 
-/// Shares an Application `vm deploy` just made with everyone, as its first
+/// Shares an Application `vibe deploy` just made with everyone, as its first
 /// Contributor (the one `visible_to.contributors` names), failing the test
 /// unless it is `200`: for tests of a deployed Application that are not
 /// about who can open it.

@@ -1,5 +1,5 @@
 //! The harness of the tests of generating migrations checked against the
-//! real `drizzle-kit` and the real platform, without `vm generate`: the
+//! real `drizzle-kit` and the real platform, without `vibe generate`: the
 //! shapes the tests change the own schema in make what those tests assume,
 //! the journal is read in its order, and the add, copy, drop path made by
 //! hand is applied by the platform over rows that are there.

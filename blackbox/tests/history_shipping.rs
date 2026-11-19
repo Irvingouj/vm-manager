@@ -1440,7 +1440,7 @@ const CROWD_ROWS: usize = 25_000;
 
 /// CONTRACT.md, "Nobody waits for what is not theirs": "The relay keeps at
 /// most 32 connections to own databases at once (their `application_name`
-/// is `vm relay`), and an own database keeps one no longer than one batch
+/// is `vibe relay`), and an own database keeps one no longer than one batch
 /// while another waits for one. So the promise holds also when more than
 /// 32 own databases have large outboxes to ship at once: a write of yet
 /// another Application is shipped, and a read of its history answered,
@@ -1454,7 +1454,7 @@ const CROWD_ROWS: usize = 25_000;
 /// shipments at once (900,000 changes). At once, and at the same time,
 /// one more Application writes a row left to the relay alone, and another
 /// writes a row and reads its history. Meanwhile the administrator counts, every 20 ms, the
-/// sessions named `vm relay` in these own databases: never more than 32.
+/// sessions named `vibe relay` in these own databases: never more than 32.
 ///
 /// The bound, from measurement: the rate at which the 37 outboxes are
 /// shipped (all changes over the time until all are empty) gives the time
@@ -1536,7 +1536,7 @@ fn more_than_32_own_databases_shipping_at_once_hold_up_no_other_and_use_at_most_
                 while sampling.load(std::sync::atomic::Ordering::Relaxed) {
                     let n: i64 = sql
                         .value(&format!(
-                            "SELECT count(*)::text FROM pg_stat_activity WHERE application_name = 'vm relay' AND datname IN ({in_list})"
+                            "SELECT count(*)::text FROM pg_stat_activity WHERE application_name = 'vibe relay' AND datname IN ({in_list})"
                         ))
                         .and_then(|v| v.parse().ok())
                         .unwrap_or(0);
@@ -1607,7 +1607,7 @@ fn more_than_32_own_databases_shipping_at_once_hold_up_no_other_and_use_at_most_
     #[expect(clippy::cast_precision_loss, reason = "a count of batches")]
     let bound = Duration::from_secs_f64(3.0 * (CROWD as f64 + 2.0) * batch + 2.0);
     println!(
-        "{CROWD} Applications installed in {installed:?}, their {waiting} changes written by {written:?}; after the start all were shipped in {all_shipped:?} ({rate:.0} a second, a batch of 1,000 every {:.1} ms); the lone Application's write shipped by the relay {lone_shipped:?} after it, the other's read after its write answered in {read_took:?} (bound {bound:?}); at most {most_relay} `vm relay` sessions in {samples} samples",
+        "{CROWD} Applications installed in {installed:?}, their {waiting} changes written by {written:?}; after the start all were shipped in {all_shipped:?} ({rate:.0} a second, a batch of 1,000 every {:.1} ms); the lone Application's write shipped by the relay {lone_shipped:?} after it, the other's read after its write answered in {read_took:?} (bound {bound:?}); at most {most_relay} `vibe relay` sessions in {samples} samples",
         batch * 1_000.0
     );
     assert!(
@@ -1616,7 +1616,7 @@ fn more_than_32_own_databases_shipping_at_once_hold_up_no_other_and_use_at_most_
     );
     assert!(
         most_relay <= 32,
-        "expected at most 32 sessions named `vm relay` in these own databases at once (CONTRACT.md: \"The relay keeps at most 32 connections to own databases at once\"), saw {most_relay}"
+        "expected at most 32 sessions named `vibe relay` in these own databases at once (CONTRACT.md: \"The relay keeps at most 32 connections to own databases at once\"), saw {most_relay}"
     );
     let holds = lone_read["ok"]["changes"]
         .as_array()

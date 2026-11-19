@@ -1,4 +1,4 @@
-//! `vm pull <resource> [--project <directory>] [--json]` (CONTRACT.md,
+//! `vibe pull <resource> [--project <directory>] [--json]` (CONTRACT.md,
 //! "Pulling a Resource's structure: The tool"; ticket "Pull a Resource's
 //! structure as a typed Drizzle definition": pulling twice changes
 //! nothing; the generated files say they are generated; a Builder whose
@@ -82,7 +82,7 @@ fn names(snapshot: &[(PathBuf, Vec<u8>, SystemTime)]) -> Vec<String> {
         .collect()
 }
 
-/// `vm pull <resource> --project <dir> [--json]`.
+/// `vibe pull <resource> --project <dir> [--json]`.
 fn pull_args<'a>(resource: &'a str, dir: &'a str, json: bool) -> Vec<&'a str> {
     let mut args = vec!["pull", resource, "--project", dir];
     if json {
@@ -177,12 +177,12 @@ fn pull_writes_the_definition_and_the_link_and_prints_what_it_did() {
             String::from_utf8_lossy(&bytes).into_owned(),
         )
     }));
-    blackbox::scenario::assert_none_holds(&texts, &stock.markers(), "`vm pull`");
+    blackbox::scenario::assert_none_holds(&texts, &stock.markers(), "`vibe pull`");
     let written = names(&snapshot(&dir));
     assert_eq!(
         written.len(),
         5,
-        "expected the manifest, the three files and vm.dev.json (made by the pull), nothing else, got {written:?}"
+        "expected the manifest, the three files and vibe.dev.json (made by the pull), nothing else, got {written:?}"
     );
 }
 
@@ -349,7 +349,7 @@ fn without_a_grant_the_pull_is_refused_and_nothing_is_written_or_changed() {
     let message = nora_machine
         .run(&pull_args(STOCK, dir.to_str().unwrap(), true))
         .json_error(3, "no-grant");
-    assert_no_grant_message(&message, "`vm pull` with no Grant");
+    assert_no_grant_message(&message, "`vibe pull` with no Grant");
     let api_refusal = blackbox::structure::pull(&stock.scenario.vm.api_as(&nora()), STOCK).json();
     assert_eq!(
         message,
@@ -360,7 +360,7 @@ fn without_a_grant_the_pull_is_refused_and_nothing_is_written_or_changed() {
     let words = nora_machine
         .run(&pull_args(STOCK, dir.to_str().unwrap(), false))
         .text_error(3);
-    assert_no_grant_message(&words, "`vm pull` with no Grant, in words");
+    assert_no_grant_message(&words, "`vibe pull` with no Grant, in words");
 
     // Also when an earlier pull's files are there.
     let rita_machine = Machine::new();
@@ -376,7 +376,7 @@ fn without_a_grant_the_pull_is_refused_and_nothing_is_written_or_changed() {
     assert_eq!(
         before.len(),
         5,
-        "the manifest, the three files and vm.dev.json"
+        "the manifest, the three files and vibe.dev.json"
     );
     std::thread::sleep(Duration::from_millis(50));
     nora_machine

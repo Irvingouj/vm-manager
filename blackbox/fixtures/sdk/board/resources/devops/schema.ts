@@ -1,6 +1,6 @@
 // The structure of the shared database the tests register as `devops`
 // (blackbox/src/shared_database.rs and blackbox/src/sdk.rs), written by hand
-// as `vm resources pull` will write it.
+// as `vibe resources pull` will write it.
 import {
   bigint,
   boolean,

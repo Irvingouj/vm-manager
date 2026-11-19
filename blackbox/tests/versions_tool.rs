@@ -1,4 +1,4 @@
-//! `vm versions` and `vm go-back` (CONTRACT.md, "Versions, going back, and
+//! `vibe versions` and `vibe go-back` (CONTRACT.md, "Versions, going back, and
 //! logs: The commands", "The instruction file"; ticket "Versions: list
 //! them, go back to the previous one, read logs": listing Versions shows
 //! each with its commit, when it was deployed, by whom, and which is
@@ -241,8 +241,8 @@ fn vm_versions_of_an_application_with_no_version_says_vm_deploy_sends_the_first(
     );
     let text = machine.run(&["versions", "empty"]).ok_text();
     assert!(
-        text.contains("vm deploy") && text.to_lowercase().contains("no version"),
-        "expected the words to say there is no Version yet and that `vm deploy` sends the first, got\n{text}"
+        text.contains("vibe deploy") && text.to_lowercase().contains("no version"),
+        "expected the words to say there is no Version yet and that `vibe deploy` sends the first, got\n{text}"
     );
 }
 
@@ -488,7 +488,7 @@ fn vm_help_lists_versions_go_back_and_logs_and_each_help_names_its_options() {
     for command in ["versions", "go-back", "logs"] {
         assert!(
             commands.iter().any(|c| c == command),
-            "expected `vm --help` to list `{command}`, got {commands:?}"
+            "expected `vibe --help` to list `{command}`, got {commands:?}"
         );
     }
     assert_help_names(
@@ -516,22 +516,22 @@ fn agents_md_names_the_three_commands_and_how_to_debug_and_go_back() {
     for command in ["versions", "go-back", "logs"] {
         assert!(
             named.iter().any(|c| c == command),
-            "expected AGENTS.md to name `vm {command}` in code, it names {named:?}\n{text}"
+            "expected AGENTS.md to name `vibe {command}` in code, it names {named:?}\n{text}"
         );
     }
     let listed = help_commands(&machine.run(&["--help"]).stdout);
     for command in &named {
         assert!(
             listed.contains(command),
-            "expected every `vm <command>` of AGENTS.md to be one `vm --help` lists; {command:?} is not ({listed:?})"
+            "expected every `vibe <command>` of AGENTS.md to be one `vibe --help` lists; {command:?} is not ({listed:?})"
         );
     }
     assert!(
         code_in(&text).iter().any(|c| c
             .split_whitespace()
             .collect::<Vec<_>>()
-            .starts_with(&["vm", "logs"])),
-        "expected `vm logs <name>` in code"
+            .starts_with(&["vibe", "logs"])),
+        "expected `vibe logs <name>` in code"
     );
     let paragraphs: Vec<String> = paragraphs(&text)
         .iter()
@@ -545,7 +545,7 @@ fn agents_md_names_the_three_commands_and_how_to_debug_and_go_back() {
             "expected a paragraph of AGENTS.md that says {what} (words {words:?})\n{text}"
         );
     };
-    any("to debug, read `vm logs`", &["debug", "vm logs"]);
+    any("to debug, read `vibe logs`", &["debug", "vibe logs"]);
     any(
         "a response's x-vm-request-id is what --request takes",
         &["x-vm-request-id", "--request"],
@@ -564,12 +564,12 @@ fn agents_md_names_the_three_commands_and_how_to_debug_and_go_back() {
         "expected AGENTS.md to say --follow does not end by itself\n{text}"
     );
     any(
-        "vm go-back is the quick way out of a bad deploy and does not undo migrations, which migrations/ keeps",
-        &["vm go-back", "migrations/"],
+        "vibe go-back is the quick way out of a bad deploy and does not undo migrations, which migrations/ keeps",
+        &["vibe go-back", "migrations/"],
     );
     assert!(
-        paragraphs.iter().any(|p| p.contains("vm go-back")
+        paragraphs.iter().any(|p| p.contains("vibe go-back")
             && (p.contains("not undo") || p.contains("does not undo") || p.contains("not undone"))),
-        "expected AGENTS.md to say vm go-back does not undo migrations\n{text}"
+        "expected AGENTS.md to say vibe go-back does not undo migrations\n{text}"
     );
 }

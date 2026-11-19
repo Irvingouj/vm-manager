@@ -3,9 +3,9 @@
 //! instruction file"; ticket "The project template, and creating and
 //! checking a project": a new project passes the check untouched; the
 //! instruction file carries the three corrections). Each test makes the
-//! project with `vm new` and reads what it wrote, runs the SDK's tooling,
+//! project with `vibe new` and reads what it wrote, runs the SDK's tooling,
 //! `tsc`, `drizzle-kit`, `git` and `tar` on it, sends it as a Version, and
-//! checks it with `vm check`, once with its packages resolved from the
+//! checks it with `vibe check`, once with its packages resolved from the
 //! repository's root and once installed by `npm install` outside it.
 #![allow(
     clippy::unwrap_used,
@@ -90,7 +90,7 @@ fn claude_md_is_one_line_that_points_at_agents_md() {
 #[test]
 fn vm_dev_json_holds_one_user_outsider_in_no_group_and_no_grant() {
     let (_machine, dir) = made();
-    let users = read_json(&dir, "vm.dev.json");
+    let users = read_json(&dir, "vibe.dev.json");
     let mut keys: Vec<&String> = users.as_object().unwrap().keys().collect();
     keys.sort();
     assert_eq!(keys, ["about", "grants", "users"], "{users}");
@@ -158,8 +158,8 @@ fn gitignore_ignores_node_modules_and_the_tools_folder_but_its_packages() {
     };
     for path in [
         "node_modules/drizzle-orm/index.js",
-        ".vm/state.json",
-        ".vm/cache/x",
+        ".vibe/state.json",
+        ".vibe/cache/x",
     ] {
         assert!(ignored(path), "expected {path} ignored by .gitignore");
     }
@@ -168,7 +168,7 @@ fn gitignore_ignores_node_modules_and_the_tools_folder_but_its_packages() {
         "manifest.ts",
         "migrations/.gitkeep",
         "src/index.ts",
-        "vm.dev.json",
+        "vibe.dev.json",
         "AGENTS.md",
         "package.json",
     ] {
@@ -352,8 +352,8 @@ fn agents_md_carries_the_three_corrections() {
     assert!(
         paragraphs(&text)
             .iter()
-            .any(|p| p.contains("vm.dev.json") && p.contains("outsider")),
-        "expected one paragraph of AGENTS.md to name both vm.dev.json and outsider\n{text}"
+            .any(|p| p.contains("vibe.dev.json") && p.contains("outsider")),
+        "expected one paragraph of AGENTS.md to name both vibe.dev.json and outsider\n{text}"
     );
 }
 
@@ -362,16 +362,16 @@ fn agents_md_says_a_refused_pull_is_told_to_the_builder_not_worked_around() {
     let text = agents_md();
     let rule = paragraphs(&text).into_iter().find(|p| {
         let lower = p.to_lowercase();
-        p.contains("vm pull") && lower.contains("refus")
+        p.contains("vibe pull") && lower.contains("refus")
     });
     let rule = rule.unwrap_or_else(|| {
-        panic!("expected a paragraph of AGENTS.md on a refused `vm pull`\n{text}")
+        panic!("expected a paragraph of AGENTS.md on a refused `vibe pull`\n{text}")
     });
     let lower = squashed(&rule).to_lowercase();
     for word in ["builder", "ask", "invent", "mock"] {
         assert!(
             lower.contains(word),
-            "expected the rule on a refused `vm pull` to say {word:?}, got\n{rule}"
+            "expected the rule on a refused `vibe pull` to say {word:?}, got\n{rule}"
         );
     }
 }
@@ -387,13 +387,13 @@ fn agents_md_names_only_commands_this_program_has() {
     for command in ["check", "pull"] {
         assert!(
             named.iter().any(|c| c == command),
-            "expected AGENTS.md to name `vm {command}`, it names {named:?}"
+            "expected AGENTS.md to name `vibe {command}`, it names {named:?}"
         );
     }
     for command in &named {
         assert!(
             listed.contains(command),
-            "AGENTS.md names `vm {command}`, which `vm --help` does not list ({listed:?})"
+            "AGENTS.md names `vibe {command}`, which `vibe --help` does not list ({listed:?})"
         );
     }
 }
@@ -483,20 +483,20 @@ fn agents_md_says_grants_unknown_and_log_unavailable_are_nothing_to_fix() {
 #[test]
 fn agents_md_says_the_local_databases_are_not_kept_through_a_crash_and_what_to_do() {
     // CONTRACT.md, "The local run on a busy machine: The local databases do
-    // not wait on the disk": where the template's AGENTS.md describes `vm
+    // not wait on the disk": where the template's AGENTS.md describes `vibe
     // local reset`, it says that the local databases are not kept through
-    // a crash of the machine or a loss of power, that `vm local reset`
+    // a crash of the machine or a loss of power, that `vibe local reset`
     // starts them anew, and that rows which must be there belong in
     // `test-rows/`.
     let text = agents_md();
     let found = paragraphs(&text).into_iter().find(|p| {
         let lower = squashed(p).to_lowercase();
-        lower.contains("vm local reset")
+        lower.contains("vibe local reset")
             && (lower.contains("crash") || lower.contains("power"))
             && lower.contains("test-rows")
     });
     assert!(
         found.is_some(),
-        "expected one paragraph of AGENTS.md naming `vm local reset` to say that the local databases are not kept through a crash of the machine or a loss of power, and that rows which must be there belong in `test-rows/`\n{text}"
+        "expected one paragraph of AGENTS.md naming `vibe local reset` to say that the local databases are not kept through a crash of the machine or a loss of power, and that rows which must be there belong in `test-rows/`\n{text}"
     );
 }

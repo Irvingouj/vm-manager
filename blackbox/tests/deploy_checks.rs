@@ -1,4 +1,4 @@
-//! The checks of `vm check` at deploy, the bundle, and the size of what is
+//! The checks of `vibe check` at deploy, the bundle, and the size of what is
 //! sent (CONTRACT.md, "Deploying: The command", step 6 and what follows
 //! step 8; "What the installation may answer"). A problem of any of the
 //! four checks ends the deploy exactly as it ends the check: exit code `1`,
@@ -27,7 +27,7 @@ use blackbox::tool::Machine;
 use serde_json::{Value, json};
 
 /// Deploys `project` (named `name`), which must fail its checks: fails
-/// unless the deploy ends as `vm check` on the same project ends, with the
+/// unless the deploy ends as `vibe check` on the same project ends, with the
 /// same problems, nothing written in the project, and nothing sent.
 fn assert_fails_as_the_check(
     scenario: &Scenario,
@@ -88,7 +88,7 @@ const NOT_LITERAL: &str = r#"import { defineManifest } from "@vm/sdk";
 const n = "not-literal-board";
 export default defineManifest({
   name: n,
-  description: "A project for the tests of vm check.",
+  description: "A project for the tests of vibe check.",
   resources: {},
 });
 "#;
@@ -157,7 +157,7 @@ fn a_declared_resource_that_is_not_pulled_is_left_to_the_check_and_not_pulled() 
         report.problem("resources", "resource-not-pulled")["message"]
             .as_str()
             .unwrap()
-            .contains("vm pull devops")
+            .contains("vibe pull devops")
     );
     assert!(
         !project.dir.join("resources").exists(),

@@ -1,8 +1,8 @@
 //! The tool's commands of Contributors and sharing (CONTRACT.md,
-//! "Contributors and sharing: The tool"): `vm show`, `vm share`,
-//! `vm unshare`, `vm contributors add` and `vm contributors remove`, what
-//! they print and how they end; `vm applications` with what is shared;
-//! `vm deploy`'s `visible_to`; the instruction file of a new project.
+//! "Contributors and sharing: The tool"): `vibe show`, `vibe share`,
+//! `vibe unshare`, `vibe contributors add` and `vibe contributors remove`, what
+//! they print and how they end; `vibe applications` with what is shared;
+//! `vibe deploy`'s `visible_to`; the instruction file of a new project.
 //!
 //! Acceptance criteria: "The tool's output after a deploy or a share names
 //! who can now see the Application"; "The tool's list of Applications for
@@ -74,7 +74,7 @@ fn vm_help_lists_show_share_unshare_and_contributors() {
     for command in ["show", "share", "unshare", "contributors"] {
         assert!(
             listed.iter().any(|c| c == command),
-            "expected `vm --help` to list `{command}`, it lists {listed:?}"
+            "expected `vibe --help` to list `{command}`, it lists {listed:?}"
         );
     }
 }
@@ -115,7 +115,7 @@ fn the_four_that_change_something_need_an_entry_and_an_application() {
         assert_eq!(
             run.code,
             Some(2),
-            "expected exit code 2 for `vm {}`\n{}",
+            "expected exit code 2 for `vibe {}`\n{}",
             args.join(" "),
             run.describe()
         );
@@ -147,7 +147,7 @@ fn vm_share_prints_what_it_changed_and_who_can_see_it_now() {
         keys(&printed["visible_to"]["shared_with"]),
         expected(&["user:bob", "group:finance", "user:carol"])
     );
-    assert_opens(&vm, &bob(), APP, "bob, after `vm share`");
+    assert_opens(&vm, &bob(), APP, "bob, after `vibe share`");
     // The same again: nothing changed, the same who can see it.
     let again = assert_change_printed(&tool_json(&machine, &["share", APP, "--user", "bob"]), APP);
     assert_eq!(again["added"], json!([]));
@@ -198,7 +198,7 @@ fn vm_unshare_prints_what_it_removed_and_bob_can_no_longer_open_it() {
             run.describe()
         );
     }
-    blackbox::sharing::assert_cannot_open(&vm, &bob(), APP, "bob, after `vm unshare`");
+    blackbox::sharing::assert_cannot_open(&vm, &bob(), APP, "bob, after `vibe unshare`");
 }
 
 #[test]
@@ -315,13 +315,13 @@ fn vm_show_prints_the_application_as_the_api_answers_it() {
     assert_eq!(
         shown,
         vm.api_as(&alice()).application(APP),
-        "expected `vm show --json` to print the Application as the API answers it"
+        "expected `vibe show --json` to print the Application as the API answers it"
     );
     let words = machine.run(&["show", APP]).ok_text();
     for named in [APP, "board.vm.test", "alice", "bob", "finance"] {
         assert!(
             words.contains(named),
-            "expected the words of `vm show` to name {named:?}\n{words}"
+            "expected the words of `vibe show` to name {named:?}\n{words}"
         );
     }
     // To someone it is shared with: who maintains it, and that only its
@@ -426,8 +426,8 @@ fn vm_deploy_names_whom_the_application_is_shared_with() {
     assert_eq!(first.shared_with, Vec::<Value>::new());
     let words = deploy_in_words(&machine, &project.dir, &[]).ok_text();
     assert!(
-        words.contains("vm share") && words.to_ascii_lowercase().contains("contributors only"),
-        "expected the words to say it is visible to its Contributors only and that `vm share` shares it\n{words}"
+        words.contains("vibe share") && words.to_ascii_lowercase().contains("contributors only"),
+        "expected the words to say it is visible to its Contributors only and that `vibe share` shares it\n{words}"
     );
     share_ok(
         &vm.api_as(&dana()),
@@ -459,13 +459,13 @@ fn the_instruction_file_says_who_can_see_an_application_and_names_the_commands()
     for command in ["share", "unshare", "contributors", "show"] {
         assert!(
             named.iter().any(|c| c == command),
-            "expected AGENTS.md to name `vm {command}`, it names {named:?}"
+            "expected AGENTS.md to name `vibe {command}`, it names {named:?}"
         );
     }
     let flat = squashed(&text);
     assert!(
-        flat.contains("vm contributors add"),
-        "expected AGENTS.md to name `vm contributors add`\n{text}"
+        flat.contains("vibe contributors add"),
+        "expected AGENTS.md to name `vibe contributors add`\n{text}"
     );
     let paragraphs = paragraphs(&text);
     assert!(
@@ -579,7 +579,7 @@ fn api_requests_of(vm: &Vm, id: &str) -> Vec<Value> {
         .collect()
 }
 
-/// Runs `vm <args> --json` as the machine's User (`id`) and fails unless
+/// Runs `vibe <args> --json` as the machine's User (`id`) and fails unless
 /// it made exactly one request of the API, a `POST` to `path`, and no read
 /// of the Application; returns the run.
 fn run_as_one_request(vm: &Vm, machine: &Machine, id: &str, args: &[&str], path: &str) -> Run {
@@ -605,7 +605,7 @@ fn run_as_one_request(vm: &Vm, machine: &Machine, id: &str, args: &[&str], path:
     while posts(&after) == posts(&before) {
         assert!(
             Instant::now() < deadline,
-            "expected a `request` record of `POST {path}` for `vm {}`\n{}",
+            "expected a `request` record of `POST {path}` for `vibe {}`\n{}",
             args.join(" "),
             run.describe()
         );
@@ -616,14 +616,14 @@ fn run_as_one_request(vm: &Vm, machine: &Machine, id: &str, args: &[&str], path:
     assert_eq!(
         made.len(),
         1,
-        "expected `vm {}` to be one request of the API, it made {made:?}",
+        "expected `vibe {}` to be one request of the API, it made {made:?}",
         args.join(" ")
     );
     assert!(
         !made
             .iter()
             .any(|r| r["method"] == "GET" && r["path"] == format!("/v1/applications/{APP}")),
-        "expected `vm {}` not to read the Application first: {made:?}",
+        "expected `vibe {}` not to read the Application first: {made:?}",
         args.join(" ")
     );
     run

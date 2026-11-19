@@ -1,4 +1,4 @@
-//! `vm request`'s command line, the test Users file, what is looked at
+//! `vibe request`'s command line, the test Users file, what is looked at
 //! first, the help and the instruction file (CONTRACT.md, "The local loop:
 //! one request as a test User": "The test Users file", "The command", "The
 //! instruction file"; ticket "Local loop: run the Application on the
@@ -6,7 +6,7 @@
 //! JSON form; the local Operation log and Change history can be read with
 //! the tool).
 //!
-//! Most projects here declare no Resource: a project made by `vm new` with
+//! Most projects here declare no Resource: a project made by `vibe new` with
 //! the harness's handler (`/echo` answers the request as it came).
 #![allow(
     clippy::unwrap_used,
@@ -30,7 +30,7 @@ use blackbox::project::{
 use blackbox::tool::Run;
 use serde_json::{Value, json};
 
-/// A project made by `vm new` (under the repository's `target/`) declaring
+/// A project made by `vibe new` (under the repository's `target/`) declaring
 /// nothing, with the harness's handler.
 fn echo_project(local: &Local) -> blackbox::sdk::TempProject {
     local_project(&local.machine, "echo-board", &[])
@@ -43,7 +43,7 @@ fn echoed(requested: &Requested) -> Value {
 }
 
 fn no_local_state(dir: &Path) -> bool {
-    !dir.join(".vm/local").exists()
+    !dir.join(".vibe/local").exists()
 }
 
 #[test]
@@ -388,7 +388,7 @@ fn a_command_line_the_tool_refuses_is_exit_code_2_and_nothing_is_made() {
     // the one thing wrong in it.
     let right = local.request_ok(&project.dir, "/echo", OUTSIDER, &["--timeout", "3600"]);
     assert_eq!(right.status(), 200, "{}", right.describe());
-    fs::remove_dir_all(project.dir.join(".vm/local")).unwrap();
+    fs::remove_dir_all(project.dir.join(".vibe/local")).unwrap();
     let before = Tree::of(&project.dir);
     for (case, args) in cases {
         let mut with_json = args.clone();
@@ -437,7 +437,7 @@ fn what_is_looked_at_first_is_the_command_line_then_the_project_then_the_file_th
     // Not a project, and a wrong command line: the command line first.
     let empty = local.machine.root().join("empty");
     fs::create_dir_all(&empty).unwrap();
-    fs::write(empty.join("vm.dev.json"), "not JSON").unwrap();
+    fs::write(empty.join("vibe.dev.json"), "not JSON").unwrap();
     local
         .run(
             &[
@@ -458,12 +458,12 @@ fn what_is_looked_at_first_is_the_command_line_then_the_project_then_the_file_th
         .json_error(1, "not-a-project");
     // A project whose file cannot be read, and a User not in it: the file.
     let project = echo_project(&local);
-    let good = fs::read_to_string(project.dir.join("vm.dev.json")).unwrap();
-    fs::write(project.dir.join("vm.dev.json"), "not JSON").unwrap();
+    let good = fs::read_to_string(project.dir.join("vibe.dev.json")).unwrap();
+    fs::write(project.dir.join("vibe.dev.json"), "not JSON").unwrap();
     local
         .request(&project.dir, "/echo", "nobody", &[])
         .json_error(1, "test-users-file");
-    fs::write(project.dir.join("vm.dev.json"), good).unwrap();
+    fs::write(project.dir.join("vibe.dev.json"), good).unwrap();
     // A User not in the file and no node: the User first.
     let no_node = path_without_node(&local.machine);
     local
@@ -496,7 +496,7 @@ fn node_older_than_22_is_node_missing_and_packages_not_installed_is_not_installe
     assert!(no_local_state(&dir));
 }
 
-/// A file of one User and one Grant, as `vm.dev.json` may be, to be broken
+/// A file of one User and one Grant, as `vibe.dev.json` may be, to be broken
 /// one way at a time.
 fn good_file() -> Value {
     json!({
@@ -515,8 +515,8 @@ fn each_malformed_test_users_file_is_test_users_file_naming_what_is_wrong() {
     let project = echo_project(&local);
     let long_id = "u".repeat(257);
     let mut cases: Vec<(&str, String, &str)> = vec![
-        ("not JSON", "{ \"users\": ".to_owned(), "vm.dev.json"),
-        ("not an object", "[]".to_owned(), "vm.dev.json"),
+        ("not JSON", "{ \"users\": ".to_owned(), "vibe.dev.json"),
+        ("not an object", "[]".to_owned(), "vibe.dev.json"),
     ];
     let mut broken = |case: &'static str, word: &'static str, change: &dyn Fn(&mut Value)| {
         let mut file = good_file();
@@ -598,7 +598,7 @@ fn each_malformed_test_users_file_is_test_users_file_naming_what_is_wrong() {
     );
 
     for (case, text, word) in cases {
-        fs::write(project.dir.join("vm.dev.json"), &text).unwrap();
+        fs::write(project.dir.join("vibe.dev.json"), &text).unwrap();
         let message = local
             .request(&project.dir, "/", OUTSIDER, &[])
             .json_error(1, "test-users-file");
@@ -643,7 +643,7 @@ fn the_help_lists_the_commands_and_their_options() {
     for command in ["request", "local"] {
         assert!(
             commands.iter().any(|c| c == command),
-            "expected `vm --help` to list {command:?}, got {commands:?}"
+            "expected `vibe --help` to list {command:?}, got {commands:?}"
         );
     }
     let request = local.machine.run(&["request", "--help"]);
@@ -660,7 +660,7 @@ fn the_help_lists_the_commands_and_their_options() {
     ] {
         assert!(
             request.stdout.contains(option),
-            "expected `vm request --help` to name {option}, got\n{}",
+            "expected `vibe request --help` to name {option}, got\n{}",
             request.stdout
         );
     }
@@ -670,7 +670,7 @@ fn the_help_lists_the_commands_and_their_options() {
     for command in ["operation-log", "change-history"] {
         assert!(
             subcommands.iter().any(|c| c == command),
-            "expected `vm local --help` to list {command:?}, got\n{}",
+            "expected `vibe local --help` to list {command:?}, got\n{}",
             local_help.stdout
         );
     }
@@ -689,7 +689,7 @@ fn the_help_lists_the_commands_and_their_options() {
         for option in options {
             assert!(
                 run.stdout.contains(option),
-                "expected `vm local {sub} --help` to name {option}, got\n{}",
+                "expected `vibe local {sub} --help` to name {option}, got\n{}",
                 run.stdout
             );
         }
@@ -706,14 +706,14 @@ fn the_instruction_file_tells_the_agent_to_try_the_application_as_builder_and_as
     for command in ["request", "local"] {
         assert!(
             commands.iter().any(|c| c == command),
-            "expected AGENTS.md to name `vm {command}` in code, got {commands:?}"
+            "expected AGENTS.md to name `vibe {command}` in code, got {commands:?}"
         );
     }
     let code = code_in(&text).join("\n");
     for named in [
-        "vm request",
-        "vm local operation-log",
-        "vm local change-history",
+        "vibe request",
+        "vibe local operation-log",
+        "vibe local change-history",
     ] {
         assert!(
             squashed(&code).contains(named),
@@ -723,21 +723,21 @@ fn the_instruction_file_tells_the_agent_to_try_the_application_as_builder_and_as
     let flat = squashed(&text);
     assert!(
         flat.contains("--as"),
-        "expected AGENTS.md to show `vm request <path> --as <user>`\n{text}"
+        "expected AGENTS.md to show `vibe request <path> --as <user>`\n{text}"
     );
     assert!(
         paragraphs(&text).iter().any(|p| {
             let p = squashed(p);
-            p.contains(BUILDER) && p.contains(OUTSIDER) && p.contains("vm request")
+            p.contains(BUILDER) && p.contains(OUTSIDER) && p.contains("vibe request")
         }),
-        "expected one paragraph to say to try the Application with vm request as builder and as outsider\n{text}"
+        "expected one paragraph to say to try the Application with vibe request as builder and as outsider\n{text}"
     );
     assert!(
         paragraphs(&text).iter().any(|p| {
             let p = squashed(p);
-            p.contains("vm.dev.json") && p.contains("vm pull") && p.contains("Grant")
+            p.contains("vibe.dev.json") && p.contains("vibe pull") && p.contains("Grant")
         }),
-        "expected AGENTS.md to say the Grants of vm.dev.json decide and vm pull copies the Builder's own there\n{text}"
+        "expected AGENTS.md to say the Grants of vibe.dev.json decide and vibe pull copies the Builder's own there\n{text}"
     );
     let lower = flat.to_lowercase();
     assert!(
@@ -749,13 +749,13 @@ fn the_instruction_file_tells_the_agent_to_try_the_application_as_builder_and_as
         "expected AGENTS.md at most 120 lines, got {}",
         text.lines().count()
     );
-    // Every command it names is one `vm --help` lists.
+    // Every command it names is one `vibe --help` lists.
     let help = local.machine.run(&["--help"]);
     let listed = help_commands(&help.stdout);
     for command in commands {
         assert!(
             listed.contains(&command),
-            "AGENTS.md names `vm {command}`, which `vm --help` does not list"
+            "AGENTS.md names `vibe {command}`, which `vibe --help` does not list"
         );
     }
 }

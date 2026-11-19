@@ -1,6 +1,6 @@
 //! The platform needs no superuser (CONTRACT.md, "The Application's own
 //! database: What it looks like in Postgres": it needs only what
-//! `VM_DATABASE_URL`'s role was promised, creating databases and roles).
+//! `VIBE_DATABASE_URL`'s role was promised, creating databases and roles).
 //!
 //! The main path, with a platform role that is `LOGIN CREATEDB CREATEROLE`
 //! and nothing more: the program creates its platform database, an

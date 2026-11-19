@@ -4,7 +4,7 @@
 //! finds rather than this repository; a project in a sub-folder of a
 //! repository is in that repository; the `PATH`s that lack `git` or `node`
 //! lack them; the project that type-checks and does not bundle does both;
-//! the project's tree leaves `.git` out. These pass before `vm deploy`
+//! the project's tree leaves `.git` out. These pass before `vibe deploy`
 //! exists.
 #![allow(
     clippy::unwrap_used,

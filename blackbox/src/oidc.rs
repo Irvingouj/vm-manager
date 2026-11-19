@@ -372,7 +372,7 @@ impl ClientSecret {
         Self(value.to_owned())
     }
 
-    /// The value, for `VM_OIDC_CLIENT_SECRET` and for looking for it where
+    /// The value, for `VIBE_OIDC_CLIENT_SECRET` and for looking for it where
     /// it must not be. Never print it.
     pub fn expose(&self) -> &str {
         &self.0
@@ -484,7 +484,7 @@ impl Provider {
     }
 
     /// The client secret the platform must present, for
-    /// `VM_OIDC_CLIENT_SECRET`.
+    /// `VIBE_OIDC_CLIENT_SECRET`.
     pub fn client_secret(&self) -> ClientSecret {
         ClientSecret(self.shared.secret.clone())
     }

@@ -5,7 +5,7 @@
 //! Docker, administrator rights or anything installed by hand).
 //!
 //! The Postgres of a run is seen from outside through the `postmaster.pid`
-//! under the project's `.vm/local/` (its process, its data folder, its port
+//! under the project's `.vibe/local/` (its process, its data folder, its port
 //! and address), and every process a run started is found again from
 //! `/proc` (`blackbox/src/local.rs`, `Local::processes`). The project is a
 //! new one declaring nothing, whose `/slow?ms=<n>` answers after `n`
@@ -74,7 +74,7 @@ fn a_run_listens_on_loopback_only_and_stops_everything_it_started_when_it_ends()
     let project = local_project(&local.machine, "slow-board", &[]);
     let mut running = local.spawn_request(&project.dir, "/slow?ms=3000", OUTSIDER, &[]);
     let postmaster = wait_for_postmaster(&project.dir, &mut running, POSTMASTER_WAIT)
-        .unwrap_or_else(|| panic!("expected the run's Postgres to listen, under .vm/local/"));
+        .unwrap_or_else(|| panic!("expected the run's Postgres to listen, under .vibe/local/"));
     assert!(
         matches!(
             postmaster.listen.as_str(),
@@ -85,8 +85,8 @@ fn a_run_listens_on_loopback_only_and_stops_everything_it_started_when_it_ends()
     );
     let data = fs::canonicalize(&postmaster.data).unwrap();
     assert!(
-        data.starts_with(fs::canonicalize(project.dir.join(".vm/local")).unwrap()),
-        "expected the data of the private Postgres in the project's .vm/local/, got {}",
+        data.starts_with(fs::canonicalize(project.dir.join(".vibe/local")).unwrap()),
+        "expected the data of the private Postgres in the project's .vibe/local/, got {}",
         data.display()
     );
     assert_eq!(
@@ -105,13 +105,13 @@ fn a_run_listens_on_loopback_only_and_stops_everything_it_started_when_it_ends()
     let requested = Requested::of(&run);
     assert_eq!(requested.text(), "slow");
     assert_nothing_left(&local, Some(&postmaster), "a run that answered");
-    // .vm/local/ is git's to ignore.
+    // .vibe/local/ is git's to ignore.
     let ignored = fs::read_to_string(project.dir.join(".gitignore")).unwrap();
     assert!(
         ignored
             .lines()
-            .any(|l| l.trim() == ".vm/*" || l.trim() == ".vm/local/" || l.trim() == ".vm/"),
-        "expected .vm/local/ ignored by git\n{ignored}"
+            .any(|l| l.trim() == ".vibe/*" || l.trim() == ".vibe/local/" || l.trim() == ".vibe/"),
+        "expected .vibe/local/ ignored by git\n{ignored}"
     );
 }
 

@@ -1,4 +1,4 @@
-//! `vm local reset`: the local databases started over (CONTRACT.md, "The
+//! `vibe local reset`: the local databases started over (CONTRACT.md, "The
 //! local loop, kept running: the browser, test rows and reset": "Starting
 //! over"; ticket "Local loop in the browser, with test rows, reset and
 //! working offline": reset empties the local own database and applies the
@@ -30,7 +30,7 @@ use serde_json::{Value, json};
 const DEVOPS_ROWS: &str = "test-rows/devops.sql";
 const OWN_ROWS: &str = "test-rows/own-database.sql";
 
-/// The fields of what `vm local reset --json` prints, sorted.
+/// The fields of what `vibe local reset --json` prints, sorted.
 const RESET_KEYS: [&str; 8] = [
     "application",
     "migrations_applied",
@@ -61,17 +61,17 @@ fn with_notes_and_rows(board: &Board) {
     );
 }
 
-/// The project's files and folders, without `.vm/` and `node_modules/`
+/// The project's files and folders, without `.vibe/` and `node_modules/`
 /// (neither the folders' contents nor their own times): what a reset must
 /// leave as it was.
 fn project_files(dir: &Path) -> Tree {
-    let mut tree = Tree::of_skipping(dir, &[".vm", "node_modules"]);
-    tree.0.remove(".vm");
+    let mut tree = Tree::of_skipping(dir, &[".vibe", "node_modules"]);
+    tree.0.remove(".vibe");
     tree.0.remove("node_modules");
     tree
 }
 
-/// `vm local reset --project <dir> --json <extra>`.
+/// `vibe local reset --project <dir> --json <extra>`.
 fn reset(local: &Local, dir: &Path, extra: &[&str]) -> Run {
     local.watch(dir);
     let mut args = vec![
@@ -85,7 +85,7 @@ fn reset(local: &Local, dir: &Path, extra: &[&str]) -> Run {
     local.run(&args, &[])
 }
 
-/// What `vm local reset --json` printed, which must end with `0` and have
+/// What `vibe local reset --json` printed, which must end with `0` and have
 /// exactly the contract's fields.
 fn reset_ok(local: &Local, dir: &Path, extra: &[&str]) -> Value {
     let run = reset(local, dir, extra);
@@ -180,7 +180,7 @@ fn reset_starts_the_local_databases_over_and_leaves_the_project_and_postgres_alo
     assert_eq!(
         project_before.differences(&project_files(board.dir())),
         Vec::<String>::new(),
-        "expected vm.dev.json, the test rows and every other file of the project untouched"
+        "expected vibe.dev.json, the test rows and every other file of the project untouched"
     );
 
     // The local records of the earlier runs are gone.
@@ -249,7 +249,7 @@ fn reset_in_a_project_that_never_ran_does_a_first_run_from_nothing() {
         &generate(&local.machine, &project.dir, &["--name", "add_notes"]),
         &project.dir,
     );
-    assert!(!project.dir.join(".vm/local").exists());
+    assert!(!project.dir.join(".vibe/local").exists());
     let body = reset_ok(&local, &project.dir, &[]);
     assert_eq!(body["application"], json!("fresh-board"));
     assert_eq!(body["version"], json!(1));
@@ -266,7 +266,7 @@ fn reset_in_a_project_that_never_ran_does_a_first_run_from_nothing() {
 fn a_reset_that_fails_fails_as_a_run_fails() {
     let local = Local::new();
     let project = local_project(&local.machine, "broken-board", &[]);
-    std::fs::write(project.dir.join("vm.dev.json"), "{ \"users\": 7 }\n").unwrap();
+    std::fs::write(project.dir.join("vibe.dev.json"), "{ \"users\": 7 }\n").unwrap();
     reset(&local, &project.dir, &[]).json_error(1, "test-users-file");
     let elsewhere = local.machine.root().join("not-a-project");
     std::fs::create_dir_all(&elsewhere).unwrap();

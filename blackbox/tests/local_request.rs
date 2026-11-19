@@ -1,4 +1,4 @@
-//! `vm request`: one request as a test User, on the Builder's machine
+//! `vibe request`: one request as a test User, on the Builder's machine
 //! (CONTRACT.md, "The local loop: one request as a test User": "The
 //! command", "What a run does", "What it prints"; ticket "Local loop: run
 //! the Application on the Builder's machine and send a request as a test
@@ -9,7 +9,7 @@
 //! refusal their Users without a Grant will see; the command has a JSON
 //! form).
 //!
-//! A project made by `vm new`, its Manifest declaring `devops` (the
+//! A project made by `vibe new`, its Manifest declaring `devops` (the
 //! harness's usual shared database, registered on a real installation), its
 //! code reading `incidents` through `ctx.user().db("devops")` and answering
 //! what it got or the refusal it got (`blackbox/src/local.rs`, `handler`),
@@ -216,7 +216,7 @@ fn the_grants_of_vm_dev_json_decide_each_run() {
     assert_eq!(
         allowed.json(),
         json!({ "user": OUTSIDER, "incidents": [] }),
-        "expected a Grant added to vm.dev.json to decide the next run\n{}",
+        "expected a Grant added to vibe.dev.json to decide the next run\n{}",
         allowed.describe()
     );
     // The Grant removed: gone at the next run.
@@ -242,7 +242,7 @@ fn the_grants_of_vm_dev_json_decide_each_run() {
     assert_refused(
         &lowered,
         &no_grant(BUILDER, Some("structure")),
-        "the builder after their Grant in vm.dev.json was edited to structure",
+        "the builder after their Grant in vibe.dev.json was edited to structure",
     );
 }
 
@@ -472,11 +472,11 @@ fn a_project_larger_than_an_installation_takes_is_too_large_in_the_local_runs_wo
     let run = local.request(&project.dir, "/", OUTSIDER, &[]);
     let message = run.json_error(1, "too-large");
     assert!(
-        message.contains("vm request"),
-        "expected the message in the local run's words, naming vm request, got {message:?}"
+        message.contains("vibe request"),
+        "expected the message in the local run's words, naming vibe request, got {message:?}"
     );
     assert!(
-        !message.contains("vm deploy") && !message.contains("sent"),
+        !message.contains("vibe deploy") && !message.contains("sent"),
         "expected nothing of a deploy or of sending in the local run's message, got {message:?}"
     );
     let left = local.processes_after(std::time::Duration::from_secs(5));

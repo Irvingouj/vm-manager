@@ -1,4 +1,4 @@
-//! `vm resources` and `vm applications` (CONTRACT.md, "The tool: Listing
+//! `vibe resources` and `vibe applications` (CONTRACT.md, "The tool: Listing
 //! Resources", "Listing Applications"; ticket "The tool signs in, and lists
 //! Resources and Applications": every registered Resource, also those the
 //! Builder holds no Grant on, with the description, the Builder's Access
@@ -204,7 +204,7 @@ fn vm_resources_shows_nothing_of_a_resources_connection_or_structure() {
     assert_none_holds(
         &texts,
         &markers,
-        "`vm resources` shows no structure and nothing of a Resource's connection",
+        "`vibe resources` shows no structure and nothing of a Resource's connection",
     );
     for (whence, text) in &texts {
         assert!(
@@ -371,7 +371,7 @@ fn without_json_no_control_character_of_the_installations_reaches_the_terminal()
     machine.sign_in(&s.vm, &alice);
 
     let words = machine.run(&["resources"]).ok_text();
-    assert_no_raw_control(&words, "`vm resources`");
+    assert_no_raw_control(&words, "`vibe resources`");
     assert!(
         words.contains("\\u{1b}"),
         "expected the escape character printed as \\u{{1b}}, got\n{}",
@@ -383,7 +383,7 @@ fn without_json_no_control_character_of_the_installations_reaches_the_terminal()
         words.escape_debug()
     );
     let words = machine.run(&["applications"]).ok_text();
-    assert_no_raw_control(&words, "`vm applications`");
+    assert_no_raw_control(&words, "`vibe applications`");
     assert!(words.contains("\\u{1b}"), "{}", words.escape_debug());
 
     let listed = machine.run(&["resources", "--json"]).ok_json();
@@ -392,7 +392,7 @@ fn without_json_no_control_character_of_the_installations_reaches_the_terminal()
     assert_eq!(r["owner"], json!(owner));
     assert_eq!(r["contact"], json!(contact));
     let run = machine.run(&["resources", "--json"]);
-    assert_no_raw_control(&run.stdout, "`vm resources --json`");
+    assert_no_raw_control(&run.stdout, "`vibe resources --json`");
     let listed = machine.run(&["applications", "--json"]).ok_json();
     assert_eq!(
         listed["applications"][0]["description"],
@@ -428,19 +428,19 @@ fn bidirectional_marks_and_overrides_are_escaped_too() {
 
     for command in ["resources", "applications"] {
         let words = machine.run(&[command]).ok_text();
-        assert_no_raw_control(&words, &format!("`vm {command}`"));
+        assert_no_raw_control(&words, &format!("`vibe {command}`"));
         let escaped = escapes_in(&words);
         assert!(
             escaped.contains(&0x202e) || escaped.contains(&0x202d),
-            "expected an override printed as \\u{{<hex>}} by `vm {command}`, got\n{}",
+            "expected an override printed as \\u{{<hex>}} by `vibe {command}`, got\n{}",
             words.escape_debug()
         );
         let run = machine.run(&[command, "--json"]);
         let listed = run.ok_json();
-        assert_no_raw_control(&run.stdout, &format!("`vm {command} --json`"));
+        assert_no_raw_control(&run.stdout, &format!("`vibe {command} --json`"));
         assert!(
             run.stdout.to_lowercase().contains("\\u202"),
-            "expected the overrides written as JSON escapes (\\u202e) by `vm {command} --json`, got\n{}",
+            "expected the overrides written as JSON escapes (\\u202e) by `vibe {command} --json`, got\n{}",
             run.stdout.escape_debug()
         );
         if command == "resources" {
@@ -460,7 +460,7 @@ fn bidirectional_marks_and_overrides_are_escaped_too() {
     for mark in &marks {
         assert!(
             escaped.contains(&u32::from(*mark)),
-            "expected U+{:04X} printed as \\u{{<hex>}} in the words of `vm resources`, got\n{}",
+            "expected U+{:04X} printed as \\u{{<hex>}} in the words of `vibe resources`, got\n{}",
             u32::from(*mark),
             words.escape_debug()
         );

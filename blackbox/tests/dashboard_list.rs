@@ -4,7 +4,7 @@
 //! group by name, and nothing else; `data-vm-relation`, `data-vm-serving`
 //! and the link that opens an Application; its description and its
 //! Contributors (the first 20, and how many more); pages of 100; and the
-//! same Applications as `GET /v1/applications` and `vm applications`.
+//! same Applications as `GET /v1/applications` and `vibe applications`.
 //!
 //! Acceptance criteria: "A signed-in person sees the Applications they
 //! contribute to and those shared with them, and no others"; "Each
@@ -509,8 +509,8 @@ fn someone_with_no_application_is_told_nothing_is_shared_with_them_yet_and_that_
         .filter(|w| !w.is_empty())
         .collect();
     assert!(
-        text.contains("shared") && words.contains(&"vm"),
-        "expected words saying that nothing is shared with the person yet and that an Application is made with the `vm` tool, got {text:?}"
+        text.contains("shared") && words.contains(&"vibe"),
+        "expected words saying that nothing is shared with the person yet and that an Application is made with the `vibe` tool, got {text:?}"
     );
 }
 
@@ -592,7 +592,7 @@ fn the_dashboard_and_the_tools_list_agree_for_the_same_person() {
         assert_eq!(
             dashboard,
             facts_of_json(&printed),
-            "{}: expected the Dashboard and `vm applications` to show the same Applications to the same person, and say the same of each which of the two it is",
+            "{}: expected the Dashboard and `vibe applications` to show the same Applications to the same person, and say the same of each which of the two it is",
             person.id
         );
     }

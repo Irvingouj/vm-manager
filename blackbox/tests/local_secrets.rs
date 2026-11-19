@@ -5,7 +5,7 @@
 //! request as a test User").
 //!
 //! After pulls and runs that read, are refused and write, every file the
-//! machine holds (the project, its `.vm/local/` with the private Postgres's
+//! machine holds (the project, its `.vibe/local/` with the private Postgres's
 //! data, the user's data folder, `TMPDIR`, the home) and everything the
 //! commands printed is searched, byte for byte, for the shared database's
 //! logins, its name, and values of its rows.
@@ -67,7 +67,7 @@ fn no_real_row_and_no_credential_of_the_resource_is_anywhere_on_the_builders_mac
         }
     }
     assert!(
-        board.dir().join(".vm/local").is_dir(),
+        board.dir().join(".vibe/local").is_dir(),
         "the harness's own check: the local state is there to be searched"
     );
     assert_eq!(

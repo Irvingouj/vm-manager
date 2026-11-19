@@ -323,7 +323,7 @@ fn a_platform_database_it_does_not_own_and_public_may_connect_to_stops_the_start
     );
     assert!(
         finished.status.is_some_and(|s| !s.success()),
-        "expected `vm serve` to exit with a status other than 0 by itself\n{shown}"
+        "expected `vibe serve` to exit with a status other than 0 by itself\n{shown}"
     );
     assert!(
         !finished.stderr.contains("\"listening\""),

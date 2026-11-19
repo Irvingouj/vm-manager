@@ -1,6 +1,6 @@
-//! Starting and stopping `vm serve` (CONTRACT.md, "Serving: Starting and
+//! Starting and stopping `vibe serve` (CONTRACT.md, "Serving: Starting and
 //! stopping"), the shape of its log, and the start-ups that cannot work
-//! (no `VM_DATABASE_URL`, one that cannot be parsed, a Postgres that cannot
+//! (no `VIBE_DATABASE_URL`, one that cannot be parsed, a Postgres that cannot
 //! be reached or that refuses the role).
 #![allow(
     clippy::unwrap_used,
@@ -119,7 +119,7 @@ fn with_no_applications_the_program_starts_and_every_application_address_is_404(
     }
 }
 
-/// Runs `vm serve` with `VM_DATABASE_URL` set to `database_url` (or unset)
+/// Runs `vibe serve` with `VIBE_DATABASE_URL` set to `database_url` (or unset)
 /// and fails unless it exits non-zero by itself within the contract's 15
 /// seconds, without listening, with a message on standard error that
 /// mentions each of `named` and shows none of `secrets` anywhere.
@@ -146,7 +146,7 @@ fn assert_start_up_fails(case: &str, database_url: Option<&str>, named: &[&str],
     );
     assert!(
         finished.status.is_some_and(|s| !s.success()),
-        "expected `vm serve` to exit non-zero by itself within {EXIT_TIMEOUT:?}\n{shown}"
+        "expected `vibe serve` to exit non-zero by itself within {EXIT_TIMEOUT:?}\n{shown}"
     );
     assert!(
         !finished.stderr.contains("\"listening\""),
@@ -175,7 +175,7 @@ fn assert_start_up_fails(case: &str, database_url: Option<&str>, named: &[&str],
 
 #[test]
 fn start_up_fails_without_vm_database_url() {
-    assert_start_up_fails("VM_DATABASE_URL unset", None, &["VM_DATABASE_URL"], &[]);
+    assert_start_up_fails("VIBE_DATABASE_URL unset", None, &["VIBE_DATABASE_URL"], &[]);
 }
 
 #[test]
@@ -201,7 +201,7 @@ fn start_up_fails_for_a_vm_database_url_that_cannot_be_parsed() {
         ),
     ];
     for (case, url) in &cases {
-        assert_start_up_fails(case, Some(url), &["VM_DATABASE_URL"], &[secret]);
+        assert_start_up_fails(case, Some(url), &["VIBE_DATABASE_URL"], &[secret]);
     }
 }
 

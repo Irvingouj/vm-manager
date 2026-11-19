@@ -1,7 +1,7 @@
-//! What `vm generate` needs, what it leaves, and how it ends (CONTRACT.md,
+//! What `vibe generate` needs, what it leaves, and how it ends (CONTRACT.md,
 //! "Generating migrations: The command", "What stops it before drizzle-kit
 //! is asked", "The instruction file and the check"; "A project: Checking a
-//! project" for what holds as for `vm check`; "The tool: Every command").
+//! project" for what holds as for `vibe check`; "The tool: Every command").
 //! It needs no sign-in and asks the installation nothing; it needs a
 //! project, Node 22 or later and `drizzle-kit` installed; it writes in a
 //! folder of its own in `TMPDIR` and nothing in the project unless a
@@ -209,7 +209,7 @@ fn a_migration_whose_sql_file_is_gone_is_migrations_unreadable() {
 }
 
 /// A `.sql` file the journal does not name: the message names it, says to
-/// remove it if it was never committed, and gives `vm generate`.
+/// remove it if it was never committed, and gives `vibe generate`.
 #[test]
 fn a_sql_file_the_journal_does_not_name_is_migrations_unreadable_and_to_be_removed() {
     let machine = Machine::new();
@@ -650,7 +650,7 @@ fn vm_help_lists_generate_and_its_own_help_names_its_options() {
     let commands = help_commands(&help.stdout);
     assert!(
         commands.iter().any(|c| c == "generate"),
-        "expected `vm --help` to list `generate`, got {commands:?}"
+        "expected `vibe --help` to list `generate`, got {commands:?}"
     );
     let own = machine.run(&["generate", "--help"]);
     own.expect_code(0);
@@ -681,8 +681,8 @@ fn agents_md_names_vm_generate_and_no_longer_says_to_run_drizzle_kit_by_hand() {
         code.iter().any(|c| c
             .split_whitespace()
             .collect::<Vec<_>>()
-            .starts_with(&["vm", "generate"])),
-        "expected AGENTS.md to name `vm generate` in a code span\n{text}"
+            .starts_with(&["vibe", "generate"])),
+        "expected AGENTS.md to name `vibe generate` in a code span\n{text}"
     );
     for piece in &code {
         assert!(
@@ -706,7 +706,7 @@ fn the_checks_migrations_behind_message_gives_vm_generate() {
     let problem = report.problem("migrations", "migrations-behind");
     let message = problem["message"].as_str().unwrap();
     assert!(
-        message.contains("vm generate"),
-        "expected the message to give the command `vm generate`, got {message:?}"
+        message.contains("vibe generate"),
+        "expected the message to give the command `vibe generate`, got {message:?}"
     );
 }

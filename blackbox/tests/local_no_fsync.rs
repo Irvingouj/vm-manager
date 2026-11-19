@@ -8,7 +8,7 @@
 //! full_page_writes`), not read from a command line or a file: the harness
 //! connects to the private Postgres while a run holds it, on the port its
 //! `postmaster.pid` names, as the superuser the run made, with the password
-//! the run gave `initdb` (a stand-in `initdb` of `VM_LOCAL_POSTGRES_BIN`
+//! the run gave `initdb` (a stand-in `initdb` of `VIBE_LOCAL_POSTGRES_BIN`
 //! keeps a copy of the password file, then runs the real one; `postgres`
 //! and `pg_ctl` are the real ones).
 #![allow(
@@ -152,7 +152,7 @@ fn note_bodies(requested: &Requested) -> Vec<String> {
         .collect()
 }
 
-/// While a `vm request` holds the project's private Postgres (a slow
+/// While a `vibe request` holds the project's private Postgres (a slow
 /// request), its settings; then the run is waited for.
 fn settings_during_a_request(machine: &Machine, dir: &Path, context: &str) {
     let mut running = machine
@@ -180,11 +180,11 @@ fn the_private_postgres_of_vm_dev_runs_with_fsync_and_full_page_writes_off() {
     let machine = Machine::new();
     let project = local_project(&machine.local.machine, "fsync-dev", &[]);
     let dev = Dev::start(&machine.local, &project.dir, "fsync-dev");
-    machine.assert_settings(&dev.postmaster(), "vm dev, a first run");
+    machine.assert_settings(&dev.postmaster(), "vibe dev, a first run");
     dev.stop("INT").expect_code(0);
-    // Made by `vm dev` before, started again by `vm dev`.
+    // Made by `vibe dev` before, started again by `vibe dev`.
     let dev = Dev::start(&machine.local, &project.dir, "fsync-dev");
-    machine.assert_settings(&dev.postmaster(), "vm dev, again");
+    machine.assert_settings(&dev.postmaster(), "vibe dev, again");
     dev.stop("INT").expect_code(0);
 }
 
@@ -195,7 +195,7 @@ fn rows_written_are_there_after_vm_dev_and_its_postgres_are_killed_outright() {
     let project = notes_project(local, "killed-notes");
     let dev = Dev::start(local, &project.dir, "killed-notes");
     let postgres = dev.postmaster();
-    // Written through `vm dev` (a `vm request` it answers), so that the
+    // Written through `vibe dev` (a `vibe request` it answers), so that the
     // Postgres that holds it has not been stopped since.
     let written = Requested::of(&local.request(
         &project.dir,
@@ -211,7 +211,7 @@ fn rows_written_are_there_after_vm_dev_and_its_postgres_are_killed_outright() {
     );
     // At once, as a crash would come: a commit that was answered is
     // committed (a kill or a crash of `vm` or of Postgres loses nothing).
-    // Postgres first, outright, then `vm dev`: neither stops anything.
+    // Postgres first, outright, then `vibe dev`: neither stops anything.
     let killed = std::process::Command::new("kill")
         .args(["-KILL", &postgres.pid.to_string()])
         .status()

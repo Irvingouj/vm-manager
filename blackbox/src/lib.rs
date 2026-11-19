@@ -1,14 +1,14 @@
-//! Black-box tests of the `vm` program, written from the tickets' acceptance
+//! Black-box tests of the `vibe` program, written from the tickets' acceptance
 //! criteria against the program from outside. The outside interface they
 //! assume is in `CONTRACT.md` beside this crate.
 //!
 //! This library is the harness every ticket's tests use:
 //!
-//! - [`program`] gets the binary (`VM_BIN`, or a build of `vm` once per test
+//! - [`program`] gets the binary (`VIBE_BIN`, or a build of `vibe` once per test
 //!   binary) and runs it to its exit for start-up checks;
 //! - [`postgres`] runs the harness's private Postgres, one per test binary,
 //!   and hands each test's program a platform database of its own;
-//! - [`Vm`] starts `vm serve` on a free port against a platform database,
+//! - [`Vm`] starts `vibe serve` on a free port against a platform database,
 //!   waits for its `listening` record, installs fixture Applications from
 //!   `fixtures/` through the platform's API, and ends the process when
 //!   dropped, showing the program's log if the test is failing;
@@ -42,24 +42,24 @@
 //! - [`tool`] runs the program as the Builder's command-line tool, on a
 //!   temporary directory standing for the Builder's machine;
 //! - [`project`] is what the tests of creating and checking a project
-//!   share: `vm new`, `vm check` and its report, a project of the
+//!   share: `vibe new`, `vibe check` and its report, a project of the
 //!   harness's own, a tree snapshot, whether a process runs, a tarball;
 //! - [`structure`] is what the tests of pulling a Resource's structure
 //!   share: a fixture shared database with the common shapes, the
 //!   generated link, and a reading of the server log that says whether a
 //!   login read only the catalogs;
-//! - [`generate`] is what the tests of generating migrations share: `vm
+//! - [`generate`] is what the tests of generating migrations share: `vibe
 //!   generate` and what it printed, the entries of `destroys`, a project's
 //!   migrations in its journal's order as a Version carries them, and the
 //!   own schemas the tests change;
 //! - [`deploy`] is what the tests of deploying share: a `git` that works
 //!   under a machine's own `HOME`, a project's repository of its own made
-//!   and committed, `vm deploy` and what it printed;
+//!   and committed, `vibe deploy` and what it printed;
 //! - [`logs`] is what the tests of Versions, going back and logs share:
 //!   the fixture that prints what it is asked, going back, and reading an
 //!   Application's log entries;
-//! - [`local`] is what the tests of the local loop share: `vm request` and
-//!   `vm local ...` on a machine with its own data folder and `TMPDIR`, what
+//! - [`local`] is what the tests of the local loop share: `vibe request` and
+//!   `vibe local ...` on a machine with its own data folder and `TMPDIR`, what
 //!   they printed, the local Postgres seen from outside, a mirror that hands
 //!   over Postgres's archive, and a project whose handler does what each
 //!   path says;
@@ -67,7 +67,7 @@
 //!   browser with a cookie jar that follows redirects a step at a time, and
 //!   [`sessions`] what the tests of sign-in and sessions share;
 //! - [`connection`] connects OIDC as an administrator would (the
-//!   installation's key, `vm setup`, `vm admin connect-oidc`, `PUT
+//!   installation's key, `vibe setup`, `vibe admin connect-oidc`, `PUT
 //!   /v1/oidc`), and [`tool_sign_ins`] is what the tests of the tool's
 //!   sign-in through the browser share: a verifier and its challenge, the
 //!   forms of a page, and the harness's `BROWSER` command;

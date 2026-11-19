@@ -81,8 +81,8 @@ fn the_credential_is_kept_in_xdg_config_home_when_it_is_absolute() {
             "the harness's own check"
         );
         assert!(
-            !machine.home().join(".config").join("vm").exists(),
-            "expected nothing under $HOME/.config/vm when XDG_CONFIG_HOME is absolute"
+            !machine.home().join(".config").join("vibe").exists(),
+            "expected nothing under $HOME/.config/vibe when XDG_CONFIG_HOME is absolute"
         );
         machine.kept_credential(&vm);
         machine.run(&["whoami", "--json"]).ok_json();
@@ -110,7 +110,7 @@ fn the_credential_is_kept_in_home_config_when_xdg_config_home_is_unset_or_relati
             "expected a relative XDG_CONFIG_HOME not to be used ({config_home:?})"
         );
         assert!(
-            !machine.absolute_config_home().join("vm").exists(),
+            !machine.absolute_config_home().join("vibe").exists(),
             "the harness's own check: the absolute configuration home is not told to the tool"
         );
         machine.kept_credential(&vm);
@@ -285,14 +285,14 @@ fn the_credential_is_not_taken_from_the_environment_or_the_command_line() {
     let s = Scenario::start();
     let (bobs, _) = s.vm.api_as(&bob()).tool_credential();
     let names = [
-        "VM_CREDENTIAL",
-        "VM_TOOL_CREDENTIAL",
-        "VM_TOKEN",
-        "VM_API_TOKEN",
-        "VM_AUTH_TOKEN",
-        "VM_ACCESS_TOKEN",
-        "VM_BEARER_TOKEN",
-        "VM_SESSION",
+        "VIBE_CREDENTIAL",
+        "VIBE_TOOL_CREDENTIAL",
+        "VIBE_TOKEN",
+        "VIBE_API_TOKEN",
+        "VIBE_AUTH_TOKEN",
+        "VIBE_ACCESS_TOKEN",
+        "VIBE_BEARER_TOKEN",
+        "VIBE_SESSION",
         "TOKEN",
     ];
     let env: Vec<(&str, &str)> = names.iter().map(|n| (*n, bobs.as_str())).collect();
@@ -328,13 +328,13 @@ fn the_credential_is_not_taken_from_the_environment_or_the_command_line() {
                 assert_eq!(
                     who["user"],
                     "alice",
-                    "expected `vm whoami {}` to stay alice, got {who}",
+                    "expected `vibe whoami {}` to stay alice, got {who}",
                     extra.first().unwrap()
                 );
                 assert_eq!(who["platform_administrator"], false, "{who}");
             }
             _ => panic!(
-                "expected `vm whoami` with an extra {:?} to be a wrong command line (2) or to change nothing (0), got exit code {:?}",
+                "expected `vibe whoami` with an extra {:?} to be a wrong command line (2) or to change nothing (0), got exit code {:?}",
                 extra.first().unwrap(),
                 run.code
             ),
