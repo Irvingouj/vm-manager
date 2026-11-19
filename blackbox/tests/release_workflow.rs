@@ -460,6 +460,69 @@ fn the_workflow_runs_the_gate_through_gate_hosted_and_the_install_gate_with_no_f
     }
 }
 
+/// CONTRACT.md, "A real browser in the gate: The browser": "The release
+/// workflow's gate has a browser too: the hosted runner's Firefox, whose
+/// version the job prints." The job that runs `scripts/gate-hosted.sh` has
+/// a step before that one whose `run:` asks the browser its version
+/// (`firefox --version`, or `"${VIBE_TEST_BROWSER:-firefox}" --version`),
+/// and that step does not swallow a failure.
+#[test]
+fn the_gate_job_prints_the_runners_firefox_version_before_it_runs_the_gate() {
+    let workflow = workflow();
+    let calls_gate_hosted = |step: &Value| {
+        step["run"].as_str().is_some_and(|run| {
+            run.split_whitespace()
+                .any(|w| w == "scripts/gate-hosted.sh" || w == "./scripts/gate-hosted.sh")
+        })
+    };
+    let (id, steps) = jobs(&workflow)
+        .iter()
+        .find_map(|(id, job)| {
+            let steps = job["steps"].as_array()?;
+            steps.iter().any(calls_gate_hosted).then_some((id, steps))
+        })
+        .unwrap_or_else(|| panic!("expected a job whose step runs scripts/gate-hosted.sh"));
+    let gate_at = steps.iter().position(calls_gate_hosted).unwrap();
+    let asks = |step: &Value| {
+        step["run"].as_str().is_some_and(|run| {
+            run.lines()
+                .any(|line| line.contains("firefox") && line.contains("--version"))
+        })
+    };
+    let Some(at) = steps.iter().position(asks) else {
+        panic!(
+            "expected the job {id} to have a step whose `run:` asks the runner's Firefox its version (`firefox --version`); its steps run {:?}",
+            steps
+                .iter()
+                .filter_map(|s| s["run"].as_str())
+                .collect::<Vec<_>>()
+        );
+    };
+    assert!(
+        at < gate_at,
+        "expected the step that asks Firefox its version (step {at}) before the step that runs scripts/gate-hosted.sh (step {gate_at}) in the job {id}"
+    );
+    let step = &steps[at];
+    let run = step["run"].as_str().unwrap_or_default();
+    let swallowed = match &step["continue-on-error"] {
+        Value::Null | Value::Bool(false) => false,
+        Value::String(text) => text.trim() != "false",
+        _ => true,
+    };
+    assert!(
+        !swallowed,
+        "expected the step that asks Firefox its version not to go on past its failure (`continue-on-error: {}`)",
+        step["continue-on-error"]
+    );
+    let squeezed: String = run.split_whitespace().collect::<Vec<_>>().join(" ");
+    for swallowing in ["|| true", "|| :", "||true", "||:", "set +e"] {
+        assert!(
+            !squeezed.contains(swallowing),
+            "expected the step that asks Firefox its version not to swallow a failure; its `run:` holds {swallowing:?}: {run:?}"
+        );
+    }
+}
+
 #[test]
 fn the_jobs_that_publish_run_only_for_a_tag_and_need_every_job_that_checks() {
     let workflow = workflow();
