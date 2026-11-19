@@ -437,7 +437,29 @@ async fn tls_connect(
     tokio_rustls::TlsConnector::from(config)
         .connect(name, stream)
         .await
-        .map_err(|e| format!("the TLS handshake with {host} failed ({e})"))
+        .map_err(|error| handshake_failed(host, &error))
+}
+
+/// A failed handshake with the mirror `host`, in words: which way its
+/// certificate was not taken, read from rustls's error by its type
+/// (crate::trust::refusal), else the handshake's own words.
+fn handshake_failed(host: &str, error: &std::io::Error) -> String {
+    use crate::trust::{Refusal, VARIABLE};
+    match crate::trust::refusal(error) {
+        Some(Refusal::UnknownAuthority) => format!(
+            "the certificate of {host} is issued by a certificate authority this program does not trust: if the mirror's certificate is issued by your company's own authority, put that authority's certificate (PEM) in a file and name it with {VARIABLE}"
+        ),
+        Some(Refusal::OtherName) => {
+            format!("the certificate of {host} is for another name, not for {host}")
+        }
+        Some(Refusal::Expired) => format!("the certificate of {host} has expired"),
+        Some(Refusal::NotValidYet) => {
+            format!("the certificate of {host} is not valid yet (check this machine's clock)")
+        }
+        Some(Refusal::Other) | None => {
+            format!("the TLS handshake with {host} failed ({error})")
+        }
+    }
 }
 
 /// The request on one connection, the body of a `200` written into `into`.
