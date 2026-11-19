@@ -57,6 +57,8 @@ npm ci && npm test          # once the root npm workspace exists; needs Node 22 
 cargo test --workspace
 ```
 
+`scripts/install-gate.sh` is beside it and not part of it: it builds the container image from the working tree and runs the install tests (`blackbox/tests/install_*.rs`, ignored in the gate) against it with Docker and Compose. It is run for a ticket that touches the image, the Compose files or what they start, and by the release pipeline before anything is published.
+
 The SDK (`sdk/`), its type tests and the fixture projects written with it are one npm workspace at the repository root. The black-box tests build those fixture projects with the SDK's tooling and send them to the real program.
 
 ### Rust rules

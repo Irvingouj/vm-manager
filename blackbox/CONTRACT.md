@@ -1635,7 +1635,7 @@ From this ticket on the template's `AGENTS.md` names `vibe request` in its table
 - Test rows in the stand-ins, opening the local Application in a browser, a command that resets the local databases, and working with a pull that cannot reach the installation are the next ticket's.
 - Windows: the ticket on the three systems.
 - A stand-in gives its read login every table and its write login every table: an installation's logins may be allowed less, table by table, and a view's stand-in can be written to where the view cannot.
-- The archive of Postgres is a third party's build, pinned by its checksum; where it comes from before release is the ticket on installing.
+- The archive of Postgres is a third party's build, pinned by its checksum; for the first release it stays that build, said in the release's notes (the ticket "A first, minimal release").
 - Each run starts and stops its Postgres and builds the project: a request takes seconds, not milliseconds. The next ticket keeps the local Application running.
 - `vibe.dev.json` is in the repository: the Grant a pull copies there is the one of whoever pulled last.
 
@@ -1802,8 +1802,8 @@ The black-box harness has an identity provider of its own (`blackbox`, no produc
 - Whom an Application is shared with: the ticket on Contributors and sharing ("Contributors and sharing: Opening an Application"). Until then every signed-in User may open every Application.
 - The Dashboard at `dashboard.<domain>`: its ticket; it signs in by the same way through ("The Dashboard: Signing in to it").
 - Signing out at the identity provider, and being signed out by it (back-channel logout).
-- TLS: the program listens in plain HTTP behind what ends TLS (the ticket on installing).
-- An identity provider whose certificate is signed by a company's own certificate authority: the program trusts the public roots compiled into it and no other (the ticket on installing).
+- TLS: the program listens in plain HTTP behind what ends TLS: the Compose file's proxy or the administrator's own ("Installing: one image and a Compose file"). The program serving TLS itself is the ticket "The program serves TLS itself with a supplied wildcard certificate".
+- An identity provider whose certificate is signed by a company's own certificate authority: closed since, by `VIBE_CA_FILE` ("A company's own certificate authority").
 
 ## The tool signs in through the browser, and OIDC is connected from the tool (ticket: The tool signs in through the browser; Platform administrators come from the directory)
 
@@ -1895,7 +1895,7 @@ The harness connects OIDC as an administrator would (`vibe setup`, then the conn
 
 - Other commands for Platform administrators: the tickets on Resources and Grants in full and on what Platform administrators see.
 - A Platform administrator ending someone else's tool credential or session.
-- The tool still speaks plain HTTP to a loopback address (the ticket on installing brings HTTPS). The Dashboard: its ticket.
+- The tool spoke plain HTTP to a loopback address only; closed since ("The tool reaches an installation over HTTPS"). The Dashboard: its ticket.
 
 ## Contributors and sharing (ticket: Contributors and sharing: who may change and who may open an Application)
 
@@ -2182,3 +2182,55 @@ vibe admin connect-oidc --domain <domain> [--port <n>] [--resolve <ip>] | --conn
 - **The identity provider.** With the provider's certificate issued under an authority of the file, `PUT /v1/oidc` and every sign-in work as with a public one. Without the file (or with a file that does not hold that authority), `PUT /v1/oidc` is `422` `identity-provider-unusable` as before, and the message says that the provider's certificate was not trusted and names `VIBE_CA_FILE`; a certificate that is for another name than the issuer's, expired or not valid yet is the same refusal whatever the file holds, and the message says which of these it was; a connection that is in the platform database is kept and its sign-ins end as with a provider that cannot be reached.
 - **The local run's download of Postgres** ("The local run": `VIBE_LOCAL_POSTGRES_MIRROR`). From an `https` mirror whose certificate is issued under an authority of the file, the download works as from a public one. Without that authority it is `postgres-unavailable` as any failed download, and when the certificate's authority is the one not known the message names `VIBE_CA_FILE`; a certificate that is for another name than the mirror's, expired or not valid yet is `postgres-unavailable` whatever the file holds, the message saying which of these it was, and nothing is asked of the mirror. A file that cannot be used is reason `ca-file`, exit code `1`, found when the download is about to make an HTTPS connection and before anything is asked over it: with an `https` mirror (its scheme in any letter case) that is before anything is asked at all; with an `http` mirror that redirects to `https`, it is at the redirect. A download that never leaves `http` does not look at the file.
 - Nothing the program serves changes by it: it gives no certificate to anyone and trusts nothing more on what it listens on.
+
+## Installing: one image and a Compose file (ticket: Install: one image and a Compose file, hardened)
+
+Installing is one container image and one Compose file beside a Postgres 18 (ADR 0015). What is said here is what an outsider with Docker can observe; it is tested by the install tests (`blackbox/tests/install_*.rs`), which are not part of the gate: they need Docker and a built image, are marked ignored with that reason, and are run by `scripts/install-gate.sh`, which builds the image from the working tree first and gives its name to the tests in `VIBE_INSTALL_IMAGE`. The release workflow runs the same script before it publishes anything.
+
+### The image
+
+- Built by `docker build .` from the `Dockerfile` at the repository's root, with nothing else on the machine than Docker (the build stage brings the toolchain of `rust-toolchain.toml` and what the build needs; the lock file is honoured: a build whose lock file would change fails).
+- It holds the program `vibe` on the path and runs it: `docker run --rm <image> --version` prints what `vibe --version` prints. Its default command is `serve`; what `serve` needs comes from the environment and the command line as "Serving" says.
+- It runs as a user that is not root, given as a number (so that `runAsNonRoot` can check it), and needs nothing writable: it starts and serves with a read-only root filesystem, every capability dropped, `no-new-privileges`, no volume and no tmpfs. The program writes its log to standard error and nothing to disk.
+- It needs no certificate authorities of the system: the public ones are built into the program. A company's own authority is a file mounted read-only and named by `VIBE_CA_FILE` ("A company's own certificate authority").
+- It holds `/usr/share/doc/vibe/THIRD-PARTY-LICENSES`: every crate of the lock file that is built into the program for the image's target, with its version, its licence as its manifest states it, and the licence texts its source carries (a crate whose source carries none is listed with its manifest's statement and that fact). It is made at the image's build from the lock file, never kept by hand. The program's own `LICENSE` comes with the ticket of the first release.
+- It holds no compiler, no package manager, no source, and no shell is needed to run it (there is none).
+- Its labels say where it comes from: `org.opencontainers.image.source` (the repository), `org.opencontainers.image.version` (what `vibe --version` says) and `org.opencontainers.image.licenses`.
+
+### The Compose files
+
+`deploy/compose.yaml` works as downloaded, alone, with a `.env` file beside it holding the values; `deploy/.env.example` lists every value with how to make it, and `deploy/README.md` is the install document (from a machine with Docker to a signed-in person, every command written out).
+
+| Value | What it is | Without it |
+|---|---|---|
+| `VIBE_DOMAIN` | the installation's domain; Applications are at `<name>.<domain>` | Compose refuses, naming it |
+| `VIBE_SECRET_KEY` | the installation's key ("The installation's key"): `openssl rand -base64 32` | Compose refuses, naming it |
+| `POSTGRES_PASSWORD` | the bundled Postgres's password: `openssl rand -hex 24` | Compose refuses, naming it (not asked with `compose.own-postgres.yaml`) |
+| `VIBE_BIND` | the address the installation is published on | `127.0.0.1`: reached from this machine only |
+| `VIBE_HTTPS_PORT` | the port browsers and the tool reach | `443` |
+| `VIBE_IMAGE` | the image | the published image of this release |
+| `VIBE_CA_FILE` | a file of `deploy/ca/`, as the container sees it (`/etc/vibe/ca/<file>`): the company's own authority | none: the built-in public authorities alone |
+
+- **Services.** `vibe` (the image), `postgres` (the bundled Postgres 18, its data in a named volume, published nowhere), and `proxy` (a reverse proxy that terminates TLS with the administrator's wildcard certificate for `*.<domain>`, read from `deploy/certs/fullchain.pem` and `deploy/certs/privkey.pem`, and passes every request on with its `Host` unchanged and no limit of its own below the platform's on a request's size or time). Each image is named with its version, never `latest`.
+- **The bundled Postgres** holds the role `vibe`, which may create databases and roles and is not a superuser, with the password `POSTGRES_PASSWORD`, and the platform database `vibe`; the platform connects as that role and never as a superuser. The superuser `postgres` cannot connect over the network at all (the administrator reaches it inside the container: `docker compose exec postgres psql -U postgres`), and `CONNECT` on the databases `postgres` and `template1` is revoked from `PUBLIC`, which a platform that is no superuser cannot do itself ("What this does not close" of the own databases). `deploy/README.md` says the same two things to do on a Postgres the administrator brings.
+- **`vibe` as started by the file**: read-only root filesystem, all capabilities dropped, `no-new-privileges`, the image's non-root user, no tmpfs, and one mount: the folder `deploy/ca/` read-only at `/etc/vibe/ca` (empty as downloaded). `serve --domain <VIBE_DOMAIN> --listen 0.0.0.0:8080 --public-scheme https --public-port <VIBE_HTTPS_PORT>`; never `--stand-in-sign-in`. It is restarted unless stopped. The installation's key and the database's address are in its environment and in no command line.
+- **Listening.** With the file as downloaded only `VIBE_BIND:VIBE_HTTPS_PORT` is published, on loopback; `VIBE_BIND=0.0.0.0` is the explicit setting that lets other machines in. The program's own port and Postgres's are published nowhere.
+- **Behind the administrator's own reverse proxy** instead of the file's: `docker compose -f compose.yaml -f compose.own-proxy.yaml up -d`. There is no `proxy` service then, and the program's own port is published at `VIBE_HTTP_BIND:VIBE_HTTP_PORT` (`127.0.0.1` and `8080` without them), plain HTTP, for that proxy only. That proxy must pass `Host` on unchanged; the addresses the platform writes come from `--public-scheme` and `--public-port`, never from a header of the request.
+- **With the administrator's Postgres**: `VIBE_DATABASE_URL` in `.env` and `docker compose -f compose.yaml -f compose.own-postgres.yaml up -d`. There is no `postgres` service and no volume then; without `VIBE_DATABASE_URL` Compose refuses, naming it. The role must be allowed to create databases and roles; a server that is not Postgres 18 is refused as "One Postgres version" says, and the container's log says so. The two other files can be given together.
+- **The setup credential** is printed once by `docker compose exec vibe vibe setup`, to the administrator's terminal and to no log. From there on the steps are those of "Connecting OIDC": the redirect address to register at the identity provider is `https://auth.<domain>[:<port>]/callback`, then `vibe admin connect-oidc --domain <domain> ...` with the tool, from any machine that reaches the installation over HTTPS.
+- **Upgrading** is a newer `VIBE_IMAGE` and `docker compose pull && docker compose up -d`: the platform database, every own database, the OIDC connection and the sessions are kept (the data is the volume's, the key the `.env`'s). `docker compose down` keeps them too; only `down --volumes` removes the bundled Postgres's data.
+
+### What the install tests show
+
+Against the image `VIBE_INSTALL_IMAGE` names, started by the files of `deploy/` themselves, copied unchanged to a folder of the test's with its `.env`, certificates and authority (a test may add one more `-f` file for what stands in for the outside world, which is name resolution to the identity provider; that file changes nothing else of `vibe`, `postgres` or `proxy`):
+
+- with the file as downloaded and the three required values, the installation comes up; `https://api.<domain>/v1/installation` answers through the proxy with the wildcard certificate, and says no sign-in is connected;
+- `docker compose exec vibe vibe setup` prints a setup credential; OIDC is connected with it by the tool outside the container, over HTTPS (`--port`, `--resolve`, `VIBE_CA_FILE` for the proxy's test authority), against an identity provider the container reaches over HTTPS under a private authority given by `VIBE_CA_FILE` in `deploy/ca/`; a person signs in, a Contributor deploys the template's Application with the tool, and a request to `https://<application>.<domain>/` as that person is answered by it (the walking skeleton's request, as installed); sign-out works by its form; every redirect names the public address (`https`, the public port);
+- what `docker inspect` says of the running `vibe` container: read-only root filesystem, no capability, `no-new-privileges`, a user that is not root, no mount but `/etc/vibe/ca` read-only; and nothing but the proxy is published, on loopback;
+- in the bundled Postgres the role `vibe` is no superuser and may create databases and roles; `PUBLIC` may not connect to `postgres` or `template1`; the superuser is refused over the network with its right password and let in inside the container; after the deploy, the Application's own database and roles are there;
+- restarting `vibe`, and `down` then `up`, keep the Application and the connection and let the same person in again; with `VIBE_IMAGE` naming a second tag of the image (an upgrade), the same;
+- with `compose.own-postgres.yaml` and `VIBE_DATABASE_URL` naming a Postgres 18 outside the files, the installation comes up and takes a sign-in's first step;
+- with `compose.own-proxy.yaml`, behind another reverse proxy that terminates TLS, the installation answers and its redirects name the public address;
+- without `VIBE_DOMAIN`, `VIBE_SECRET_KEY` or `POSTGRES_PASSWORD`, `docker compose config` fails naming the missing value;
+- the image's `THIRD-PARTY-LICENSES` names every crate `cargo tree -p vibe --edges normal,build --prefix none` lists for the image's target with its version, and each has a licence stated;
+- the image has no shell (`docker run --rm --entrypoint /bin/sh <image>` cannot start) and its user is a number other than `0`.
