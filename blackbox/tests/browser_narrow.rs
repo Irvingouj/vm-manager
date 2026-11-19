@@ -1,4 +1,5 @@
-//! No page is wider than a narrow window, in a real browser (CONTRACT.md,
+//! No page is wider than a narrow window, in a real browser (the
+//! installation's pages over HTTPS, the local run's in plain HTTP) (CONTRACT.md,
 //! "A real browser in the gate: What it walks", 8; "The Dashboard": "A page
 //! is never wider than its window, down to a phone's 320 CSS pixels").
 //!
@@ -21,13 +22,10 @@
 use blackbox::dev::Dev;
 use blackbox::firefox::{self, Firefox, Options, no_wider_than};
 use blackbox::local::{Local, local_project};
-use blackbox::sessions::{ADA, GRACE, Installation, ada, grace};
+use blackbox::sessions::{ADA, GRACE, ada, grace};
 use blackbox::tool::Machine;
 use blackbox::tool_sign_ins::{OPEN_TIMEOUT, tool_address_in};
-use blackbox::walks::{
-    application, application_of, auth, browser_for, choose_at_provider, dashboard, on,
-    share_by_form, sign_in_to_dashboard,
-};
+use blackbox::walks::{Site, choose_at_provider, on_site, share_by_form, sign_in_to_dashboard};
 
 /// The width of a phone's window, in CSS pixels.
 const NARROW: u32 = 320;
@@ -56,19 +54,19 @@ fn assert_narrow(browser: &mut Firefox, page: &str) {
 #[test]
 fn the_platforms_pages_are_no_wider_than_a_window_320_css_pixels_wide() {
     firefox::required();
-    let at = Installation::start_with(&[], &[ada(), grace()], &[]);
+    let site = Site::start(&[ada(), grace()]);
     let long = longest_name();
-    application_of(&at, ADA, &long, Some(&long_description()));
-    application_of(&at, ADA, "board", Some("The incident board"));
-    application_of(&at, GRACE, "private", None);
+    site.application_of(ADA, &long, Some(&long_description()));
+    site.application_of(ADA, "board", Some("The incident board"));
+    site.application_of(GRACE, "private", None);
     // Grace signs in once, so that Ada can share with her by email.
-    let mut browser = browser_for(&[long.as_str(), "board", "private"]);
-    sign_in_to_dashboard(&mut browser, &at, GRACE);
+    let mut browser = site.browser(&[long.as_str(), "board", "private"]);
+    sign_in_to_dashboard(&mut browser, &site, GRACE);
     drop(browser);
 
-    let mut browser = browser_for(&[long.as_str(), "board", "private"]);
+    let mut browser = site.browser(&[long.as_str(), "board", "private"]);
     browser.narrow(NARROW);
-    sign_in_to_dashboard(&mut browser, &at, ADA);
+    sign_in_to_dashboard(&mut browser, &site, ADA);
     assert!(
         browser
             .find(&format!("[data-vm-application=\"{long}\"]"))
@@ -78,7 +76,7 @@ fn the_platforms_pages_are_no_wider_than_a_window_320_css_pixels_wide() {
     );
     assert_narrow(&mut browser, "the Dashboard's list with Applications in it");
 
-    browser.navigate(&dashboard(&at, &format!("/applications/{long}")));
+    browser.navigate(&site.dashboard(&format!("/applications/{long}")));
     share_by_form(&mut browser, "email", "grace@example.test");
     assert!(
         browser.find("form[data-vm-form=\"unshare\"]").is_some(),
@@ -102,31 +100,36 @@ fn the_platforms_pages_are_no_wider_than_a_window_320_css_pixels_wide() {
     );
     assert_narrow(&mut browser, "the Dashboard's page of a refusal");
 
-    browser.navigate(&application(&at, "private", "/"));
+    browser.navigate(&site.application("private", "/"));
     assert_eq!(browser.status(), Some(403), "{}", browser.describe());
     assert_narrow(
         &mut browser,
         "the page of an Application not shared with the person",
     );
 
-    browser.navigate(&auth(&at, "/sign-out"));
+    browser.navigate(&site.auth("/sign-out"));
     assert_eq!(browser.status(), Some(200), "{}", browser.describe());
     assert_narrow(&mut browser, "the sign-out page");
 
     let machine = Machine::new();
-    let running = at.spawn_sign_in(&machine, &["--no-browser", "--json"], &[]);
+    let mut args = vec!["sign-in".to_owned()];
+    args.extend(site.place());
+    args.extend(["--no-browser".to_owned(), "--json".to_owned()]);
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let (ca_name, ca_value) = site.ca_env();
+    let running = machine.spawn_into_files(&machine.cwd(), &refs, &[(ca_name, ca_value.as_str())]);
     let started = std::time::Instant::now();
     let address = loop {
-        if let Some(address) = tool_address_in(&running.stderr_so_far(), &at.auth_origin()) {
+        if let Some(address) = tool_address_in(&running.stderr_so_far(), &site.origin("auth")) {
             break address;
         }
         assert!(started.elapsed() < OPEN_TIMEOUT, "no address from the tool");
         std::thread::sleep(std::time::Duration::from_millis(50));
     };
     browser.navigate(address.as_str());
-    choose_at_provider(&mut browser, &at.provider, ADA);
+    choose_at_provider(&mut browser, site.provider(), ADA);
     browser.wait_for_page("the page of the tool's sign-in", |u| {
-        on(u, &at.auth_host(), at.port())
+        on_site(u, &site, "auth")
     });
     assert!(
         browser.find("form input[name=\"code\"]").is_some(),

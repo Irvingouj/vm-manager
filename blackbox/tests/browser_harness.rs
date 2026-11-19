@@ -417,3 +417,174 @@ fn a_browser_reaches_the_names_it_is_given_on_this_machine_and_nothing_else_of_t
         );
     }
 }
+
+/// A stand-in site in plain HTTP on the loopback address, for a TLS front
+/// to stand before: `GET /` is a page with one form posting to `/sent`
+/// and a cookie `__Host-probe` (`Secure; HttpOnly; SameSite=Lax`); `POST
+/// /sent` is a page saying it arrived. Each answer closes its connection.
+/// It serves at most [`STAND_IN_CONNECTIONS`] connections, each read
+/// within a time limit, and ends when its owner stops it.
+struct StandIn {
+    address: std::net::SocketAddr,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    serving: Option<thread::JoinHandle<()>>,
+}
+
+const STAND_IN_CONNECTIONS: usize = 32;
+
+impl StandIn {
+    fn start() -> Self {
+        use std::io::{Read, Write};
+        use std::sync::atomic::Ordering;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stopping = std::sync::Arc::clone(&stop);
+        let serving = thread::spawn(move || {
+            let mut served = 0;
+            while served < STAND_IN_CONNECTIONS && !stopping.load(Ordering::Relaxed) {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    thread::sleep(Duration::from_millis(20));
+                    continue;
+                };
+                served += 1;
+                drop(stream.set_nonblocking(false));
+                drop(stream.set_read_timeout(Some(Duration::from_secs(10))));
+                let mut head = Vec::new();
+                let mut chunk = [0_u8; 4096];
+                while !head.windows(4).any(|w| w == b"\r\n\r\n") && head.len() < 65_536 {
+                    match stream.read(&mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => head.extend_from_slice(&chunk[..n]),
+                    }
+                }
+                let text = String::from_utf8_lossy(&head).into_owned();
+                let (body, cookie) = if text.starts_with("POST /sent ") {
+                    (
+                        "<!doctype html><title>sent</title><p id=sent>arrived</p>",
+                        "",
+                    )
+                } else {
+                    (
+                        "<!doctype html><title>form</title><form method=post action=/sent><input type=hidden name=a value=b><button type=submit id=go>Send</button></form>",
+                        "Set-Cookie: __Host-probe=1; Path=/; Secure; HttpOnly; SameSite=Lax\r\n",
+                    )
+                };
+                drop(write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\n{cookie}Connection: close\r\n\r\n{body}",
+                    body.len()
+                ));
+            }
+        });
+        Self {
+            address,
+            stop,
+            serving: Some(serving),
+        }
+    }
+}
+
+impl Drop for StandIn {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(serving) = self.serving.take() {
+            drop(serving.join());
+        }
+    }
+}
+
+/// The name of the stand-in site, one of the installation's domain.
+const SITE: &str = "form.vm.test";
+
+#[test]
+fn a_browser_not_given_the_authority_refuses_the_front_and_shows_its_own_certificate_error() {
+    let stand_in = StandIn::start();
+    let authority = blackbox::tls::Authority::new("Harness authority of a browser check");
+    let front = blackbox::tls::Front::tls(&authority.issue(&[SITE]), stand_in.address);
+    let mut browser = Firefox::start_with(&Options::reaching(&[SITE.to_owned()]));
+    let address = format!("https://{SITE}:{}/", front.port());
+    let refused = browser.command("WebDriver:Navigate", &serde_json::json!({ "url": address }));
+    eprintln!("Marionette answered the navigation with: {refused:?}");
+    assert!(
+        refused
+            .as_ref()
+            .is_err_and(|e| e.error == "insecure certificate"),
+        "expected the navigation refused as an insecure certificate, got {refused:?}"
+    );
+    let document = browser.script("return document.documentURI;", &[]);
+    let text = browser.text();
+    eprintln!(
+        "the page shown: {} (document {document})\n--- its text ---\n{text}\n---",
+        browser.url()
+    );
+    assert!(
+        document
+            .as_str()
+            .is_some_and(|d| d.starts_with("about:certerror")),
+        "expected the document shown to be the browser's own certificate error, got {document}"
+    );
+    let seen = front.connections();
+    assert!(
+        !seen.is_empty()
+            && seen.iter().all(
+                |s| s.received_bytes == 0 && s.handshake != blackbox::tls::Handshake::Completed
+            ),
+        "expected no handshake completed and nothing sent past it: {seen:?}"
+    );
+    eprintln!("the front saw: {seen:?}");
+}
+
+#[test]
+fn a_form_of_an_https_page_submitted_by_a_click_arrives_with_the_browsers_origin_and_sec_fetch_headers()
+ {
+    let stand_in = StandIn::start();
+    let authority = blackbox::tls::Authority::new("Harness authority of a browser check");
+    let front = blackbox::tls::Front::tls(&authority.issue(&[SITE]), stand_in.address);
+    let mut browser = Firefox::start_with(
+        &Options::reaching(&[SITE.to_owned()]).trusting(authority.der().as_ref()),
+    );
+    let origin = format!("https://{SITE}:{}", front.port());
+    browser.navigate(&format!("{origin}/"));
+    let go = browser.the("#go");
+    browser.click(&go);
+    browser.wait_for("the page the form led to", Duration::from_secs(30), |f| {
+        f.find("#sent")
+    });
+    let requests = front.requests();
+    let posted = requests
+        .iter()
+        .find(|r| r.line.starts_with("POST /sent "))
+        .unwrap_or_else(|| panic!("expected the form's POST through the front: {requests:?}"));
+    let header = |name: &str| posted.header_values(name);
+    for (name, _) in posted
+        .headers
+        .iter()
+        .filter(|(n, _)| n.to_ascii_lowercase().starts_with("sec-fetch-"))
+    {
+        eprintln!("the form's request: {name}: {}", header(name).join(", "));
+    }
+    eprintln!(
+        "the form's request: origin: {}",
+        header("origin").join(", ")
+    );
+    let names: Vec<String> = header("cookie")
+        .iter()
+        .flat_map(|c| {
+            c.split(';')
+                .map(|p| p.trim().split('=').next().unwrap_or("").to_owned())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    eprintln!("cookie names sent: {names:?}");
+    assert_eq!(header("origin"), [origin], "{posted:?}");
+    assert_eq!(header("sec-fetch-site"), ["same-origin"]);
+    assert_eq!(header("sec-fetch-mode"), ["navigate"]);
+    assert_eq!(header("sec-fetch-dest"), ["document"]);
+    assert_eq!(
+        names,
+        ["__Host-probe"],
+        "expected the Secure cookie sent back"
+    );
+}

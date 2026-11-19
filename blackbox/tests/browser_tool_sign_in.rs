@@ -1,5 +1,7 @@
 //! The tool's sign-in, both ways, with the page walked in a real browser
-//! (CONTRACT.md, "A real browser in the gate: What it walks", 6; "The tool
+//! over HTTPS, the tool reaching the installation over HTTPS with
+//! `VIBE_CA_FILE` (CONTRACT.md, "The tool reaches an installation over
+//! HTTPS"; "A real browser in the gate: What it walks", 6; "The tool
 //! signs in through the browser, and OIDC is connected from the tool:
 //! Signing the tool in").
 //!
@@ -17,26 +19,46 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use blackbox::firefox::{self, Firefox};
-use blackbox::sessions::{ADA, Installation, ada, grace};
+use blackbox::sessions::{ADA, ada, grace};
 use blackbox::tool::{Machine, Running};
 use blackbox::tool_sign_ins::{
     BrowserCommand, OPEN_TIMEOUT, check_code_in, check_code_of, tool_address_in,
 };
-use blackbox::walks::{browser_for, choose_at_provider, click_to_another_page, on};
+use blackbox::walks::{Site, choose_at_provider, click_to_another_page, on_site};
 use url::Url;
 
-fn installation() -> Installation {
-    Installation::start_with(&[], &[ada(), grace()], &[])
+fn site() -> Site {
+    Site::start(&[ada(), grace()])
+}
+
+/// Starts `vibe sign-in` reaching the installation over HTTPS (`--domain`,
+/// `--resolve`, `--port` of the front, `VIBE_CA_FILE` naming its
+/// authority), with these more arguments and environment variables.
+fn spawn_sign_in(site: &Site, machine: &Machine, more: &[&str], env: &[(&str, &str)]) -> Running {
+    let mut args = vec!["sign-in".to_owned()];
+    args.extend(site.place());
+    args.extend(more.iter().map(|a| (*a).to_owned()));
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let (ca_name, ca_value) = site.ca_env();
+    let mut all: Vec<(&str, &str)> = vec![(ca_name, ca_value.as_str())];
+    all.extend_from_slice(env);
+    machine.spawn_into_files(&machine.cwd(), &refs, &all)
+}
+
+/// `vibe whoami --json` through the front, as the tool reaches it.
+fn whoami(site: &Site, machine: &Machine) -> blackbox::tool::Run {
+    let (ca_name, ca_value) = site.ca_env();
+    machine.run_with_env(&["whoami", "--json"], &[(ca_name, ca_value.as_str())])
 }
 
 /// The address and the check code `vibe sign-in --no-browser` wrote on
 /// standard error, waited for.
-fn shown_address_and_code(at: &Installation, running: &Running) -> (Url, String) {
+fn shown_address_and_code(site: &Site, running: &Running) -> (Url, String) {
     let deadline = Instant::now() + OPEN_TIMEOUT;
     loop {
         let stderr = running.stderr_so_far();
         if let (Some(address), Some(code)) = (
-            tool_address_in(&stderr, &at.auth_origin()),
+            tool_address_in(&stderr, &site.origin("auth")),
             check_code_in(&stderr),
         ) {
             return (address, code);
@@ -51,11 +73,16 @@ fn shown_address_and_code(at: &Installation, running: &Running) -> (Url, String)
 
 /// Opens the tool's address in the browser and goes through the provider
 /// as Ada, to the page that asks.
-fn to_the_page(browser: &mut Firefox, at: &Installation, address: &Url) {
+fn to_the_page(browser: &mut Firefox, site: &Site, address: &Url) {
+    assert_eq!(
+        address.scheme(),
+        "https",
+        "expected the tool to give an https address: {address}"
+    );
     browser.navigate(address.as_str());
-    choose_at_provider(browser, &at.provider, ADA);
+    choose_at_provider(browser, site.provider(), ADA);
     browser.wait_for_page("the page of the tool's sign-in", |u| {
-        on(u, &at.auth_host(), at.port())
+        on_site(u, site, "auth")
     });
     assert_eq!(
         browser.status(),
@@ -77,12 +104,12 @@ fn wait_end(running: Running) -> blackbox::tool::Run {
 #[test]
 fn without_a_browser_the_check_code_typed_into_the_page_signs_the_tool_in() {
     firefox::required();
-    let at = installation();
+    let site = site();
     let machine = Machine::new();
-    let running = at.spawn_sign_in(&machine, &["--no-browser", "--json"], &[]);
-    let (address, code) = shown_address_and_code(&at, &running);
-    let mut browser = browser_for(&[]);
-    to_the_page(&mut browser, &at, &address);
+    let running = spawn_sign_in(&site, &machine, &["--no-browser", "--json"], &[]);
+    let (address, code) = shown_address_and_code(&site, &running);
+    let mut browser = site.browser(&[]);
+    to_the_page(&mut browser, &site, &address);
     let input = browser.the("form input[name=\"code\"]");
     browser.type_into(&input, &code);
     let confirm = confirm_button(&mut browser);
@@ -101,21 +128,22 @@ fn without_a_browser_the_check_code_typed_into_the_page_signs_the_tool_in() {
     let run = wait_end(running);
     let printed = run.ok_json();
     assert_eq!(printed["user"], ADA, "{}", run.describe());
-    let who = machine.run(&["whoami", "--json"]).ok_json();
+    let who = whoami(&site, &machine).ok_json();
     assert_eq!(who["user"], ADA, "expected `vibe whoami` to say Ada: {who}");
 }
 
 #[test]
 fn a_wrong_check_code_is_refused_on_the_page_in_words_and_the_tool_is_not_signed_in() {
     firefox::required();
-    let at = installation();
+    let site = site();
     let machine = Machine::new();
-    let running = at.spawn_sign_in(
+    let running = spawn_sign_in(
+        &site,
         &machine,
         &["--no-browser", "--json", "--timeout", "10"],
         &[],
     );
-    let (address, code) = shown_address_and_code(&at, &running);
+    let (address, code) = shown_address_and_code(&site, &running);
     let challenge = address
         .query_pairs()
         .find(|(n, _)| n == "challenge")
@@ -127,8 +155,8 @@ fn a_wrong_check_code_is_refused_on_the_page_in_words_and_the_tool_is_not_signed
     } else {
         "0000-0000"
     };
-    let mut browser = browser_for(&[]);
-    to_the_page(&mut browser, &at, &address);
+    let mut browser = site.browser(&[]);
+    to_the_page(&mut browser, &site, &address);
     let input = browser.the("form input[name=\"code\"]");
     browser.type_into(&input, wrong);
     let confirm = confirm_button(&mut browser);
@@ -156,25 +184,23 @@ fn a_wrong_check_code_is_refused_on_the_page_in_words_and_the_tool_is_not_signed
     );
     let run = wait_end(running);
     run.json_error(3, "sign-in-not-finished");
-    machine
-        .run(&["whoami", "--json"])
-        .json_error(4, "not-signed-in");
+    whoami(&site, &machine).json_error(4, "not-signed-in");
 }
 
 #[test]
 fn with_a_browser_on_the_machine_the_pages_confirmation_signs_the_tool_in() {
     firefox::required();
-    let at = installation();
+    let site = site();
     let machine = Machine::new();
     let opener = BrowserCommand::on(&machine);
     let (name, value) = opener.env();
-    let running = at.spawn_sign_in(&machine, &["--json"], &[(name, value.as_str())]);
+    let running = spawn_sign_in(&site, &machine, &["--json"], &[(name, value.as_str())]);
     let opened = opener
         .wait_opened(OPEN_TIMEOUT)
         .expect("expected `vibe sign-in` to hand an address to BROWSER");
     let address = Url::parse(&opened).unwrap();
-    let mut browser = browser_for(&[]);
-    to_the_page(&mut browser, &at, &address);
+    let mut browser = site.browser(&[]);
+    to_the_page(&mut browser, &site, &address);
     assert!(
         browser.find("form input[name=\"code\"]").is_none(),
         "with a port the page asks for no check code\n{}",
@@ -184,6 +210,12 @@ fn with_a_browser_on_the_machine_the_pages_confirmation_signs_the_tool_in() {
     click_to_another_page(&mut browser, &confirm);
     let url = browser.url();
     let at_tool = Url::parse(&url).unwrap();
+    assert_eq!(
+        (at_tool.scheme(), at_tool.path()),
+        ("http", "/"),
+        "expected the tool's own loopback address in plain HTTP\n{}",
+        browser.describe()
+    );
     assert_eq!(
         at_tool.host_str(),
         Some("127.0.0.1"),
@@ -199,6 +231,6 @@ fn with_a_browser_on_the_machine_the_pages_confirmation_signs_the_tool_in() {
     let run = wait_end(running);
     let printed = run.ok_json();
     assert_eq!(printed["user"], ADA, "{}", run.describe());
-    let who = machine.run(&["whoami", "--json"]).ok_json();
+    let who = whoami(&site, &machine).ok_json();
     assert_eq!(who["user"], ADA, "expected `vibe whoami` to say Ada: {who}");
 }

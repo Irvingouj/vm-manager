@@ -63,6 +63,7 @@ use std::sync::{Condvar, Mutex, OnceLock, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use base64::Engine;
 use serde_json::{Value, json};
 
 use crate::program::run_to_exit;
@@ -247,6 +248,13 @@ pub struct Options {
     /// (`network.dns.localDomains`): every name of the installation the
     /// test opens. Names under `.localhost` need none.
     pub names: Vec<String>,
+    /// Certificate authorities the browser trusts for the sites it opens,
+    /// each its certificate in DER (never a key): an installation's TLS
+    /// front of the test's own. Put into the fresh profile's certificate
+    /// store after the start, before the first page; nothing else is
+    /// trusted beyond the browser's own, and a certificate it cannot check
+    /// is refused (`acceptInsecureCerts` false).
+    pub authorities: Vec<Vec<u8>>,
 }
 
 impl Options {
@@ -254,7 +262,15 @@ impl Options {
     pub fn reaching(names: &[String]) -> Self {
         Self {
             names: names.to_vec(),
+            authorities: Vec::new(),
         }
+    }
+
+    /// As it is, also trusting this authority (its certificate in DER).
+    #[must_use]
+    pub fn trusting(mut self, authority_der: &[u8]) -> Self {
+        self.authorities.push(authority_der.to_vec());
+        self
     }
 }
 
@@ -343,8 +359,13 @@ pub fn preferences(marionette_port: u16, options: &Options) -> String {
         // A JSON answer is shown as its text, as a page, not in the
         // browser's own viewer (which replaces the document a test reads).
         ("devtools.jsonview.enabled", json!(false)),
-        // A page served over plain HTTP is loaded as it is (the
-        // installation under test speaks HTTP on the loopback address).
+        // An `http` address is loaded as it is, never tried over HTTPS
+        // first or upgraded: the local run (`vibe dev`) serves its pages in
+        // plain HTTP on a name under `.localhost`, and the harness's
+        // identity provider answers in plain HTTP on `127.0.0.1`. Both are
+        // Firefox's defaults on a desktop build today; written down so
+        // that a build whose defaults differ walks the same way. The
+        // installation's own pages are `https` (its TLS front).
         ("dom.security.https_only_mode", json!(false)),
         ("dom.security.https_first", json!(false)),
         ("browser.fixup.alternate.enabled", json!(false)),
@@ -613,6 +634,9 @@ pub struct Firefox {
     log: PathBuf,
     port: u16,
     found: &'static Found,
+    /// From the start of the program to the open session (and the
+    /// authorities trusted).
+    start_took: Duration,
     /// Whether it was ended already.
     ended: bool,
     slot: Option<Slot>,
@@ -734,7 +758,9 @@ impl Firefox {
                 ));
             }
         };
-        let spawned = Command::new(&found.program)
+        let began = Instant::now();
+        let mut command = Command::new(&found.program);
+        command
             .arg("--headless")
             .arg("--marionette")
             .arg("--no-remote")
@@ -743,6 +769,14 @@ impl Firefox {
             .env("MOZ_HEADLESS", "1")
             .env("MOZ_CRASHREPORTER_DISABLE", "1")
             .env_remove("MOZ_MARIONETTE")
+            .env_remove("MOZ_REMOTE_ALLOW_SYSTEM_ACCESS");
+        if !options.authorities.is_empty() {
+            // Marionette's chrome scope, only to put the authorities into
+            // the profile's certificate store (see `trust`): a browser
+            // given none runs without it.
+            command.env("MOZ_REMOTE_ALLOW_SYSTEM_ACCESS", "1");
+        }
+        let spawned = command
             .process_group(0)
             .stdin(Stdio::null())
             .stdout(out)
@@ -768,6 +802,7 @@ impl Firefox {
                 log,
                 port,
                 found,
+                start_took: Duration::ZERO,
                 ended: false,
                 slot: Some(slot),
             };
@@ -783,11 +818,22 @@ impl Firefox {
             log,
             port,
             found,
+            start_took: Duration::ZERO,
             ended: false,
             slot: Some(slot),
         };
-        match firefox.connect() {
-            Ok(()) => Ok(firefox),
+        let connected = firefox
+            .connect()
+            .and_then(|()| firefox.trust(&options.authorities).map_err(|e| (e, false)));
+        match connected {
+            Ok(()) => {
+                firefox.start_took = began.elapsed();
+                eprintln!(
+                    "the harness's browser started (to its open session) in {} ms",
+                    firefox.start_took.as_millis()
+                );
+                Ok(firefox)
+            }
             Err((problem, retry)) => {
                 let shown = format!(
                     "{problem}\nthe browser: {} ({}), profile {}\nits output (the end):\n{}",
@@ -874,6 +920,38 @@ impl Firefox {
             ));
         }
         Ok(())
+    }
+
+    /// Puts each authority into the profile's certificate store, trusted
+    /// to issue sites' certificates (`C,,`), through Marionette's chrome
+    /// scope; the certificate is passed as the script's argument, never
+    /// pasted into it.
+    fn trust(&mut self, authorities: &[Vec<u8>]) -> Result<(), String> {
+        if authorities.is_empty() {
+            return Ok(());
+        }
+        self.command("Marionette:SetContext", &json!({ "value": "chrome" }))
+            .map_err(|e| format!("cannot reach the browser's chrome scope: {e}"))?;
+        for der in authorities {
+            let encoded = base64::engine::general_purpose::STANDARD.encode(der);
+            self.command(
+                "WebDriver:ExecuteScript",
+                &json!({
+                    "script": "const db = Cc['@mozilla.org/security/x509certdb;1'].getService(Ci.nsIX509CertDB); db.addCertFromBase64(arguments[0], 'C,,'); return true;",
+                    "args": [encoded]
+                }),
+            )
+            .map_err(|e| format!("cannot trust the test's authority in the browser: {e}"))?;
+        }
+        self.command("Marionette:SetContext", &json!({ "value": "content" }))
+            .map_err(|e| format!("cannot go back to the page's scope: {e}"))?;
+        Ok(())
+    }
+
+    /// How long its start took, from the program's start to the open
+    /// session.
+    pub fn start_took(&self) -> Duration {
+        self.start_took
     }
 
     /// The browser's main process.

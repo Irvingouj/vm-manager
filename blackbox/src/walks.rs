@@ -1,25 +1,39 @@
 //! What the tests that walk the platform's pages in a real browser share
-//! (CONTRACT.md, "A real browser in the gate: What it walks"): the names a
-//! browser must reach, a browser started for an installation, the person's
-//! step at the harness's identity provider taken by its form, signing in
-//! to the Dashboard, an Application of a person's own, and reading what
-//! the page shown says.
+//! (CONTRACT.md, "A real browser in the gate: What it walks"): an
+//! installation reached over HTTPS as a person reaches one ([`Site`]), a
+//! browser started for it that trusts its authority, the person's step at
+//! the harness's identity provider taken by its form, signing in to the
+//! Dashboard, an Application of a person's own, and reading what the page
+//! shown says.
 //!
 //! The browser is [`crate::firefox::Firefox`]: everything it sends (its
 //! `Origin`, `Referer`, `Sec-Fetch-...` headers and cookies) is its own; a
 //! walk only opens addresses, clicks and types.
+//!
+//! **Over HTTPS** ("What it walks: Over HTTPS, as an installation is
+//! reached"): the program is started with `--public-scheme https` and
+//! `--public-port` the port of a TLS front of the harness's
+//! ([`crate::tls`]) that stands before it, whose certificate (for
+//! `api.<domain>` and `*.<domain>`) an authority of the test's own issued.
+//! The browser trusts that authority, given to its fresh profile. The
+//! identity provider stays the harness's, in plain HTTP on `127.0.0.1` (a
+//! loopback address is a trustworthy origin to a browser).
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use serde_json::{Value, json};
 use url::Url;
 
 use crate::api::version_body;
+use crate::connection::SecretKey;
 use crate::firefox::{COMMAND_TIMEOUT, Firefox, Options};
-use crate::oidc::Provider;
+use crate::oidc::{Person, Provider};
 use crate::sessions::Installation;
+use crate::tls::{Authority, Bound, Files, Front, api_name, place_at, text_of};
 use crate::tool::bearer;
-use crate::vm::{DOMAIN, fixture_bundle};
+use crate::tool_sign_ins::{Challenge, Decision};
+use crate::vm::{DOMAIN, VmOptions, fixture_bundle};
 
 /// The fixture an Application of the walks runs: it answers JSON naming
 /// the User it was given the request as.
@@ -33,30 +47,174 @@ pub fn names_of(applications: &[&str]) -> Vec<String> {
     names
 }
 
-/// A browser that reaches the installation's names (the sign-in address,
-/// the Dashboard and these Applications) on this machine.
-pub fn browser_for(applications: &[&str]) -> Firefox {
-    Firefox::start_with(&Options::reaching(&names_of(applications)))
+/// An installation reached over HTTPS: the program with OIDC connected to
+/// the harness's provider, behind a TLS front with a certificate of the
+/// test's own authority.
+pub struct Site {
+    // The front first: it ends before the program it stands before.
+    pub front: Front,
+    pub at: Installation,
+    pub authority: Authority,
+    pub files: Files,
+    ca_file: PathBuf,
 }
 
-/// The Dashboard's address of `at` with this path and query, as text.
-pub fn dashboard(at: &Installation, target: &str) -> String {
-    crate::dashboard::oidc_url(at, target).to_string()
-}
+impl Site {
+    /// These people at the provider, the program started with
+    /// `--public-scheme https --public-port <the front's port>` and an
+    /// installation's key, OIDC connected, and the front serving.
+    pub fn start(people: &[Person]) -> Self {
+        let bound = Bound::new();
+        let port = bound.port().to_string();
+        let options = VmOptions::new()
+            .args_extra(&["--public-scheme", "https", "--public-port", &port])
+            .env("VIBE_SECRET_KEY", SecretKey::fresh().expose());
+        let at = Installation::from(Provider::start(people), &options);
+        let authority = Authority::new("Harness authority of the walks");
+        let identity = authority.issue(&[&api_name(), &format!("*.{DOMAIN}")]);
+        let front = bound.tls(&identity, at.vm.address());
+        let files = Files::new();
+        let ca_file = files.authorities("walks-authority.pem", &[&authority]);
+        Self {
+            front,
+            at,
+            authority,
+            files,
+            ca_file,
+        }
+    }
 
-/// An Application's address of `at` with this path and query, as text.
-pub fn application(at: &Installation, name: &str, target: &str) -> String {
-    at.app_url(name, target).to_string()
-}
+    /// The port a browser reaches the installation at: the front's.
+    pub fn port(&self) -> u16 {
+        self.front.port()
+    }
 
-/// The sign-in address of `at` with this path and query, as text.
-pub fn auth(at: &Installation, target: &str) -> String {
-    at.auth_url(target).to_string()
+    pub fn provider(&self) -> &Provider {
+        &self.at.provider
+    }
+
+    /// `https://<name>.<domain>:<port>`.
+    pub fn origin(&self, name: &str) -> String {
+        format!("https://{name}.{DOMAIN}:{}", self.port())
+    }
+
+    /// The host of a name of the installation: `<name>.<domain>`.
+    pub fn host(name: &str) -> String {
+        format!("{name}.{DOMAIN}")
+    }
+
+    /// The Dashboard's address with this path and query.
+    pub fn dashboard(&self, target: &str) -> String {
+        format!("{}{target}", self.origin("dashboard"))
+    }
+
+    /// An Application's address with this path and query.
+    pub fn application(&self, name: &str, target: &str) -> String {
+        format!("{}{target}", self.origin(name))
+    }
+
+    /// The sign-in address with this path and query.
+    pub fn auth(&self, target: &str) -> String {
+        format!("{}{target}", self.origin("auth"))
+    }
+
+    /// A browser that reaches the installation's names (the sign-in
+    /// address, the Dashboard and these Applications) on this machine and
+    /// trusts the installation's authority.
+    pub fn browser(&self, applications: &[&str]) -> Firefox {
+        Firefox::start_with(
+            &Options::reaching(&names_of(applications)).trusting(self.authority.der().as_ref()),
+        )
+    }
+
+    /// `VIBE_CA_FILE` naming the authority's certificate, for the tool.
+    pub fn ca_env(&self) -> (&'static str, String) {
+        ("VIBE_CA_FILE", text_of(&self.ca_file))
+    }
+
+    /// `--domain <domain> --resolve 127.0.0.1 --port <the front's port>`:
+    /// where the tool reaches the installation.
+    pub fn place(&self) -> Vec<String> {
+        place_at(self.port())
+    }
+
+    /// A tool credential for this person, made as the tool makes one with
+    /// a browser, played by the harness's own small browser (setup, not a
+    /// walk): a challenge with a port, `/tool` at the `https` sign-in
+    /// address and the provider, confirmed, and `POST /v1/tool-sign-ins`.
+    pub fn credential_for(&self, sub: &str) -> String {
+        let at = &self.at;
+        let challenge = Challenge::fresh();
+        let port =
+            crate::postgres::free_port().unwrap_or_else(|e| panic!("cannot find a free port: {e}"));
+        let mut browser = at.browser_as(sub);
+        let mut address = crate::browser::url(&self.auth("/tool"));
+        address
+            .query_pairs_mut()
+            .append_pair("challenge", &challenge.challenge)
+            .append_pair("port", &port.to_string())
+            .append_pair("machine", "harness-machine");
+        let steps = at.walk_tool_to_page(&mut browser, &address);
+        let page = steps.last().unwrap_or_else(|| panic!("no steps"));
+        let confirmed = at.answer_tool_page(&mut browser, page, Decision::Confirm, None);
+        let grant = at.grant_of(&confirmed, port);
+        let answer = at.post_tool_sign_in(challenge.verifier(), Some(&grant));
+        if answer.status != 201 {
+            at.vm.fail(&format!(
+                "expected 201 from POST /v1/tool-sign-ins for a confirmed sign-in\n{}",
+                crate::connection::shown(&answer, &[])
+            ));
+        }
+        answer.json()["credential"]
+            .as_str()
+            .unwrap_or_else(|| panic!("expected a credential in the answer"))
+            .to_owned()
+    }
+
+    /// `name`, made by `sub` through the platform's API with
+    /// `description`, its first Version the fixture [`FIXTURE`], shared
+    /// with nobody. Returns `sub`'s tool credential.
+    pub fn application_of(&self, sub: &str, name: &str, description: Option<&str>) -> String {
+        let credential = self.credential_for(sub);
+        let created = bearer(&self.at.vm, "/v1/applications", &credential)
+            .method("POST")
+            .json(&json!({ "name": name, "description": description }))
+            .send();
+        created.expect_status(201);
+        let sent = bearer(
+            &self.at.vm,
+            &format!("/v1/applications/{name}/versions"),
+            &credential,
+        )
+        .method("POST")
+        .json(&version_body(&fixture_bundle(FIXTURE)))
+        .send();
+        sent.expect_status(201);
+        credential
+    }
+
+    /// The entries `name` is shared with, as the platform's API answers
+    /// its Contributor (`user:<id>`, `group:<Group>`, `everyone`).
+    pub fn shared_with(&self, credential: &str, name: &str) -> Vec<String> {
+        let answer = bearer(&self.at.vm, &format!("/v1/applications/{name}"), credential).send();
+        answer.expect_status(200);
+        crate::sharing::keys(&answer.json()["shared_with"])
+    }
 }
 
 /// Whether `url` is on this host and port.
 pub fn on(url: &str, host: &str, port: u16) -> bool {
     Url::parse(url).is_ok_and(|u| u.host_str() == Some(host) && u.port() == Some(port))
+}
+
+/// Whether `url` is an `https` address on this name of the installation
+/// and port.
+pub fn on_site(url: &str, site: &Site, name: &str) -> bool {
+    Url::parse(url).is_ok_and(|u| {
+        u.scheme() == "https"
+            && u.host_str() == Some(Site::host(name).as_str())
+            && u.port() == Some(site.port())
+    })
 }
 
 /// Whether the page shown is the provider's.
@@ -91,12 +249,12 @@ pub fn choose_at_provider(firefox: &mut Firefox, provider: &Provider, sub: &str)
 
 /// Opens the Dashboard with no session, is sent to the provider, chooses
 /// `sub` there, and must land on the Dashboard's `/`.
-pub fn sign_in_to_dashboard(firefox: &mut Firefox, at: &Installation, sub: &str) {
-    firefox.navigate(&dashboard(at, "/"));
-    choose_at_provider(firefox, &at.provider, sub);
-    let host = format!("dashboard.{DOMAIN}");
-    let port = at.port();
-    let landed = firefox.wait_for_page("the Dashboard after signing in", |u| on(u, &host, port));
+pub fn sign_in_to_dashboard(firefox: &mut Firefox, site: &Site, sub: &str) {
+    firefox.navigate(&site.dashboard("/"));
+    choose_at_provider(firefox, site.provider(), sub);
+    let landed = firefox.wait_for_page("the Dashboard after signing in", |u| {
+        on_site(u, site, "dashboard")
+    });
     let path = Url::parse(&landed).map(|u| u.path().to_owned());
     assert_eq!(
         path.as_deref(),
@@ -122,41 +280,6 @@ pub fn page_json(firefox: &mut Firefox) -> Value {
 /// How many authorization requests the provider has been sent.
 pub fn authorizations(provider: &Provider) -> usize {
     provider.requests_to("/authorize").len()
-}
-
-/// `name`, made by `sub` through the platform's API with `description`,
-/// its first Version the fixture [`FIXTURE`], shared with nobody. Returns
-/// `sub`'s tool credential.
-pub fn application_of(
-    at: &Installation,
-    sub: &str,
-    name: &str,
-    description: Option<&str>,
-) -> String {
-    let credential = at.tool_credential_for(sub);
-    let created = bearer(&at.vm, "/v1/applications", &credential)
-        .method("POST")
-        .json(&json!({ "name": name, "description": description }))
-        .send();
-    created.expect_status(201);
-    let sent = bearer(
-        &at.vm,
-        &format!("/v1/applications/{name}/versions"),
-        &credential,
-    )
-    .method("POST")
-    .json(&version_body(&fixture_bundle(FIXTURE)))
-    .send();
-    sent.expect_status(201);
-    credential
-}
-
-/// The entries `name` is shared with, as the platform's API answers its
-/// Contributor (`user:<id>`, `group:<Group>`, `everyone`).
-pub fn shared_with(at: &Installation, credential: &str, name: &str) -> Vec<String> {
-    let answer = bearer(&at.vm, &format!("/v1/applications/{name}"), credential).send();
-    answer.expect_status(200);
-    crate::sharing::keys(&answer.json()["shared_with"])
 }
 
 /// Waits for an element `css` on the page shown; fails, showing the page,

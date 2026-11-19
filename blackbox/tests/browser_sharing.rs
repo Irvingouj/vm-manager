@@ -1,5 +1,5 @@
 //! Sharing and unsharing by the Dashboard's forms, and a refusal in words,
-//! walked in real browsers (CONTRACT.md, "A real browser in the gate: What
+//! walked in real browsers over HTTPS (CONTRACT.md, "A real browser in the gate: What
 //! it walks", 3 and 4; "The Dashboard: One Application", "Sharing from
 //! it").
 //!
@@ -14,18 +14,17 @@
     reason = "test code: a failed expectation is a failing test"
 )]
 
-use blackbox::DOMAIN;
 use blackbox::firefox::{self, Firefox};
-use blackbox::sessions::{ADA, GRACE, Installation, ada, grace};
+use blackbox::sessions::{ADA, GRACE, ada, grace};
 use blackbox::walks::{
-    application, application_of, browser_for, click_to_another_page, dashboard, on, page_json,
-    share_by_form, shared_with, sign_in_to_dashboard, unshare_by_form, wait_for_element,
+    Site, click_to_another_page, on_site, page_json, share_by_form, sign_in_to_dashboard,
+    unshare_by_form, wait_for_element,
 };
 
 const APP: &str = "board";
 
-fn installation() -> Installation {
-    Installation::start_with(&[], &[ada(), grace()], &[])
+fn site() -> Site {
+    Site::start(&[ada(), grace()])
 }
 
 /// The `data-vm-shared` entries of the Application's page shown, as
@@ -53,12 +52,12 @@ fn notice(browser: &mut Firefox) -> Option<String> {
 #[test]
 fn a_contributor_shares_by_the_form_the_other_person_opens_it_and_after_unsharing_is_refused() {
     firefox::required();
-    let at = installation();
-    let credential = application_of(&at, ADA, APP, Some("The incident board"));
+    let site = site();
+    let credential = site.application_of(ADA, APP, Some("The incident board"));
 
     // Grace has signed in here once, so the platform knows her email.
-    let mut grace_browser = browser_for(&[APP]);
-    sign_in_to_dashboard(&mut grace_browser, &at, GRACE);
+    let mut grace_browser = site.browser(&[APP]);
+    sign_in_to_dashboard(&mut grace_browser, &site, GRACE);
     assert!(
         grace_browser
             .find(&format!("[data-vm-application=\"{APP}\"]"))
@@ -67,9 +66,9 @@ fn a_contributor_shares_by_the_form_the_other_person_opens_it_and_after_unsharin
         grace_browser.describe()
     );
 
-    let mut ada_browser = browser_for(&[APP]);
-    sign_in_to_dashboard(&mut ada_browser, &at, ADA);
-    ada_browser.navigate(&dashboard(&at, &format!("/applications/{APP}")));
+    let mut ada_browser = site.browser(&[APP]);
+    sign_in_to_dashboard(&mut ada_browser, &site, ADA);
+    ada_browser.navigate(&site.dashboard(&format!("/applications/{APP}")));
     assert_eq!(
         shown_shared(&mut ada_browser),
         Vec::<String>::new(),
@@ -95,11 +94,11 @@ fn a_contributor_shares_by_the_form_the_other_person_opens_it_and_after_unsharin
         ada_browser.describe()
     );
     assert_eq!(
-        shared_with(&at, &credential, APP),
+        site.shared_with(&credential, APP),
         [format!("user:{GRACE}")]
     );
 
-    grace_browser.navigate(&dashboard(&at, "/"));
+    grace_browser.navigate(&site.dashboard("/"));
     let listed = wait_for_element(
         &mut grace_browser,
         &format!("[data-vm-application=\"{APP}\"][data-vm-relation=\"shared\"]"),
@@ -108,7 +107,7 @@ fn a_contributor_shares_by_the_form_the_other_person_opens_it_and_after_unsharin
     assert_eq!(link.len(), 1, "{}", grace_browser.describe());
     click_to_another_page(&mut grace_browser, &link[0]);
     let url = grace_browser.url();
-    assert!(on(&url, &format!("{APP}.{DOMAIN}"), at.port()), "{url}");
+    assert!(on_site(&url, &site, APP), "{url}");
     assert_eq!(
         page_json(&mut grace_browser)["user"]["id"],
         GRACE,
@@ -116,7 +115,7 @@ fn a_contributor_shares_by_the_form_the_other_person_opens_it_and_after_unsharin
         grace_browser.describe()
     );
 
-    ada_browser.navigate(&dashboard(&at, &format!("/applications/{APP}")));
+    ada_browser.navigate(&site.dashboard(&format!("/applications/{APP}")));
     unshare_by_form(&mut ada_browser, "user", GRACE);
     assert_eq!(
         notice(&mut ada_browser).as_deref(),
@@ -130,9 +129,9 @@ fn a_contributor_shares_by_the_form_the_other_person_opens_it_and_after_unsharin
         "expected the page no longer to show Grace\n{}",
         ada_browser.describe()
     );
-    assert_eq!(shared_with(&at, &credential, APP), Vec::<String>::new());
+    assert_eq!(site.shared_with(&credential, APP), Vec::<String>::new());
 
-    grace_browser.navigate(&application(&at, APP, "/"));
+    grace_browser.navigate(&site.application(APP, "/"));
     assert_eq!(
         grace_browser.status(),
         Some(403),
@@ -145,7 +144,7 @@ fn a_contributor_shares_by_the_form_the_other_person_opens_it_and_after_unsharin
         "expected the refusal to say the Application is not shared with her\n{}",
         grace_browser.describe()
     );
-    grace_browser.navigate(&dashboard(&at, "/"));
+    grace_browser.navigate(&site.dashboard("/"));
     assert!(
         grace_browser
             .find(&format!("[data-vm-application=\"{APP}\"]"))
@@ -158,11 +157,11 @@ fn a_contributor_shares_by_the_form_the_other_person_opens_it_and_after_unsharin
 #[test]
 fn sharing_with_an_unknown_email_is_refused_on_the_page_in_words_and_nothing_is_shared() {
     firefox::required();
-    let at = installation();
-    let credential = application_of(&at, ADA, APP, None);
-    let mut browser = browser_for(&[APP]);
-    sign_in_to_dashboard(&mut browser, &at, ADA);
-    browser.navigate(&dashboard(&at, &format!("/applications/{APP}")));
+    let site = site();
+    let credential = site.application_of(ADA, APP, None);
+    let mut browser = site.browser(&[APP]);
+    sign_in_to_dashboard(&mut browser, &site, ADA);
+    browser.navigate(&site.dashboard(&format!("/applications/{APP}")));
     let unknown = "nobody-here@example.test";
     share_by_form(&mut browser, "email", unknown);
     assert_eq!(
@@ -196,5 +195,5 @@ fn sharing_with_an_unknown_email_is_refused_on_the_page_in_words_and_nothing_is_
         "expected nothing shared\n{}",
         browser.describe()
     );
-    assert_eq!(shared_with(&at, &credential, APP), Vec::<String>::new());
+    assert_eq!(site.shared_with(&credential, APP), Vec::<String>::new());
 }
