@@ -48,10 +48,7 @@ const READ_CHUNK: usize = 64 * 1024;
 /// run its query at the commit), then `vm.before_commit()`, which raises
 /// `VM004` while the session holds a lock that only a change of structure
 /// or capture takes. A statement that fails skips the rest, `COMMIT`
-/// included: the transaction is left aborted and rolled back. (A deferred
-/// trigger the owner's code queued fails with Postgres's own error before
-/// the check on Postgres 16 and 17, where it runs without the owner's
-/// rights; rolled back all the same.)
+/// included: the transaction is left aborted and rolled back.
 const CHECKED_COMMIT: &str =
     "SET CONSTRAINTS ALL IMMEDIATE; CLOSE ALL; SELECT vm.before_commit(); COMMIT";
 

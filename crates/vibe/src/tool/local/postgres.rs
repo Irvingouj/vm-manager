@@ -101,7 +101,7 @@ pub(super) fn unavailable(what: &str, command: &str) -> super::super::Ending {
         1,
         "postgres-unavailable",
         format!(
-            "The private Postgres of the local run cannot be had: {what}. Name the folder of a Postgres 16, 17 or 18 you have (its bin folder, with postgres, initdb and pg_ctl) with {BIN_VARIABLE}, or a mirror of Maven Central with {MIRROR_VARIABLE}, then run {command} again"
+            "The private Postgres of the local run cannot be had: {what}. Name the folder of a Postgres 18 you have (its bin folder, with postgres, initdb and pg_ctl) with {BIN_VARIABLE}, or a mirror of Maven Central with {MIRROR_VARIABLE}, then run {command} again"
         ),
     )
 }
@@ -165,7 +165,15 @@ pub(super) async fn programs(
         let programs = Programs { bin };
         return match checked(&programs, own).await {
             Ok(()) => Ok(programs),
-            Err(why) => Err(unavailable(
+            Err(Unchecked::Version(found)) => Err(super::super::Ending::new(
+                1,
+                "postgres-unavailable",
+                format!(
+                    "The private Postgres of the local run cannot be had: {BIN_VARIABLE} names {}, which holds Postgres {found}, and the local run needs Postgres {MAJOR}. Unset {BIN_VARIABLE} so that {command} downloads a Postgres {MAJOR} itself (or name the folder of a Postgres {MAJOR} you have with it), then run {command} again",
+                    programs.bin.display()
+                ),
+            )),
+            Err(Unchecked::Other(why)) => Err(unavailable(
                 &format!(
                     "{BIN_VARIABLE} names {}, which {why}",
                     programs.bin.display()
@@ -215,12 +223,36 @@ pub(super) async fn programs(
     }
 }
 
+/// The one major version of Postgres the platform runs on
+/// (blackbox/CONTRACT.md, "One Postgres version").
+const MAJOR: u32 = crate::platform_db::POSTGRES_MAJOR;
+
+/// Why a folder's programs are not taken.
+enum Unchecked {
+    /// Its `postgres` is of another major version: the version it says.
+    Version(String),
+    /// Anything else, in words.
+    Other(String),
+}
+
+impl std::fmt::Display for Unchecked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Version(found) => write!(
+                f,
+                "holds Postgres {found}, and the local run needs Postgres {MAJOR}"
+            ),
+            Self::Other(why) => f.write_str(why),
+        }
+    }
+}
+
 /// That `programs` holds `postgres`, `initdb` and `pg_ctl`, and that
-/// `postgres` is 16, 17 or 18; else why not, in words.
-async fn checked(programs: &Programs, own: &Path) -> Result<(), String> {
+/// `postgres` is a Postgres 18 (any minor, a beta included); else why not.
+async fn checked(programs: &Programs, own: &Path) -> Result<(), Unchecked> {
     for name in ["postgres", "initdb", "pg_ctl"] {
         if !programs.program(name).is_file() {
-            return Err(format!("has no {name}"));
+            return Err(Unchecked::Other(format!("has no {name}")));
         }
     }
     let ran = tokio::time::timeout(
@@ -235,14 +267,17 @@ async fn checked(programs: &Programs, own: &Path) -> Result<(), String> {
         ),
     )
     .await
-    .map_err(|_| "has a postgres that did not say its version in time".to_owned())?
-    .map_err(|e| format!("has a postgres that cannot be run ({e})"))?;
+    .map_err(|_| {
+        Unchecked::Other("has a postgres that did not say its version in time".to_owned())
+    })?
+    .map_err(|e| Unchecked::Other(format!("has a postgres that cannot be run ({e})")))?;
     let said = ran.out.text();
     // `postgres (PostgreSQL) 18.6`, and whatever a distribution adds after
     // the number (`(Homebrew)`, `(Debian 18.6-1)`) or in it (`18beta1`).
-    let major = said
+    let number = said
         .split_once("(PostgreSQL)")
-        .and_then(|(_, rest)| rest.split_whitespace().next())
+        .and_then(|(_, rest)| rest.split_whitespace().next());
+    let major = number
         .map(|number| {
             number
                 .chars()
@@ -250,12 +285,15 @@ async fn checked(programs: &Programs, own: &Path) -> Result<(), String> {
                 .collect::<String>()
         })
         .and_then(|m| m.parse::<u32>().ok());
-    match major {
-        Some(16..=18) if ran.status.success() => Ok(()),
-        Some(major) => Err(format!(
-            "holds Postgres {major}, and the local run needs 16, 17 or 18"
+    match (major, number) {
+        _ if !ran.status.success() => Err(Unchecked::Other(
+            "has a postgres that did not say its version (it failed)".to_owned(),
         )),
-        None => Err("has a postgres that does not say its version".to_owned()),
+        (Some(MAJOR), _) => Ok(()),
+        (Some(_), Some(number)) => Err(Unchecked::Version(number.to_owned())),
+        _ => Err(Unchecked::Other(
+            "has a postgres that does not say its version".to_owned(),
+        )),
     }
 }
 

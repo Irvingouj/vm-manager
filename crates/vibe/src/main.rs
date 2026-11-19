@@ -305,7 +305,18 @@ fn run(serve: &Serve) -> Result<(), String> {
             log,
             runner,
             ..
-        } = Platform::open(&address, limits).await?;
+        } = Platform::open(&address, limits).await.map_err(|error| {
+            if let Some(found) = &error.unsupported_version {
+                log::record(
+                    "postgres-version-unsupported",
+                    json!({
+                        "found": found,
+                        "needed": platform_db::POSTGRES_MAJOR.to_string(),
+                    }),
+                );
+            }
+            String::from(error)
+        })?;
         let stored = tokio::time::timeout(DATABASE_START_TIMEOUT, connection::read(&database))
             .await
             .map_err(|_| "the platform database did not answer in time".to_owned())?

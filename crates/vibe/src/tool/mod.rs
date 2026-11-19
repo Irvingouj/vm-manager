@@ -481,7 +481,7 @@ fn domain(text: &str) -> Result<String, String> {
     let domain = text.trim_end_matches('.').to_ascii_lowercase();
     if domain.is_empty() || !domain.split('.').all(is_dns_label) {
         return Err(
-            "not a domain name: use DNS labels joined by dots, such as vm.example.com".into(),
+            "not a domain name: use DNS labels joined by dots, such as vibe.example.com".into(),
         );
     }
     Ok(domain)

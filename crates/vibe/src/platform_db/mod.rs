@@ -7,7 +7,9 @@
 //!   its password.
 //! - [`PlatformDatabase::open`]: at start, connects (creating the database
 //!   if it does not exist), brings its structure up to date ([`steps`]), and
-//!   answers a pool, or a message naming the problem.
+//!   answers a pool, or a message naming the problem. Before anything is
+//!   written to the server, its version is looked at: a Postgres whose
+//!   major version is not [`POSTGRES_MAJOR`] is refused.
 //! - [`Pool::run`]: one operation on one connection, within time limits.
 //!   The modules that own tables (the Application registry, later Resources,
 //!   Grants, the Operation log) write their own queries against it.
@@ -28,6 +30,10 @@ pub(crate) use pool::Connection;
 pub use pool::{Pool, PoolLimits};
 
 use crate::log;
+
+/// The one major version of Postgres the platform runs on
+/// (blackbox/CONTRACT.md, "One Postgres version").
+pub const POSTGRES_MAJOR: u32 = 18;
 
 /// `created_at` and the like as RFC 3339 in UTC, with microseconds, for
 /// the tables' queries.
@@ -199,19 +205,23 @@ impl fmt::Display for DbError {
 pub struct OpenError {
     pub cause: Option<Cause>,
     pub message: String,
+    /// The server's version as it gives it, when the server is not a
+    /// Postgres [`POSTGRES_MAJOR`] (then nothing was written to it).
+    pub unsupported_version: Option<String>,
 }
 
 impl OpenError {
     pub fn new(cause: Option<Cause>, message: String) -> Self {
-        Self { cause, message }
+        Self {
+            cause,
+            message,
+            unsupported_version: None,
+        }
     }
 
     /// `message`, with the cause of `error`.
     pub fn of(error: &DbError, message: String) -> Self {
-        Self {
-            cause: Some(error.cause().clone()),
-            message,
-        }
+        Self::new(Some(error.cause().clone()), message)
     }
 }
 
@@ -264,14 +274,20 @@ impl PlatformDatabase {
     }
 
     /// Connects, creating the database if it does not exist; does not
-    /// touch its structure.
+    /// touch its structure. Every way of opening the platform database
+    /// comes through here, and the server's version is looked at on the
+    /// first connection, before anything is written to the server (the
+    /// database made, a step of its structure, a role, an own database).
     pub async fn connect(
         address: &DatabaseAddress,
         limits: &PoolLimits,
     ) -> Result<Self, OpenError> {
         let config = config(address, limits);
         let first = match Connection::open(&config, limits.connect).await {
-            Ok(connection) => connection,
+            Ok(connection) => {
+                supported(&connection, address, limits.operation).await?;
+                connection
+            }
             Err(error) if error.code() == Some(&SqlState::INVALID_CATALOG_NAME) => {
                 create_database(address, limits).await?;
                 Connection::open(&config, limits.connect)
@@ -381,6 +397,7 @@ async fn create_database(address: &DatabaseAddress, limits: &PoolLimits) -> Resu
     let connection = Connection::open(&config(&maintenance, limits), limits.connect)
         .await
         .map_err(|e| cannot_connect(&maintenance, &e))?;
+    supported(&connection, &maintenance, limits.operation).await?;
     let statement = format!("CREATE DATABASE {}", quote_identifier(address.database()));
     let created = tokio::time::timeout(
         limits.operation,
@@ -413,6 +430,65 @@ async fn create_database(address: &DatabaseAddress, limits: &PoolLimits) -> Resu
             ),
         )),
     }
+}
+
+/// That the server `connection` is open on is a Postgres
+/// [`POSTGRES_MAJOR`] (any minor); else the start-up failure that says the
+/// version it has, as it gives it. Reads only, within `limit`.
+async fn supported(
+    connection: &Connection,
+    address: &DatabaseAddress,
+    limit: Duration,
+) -> Result<(), OpenError> {
+    let read = tokio::time::timeout(limit, async {
+        let row = connection
+            .client()
+            .query_one(
+                "SELECT pg_catalog.current_setting('server_version'), \
+                        pg_catalog.current_setting('server_version_num')",
+                &[],
+            )
+            .await
+            .map_err(DbError::from)?;
+        let version: String = row
+            .try_get(0)
+            .map_err(|_| DbError::unexpected("the server's version"))?;
+        let number: String = row
+            .try_get(1)
+            .map_err(|_| DbError::unexpected("the server's version number"))?;
+        let number = number
+            .trim()
+            .parse::<u32>()
+            .map_err(|_| DbError::unexpected("the server's version number"))?;
+        Ok::<_, DbError>((version, number))
+    })
+    .await
+    .map_err(|_| DbError::timed_out("reading the server's version", limit))
+    .and_then(|r| r);
+    let (version, number) = read.map_err(|error| {
+        OpenError::of(
+            &error,
+            format!(
+                "cannot read the version of Postgres at {} (role \"{}\", platform database \"{}\"): {error}",
+                address.server(),
+                address.role(),
+                address.database()
+            ),
+        )
+    })?;
+    // `server_version_num` is the major version times 10000 and the minor
+    // (since Postgres 10).
+    if number / 10_000 == POSTGRES_MAJOR {
+        return Ok(());
+    }
+    Err(OpenError {
+        cause: None,
+        message: format!(
+            "Postgres at {} is version {version}, and the platform needs Postgres {POSTGRES_MAJOR}: point {VARIABLE} at a Postgres {POSTGRES_MAJOR} server. Nothing was written to this one",
+            address.server()
+        ),
+        unsupported_version: Some(version),
+    })
 }
 
 async fn connection_execute(connection: &Connection, statement: &str) -> Result<(), DbError> {
