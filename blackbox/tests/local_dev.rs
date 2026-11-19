@@ -19,7 +19,10 @@ use std::fs;
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::time::{Duration, Instant};
 
-use blackbox::dev::{Dev, assert_nothing_left, dev_args, free_port, has_ipv6_loopback, listeners};
+use blackbox::dev::{
+    Dev, assert_nothing_left, dev_args, has_ipv6_loopback, listeners, run_dev_on_a_free_port,
+    spawn_piped_listening,
+};
 use blackbox::local::{Local, OUTSIDER, local_project, port_open};
 use blackbox::project::{
     code_in, help_commands, new_project, paragraphs, squashed, vm_commands_in,
@@ -129,7 +132,7 @@ fn each_request_it_serves_is_a_json_line_with_the_user_method_path_status_and_re
 fn in_words_it_gives_the_address_and_that_it_runs_until_interrupted_then_a_line_for_each_request() {
     let local = Local::new();
     let project = project(&local);
-    let dev = Dev::start_with(&local, &project.dir, NAME, free_port(), false);
+    let dev = Dev::start_on_a_free_port(&local, &project.dir, NAME, false);
     let words = dev.stdout();
     assert!(
         words.contains(&dev.url()),
@@ -266,10 +269,8 @@ fn a_second_vm_dev_in_the_same_project_is_already_running_at_once_giving_the_fir
     let local = Local::new();
     let project = project(&local);
     let first = Dev::start(&local, &project.dir, NAME);
-    let args = dev_args(&project.dir, free_port(), true);
-    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let began = Instant::now();
-    let second = local.run(&refs, &[]);
+    let (_, second) = run_dev_on_a_free_port(&local, &project.dir, true, &[]);
     let message = second.json_error(1, "already-running");
     assert!(
         began.elapsed() < Duration::from_secs(15),
@@ -293,18 +294,15 @@ fn failures_before_it_listens_are_those_of_vm_request_and_nothing_listens() {
     let local = Local::new();
     let not_a_project = local.machine.root().join("empty-folder");
     fs::create_dir_all(&not_a_project).unwrap();
-    let port = free_port();
-    let args = dev_args(&not_a_project, port, true);
-    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    local.run(&refs, &[]).json_error(1, "not-a-project");
+    let (port, run) = run_dev_on_a_free_port(&local, &not_a_project, true, &[]);
+    run.json_error(1, "not-a-project");
     assert!(!port_open(port), "expected nothing listening on {port}");
 
     let project = project(&local);
     fs::write(project.dir.join("vibe.dev.json"), "{ \"users\": 7 }\n").unwrap();
-    let args = dev_args(&project.dir, port, true);
-    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     local.watch(&project.dir);
-    local.run(&refs, &[]).json_error(1, "test-users-file");
+    let (port, run) = run_dev_on_a_free_port(&local, &project.dir, true, &[]);
+    run.json_error(1, "test-users-file");
     assert!(!port_open(port), "expected nothing listening on {port}");
     let left = local.processes_after(Duration::from_secs(5));
     assert!(
@@ -318,20 +316,7 @@ fn a_closed_output_ends_it_with_output_closed_and_nothing_left_running() {
     let local = Local::new();
     let project = project(&local);
     local.watch(&project.dir);
-    let port = free_port();
-    let args = dev_args(&project.dir, port, true);
-    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let own = local.env();
-    let env: Vec<(&str, &str)> = own.iter().map(|(n, v)| (n.as_str(), v.as_str())).collect();
-    let (mut running, reader) = local.machine.spawn_piped_with_env(&refs, &env);
-    let deadline = Instant::now() + blackbox::local::LOCAL_TIMEOUT;
-    while !port_open(port) {
-        assert!(
-            !running.has_ended() && Instant::now() < deadline,
-            "expected `vibe dev` to listen on {port}"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    let (port, running, reader) = spawn_piped_listening(&local, &project.dir);
     let postmaster = blackbox::local::postmaster_of(&project.dir);
     // The reading end goes: the next line it prints finds no reader.
     drop(reader);

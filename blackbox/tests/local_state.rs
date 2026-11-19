@@ -311,14 +311,9 @@ fn vm_dev_with_a_postgres_log_that_is_a_folder_is_local_state() {
     let project = project_with(&local, "dev-log-folder", |dir| {
         fs::create_dir(dir.join("postgres.log")).unwrap();
     });
-    let dev = blackbox::dev::Dev::spawn(
-        &local,
-        &project.dir,
-        "dev-log-folder",
-        blackbox::dev::free_port(),
-        true,
-    );
-    let run = dev.wait_end(Duration::from_secs(200));
+    let dev =
+        blackbox::dev::Dev::spawn_on_a_free_port(&local, &project.dir, "dev-log-folder", true);
+    let run = dev.wait_end_trying_ports(Duration::from_secs(200));
     assert_local_state_not_postgres(&run, "vibe dev, postgres.log a folder");
     assert_nothing_left(&local, "vibe dev, postgres.log a folder");
 }

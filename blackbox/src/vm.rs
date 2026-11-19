@@ -41,6 +41,16 @@ pub const INSTALLER: &str = "fixture-installer";
 /// A fixture Application installed by the harness is its first Version.
 pub const FIXTURE_VERSION: u64 = 1;
 
+/// Whether `message` (from a start of `vibe serve` that failed) is the
+/// program's own refusal of `address` as taken: it exited saying it cannot
+/// listen there because the address is in use. Nothing else counts.
+pub fn refused_address(address: SocketAddr, message: &str) -> bool {
+    message.contains("exited (")
+        && message.contains(&format!(
+            "cannot listen on {address}: Address already in use"
+        ))
+}
+
 /// The path of a fixture Application under `blackbox/fixtures/`.
 pub fn fixture(file: &str) -> PathBuf {
     let path = crate::program::manifest_dir().join("fixtures").join(file);
@@ -364,6 +374,48 @@ impl Vm {
     pub fn try_start(options: &VmOptions, within: Duration) -> Result<Self, String> {
         let platform = options.platform.clone().unwrap_or_else(Platform::fresh);
         Self::try_launch(options, &platform, within)
+    }
+
+    /// As [`Vm::start`] with the stand-in sign-in on, listening at
+    /// 127.0.0.1 on a port the harness chooses rather than one the system
+    /// gives (`:0`): for a test that starts the program again at the same
+    /// address. When the program ends refusing that port as taken
+    /// ([`refused_address`]) it is started again on another, at most
+    /// [`crate::dev::PORT_TRIES`] times, saying so on standard error; any
+    /// other failure fails the test as [`Vm::start`] does.
+    pub fn start_at_a_chosen_port(options: &VmOptions) -> Self {
+        Self::start_choosing(options, || {
+            SocketAddr::from(([127, 0, 0, 1], crate::dev::free_port()))
+        })
+    }
+
+    /// As [`Vm::start_at_a_chosen_port`], with the addresses `choose` gives:
+    /// for the harness's own checks, which hand it a port they hold.
+    pub fn start_choosing(options: &VmOptions, mut choose: impl FnMut() -> SocketAddr) -> Self {
+        assert!(
+            options.stand_in_sign_in,
+            "the harness's own check: a start at a chosen port is for the stand-in sign-in"
+        );
+        let platform = options.platform.clone().unwrap_or_else(Platform::fresh);
+        let mut attempt = 1;
+        loop {
+            let address = choose();
+            let tried = options.clone().listen(address);
+            match Self::try_launch(&tried, &platform, START_TIMEOUT) {
+                Ok(vm) => {
+                    vm.install_all(&tried.applications);
+                    return vm;
+                }
+                Err(message) => {
+                    if attempt < crate::dev::PORT_TRIES && refused_address(address, &message) {
+                        crate::dev::say_port_taken("`vibe serve`", address.port(), attempt);
+                        attempt += 1;
+                        continue;
+                    }
+                    panic!("{message}");
+                }
+            }
+        }
     }
 
     /// Starts `vibe serve` and waits for its `listening` record.

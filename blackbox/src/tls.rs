@@ -313,6 +313,8 @@ impl fmt::Debug for Seen {
 
 struct FrontState {
     config: Option<Arc<ServerConfig>>,
+    /// Where each new connection's bytes go.
+    target: SocketAddr,
     seen: Vec<Seen>,
     not_recorded: usize,
 }
@@ -419,6 +421,7 @@ impl Front {
         let shared = Arc::new(FrontShared {
             state: Mutex::new(FrontState {
                 config,
+                target,
                 seen: Vec::new(),
                 not_recorded: 0,
             }),
@@ -431,7 +434,7 @@ impl Front {
                 .enable_time()
                 .build()
                 .unwrap_or_else(|e| panic!("a front cannot make its runtime: {e}"));
-            runtime.block_on(accept_loop(listener, serving, target));
+            runtime.block_on(accept_loop(listener, serving));
         });
         Self {
             address,
@@ -452,6 +455,18 @@ impl Front {
     /// installation's certificate replaced.
     pub fn replace_identity(&self, identity: &Identity) {
         self.shared.lock().config = Some(identity.server_config());
+    }
+
+    /// From the next connection on, passes the bytes on to `target`: the
+    /// program behind it moved to another port (an install test's port
+    /// taken by something else before Compose could publish it).
+    pub fn retarget(&self, target: SocketAddr) {
+        self.shared.lock().target = target;
+    }
+
+    /// Where it passes the bytes of a new connection on to.
+    pub fn target(&self) -> SocketAddr {
+        self.shared.lock().target
     }
 
     /// Every connection seen so far, in the order they came. Fails if more
@@ -542,7 +557,7 @@ impl Drop for Front {
     }
 }
 
-async fn accept_loop(listener: StdListener, shared: Arc<FrontShared>, target: SocketAddr) {
+async fn accept_loop(listener: StdListener, shared: Arc<FrontShared>) {
     let listener = match tokio::net::TcpListener::from_std(listener) {
         Ok(listener) => listener,
         Err(e) => panic!("a front cannot listen: {e}"),
@@ -557,9 +572,10 @@ async fn accept_loop(listener: StdListener, shared: Arc<FrontShared>, target: So
             drop(stream);
             continue;
         }
-        let index = {
+        let (index, target) = {
             let mut state = shared.lock();
-            if state.seen.len() < MAX_RECORDED {
+            let target = state.target;
+            let index = if state.seen.len() < MAX_RECORDED {
                 state.seen.push(Seen {
                     server_name: None,
                     handshake: Handshake::Pending,
@@ -571,7 +587,8 @@ async fn accept_loop(listener: StdListener, shared: Arc<FrontShared>, target: So
             } else {
                 state.not_recorded += 1;
                 None
-            }
+            };
+            (index, target)
         };
         tasks.spawn(serve_connection(stream, index, Arc::clone(&shared), target));
     }

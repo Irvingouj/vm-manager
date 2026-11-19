@@ -43,6 +43,174 @@ pub fn free_port() -> u16 {
         .port()
 }
 
+/// How many ports the harness tries for one start of a program on a port
+/// it chose ([`free_port`]): a port free when the harness looked can be
+/// taken by something else (with some 1900 tests side by side) before the
+/// program binds it.
+pub const PORT_TRIES: usize = 5;
+
+/// Whether the output of a `vibe dev` that ended is its own refusal of
+/// `port` as taken: `--json`'s `port-in-use`, or in words "Port <port> of
+/// this machine's loopback address is taken". Nothing else counts.
+pub fn refused_port(port: u16, stdout: &str, stderr: &str) -> bool {
+    // Leniently: in words standard output is not JSON.
+    let json = stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .any(|l| l["error"]["reason"] == "port-in-use");
+    json || stderr.contains(&format!(
+        "Port {port} of this machine's loopback address is taken"
+    ))
+}
+
+/// Says on standard error that a start on a port the harness chose was
+/// refused because something else took the port, and that another is
+/// tried.
+pub fn say_port_taken(program: &str, port: u16, attempt: usize) {
+    eprintln!(
+        "the harness: {program} refused the port {port}, free when the harness chose it and taken since by something else; trying another port (attempt {attempt} of {PORT_TRIES})"
+    );
+}
+
+/// Runs `vibe dev --project <dir> --port <p> [--json]` to its end, with
+/// these variables, on a port the harness chooses, choosing another when
+/// it refuses the port as taken ([`refused_port`]), at most [`PORT_TRIES`]
+/// times; the port and the run that counted. For a test of a `vibe dev`
+/// that is to end by itself before it listens.
+pub fn run_dev_on_a_free_port(
+    local: &Local,
+    dir: &Path,
+    json: bool,
+    env: &[(&str, &str)],
+) -> (u16, Run) {
+    run_dev_choosing(local, dir, json, env, free_port)
+}
+
+/// As [`run_dev_on_a_free_port`], with the ports `choose` gives: for the
+/// harness's own checks, which hand it a port they hold.
+pub fn run_dev_choosing(
+    local: &Local,
+    dir: &Path,
+    json: bool,
+    env: &[(&str, &str)],
+    mut choose: impl FnMut() -> u16,
+) -> (u16, Run) {
+    let mut attempt = 1;
+    loop {
+        let port = choose();
+        let args = dev_args(dir, port, json);
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let run = local.run(&refs, env);
+        if attempt < PORT_TRIES
+            && run.code == Some(1)
+            && refused_port(port, &run.stdout, &run.stderr)
+        {
+            say_port_taken("`vibe dev`", port, attempt);
+            attempt += 1;
+            continue;
+        }
+        return (port, run);
+    }
+}
+
+/// Starts `vibe dev --project <dir> --port <p> --json` with its standard
+/// output a pipe ([`crate::tool::Machine::spawn_piped_with_env`]), on a port
+/// the harness chooses, and reads that pipe until the `listening` line;
+/// returns the port, the running `vibe dev` and the pipe's reading end. When
+/// it ends first refusing the port as taken ([`refused_port`]) it is started
+/// again on another, at most [`PORT_TRIES`] times, saying so on standard
+/// error; any other end, or no `listening` line within [`LOCAL_TIMEOUT`],
+/// fails the test. Listening is known from its own line, never from the
+/// port being open: something else may hold that port.
+pub fn spawn_piped_listening(local: &Local, dir: &Path) -> (u16, Running, std::io::PipeReader) {
+    spawn_piped_listening_choosing(local, dir, free_port)
+}
+
+/// As [`spawn_piped_listening`], with the ports `choose` gives: for the
+/// harness's own checks, which hand it a port they hold.
+pub fn spawn_piped_listening_choosing(
+    local: &Local,
+    dir: &Path,
+    mut choose: impl FnMut() -> u16,
+) -> (u16, Running, std::io::PipeReader) {
+    let own = local.env();
+    let env: Vec<(&str, &str)> = own.iter().map(|(n, v)| (n.as_str(), v.as_str())).collect();
+    let mut attempt = 1;
+    loop {
+        let port = choose();
+        let args = dev_args(dir, port, true);
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let (running, reader) = local.machine.spawn_piped_with_env(&refs, &env);
+        let (read, reader) = read_until_listening(reader, &running);
+        if let Some(reader) = reader {
+            return (port, running, reader);
+        }
+        let run = running.wait(Duration::from_secs(5));
+        if attempt < PORT_TRIES && run.code == Some(1) && refused_port(port, &read, &run.stderr) {
+            say_port_taken("`vibe dev`", port, attempt);
+            attempt += 1;
+            continue;
+        }
+        panic!(
+            "expected `vibe dev` to say that it listens on {port}\nstandard output read:\n{read}\n{}",
+            run.describe()
+        );
+    }
+}
+
+/// Reads `reader` (the standard output of `vibe dev --json`) a byte at a
+/// time until the `listening` line (what it read and the reader, to go on
+/// with) or its end (what it read, no reader). A thread of its own reads,
+/// so that the wait has a limit: past [`LOCAL_TIMEOUT`] `running` is
+/// killed, which ends the pipe and the thread, and the test fails.
+fn read_until_listening(
+    reader: std::io::PipeReader,
+    running: &Running,
+) -> (String, Option<std::io::PipeReader>) {
+    use std::io::Read as _;
+    let (send, receive) = std::sync::mpsc::sync_channel(1);
+    let reading = thread::spawn(move || {
+        let mut reader = reader;
+        let mut read = Vec::new();
+        let mut line = Vec::new();
+        let mut byte = [0_u8; 1];
+        let listening = loop {
+            match reader.read(&mut byte) {
+                Ok(0) | Err(_) => break false,
+                Ok(_) => {
+                    read.push(byte[0]);
+                    if byte[0] == b'\n' {
+                        let said: Option<Value> = serde_json::from_slice(&line).ok();
+                        line.clear();
+                        if said.is_some_and(|v| v["event"] == "listening") {
+                            break true;
+                        }
+                    } else {
+                        line.push(byte[0]);
+                    }
+                }
+            }
+        };
+        let read = String::from_utf8_lossy(&read).into_owned();
+        drop(send.send((read, listening.then_some(reader))));
+    });
+    match receive.recv_timeout(LOCAL_TIMEOUT) {
+        Ok(got) => {
+            drop(reading.join());
+            got
+        }
+        Err(_) => {
+            running.signal("KILL");
+            // A child of `vibe dev` may hold the pipe still: the thread is
+            // joined only once it has said it is done, within a limit.
+            if receive.recv_timeout(Duration::from_secs(5)).is_ok() {
+                drop(reading.join());
+            }
+            panic!("expected `vibe dev` to say that it listens within {LOCAL_TIMEOUT:?}");
+        }
+    }
+}
+
 /// The JSON objects of the complete lines of `text` (a line not yet ended
 /// is left out). Fails the test on a complete line that is not a JSON
 /// object.
@@ -75,6 +243,11 @@ pub struct Dev<'a> {
     pub application: String,
     pub json: bool,
     running: Option<Running>,
+    /// What chose the port, when the harness did (so that a refusal of it
+    /// as taken is tried again on another it chooses), and how many ports
+    /// were tried.
+    choose: Option<Box<dyn FnMut() -> u16 + 'a>>,
+    attempt: usize,
 }
 
 /// The arguments of `vibe dev --project <dir> --port <port> [--json]`.
@@ -97,9 +270,110 @@ pub fn dev_args(dir: &Path, port: u16, json: bool) -> Vec<String> {
 impl<'a> Dev<'a> {
     /// Starts `vibe dev --json` on a free port in the project `dir`, whose
     /// Application is named `application`, and waits for its `listening`
-    /// line. Fails the test, saying how it ended, unless it listens.
+    /// line. Fails the test, saying how it ended, unless it listens. A port
+    /// taken between the harness's choice and the start is tried again on
+    /// another ([`Dev::start_on_a_free_port`]).
     pub fn start(local: &'a Local, dir: &Path, application: &str) -> Self {
-        Self::start_with(local, dir, application, free_port(), true)
+        Self::start_on_a_free_port(local, dir, application, true)
+    }
+
+    /// As [`Dev::start`], with `--json` or in words: on a port the harness
+    /// chooses, and when `vibe dev` ends refusing it as taken
+    /// ([`refused_port`]), on another, at most [`PORT_TRIES`] times, saying
+    /// so on standard error. Any other end, and a start that takes too long,
+    /// fail the test as before.
+    pub fn start_on_a_free_port(
+        local: &'a Local,
+        dir: &Path,
+        application: &str,
+        json: bool,
+    ) -> Self {
+        Self::start_choosing(local, dir, application, json, free_port)
+    }
+
+    /// As [`Dev::start_on_a_free_port`], with the ports `choose` gives: for
+    /// the harness's own checks, which hand it a port they hold.
+    pub fn start_choosing(
+        local: &'a Local,
+        dir: &Path,
+        application: &str,
+        json: bool,
+        choose: impl FnMut() -> u16 + 'a,
+    ) -> Self {
+        let mut dev = Self::spawn_choosing(local, dir, application, json, choose);
+        dev.wait_until_listening();
+        dev
+    }
+
+    /// As [`Dev::spawn`], on a port the harness chooses: a later
+    /// [`Dev::respawn_if_port_refused`] starts it again on another when it
+    /// ended refusing that one.
+    pub fn spawn_on_a_free_port(
+        local: &'a Local,
+        dir: &Path,
+        application: &str,
+        json: bool,
+    ) -> Self {
+        Self::spawn_choosing(local, dir, application, json, free_port)
+    }
+
+    fn spawn_choosing(
+        local: &'a Local,
+        dir: &Path,
+        application: &str,
+        json: bool,
+        mut choose: impl FnMut() -> u16 + 'a,
+    ) -> Self {
+        let port = choose();
+        let mut dev = Self::spawn(local, dir, application, port, json);
+        dev.choose = Some(Box::new(choose));
+        dev
+    }
+
+    /// For a `vibe dev` started on a port the harness chose: when it has
+    /// ended refusing that port as taken, starts it again on another (at
+    /// most [`PORT_TRIES`] ports in all), says so on standard error and
+    /// returns `true`. Otherwise changes nothing and returns `false`.
+    pub fn respawn_if_port_refused(&mut self) -> bool {
+        if self.choose.is_none() || !self.has_ended() {
+            return false;
+        }
+        let refused = self
+            .running
+            .as_ref()
+            .is_some_and(|r| refused_port(self.port, &r.stdout_so_far(), &r.stderr_so_far()));
+        if !refused || self.attempt >= PORT_TRIES {
+            return false;
+        }
+        drop(self.running.take().map(|r| r.wait(Duration::from_secs(5))));
+        self.respawn();
+        true
+    }
+
+    /// Starts it again on another port the harness chooses, when `run` (how
+    /// it ended) is its refusal of its port and tries are left.
+    fn respawn_after(&mut self, run: &Run) -> bool {
+        if self.choose.is_none()
+            || self.attempt >= PORT_TRIES
+            || run.code != Some(1)
+            || !refused_port(self.port, &run.stdout, &run.stderr)
+        {
+            return false;
+        }
+        self.respawn();
+        true
+    }
+
+    fn respawn(&mut self) {
+        say_port_taken("`vibe dev`", self.port, self.attempt);
+        self.attempt += 1;
+        self.port = self
+            .choose
+            .as_mut()
+            .map_or_else(free_port, |choose| choose());
+        let args = dev_args(&self.dir, self.port, self.json);
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        self.running = Some(self.local.spawn(&refs, &[]));
     }
 
     /// As [`Dev::start`], on this port, with `--json` or in words.
@@ -128,6 +402,8 @@ impl<'a> Dev<'a> {
             application: application.to_owned(),
             json,
             running: Some(running),
+            choose: None,
+            attempt: 1,
         }
     }
 
@@ -167,8 +443,26 @@ impl<'a> Dev<'a> {
 
     /// Waits until it says it listens: with `--json` the `listening` line,
     /// in words its address. Fails the test, with what it printed, if it
-    /// ends first or takes longer than a first local run may.
+    /// ends first or takes longer than a first local run may; except that,
+    /// started on a port the harness chose, an end refusing that port as
+    /// taken starts it again on another ([`Dev::start_on_a_free_port`]).
     pub fn wait_until_listening(&mut self) {
+        loop {
+            match self.listening_or_ended() {
+                Ok(()) => return,
+                Err(run) => {
+                    if !self.respawn_after(&run) {
+                        self.fail_not_listening(&run);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Waits until it says it listens (`Ok`) or ends (`Err`, how it ended).
+    /// Fails the test if it does neither within what a first local run may
+    /// take: a timeout is never tried again.
+    fn listening_or_ended(&mut self) -> Result<(), Run> {
         let deadline = Instant::now() + LOCAL_TIMEOUT;
         loop {
             let said = if self.json {
@@ -177,18 +471,36 @@ impl<'a> Dev<'a> {
                 self.stdout().contains(&self.url())
             };
             if said {
-                return;
+                return Ok(());
             }
-            if self.has_ended() || Instant::now() >= deadline {
+            if self.has_ended() {
+                let run = self
+                    .running
+                    .take()
+                    .map(|r| r.wait(Duration::from_secs(5)))
+                    .unwrap_or_else(|| {
+                        panic!("the harness's own check: `vibe dev` was already stopped")
+                    });
+                return Err(run);
+            }
+            if Instant::now() >= deadline {
                 let run = self.running.take().map(|r| r.wait(Duration::from_secs(5)));
                 panic!(
-                    "expected `vibe dev` to say that it listens at {}\n{}",
+                    "expected `vibe dev` to say that it listens at {} within {LOCAL_TIMEOUT:?}\n{}",
                     self.url(),
                     run.map_or_else(String::new, |r| r.describe())
                 );
             }
             thread::sleep(Duration::from_millis(50));
         }
+    }
+
+    fn fail_not_listening(&self, run: &Run) -> ! {
+        panic!(
+            "expected `vibe dev` to say that it listens at {}\n{}",
+            self.url(),
+            run.describe()
+        );
     }
 
     /// Waits up to `limit` for a `--json` line for which `matches` holds.
@@ -266,6 +578,22 @@ impl<'a> Dev<'a> {
             .take()
             .unwrap_or_else(|| panic!("the harness's own check: `vibe dev` was already stopped"));
         running.wait(limit)
+    }
+
+    /// Waits up to `limit` for it to end; when it was started on a port the
+    /// harness chose and ended refusing it as taken, starts it again on
+    /// another (at most [`PORT_TRIES`] ports) and waits for that one. For
+    /// a test of a `vibe dev` that is to end by itself.
+    pub fn wait_end_trying_ports(mut self, limit: Duration) -> Run {
+        loop {
+            let running = self.running.take().unwrap_or_else(|| {
+                panic!("the harness's own check: `vibe dev` was already stopped")
+            });
+            let run = running.wait(limit);
+            if !self.respawn_after(&run) {
+                return run;
+            }
+        }
     }
 
     /// Kills it outright (`SIGKILL`), leaving what it started.

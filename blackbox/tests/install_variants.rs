@@ -106,7 +106,7 @@ fn with_the_administrators_postgres_17_vibe_is_refused_and_its_log_says_so() {
         .install
         .administrators_postgres(at.idp.bridge, "postgres:17");
     at.install.set_secret("VIBE_DATABASE_URL", &url);
-    at.install.up();
+    at.up();
     let deadline = Instant::now() + Duration::from_secs(90);
     loop {
         let logs = at
@@ -201,19 +201,18 @@ fn behind_another_proxy_that_ends_tls_the_installation_answers_and_its_redirects
 #[test]
 #[ignore = "needs Docker and a built image: scripts/install-gate.sh"]
 fn compose_yaml_alone_in_a_folder_with_its_env_and_certificates_comes_up_and_answers() {
-    use blackbox::install::{Install, Reach, free_port, image};
+    use blackbox::install::{Install, Reach, image};
     let image = image();
     let mut install = Install::alone(&[COMPOSE]);
     let authority = blackbox::tls::Authority::new("Harness authority of the wildcard certificate");
     install.certificates(&authority.issue(&[&format!("*.{DOMAIN}")]));
-    let port = free_port();
+    install.choose_port("VIBE_HTTPS_PORT");
     install.set("VIBE_DOMAIN", DOMAIN);
     install.set_secret(
         "VIBE_SECRET_KEY",
         blackbox::connection::SecretKey::fresh().expose(),
     );
     install.set_secret("POSTGRES_PASSWORD", &blackbox::shared_database::token());
-    install.set("VIBE_HTTPS_PORT", &port.to_string());
     install.set("VIBE_IMAGE", &image);
     install.write_env();
     // Nothing but compose.yaml, .env and certs/ with the two files.
@@ -240,6 +239,8 @@ fn compose_yaml_alone_in_a_folder_with_its_env_and_certificates_comes_up_and_ans
         "the harness's folder holds more than the contract's"
     );
     install.up();
+    // Read back after `up`: it chooses another port if this one was taken.
+    let port: u16 = install.value("VIBE_HTTPS_PORT").unwrap().parse().unwrap();
     let installation = Reach::at(port, &authority).wait_ready(&install);
     assert_eq!(
         installation,

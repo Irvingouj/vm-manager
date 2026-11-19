@@ -21,7 +21,7 @@ use std::net::{Ipv4Addr, TcpListener};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use blackbox::dev::{Dev, free_port, hex64_runs, local_files_but_postgres, local_files_holding};
+use blackbox::dev::{Dev, hex64_runs, local_files_but_postgres, local_files_holding};
 use blackbox::generate::{Generated, generate};
 use blackbox::local::{
     APP, BUILDER, Board, Local, OUTSIDER, Requested, handler, local_project, port_open,
@@ -370,9 +370,12 @@ fn a_vm_request_started_while_vm_dev_is_starting_is_answered_as_soon_as_it_liste
         }
         let name = format!("starting-board-{round}");
         let project = local_project(&local.machine, &name, &[]);
-        let mut dev = Dev::spawn(&local, &project.dir, &name, free_port(), true);
+        let mut dev = Dev::spawn_on_a_free_port(&local, &project.dir, &name, true);
         let deadline = Instant::now() + blackbox::local::LOCAL_TIMEOUT;
         while postmaster_of(&project.dir).is_none_or(|p| !is_running(p.pid)) {
+            if dev.respawn_if_port_refused() {
+                continue;
+            }
             assert!(
                 !dev.has_ended() && Instant::now() < deadline,
                 "round {round}: expected the private Postgres of `vibe dev` to listen while it starts\n{}",
@@ -428,12 +431,15 @@ fn a_vm_request_started_while_vm_dev_is_starting_is_answered_as_soon_as_it_liste
 fn a_second_vm_dev_started_while_the_first_is_starting_ends_already_running_without_waiting() {
     let local = Local::new();
     let project = local_project(&local.machine, "twice-board", &[]);
-    let mut first = Dev::spawn(&local, &project.dir, "twice-board", free_port(), true);
-    let mut second = Dev::spawn(&local, &project.dir, "twice-board", free_port(), true);
+    let mut first = Dev::spawn_on_a_free_port(&local, &project.dir, "twice-board", true);
+    let mut second = Dev::spawn_on_a_free_port(&local, &project.dir, "twice-board", true);
     let deadline = Instant::now() + blackbox::local::LOCAL_TIMEOUT;
     // Until one ends, or one says it listens; then the other has 15 seconds.
     let mut listened: Option<Instant> = None;
     let (ended, mut running) = loop {
+        if first.respawn_if_port_refused() || second.respawn_if_port_refused() {
+            continue;
+        }
         if second.has_ended() {
             break (second, first);
         }

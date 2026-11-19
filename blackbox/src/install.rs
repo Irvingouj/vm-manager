@@ -368,6 +368,18 @@ pub fn harness_file(bridge: IpAddr) -> String {
     )
 }
 
+/// Whether `said` (what `docker run` or `docker compose up` printed when it
+/// failed) is Docker refusing to publish `port` because something holds it
+/// ("failed to bind host port <ip>:<port>/tcp: address already in use", or
+/// "Bind for <ip>:<port> failed: port is already allocated"). Nothing else
+/// counts.
+pub fn docker_refused_port(said: &str, port: u16) -> bool {
+    said.lines().any(|line| {
+        line.contains(&format!(":{port}/tcp: address already in use"))
+            || line.contains(&format!(":{port} failed: port is already allocated"))
+    })
+}
+
 /// A port of `127.0.0.1` that is free now.
 pub fn free_port() -> u16 {
     crate::postgres::free_port().unwrap_or_else(|e| panic!("{e}"))
@@ -382,6 +394,10 @@ pub struct Install {
     secrets: Vec<String>,
     own_containers: RefCell<Vec<String>>,
     own_tags: RefCell<Vec<String>>,
+    /// The `.env` values that are ports the harness chose and nothing has
+    /// published yet: the first [`Install::up`] that finds one taken
+    /// chooses another ([`Install::choose_port`]).
+    chosen_ports: Vec<String>,
 }
 
 impl Install {
@@ -418,6 +434,7 @@ impl Install {
             secrets: Vec::new(),
             own_containers: RefCell::new(Vec::new()),
             own_tags: RefCell::new(Vec::new()),
+            chosen_ports: Vec::new(),
         };
         for name in files {
             let from = deploy_file(name);
@@ -585,10 +602,56 @@ impl Install {
         ran
     }
 
-    /// `docker compose up -d`.
-    pub fn up(&self) {
-        self.write_env();
-        self.compose_ok(&["up", "-d"], UP_WAIT);
+    /// Sets the `.env` value `name` to a port of 127.0.0.1 free now and
+    /// returns it: a port the harness chose, which something else may take
+    /// before Compose publishes it. The first [`Install::up`] that is
+    /// refused it as taken chooses another.
+    pub fn choose_port(&mut self, name: &str) -> u16 {
+        let port = free_port();
+        self.set(name, &port.to_string());
+        if !self.chosen_ports.iter().any(|n| n == name) {
+            self.chosen_ports.push(name.to_owned());
+        }
+        port
+    }
+
+    /// `docker compose up -d`; fails the test (with the containers' logs)
+    /// unless it ends with `0`. When Docker refuses to publish a port the
+    /// harness chose ([`Install::choose_port`]) because something else
+    /// holds it, another is chosen, `.env` written again, and `up -d` run
+    /// again, at most [`crate::dev::PORT_TRIES`] times, saying so on
+    /// standard error. Once up, the ports are the installation's: a later
+    /// `up` (after a `down`, an upgrade) is never moved to another port.
+    pub fn up(&mut self) {
+        let mut attempt = 1;
+        loop {
+            self.write_env();
+            let ran = self.compose(&["up", "-d"], UP_WAIT);
+            if ran.ok() {
+                self.chosen_ports.clear();
+                return;
+            }
+            let said = format!("{}\n{}", ran.stdout, ran.stderr);
+            let refused = self.chosen_ports.iter().find_map(|name| {
+                let port = self.value(name)?.parse::<u16>().ok()?;
+                docker_refused_port(&said, port).then(|| (name.clone(), port))
+            });
+            match refused {
+                Some((name, port)) if attempt < crate::dev::PORT_TRIES => {
+                    crate::dev::say_port_taken(
+                        &format!("`docker compose up` ({name})"),
+                        port,
+                        attempt,
+                    );
+                    attempt += 1;
+                    self.set(&name, &free_port().to_string());
+                }
+                _ => self.fail(&format!(
+                    "expected `docker compose up -d` to end with 0\n{}",
+                    ran.describe(&self.secrets())
+                )),
+            }
+        }
     }
 
     /// The containers' logs (`docker compose logs`), secrets masked.
@@ -763,6 +826,25 @@ impl Install {
         command: &[&str],
         env: &[(&str, &str)],
     ) -> String {
+        self.try_start_own(options, image, command, env)
+            .unwrap_or_else(|ran| {
+                self.fail(&format!(
+                    "expected a container of the test's own to start\n{}",
+                    ran.describe(&self.secrets())
+                ))
+            })
+    }
+
+    /// As [`Install::start_own`]: its name, or how `docker run` ended when
+    /// it did not start (the container, made or not, is removed when the
+    /// test ends all the same).
+    pub fn try_start_own(
+        &self,
+        options: &[&str],
+        image: &str,
+        command: &[&str],
+        env: &[(&str, &str)],
+    ) -> Result<String, Ran> {
         public_image(image);
         let name = format!("{}-own-{}", self.project, token());
         self.own_containers.borrow_mut().push(name.clone());
@@ -771,13 +853,7 @@ impl Install {
         all.push(image);
         all.extend_from_slice(command);
         let ran = docker_with(None, &all, env, DOCKER_WAIT);
-        if !ran.ok() {
-            self.fail(&format!(
-                "expected a container of the test's own to start\n{}",
-                ran.describe(&self.secrets())
-            ));
-        }
-        name
+        if ran.ok() { Ok(name) } else { Err(ran) }
     }
 
     /// `psql` from a container of the test's own on the network of the
@@ -836,23 +912,49 @@ impl Install {
         if let Some(folder) = script.parent() {
             set_mode(folder, 0o755);
         }
-        let port = free_port();
-        let name = self.start_own(
-            &[
-                "-e",
-                "POSTGRES_PASSWORD",
-                "--publish",
-                &format!("{bridge}:{port}:5432"),
-                "--volume",
-                &format!(
-                    "{}:/docker-entrypoint-initdb.d/init.sql:ro",
-                    script.display()
-                ),
-            ],
-            image,
-            &[],
-            &[("POSTGRES_PASSWORD", superuser_password.as_str())],
-        );
+        // A port the harness chooses: when Docker cannot publish it because
+        // something else took it since, another, at most PORT_TRIES times.
+        let mut attempt = 1;
+        let (port, name) = loop {
+            let port = free_port();
+            let started = self.try_start_own(
+                &[
+                    "-e",
+                    "POSTGRES_PASSWORD",
+                    "--publish",
+                    &format!("{bridge}:{port}:5432"),
+                    "--volume",
+                    &format!(
+                        "{}:/docker-entrypoint-initdb.d/init.sql:ro",
+                        script.display()
+                    ),
+                ],
+                image,
+                &[],
+                &[("POSTGRES_PASSWORD", superuser_password.as_str())],
+            );
+            match started {
+                Ok(name) => break (port, name),
+                Err(ran)
+                    if attempt < crate::dev::PORT_TRIES
+                        && docker_refused_port(
+                            &format!("{}\n{}", ran.stdout, ran.stderr),
+                            port,
+                        ) =>
+                {
+                    crate::dev::say_port_taken(
+                        "`docker run` (the test's own Postgres)",
+                        port,
+                        attempt,
+                    );
+                    attempt += 1;
+                }
+                Err(ran) => self.fail(&format!(
+                    "expected a container of the test's own to start\n{}",
+                    ran.describe(&self.secrets())
+                )),
+            }
+        };
         // Over TCP only once the first start's script has run and the
         // server has started for good.
         let deadline = Instant::now() + POSTGRES_READY;
@@ -1532,18 +1634,21 @@ impl Installed {
         install.set_secret("POSTGRES_PASSWORD", &token());
         install.set("VIBE_IMAGE", &image);
         install.set("VIBE_CA_FILE", &ca);
+        // The ports Compose publishes are chosen ([`Install::choose_port`]):
+        // the first `up` chooses again if one was taken since, and
+        // [`Installed::up`] follows it. The front's port is held by the
+        // front itself from now on.
         let (port, front) = match door {
-            FrontDoor::TheFilesProxy => (free_port(), None),
+            FrontDoor::TheFilesProxy => (install.choose_port("VIBE_HTTPS_PORT"), None),
             FrontDoor::AnotherProxy => {
-                let http_port = free_port();
-                install.set("VIBE_HTTP_PORT", &http_port.to_string());
+                let http_port = install.choose_port("VIBE_HTTP_PORT");
                 let bound = Bound::new();
                 let port = bound.port();
+                install.set("VIBE_HTTPS_PORT", &port.to_string());
                 let front = bound.tls(&wildcard, SocketAddr::from(([127, 0, 0, 1], http_port)));
                 (port, Some(front))
             }
         };
-        install.set("VIBE_HTTPS_PORT", &port.to_string());
         install.write_env();
         let tool_ca = crate::tls::Files::new();
         let tool_ca_file = crate::tls::text_of(
@@ -1568,10 +1673,35 @@ impl Installed {
         &self.tool_ca_file
     }
 
-    /// `docker compose up -d`, then waits until `GET /v1/installation`
-    /// answers through the front door; returns its JSON.
-    pub fn up_and_ready(&self) -> Value {
+    /// `docker compose up -d` ([`Install::up`]); when it had to choose
+    /// another port for one taken since [`Installed::prepare`], the front
+    /// door follows: [`Installed::reach`] for the Compose file's proxy, the
+    /// test's front's target for another proxy.
+    pub fn up(&mut self) {
         self.install.up();
+        if let Some(front) = &self.front {
+            if let Some(http) = self
+                .install
+                .value("VIBE_HTTP_PORT")
+                .and_then(|p| p.parse::<u16>().ok())
+                && front.target().port() != http
+            {
+                front.retarget(SocketAddr::from(([127, 0, 0, 1], http)));
+            }
+        } else if let Some(https) = self
+            .install
+            .value("VIBE_HTTPS_PORT")
+            .and_then(|p| p.parse::<u16>().ok())
+            && https != self.reach.port
+        {
+            self.reach = Reach::at(https, &self.proxy_authority);
+        }
+    }
+
+    /// [`Installed::up`], then waits until `GET /v1/installation` answers
+    /// through the front door; returns its JSON.
+    pub fn up_and_ready(&mut self) -> Value {
+        self.up();
         self.reach.wait_ready(&self.install)
     }
 

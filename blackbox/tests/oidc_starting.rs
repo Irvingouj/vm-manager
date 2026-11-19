@@ -27,7 +27,7 @@ use blackbox::connection::{
     Connection, SecretKey, installation_of, put_oidc, setup_credential, shown,
 };
 use blackbox::oidc::{Outage, Provider};
-use blackbox::postgres::{Platform, free_port};
+use blackbox::postgres::Platform;
 use blackbox::program::{EXIT_TIMEOUT, Finished, run_to_exit, vm_binary};
 use blackbox::sessions::{ADA, Installation, ada, oidc_options};
 use blackbox::tool::{Machine, bearer};
@@ -433,23 +433,29 @@ fn the_client_secret_and_the_key_are_in_no_line_of_the_log_after_a_sign_in() {
     installation.assert_none_in_log(&hidden, "after a sign-in");
 }
 
-/// An address on 127.0.0.1 nothing listens on now: to start the program
-/// again where the tool's credential file says it is.
-fn fixed_address() -> SocketAddr {
-    SocketAddr::from(([127, 0, 0, 1], free_port().unwrap()))
+/// A program with the stand-in and `--administrators-group admins` on a
+/// fresh platform database, at an address on 127.0.0.1 with a port the
+/// harness chose (tried again on another if something took it first): to
+/// start the program again where the tool's credential file says it is.
+fn stand_in_at_a_fixed_address() -> Vm {
+    Vm::start_at_a_chosen_port(
+        &VmOptions::new()
+            .stand_in_sign_in()
+            .administrators_group("admins"),
+    )
 }
 
 /// A program with the stand-in and `--administrators-group admins` at
-/// `address`, on a fresh platform database or this one.
-fn stand_in_at(address: SocketAddr, platform: Option<&Platform>) -> Vm {
-    let options = VmOptions::new()
-        .stand_in_sign_in()
-        .administrators_group("admins")
-        .listen(address);
-    Vm::start(&match platform {
-        Some(platform) => options.platform(platform),
-        None => options,
-    })
+/// `address` again, on this platform database. Not tried at another
+/// address: being at this one is what the test is about.
+fn stand_in_at(address: SocketAddr, platform: &Platform) -> Vm {
+    Vm::start(
+        &VmOptions::new()
+            .stand_in_sign_in()
+            .administrators_group("admins")
+            .listen(address)
+            .platform(platform),
+    )
 }
 
 /// The tool on a new machine signed in with the stand-in as someone in the
@@ -481,8 +487,8 @@ fn assert_signs_nobody_in(vm: &Vm, machine: &Machine, credential: &str, context:
 
 #[test]
 fn a_tool_credential_made_with_the_stand_in_signs_nobody_in_without_the_stand_in() {
-    let address = fixed_address();
-    let stand_in = stand_in_at(address, None);
+    let stand_in = stand_in_at_a_fixed_address();
+    let address = stand_in.address();
     let (machine, credential) = administrator_signed_in_with_the_stand_in(&stand_in);
     let platform = stand_in.platform().clone();
     drop(stand_in);
@@ -512,15 +518,15 @@ fn a_tool_credential_made_with_the_stand_in_signs_nobody_in_without_the_stand_in
 
 #[test]
 fn a_tool_credential_made_with_the_stand_in_is_good_again_at_a_start_with_the_stand_in() {
-    let address = fixed_address();
-    let stand_in = stand_in_at(address, None);
+    let stand_in = stand_in_at_a_fixed_address();
+    let address = stand_in.address();
     let (machine, credential) = administrator_signed_in_with_the_stand_in(&stand_in);
     let platform = stand_in.platform().clone();
     drop(stand_in);
     let vm = Vm::start(&oidc_options().platform(&platform).listen(address));
     assert_signs_nobody_in(&vm, &machine, &credential, "started without the stand-in");
     drop(vm);
-    let again = stand_in_at(address, Some(&platform));
+    let again = stand_in_at(address, &platform);
     let me = bearer(&again, "/v1/me", &credential).send();
     assert_eq!(
         me.status,

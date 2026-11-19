@@ -38,7 +38,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use blackbox::dev::{Dev, free_port};
+use blackbox::dev::Dev;
 use blackbox::generate::listed;
 use blackbox::local::{Local, OUTSIDER, local_postgres_bin, local_project};
 use blackbox::project::stand_ins;
@@ -383,14 +383,13 @@ fn vm_dev_that_fails_before_it_listens_says_the_same() {
         "pg-dev-read-only",
         "exec \"$REAL/postgres\" \"$@\" -c default_transaction_read_only=on",
     );
-    let dev = Dev::spawn(
+    let dev = Dev::spawn_on_a_free_port(
         &failing.local,
         &failing.project.dir,
         "pg-dev-read-only",
-        free_port(),
         true,
     );
-    let run = dev.wait_end(Duration::from_secs(200));
+    let run = dev.wait_end_trying_ports(Duration::from_secs(200));
     run.json_error(1, "postgres-failed");
     let error = run.json()["error"].clone();
     assert_step_shape(&error);

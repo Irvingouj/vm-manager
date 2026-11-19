@@ -20,7 +20,7 @@
 
 use std::path::PathBuf;
 
-use blackbox::dev::{dev_args, free_port};
+use blackbox::dev::run_dev_on_a_free_port;
 use blackbox::local::{
     Local, Mirror, OUTSIDER, Redirector, Requested, Serving, archive_path, holds_postgres_programs,
     local_project, port_open,
@@ -279,11 +279,9 @@ fn vibe_dev_with_an_https_mirror_and_an_unusable_file_is_ca_file_and_listens_now
     let local = Local::new().without_bin().with_mirror(&https.base_url());
     let project = local_project(&local.machine, "tls-dev", &[]);
     let path = https.unusable_files().remove(0);
-    let port = free_port();
-    let args = dev_args(&project.dir, port, true);
-    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     local.watch(&project.dir);
-    let run = local.run(&refs, &[("VIBE_CA_FILE", &path)]);
+    let (port, run) =
+        run_dev_on_a_free_port(&local, &project.dir, true, &[("VIBE_CA_FILE", &path)]);
     assert_ca_file(&run, &path);
     assert!(!port_open(port), "expected nothing listening on {port}");
     assert_eq!(https.front.accepted(), 0, "{}", https.front.describe());

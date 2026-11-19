@@ -61,7 +61,7 @@ fn psql_when_up(at: &Installed, sql: &str) -> Result<String, String> {
 #[test]
 #[ignore = "needs Docker and a built image: scripts/install-gate.sh"]
 fn a_bundled_postgres_whose_first_start_was_interrupted_stays_unhealthy_and_vibe_is_not_started() {
-    let at = Installed::prepare(&[COMPOSE], &[ada()], FrontDoor::TheFilesProxy);
+    let mut at = Installed::prepare(&[COMPOSE], &[ada()], FrontDoor::TheFilesProxy);
     let mut hit = None;
     let mut seen = Vec::new();
     for attempt in 1..=TRIES {
