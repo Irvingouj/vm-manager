@@ -833,18 +833,7 @@ pub fn tls_exchange(
     wire: &[u8],
     timeout: Duration,
 ) -> Result<Vec<u8>, String> {
-    let mut store = RootCertStore::empty();
-    for root in roots {
-        store
-            .add(root.clone())
-            .map_err(|e| format!("cannot trust a root: {e}"))?;
-    }
-    let config =
-        ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-            .with_safe_default_protocol_versions()
-            .map_err(|e| format!("the harness's TLS versions: {e}"))?
-            .with_root_certificates(store)
-            .with_no_client_auth();
+    let config = client_config(roots)?;
     let name = ServerName::try_from(server_name.to_owned())
         .map_err(|e| format!("not a server name {server_name:?}: {e}"))?;
     let connection = ClientConnection::new(Arc::new(config), name)
@@ -881,6 +870,88 @@ pub fn tls_exchange(
         }
     }
     Ok(answer)
+}
+
+/// The harness's TLS client's configuration: these roots alone.
+fn client_config(roots: &[CertificateDer<'static>]) -> Result<ClientConfig, String> {
+    let mut store = RootCertStore::empty();
+    for root in roots {
+        store
+            .add(root.clone())
+            .map_err(|e| format!("cannot trust a root: {e}"))?;
+    }
+    Ok(
+        ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .map_err(|e| format!("the harness's TLS versions: {e}"))?
+            .with_root_certificates(store)
+            .with_no_client_auth(),
+    )
+}
+
+/// As [`tls_exchange`], for a large request: `wire` is written while the
+/// answer is read, so that an answer the server gives before it has read
+/// the whole request (a `413`), and its closing the connection then, are
+/// heard rather than lost in a failed write. Connecting, the handshake and
+/// each read are held to `timeout`, and the writing to it as a whole.
+/// `Err` when no answer came.
+pub fn tls_exchange_while_writing(
+    address: SocketAddr,
+    server_name: &str,
+    roots: &[CertificateDer<'static>],
+    wire: &[u8],
+    timeout: Duration,
+) -> Result<Vec<u8>, String> {
+    let config = client_config(roots)?;
+    let name = ServerName::try_from(server_name.to_owned())
+        .map_err(|e| format!("not a server name {server_name:?}: {e}"))?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()
+        .map_err(|e| format!("cannot make a runtime: {e}"))?;
+    runtime.block_on(async {
+        let socket = tokio::time::timeout(timeout, TcpStream::connect(address))
+            .await
+            .map_err(|_| format!("cannot connect to {address} in time"))?
+            .map_err(|e| format!("cannot connect to {address}: {e}"))?;
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+        let tls = tokio::time::timeout(timeout, connector.connect(name, socket))
+            .await
+            .map_err(|_| "the handshake did not end in time".to_owned())?
+            .map_err(|e| format!("TLS: {e}"))?;
+        let (mut reading, mut writing) = tokio::io::split(tls);
+        let write = async {
+            let wrote = tokio::time::timeout(timeout, writing.write_all(wire)).await;
+            drop(writing.flush().await);
+            match wrote {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(e)) => Err(e.to_string()),
+                Err(_) => Err("not written in time".to_owned()),
+            }
+        };
+        let read = async {
+            let mut answer = Vec::new();
+            let mut chunk = vec![0_u8; 64 * 1024];
+            loop {
+                match tokio::time::timeout(timeout, reading.read(&mut chunk)).await {
+                    Ok(Ok(0)) => break Ok(answer),
+                    Ok(Ok(n)) => answer.extend_from_slice(chunk.get(..n).unwrap_or_default()),
+                    Ok(Err(_)) if !answer.is_empty() => break Ok(answer),
+                    Ok(Err(e)) => break Err(format!("TLS: {e}")),
+                    Err(_) => break Err(format!("no answer within {timeout:?}")),
+                }
+            }
+        };
+        let (wrote, read) = tokio::join!(write, read);
+        match read {
+            Ok(answer) if !answer.is_empty() => Ok(answer),
+            Ok(_) => Err(format!(
+                "the connection closed with no answer (writing the request: {wrote:?})"
+            )),
+            Err(problem) => Err(format!("{problem} (writing the request: {wrote:?})")),
+        }
+    })
 }
 
 /// A folder of a test's own for PEM files (certificates; a private key

@@ -23,13 +23,16 @@ use blackbox::shared_database::token;
 use serde_json::Value;
 
 /// The values of the contract's table.
-const TABLE: [&str; 7] = [
+const TABLE: [&str; 10] = [
     "VIBE_DOMAIN",
     "VIBE_SECRET_KEY",
     "POSTGRES_PASSWORD",
     "VIBE_BIND",
     "VIBE_HTTPS_PORT",
     "VIBE_IMAGE",
+    "VIBE_DATABASE_URL",
+    "VIBE_HTTP_BIND",
+    "VIBE_HTTP_PORT",
     "VIBE_CA_FILE",
 ];
 
@@ -157,6 +160,9 @@ fn compose_refuses_each_missing_required_value_naming_it() {
 #[test]
 #[ignore = "needs Docker and a built image: scripts/install-gate.sh"]
 fn with_the_administrators_postgres_compose_refuses_a_missing_database_url_naming_it() {
+    // POSTGRES_PASSWORD stays set, so that no refusal of the base file
+    // hides this one; the message is only to name VIBE_DATABASE_URL (it may
+    // name others too).
     let mut install = with_required(&[COMPOSE, OWN_POSTGRES]);
     install.unset("VIBE_DATABASE_URL");
     assert_refused_naming(&install, "VIBE_DATABASE_URL");

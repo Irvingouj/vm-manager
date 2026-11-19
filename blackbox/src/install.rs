@@ -76,6 +76,12 @@ pub const UP_WAIT: Duration = Duration::from_secs(600);
 pub const READY_WAIT: Duration = Duration::from_secs(180);
 /// The longest a Postgres of the test's own may take to take connections.
 pub const POSTGRES_READY: Duration = Duration::from_secs(90);
+/// The longest a request with a body at the API's limit (16 MiB) may take
+/// to be sent and answered.
+pub const BODY_WAIT: Duration = Duration::from_secs(60);
+/// The API's limit on a request's body (CONTRACT.md, "The platform's API":
+/// exactly this is accepted, one byte more is `413` `too-large`).
+pub const API_BODY_LIMIT: usize = 16 * 1024 * 1024;
 /// The longest `docker export` of the image may take.
 pub const EXPORT_WAIT: Duration = Duration::from_secs(300);
 
@@ -994,6 +1000,40 @@ impl Reach {
             &format!("api.{DOMAIN}"),
             std::slice::from_ref(&self.authority),
         )
+    }
+
+    /// `POST https://api.<domain>:<port><target>` over TLS with a JSON body
+    /// of exactly `size` bytes (not JSON the API takes: `x` repeated),
+    /// given [`BODY_WAIT`]; the caller says who sends it.
+    pub fn post_of_size(&self, target: &str, size: usize) -> Request {
+        self.api(target)
+            .method("POST")
+            .timeout(BODY_WAIT)
+            .header("content-type", "application/json")
+            .body(vec![b'x'; size])
+    }
+
+    /// The tool's credential kept on `machine`: of the runs of
+    /// credential-like text in its credential files, the one with which
+    /// the installation answers `GET /v1/me` through the front door.
+    pub fn kept_credential(&self, machine: &Machine) -> String {
+        let mut signing_in = Vec::new();
+        for file in machine.credential_files() {
+            let bytes =
+                fs::read(&file).unwrap_or_else(|e| panic!("cannot read {}: {e}", file.display()));
+            for candidate in crate::tool::credential_like_runs(&bytes) {
+                let answer = self.api("/v1/me").bearer(&candidate).try_send();
+                if answer.is_ok_and(|a| a.status == 200) {
+                    signing_in.push(candidate);
+                }
+            }
+        }
+        assert_eq!(
+            signing_in.len(),
+            1,
+            "expected one credential kept on the machine with which the installation answers GET /v1/me"
+        );
+        signing_in.remove(0)
     }
 
     /// `GET https://api.<domain>:<port>/v1/installation`.

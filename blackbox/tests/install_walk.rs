@@ -33,7 +33,7 @@
 use blackbox::DOMAIN;
 use blackbox::browser::{Browser, describe_steps};
 use blackbox::deploy::{Deployed, commit_all, deploy_with_env, init_repository};
-use blackbox::install::{COMPOSE, DOCKER_WAIT, FrontDoor, Installed};
+use blackbox::install::{API_BODY_LIMIT, COMPOSE, DOCKER_WAIT, FrontDoor, Installed};
 use blackbox::project::new_project_in_repository;
 use blackbox::sessions::{ADA, ada};
 use blackbox::tls::{Authority, tls_get};
@@ -428,6 +428,36 @@ fn installed_as_downloaded_a_person_signs_in_deploys_and_is_let_in_again_after_r
     let deployed = Deployed::of(&run);
     assert_eq!(deployed.application, APPLICATION);
     assert_eq!(deployed.version, 1);
+
+    // A body over the API's limit, through the proxy as a signed-in
+    // person, is the platform's own refusal; one at the limit is not
+    // refused for its size.
+    let credential = at.reach.kept_credential(&machine);
+    at.install.hide(&credential);
+    for (size, over) in [(API_BODY_LIMIT + 1, true), (API_BODY_LIMIT, false)] {
+        let answer = at
+            .reach
+            .post_of_size("/v1/applications", size)
+            .bearer(&credential)
+            .try_send();
+        let answer = match answer {
+            Ok(answer) => answer,
+            Err(problem) => at.install.fail(&format!(
+                "expected the platform to answer a body of {size} bytes through the proxy, got no answer: {problem}"
+            )),
+        };
+        let reason = serde_json::from_slice::<Value>(answer.body())
+            .ok()
+            .and_then(|b| b["error"]["reason"].as_str().map(str::to_owned));
+        let refused_for_size = answer.status == 413 && reason.as_deref() == Some("too-large");
+        if over != refused_for_size || reason.is_none() {
+            at.install.fail(&format!(
+                "expected a body of {size} bytes through the proxy to be answered by the platform's own JSON {}\n{}",
+                if over { "refusal 413 too-large" } else { "answer, not refused for its size" },
+                blackbox::connection::masked(&answer.describe(), &[&credential])
+            ));
+        }
+    }
 
     // The walking skeleton's request, as installed.
     let mut browser = at.reach.browser_as(&at.idp, ADA);

@@ -207,13 +207,21 @@ impl Request {
     /// Sends the request; an error says what went wrong on the wire.
     pub fn try_send(&self) -> Result<Response, String> {
         if let Some((server_name, roots)) = &self.tls {
-            let raw = crate::tls::tls_exchange(
-                self.address,
-                server_name,
-                roots,
-                &self.wire_bytes(),
-                self.timeout,
-            )?;
+            let wire = self.wire_bytes();
+            // A large body is written while the answer is read, as over
+            // plain HTTP: a server may answer (`413`) before it has read it
+            // all, and close.
+            let raw = if wire.len() < WRITE_ON_A_THREAD_FROM {
+                crate::tls::tls_exchange(self.address, server_name, roots, &wire, self.timeout)?
+            } else {
+                crate::tls::tls_exchange_while_writing(
+                    self.address,
+                    server_name,
+                    roots,
+                    &wire,
+                    self.timeout,
+                )?
+            };
             return Response::parse_answer(&raw, self.to_string(), self.method == "HEAD");
         }
         let deadline = Instant::now() + self.timeout;

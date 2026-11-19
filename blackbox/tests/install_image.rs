@@ -107,9 +107,21 @@ fn the_image_runs_vibe_which_prints_what_the_programs_version_prints() {
         "expected `docker run <image> --version` to end with 0\n{}",
         ran.describe(&[])
     );
+    // The first line (the name and the version) is the working tree's;
+    // the lines after it describe the build, and are only to be there.
+    let first = |text: &str| text.lines().next().unwrap_or_default().to_owned();
     assert_eq!(
-        ran.stdout, want,
-        "expected the image to print what `vibe --version` of the working tree prints"
+        first(&ran.stdout),
+        first(&want),
+        "expected the first line of `docker run <image> --version` to be that of `vibe --version` of the working tree\n{}",
+        ran.describe(&[])
+    );
+    let lines: Vec<&str> = ran.stdout.lines().collect();
+    assert!(
+        lines.len() == want.lines().count() && lines.iter().all(|l| !l.trim().is_empty()),
+        "expected `docker run <image> --version` to print as many lines as `vibe --version` ({}), none empty\n{}",
+        want.lines().count(),
+        ran.describe(&[])
     );
     // `vibe` is on the path.
     let on_path = docker(
@@ -126,7 +138,7 @@ fn the_image_runs_vibe_which_prints_what_the_programs_version_prints() {
         DOCKER_WAIT,
     );
     assert!(
-        on_path.ok() && on_path.stdout == want,
+        on_path.ok() && first(&on_path.stdout) == first(&want),
         "expected `vibe` on the image's path\n{}",
         on_path.describe(&[])
     );

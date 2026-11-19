@@ -389,3 +389,31 @@ fn a_resolved_name_is_reached_at_its_address_over_tls() {
         front.describe()
     );
 }
+
+#[test]
+fn a_body_over_the_apis_limit_sent_over_tls_is_answered_and_one_at_the_limit_is_not_refused_for_its_size()
+ {
+    use blackbox::install::{API_BODY_LIMIT, Reach};
+    let vm = blackbox::Vm::with_stand_in(&[]);
+    let a = Authority::new("Harness authority A");
+    let front = Front::tls(&a.issue(&[&format!("*.{DOMAIN}")]), vm.address());
+    let reach = Reach::at(front.port(), &a);
+    let over = reach
+        .post_of_size("/v1/applications", API_BODY_LIMIT + 1)
+        .header("x-vm-stand-in-user", "dana")
+        .try_send()
+        .unwrap_or_else(|e| panic!("expected an answer to a body over the limit, got {e}"));
+    assert_eq!(over.status, 413, "{}", over.describe());
+    assert_eq!(over.json()["error"]["reason"], "too-large");
+    let at_limit = reach
+        .post_of_size("/v1/applications", API_BODY_LIMIT)
+        .header("x-vm-stand-in-user", "dana")
+        .try_send()
+        .unwrap_or_else(|e| panic!("expected an answer to a body at the limit, got {e}"));
+    assert_ne!(at_limit.status, 413, "{}", at_limit.describe());
+    assert!(
+        at_limit.json()["error"]["reason"].is_string(),
+        "{}",
+        at_limit.describe()
+    );
+}
