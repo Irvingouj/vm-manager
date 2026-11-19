@@ -6,10 +6,16 @@
 //! Maven Central, downloaded once to a per-user cache and checked against
 //! the SHA-256 pinned here and published beside them
 //! (`docs/research/local-postgres-without-docker.md`). No Docker, no
-//! administrator rights. `VIBE_TEST_PG_VERSION` (16, 17 or 18; default 18)
-//! chooses the version: a Postgres on the machine is used only if it is
-//! exactly that version (at least 18 when the variable is unset), and the
-//! download is of that version.
+//! administrator rights. It is a Postgres 18 ([`MAJOR`]), the one version
+//! the platform supports (CONTRACT.md, "One Postgres version"): nothing
+//! chooses another. `VIBE_TEST_PG_BIN` naming a Postgres of another version
+//! stops the harness, saying so; a Postgres on the machine of another
+//! version is passed over, saying so, and 18 is downloaded.
+//!
+//! For the tests that need a server of another version, [`other_binaries`]
+//! downloads a Postgres 17 ([`OTHER_MAJOR`]) beside it, to the same cache by
+//! the same means, and [`PrivatePostgres::start_other_version`] starts an
+//! instance of it, which its test stops (on drop).
 //!
 //! [`PrivatePostgres::start`] runs `initdb` into a fresh directory under the
 //! system temp directory and starts `postgres` on a free 127.0.0.1 port, with
@@ -40,42 +46,13 @@ use sha2::{Digest, Sha256};
 
 use crate::program::run_to_exit;
 
-/// The Postgres major version the harness runs when `VIBE_TEST_PG_VERSION`
-/// does not say.
-pub const DEFAULT_MAJOR: u32 = 18;
+/// The Postgres major version the harness runs: the one the platform
+/// supports.
+pub const MAJOR: u32 = 18;
 
-/// The major versions `VIBE_TEST_PG_VERSION` may choose.
-pub const MAJORS: [u32; 3] = [16, 17, 18];
-
-/// The Postgres major version the harness wants: `VIBE_TEST_PG_VERSION` (16,
-/// 17 or 18), else [`DEFAULT_MAJOR`]. Any other value fails the test that
-/// asks, saying what is allowed.
-pub fn wanted_major() -> u32 {
-    match chosen_major() {
-        Ok(Some(major)) => major,
-        Ok(None) => DEFAULT_MAJOR,
-        Err(problem) => panic!("{problem}"),
-    }
-}
-
-/// The version `VIBE_TEST_PG_VERSION` chooses, if it is set.
-fn chosen_major() -> Result<Option<u32>, String> {
-    let Some(value) = std::env::var_os("VIBE_TEST_PG_VERSION") else {
-        return Ok(None);
-    };
-    let text = value.to_string_lossy();
-    let text = text.trim();
-    if text.is_empty() {
-        return Ok(None);
-    }
-    text.parse::<u32>()
-        .ok()
-        .filter(|major| MAJORS.contains(major))
-        .map(Some)
-        .ok_or_else(|| {
-            format!("VIBE_TEST_PG_VERSION is {text:?}: it must be one of {MAJORS:?}, or unset for {DEFAULT_MAJOR}")
-        })
-}
+/// The major version of the server of another version that
+/// [`other_binaries`] downloads, for the tests that the program refuses it.
+pub const OTHER_MAJOR: u32 = 17;
 
 /// Per major version and platform: the major, the version of zonky's build
 /// that is downloaded, Rust's `(OS, ARCH)`, zonky's name for the platform,
@@ -146,38 +123,6 @@ const ARCHIVES: &[(u32, &str, &str, &str, &str, &str)] = &[
         "aarch64",
         "darwin-arm64v8",
         "a1c2786acb0c398f9b2d76806fc52f5dc8b222cbc8e9383a9b9702084daaf3a5",
-    ),
-    (
-        16,
-        "16.15.0",
-        "linux",
-        "x86_64",
-        "linux-amd64",
-        "653abc065c682b85d3da50168fb95dc524bd85426cdec9ce3695a550ef431df2",
-    ),
-    (
-        16,
-        "16.15.0",
-        "linux",
-        "aarch64",
-        "linux-arm64v8",
-        "f846a9989d686b7977d6eca9bc9d8b2b69e3f70c7eb60e032197d9c574a6136c",
-    ),
-    (
-        16,
-        "16.15.0",
-        "macos",
-        "x86_64",
-        "darwin-amd64",
-        "1229188b99515d2160d5cb6222bc96d9c5f3a248268df3bc2dfe0047e6c233d8",
-    ),
-    (
-        16,
-        "16.15.0",
-        "macos",
-        "aarch64",
-        "darwin-arm64v8",
-        "65b953905f0a4d46030767a6b44a52360170d69a7985f1b02aa435f2f6256a83",
     ),
 ];
 
@@ -251,39 +196,65 @@ pub fn binaries() -> &'static Binaries {
 }
 
 fn find_binaries() -> Result<Binaries, String> {
-    let chosen = chosen_major()?;
     if let Some(dir) = std::env::var_os("VIBE_TEST_PG_BIN") {
         let bin = PathBuf::from(dir);
-        return if has_all_three(&bin) {
-            Ok(Binaries {
-                bin,
-                origin: Origin::Variable,
-            })
-        } else {
-            Err(format!(
+        if !has_all_three(&bin) {
+            return Err(format!(
                 "VIBE_TEST_PG_BIN names {}, which does not hold postgres, initdb and pg_ctl",
                 bin.display()
-            ))
+            ));
+        }
+        return match major_version(&bin.join(exe("postgres"))) {
+            Some(MAJOR) => Ok(Binaries {
+                bin,
+                origin: Origin::Variable,
+            }),
+            found => Err(format!(
+                "VIBE_TEST_PG_BIN names {}, a Postgres {}: the harness runs Postgres {MAJOR} only, the one version the platform supports; unset it, or name a Postgres {MAJOR}",
+                bin.display(),
+                found.map_or_else(
+                    || "of a version it cannot tell".to_owned(),
+                    |m| m.to_string()
+                )
+            )),
         };
     }
-    if let Some(bin) = on_the_machine(chosen) {
+    if let Some(bin) = on_the_machine() {
         return Ok(Binaries {
             bin,
             origin: Origin::OnTheMachine,
         });
     }
-    let bin = downloaded(chosen.unwrap_or(DEFAULT_MAJOR))?;
+    let bin = downloaded(MAJOR)?;
     Ok(Binaries {
         bin,
         origin: Origin::Cache,
     })
 }
 
-/// A directory on the machine with all three binaries: of exactly the
-/// version `VIBE_TEST_PG_VERSION` chose, or, when it is unset, of a Postgres
-/// at least [`DEFAULT_MAJOR`]. On `PATH`, or where packages and installers
-/// put them.
-fn on_the_machine(chosen: Option<u32>) -> Option<PathBuf> {
+/// The binaries of a Postgres 17 ([`OTHER_MAJOR`]), downloaded once to the
+/// same cache as the 18, by the same means: for the tests that the program
+/// refuses a server of another version. Never a Postgres on the machine,
+/// nor `VIBE_TEST_PG_BIN`'s.
+pub fn other_binaries() -> &'static Binaries {
+    static OTHER: OnceLock<Result<Binaries, String>> = OnceLock::new();
+    match OTHER.get_or_init(|| {
+        downloaded(OTHER_MAJOR).map(|bin| Binaries {
+            bin,
+            origin: Origin::Cache,
+        })
+    }) {
+        Ok(binaries) => binaries,
+        Err(problem) => {
+            panic!("cannot get the binaries of Postgres {OTHER_MAJOR} for the tests: {problem}")
+        }
+    }
+}
+
+/// A directory on the machine with all three binaries of a Postgres 18
+/// ([`MAJOR`]), on `PATH`, or where packages and installers put them. One
+/// of another version is passed over, and the harness says so.
+fn on_the_machine() -> Option<PathBuf> {
     let mut candidates: Vec<PathBuf> = std::env::var_os("PATH")
         .map(|path| std::env::split_paths(&path).collect())
         .unwrap_or_default();
@@ -303,22 +274,34 @@ fn on_the_machine(chosen: Option<u32>) -> Option<PathBuf> {
     candidates
         .into_iter()
         .filter(|bin| has_all_three(bin))
-        .find(|bin| {
-            major_version(&bin.join(exe("postgres"))).is_some_and(|m| match chosen {
-                Some(chosen) => m == chosen,
-                None => m >= DEFAULT_MAJOR,
-            })
+        .find(|bin| match major_version(&bin.join(exe("postgres"))) {
+            Some(MAJOR) => true,
+            found => {
+                eprintln!(
+                    "blackbox: not using the Postgres at {} ({}): the harness runs Postgres {MAJOR} only",
+                    bin.display(),
+                    found.map_or_else(
+                        || "of a version it cannot tell".to_owned(),
+                        |m| format!("version {m}")
+                    )
+                );
+                false
+            }
         })
 }
 
-/// The major version `postgres --version` reports ("postgres (PostgreSQL) 18.1").
+/// The major version `postgres --version` reports: the number after
+/// `(PostgreSQL)`, whatever follows it ("postgres (PostgreSQL) 18.1
+/// (Debian 18.1-1)", "18beta1").
 fn major_version(postgres: &Path) -> Option<u32> {
     let mut command = Command::new(postgres);
     command.arg("--version");
     let finished = run_to_exit(command, VERSION_TIMEOUT).ok()?;
     let words = finished.stdout;
-    let version = words.split_whitespace().last()?;
-    version.split('.').next()?.parse().ok()
+    let after = words.split("(PostgreSQL)").nth(1)?;
+    let version = after.split_whitespace().next()?;
+    let digits: String = version.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
 }
 
 /// The per-user cache directory the downloaded binaries are kept in.
@@ -718,7 +701,18 @@ impl PrivatePostgres {
     /// As [`PrivatePostgres::start`], listening also on this second loopback
     /// address (on Linux all of 127.0.0.0/8 is loopback).
     pub fn start_also_on(also_on: Option<Ipv4Addr>) -> Result<Self, String> {
-        let binaries = binaries();
+        Self::start_from(binaries(), also_on)
+    }
+
+    /// An instance of the Postgres 17 of [`other_binaries`], on its own data
+    /// folder and port, with a superuser as the harness's own instance has.
+    /// It is the test's to stop: dropping it stops it, also when the test
+    /// fails.
+    pub fn start_other_version() -> Result<Self, String> {
+        Self::start_from(other_binaries(), None)
+    }
+
+    fn start_from(binaries: &'static Binaries, also_on: Option<Ipv4Addr>) -> Result<Self, String> {
         let root = scratch_dir().join(format!(
             "vm-blackbox-pg-{}-{}",
             std::process::id(),

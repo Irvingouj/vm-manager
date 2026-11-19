@@ -98,8 +98,11 @@ fn the_shared_postgres_serves_the_platform_databases_of_this_test_binary() {
     );
 }
 
+/// CONTRACT.md, "How the tests get a Postgres": "It is a Postgres 18, the
+/// one version the platform supports: nothing chooses another", wherever
+/// its binaries came from.
 #[test]
-fn the_postgres_runs_the_version_asked_for() {
+fn the_postgres_is_18() {
     let shared = postgres::shared();
     let sql = blackbox::sql::Sql::connect(&shared.url("postgres")).unwrap();
     let number: u32 = sql
@@ -115,14 +118,41 @@ fn the_postgres_runs_the_version_asked_for() {
         shared.initdb_took,
         shared.start_took,
     );
-    if binaries.origin == Origin::Variable {
-        eprintln!("VIBE_TEST_PG_BIN chose the binaries: their version is the caller's choice");
-        return;
-    }
     assert_eq!(
         number / 10_000,
-        postgres::wanted_major(),
-        "expected the Postgres major version VIBE_TEST_PG_VERSION asks for (or {} when unset)",
-        postgres::DEFAULT_MAJOR
+        postgres::MAJOR,
+        "expected the harness's Postgres to be {}",
+        postgres::MAJOR
+    );
+}
+
+/// CONTRACT.md: "For the tests that need a server of another version, the
+/// harness downloads a Postgres 17 beside it." It is in the same cache,
+/// runs on its own port, and is gone once dropped.
+#[test]
+fn a_postgres_17_runs_beside_it_and_is_gone_once_dropped() {
+    let mut other = PrivatePostgres::start_other_version().unwrap();
+    let cache = postgres::cache_dir().unwrap();
+    assert!(
+        other.binaries().bin.starts_with(&cache),
+        "expected the Postgres 17 in the per-user cache {}, got {}",
+        cache.display(),
+        other.binaries().bin.display()
+    );
+    let sql = blackbox::sql::Sql::connect(&other.url("postgres")).unwrap();
+    let number: u32 = sql
+        .value("show server_version_num")
+        .and_then(|v| v.parse().ok())
+        .expect("expected a numeric server_version_num");
+    drop(sql);
+    assert_eq!(number / 10_000, postgres::OTHER_MAJOR);
+    assert!(other.is_running());
+    let port = other.port();
+    let root = other.root().to_path_buf();
+    drop(other);
+    assert!(!root.exists(), "expected {} removed", root.display());
+    assert!(
+        TcpStream::connect_timeout(&([127, 0, 0, 1], port).into(), Duration::from_secs(2)).is_err(),
+        "expected nothing to listen on 127.0.0.1:{port} once the Postgres 17 was dropped"
     );
 }

@@ -284,8 +284,7 @@ fn the_runtime_role_s_own_settings_do_not_change_what_is_recorded() {
 
 /// CONTRACT.md, "The capture itself": "A virtual generated column
 /// (Postgres 18) is recorded as null: it holds no data of its own, and the
-/// capture computes nothing." Skipped before Postgres 18, which has no
-/// virtual generated columns.
+/// capture computes nothing."
 #[test]
 fn a_virtual_generated_column_is_recorded_as_null() {
     let own = start();
@@ -298,13 +297,6 @@ fn a_virtual_generated_column_is_recorded_as_null() {
 	"doubled" integer GENERATED ALWAYS AS ("n" * 2) VIRTUAL
 );"#],
     ));
-    let major = blackbox::out_of_reach::server_version_num();
-    if major < 180_000 {
-        eprintln!(
-            "SKIPPED: Postgres {major} has no virtual generated columns (CONTRACT.md: Postgres 18)"
-        );
-        return;
-    }
     let db = own.install(APP, &list);
     let last = last_history_id(&db);
     write(&own, "user", "insert into gen (id, n) values (1, 21)");

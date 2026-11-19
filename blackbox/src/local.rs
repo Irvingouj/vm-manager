@@ -103,8 +103,8 @@ pub fn outsider_user() -> Value {
 }
 
 /// The directory of the harness's own Postgres programs (`postgres`,
-/// `initdb`, `pg_ctl`), of the version `VIBE_TEST_PG_VERSION` chose: what the
-/// tests give `VIBE_LOCAL_POSTGRES_BIN`.
+/// `initdb`, `pg_ctl`), a Postgres 18: what the tests give
+/// `VIBE_LOCAL_POSTGRES_BIN`.
 pub fn local_postgres_bin() -> String {
     crate::postgres::binaries()
         .bin
@@ -800,13 +800,13 @@ pub enum Serving {
 /// The bytes of the archive a mirror hands over, read once.
 fn archive() -> &'static [u8] {
     static ARCHIVE: OnceLock<Vec<u8>> = OnceLock::new();
-    ARCHIVE.get_or_init(|| crate::postgres::archive_bytes(18))
+    ARCHIVE.get_or_init(|| crate::postgres::archive_bytes(crate::postgres::MAJOR))
 }
 
 /// The path of zonky's archive of Postgres 18 for this machine, as a
 /// [`Mirror`] serves it: `/maven2/io/zonky/...jar`.
 pub fn archive_path() -> String {
-    let archive = crate::postgres::archive_of(18).unwrap_or_else(|| {
+    let archive = crate::postgres::archive_of(crate::postgres::MAJOR).unwrap_or_else(|| {
         panic!(
             "the harness knows no archive of Postgres 18 for {} {}",
             std::env::consts::OS,

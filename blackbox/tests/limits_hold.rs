@@ -5,8 +5,8 @@
 //!
 //! Application SQL lifts every Postgres setting that could stand in for a
 //! limit (`statement_timeout`, `lock_timeout`,
-//! `idle_in_transaction_session_timeout`, `transaction_timeout` from
-//! Postgres 17, `work_mem`), for the session on as many pooled connections
+//! `idle_in_transaction_session_timeout`, `transaction_timeout`,
+//! `work_mem`), for the session on as many pooled connections
 //! as it can reach and inside the very statement that should be ended,
 //! always through `set_config` run by `ts_stat`, which a statement check
 //! does not see (`docs/research/what-postgres-sees.md`: "A role-level
@@ -36,17 +36,9 @@ use serde_json::{Value, json};
 const SLOW: Duration = Duration::from_secs(40);
 
 /// `set_config(name, value, is_local)` run by `ts_stat`, as a relation of
-/// exactly one row; for `transaction_timeout` only where the server has it
-/// (Postgres 17 and later).
+/// exactly one row.
 fn lift(name: &str, value: &str, local: bool) -> String {
     let set = format!("set_config('{name}', '{value}', {local})");
-    let set = if name == "transaction_timeout" {
-        format!(
-            "case when current_setting('server_version_num')::int >= 170000 then {set} else 'unknown' end"
-        )
-    } else {
-        set
-    };
     format!(
         "(select * from ts_stat($vm$select to_tsvector('simple', 'set ' || {set})$vm$) limit 1) lifted_{name}"
     )

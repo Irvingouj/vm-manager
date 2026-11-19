@@ -18,11 +18,7 @@
 //! untouched`, and the capture triggers' very catalog rows); the Operation
 //! log entry of the `execute` or the `commit` is `failed` with `error`
 //! `VM004`; after a failed commit the transaction is over; the next honest
-//! write runs and is in the Change history. Where a deferred trigger the owner's
-//! code queued is what fails while the host makes deferred constraints
-//! immediate (`deferred-constraint-trigger-queued`), `42501` (Postgres's
-//! own error for that on 16 and 17) may stand in for `VM004`, in the
-//! answer and in the entry.
+//! write runs and is in the Change history.
 //!
 //! A `query` calling the same code fails with `25006` and changes nothing.
 //! What reading and writing rows brings with it is not refused and is
@@ -44,7 +40,7 @@ use blackbox::left_behind::{
     assert_vm004, begin_write, capture_catalog, first_version, inside, install, outside, send,
     steps,
 };
-use blackbox::out_of_reach::{differences, panic_text, server_version_num, start, untouched};
+use blackbox::out_of_reach::{differences, panic_text, start, untouched};
 use blackbox::own_database::{Migration, Own};
 use blackbox::scenario::lines;
 use blackbox::transactions::{commit, execute_in, query_in};
@@ -86,13 +82,6 @@ struct Attack {
     /// The last step uses the transaction after its failed commit and must
     /// be answered `no-transaction`.
     then_over: bool,
-    /// The lowest `server_version_num` it can run on.
-    since: u32,
-    /// A deferred trigger the owner's code queued fails while the host
-    /// makes deferred constraints immediate: CONTRACT.md allows `42501`
-    /// in place of `VM004` (on Postgres 16 and 17, where it runs without
-    /// the owner's rights).
-    queued_deferred: bool,
 }
 
 /// Through the `BEFORE DELETE` trigger on `ca`: a row of `ca` whose action
@@ -110,8 +99,6 @@ fn through_a_cascade(name: &str, action: &str) -> Attack {
         failing: 0,
         entry: "execute",
         then_over: false,
-        since: 0,
-        queued_deferred: false,
     }
 }
 
@@ -134,23 +121,13 @@ fn through_a_cascade_in_a_transaction(name: &str, action: &str) -> Attack {
         failing: 2,
         entry: "commit",
         then_over: true,
-        since: 0,
-        queued_deferred: false,
     }
 }
 
 fn run_attacks(own: &Own, prefix: &str, attacks: Vec<Attack>) {
-    let version = server_version_num();
     let mut failures = Vec::new();
     let total = attacks.len();
     for (i, attack) in attacks.into_iter().enumerate() {
-        if version < attack.since {
-            eprintln!(
-                "SKIPPED {}: needs server_version_num {} or later",
-                attack.name, attack.since
-            );
-            continue;
-        }
         let application = format!("{prefix}-{i}");
         let outcome = catch_unwind(AssertUnwindSafe(|| {
             let db = install(own, &application);
@@ -167,27 +144,7 @@ fn run_attacks(own: &Own, prefix: &str, attacks: Vec<Attack>) {
             let catalog = capture_catalog(&db);
             let (response, answers) = steps(own, &application, &attack.attack);
             let answer = answers.get(attack.failing).cloned().unwrap_or(Value::Null);
-            // The code the answer and the entry carry: `VM004`, or for a
-            // queued deferred trigger `42501` on Postgres 16 and 17.
-            let code = if attack.queued_deferred
-                && version < 180_000
-                && answer["error"]["code"] != "VM004"
-            {
-                assert!(
-                    answer["error"]["kind"] == "database" && answer["error"]["code"] == "42501",
-                    "the attack: expected `VM004`, or `42501` for the deferred trigger that failed (CONTRACT.md: \"`42501` on Postgres 16 and 17\"), got {answer}"
-                );
-                "42501".to_owned()
-            } else {
-                assert_vm004(&answer, "the attack");
-                "VM004".to_owned()
-            };
-            if attack.queued_deferred {
-                eprintln!(
-                    "{}: answered {code} on server_version_num {version}",
-                    attack.name
-                );
-            }
+            assert_vm004(&answer, "the attack");
             if attack.then_over {
                 let last = answers.last().cloned().unwrap_or(Value::Null);
                 assert_eq!(
@@ -214,8 +171,8 @@ fn run_attacks(own: &Own, prefix: &str, attacks: Vec<Attack>) {
             assert!(
                 of_entry.len() == 1
                     && of_entry[0]["outcome"] == "failed"
-                    && of_entry[0]["error"] == code.as_str(),
-                "expected one Operation log entry of the {} `failed` with `error` `{code}`, got:\n{}",
+                    && of_entry[0]["error"] == "VM004",
+                "expected one Operation log entry of the {} `failed` with `error` `VM004`, got:\n{}",
                 attack.entry,
                 lines(&entries)
             );
@@ -275,10 +232,7 @@ fn code_a_migration_left_cannot_change_the_structure_or_the_capture_through_a_ca
         through_a_cascade("drop-a-table", DROP_TABLE),
         through_a_cascade("rename-a-table", RENAME_TABLE),
         through_a_cascade("move-a-table-to-another-schema", MOVE_TABLE),
-        Attack {
-            queued_deferred: true,
-            ..through_a_cascade("deferred-constraint-trigger-queued", DEFERRED_TRIGGER)
-        },
+        through_a_cascade("deferred-constraint-trigger-queued", DEFERRED_TRIGGER),
         through_a_cascade("deferrable-foreign-key", DEFERRABLE_FK),
         through_a_cascade("detach-and-attach-a-partition", DETACH_ATTACH),
         through_a_cascade("detach-a-partition", DETACH),
@@ -325,8 +279,6 @@ fn other_vectors_transactions_and_the_runtime_role_s_functions_are_held_alike() 
             failing: 4,
             entry: "commit",
             then_over: true,
-            since: 0,
-            queued_deferred: false,
         },
         // A CHECK on the child of ON UPDATE CASCADE.
         Attack {
@@ -344,8 +296,6 @@ fn other_vectors_transactions_and_the_runtime_role_s_functions_are_held_alike() 
             failing: 0,
             entry: "execute",
             then_over: false,
-            since: 0,
-            queued_deferred: false,
         },
         // A stored generated column there.
         Attack {
@@ -363,8 +313,6 @@ fn other_vectors_transactions_and_the_runtime_role_s_functions_are_held_alike() 
             failing: 0,
             entry: "execute",
             then_over: false,
-            since: 0,
-            queued_deferred: false,
         },
         // A default under ON DELETE SET DEFAULT, obeying `orders`, in one
         // transaction with the order.
@@ -388,8 +336,6 @@ fn other_vectors_transactions_and_the_runtime_role_s_functions_are_held_alike() 
             failing: 3,
             entry: "commit",
             then_over: false,
-            since: 0,
-            queued_deferred: false,
         },
         // A domain's CHECK on the child's key under ON UPDATE CASCADE,
         // obeying `orders`, in one transaction with the order.
@@ -413,8 +359,6 @@ fn other_vectors_transactions_and_the_runtime_role_s_functions_are_held_alike() 
             failing: 3,
             entry: "commit",
             then_over: false,
-            since: 0,
-            queued_deferred: false,
         },
         // A BEFORE UPDATE trigger on the child under ON DELETE SET NULL.
         Attack {
@@ -428,8 +372,6 @@ fn other_vectors_transactions_and_the_runtime_role_s_functions_are_held_alike() 
             failing: 0,
             entry: "execute",
             then_over: false,
-            since: 0,
-            queued_deferred: false,
         },
         // The same under ON UPDATE SET NULL.
         Attack {
@@ -447,8 +389,6 @@ fn other_vectors_transactions_and_the_runtime_role_s_functions_are_held_alike() 
             failing: 0,
             entry: "execute",
             then_over: false,
-            since: 0,
-            queued_deferred: false,
         },
         // The runtime role's own call of a function of the Application's:
         // a lock stronger than ROW EXCLUSIVE.
@@ -459,10 +399,8 @@ fn other_vectors_transactions_and_the_runtime_role_s_functions_are_held_alike() 
             failing: 0,
             entry: "execute",
             then_over: false,
-            since: 0,
-            queued_deferred: false,
         },
-        // A refresh by the runtime role, granted MAINTAIN (17 and later).
+        // A refresh by the runtime role, granted MAINTAIN.
         Attack {
             name: "runtime-function-refresh-with-maintain".to_owned(),
             setup: Vec::new(),
@@ -470,8 +408,6 @@ fn other_vectors_transactions_and_the_runtime_role_s_functions_are_held_alike() 
             failing: 0,
             entry: "execute",
             then_over: false,
-            since: 170_000,
-            queued_deferred: false,
         },
         // A table the runtime role itself makes where a migration let it
         // (CONTRACT.md: "whoever comes to own what it made").
@@ -486,8 +422,6 @@ fn other_vectors_transactions_and_the_runtime_role_s_functions_are_held_alike() 
             failing: 0,
             entry: "execute",
             then_over: false,
-            since: 0,
-            queued_deferred: false,
         },
         Attack {
             name: "runtime-made-table-in-a-transaction".to_owned(),
@@ -507,8 +441,6 @@ fn other_vectors_transactions_and_the_runtime_role_s_functions_are_held_alike() 
             failing: 2,
             entry: "commit",
             then_over: true,
-            since: 0,
-            queued_deferred: false,
         },
     ];
     // The isolation levels do not change it.
@@ -528,8 +460,6 @@ fn other_vectors_transactions_and_the_runtime_role_s_functions_are_held_alike() 
             failing: 2,
             entry: "commit",
             then_over: false,
-            since: 0,
-            queued_deferred: false,
         });
     }
     run_attacks(&own, "vectors", attacks);
@@ -613,7 +543,7 @@ fn a_query_calling_the_same_code_fails_read_only_and_changes_nothing() {
     let mut wrong = Vec::new();
     // Not a lock alone: Postgres lets `LOCK TABLE` in any mode, and
     // `ANALYZE`, run in a read-only transaction; they change nothing.
-    let mut cases = vec![
+    let cases = vec![
         (
             "a function switching the capture off",
             "select public.obey($1)",
@@ -629,14 +559,12 @@ fn a_query_calling_the_same_code_fails_read_only_and_changes_nothing() {
             "select public.cascade_now()",
             vec![],
         ),
-    ];
-    if server_version_num() >= 170_000 {
-        cases.push((
+        (
             "a function refreshing a materialized view (MAINTAIN granted)",
             "select public.obey($1)",
             vec![REFRESH],
-        ));
-    }
+        ),
+    ];
     for (label, sql, params) in cases {
         let (_, answers) = steps(&own, application, &[outside("query", sql, &params)]);
         let answer = &answers[0];

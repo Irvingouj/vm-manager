@@ -48,7 +48,7 @@ pub const BUNDLE: &str = "transactions.js";
 /// - `cascade_now()`: deletes `pa` row 9, whose child `ca` row 9 switches
 ///   the capture of `parents` off, changes a row and switches it on again;
 /// - `mv`: a materialized view over `parents`, `MAINTAIN` granted to
-///   `PUBLIC` on Postgres 17 and later ([`maintain_grant`]);
+///   `PUBLIC` ([`maintain_grant`]);
 /// - schema `scratch`, where `PUBLIC` (the runtime role among it) may create.
 pub fn left_behind() -> Migration {
     Migration::new(
@@ -135,20 +135,17 @@ END $f$;"#,
     )
 }
 
-/// `0005_maintain`: `GRANT MAINTAIN ON mv TO PUBLIC` (Postgres 17 and
-/// later; the privilege does not exist on 16).
+/// `0005_maintain`: `GRANT MAINTAIN ON mv TO PUBLIC`.
 pub fn maintain_grant() -> Migration {
     Migration::new("0005_maintain", &[r#"GRANT MAINTAIN ON "mv" TO PUBLIC;"#])
 }
 
-/// The first Version's migrations: [`base`], [`left_behind`], and on
-/// Postgres 17 and later [`maintain_grant`].
+/// The first Version's migrations: [`base`], [`left_behind`] and
+/// [`maintain_grant`].
 pub fn first_version() -> Vec<Migration> {
     let mut list = base();
     list.push(left_behind());
-    if crate::out_of_reach::server_version_num() >= 170_000 {
-        list.push(maintain_grant());
-    }
+    list.push(maintain_grant());
     list
 }
 

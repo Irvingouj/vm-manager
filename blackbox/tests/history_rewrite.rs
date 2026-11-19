@@ -1222,17 +1222,9 @@ fn a_cast_to_json_that_exists_at_a_rewrites_reading_is_refused_also_when_dropped
 /// columns of such a table are recorded as of any other." One `DO` block
 /// changes the virtual column's expression (its value differs when read)
 /// and rewrites `s`; then the expression is changed again and the table set
-/// unlogged (written anew, no stored value changed). Skipped before
-/// Postgres 18.
+/// unlogged (written anew, no stored value changed).
 #[test]
 fn a_virtual_generated_column_is_null_in_old_and_new_and_never_in_changed() {
-    let major = blackbox::out_of_reach::server_version_num();
-    if major < 180_000 {
-        eprintln!(
-            "SKIPPED: Postgres {major} has no virtual generated columns (CONTRACT.md: Postgres 18)"
-        );
-        return;
-    }
     let mut r = Rewrite::start();
     r.send_ok(&[Migration::new(
         "0004_virtual",
