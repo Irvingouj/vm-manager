@@ -2205,7 +2205,7 @@ Installing is one container image and one Compose file beside a Postgres 18 (ADR
 |---|---|---|
 | `VIBE_DOMAIN` | the installation's domain; Applications are at `<name>.<domain>` | Compose refuses, naming it |
 | `VIBE_SECRET_KEY` | the installation's key ("The installation's key"): `openssl rand -base64 32` | Compose refuses, naming it |
-| `POSTGRES_PASSWORD` | the bundled Postgres's password: `openssl rand -hex 24` | the bundled Postgres does not start: `docker compose up` ends with an error, `vibe` is not started, and the `postgres` service's log names `POSTGRES_PASSWORD`. Not needed with `compose.own-postgres.yaml`, and never asked for then |
+| `POSTGRES_PASSWORD` | the bundled Postgres's password: `openssl rand -hex 24` | the bundled Postgres does not start: `docker compose up` ends with an error, `vibe` is not started, and the `postgres` service's log names `POSTGRES_PASSWORD`. Taken away from a Postgres already made, that Postgres runs and is never healthy (its health check's own output, which `docker inspect` shows, says that `POSTGRES_PASSWORD` is empty), so `vibe` is not started with an empty password either. Not needed with `compose.own-postgres.yaml`, and never asked for then |
 | `VIBE_BIND` | the address the installation is published on | `127.0.0.1`: reached from this machine only |
 | `VIBE_HTTPS_PORT` | the port browsers and the tool reach | `443` |
 | `VIBE_IMAGE` | the image | the published image of this release |
@@ -2237,7 +2237,7 @@ Against the image `VIBE_INSTALL_IMAGE` names, started by the files of `deploy/` 
 - a request body larger than the platform's own limit, sent through the file's proxy, is answered by the platform (`413` `too-large`), not cut short by the proxy;
 - with `compose.own-proxy.yaml`, behind another reverse proxy that terminates TLS, the installation answers and its redirects name the public address;
 - without `VIBE_DOMAIN` or `VIBE_SECRET_KEY`, `docker compose config` fails naming the missing value; with `compose.own-postgres.yaml`, without `VIBE_DATABASE_URL` it fails naming that one, and with it `config` passes with no `POSTGRES_PASSWORD` anywhere; no file of `deploy/` has a `${NAME:?...}` inside another value's default (read from the files, in the gate);
-- with `compose.yaml` and no `POSTGRES_PASSWORD`, `docker compose config` passes, `docker compose up -d` ends other than `0` within three minutes, the `vibe` container was never started, and `docker compose logs postgres` names `POSTGRES_PASSWORD`;
+- with `compose.yaml` and no `POSTGRES_PASSWORD`, `docker compose config` passes, `docker compose up -d` ends other than `0` within three minutes, the `vibe` container was never started, and `docker compose logs postgres` names `POSTGRES_PASSWORD`; with the value taken out of the `.env` of an installation that is up, the `postgres` service started again alone is not healthy and its health check's output names `POSTGRES_PASSWORD` within seconds;
 - the image's `THIRD-PARTY-LICENSES` names every crate `cargo tree -p vibe --edges normal,build --prefix none` lists for the image's target with its version (but the workspace's own), and each has a licence stated; its second part names V8, ICU, libc++, abseil, libpg_query and PostgreSQL, each with a licence, where it was taken from and a text; the base's own `/usr/share/doc/*/copyright` files are in the image;
 - the image has no shell (`docker run --rm --entrypoint /bin/sh <image>` cannot start) and its user is a number other than `0`.
 
