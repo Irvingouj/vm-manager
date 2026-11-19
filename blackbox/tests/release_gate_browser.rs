@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use blackbox::firefox::{ENV, NO_BROWSER, WHAT_TO_DO};
+use blackbox::firefox::{ENV, NO_BROWSER, NOT_ABSOLUTE, WHAT_TO_DO};
 use blackbox::release::{Clone, GateStandIns, Ran, run, script};
 
 /// "A gate without a browser ends in seconds."
@@ -49,7 +49,13 @@ enum Browser {
     /// A pretender named `firefox` on the `PATH` answers `--version` so;
     /// `VIBE_TEST_BROWSER` not set.
     OnThePath(&'static str),
+    /// `VIBE_TEST_BROWSER` is the relative path [`RELATIVE`], which names,
+    /// from the clone's root, a pretender that answers `--version` so.
+    Relative(&'static str),
 }
+
+/// A relative path to a pretender inside the clone.
+const RELATIVE: &str = "test-browser/firefox";
 
 /// One run of the gate of a clone, and what its stand-ins recorded.
 struct GateRun {
@@ -123,6 +129,14 @@ fn gate_with(browser: &Browser) -> GateRun {
             let program = pretender(&pretenders, "pretending-browser", says);
             named = Some(program.clone());
             vec![ENV.to_owned(), program.display().to_string()]
+        }
+        Browser::Relative(says) => {
+            let dir = clone.root().join("test-browser");
+            std::fs::create_dir_all(&dir).unwrap();
+            pretender(&dir, "firefox", says);
+            assert!(clone.root().join(RELATIVE).is_file());
+            named = Some(PathBuf::from(RELATIVE));
+            vec![format!("{ENV}={RELATIVE}"), NOT_ABSOLUTE.to_owned()]
         }
         Browser::OnThePath(says) => {
             pretender(&pretenders, "firefox", says);
@@ -216,6 +230,12 @@ fn the_gate_with_a_firefox_older_than_128_stops_before_anything_is_built() {
 fn the_gate_with_a_browser_that_is_not_firefox_stops_before_anything_is_built() {
     let gate = gate_with(&Browser::Named("Chromium 140.0"));
     assert_stopped_for_no_browser("Chromium 140.0", &gate);
+}
+
+#[test]
+fn the_gate_with_vibe_test_browser_a_relative_path_to_firefox_128_stops_before_anything_is_built() {
+    let gate = gate_with(&Browser::Relative("Mozilla Firefox 128.0"));
+    assert_stopped_for_no_browser("VIBE_TEST_BROWSER a relative path", &gate);
 }
 
 #[test]

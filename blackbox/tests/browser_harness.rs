@@ -31,7 +31,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use blackbox::firefox::{
-    self, ENV, Firefox, MIN_VERSION, NO_BROWSER, Options, Process, no_wider_than, processes_naming,
+    self, ENV, Firefox, MIN_VERSION, NO_BROWSER, NOT_ABSOLUTE, Options, Process, WHAT_TO_DO,
+    no_wider_than, processes_naming,
 };
 use blackbox::program::{run_to_exit, write_program};
 
@@ -260,8 +261,14 @@ fn a_browser_is_ended_with_every_process_and_its_profile_when_the_test_process_i
 }
 
 /// A machine without a usable browser: what it is, the environment the
-/// browser test is run with, and words the failure must hold.
-type Case = (String, Vec<(&'static str, String)>, String);
+/// browser test is run with, the folder it is run from (`None`: this
+/// test's own), and words the failure must hold.
+type Case = (
+    String,
+    Vec<(&'static str, String)>,
+    Option<PathBuf>,
+    Vec<String>,
+);
 
 /// A program at `dir/name` that answers `--version` with `said`.
 fn pretender(dir: &Path, name: &str, said: &str) -> PathBuf {
@@ -279,39 +286,66 @@ fn without_firefox_128_or_later_every_browser_test_fails_saying_what_was_looked_
     let missing = dir.join("no-such-firefox");
     let old = pretender(&dir, "old-firefox", "Mozilla Firefox 127.0.2");
     let other = pretender(&dir, "chromium", "Chromium 140.0.7339.80 built on Debian");
+    // A Firefox 128 that is there, reached from the folder the browser
+    // test is run from by a relative path: refused all the same.
+    let relative_dir = dir.join("relative");
+    fs::create_dir_all(relative_dir.join("bin")).unwrap();
+    pretender(
+        &relative_dir.join("bin"),
+        "firefox",
+        "Mozilla Firefox 128.0",
+    );
     let cases: Vec<Case> = vec![
         (
             "VIBE_TEST_BROWSER names nothing".to_owned(),
             vec![(ENV, missing.display().to_string())],
-            missing.display().to_string(),
+            None,
+            vec![missing.display().to_string()],
         ),
         (
             "VIBE_TEST_BROWSER names a Firefox older than 128".to_owned(),
             vec![(ENV, old.display().to_string())],
-            "127".to_owned(),
+            None,
+            vec!["127".to_owned()],
         ),
         (
             "VIBE_TEST_BROWSER names a browser that is not Firefox".to_owned(),
             vec![(ENV, other.display().to_string())],
-            "Chromium".to_owned(),
+            None,
+            vec!["Chromium".to_owned()],
         ),
         (
             "no VIBE_TEST_BROWSER and no firefox on the PATH".to_owned(),
             vec![(ENV, String::new()), ("PATH", empty.display().to_string())],
-            "`firefox` on the PATH".to_owned(),
+            None,
+            vec!["`firefox` on the PATH".to_owned()],
+        ),
+        (
+            "VIBE_TEST_BROWSER a relative path to a Firefox 128 that is there".to_owned(),
+            vec![(ENV, "bin/firefox".to_owned())],
+            Some(relative_dir),
+            vec![
+                format!("{ENV}=bin/firefox"),
+                NOT_ABSOLUTE.to_owned(),
+                WHAT_TO_DO.to_owned(),
+            ],
         ),
     ];
-    for (case, env, named) in cases {
+    for (case, env, from, named) in cases {
         let env: Vec<(&str, &str)> = env.iter().map(|(n, v)| (*n, v.as_str())).collect();
         let began = Instant::now();
-        let run = run_to_exit(
-            this_binary(
-                "a_browser_starts_on_a_fresh_profile_of_its_own_and_opens_no_page_of_its_own",
-                &env,
-            ),
-            CHILD_TIMEOUT,
-        )
-        .unwrap();
+        let mut command = this_binary(
+            "a_browser_starts_on_a_fresh_profile_of_its_own_and_opens_no_page_of_its_own",
+            &env,
+        );
+        if let Some(from) = &from {
+            assert!(
+                from.join("bin/firefox").is_file(),
+                "the relative path must name a program from the folder the test runs in"
+            );
+            command.current_dir(from);
+        }
+        let run = run_to_exit(command, CHILD_TIMEOUT).unwrap();
         let output = format!("{}\n{}", run.stdout, run.stderr);
         assert!(
             run.status.is_some_and(|s| !s.success()),
@@ -326,10 +360,12 @@ fn without_firefox_128_or_later_every_browser_test_fails_saying_what_was_looked_
         for words in [
             NO_BROWSER,
             "looked for",
-            named.as_str(),
             "Install Firefox 128 or later",
             "set VIBE_TEST_BROWSER",
-        ] {
+        ]
+        .into_iter()
+        .chain(named.iter().map(String::as_str))
+        {
             assert!(
                 output.contains(words),
                 "{case}: expected the failure to say {words:?}\n{output}"

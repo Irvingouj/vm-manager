@@ -5,7 +5,8 @@
 //! happens to the test.
 //!
 //! - **Finding it** ([`required`], [`find_with`]): the program
-//!   `VIBE_TEST_BROWSER` names (a path, or a name looked up on `PATH`), else
+//!   `VIBE_TEST_BROWSER` names (an absolute path, or a name looked up on
+//!   `PATH`; a relative path is refused, [`NOT_ABSOLUTE`]), else
 //!   `firefox` on `PATH`. It is asked `--version` (within
 //!   [`VERSION_TIMEOUT`]) and must answer `Mozilla Firefox <major>.<...>`
 //!   with a major of [`MIN_VERSION`] or later. Anything else is the failure
@@ -78,7 +79,14 @@ pub const MIN_VERSION: u32 = 128;
 pub const NO_BROWSER: &str = "No browser for the browser tests";
 
 /// What to do, in every failure to find a browser.
-pub const WHAT_TO_DO: &str = "Install Firefox 128 or later, or set VIBE_TEST_BROWSER to the Firefox to use (a path, or a name on the PATH).";
+pub const WHAT_TO_DO: &str = "Install Firefox 128 or later, or set VIBE_TEST_BROWSER to the Firefox to use (an absolute path, or a name on the PATH).";
+
+/// Why a relative path in `VIBE_TEST_BROWSER` (one that holds a `/` and
+/// does not begin with one) is refused: the tests and `scripts/gate.sh`
+/// run in different folders, so the same relative path would name a
+/// different file to each.
+pub const NOT_ABSOLUTE: &str =
+    "which is a relative path; a path in VIBE_TEST_BROWSER must be absolute";
 
 /// How a profile folder of the harness's is named.
 pub const PROFILE_PREFIX: &str = "vibe-blackbox-browser-";
@@ -137,6 +145,16 @@ pub fn required() -> &'static Found {
 /// `VIBE_TEST_BROWSER` and `PATH`.
 pub fn find_with(named: Option<OsString>, path: Option<&OsString>) -> Result<Found, String> {
     let named = named.filter(|n| !n.is_empty());
+    if let Some(name) = &named {
+        let bytes = std::os::unix::ffi::OsStrExt::as_bytes(name.as_os_str());
+        let name = Path::new(name);
+        if bytes.contains(&b'/') && !bytes.starts_with(b"/") {
+            return Err(format!(
+                "{NO_BROWSER}: looked for {ENV}={}, {NOT_ABSOLUTE}. {WHAT_TO_DO}",
+                name.display()
+            ));
+        }
+    }
     let (looked_for, program) = match &named {
         Some(name) => {
             let shown = Path::new(name).display().to_string();
