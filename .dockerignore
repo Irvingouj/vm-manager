@@ -17,6 +17,10 @@
 # The licence texts of what is built in and is not a crate's own
 # (THIRD-PARTY-LICENSES, its second part).
 !deploy/third-party-licenses/
+# The script that writes the notices, and the program's own licence when
+# the repository has one (the image holds it at /usr/share/doc/vibe/LICENSE).
+!scripts/third-party-licenses.sh
+!LICENSE
 **/node_modules
 **/target
 **/.DS_Store
