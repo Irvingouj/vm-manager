@@ -1,0 +1,19 @@
+# The image is built from what the program is made of and nothing else
+# (Dockerfile): everything is left out but what is named below.
+*
+!Cargo.toml
+!Cargo.lock
+!rust-toolchain.toml
+!.cargo/config.toml
+!package-lock.json
+!crates/
+!sdk/
+!vendor/
+# The black-box tests are a member of the workspace: Cargo reads their
+# manifest and needs their library's root to load the workspace. They are
+# not built into the image.
+!blackbox/Cargo.toml
+!blackbox/src/
+**/node_modules
+**/target
+**/.DS_Store
