@@ -262,10 +262,19 @@ fn check(files: &Files, domain: &str, read: &Contents) -> Result<Loaded, String>
     // The key.
     let key = private_key(&read.key.0).map_err(|what| key_problem(&what))?;
     let provider = provider();
+    // What the key's DER says it is, read before ring takes the key: ring's
+    // refusal does not say whether the kind is not taken or the key is
+    // damaged.
+    let kind = key_kind(&key);
     let signing = provider
         .key_provider
         .load_private_key(key)
-        .map_err(|_| key_problem(KIND_NOT_SUPPORTED))?;
+        .map_err(|_| match kind {
+            KeyKind::NotTaken(what) => key_problem(&format!(
+                "holds {what}, a kind of key that is not supported: {KINDS_TAKEN}"
+            )),
+            KeyKind::Taken | KeyKind::Unreadable => key_problem(KEY_UNREADABLE),
+        })?;
 
     // The names.
     let wildcard = format!("*.{domain}");
@@ -319,7 +328,9 @@ fn check(files: &Files, domain: &str, read: &Contents) -> Result<Loaded, String>
     })
 }
 
-const KIND_NOT_SUPPORTED: &str = "holds a key of a kind that is not supported: an RSA key of 2048 bits or more, an ECDSA key on P-256 or P-384, or an Ed25519 key is taken";
+const KINDS_TAKEN: &str =
+    "an RSA key of 2048 to 4096 bits, an ECDSA key on P-256 or P-384, or an Ed25519 key is taken";
+const KEY_UNREADABLE: &str = "holds a key that cannot be read: its PEM section is whole, but what it holds is damaged, not a key of its label (PRIVATE KEY, RSA PRIVATE KEY or EC PRIVATE KEY)";
 
 /// The DNS names among the certificate's subject alternative names.
 fn dns_names(certificate: &X509Certificate<'_>) -> Result<Vec<String>, String> {
@@ -376,7 +387,9 @@ fn private_key(text: &[u8]) -> Result<PrivateKeyDer<'static>, String> {
         return Err("holds a key that is encrypted: a passphrase is not supported; write the key out unencrypted (for example `openssl pkey -in <encrypted> -out <key>`) and keep the file readable only by the program".to_owned());
     }
     if other_kind {
-        return Err(KIND_NOT_SUPPORTED.to_owned());
+        return Err(format!(
+            "holds a key of a kind that is not supported: {KINDS_TAKEN}"
+        ));
     }
     if keys == 0 {
         return Err(
@@ -387,7 +400,7 @@ fn private_key(text: &[u8]) -> Result<PrivateKeyDer<'static>, String> {
     for section in <(SectionKind, Vec<u8>)>::pem_slice_iter(text) {
         // The error is not formatted: it may quote the file.
         let Ok((kind, der)) = section else {
-            return Err("is not PEM that can be read (the key's section is broken)".to_owned());
+            return Err(KEY_BROKEN.to_owned());
         };
         let key = match kind {
             SectionKind::PrivateKey => PrivateKeyDer::from(PrivatePkcs8KeyDer::from(der)),
@@ -397,7 +410,195 @@ fn private_key(text: &[u8]) -> Result<PrivateKeyDer<'static>, String> {
         };
         return Ok(key);
     }
-    Err("is not PEM that can be read (the key's section is broken)".to_owned())
+    Err(KEY_BROKEN.to_owned())
+}
+
+const KEY_BROKEN: &str =
+    "holds a key that cannot be read: its PEM section is broken (not base64, or never ended)";
+
+/// What a key's DER says it is. Nothing of the key is kept: only the kind.
+enum KeyKind {
+    /// A kind ring takes (whether ring then takes this key or not).
+    Taken,
+    /// A kind that is not taken, in words: "an ECDSA key on P-521".
+    NotTaken(&'static str),
+    /// The DER is not a key of its label.
+    Unreadable,
+}
+
+/// The OIDs, as their DER contents.
+const OID_RSA: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01];
+const OID_EC: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01];
+const OID_ED25519: &[u8] = &[0x2b, 0x65, 0x70];
+const OID_ED448: &[u8] = &[0x2b, 0x65, 0x71];
+const OID_DSA: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x38, 0x04, 0x01];
+const OID_P256: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07];
+const OID_P384: &[u8] = &[0x2b, 0x81, 0x04, 0x00, 0x22];
+const OID_P521: &[u8] = &[0x2b, 0x81, 0x04, 0x00, 0x23];
+const OID_SECP256K1: &[u8] = &[0x2b, 0x81, 0x04, 0x00, 0x0a];
+
+/// DER tags read here.
+const SEQUENCE: u8 = 0x30;
+const INTEGER: u8 = 0x02;
+const OCTET_STRING: u8 = 0x04;
+const OID: u8 = 0x06;
+const NULL: u8 = 0x05;
+/// SEC 1's `[0] parameters`, constructed.
+const CONTEXT_0: u8 = 0xa0;
+
+/// The key's kind from its DER, by its label: PKCS #8 (`PRIVATE KEY`),
+/// PKCS #1 (`RSA PRIVATE KEY`) or SEC 1 (`EC PRIVATE KEY`).
+fn key_kind(key: &PrivateKeyDer<'_>) -> KeyKind {
+    let kind = match key {
+        PrivateKeyDer::Pkcs8(k) => pkcs8_kind(k.secret_pkcs8_der()),
+        PrivateKeyDer::Pkcs1(k) => rsa_kind(k.secret_pkcs1_der()),
+        PrivateKeyDer::Sec1(k) => sec1_kind(k.secret_sec1_der()),
+        _ => None,
+    };
+    kind.unwrap_or(KeyKind::Unreadable)
+}
+
+/// PKCS #8: SEQUENCE { INTEGER version, SEQUENCE { OID algorithm,
+/// parameters }, OCTET STRING privateKey, ... }.
+fn pkcs8_kind(der: &[u8]) -> Option<KeyKind> {
+    let mut info = Der::whole(der, SEQUENCE)?;
+    info.next(INTEGER)?;
+    let mut algorithm = Der::new(info.next(SEQUENCE)?);
+    let oid = algorithm.next(OID)?;
+    let private = info.next(OCTET_STRING)?;
+    Some(match oid {
+        OID_RSA => {
+            // parameters NULL, or absent.
+            if !algorithm.is_empty() {
+                algorithm.next(NULL)?;
+            }
+            rsa_kind(private)?
+        }
+        OID_EC => {
+            let curve = algorithm.next(OID)?;
+            let kind = curve_kind(curve);
+            if matches!(kind, KeyKind::Taken) {
+                // The key itself must be a SEC 1 structure.
+                sec1_kind(private)?;
+            }
+            kind
+        }
+        OID_ED25519 => {
+            // CurvePrivateKey ::= OCTET STRING of 32 bytes.
+            let seed = Der::whole(private, OCTET_STRING)?.rest;
+            if seed.len() != 32 {
+                return None;
+            }
+            KeyKind::Taken
+        }
+        OID_ED448 => KeyKind::NotTaken("an Ed448 key"),
+        OID_DSA => KeyKind::NotTaken("a DSA key"),
+        _ => KeyKind::NotTaken("a key of an algorithm that is not RSA, ECDSA or Ed25519"),
+    })
+}
+
+/// PKCS #1: SEQUENCE { INTEGER version, INTEGER modulus, ... }.
+fn rsa_kind(der: &[u8]) -> Option<KeyKind> {
+    let mut key = Der::whole(der, SEQUENCE)?;
+    key.next(INTEGER)?;
+    let modulus = key.next(INTEGER)?;
+    // Its other seven integers must be there.
+    for _ in 0..7 {
+        key.next(INTEGER)?;
+    }
+    // The modulus's length in bits: its bytes without the sign's zero.
+    let digits = modulus.get(modulus.iter().position(|b| *b != 0)?..)?;
+    let top = digits.first()?;
+    let bits = (digits.len() - 1) * 8 + (8 - usize::try_from(top.leading_zeros()).ok()?);
+    Some(if bits < 2048 {
+        KeyKind::NotTaken("an RSA key of fewer than 2048 bits")
+    } else if bits > 4096 {
+        KeyKind::NotTaken("an RSA key of more than 4096 bits")
+    } else {
+        KeyKind::Taken
+    })
+}
+
+/// SEC 1: SEQUENCE { INTEGER 1, OCTET STRING privateKey, [0] OID curve
+/// (optional), [1] publicKey (optional) }.
+fn sec1_kind(der: &[u8]) -> Option<KeyKind> {
+    let mut key = Der::whole(der, SEQUENCE)?;
+    key.next(INTEGER)?;
+    key.next(OCTET_STRING)?;
+    if key.is_empty() {
+        // No curve named: within PKCS #8 the algorithm names it.
+        return Some(KeyKind::Taken);
+    }
+    match key.peek() {
+        Some(CONTEXT_0) => {
+            let curve = Der::whole(key.next(CONTEXT_0)?, OID)?.rest;
+            Some(curve_kind(curve))
+        }
+        _ => Some(KeyKind::Taken),
+    }
+}
+
+fn curve_kind(oid: &[u8]) -> KeyKind {
+    match oid {
+        OID_P256 | OID_P384 => KeyKind::Taken,
+        OID_P521 => KeyKind::NotTaken("an ECDSA key on P-521"),
+        OID_SECP256K1 => KeyKind::NotTaken("an ECDSA key on secp256k1"),
+        _ => KeyKind::NotTaken("an ECDSA key on a curve that is not P-256 or P-384"),
+    }
+}
+
+/// A reader of DER elements, one after the other, with no recursion: each
+/// caller goes one level down by hand. It never indexes; a length past the
+/// end, or a form DER does not allow, is `None`.
+struct Der<'a> {
+    rest: &'a [u8],
+}
+
+impl<'a> Der<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { rest: bytes }
+    }
+
+    /// The contents of the one element `tag` that is the whole of `bytes`.
+    fn whole(bytes: &'a [u8], tag: u8) -> Option<Self> {
+        let mut outer = Self::new(bytes);
+        let inner = outer.next(tag)?;
+        outer.is_empty().then(|| Self::new(inner))
+    }
+
+    fn is_empty(&self) -> bool {
+        self.rest.is_empty()
+    }
+
+    fn peek(&self) -> Option<u8> {
+        self.rest.first().copied()
+    }
+
+    /// The contents of the next element, which must be of `tag`.
+    fn next(&mut self, tag: u8) -> Option<&'a [u8]> {
+        let (&found, rest) = self.rest.split_first()?;
+        if found != tag {
+            return None;
+        }
+        let (&first, rest) = rest.split_first()?;
+        let (length, rest) = if first < 0x80 {
+            (usize::from(first), rest)
+        } else {
+            // Long form: one to four bytes of length (never indefinite).
+            let count = usize::from(first & 0x7f);
+            if count == 0 || count > 4 {
+                return None;
+            }
+            let (bytes, rest) = rest.split_at_checked(count)?;
+            let length = bytes
+                .iter()
+                .fold(0_usize, |n, b| (n << 8) | usize::from(*b));
+            (length, rest)
+        };
+        let (contents, rest) = rest.split_at_checked(length)?;
+        self.rest = rest;
+        Some(contents)
+    }
 }
 
 /// The cryptography of the program's TLS: ring's.
