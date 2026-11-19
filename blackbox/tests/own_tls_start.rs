@@ -25,8 +25,8 @@ use std::time::Duration;
 use blackbox::DOMAIN;
 use blackbox::own_tls::{
     CERT_VAR, Hello, KEY_VAR, KeyKind, KeyLabel, MIB, Pair, Place, Serving, Validity,
-    assert_loaded_record, assert_no_key_in, certificate, fingerprint, fixture_text, hide_keys,
-    installation_names, listened, serve_once, shake, wildcard,
+    assert_loaded_record, assert_no_key_in, certificate, damaged_keys, fingerprint, fixture_text,
+    hide_keys, installation_names, listened, serve_once, shake, wildcard,
 };
 use blackbox::program::Finished;
 use blackbox::tls::{Authority, api_name, pem, text_of};
@@ -564,17 +564,159 @@ fn an_rsa_key_of_1024_bits_is_refused_as_a_kind_not_taken() {
         &[],
         &g.env(),
         &[KEY_VAR, &path],
-        &[&[
-            "1024",
-            "2048",
-            "kind",
-            "not supported",
-            "unsupported",
-            "too small",
-            "too short",
-        ]],
+        &[
+            &[
+                "1024",
+                "2048",
+                "kind",
+                "not supported",
+                "unsupported",
+                "too small",
+                "too short",
+            ],
+            KINDS_TAKEN[0],
+            KINDS_TAKEN[1],
+            KINDS_TAKEN[2],
+            KINDS_TAKEN[3],
+        ],
         &[&key],
     );
+}
+
+/// The kinds a key may be of, each in the words it may be named by: the
+/// message of a key of a kind not taken names them all ("the message names
+/// the kinds that are taken").
+const KINDS_TAKEN: [&[&str]; 4] = [
+    &["rsa"],
+    &["p-256", "p256", "secp256r1", "prime256v1"],
+    &["p-384", "p384", "secp384r1"],
+    &["ed25519"],
+];
+
+#[test]
+fn an_ecdsa_key_on_p_521_is_refused_as_a_kind_not_taken_naming_the_kinds_that_are() {
+    let g = given();
+    let key = fixture_text("p521.pem");
+    g.place.write_cert(fixture_text("p521-cert.pem").as_bytes());
+    g.place.write_key(key.as_bytes());
+    let path = g.key();
+    let mut why: Vec<&[&str]> = vec![&[
+        "kind",
+        "not supported",
+        "unsupported",
+        "not taken",
+        "p-521",
+        "p521",
+        "secp521r1",
+    ]];
+    why.extend(KINDS_TAKEN);
+    assert_refused(
+        "an ECDSA key on P-521 (PRIVATE KEY), with its certificate for api and the wildcard",
+        &[],
+        &g.env(),
+        &[KEY_VAR, &path],
+        &why,
+        &[&key],
+    );
+}
+
+#[test]
+fn a_dsa_private_key_is_refused_as_a_kind_not_taken_naming_the_kinds_that_are() {
+    let g = given();
+    let key = fixture_text("dsa.pem");
+    g.place.write_key(key.as_bytes());
+    let path = g.key();
+    let mut why: Vec<&[&str]> = vec![&["kind", "not supported", "unsupported", "not taken", "dsa"]];
+    why.extend(KINDS_TAKEN);
+    assert_refused(
+        "a key file holding a `DSA PRIVATE KEY`",
+        &[],
+        &g.env(),
+        &[KEY_VAR, &path],
+        &why,
+        &[&key],
+    );
+}
+
+/// The words a message may use to say a key cannot be read.
+const CANNOT_BE_READ: &[&str] = &[
+    "cannot be read",
+    "can't be read",
+    "could not be read",
+    "cannot read",
+    "could not read",
+    "unreadable",
+    "damaged",
+    "corrupt",
+    "malformed",
+    "cannot be parsed",
+    "could not be parsed",
+    "cannot parse",
+    "could not parse",
+    "failed to parse",
+    "not a valid",
+    "invalid",
+];
+
+/// Fails unless each damaged key of `label`, the installation's
+/// certificate beside it, is a start-up failure saying the key cannot be
+/// read, never that it is of a kind not supported, and showing no line of
+/// its body.
+fn damaged_is_refused(label: KeyLabel) {
+    for (what, damaged) in damaged_keys(label) {
+        let g = given();
+        g.place.write_key(damaged.as_bytes());
+        let path = g.key();
+        let said = assert_refused(
+            &what,
+            &[],
+            &g.env(),
+            &[KEY_VAR, &path],
+            &[CANNOT_BE_READ],
+            &[&damaged],
+        );
+        let lower = said.to_lowercase();
+        for wrong in ["not supported", "unsupported"] {
+            assert!(
+                !lower.contains(wrong),
+                "expected {what} said to be a key that cannot be read, not one of a kind {wrong:?} (its label is one of the three):\n{}",
+                hide_keys(&said, &[&damaged])
+            );
+        }
+    }
+}
+
+#[test]
+fn a_damaged_private_key_is_refused_as_a_key_that_cannot_be_read() {
+    damaged_is_refused(KeyLabel::Pkcs8);
+}
+
+#[test]
+fn a_damaged_rsa_private_key_is_refused_as_a_key_that_cannot_be_read() {
+    damaged_is_refused(KeyLabel::Rsa);
+}
+
+#[test]
+fn a_damaged_ec_private_key_is_refused_as_a_key_that_cannot_be_read() {
+    damaged_is_refused(KeyLabel::Ec);
+}
+
+/// The harness's own check: rustls cannot take any of the damaged keys.
+#[test]
+fn the_harness_s_damaged_keys_cannot_be_read_as_keys() {
+    use rustls::pki_types::PrivateKeyDer;
+    use rustls::pki_types::pem::PemObject;
+    let provider = rustls::crypto::ring::default_provider();
+    for label in [KeyLabel::Pkcs8, KeyLabel::Rsa, KeyLabel::Ec] {
+        for (what, damaged) in damaged_keys(label) {
+            let read = PrivateKeyDer::from_pem_slice(damaged.as_bytes())
+                .unwrap_or_else(|e| panic!("expected the PEM of {what} whole: {e}"));
+            assert!(
+                provider.key_provider.load_private_key(read).is_err(),
+                "expected {what} not to be taken as a key"
+            );
+        }
+    }
 }
 
 #[test]

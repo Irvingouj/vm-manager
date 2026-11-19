@@ -218,6 +218,49 @@ impl Key {
     }
 }
 
+/// Keys whose PEM section is whole and labelled `label`, but whose body
+/// cannot be read as a key of that label: (what it is, the PEM text).
+/// Two of them: 200 bytes that are no DER (the same each run, made from
+/// SHA-256), and a key of that label (P-256, or the RSA fixture's for
+/// `RSA PRIVATE KEY`) cut to half its length. Never print them.
+pub fn damaged_keys(label: KeyLabel) -> Vec<(String, String)> {
+    let mut noise = Vec::new();
+    let mut block = Sha256::digest(b"a damaged key of the harness").to_vec();
+    while noise.len() < 200 {
+        noise.extend_from_slice(&block);
+        block = Sha256::digest(&block).to_vec();
+    }
+    noise.truncate(200);
+    // Not DER whatever the hash gave: the first byte is no SEQUENCE.
+    if let Some(first) = noise.first_mut() {
+        *first = 0x5a;
+    }
+    let (name, whole) = match label {
+        KeyLabel::Pkcs8 => ("PRIVATE KEY", Key::new(KeyKind::EcdsaP256).pkcs8),
+        KeyLabel::Rsa => (
+            "RSA PRIVATE KEY",
+            pkcs8_private_key(&Key::new(KeyKind::Rsa2048).pkcs8)
+                .unwrap_or_else(|| panic!("the harness's RSA fixture is not PKCS #8")),
+        ),
+        KeyLabel::Ec => (
+            "EC PRIVATE KEY",
+            sec1_of(&Key::new(KeyKind::EcdsaP256).pkcs8)
+                .unwrap_or_else(|| panic!("the harness cannot write the key as SEC 1")),
+        ),
+    };
+    let half = whole.get(..whole.len() / 2).unwrap_or_default().to_vec();
+    vec![
+        (
+            format!("200 bytes that are no DER under `{name}`"),
+            pem(name, &noise),
+        ),
+        (
+            format!("a key of `{name}` cut to half its length"),
+            pem(name, &half),
+        ),
+    ]
+}
+
 /// The path of a file of `fixtures/tls/`.
 pub fn fixture_path(file: &str) -> PathBuf {
     crate::program::manifest_dir()
