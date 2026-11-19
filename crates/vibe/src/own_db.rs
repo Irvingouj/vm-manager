@@ -1690,7 +1690,7 @@ impl OwnDatabases {
                      GRANT USAGE, SELECT ON SEQUENCES TO {runtime};
                  ALTER DEFAULT PRIVILEGES FOR ROLE {owner}
                      GRANT USAGE ON SCHEMAS TO {runtime};",
-                comment = literal(&format!("vm application {application}")),
+                comment = literal(&format!("vibe application {application}")),
             );
             let fail = |e: &tokio_postgres::Error| Problem::postgres(step, e);
             let transaction = connection
@@ -1845,7 +1845,7 @@ impl OwnDatabases {
             .user(role)
             .password(&password.0)
             .dbname(&names.database)
-            .application_name("vm")
+            .application_name("vibe")
             .connect_timeout(CONNECT_TIMEOUT);
         if pinned {
             config.options("-c search_path=pg_catalog,pg_temp");

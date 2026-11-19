@@ -557,7 +557,7 @@ impl Courier {
             .user(&route.role)
             .password(&route.known.platform_password.0)
             .dbname(&route.database)
-            .application_name("vm relay")
+            .application_name("vibe relay")
             .connect_timeout(CONNECT_TIMEOUT)
             .options(format!(
                 "-c search_path=pg_catalog,pg_temp -c statement_timeout={ms} -c lock_timeout={ms}"

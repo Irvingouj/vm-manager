@@ -151,7 +151,7 @@ impl DatabaseAddress {
             .port(self.port)
             .user(&self.role)
             .dbname(&self.database)
-            .application_name("vm")
+            .application_name("vibe")
             .connect_timeout(connect_timeout);
         if let Some(password) = &self.password {
             config.password(password.expose());

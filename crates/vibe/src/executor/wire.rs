@@ -223,7 +223,7 @@ impl Connection {
                 ("user", target.role.as_str()),
                 ("database", target.database.as_str()),
                 ("client_encoding", "UTF8"),
-                ("application_name", "vm"),
+                ("application_name", "vibe"),
                 ("standard_conforming_strings", "on"),
             ],
             &mut out,
