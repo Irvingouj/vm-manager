@@ -245,13 +245,9 @@ pub(super) async fn start_server(
         local
             .empty_data()
             .map_err(|why| local_state_failed(&why, name))?;
-        local
-            .renew_state()
-            .map_err(|why| local_state_failed(&why, name))?;
+        local.renew_state().map_err(|failed| failed.ending(name))?;
     }
-    let mut state = local
-        .state()
-        .map_err(|why| local_state_failed(&why, name))?;
+    let mut state = local.state().map_err(|failed| failed.ending(name))?;
     local
         .stop_leftover(&state)
         .await

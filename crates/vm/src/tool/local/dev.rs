@@ -74,12 +74,12 @@ use super::super::theirs::Theirs;
 use super::super::{Done, Ending, json_line};
 use super::control::{self, ControlSecret};
 use super::page::{self, COOKIE as TEST_USER_COOKIE};
-use super::postgres::{self, Local, Programs};
+use super::postgres::{self, Local, Programs, StateFailed};
 use super::run::{self, Base, Brought, Held, Live, Pg, Size};
 use super::walk::{self, Look};
 use super::{
     Command, DRAIN_WAIT, DevArgs, Progress, Reading, Stage, WHO, WHO_DEV, WHO_LOCAL, WHO_RESET,
-    local_state_failed, one_line, read_records, request_output, reset_output, standins,
+    one_line, read_records, request_output, reset_output, standins,
 };
 use crate::runner;
 use crate::server::{self, Handler};
@@ -260,11 +260,11 @@ pub(in super::super) async fn dev(args: &DevArgs) -> Result<Done, Ending> {
     let application: Arc<str> = Arc::from(brought.application.as_str());
     let secret = match write_control(&project, args.port, &application).await {
         Ok(secret) => secret,
-        Err(why) => {
+        Err(failed) => {
             live.close().await;
             held.release().await;
             control::remove_left(&local);
-            return Err(local_state_failed(&why, name));
+            return Err(failed.ending(name));
         }
     };
     let (jobs_tx, jobs_rx) = mpsc::channel(JOBS);
@@ -362,9 +362,11 @@ async fn write_control(
     project: &Path,
     port: u16,
     application: &str,
-) -> Result<Arc<ControlSecret>, String> {
-    let secret = Arc::new(ControlSecret::generate()?);
-    rewrite_control(project, port, application, &secret).await?;
+) -> Result<Arc<ControlSecret>, StateFailed> {
+    let secret = Arc::new(ControlSecret::generate().map_err(StateFailed::NoRandomness)?);
+    rewrite_control(project, port, application, &secret)
+        .await
+        .map_err(StateFailed::State)?;
     Ok(secret)
 }
 

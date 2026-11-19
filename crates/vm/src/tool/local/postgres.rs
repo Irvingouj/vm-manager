@@ -333,13 +333,13 @@ impl Local {
     }
 
     /// New passwords, for a reset: the state written anew, whole.
-    pub(super) fn renew_state(&self) -> Result<State, String> {
+    pub(super) fn renew_state(&self) -> Result<State, StateFailed> {
         let state = State {
-            superuser: Secret::generate()?,
-            platform: Secret::generate()?,
+            superuser: Secret::generate().map_err(StateFailed::NoRandomness)?,
+            platform: Secret::generate().map_err(StateFailed::NoRandomness)?,
             ready: false,
         };
-        self.write_state(&state)?;
+        self.write_state(&state).map_err(StateFailed::State)?;
         Ok(state)
     }
 
@@ -385,17 +385,18 @@ impl Local {
     }
 
     /// The state, made (new passwords) when it is not there.
-    pub(super) fn state(&self) -> Result<State, String> {
+    pub(super) fn state(&self) -> Result<State, StateFailed> {
         let path = self.dir.join("state.json");
         match fs::read(&path) {
             Ok(bytes) => {
-                let value: Value = serde_json::from_slice(&bytes).map_err(|_| self.broken())?;
+                let value: Value = serde_json::from_slice(&bytes)
+                    .map_err(|_| StateFailed::State(self.broken()))?;
                 let text = |key: &str| {
                     value
                         .get(key)
                         .and_then(Value::as_str)
                         .map(|s| Secret(s.to_owned()))
-                        .ok_or_else(|| self.broken())
+                        .ok_or_else(|| StateFailed::State(self.broken()))
                 };
                 Ok(State {
                     superuser: text("superuser")?,
@@ -405,17 +406,20 @@ impl Local {
             }
             Err(error) if error.kind() == ErrorKind::NotFound => {
                 if self.data().exists() {
-                    return Err(self.broken());
+                    return Err(StateFailed::State(self.broken()));
                 }
                 let state = State {
-                    superuser: Secret::generate()?,
-                    platform: Secret::generate()?,
+                    superuser: Secret::generate().map_err(StateFailed::NoRandomness)?,
+                    platform: Secret::generate().map_err(StateFailed::NoRandomness)?,
                     ready: false,
                 };
-                self.write_state(&state)?;
+                self.write_state(&state).map_err(StateFailed::State)?;
                 Ok(state)
             }
-            Err(error) => Err(format!("{} cannot be read ({error})", path.display())),
+            Err(error) => Err(StateFailed::State(format!(
+                "{} cannot be read ({error})",
+                path.display()
+            ))),
         }
     }
 
@@ -711,6 +715,29 @@ fn empty_folder(folder: &Path) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Why the local state could not be had: `.vm/local/` that cannot be used
+/// (`local-state`), or no randomness for a password or a secret (`failed`:
+/// removing `.vm/local/` would not help).
+pub(super) enum StateFailed {
+    State(String),
+    NoRandomness(String),
+}
+
+impl StateFailed {
+    pub(super) fn ending(&self, command: &str) -> super::super::Ending {
+        match self {
+            Self::State(why) => super::local_state_failed(why, command),
+            Self::NoRandomness(why) => super::super::Ending::new(
+                1,
+                "failed",
+                format!(
+                    "{command} could not make a secret: {why}. The operating system gave no randomness, which is not a fault of .vm/local/; run {command} again"
+                ),
+            ),
+        }
+    }
 }
 
 /// Why the private Postgres could not be made or started: Postgres's own
