@@ -49,12 +49,14 @@ pub fn names_of(applications: &[&str]) -> Vec<String> {
 
 /// An installation reached over HTTPS: the program with OIDC connected to
 /// the harness's provider, behind a TLS front with a certificate of the
-/// test's own authority.
+/// test's own authority ([`Site::start`]), or serving TLS itself with such
+/// a certificate, no front between ([`Site::own_tls`]).
 pub struct Site {
     // The front first: it ends before the program it stands before.
-    pub front: Front,
+    pub front: Option<Front>,
     pub at: Installation,
     pub authority: Authority,
+    // After the program: the files of its own TLS are here.
     pub files: Files,
     ca_file: PathBuf,
 }
@@ -76,7 +78,7 @@ impl Site {
         let files = Files::new();
         let ca_file = files.authorities("walks-authority.pem", &[&authority]);
         Self {
-            front,
+            front: Some(front),
             at,
             authority,
             files,
@@ -84,9 +86,50 @@ impl Site {
         }
     }
 
-    /// The port a browser reaches the installation at: the front's.
+    /// These people at the provider, the program serving TLS itself
+    /// (CONTRACT.md, "The program serves TLS itself") with a certificate
+    /// for `api.<domain>` and `*.<domain>` of the test's own authority and
+    /// its key in `VIBE_TLS_CERT_FILE` and `VIBE_TLS_KEY_FILE`, listening
+    /// on a port the harness chose and given as `--public-port`, with an
+    /// installation's key, OIDC connected over HTTPS. No front: a browser
+    /// reaches the program itself.
+    pub fn own_tls(people: &[Person]) -> Self {
+        let authority = Authority::new("Harness authority of the walks, served by the program");
+        let pair = crate::own_tls::Pair::installation(&authority);
+        let files = Files::new();
+        let cert = files.write("fullchain.pem", pair.cert_pem().as_bytes());
+        let key_text = pair.key_pem();
+        let key = files.write("privkey.pem", key_text.as_bytes());
+        let ca_file = files.authorities("walks-authority.pem", &[&authority]);
+        let mut options = VmOptions::new()
+            .env("VIBE_SECRET_KEY", SecretKey::fresh().expose())
+            .env(crate::own_tls::CERT_VAR, &text_of(&cert))
+            .env(crate::own_tls::KEY_VAR, &text_of(&key))
+            .reached_over_tls(crate::vm::TlsClient {
+                roots: vec![authority.der()],
+                ca_file: ca_file.clone(),
+            });
+        for line in crate::own_tls::body_lines(&key_text) {
+            options = options.hide(&line);
+        }
+        let vm = crate::own_tls::start_on_a_port(&options, true);
+        let at = Installation::of(vm, Provider::start(people));
+        at.connect(&crate::connection::Connection::to(&at.provider));
+        Self {
+            front: None,
+            at,
+            authority,
+            files,
+            ca_file,
+        }
+    }
+
+    /// The port a browser reaches the installation at: the front's, or the
+    /// program's own when it serves TLS itself.
     pub fn port(&self) -> u16 {
-        self.front.port()
+        self.front
+            .as_ref()
+            .map_or_else(|| self.at.vm.address().port(), Front::port)
     }
 
     pub fn provider(&self) -> &Provider {

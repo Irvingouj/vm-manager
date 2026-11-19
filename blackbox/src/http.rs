@@ -143,6 +143,16 @@ impl Request {
         self
     }
 
+    /// The name of the `Host` header's value, without a port (empty when
+    /// there is none): the server name a TLS client asks for.
+    pub fn host_name(&self) -> String {
+        let host = String::from_utf8_lossy(self.host.as_deref().unwrap_or_default()).into_owned();
+        match host.rsplit_once(':') {
+            Some((name, port)) if port.chars().all(|c| c.is_ascii_digit()) => name.to_owned(),
+            _ => host,
+        }
+    }
+
     /// Replaces the `Host` header's value.
     #[must_use]
     pub fn host(mut self, host: &str) -> Self {

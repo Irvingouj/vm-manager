@@ -112,6 +112,21 @@ impl Installation {
         at
     }
 
+    /// This program, already started, beside this provider, OIDC not
+    /// connected: one started on a port of the harness's choosing, say,
+    /// serving TLS itself ([`crate::own_tls`]).
+    pub fn of(vm: Vm, provider: Provider) -> Self {
+        let public_port = vm
+            .options()
+            .extra_arg_value("--public-port")
+            .and_then(|p| p.parse().ok());
+        Self {
+            vm,
+            provider,
+            public_port,
+        }
+    }
+
     /// The program started with these options beside this provider, OIDC
     /// not connected.
     pub fn unconnected(provider: Provider, options: &VmOptions) -> Self {
@@ -243,14 +258,26 @@ impl Installation {
         format!("auth.{DOMAIN}")
     }
 
-    /// `http://auth.<domain>:<port>`.
-    pub fn auth_origin(&self) -> String {
-        format!("http://auth.{DOMAIN}:{}", self.port())
+    /// The scheme browsers reach it with: `https` when the program serves
+    /// TLS itself, `http` otherwise (`--public-scheme http`).
+    pub fn scheme(&self) -> &'static str {
+        if self.vm.tls_client().is_some() {
+            "https"
+        } else {
+            "http"
+        }
     }
 
-    /// `http://<application>.<domain>:<port>`.
+    /// `http://auth.<domain>:<port>` (`https` when the program serves TLS
+    /// itself).
+    pub fn auth_origin(&self) -> String {
+        format!("{}://auth.{DOMAIN}:{}", self.scheme(), self.port())
+    }
+
+    /// `http://<application>.<domain>:<port>` (`https` when the program
+    /// serves TLS itself).
     pub fn app_origin(&self, application: &str) -> String {
-        format!("http://{application}.{DOMAIN}:{}", self.port())
+        format!("{}://{application}.{DOMAIN}:{}", self.scheme(), self.port())
     }
 
     /// The sign-in address with this path and query.
@@ -269,9 +296,21 @@ impl Installation {
         format!("{}/callback", self.auth_origin())
     }
 
-    /// A browser signed in as no one anywhere.
+    /// A browser signed in as no one anywhere. When the program serves TLS
+    /// itself, the browser speaks TLS to it and trusts its authority.
     pub fn browser(&self) -> Browser {
-        Browser::new(self.vm.address())
+        match self.vm.tls_client() {
+            Some(client) => {
+                let mut roots = client.roots.iter();
+                let first = roots.next().unwrap_or_else(|| {
+                    panic!("the harness's own check: a TLS client trusts an authority")
+                });
+                let mut browser = Browser::behind_tls(self.vm.address(), first.clone());
+                roots.for_each(|r| browser.trust(r.clone()));
+                browser
+            }
+            None => Browser::new(self.vm.address()),
+        }
     }
 
     /// A browser signed in at the provider (only) as this person.
@@ -619,16 +658,33 @@ impl Installation {
 
     /// The arguments of `vibe sign-in` to this installation through the
     /// browser, with these more (`--json`, `--timeout 10`, ...).
+    /// When the program serves TLS itself: `--domain <domain> --resolve
+    /// 127.0.0.1 --port <its port>`, over HTTPS (the run needs
+    /// [`Installation::tool_env`]).
     pub fn sign_in_args(&self, more: &[&str]) -> Vec<String> {
-        let mut args = vec![
-            "sign-in".to_owned(),
-            "--domain".to_owned(),
-            DOMAIN.to_owned(),
-            "--connect".to_owned(),
-            self.vm.address().to_string(),
-        ];
+        let mut args = vec!["sign-in".to_owned()];
+        if self.vm.tls_client().is_some() {
+            args.extend(crate::tls::place_at(self.vm.address().port()));
+        } else {
+            args.extend([
+                "--domain".to_owned(),
+                DOMAIN.to_owned(),
+                "--connect".to_owned(),
+                self.vm.address().to_string(),
+            ]);
+        }
         args.extend(more.iter().map(|a| (*a).to_owned()));
         args
+    }
+
+    /// The environment the tool needs to reach this installation: its
+    /// authority in `VIBE_CA_FILE` when the program serves TLS itself,
+    /// nothing otherwise.
+    pub fn tool_env(&self) -> Vec<(&'static str, String)> {
+        self.vm
+            .tls_client()
+            .map(|c| vec![("VIBE_CA_FILE", crate::tls::text_of(&c.ca_file))])
+            .unwrap_or_default()
     }
 
     /// Starts `vibe sign-in` with these more arguments on `machine`, with

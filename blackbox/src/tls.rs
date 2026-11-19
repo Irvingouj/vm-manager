@@ -146,6 +146,20 @@ impl Authority {
         self.issue_with(names, Validity::NotYet)
     }
 
+    /// A certificate of these parameters for this public key, signed by
+    /// this authority: for a certificate the program is to serve itself
+    /// with a key of a kind the test chooses ([`crate::own_tls`]).
+    pub fn sign(
+        &self,
+        params: &CertificateParams,
+        public_key: &impl rcgen::PublicKeyData,
+    ) -> CertificateDer<'static> {
+        params
+            .signed_by(public_key, &self.certified)
+            .map(|c| c.der().clone())
+            .unwrap_or_else(|e| panic!("cannot issue a certificate under {:?}: {e}", self.name))
+    }
+
     fn issue_with(&self, names: &[&str], validity: Validity) -> Identity {
         let owned: Vec<String> = names.iter().map(|n| (*n).to_owned()).collect();
         let mut params = CertificateParams::new(owned.clone()).unwrap_or_else(|e| {
@@ -218,6 +232,11 @@ impl fmt::Debug for Identity {
 }
 
 impl Identity {
+    /// The certificate chain, the server's own first.
+    pub fn chain(&self) -> &[CertificateDer<'static>] {
+        &self.chain
+    }
+
     /// The certificate chain in PEM form, the server's own first (what a
     /// proxy reads as `fullchain.pem`). The authority's certificate is not
     /// in it.
@@ -250,7 +269,7 @@ impl Identity {
 }
 
 /// `der` in PEM form under this label, 64 characters a line.
-fn pem(label: &str, der: &[u8]) -> String {
+pub fn pem(label: &str, der: &[u8]) -> String {
     use base64::Engine;
     let text = base64::engine::general_purpose::STANDARD.encode(der);
     let mut out = format!("-----BEGIN {label}-----\n");

@@ -91,6 +91,9 @@ pub const COMPOSE: &str = "compose.yaml";
 pub const OWN_PROXY: &str = "compose.own-proxy.yaml";
 /// The file for the administrator's own Postgres.
 pub const OWN_POSTGRES: &str = "compose.own-postgres.yaml";
+/// The file that has `vibe` serve TLS itself in place of the proxy
+/// (CONTRACT.md, "The program serves TLS itself: The Compose file").
+pub const OWN_TLS: &str = "compose.own-tls.yaml";
 /// The one file the tests add: name resolution to the identity provider,
 /// for `vibe` only.
 pub const HARNESS_FILE: &str = "compose.harness.yaml";
@@ -1588,6 +1591,10 @@ pub enum FrontDoor {
     /// `127.0.0.1:VIBE_HTTPS_PORT` before it, with the same certificate:
     /// another reverse proxy that ends TLS and passes `Host` on unchanged.
     AnotherProxy,
+    /// `compose.own-tls.yaml`: `vibe` itself published on
+    /// `127.0.0.1:VIBE_HTTPS_PORT`, ending TLS with the wildcard
+    /// certificate of `certs/`.
+    TheProgramItself,
 }
 
 /// An installation as an install test makes one: the image under test,
@@ -1605,6 +1612,8 @@ pub struct Installed {
     pub reach: Reach,
     pub idp: OutsideProvider,
     pub proxy_authority: Authority,
+    /// The wildcard certificate of `certs/` (and its key, never printed).
+    pub wildcard: Identity,
     pub image: String,
     /// The test's own front before the program, with
     /// [`FrontDoor::AnotherProxy`].
@@ -1639,7 +1648,9 @@ impl Installed {
         // [`Installed::up`] follows it. The front's port is held by the
         // front itself from now on.
         let (port, front) = match door {
-            FrontDoor::TheFilesProxy => (install.choose_port("VIBE_HTTPS_PORT"), None),
+            FrontDoor::TheFilesProxy | FrontDoor::TheProgramItself => {
+                (install.choose_port("VIBE_HTTPS_PORT"), None)
+            }
             FrontDoor::AnotherProxy => {
                 let http_port = install.choose_port("VIBE_HTTP_PORT");
                 let bound = Bound::new();
@@ -1660,6 +1671,7 @@ impl Installed {
             reach,
             idp,
             proxy_authority,
+            wildcard,
             image,
             front,
             _tool_ca: tool_ca,

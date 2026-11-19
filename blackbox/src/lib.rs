@@ -95,6 +95,11 @@
 //! - [`tls`] is what the tests of the tool over HTTPS and of `VIBE_CA_FILE`
 //!   share: test certificate authorities, TLS fronts before the program and
 //!   before the identity provider, and the harness's own TLS client;
+//!   [`own_tls`] is what the tests of the program serving TLS itself
+//!   share: keys of each kind under each PEM label, the two files in a
+//!   folder of the test's, replaced as an administrator replaces them, the
+//!   program started with them on a port the harness chose, and a TLS
+//!   client held to one version, a server name or none, and ALPN;
 //! - [`install`] is what the install tests share (they need Docker and a
 //!   built image, and are run by `scripts/install-gate.sh`): the image, the
 //!   files of `deploy/` copied unchanged to a folder of the test's, an
@@ -145,6 +150,7 @@ pub mod lost_answer;
 pub mod oidc;
 pub mod out_of_reach;
 pub mod own_database;
+pub mod own_tls;
 pub mod page;
 pub mod ports;
 pub mod postgres;

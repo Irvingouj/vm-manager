@@ -81,6 +81,33 @@ pub struct VmOptions {
     extra_args: Vec<String>,
     /// Environment variables the program is started with.
     env: Vec<EnvVar>,
+    /// How the harness reaches a program that serves TLS itself
+    /// (CONTRACT.md, "The program serves TLS itself"): `None` for one that
+    /// listens in plain HTTP. Nothing of it is given to the program.
+    tls: Option<TlsClient>,
+    /// Texts never shown in a failure message of this program's: the body
+    /// lines of a key the program was given, say. A failure message shows
+    /// `<hidden>` in their place.
+    hidden: Vec<Hidden>,
+}
+
+/// How the harness's clients reach a program that serves TLS itself: the
+/// authorities they trust for its certificate, and a file holding them
+/// for the tool's `VIBE_CA_FILE`.
+#[derive(Clone, Debug)]
+pub struct TlsClient {
+    pub roots: Vec<rustls::pki_types::CertificateDer<'static>>,
+    pub ca_file: PathBuf,
+}
+
+/// A text never shown; its `Debug` shows nothing of it.
+#[derive(Clone)]
+struct Hidden(String);
+
+impl std::fmt::Debug for Hidden {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "<hidden>")
+    }
 }
 
 /// An environment variable for the program. Its value may be a secret
@@ -109,6 +136,8 @@ impl Default for VmOptions {
             listen: None,
             extra_args: Vec::new(),
             env: Vec::new(),
+            tls: None,
+            hidden: Vec::new(),
         }
     }
 }
@@ -210,13 +239,49 @@ impl VmOptions {
             .map(|e| e.value.as_str())
     }
 
+    /// The harness reaches the program over TLS, trusting these
+    /// authorities: the program serves TLS itself (its two files are given
+    /// with [`VmOptions::env`]). Requests the harness makes of it
+    /// ([`Vm::api_request`], [`Vm::request`]) go over TLS, asking for the
+    /// `Host`'s name.
+    #[must_use]
+    pub fn reached_over_tls(mut self, client: TlsClient) -> Self {
+        self.tls = Some(client);
+        self
+    }
+
+    /// How the harness reaches the program over TLS, when it serves TLS
+    /// itself.
+    pub fn tls_client(&self) -> Option<&TlsClient> {
+        self.tls.as_ref()
+    }
+
+    /// Never shows `text` in a failure message of this program's.
+    #[must_use]
+    pub fn hide(mut self, text: &str) -> Self {
+        if !text.is_empty() {
+            self.hidden.push(Hidden(text.to_owned()));
+        }
+        self
+    }
+
+    /// `text` with every hidden text of these options replaced by
+    /// `<hidden>`.
+    pub fn masked(&self, text: &str) -> String {
+        self.hidden
+            .iter()
+            .fold(text.to_owned(), |t, h| t.replace(&h.0, "<hidden>"))
+    }
+
     /// The same options without the extra arguments and environment, and
     /// with the stand-in sign-in on: what installs the fixture Applications
-    /// before a program without the stand-in starts.
+    /// before a program without the stand-in starts. It listens in plain
+    /// HTTP, as ever.
     fn installer(&self) -> Self {
         Self {
             extra_args: Vec::new(),
             env: Vec::new(),
+            tls: None,
             ..self.clone()
         }
         .stand_in_sign_in()
@@ -477,7 +542,7 @@ impl Vm {
                 };
                 let message = format!(
                     "expected `vibe serve` to write a `listening` record, but it {why}.\ncommand: {command_line}\nits standard error:\n{}\nthe last {POSTGRES_LOG_LINES_SHOWN} lines of the test Postgres's server log:\n{}",
-                    log.tail(LOG_LINES_SHOWN),
+                    options.masked(&log.tail(LOG_LINES_SHOWN)),
                     crate::postgres::shared_log_tail(POSTGRES_LOG_LINES_SHOWN)
                 );
                 // End the process before the log reader is joined, so that
@@ -528,9 +593,29 @@ impl Vm {
         format!("api.{}", self.domain)
     }
 
-    /// A `GET` of `target` on the platform's API, not signed in.
+    /// A `GET` of `target` on the platform's API, not signed in; over TLS
+    /// when the program serves TLS itself ([`VmOptions::reached_over_tls`]).
     pub fn api_request(&self, target: &str) -> Request {
-        Request::new(self.address, target, &self.api_host())
+        self.reached(Request::new(self.address, target, &self.api_host()))
+    }
+
+    /// `request` over TLS, asking for its `Host`'s name and trusting the
+    /// authorities of [`VmOptions::reached_over_tls`], when the program
+    /// serves TLS itself; as it is otherwise.
+    fn reached(&self, request: Request) -> Request {
+        match &self.options.tls {
+            Some(client) => {
+                let name = request.host_name();
+                request.over_tls(&name, &client.roots)
+            }
+            None => request,
+        }
+    }
+
+    /// How the harness reaches this program over TLS, when it serves TLS
+    /// itself.
+    pub fn tls_client(&self) -> Option<&TlsClient> {
+        self.options.tls.as_ref()
     }
 
     pub fn address(&self) -> SocketAddr {
@@ -547,9 +632,14 @@ impl Vm {
         format!("{application}.{}", self.domain)
     }
 
-    /// A `GET` of `target` on an Application, not signed in.
+    /// A `GET` of `target` on an Application, not signed in; over TLS when
+    /// the program serves TLS itself.
     pub fn request(&self, application: &str, target: &str) -> Request {
-        Request::new(self.address, target, &self.host_of(application))
+        self.reached(Request::new(
+            self.address,
+            target,
+            &self.host_of(application),
+        ))
     }
 
     /// A `GET` of `target` on an Application as this User.
@@ -633,7 +723,7 @@ impl Vm {
         panic!(
             "{message}\ncommand: {}\nthe program's log:\n{}",
             self.command_line,
-            self.log.tail(LOG_LINES_SHOWN)
+            self.options.masked(&self.log.tail(LOG_LINES_SHOWN))
         )
     }
 
@@ -701,7 +791,7 @@ impl Drop for Vm {
             eprintln!(
                 "--- the log of `{}` ---\n{}--- end of the log ---",
                 self.command_line,
-                self.log.tail(LOG_LINES_SHOWN)
+                self.options.masked(&self.log.tail(LOG_LINES_SHOWN))
             );
         }
         // Then `process` is dropped, ending the program, and `log` joins its

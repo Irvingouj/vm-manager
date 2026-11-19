@@ -300,8 +300,9 @@ pub fn connect_args(address: SocketAddr, connection: &Connection, json: bool) ->
 
 /// Runs `vibe admin connect-oidc` on `machine` with the setup credential in
 /// `VIBE_SETUP_CREDENTIAL` and the client secret in `VIBE_OIDC_CLIENT_SECRET`,
-/// to the program `vibe`; `json` adds `--json`. The run is returned as it
-/// is: hide it ([`hide`]) before showing it.
+/// to the program `vibe` (over HTTPS when it serves TLS itself); `json`
+/// adds `--json`. The run is returned as it is: hide it ([`hide`]) before
+/// showing it.
 pub fn connect_with_setup(
     machine: &Machine,
     vm: &Vm,
@@ -309,15 +310,31 @@ pub fn connect_with_setup(
     connection: &Connection,
     json: bool,
 ) -> Run {
-    let args = connect_args(vm.address(), connection, json);
+    let mut env = vec![
+        ("VIBE_SETUP_CREDENTIAL", setup.expose().to_owned()),
+        (
+            "VIBE_OIDC_CLIENT_SECRET",
+            connection.secret().expose().to_owned(),
+        ),
+    ];
+    // A program that serves TLS itself is reached over HTTPS: `--port
+    // <its port> --resolve 127.0.0.1`, its authority in `VIBE_CA_FILE`.
+    let args = match vm.tls_client() {
+        Some(client) => {
+            env.push(("VIBE_CA_FILE", crate::tls::text_of(&client.ca_file)));
+            let mut args = vec!["admin".to_owned(), "connect-oidc".to_owned()];
+            args.extend(crate::tls::place_at(vm.address().port()));
+            args.extend(connection.tool_args());
+            if json {
+                args.push("--json".to_owned());
+            }
+            args
+        }
+        None => connect_args(vm.address(), connection, json),
+    };
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    machine.run_with_env(
-        &refs,
-        &[
-            ("VIBE_SETUP_CREDENTIAL", setup.expose()),
-            ("VIBE_OIDC_CLIENT_SECRET", connection.secret().expose()),
-        ],
-    )
+    let env: Vec<(&str, &str)> = env.iter().map(|(n, v)| (*n, v.as_str())).collect();
+    machine.run_with_env(&refs, &env)
 }
 
 /// How long a request that connects OIDC is waited for: the platform gives
