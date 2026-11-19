@@ -2111,6 +2111,18 @@ A local run that ends `postgres-failed` (exit code `1`; "The local loop: one req
 - Nothing of a password or a connection string is in any of them.
 - The exit code, the reason, and that nothing the run started is left running are unchanged.
 
+- Only a failure of the private Postgres is `postgres-failed`. A `.vm/local/` that cannot be written (its `state.json` included) is `local-state`, as before; something of the program's own that is not Postgres's (no randomness for a password, a local platform database written by a newer program) is `failed`, with what to do.
+
+### The local databases do not wait on the disk
+
+Measured for this ticket (the numbers are in the ticket): with 34 local runs starting at once on the gate's machine, making the own database took up to 18.8 s of its 20 s limit and stopping the private Postgres a median of 15 s, all of it waiting on `fsync` (checkpoints of 813 files after `initdb`, the journal's commits under `CREATE DATABASE`), none on the processor; with `fsync` off the same steps took 0.24 s and 0.1 s.
+
+- **The private Postgres of the local run runs with `fsync` off and `full_page_writes` off.** Everything in it can be made again: the stand-ins from the pulled structures and the project's test rows, the own database from the migrations and `test-rows/own-database.sql`, the local records by running again.
+- What this costs, and what the Builder is told: the local databases are **not kept through a crash of the machine or a loss of power** (a kill or a crash of `vm` or of Postgres loses nothing: the operating system still writes what it was given). After such a crash a local run may end `postgres-failed`; `vm local reset` starts the local databases anew and loads the test rows again. Rows that must be there after that belong in the project's `test-rows/` files. The project template's `AGENTS.md` says so where it describes `vm local reset`.
+- A private Postgres made by an earlier program is started with the same settings: nothing is to be migrated.
+- The time limits of the steps stay as they are (they bound a step that hangs; they are no longer what a busy disk runs into).
+- This is the local run only. An installation's platform database and the own databases on it are IT's Postgres and are not touched.
+
 ### The harness
 
 - A program the harness writes for a test to start (a stand-in `node`, a stand-in tool) is never started while it is still open for writing in any thread's child: "Text file busy" is the harness's own race, not the program's, and no test may fail by it.
