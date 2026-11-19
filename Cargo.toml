@@ -114,6 +114,16 @@ disallowed_types = "deny"
 # An exception says why.
 allow_attributes_without_reason = "deny"
 
+# Debug builds carry line numbers for our own crates (a panic's backtrace
+# still names the line) and no debug information for dependencies. The gate
+# links some 190 test binaries; with full debug information `target/debug`
+# passed 34 GB and filled the disk of the machine that runs the gate.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
 [profile.release]
 strip = "debuginfo"
 
