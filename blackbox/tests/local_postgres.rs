@@ -307,27 +307,68 @@ fn a_distributions_version_line_is_read_up_to_the_number() {
     );
 }
 
+/// CONTRACT.md, "One Postgres version": "A `VIBE_LOCAL_POSTGRES_BIN` that
+/// names a Postgres of another major version ends `postgres-unavailable`
+/// as before, and the message says the version found, that 18 is needed,
+/// and what to do: unset `VIBE_LOCAL_POSTGRES_BIN`". Postgres 17 and 16
+/// are another version now.
 #[test]
-fn a_distributions_postgres_15_is_postgres_unavailable_naming_15() {
+fn a_distributions_postgres_17_or_16_is_postgres_unavailable_naming_it_and_18() {
     let mirror = Mirror::start(Serving::Archive);
     let probe = Local::new();
-    let bin = distribution(
-        &probe,
-        "homebrew-15",
-        "postgres (PostgreSQL) 15.4 (Homebrew)",
-    );
-    let local = Local::new()
-        .with_bin(bin.to_str().unwrap())
-        .with_mirror(&mirror.base_url());
-    let project = local_project(&local.machine, "pg-homebrew-15", &[]);
-    let message = local
-        .request(&project.dir, "/", OUTSIDER, &[])
-        .json_error(1, "postgres-unavailable");
-    assert!(
-        message.contains("15"),
-        "expected the message to name the version found, 15, got {message:?}"
-    );
+    for (name, found) in [("debian-17", "17.6"), ("homebrew-16", "16.10")] {
+        let line = format!("postgres (PostgreSQL) {found} (Debian {found}-1.pgdg120+1)");
+        let bin = distribution(&probe, name, &line);
+        let bin_text = bin.to_str().unwrap();
+        let local = Local::new()
+            .with_bin(bin_text)
+            .with_mirror(&mirror.base_url());
+        let project = local_project(&local.machine, &format!("pg-{name}"), &[]);
+        let message = local
+            .request(&project.dir, "/", OUTSIDER, &[])
+            .json_error(1, "postgres-unavailable");
+        let without_path = message.replace(bin_text, "");
+        assert!(
+            without_path.contains(found),
+            "{name}: expected the message to say the version found, {found}, got {message:?}"
+        );
+        assert!(
+            without_path.replace(found, "").contains("18"),
+            "{name}: expected the message to say Postgres 18 is needed, got {message:?}"
+        );
+        assert!(
+            message.contains("VIBE_LOCAL_POSTGRES_BIN") && message.to_lowercase().contains("unset"),
+            "{name}: expected the message to say to unset VIBE_LOCAL_POSTGRES_BIN, got {message:?}"
+        );
+    }
     assert!(mirror.requests().is_empty());
+}
+
+/// CONTRACT.md: "The version is the number after `(PostgreSQL)` in what
+/// `postgres --version` says, whatever follows it (a distribution's note in
+/// brackets, `beta1`)"; "A minor version is never looked at: any 18."
+#[test]
+fn a_distributions_postgres_18_of_any_minor_or_a_beta_is_taken() {
+    let mirror = Mirror::start(Serving::Archive);
+    let probe = Local::new();
+    for (name, line) in [
+        (
+            "debian-18-1",
+            "postgres (PostgreSQL) 18.1 (Debian 18.1-1.pgdg120+1)",
+        ),
+        ("beta-18", "postgres (PostgreSQL) 18beta1"),
+    ] {
+        let bin = distribution(&probe, name, line);
+        let local = Local::new()
+            .with_bin(bin.to_str().unwrap())
+            .with_mirror(&mirror.base_url());
+        let project = local_project(&local.machine, &format!("pg-{name}"), &[]);
+        page_ok(&local, &project.dir);
+    }
+    assert!(
+        mirror.requests().is_empty(),
+        "expected the Builder's Postgres used, nothing downloaded"
+    );
 }
 
 /// Sets the modification time of `path` (a file or a folder) to `ago`
