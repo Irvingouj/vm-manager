@@ -2,7 +2,9 @@
 
 An open-source, self-hosted platform on which an enterprise's employees and their AI coding agents build, deploy and run internal applications against shared, IT-governed infrastructure. Think PocketBase for the enterprise, built for the AI coding era.
 
-**Status: building Milestone 1.** The program is scaffolding only so far.
+**Status: Milestone 1 is being built; the first release, `v0.1.0`, is a minimal one to try it.** It is not for untrusted Applications or real company data yet: its [release's notes](docs/releases/v0.1.0.md) say what works and what is missing.
+
+**To install it and make a first Application, start with [Getting started](docs/getting-started.md).** The install document for administrators is [`deploy/README.md`](deploy/README.md).
 
 ## Build and test
 
@@ -26,8 +28,11 @@ The gate is `scripts/gate.sh`: it checks that `blackbox` depends on no product c
 ```
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
+npm ci && npm test
 cargo test --workspace
 ```
+
+The install tests, which need Docker with Compose, are `scripts/install-gate.sh`. How a release is made is in [docs/releasing.md](docs/releasing.md).
 
 - `crates/vibe`: the platform program, one binary named `vibe` (ADR 0015).
 - `blackbox`: the black-box tests, which start the real `vibe` and depend on no product crate (see "How code gets written" in `AGENTS.md`).
