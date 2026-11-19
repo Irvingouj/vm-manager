@@ -38,7 +38,7 @@ sed -i "s|^POSTGRES_PASSWORD=.*|POSTGRES_PASSWORD=$(openssl rand -hex 24)|" .env
 - `VIBE_SECRET_KEY` is the installation's key (`openssl rand -base64 32`). It seals the OIDC connection and the sessions in the platform database. Keep `.env` as long as you keep the data: with another key, OIDC has to be connected again.
 - `POSTGRES_PASSWORD` is the password of the role `vibe` in the bundled Postgres (`openssl rand -hex 24`).
 - Without `VIBE_DOMAIN` or `VIBE_SECRET_KEY`, `docker compose` refuses to start and names the value.
-- Without `POSTGRES_PASSWORD`, or with it empty, the bundled Postgres does not start: `docker compose up -d` ends with an error (`dependency failed to start: container ... is unhealthy`), `vibe` is not started, `docker compose ps` shows `postgres` restarting, and `docker compose logs postgres` names `POSTGRES_PASSWORD`. Set it in `.env` and run `docker compose up -d` again.
+- Without `POSTGRES_PASSWORD`, or with it empty, the bundled Postgres does not start: `docker compose up -d` ends with an error (`dependency failed to start: container ... is unhealthy`), `vibe` is not started, `docker compose ps` shows `postgres` restarting, and `docker compose logs postgres` names `POSTGRES_PASSWORD`. If the value is removed later, from a Postgres already made, the Postgres starts but is never healthy and `vibe` is not started again: its health check says `POSTGRES_PASSWORD is empty in .env` (`docker inspect --format '{{json .State.Health.Log}}' $(docker compose ps --quiet postgres)`). Either way, set it in `.env` and run `docker compose up -d` again.
 
 As downloaded, the installation is published on `127.0.0.1` only: it is reached from this machine alone. To let other machines in, set:
 
