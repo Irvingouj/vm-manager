@@ -197,3 +197,65 @@ fn behind_another_proxy_that_ends_tls_the_installation_answers_and_its_redirects
         front.describe()
     );
 }
+
+#[test]
+#[ignore = "needs Docker and a built image: scripts/install-gate.sh"]
+fn compose_yaml_alone_in_a_folder_with_its_env_and_certificates_comes_up_and_answers() {
+    use blackbox::install::{Install, Reach, free_port, image};
+    let image = image();
+    let mut install = Install::alone(&[COMPOSE]);
+    let authority = blackbox::tls::Authority::new("Harness authority of the wildcard certificate");
+    install.certificates(&authority.issue(&[&format!("*.{DOMAIN}")]));
+    let port = free_port();
+    install.set("VIBE_DOMAIN", DOMAIN);
+    install.set_secret(
+        "VIBE_SECRET_KEY",
+        blackbox::connection::SecretKey::fresh().expose(),
+    );
+    install.set_secret("POSTGRES_PASSWORD", &blackbox::shared_database::token());
+    install.set("VIBE_HTTPS_PORT", &port.to_string());
+    install.set("VIBE_IMAGE", &image);
+    install.write_env();
+    // Nothing but compose.yaml, .env and certs/ with the two files.
+    let mut held: Vec<String> = Vec::new();
+    for entry in walk(install.dir()) {
+        held.push(
+            entry
+                .strip_prefix(install.dir())
+                .unwrap()
+                .display()
+                .to_string(),
+        );
+    }
+    held.sort();
+    assert_eq!(
+        held,
+        [
+            ".env",
+            "certs",
+            "certs/fullchain.pem",
+            "certs/privkey.pem",
+            "compose.yaml"
+        ],
+        "the harness's folder holds more than the contract's"
+    );
+    install.up();
+    let installation = Reach::at(port, &authority).wait_ready(&install);
+    assert_eq!(
+        installation,
+        json!({ "domain": DOMAIN, "sign_in": "none", "sign_in_address": null })
+    );
+}
+
+/// Every file and folder under `dir`.
+fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            found.extend(walk(&path));
+        }
+        found.push(path);
+    }
+    found
+}

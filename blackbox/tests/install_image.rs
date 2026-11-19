@@ -278,6 +278,18 @@ fn the_image_holds_no_compiler_no_package_manager_no_shell_and_no_source() {
         paths.iter().any(|p| p == LICENSES.trim_start_matches('/')),
         "expected {LICENSES} in the image"
     );
+    let base_copyrights = paths
+        .iter()
+        .filter(|p| {
+            p.starts_with("usr/share/doc/")
+                && p.ends_with("/copyright")
+                && p.matches('/').count() == 4
+        })
+        .count();
+    assert!(
+        base_copyrights >= 1,
+        "expected the base image's own usr/share/doc/*/copyright files left in the image"
+    );
     let file_name = |p: &str| p.rsplit('/').next().unwrap_or(p).to_owned();
     let forbidden: BTreeSet<&str> = [
         // Shells.
@@ -362,15 +374,61 @@ struct Notice {
     text: String,
 }
 
-/// The notices file read into its blocks, by `(name, version)`; fails on a
-/// header that is not `## <name> <version>` or a block whose next line is
-/// not `License: ...`.
-fn notices(text: &str) -> BTreeMap<(String, String), Notice> {
-    let mut found: BTreeMap<(String, String), Notice> = BTreeMap::new();
-    let mut current: Option<(String, String)> = None;
-    let mut expect_license = false;
+/// One entry of the notices' second part: code built into the program
+/// that is not a crate's own (CONTRACT.md: `## <name> <version> (built in
+/// through <crate>)`, `License: ...`, `Taken from: ...`, the texts).
+#[derive(Debug, Default)]
+struct BuiltIn {
+    name: String,
+    header: String,
+    license: Option<String>,
+    taken_from: Option<String>,
+    text: String,
+}
+
+/// The notices file read into its two parts. A header line is of the
+/// second part when it ends with `(built in through <crate>)`, as the
+/// contract's form has it; every other `## ` header is a crate's, `## <name>
+/// <version>`. Fails on a crate's header of another form, a block whose
+/// next line is not `License: ...`, or a built-in entry whose line after
+/// that is not `Taken from: ...`.
+fn notices(text: &str) -> (BTreeMap<(String, String), Notice>, Vec<BuiltIn>) {
+    enum Current {
+        None,
+        Crate((String, String)),
+        BuiltIn(usize),
+    }
+    let mut crates: BTreeMap<(String, String), Notice> = BTreeMap::new();
+    let mut built_in: Vec<BuiltIn> = Vec::new();
+    let mut current = Current::None;
+    // The lines still expected after a header: `License: `, then for a
+    // built-in entry `Taken from: `.
+    let mut expect: Vec<&str> = Vec::new();
     for line in text.lines() {
         if let Some(rest) = line.strip_prefix("## ") {
+            if let Some(at) = rest.find(" (built in through ") {
+                let words: Vec<&str> = rest
+                    .get(..at)
+                    .unwrap_or_default()
+                    .split_whitespace()
+                    .collect();
+                assert!(
+                    words.len() >= 2 && rest.trim_end().ends_with(')'),
+                    "expected `## <name> <version> (built in through <crate>)`, got {line:?}"
+                );
+                built_in.push(BuiltIn {
+                    name: words[..words.len() - 1].join(" "),
+                    header: line.to_owned(),
+                    ..BuiltIn::default()
+                });
+                current = Current::BuiltIn(built_in.len() - 1);
+                expect = vec!["License: ", "Taken from: "];
+                continue;
+            }
+            assert!(
+                built_in.is_empty(),
+                "expected every crate before the part of code built in through crates, got {line:?} after it"
+            );
             let parts: Vec<&str> = rest.split_whitespace().collect();
             assert_eq!(
                 parts.len(),
@@ -381,29 +439,55 @@ fn notices(text: &str) -> BTreeMap<(String, String), Notice> {
                 parts[0].to_owned(),
                 parts[1].trim_start_matches('v').to_owned(),
             );
-            assert!(!found.contains_key(&key), "{line:?} is in the file twice");
-            found.insert(key.clone(), Notice::default());
-            current = Some(key);
-            expect_license = true;
+            assert!(!crates.contains_key(&key), "{line:?} is in the file twice");
+            crates.insert(key.clone(), Notice::default());
+            current = Current::Crate(key);
+            expect = vec!["License: "];
             continue;
         }
-        let Some(key) = &current else { continue };
-        let notice = found.get_mut(key).unwrap();
-        if expect_license {
-            let license = line.strip_prefix("License: ").unwrap_or_else(|| {
-                panic!(
-                    "expected `License: <statement>` on the line after `## {} {}`, got {line:?}",
-                    key.0, key.1
-                )
-            });
-            notice.license = Some(license.trim().to_owned());
-            expect_license = false;
-        } else {
-            notice.text.push_str(line);
-            notice.text.push('\n');
+        match &current {
+            Current::None => {}
+            Current::Crate(key) => {
+                let notice = crates.get_mut(key).unwrap();
+                if let Some(prefix) = (!expect.is_empty()).then(|| expect.remove(0)) {
+                    let license = line.strip_prefix(prefix).unwrap_or_else(|| {
+                        panic!(
+                            "expected `License: <statement>` on the line after `## {} {}`, got {line:?}",
+                            key.0, key.1
+                        )
+                    });
+                    notice.license = Some(license.trim().to_owned());
+                } else {
+                    notice.text.push_str(line);
+                    notice.text.push('\n');
+                }
+            }
+            Current::BuiltIn(at) => {
+                let entry = &mut built_in[*at];
+                if let Some(prefix) = (!expect.is_empty()).then(|| expect.remove(0)) {
+                    let value = line
+                        .strip_prefix(prefix)
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "expected `{prefix}...` after {:?}, got {line:?}",
+                                entry.header
+                            )
+                        })
+                        .trim()
+                        .to_owned();
+                    if prefix == "License: " {
+                        entry.license = Some(value);
+                    } else {
+                        entry.taken_from = Some(value);
+                    }
+                } else {
+                    entry.text.push_str(line);
+                    entry.text.push('\n');
+                }
+            }
         }
     }
-    found
+    (crates, built_in)
 }
 
 #[test]
@@ -422,7 +506,7 @@ fn the_images_third_party_licenses_name_every_crate_built_into_the_program_with_
     );
     let text = std::fs::read_to_string(&copied)
         .unwrap_or_else(|e| panic!("expected {LICENSES} to be plain text: {e}"));
-    let listed = notices(&text);
+    let (listed, _) = notices(&text);
 
     let tree = cargo(&[
         "tree",
@@ -502,6 +586,60 @@ fn the_images_third_party_licenses_name_every_crate_built_into_the_program_with_
         assert!(
             notice.text.contains("Permission is hereby granted"),
             "expected the licence texts serde's source carries in its block ({key:?})"
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs Docker and a built image: scripts/install-gate.sh"]
+fn the_images_third_party_licenses_have_a_part_for_v8_libpg_query_and_postgresql_built_in() {
+    let image = image();
+    let created = Created::of(&image);
+    let folder = Folder::new();
+    let copied = folder.0.join("THIRD-PARTY-LICENSES");
+    let ran = created.copy_out(LICENSES, &copied);
+    assert!(
+        ran.ok(),
+        "expected {LICENSES} in the image\n{}",
+        ran.describe(&[])
+    );
+    let text = std::fs::read_to_string(&copied).unwrap();
+    let (_, built_in) = notices(&text);
+    let headers: Vec<&str> = built_in.iter().map(|b| b.header.as_str()).collect();
+    for (name, words) in [
+        ("V8", "Redistribution and use in source and binary forms"),
+        (
+            "libpg_query",
+            "Redistribution and use in source and binary forms",
+        ),
+        ("PostgreSQL", "PostgreSQL Global Development Group"),
+    ] {
+        let entry = built_in
+            .iter()
+            .find(|b| b.name.eq_ignore_ascii_case(name))
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected an entry for {name} in the part of code built in through crates (`## {name} <version> (built in through <crate>)`); its headers are {headers:?}"
+                )
+            });
+        assert!(
+            entry.license.as_deref().is_some_and(|l| !l.is_empty()),
+            "expected a licence for {:?}",
+            entry.header
+        );
+        assert!(
+            entry
+                .taken_from
+                .as_deref()
+                .is_some_and(|t| t.contains("https://")),
+            "expected `Taken from:` with an https:// address for {:?}, got {:?}",
+            entry.header,
+            entry.taken_from
+        );
+        assert!(
+            !entry.text.trim().is_empty() && entry.text.contains(words),
+            "expected the texts of {:?} to hold {words:?}",
+            entry.header
         );
     }
 }

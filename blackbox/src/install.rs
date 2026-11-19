@@ -345,10 +345,22 @@ impl Install {
     /// `certs/`, and no `.env` yet. Fails at once when Docker is not there
     /// or a file is not.
     pub fn new(files: &[&str]) -> Self {
+        Self::with_folders(files, &["ca", "certs"])
+    }
+
+    /// As [`Install::new`], with no `ca/` folder: `compose.yaml` alone, as
+    /// downloaded, beside the `.env` and `certs/` and nothing else.
+    pub fn alone(files: &[&str]) -> Self {
+        Self::with_folders(files, &["certs"])
+    }
+
+    fn with_folders(files: &[&str], folders: &[&str]) -> Self {
         docker_present();
         let id = token();
         let dir = std::env::temp_dir().join(format!("vm-blackbox-install-{id}"));
-        for sub in [dir.clone(), dir.join("ca"), dir.join("certs")] {
+        let mut made = vec![dir.clone()];
+        made.extend(folders.iter().map(|f| dir.join(f)));
+        for sub in made {
             fs::create_dir_all(&sub)
                 .unwrap_or_else(|e| panic!("cannot make {}: {e}", sub.display()));
             set_mode(&sub, 0o755);
@@ -818,6 +830,100 @@ impl Install {
             ));
         }
         ran.stdout.trim().to_owned()
+    }
+
+    /// Follows the log of the container `id` (`docker logs --follow`, from
+    /// its beginning) and kills the container (`docker kill`) from the
+    /// reading thread the moment a line holding `needle` is read, at most
+    /// `timeout` after the call. Returns the line, or why not.
+    pub fn kill_when_logged(
+        &self,
+        id: &str,
+        needle: &str,
+        timeout: Duration,
+    ) -> Result<String, String> {
+        use std::io::BufRead;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+        let mut following = Command::new("docker")
+            .args(["logs", "--follow", id])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("cannot follow the log: {e}"))?;
+        let killed = Arc::new(AtomicBool::new(false));
+        let found: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let readers: Vec<thread::JoinHandle<()>> = [
+            following
+                .stdout
+                .take()
+                .map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
+            following
+                .stderr
+                .take()
+                .map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
+        ]
+        .into_iter()
+        .flatten()
+        .map(|stream| {
+            let killed = Arc::clone(&killed);
+            let found = Arc::clone(&found);
+            let id = id.to_owned();
+            let needle = needle.to_owned();
+            thread::spawn(move || {
+                for line in std::io::BufReader::new(stream).lines() {
+                    let Ok(line) = line else { break };
+                    if line.contains(&needle) && !killed.swap(true, Ordering::SeqCst) {
+                        drop(
+                            Command::new("docker")
+                                .args(["kill", &id])
+                                .stdout(std::process::Stdio::null())
+                                .stderr(std::process::Stdio::null())
+                                .status(),
+                        );
+                        if let Ok(mut kept) = found.lock() {
+                            *kept = Some(line);
+                        }
+                    }
+                }
+            })
+        })
+        .collect();
+        let deadline = Instant::now() + timeout;
+        while !killed.load(Ordering::SeqCst) && Instant::now() < deadline {
+            if following.try_wait().ok().flatten().is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        // Give the reading thread the time of its `docker kill`.
+        let settle = Instant::now() + DOCKER_WAIT;
+        while killed.load(Ordering::SeqCst)
+            && found.lock().map(|f| f.is_none()).unwrap_or(false)
+            && Instant::now() < settle
+        {
+            thread::sleep(Duration::from_millis(5));
+        }
+        drop(following.kill());
+        drop(following.wait());
+        for reader in readers {
+            drop(reader.join());
+        }
+        let line = found.lock().ok().and_then(|f| f.clone());
+        line.ok_or_else(|| {
+            format!("no line holding {needle:?} in the log of {id} within {timeout:?}")
+        })
+    }
+
+    /// The health of the container `id` as Docker says it (`healthy`,
+    /// `starting`, `unhealthy`), or `none` when it has no health check.
+    pub fn health(&self, id: &str) -> String {
+        let inspected = self.inspect(id);
+        inspected["State"]["Health"]["Status"]
+            .as_str()
+            .unwrap_or("none")
+            .to_owned()
     }
 
     /// A second tag of `image`, of the test's own (removed when the test

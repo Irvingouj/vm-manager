@@ -39,6 +39,8 @@ use blackbox::sessions::{ADA, ada};
 use blackbox::tls::{Authority, tls_get};
 use blackbox::tool::{Machine, windows_in};
 use serde_json::{Value, json};
+use std::thread;
+use std::time::{Duration, Instant};
 
 /// The template's Application, as the person names it.
 const APPLICATION: &str = "greeter";
@@ -471,6 +473,34 @@ fn installed_as_downloaded_a_person_signs_in_deploys_and_is_let_in_again_after_r
         browser.jar.all(),
         browser.jar.rejected()
     );
+
+    // `vibe logs --follow` through the proxy receives an entry made after
+    // it started.
+    let mut following = machine.spawn_into_files(
+        &machine.cwd(),
+        &["logs", APPLICATION, "--follow", "--json"],
+        &[("VIBE_CA_FILE", at.tool_ca_file())],
+    );
+    thread::sleep(Duration::from_secs(3));
+    let made = at.reach.open_application(&mut browser, APPLICATION);
+    let request = made.last().unwrap().response.request_id();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let out = following.stdout_so_far();
+        if out.lines().any(|l| l.contains(&request)) {
+            break;
+        }
+        if following.has_ended() || Instant::now() >= deadline {
+            let stderr = following.stderr_so_far();
+            at.install.fail(&format!(
+                "expected `vibe logs {APPLICATION} --follow` through the proxy to print the entry of the request {request} made after it started; it printed\n{out}\nstandard error:\n{}",
+                blackbox::connection::masked(&stderr, &[])
+            ));
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    following.signal("INT");
+    following.wait(Duration::from_secs(10)).expect_code(0);
 
     // The Application's own database and its roles.
     let database = at.install.psql(
