@@ -292,15 +292,20 @@ fn without_option(args: &[String], option: &str) -> Vec<String> {
 }
 
 #[test]
-fn with_the_setup_credential_domain_and_a_loopback_connect_are_required() {
+fn with_the_setup_credential_domain_is_required_and_connect_is_loopback_and_alone() {
     let at = unconnected();
     let setup = setup_credential(at.vm.platform());
     let connection = Connection::to(&at.provider);
     let machine = Machine::new();
     let full = connect_args(at.vm.address(), &connection, true);
     let address = at.vm.address().to_string();
+    let with = |more: &[&str]| -> Vec<String> {
+        let mut args = full.clone();
+        args.extend(more.iter().map(|a| (*a).to_owned()));
+        args
+    };
+    let port = at.vm.address().port().to_string();
     let cases: Vec<(&str, Vec<String>)> = vec![
-        ("no --connect", without_option(&full, "--connect")),
         ("no --domain", without_option(&full, "--domain")),
         (
             "--connect to an address that is not loopback",
@@ -314,34 +319,68 @@ fn with_the_setup_credential_domain_and_a_loopback_connect_are_required() {
                 })
                 .collect(),
         ),
+        ("--connect with --port", with(&["--port", &port])),
+        (
+            "--connect with --resolve",
+            with(&["--resolve", "127.0.0.1"]),
+        ),
+    ];
+    let env = [
+        ("VIBE_SETUP_CREDENTIAL", setup.expose()),
+        ("VIBE_OIDC_CLIENT_SECRET", connection.secret().expose()),
     ];
     for (case, args) in cases {
         let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        let run = machine.run_with_env(
-            &refs,
-            &[
-                ("VIBE_SETUP_CREDENTIAL", setup.expose()),
-                ("VIBE_OIDC_CLIENT_SECRET", connection.secret().expose()),
-            ],
-        );
+        let run = machine.run_with_env(&refs, &env);
         let run = hide(&run, &[setup.expose(), connection.secret().expose()]);
         assert_eq!(run.code, Some(2), "{case}\n{}", run.describe());
     }
+    // Without --connect it is no wrong command line: the installation is
+    // reached over HTTPS (here at a port nothing listens on: unreachable).
+    let nowhere = blackbox::tool::closed_address().port().to_string();
+    let mut https = without_option(&full, "--connect");
+    https.extend(["--resolve".to_owned(), "127.0.0.1".to_owned()]);
+    https.extend(["--port".to_owned(), nowhere]);
+    let refs: Vec<&str> = https.iter().map(String::as_str).collect();
+    let run = hide(
+        &machine.run_with_env(&refs, &env),
+        &[setup.expose(), connection.secret().expose()],
+    );
+    run.json_error(1, "unreachable");
+    // The setup credential is still good: nothing reached the installation.
+    assert_eq!(
+        installation_of(&at.vm).json()["sign_in"],
+        "none",
+        "expected nothing connected"
+    );
 }
 
 #[test]
-fn with_the_tool_s_own_credential_domain_and_connect_are_exit_code_2() {
+fn with_the_tool_s_own_credential_domain_port_resolve_and_connect_are_each_exit_code_2() {
     let at = connected();
     let machine = Machine::new();
     at.sign_in_tool(&machine, IT_ADMIN);
     let connection = Connection::to(&at.provider);
-    let args = connect_args(at.vm.address(), &connection, true);
-    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let run = machine.run_with_env(
-        &refs,
-        &[("VIBE_OIDC_CLIENT_SECRET", connection.secret().expose())],
-    );
-    hide(&run, &[connection.secret().expose()]).expect_code(2);
+    let port = at.vm.address().port().to_string();
+    let address = at.vm.address().to_string();
+    for (option, value) in [
+        ("--domain", DOMAIN),
+        ("--port", port.as_str()),
+        ("--resolve", "127.0.0.1"),
+        ("--connect", address.as_str()),
+    ] {
+        let mut args = vec!["admin".to_owned(), "connect-oidc".to_owned()];
+        args.extend([option.to_owned(), value.to_owned()]);
+        args.extend(connection.tool_args());
+        args.push("--json".to_owned());
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let run = machine.run_with_env(
+            &refs,
+            &[("VIBE_OIDC_CLIENT_SECRET", connection.secret().expose())],
+        );
+        let run = hide(&run, &[connection.secret().expose()]);
+        assert_eq!(run.code, Some(2), "{option}\n{}", run.describe());
+    }
 }
 
 /// `vibe admin connect-oidc` with the tool's own credential: no `--domain`,

@@ -142,15 +142,51 @@ fn a_wrong_command_line_ends_with_2_and_keeps_nothing() {
         vec![
             "sign-in".into(),
             "--connect".into(),
-            address,
+            address.clone(),
             "--stand-in-user".into(),
             "alice".into(),
         ],
-        // No address.
+        // (No address is no longer a wrong command line either: without
+        // `--connect` the tool reaches `api.<domain>` over HTTPS. See
+        // `tool_https.rs`.) The two ways mixed, and what is no port or no
+        // address for HTTPS:
         vec![
             "sign-in".into(),
             "--domain".into(),
             DOMAIN.into(),
+            "--connect".into(),
+            address.clone(),
+            "--port".into(),
+            port.to_string(),
+            "--stand-in-user".into(),
+            "alice".into(),
+        ],
+        vec![
+            "sign-in".into(),
+            "--domain".into(),
+            DOMAIN.into(),
+            "--connect".into(),
+            address,
+            "--resolve".into(),
+            "127.0.0.1".into(),
+            "--stand-in-user".into(),
+            "alice".into(),
+        ],
+        vec![
+            "sign-in".into(),
+            "--domain".into(),
+            DOMAIN.into(),
+            "--port".into(),
+            "0".into(),
+            "--stand-in-user".into(),
+            "alice".into(),
+        ],
+        vec![
+            "sign-in".into(),
+            "--domain".into(),
+            DOMAIN.into(),
+            "--resolve".into(),
+            "not-an-ip".into(),
             "--stand-in-user".into(),
             "alice".into(),
         ],

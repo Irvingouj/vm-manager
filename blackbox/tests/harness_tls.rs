@@ -13,8 +13,11 @@
 )]
 
 use blackbox::DOMAIN;
+use blackbox::browser::{Browser, url};
+use blackbox::oidc::{CLIENT_ID, Person};
 use blackbox::tls::{
-    Authority, Front, Handshake, PROVIDER_HOST, api_name, provider_behind_tls, tls_get,
+    Authority, Front, Handshake, PROVIDER_HOST, api_name, provider_behind_tls, tls_exchange,
+    tls_get,
 };
 use blackbox::tool::NotAnInstallation;
 
@@ -158,7 +161,8 @@ fn the_identity_provider_behind_its_front_answers_its_configuration_over_https()
     assert_eq!(configuration["jwks_uri"], format!("{issuer}/jwks"));
     assert_eq!(
         configuration["authorization_endpoint"],
-        format!("http://127.0.0.1:{}/authorize", provider.address().port())
+        format!("{issuer}/authorize"),
+        "every endpoint is under the https issuer"
     );
     let b = Authority::new("Harness authority B");
     assert!(
@@ -171,4 +175,73 @@ fn the_identity_provider_behind_its_front_answers_its_configuration_over_https()
         )
         .is_err()
     );
+}
+
+#[test]
+fn requests_are_read_per_connection_when_a_body_ends_without_a_line_end() {
+    let server = NotAnInstallation::start();
+    let a = Authority::new("Harness authority A");
+    let front = Front::tls(&a.issue(&[&api_name()]), server.address());
+    let host = format!("{}:{}", api_name(), front.port());
+    // A first connection whose request ends in a body with no CRLF after
+    // it, then a second connection: read as one stream, the body would run
+    // into the second request line.
+    let first = format!(
+        "PUT /v1/oidc HTTP/1.1\r\nHost: {host}\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+    );
+    tls_exchange(
+        front.address(),
+        &api_name(),
+        &[a.der()],
+        first.as_bytes(),
+        std::time::Duration::from_secs(10),
+    )
+    .unwrap();
+    tls_get(front.address(), &api_name(), &[&a], "/v1/me", &host).unwrap();
+    front.settled();
+    assert_eq!(
+        front.request_lines(),
+        vec!["PUT /v1/oidc HTTP/1.1", "GET /v1/me HTTP/1.1"],
+        "{}",
+        front.describe()
+    );
+    assert_eq!(front.hosts(), vec![host.clone(), host]);
+}
+
+#[test]
+fn the_browser_reaches_the_authorization_endpoint_of_the_provider_behind_tls() {
+    let a = Authority::new("Harness authority A");
+    let (provider, front) = provider_behind_tls(&[Person::new("00u-harness")], &a);
+    let mut browser = Browser::new(NotAnInstallation::start().address());
+    browser.trust(a.der());
+    browser.sign_in_at_provider(&provider, "00u-harness");
+    let mut at = url(&format!("{}/authorize", provider.issuer()));
+    at.query_pairs_mut()
+        .append_pair("response_type", "code")
+        .append_pair("client_id", CLIENT_ID)
+        .append_pair("redirect_uri", "http://auth.vm.test:1/callback")
+        .append_pair("scope", "openid")
+        .append_pair("state", "harness-state")
+        .append_pair("nonce", "harness-nonce");
+    let step = browser.open(&at);
+    assert!(
+        step.is_redirect()
+            && step
+                .location()
+                .as_str()
+                .starts_with("http://auth.vm.test:1/callback"),
+        "expected the provider to send the browser back with a code, got\n{}",
+        step.response.describe()
+    );
+    assert!(
+        front
+            .settled()
+            .iter()
+            .any(|s| s.handshake == Handshake::Completed),
+        "expected the browser to go through the provider's TLS front\n{}",
+        front.describe()
+    );
+    // Without the authority the browser cannot reach it.
+    let mut stranger = Browser::new(NotAnInstallation::start().address());
+    assert!(stranger.try_open(&at).is_err());
 }

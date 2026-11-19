@@ -23,6 +23,9 @@
 )]
 
 use std::path::{Path, PathBuf};
+
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -57,6 +60,12 @@ enum Bad {
     KeyOnly,
     /// Certificates, more than 1 MiB of them.
     TooLarge,
+    /// The good authority, then a `CERTIFICATE` section whose base64 is
+    /// good and whose content is no certificate.
+    NotACertificate,
+    /// The good authority, then a `CERTIFICATE` section whose base64 is
+    /// broken.
+    BrokenBase64,
 }
 
 /// A bad file of this kind in `files`; `authority` is what a file too
@@ -75,6 +84,29 @@ fn bad_file(files: &Files, bad: Bad, authority: &Authority) -> PathBuf {
         ),
         Bad::KeyOnly => files.write("key-only.pem", private_key_pem().as_bytes()),
         Bad::TooLarge => files.write("too-large.pem", repeated(authority, MIB + 1).as_bytes()),
+        Bad::NotACertificate => {
+            let content = STANDARD.encode(
+                "This is no certificate, though it is in a CERTIFICATE section. ".repeat(8),
+            );
+            let lines: Vec<String> = content
+                .as_bytes()
+                .chunks(64)
+                .map(|c| String::from_utf8_lossy(c).into_owned())
+                .collect();
+            let text = format!(
+                "{}-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n",
+                authority.pem(),
+                lines.join("\n")
+            );
+            files.write("not-a-certificate.pem", text.as_bytes())
+        }
+        Bad::BrokenBase64 => {
+            let text = format!(
+                "{}-----BEGIN CERTIFICATE-----\nMIIB!!this*is*not*base64~~\n-----END CERTIFICATE-----\n",
+                authority.pem()
+            );
+            files.write("broken-base64.pem", text.as_bytes())
+        }
     }
 }
 
@@ -154,6 +186,42 @@ fn a_ca_file_holding_only_a_private_key_ends_the_tool_with_ca_file() {
 #[test]
 fn a_ca_file_larger_than_1_mib_ends_the_tool_with_ca_file() {
     assert_tool_refuses(Bad::TooLarge);
+}
+
+#[test]
+fn a_certificate_section_that_is_no_certificate_fails_the_whole_file_for_the_tool() {
+    assert_tool_refuses(Bad::NotACertificate);
+}
+
+#[test]
+fn a_certificate_section_with_broken_base64_fails_the_whole_file_for_the_tool() {
+    assert_tool_refuses(Bad::BrokenBase64);
+}
+
+#[test]
+fn a_private_key_beside_the_authority_is_passed_over_and_the_tool_reaches_the_installation() {
+    let vm = Vm::with_stand_in(&[]);
+    let behind = Behind::before(vm.address());
+    let files = Files::new();
+    let text = format!("{}{}", private_key_pem(), behind.authority.pem());
+    let path = text_of(&files.write("key-and-authority.pem", text.as_bytes()));
+    let machine = Machine::new();
+    sign_in(&machine, behind.port(), &path).ok_json();
+    assert!(behind.front.completed() >= 1, "{}", behind.front.describe());
+}
+
+#[test]
+fn the_machines_own_bundle_is_taken_as_vibe_ca_file() {
+    let bundle = Path::new("/etc/ssl/certs/ca-certificates.crt");
+    if !bundle.is_file() {
+        return;
+    }
+    let nowhere = blackbox::tool::closed_address();
+    let machine = Machine::new();
+    let run = sign_in(&machine, nowhere.port(), &text_of(bundle));
+    // Not `ca-file`: the file is taken, and the tool goes on to find that
+    // nothing listens.
+    run.json_error(1, "unreachable");
 }
 
 #[test]
@@ -302,6 +370,16 @@ fn vibe_serve_with_a_ca_file_larger_than_1_mib_does_not_start() {
 }
 
 #[test]
+fn vibe_serve_with_a_certificate_section_that_is_no_certificate_does_not_start() {
+    assert_serve_refuses(Bad::NotACertificate);
+}
+
+#[test]
+fn vibe_serve_with_a_certificate_section_with_broken_base64_does_not_start() {
+    assert_serve_refuses(Bad::BrokenBase64);
+}
+
+#[test]
 fn vibe_setup_with_a_ca_file_that_is_not_there_fails() {
     assert_setup_refuses(Bad::Missing);
 }
@@ -343,6 +421,8 @@ fn with_the_authority_in_vibe_ca_file_oidc_connects_and_a_person_signs_in() {
     let connected = at.connect_through_the_api(&Connection::to(&at.provider));
     connected.expect_status(200);
     let mut browser = at.browser_as(ADA);
+    // The browser reaches the provider's authorization endpoint over TLS.
+    browser.trust(a.der());
     at.sign_in(&mut browser, "board", "/");
     assert_eq!(at.user_seen(&mut browser, "board")["id"], ADA);
     let seen = front.settled();
@@ -358,7 +438,12 @@ fn with_the_authority_in_vibe_ca_file_oidc_connects_and_a_person_signs_in() {
         front.describe()
     );
     let lines = front.request_lines();
-    for path in ["/.well-known/openid-configuration", "/token", "/jwks"] {
+    for path in [
+        "/.well-known/openid-configuration",
+        "/authorize",
+        "/token",
+        "/jwks",
+    ] {
         assert!(
             lines.iter().any(|l| l.contains(&format!(" {path}"))),
             "expected {path} to be asked over TLS, got {lines:?}"
