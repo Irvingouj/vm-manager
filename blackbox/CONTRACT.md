@@ -10,7 +10,7 @@ The harness runs `cargo build -p vibe --bin vibe` once and starts `target/debug/
 
 ## How the tests get a Postgres
 
-The harness runs a private Postgres of its own, never through the program under test: from the binaries in the directory `VIBE_TEST_PG_BIN` names (`postgres`, `initdb`, `pg_ctl`), else from a Postgres found on the machine, else from prebuilt binaries it downloads once to a cache (`docs/research/local-postgres-without-docker.md`). No Docker, no administrator rights. It is a Postgres 18, the one version the platform supports ("One Postgres version"): nothing chooses another, and a Postgres found on the machine or named by `VIBE_TEST_PG_BIN` that is not 18 is not used (the harness says so and stops). For the tests that need a server of another version, the harness downloads a Postgres 17 beside it. It hands the program a superuser's connection address. Each test's program gets a platform database of its own name on that instance.
+The harness runs a private Postgres of its own, never through the program under test: from the binaries in the directory `VIBE_TEST_PG_BIN` names (`postgres`, `initdb`, `pg_ctl`), else from a Postgres found on the machine, else from prebuilt binaries it downloads once to a cache (`docs/research/local-postgres-without-docker.md`). No Docker, no administrator rights. It is a Postgres 18, the one version the platform supports ("One Postgres version"): nothing chooses another. A `VIBE_TEST_PG_BIN` that names a Postgres that is not 18 stops the harness with words that say so; a Postgres found on the machine that is not 18 is passed over, and the 18 is downloaded. For the tests that need a server of another version, the harness downloads a Postgres 17 beside it. It hands the program a superuser's connection address. Each test's program gets a platform database of its own name on that instance.
 
 ## Serving (ticket: Walking skeleton)
 
@@ -788,7 +788,7 @@ Code a migration leaves in the database can run later with the migration role's 
 
 - everything the statement or the transaction did is rolled back, what it did to the structure and the capture included;
 - the answer is `{ error: { kind: "database", code: "VM004", message } }`, from `execute` or from `tx.commit` (through the SDK: `OperationFailed` of kind `database` with that code); the message says that an Application's structure changes in migrations only;
-- the Operation log entry (of the `execute`, or of the `commit`) is `failed` with `error` `VM004` (or `42501` in that case); the transaction is over, as after any commit.
+- the Operation log entry (of the `execute`, or of the `commit`) is `failed` with `error` `VM004`; the transaction is over, as after any commit.
 
 At the least these are such a change, whoever's rights the statement that made them ran with, whoever comes to own what it made, and however it came to run:
 
@@ -2149,6 +2149,6 @@ Nothing is kept for the old name (nothing was installed anywhere):
 
 The platform supports **Postgres 18** and no other major version: the installation's Postgres, the local run's private Postgres, and the harness's.
 
-- **An installation.** `vibe serve` and `vibe setup` look at the server's version when they first connect, before anything is written to it. A server whose major version is not 18 is a start-up failure as "Serving" says (exit code not `0`, within 15 seconds, a message on standard error): the message says the version the server has (as the server gives it, for instance `17.6`) and that Postgres 18 is needed. Nothing was written: no platform database was made, and in a platform database that was there no table, row, role or database was made or changed. The program's log line of it is `{"event":"postgres-version-unsupported","found":"<version>","needed":"18"}`.
+- **An installation.** `vibe serve` and `vibe setup` look at the server's version when they first connect, before anything is written to it. A server whose major version is not 18 is a start-up failure as "Serving" says (exit code not `0`, within 15 seconds, a message on standard error): the message says the version the server has (as the server gives it, for instance `17.6`) and that Postgres 18 is needed. Nothing was written: no platform database was made, and in a platform database that was there no table, row, role or database was made or changed. The message is for a person and is on standard error; beside it `vibe serve` writes the log line `{"event":"postgres-version-unsupported","found":"<version>","needed":"18"}` (`vibe setup` writes no log: the message is all it says, and it prints no credential).
 - **The local run.** The private Postgres is the 18 the tool downloads. A `VIBE_LOCAL_POSTGRES_BIN` that names a Postgres of another major version ends `postgres-unavailable` as before, and the message says the version found, that 18 is needed, and what to do: unset `VIBE_LOCAL_POSTGRES_BIN` and the tool downloads one.
 - A minor version is never looked at: any 18.
