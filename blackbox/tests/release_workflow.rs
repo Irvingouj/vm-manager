@@ -29,8 +29,9 @@ use yaml_rust2::{Yaml, YamlLoader};
 const WORKFLOW: &str = ".github/workflows/release.yml";
 
 /// The scripts the workflow calls.
-const SCRIPTS: [&str; 5] = [
+const SCRIPTS: [&str; 6] = [
     "scripts/release-check.sh",
+    "scripts/try-tool.sh",
     "scripts/gate.sh",
     "scripts/install-gate.sh",
     "scripts/package-tool.sh",
@@ -383,6 +384,34 @@ fn the_workflow_builds_the_tool_on_linux_and_on_macos() {
         assert!(
             runners.iter().any(|r| r.contains(system)),
             "expected a job of the workflow on a hosted {system} runner, the runners named are {runners:?}"
+        );
+    }
+}
+
+#[test]
+fn the_jobs_that_pack_the_tool_check_a_download_with_the_pages_command_of_each_system() {
+    let workflow = workflow();
+    let packing: Vec<(&String, String)> = jobs(&workflow)
+        .iter()
+        .map(|(id, job)| (id, runs_of(job)))
+        .filter(|(_, runs)| runs.contains("scripts/package-tool.sh"))
+        .collect();
+    assert!(
+        !packing.is_empty(),
+        "expected a job that packs the tool with scripts/package-tool.sh"
+    );
+    for (command, system) in [("sha256sum", "Linux"), ("shasum -a 256", "macOS")] {
+        let found = packing.iter().any(|(_, runs)| {
+            runs.lines().any(|line| {
+                line.contains(command)
+                    && line.contains("--check")
+                    && line.contains("--ignore-missing")
+            })
+        });
+        assert!(
+            found,
+            "expected a step of the job(s) that pack the tool ({:?}) to run the page's check for {system}, `{command} --check --ignore-missing SHA256SUMS`",
+            packing.iter().map(|(id, _)| id).collect::<Vec<_>>()
         );
     }
 }

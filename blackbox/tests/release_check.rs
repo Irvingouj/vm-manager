@@ -8,7 +8,8 @@
 //! it), and `LICENSE` exists.
 //!
 //! The cases with a tag, a `LICENSE` or a file changed are made in a
-//! throwaway clone of the repository (its `main` as committed), never in
+//! throwaway clone of the repository (the commit checked out, given a
+//! `main` and an `origin/main` there), never in
 //! the repository itself, and nothing is pushed anywhere.
 #![allow(
     clippy::unwrap_used,

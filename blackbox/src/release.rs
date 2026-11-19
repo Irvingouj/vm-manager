@@ -317,11 +317,18 @@ pub fn stand_in_program(dir: &Path, name: &str, first_line: &str) -> PathBuf {
     path
 }
 
-/// A throwaway clone of the repository (`git clone` of the working
-/// repository, so it has an `origin/main`), in a folder of the test's own,
-/// removed when dropped. Commits and tags are made in it only; nothing is
-/// pushed. It holds what the repository's `main` holds as committed: no
-/// change of the real working tree is in it.
+/// A throwaway copy of the repository's history at the commit that is
+/// checked out (its `HEAD`), in a folder of the test's own, removed when
+/// dropped (CONTRACT.md, "The first release": the gate's release tests hold
+/// for the commit checked out, whether or not a branch `main` names it; the
+/// workflow runs the gate on a tag's commit, a detached `HEAD` with no
+/// local branch). The copy is made as a checkout on a runner is: `git
+/// init`, a remote `origin` naming the repository, `git fetch` of `HEAD`
+/// alone and no tag (a tag of the repository, `v<version>` in a tag's run,
+/// is not carried over); then a branch `main` and `origin/main` are made in
+/// the copy at that commit. Commits and tags are made in it only; nothing
+/// is pushed. No change of the real working tree is in it, and no git
+/// configuration of the user's or the system's is read.
 pub struct Clone {
     folder: Folder,
     root: PathBuf,
@@ -331,18 +338,18 @@ impl Clone {
     pub fn of_repository() -> Self {
         let folder = Folder::new("clone");
         let root = folder.path().join("repository");
-        let mut command = Command::new("git");
-        command
-            .args(["clone", "--quiet", "--branch", "main"])
-            .arg(repository_root())
-            .arg(&root);
-        isolate_git(&mut command);
-        run(command, COMMAND_TIMEOUT).expect_ok();
+        fs::create_dir_all(&root).unwrap_or_else(|e| panic!("cannot make {}: {e}", root.display()));
         let clone = Self { folder, root };
+        clone.git(&["init", "--quiet"]);
         clone.git(&["config", "user.name", "Release test"]);
         clone.git(&["config", "user.email", "release-test@example.invalid"]);
         clone.git(&["config", "commit.gpgsign", "false"]);
         clone.git(&["config", "tag.gpgsign", "false"]);
+        let source = repository_root();
+        clone.git(&["remote", "add", "origin", source.to_str().unwrap()]);
+        clone.git(&["fetch", "--quiet", "--no-tags", "origin", "HEAD"]);
+        clone.git(&["checkout", "--quiet", "-B", "main", "FETCH_HEAD"]);
+        clone.origin_main_at_head();
         clone
     }
 
