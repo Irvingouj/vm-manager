@@ -2359,7 +2359,7 @@ Each of these is a start-up failure as "Serving" says (exit code not `0`, within
 
 - a file that cannot be read, is empty, is larger than 1 MiB, or holds no certificate (no key);
 - a certificate file with more than ten certificates, or whose first certificate cannot be parsed;
-- a key file that holds more than one key, a key that is encrypted (a passphrase is not supported; the message says so), or a key of a kind not named above;
+- a key file that holds more than one key, a key that is encrypted (a passphrase is not supported; the message says so), a key of a kind not named above (the message names the kinds that are taken), or a key that is damaged: its PEM section is whole but what it holds cannot be read as a key of its label (the message says the key cannot be read, and does not call it a kind that is not supported when its label is one of the three);
 - **a key that is not the key of the first certificate** (the message says the two do not belong together and names both files);
 - **a first certificate that does not cover `*.<domain>`**: among its DNS names (subject alternative names; the common name is not looked at) there is none that is exactly `*.<domain>` for the `--domain` given. The message names `*.<domain>` and lists the names the certificate does have (at most ten of them).
 
