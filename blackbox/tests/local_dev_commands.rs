@@ -24,8 +24,7 @@ use std::time::{Duration, Instant};
 use blackbox::dev::{Dev, hex64_runs, local_files_but_postgres, local_files_holding};
 use blackbox::generate::{Generated, generate};
 use blackbox::local::{
-    APP, BUILDER, Board, Local, OUTSIDER, Requested, handler, local_project, port_open,
-    postmaster_of,
+    APP, BUILDER, Board, Local, OUTSIDER, Requested, handler, local_project, postmaster_of,
 };
 use blackbox::project::{NOTES_SCHEMA_TS, is_running};
 use blackbox::tool::mode_of;
@@ -337,7 +336,7 @@ fn a_file_left_by_a_vm_dev_killed_outright_is_not_believed() {
         "expected no connection to the port a killed `vibe dev` left in its file"
     );
     drop(impostor);
-    assert!(!port_open(port));
+    blackbox::dev::assert_run_not_listening(&board.local, port, "after the command");
     let left = board.local.processes_after(Duration::from_secs(5));
     assert!(
         left.is_empty(),

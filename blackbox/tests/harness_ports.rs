@@ -22,9 +22,13 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::rc::Rc;
 use std::time::Duration;
 
-use blackbox::dev::{Dev, PORT_TRIES, free_port, run_dev_choosing, spawn_piped_listening_choosing};
+use blackbox::dev::{
+    Dev, PORT_TRIES, assert_run_not_listening, free_port, run_dev_choosing, run_listening_on,
+    spawn_piped_listening_choosing,
+};
 use blackbox::install::docker_refused_port;
 use blackbox::local::{Local, OUTSIDER, local_project};
+use blackbox::ports::{LOWEST, NAMED, system_range};
 use blackbox::vm::{Vm, VmOptions, refused_address};
 
 /// A port of 127.0.0.1 held by a listener of the check's own.
@@ -74,7 +78,16 @@ fn a_vibe_dev_start_on_a_port_taken_since_it_was_chosen_goes_on_another_port() {
         let mut browser = dev.browser();
         browser.choose(OUTSIDER);
         assert_eq!(browser.get("/").status, 200, "json {json}");
+        // What listens on its port is the run's; on the port held, not.
+        assert!(
+            !run_listening_on(&local, dev.port).is_empty(),
+            "json {json}: expected the run found listening on {}",
+            dev.port
+        );
+        assert!(run_listening_on(&local, taken).is_empty(), "json {json}");
+        let port = dev.port;
         dev.stop("INT").expect_code(0);
+        assert_run_not_listening(&local, port, "after the stop");
         drop(listener);
     }
 }
@@ -246,4 +259,49 @@ fn what_counts_as_a_refused_port_is_the_programs_own_words_for_that_port() {
         "Error response from daemon: pull access denied for nothing\n",
         53065
     ));
+}
+
+#[test]
+fn ports_chosen_for_later_are_outside_the_systems_range_distinct_and_none_named() {
+    let range = system_range();
+    if let Ok(text) = fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range") {
+        let read: Vec<u16> = text
+            .split_whitespace()
+            .map(|n| n.parse().unwrap())
+            .collect();
+        assert_eq!(
+            (*range.start(), *range.end()),
+            (read[0], read[1]),
+            "the harness's range is the system's"
+        );
+    }
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..300 {
+        let port = free_port();
+        assert!(port >= LOWEST, "{port} is privileged");
+        assert!(
+            !range.contains(&port),
+            "{port} is inside the system's own range {range:?}"
+        );
+        assert!(!NAMED.contains(&port), "{port} is named on purpose");
+        assert!(seen.insert(port), "{port} was handed out twice");
+    }
+    // The other choosers draw from the same ports, never one handed out.
+    let other = blackbox::postgres::free_port().unwrap();
+    assert!(!seen.contains(&other) && !range.contains(&other));
+    let docker = blackbox::install::free_port();
+    assert!(!seen.contains(&docker) && docker != other && !range.contains(&docker));
+}
+
+#[test]
+fn something_else_on_a_port_is_not_taken_for_the_run_listening() {
+    let local = Local::new();
+    let (listener, port) = held();
+    assert!(
+        blackbox::local::port_open(port),
+        "the control: something answers on {port}"
+    );
+    assert!(run_listening_on(&local, port).is_empty());
+    assert_run_not_listening(&local, port, "a listener of the check's own");
+    drop(listener);
 }

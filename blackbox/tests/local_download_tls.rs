@@ -20,10 +20,10 @@
 
 use std::path::PathBuf;
 
-use blackbox::dev::run_dev_on_a_free_port;
+use blackbox::dev::{assert_run_not_listening, run_dev_on_a_free_port};
 use blackbox::local::{
     Local, Mirror, OUTSIDER, Redirector, Requested, Serving, archive_path, holds_postgres_programs,
-    local_project, port_open,
+    local_project,
 };
 use blackbox::tls::{Authority, Files, Front, Handshake, Identity, private_key_pem, text_of};
 use blackbox::tool::Run;
@@ -283,7 +283,7 @@ fn vibe_dev_with_an_https_mirror_and_an_unusable_file_is_ca_file_and_listens_now
     let (port, run) =
         run_dev_on_a_free_port(&local, &project.dir, true, &[("VIBE_CA_FILE", &path)]);
     assert_ca_file(&run, &path);
-    assert!(!port_open(port), "expected nothing listening on {port}");
+    assert_run_not_listening(&local, port, "vibe dev with an unusable VIBE_CA_FILE");
     assert_eq!(https.front.accepted(), 0, "{}", https.front.describe());
     https.assert_nothing_asked("vibe dev");
 }

@@ -982,12 +982,10 @@ fn write_private_file(path: &Path, content: &str) -> Result<(), String> {
         .map_err(|e| format!("cannot write {}: {e}", path.display()))
 }
 
-/// A 127.0.0.1 port nothing listens on at this moment.
+/// A 127.0.0.1 port nothing listens on at this moment, chosen for later
+/// from outside the system's own range ([`crate::ports::chosen`]).
 pub fn free_port() -> Result<u16, String> {
-    TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .and_then(|l| l.local_addr())
-        .map(|a| a.port())
-        .map_err(|e| format!("cannot find a free port: {e}"))
+    crate::ports::chosen()
 }
 
 /// The instance all tests of this test binary share. It is never dropped;

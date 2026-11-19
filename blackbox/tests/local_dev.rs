@@ -20,8 +20,8 @@ use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::time::{Duration, Instant};
 
 use blackbox::dev::{
-    Dev, assert_nothing_left, dev_args, has_ipv6_loopback, listeners, run_dev_on_a_free_port,
-    spawn_piped_listening,
+    Dev, assert_nothing_left, assert_run_not_listening, dev_args, has_ipv6_loopback, listeners,
+    run_dev_on_a_free_port, spawn_piped_listening,
 };
 use blackbox::local::{Local, OUTSIDER, local_project, port_open};
 use blackbox::project::{
@@ -296,14 +296,14 @@ fn failures_before_it_listens_are_those_of_vm_request_and_nothing_listens() {
     fs::create_dir_all(&not_a_project).unwrap();
     let (port, run) = run_dev_on_a_free_port(&local, &not_a_project, true, &[]);
     run.json_error(1, "not-a-project");
-    assert!(!port_open(port), "expected nothing listening on {port}");
+    assert_run_not_listening(&local, port, "not-a-project");
 
     let project = project(&local);
     fs::write(project.dir.join("vibe.dev.json"), "{ \"users\": 7 }\n").unwrap();
     local.watch(&project.dir);
     let (port, run) = run_dev_on_a_free_port(&local, &project.dir, true, &[]);
     run.json_error(1, "test-users-file");
-    assert!(!port_open(port), "expected nothing listening on {port}");
+    assert_run_not_listening(&local, port, "test-users-file");
     let left = local.processes_after(Duration::from_secs(5));
     assert!(
         left.is_empty(),

@@ -140,6 +140,7 @@ pub mod oidc;
 pub mod out_of_reach;
 pub mod own_database;
 pub mod page;
+pub mod ports;
 pub mod postgres;
 pub mod program;
 pub mod project;

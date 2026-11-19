@@ -16,7 +16,7 @@
 //!   and HTML's entities taken back ([`html_unescaped`]).
 
 use std::fs;
-use std::net::{Ipv4Addr, SocketAddr, TcpListener};
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -34,13 +34,10 @@ pub const DEV_REQUEST_TIMEOUT: Duration = Duration::from_secs(150);
 /// How long `vibe dev` is given to end after a signal.
 pub const STOP_WAIT: Duration = Duration::from_secs(60);
 
-/// A port that nothing listens on at this moment, as the system gives one.
+/// A port nothing listens on at this moment, chosen for later from outside
+/// the system's own range ([`crate::ports::chosen`]).
 pub fn free_port() -> u16 {
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("cannot bind 127.0.0.1:0");
-    listener
-        .local_addr()
-        .expect("the listener has an address")
-        .port()
+    crate::ports::chosen().unwrap_or_else(|e| panic!("{e}"))
 }
 
 /// How many ports the harness tries for one start of a program on a port
@@ -905,6 +902,68 @@ pub fn listeners(port: u16) -> Vec<Listener> {
     found
 }
 
+/// The inodes of the sockets of this machine that listen on `port` (TCP,
+/// IPv4 and IPv6).
+fn listening_inodes(port: u16) -> Vec<String> {
+    let mut found = Vec::new();
+    for file in ["/proc/net/tcp", "/proc/net/tcp6"] {
+        let Ok(text) = fs::read_to_string(file) else {
+            continue;
+        };
+        for line in text.lines().skip(1) {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            let (Some(local), Some(state), Some(inode)) =
+                (fields.get(1), fields.get(3), fields.get(9))
+            else {
+                continue;
+            };
+            let listening_here = *state == "0A"
+                && local
+                    .rsplit_once(':')
+                    .and_then(|(_, hex)| u16::from_str_radix(hex, 16).ok())
+                    == Some(port);
+            if listening_here && *inode != "0" {
+                found.push((*inode).to_owned());
+            }
+        }
+    }
+    found
+}
+
+/// The processes of the runs of `local` ([`Local::processes`]) that hold a
+/// socket listening on `port`, on any address. Unlike "something answers
+/// on the port", what another test (or anything else on the machine)
+/// listens on there does not count.
+pub fn run_listening_on(local: &Local, port: u16) -> Vec<crate::local::Process> {
+    let inodes = listening_inodes(port);
+    if inodes.is_empty() {
+        return Vec::new();
+    }
+    let sockets: Vec<String> = inodes.iter().map(|i| format!("socket:[{i}]")).collect();
+    local
+        .processes()
+        .into_iter()
+        .filter(|p| {
+            fs::read_dir(format!("/proc/{}/fd", p.pid)).is_ok_and(|fds| {
+                fds.flatten().any(|fd| {
+                    fs::read_link(fd.path())
+                        .is_ok_and(|to| sockets.iter().any(|s| to.as_os_str() == s.as_str()))
+                })
+            })
+        })
+        .collect()
+}
+
+/// Fails unless no process of the runs of `local` listens on `port`
+/// ([`run_listening_on`]).
+pub fn assert_run_not_listening(local: &Local, port: u16, context: &str) {
+    let found = run_listening_on(local, port);
+    assert!(
+        found.is_empty(),
+        "{context}: expected nothing the local run started listening on {port}, found {found:#?}"
+    );
+}
+
 /// Whether the machine has the IPv6 loopback address `::1`.
 pub fn has_ipv6_loopback() -> bool {
     fs::read_to_string("/proc/net/if_inet6").is_ok_and(|t| {
@@ -981,16 +1040,9 @@ pub fn assert_nothing_left(
             "{context}: expected the private Postgres ({}) stopped",
             postmaster.pid
         );
-        assert!(
-            !crate::local::port_open(postmaster.port),
-            "{context}: expected the private Postgres's port {} closed",
-            postmaster.port
-        );
+        assert_run_not_listening(local, postmaster.port, context);
     }
-    assert!(
-        !crate::local::port_open(port),
-        "{context}: expected nothing listening on {port} any more"
-    );
+    assert_run_not_listening(local, port, context);
     assert_eq!(
         crate::generate::listed(&local.tmp()),
         Vec::<String>::new(),

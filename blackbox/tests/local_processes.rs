@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 
 use blackbox::generate::{Generated, generate, listed};
 use blackbox::local::{
-    Local, OUTSIDER, Postmaster, Requested, handler, local_project, port_open, wait_for_postmaster,
+    Local, OUTSIDER, Postmaster, Requested, handler, local_project, wait_for_postmaster,
 };
 use blackbox::project::{NOTES_SCHEMA_TS, Tree, is_running};
 use blackbox::tool::{Run, mode_of};
@@ -48,11 +48,7 @@ fn assert_nothing_left(local: &Local, postmaster: Option<&Postmaster>, context: 
             "{context}: expected the run's Postgres ({}) stopped",
             postmaster.pid
         );
-        assert!(
-            !port_open(postmaster.port),
-            "{context}: expected the port {} closed",
-            postmaster.port
-        );
+        blackbox::dev::assert_run_not_listening(local, postmaster.port, context);
     }
     assert_eq!(
         listed(&local.tmp()),
