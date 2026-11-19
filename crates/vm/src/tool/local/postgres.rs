@@ -316,10 +316,7 @@ impl Local {
             Err(error) if error.kind() == ErrorKind::AlreadyExists => {
                 match fs::symlink_metadata(&self.dir) {
                     Ok(meta) if meta.is_dir() => Ok(()),
-                    _ => Err(format!(
-                        "{} is not a folder: remove it, then run the command again",
-                        self.dir.display()
-                    )),
+                    _ => Err(format!("{} is not a folder", self.dir.display())),
                 }
             }
             Err(error) => Err(cannot(error)),
@@ -424,7 +421,7 @@ impl Local {
 
     fn broken(&self) -> String {
         format!(
-            "{} cannot be read: the local databases cannot be opened. Removing the folder .vm/local/ starts them anew (their test rows are lost)",
+            "{} cannot be read: the local databases cannot be opened",
             self.dir.join("state.json").display()
         )
     }
@@ -628,7 +625,7 @@ impl Local {
                 let data = fs::canonicalize(self.data()).ok();
                 if cwd.is_some() && cwd == data {
                     return Err(
-                        "a Postgres of this project's data is running and does not answer as this project's: wait for the command that started it to end, or remove the folder .vm/local/ to start the local databases anew".to_owned(),
+                        "a Postgres of this project's data is running and does not answer as this project's: wait for the command that started it to end and run it again, or stop it".to_owned(),
                     );
                 }
                 return not_believed();

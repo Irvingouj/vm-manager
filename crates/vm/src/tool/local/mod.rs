@@ -468,12 +468,14 @@ fn project_path(given: Option<&Path>, command: &str) -> Result<PathBuf, Ending> 
     })
 }
 
+/// `local-state`: `.vm/local/` cannot be used (`why`, the tool's own
+/// words, which do not say the fix: this says it, for every caller).
 fn local_state_failed(why: &str, command: &str) -> Ending {
     Ending::new(
         1,
         "local-state",
         format!(
-            "The project's local state (.vm/local/) cannot be used: {why}; then run {command} again"
+            "The project's local state (.vm/local/) cannot be used: {why}. Removing the folder .vm/local/ starts the local databases anew (their test rows are lost); then run {command} again"
         ),
     )
 }
