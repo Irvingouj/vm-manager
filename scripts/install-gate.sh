@@ -26,6 +26,13 @@ if [ -z "${VIBE_INSTALL_IMAGE:-}" ]; then
 fi
 export VIBE_INSTALL_IMAGE
 
+# The walk deploys the template's Application with the tool, which needs
+# the root npm workspace's packages, as every deploy test of the gate does.
+if [ ! -d node_modules ] || [ package-lock.json -nt node_modules/.package-lock.json ]; then
+  echo "== npm ci"
+  npm ci --no-audit --no-fund
+fi
+
 tests=()
 for file in blackbox/tests/install_*.rs; do
   [ -e "$file" ] || { echo "no install tests (blackbox/tests/install_*.rs)" >&2; exit 1; }
