@@ -4,13 +4,19 @@ This takes you from a Linux machine with Docker to a person signed in. The platf
 
 You need:
 
-- a machine with Docker and its Compose plugin (`docker compose version` answers);
+- a machine with Docker Engine 25.0 or later and its Compose plugin 2.24.1 or later: `docker version --format '{{.Server.Version}}'` prints the Engine's version, `docker compose version` the plugin's (see below why these);
 - a domain for the installation, here `vibe.example.com`, whose names all reach the machine: Applications are at `<name>.vibe.example.com`, the platform's API at `api.vibe.example.com`, sign-in at `auth.vibe.example.com`, the Dashboard at `dashboard.vibe.example.com` (a DNS record for `*.vibe.example.com`);
 - a certificate for `*.vibe.example.com` and its private key, in PEM;
 - an OIDC identity provider at which you can register a client;
 - the tool `vibe` on the computer you connect OIDC from.
 
 Replace `vibe.example.com` with your domain in every command below.
+
+Why these versions. The Compose files use three things that older versions do not have, each according to Docker's own notes:
+
+- a config written in the file itself (`configs: ... content:`), for the Postgres first-start script and the proxy's configuration: Compose 2.23.1 ([Compose file reference, configs](https://docs.docker.com/reference/compose-file/configs/): "`content`: The content is created with the inlined value. Introduced in Docker Compose version 2.23.1");
+- the health check's `start_interval`, so that a fresh install is seen healthy within seconds: Docker Engine 25.0.0 ([Engine 25.0 release notes](https://docs.docker.com/engine/release-notes/25.0/), "Add an additional interval to be used by healthchecks during the container start period") and Compose 2.24.0, whose [release notes](https://github.com/docker/compose/releases/tag/v2.24.0) list "Add support for start_interval", with the check of the Engine's version it needs fixed in [2.24.1](https://github.com/docker/compose/releases/tag/v2.24.1) ("fix engine version require to use healthcheck.start_interval");
+- `!reset`, by which `compose.own-proxy.yaml` and `compose.own-postgres.yaml` remove the bundled proxy or Postgres: compose-go [v1.13.5](https://github.com/compose-spec/compose-go/releases/tag/v1.13.5) ("allow override compose.yaml to REMOVE elements"), first in Compose 2.18.0 (its `go.mod` names compose-go v1.13.5), well below the others.
 
 ## 1. The files
 
