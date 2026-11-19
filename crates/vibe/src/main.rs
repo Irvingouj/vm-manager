@@ -258,6 +258,9 @@ fn version() -> std::io::Result<()> {
 }
 
 fn run(serve: &Serve) -> Result<(), String> {
+    // The authorities trusted for the identity provider, read at start:
+    // a VIBE_CA_FILE that cannot be used is a start-up failure.
+    vibe::trust::client_config()?;
     let domain = serve.domain.trim_end_matches('.').to_ascii_lowercase();
     if domain.is_empty() || !domain.split('.').all(is_dns_label) {
         return Err(format!(
@@ -451,7 +454,8 @@ fn run_setup(args: &SetupArgs) -> ExitCode {
                 say_on_stderr(&format!(
                     "The setup credential, good until {} for connecting OIDC once:\n\
                      put it in VIBE_SETUP_CREDENTIAL and the client secret in VIBE_OIDC_CLIENT_SECRET, then run\n\
-                     vibe admin connect-oidc --domain <domain> --connect <ip:port> --issuer <URL> --client-id <id> --administrators-group <Group>\n\
+                     vibe admin connect-oidc --domain <domain> --issuer <URL> --client-id <id> --administrators-group <Group>\n\
+                     (with --port <n> for HTTPS on another port than 443, or --connect <ip:port> on this machine)\n\
                      A second vibe setup ends this credential.",
                     made.expires_at
                 ));
@@ -482,6 +486,7 @@ fn write_out(text: &str) -> std::io::Result<()> {
 /// The platform database opened (and brought up to date) and the setup
 /// credential made, within [`DATABASE_START_TIMEOUT`].
 fn setup_credential() -> Result<setup::Made, String> {
+    vibe::trust::client_config()?;
     let address = database_address()?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()

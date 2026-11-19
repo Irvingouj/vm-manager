@@ -79,4 +79,5 @@ pub mod statement;
 pub mod structure;
 pub mod tool;
 pub mod tool_credentials;
+pub mod trust;
 pub mod user;

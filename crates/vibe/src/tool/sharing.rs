@@ -246,7 +246,7 @@ const REFUSED: [&str; 6] = [
 
 /// The API's refusal, with the exit code the contract gives its reason.
 fn refused(kept: &Kept, reply: &Reply) -> Ending {
-    let mut ending = not_success(kept.connect, reply);
+    let mut ending = not_success(kept.at(), reply);
     let listed = ending
         .reason
         .as_str()
@@ -268,12 +268,12 @@ async fn read(kept: &Kept, name: &str) -> Result<Result<Value, Reply>, Ending> {
         None,
     )
     .await
-    .map_err(|f| super::failed(kept.connect, f))?;
+    .map_err(|f| super::failed(kept.at(), f))?;
     match reply.status {
         StatusCode::OK => reply
             .json
             .map(Ok)
-            .ok_or_else(|| unexpected(kept.connect, "its answer is not JSON")),
+            .ok_or_else(|| unexpected(kept.at(), "its answer is not JSON")),
         StatusCode::UNAUTHORIZED => Err(sign_in_expired(kept)),
         _ => Ok(Err(reply)),
     }
@@ -364,11 +364,11 @@ pub(super) async fn change<const EVERYONE: bool>(
         Some(Bytes::from(body.to_string())),
     )
     .await
-    .map_err(|f| super::failed(kept.connect, f))?;
+    .map_err(|f| super::failed(kept.at(), f))?;
     let after = match reply.status {
         StatusCode::OK => reply
             .json
-            .ok_or_else(|| unexpected(kept.connect, "its answer is not JSON"))?,
+            .ok_or_else(|| unexpected(kept.at(), "its answer is not JSON"))?,
         StatusCode::UNAUTHORIZED => return Err(sign_in_expired(&kept)),
         _ => return Err(refused(&kept, &reply)),
     };

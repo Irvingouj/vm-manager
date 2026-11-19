@@ -1,11 +1,9 @@
 //! `vibe admin connect-oidc` (blackbox/CONTRACT.md, "The tool signs in
 //! through the browser, and OIDC is connected from the tool: Connecting
 //! OIDC"): `PUT /v1/oidc` with the setup credential (`VIBE_SETUP_CREDENTIAL`,
-//! to `--domain` at `--connect`) or with the tool's own credential, the
+//! to `--domain`, over HTTPS or at `--connect`) or with the tool's own credential, the
 //! client secret from `VIBE_OIDC_CLIENT_SECRET`. Neither secret is printed
 //! or kept: each is read from the environment, sent, and dropped.
-
-use std::net::SocketAddr;
 
 use bytes::Bytes;
 use hyper::{Method, StatusCode};
@@ -15,7 +13,7 @@ use super::client::{self, Installation, Sign};
 use super::credential_file::{Place, Secret};
 use super::theirs::Theirs;
 use super::{
-    Done, Ending, Output, domain, failed, loopback, not_success, read_kept, sign_in_expired,
+    Done, Ending, Output, Reach, domain, failed, not_success, read_kept, sign_in_expired,
     unexpected,
 };
 use crate::oidc::secret::ClientSecret;
@@ -37,7 +35,7 @@ pub struct AdminArgs {
 #[derive(clap::Subcommand)]
 pub enum AdminCommand {
     /// Connect OIDC: with the setup credential in VIBE_SETUP_CREDENTIAL (and
-    /// --domain and --connect), or as a Platform administrator signed in;
+    /// --domain, with --port and --resolve or --connect), or as a Platform administrator signed in;
     /// the client secret in VIBE_OIDC_CLIENT_SECRET.
     ConnectOidc(ConnectOidcArgs),
 }
@@ -48,10 +46,9 @@ pub struct ConnectOidcArgs {
     /// With the setup credential: the installation's domain.
     #[arg(long, value_parser = domain)]
     pub domain: Option<String>,
-    /// With the setup credential: where the installation listens (a
-    /// loopback address and port).
-    #[arg(long, value_parser = loopback)]
-    pub connect: Option<SocketAddr>,
+    /// With the setup credential: how the installation is reached.
+    #[command(flatten)]
+    pub reach: Reach,
     /// The identity provider's issuer, https://... (http:// only on a
     /// loopback host).
     #[arg(long)]
@@ -124,14 +121,17 @@ async fn connect_oidc(args: &ConnectOidcArgs) -> Result<Done, Ending> {
     let body = Bytes::from(Value::Object(body).to_string());
     // The setup credential is a Secret from the moment it is read; a value
     // that cannot be one is said so, never shown.
+    // What is kept, when the command goes with the tool's own credential:
+    // it outlives the match, which lends where it is reached.
+    let kept;
     let reply = match variable(SETUP_VARIABLE).map(Secret::new) {
         Some(setup) => {
-            let (Some(domain), Some(connect)) = (&args.domain, args.connect) else {
+            let Some(domain) = &args.domain else {
                 return Err(Ending::new(
                     2,
                     "usage",
                     format!(
-                        "with {SETUP_VARIABLE}, --domain and --connect say where the installation is: give both, then run the command again"
+                        "with {SETUP_VARIABLE}, --domain says where the installation is (with --port and --resolve, or --connect for one on this machine): give it, then run the command again"
                     ),
                 ));
             };
@@ -144,7 +144,10 @@ async fn connect_oidc(args: &ConnectOidcArgs) -> Result<Done, Ending> {
                     ),
                 )
             })?;
-            let at = Installation { domain, connect };
+            let at = Installation {
+                domain,
+                route: args.reach.route(),
+            };
             let reply = client::send(
                 &at,
                 Method::PUT,
@@ -153,30 +156,30 @@ async fn connect_oidc(args: &ConnectOidcArgs) -> Result<Done, Ending> {
                 Some(body),
             )
             .await
-            .map_err(|f| failed(connect, f))?;
+            .map_err(|f| failed(at, f))?;
             if reply.status == StatusCode::UNAUTHORIZED {
                 return Err(Ending::new(
                     3,
                     "setup-credential-refused",
                     format!(
-                        "the installation at {connect} ({domain}) refused the setup credential: it is used up, replaced by a later one or expired. Run `vibe setup` again beside the platform database, put the new one in {SETUP_VARIABLE}, then run this command again"
+                        "the installation at {at} ({domain}) refused the setup credential: it is used up, replaced by a later one or expired. Run `vibe setup` again beside the platform database, put the new one in {SETUP_VARIABLE}, then run this command again"
                     ),
                 ));
             }
-            (reply, connect)
+            (reply, at)
         }
         None => {
-            if args.domain.is_some() || args.connect.is_some() {
+            if args.domain.is_some() || args.reach.given() {
                 return Err(Ending::new(
                     2,
                     "usage",
                     format!(
-                        "--domain and --connect go with the setup credential ({SETUP_VARIABLE}) only: signed in, the command goes to the installation the tool is signed in to. Leave them out, or set {SETUP_VARIABLE}"
+                        "--domain, --port, --resolve and --connect go with the setup credential ({SETUP_VARIABLE}) only: signed in, the command goes to the installation the tool is signed in to. Leave them out, or set {SETUP_VARIABLE}"
                     ),
                 ));
             }
             let place = Place::from_environment().map_err(Ending::credential_file)?;
-            let kept = read_kept(&place)?;
+            kept = read_kept(&place)?;
             let reply = client::send(
                 &super::installation(&kept),
                 Method::PUT,
@@ -185,20 +188,20 @@ async fn connect_oidc(args: &ConnectOidcArgs) -> Result<Done, Ending> {
                 Some(body),
             )
             .await
-            .map_err(|f| failed(kept.connect, f))?;
+            .map_err(|f| failed(kept.at(), f))?;
             if reply.status == StatusCode::UNAUTHORIZED {
                 return Err(sign_in_expired(&kept));
             }
-            (reply, kept.connect)
+            (reply, kept.at())
         }
     };
-    let (reply, connect) = reply;
+    let (reply, at) = reply;
     if reply.status != StatusCode::OK {
-        return Err(not_success(connect, &reply));
+        return Err(not_success(at, &reply));
     }
     let connection = reply
         .json
-        .ok_or_else(|| unexpected(connect, "its answer is not JSON"))?;
+        .ok_or_else(|| unexpected(at, "its answer is not JSON"))?;
     let text_of = |name: &str| {
         Theirs::from(
             connection

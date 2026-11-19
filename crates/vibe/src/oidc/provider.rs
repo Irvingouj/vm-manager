@@ -37,9 +37,10 @@ use url::form_urlencoded::{Serializer, byte_serialize};
 
 use super::http::{Client, Failure};
 use super::secret::Secret;
-use super::settings::Settings;
+use super::settings::{Settings, check_issuer};
 use super::token::{self, Claims, Expected, Keys, Refused};
 use crate::log;
+use crate::trust::Refusal;
 
 /// How long the configuration and the keys are kept.
 pub const KEPT_FOR: Duration = Duration::from_secs(60 * 60);
@@ -172,7 +173,10 @@ impl Provider {
                 return None;
             }
             let url = Url::parse(text).ok()?;
-            let scheme_ok = url.scheme() == "https" || (plain && url.scheme() == "http");
+            // `http` as for an issuer: with a loopback `http` issuer, or to
+            // a loopback host (crate::oidc::settings::check_issuer).
+            let scheme_ok = url.scheme() == "https"
+                || (url.scheme() == "http" && (plain || check_issuer(url.as_str()).is_ok()));
             (scheme_ok && url.host().is_some() && url.fragment().is_none()).then_some(url)
         };
         let methods: Vec<&str> = json
@@ -441,7 +445,30 @@ fn failed(what: &'static str, failure: Failure) -> Problem {
         Failure::Unreachable => "it could not be reached",
         Failure::TimedOut => "it did not answer within 10 seconds",
         Failure::TooLarge => "it answered more than 1 MiB",
+        Failure::Certificate(refusal) => untrusted(refusal),
     })
+}
+
+/// Why the provider's certificate was not trusted, in words that say what
+/// to do.
+fn untrusted(refusal: Refusal) -> &'static str {
+    match refusal {
+        Refusal::UnknownAuthority => {
+            "its certificate was not trusted: it is issued by a certificate authority the program does not know. If that is your company's own authority, start vibe serve with VIBE_CA_FILE naming a file with its certificate (PEM)"
+        }
+        Refusal::OtherName => {
+            "its certificate was not trusted: it is not for the issuer's name (VIBE_CA_FILE adds authorities, it does not change this)"
+        }
+        Refusal::Expired => {
+            "its certificate was not trusted: it is expired (VIBE_CA_FILE adds authorities, it does not change this)"
+        }
+        Refusal::NotValidYet => {
+            "its certificate was not trusted: it is not valid yet (VIBE_CA_FILE adds authorities, it does not change this)"
+        }
+        Refusal::Other => {
+            "its certificate was not trusted (the authorities trusted are the built-in public ones and those of VIBE_CA_FILE)"
+        }
+    }
 }
 
 /// A record of what went wrong with a call: which, and what kind; nothing

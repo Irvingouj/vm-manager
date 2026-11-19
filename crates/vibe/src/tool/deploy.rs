@@ -589,13 +589,13 @@ async fn application(kept: &Kept, manifest: &Manifest) -> Result<Option<Existing
         None,
     )
     .await
-    .map_err(|f| super::failed(kept.connect, f))?;
+    .map_err(|f| super::failed(kept.at(), f))?;
     let application: Application = match reply.status {
         StatusCode::OK => shaped(
-            kept.connect,
+            kept.at(),
             reply
                 .json
-                .ok_or_else(|| unexpected(kept.connect, "its answer is not JSON"))?,
+                .ok_or_else(|| unexpected(kept.at(), "its answer is not JSON"))?,
         )?,
         StatusCode::NOT_FOUND => return Ok(None),
         StatusCode::UNAUTHORIZED => return Err(sign_in_expired(kept)),
@@ -610,7 +610,7 @@ async fn application(kept: &Kept, manifest: &Manifest) -> Result<Option<Existing
                 ),
             ));
         }
-        _ => return Err(not_success(kept.connect, &reply)),
+        _ => return Err(not_success(kept.at(), &reply)),
     };
     if !application.contributor {
         let names: Vec<String> = application
@@ -632,7 +632,7 @@ async fn application(kept: &Kept, manifest: &Manifest) -> Result<Option<Existing
     let latest = match application.latest_version {
         Some(number) => {
             let version: VersionMigrations = shaped(
-                kept.connect,
+                kept.at(),
                 get_signed_in(kept, &format!("/v1/applications/{name}/versions/{number}")).await?,
             )?;
             Some(version.migrations)
@@ -1159,16 +1159,16 @@ async fn create(ready: &Ready) -> Result<Application, Ending> {
         Some(Bytes::from(body)),
     )
     .await
-    .map_err(|f| super::failed(kept.connect, f))?;
+    .map_err(|f| super::failed(kept.at(), f))?;
     match reply.status {
         StatusCode::CREATED => shaped(
-            kept.connect,
+            kept.at(),
             reply
                 .json
-                .ok_or_else(|| unexpected(kept.connect, "its answer is not JSON"))?,
+                .ok_or_else(|| unexpected(kept.at(), "its answer is not JSON"))?,
         ),
         StatusCode::UNAUTHORIZED => Err(sign_in_expired(kept)),
-        _ => Err(not_success(kept.connect, &reply)),
+        _ => Err(not_success(kept.at(), &reply)),
     }
 }
 
@@ -1214,6 +1214,11 @@ async fn send(ready: &Ready, creating: &Cell<bool>) -> Result<Done, Ending> {
     .await
     .map_err(|failure| match failure {
         Failure::Unreachable(why) | Failure::Unexpected(why) => maybe_live("unreachable", &why),
+        // The handshake failed, or the authorities could not be read:
+        // nothing of the Version was sent.
+        refused @ (Failure::Certificate(_) | Failure::CaFile(_)) => {
+            super::failed(installation(kept), refused)
+        }
     })?;
     let serving = ready
         .existing
@@ -1281,11 +1286,11 @@ fn refused(kept: &Kept, reply: &client::Reply, serving: Option<u64>) -> Ending {
         }
         (StatusCode::CONFLICT | StatusCode::PAYLOAD_TOO_LARGE, Some(_)) => {
             // Not a person's to decide: a failure of the Version's own.
-            let mut ending = not_success(kept.connect, reply);
+            let mut ending = not_success(kept.at(), reply);
             ending.code = 1;
             ending
         }
-        _ => not_success(kept.connect, reply),
+        _ => not_success(kept.at(), reply),
     }
 }
 

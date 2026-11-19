@@ -73,7 +73,7 @@ pub use versions::{GoBackArgs, VersionsArgs};
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, ErrorKind, Write};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -81,7 +81,7 @@ use hyper::{Method, StatusCode};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use client::{Failure, Installation, Reply, Sign};
+use client::{Failure, HTTPS_PORT, Installation, Reply, Route, Sign};
 use credential_file::{Found, Kept, Place, Secret};
 use theirs::Theirs;
 
@@ -110,14 +110,11 @@ pub struct Output {
 /// `vibe sign-in`.
 #[derive(clap::Args)]
 pub struct SignInArgs {
-    /// The installation's domain; the tool sends Host: api.<domain>.
+    /// The installation's domain: the tool speaks HTTPS to api.<domain>.
     #[arg(long, value_parser = domain)]
     pub domain: String,
-    /// Where the installation listens: a loopback address and port, such as
-    /// 127.0.0.1:8080 or [::1]:8080 (plain HTTP until installing brings
-    /// HTTPS).
-    #[arg(long, value_parser = loopback)]
-    pub connect: SocketAddr,
+    #[command(flatten)]
+    pub reach: Reach,
     /// Development only, while sign-in is the stand-in: the User to sign in
     /// as.
     #[arg(long, value_parser = stand_in_value)]
@@ -134,6 +131,42 @@ pub struct SignInArgs {
     pub timeout: u64,
     #[command(flatten)]
     pub output: Output,
+}
+
+/// Where the installation is beside its domain: HTTPS (`--port`,
+/// `--resolve`), or plain HTTP to a loopback address (`--connect`).
+#[derive(clap::Args)]
+pub struct Reach {
+    /// The port of HTTPS (443 when not given).
+    #[arg(long, value_parser = clap::value_parser!(u16).range(1..))]
+    pub port: Option<u16>,
+    /// Connect to this IP address (IPv4 or IPv6, written alone) in place of
+    /// what the system resolves api.<domain> to; nothing else changes: the
+    /// certificate is checked for api.<domain>.
+    #[arg(long, value_parser = ip_alone)]
+    pub resolve: Option<IpAddr>,
+    /// Plain HTTP instead, to an installation on this machine: a loopback
+    /// address and port, such as 127.0.0.1:8080 or [::1]:8080.
+    #[arg(long, value_parser = loopback, conflicts_with_all = ["port", "resolve"])]
+    pub connect: Option<SocketAddr>,
+}
+
+impl Reach {
+    /// How the installation is reached.
+    pub fn route(&self) -> Route {
+        match self.connect {
+            Some(connect) => Route::Plain(connect),
+            None => Route::Https {
+                port: self.port.unwrap_or(HTTPS_PORT),
+                resolve: self.resolve,
+            },
+        }
+    }
+
+    /// Whether any of the options is given.
+    pub fn given(&self) -> bool {
+        self.port.is_some() || self.resolve.is_some() || self.connect.is_some()
+    }
 }
 
 /// A command of the tool.
@@ -501,6 +534,12 @@ fn loopback(text: &str) -> Result<SocketAddr, String> {
     Ok(address)
 }
 
+fn ip_alone(text: &str) -> Result<IpAddr, String> {
+    text.parse().map_err(|_| {
+        "not an IP address: write an IPv4 or IPv6 address alone, such as 192.0.2.10 or 2001:db8::10 (no port: that is --port)".to_owned()
+    })
+}
+
 fn stand_in_value(text: &str) -> Result<String, String> {
     if text.is_empty()
         || text.len() > MAX_STAND_IN_VALUE_BYTES
@@ -584,10 +623,7 @@ fn write_whole(path: &Path, content: &[u8], tag: &str) -> io::Result<()> {
 
 /// The installation of what is kept.
 fn installation(kept: &Kept) -> Installation<'_> {
-    Installation {
-        domain: &kept.domain,
-        connect: kept.connect,
-    }
+    kept.at()
 }
 
 /// `text` as one word of a shell command, quoted when it needs to be.
@@ -605,17 +641,12 @@ fn shell_word(text: &str) -> String {
 
 /// The whole `vibe sign-in` command that signs in again as what is kept.
 fn sign_in_again(kept: &Kept) -> String {
+    let options = kept.at().options();
     if kept.through_browser {
-        return format!(
-            "vibe sign-in --domain {} --connect {}",
-            shell_word(&kept.domain),
-            kept.connect
-        );
+        return format!("vibe sign-in {options}");
     }
     let mut command = format!(
-        "vibe sign-in --domain {} --connect {} --stand-in-user {}",
-        shell_word(&kept.domain),
-        kept.connect,
+        "vibe sign-in {options} --stand-in-user {}",
         shell_word(&kept.user.to_string())
     );
     if !kept.groups.is_empty() {
@@ -632,7 +663,7 @@ fn not_signed_in() -> Ending {
     Ending::new(
         4,
         "not-signed-in",
-        "not signed in: run `vibe sign-in --domain <domain> --connect <ip:port>` (it opens the browser, or shows an address to open), then run this command again".into(),
+        "not signed in: run `vibe sign-in --domain <domain>` (it opens the browser, or shows an address to open; --port <n> for HTTPS on another port than 443, --connect <ip:port> for an installation on this machine over plain HTTP), then run this command again".into(),
     )
 }
 
@@ -648,36 +679,38 @@ fn sign_in_expired(kept: &Kept) -> Ending {
     )
 }
 
-fn unreachable(connect: SocketAddr, why: &str) -> Ending {
+fn unreachable(at: Installation<'_>, why: &str) -> Ending {
     Ending::new(
         1,
         "unreachable",
         format!(
-            "the installation at {connect} cannot be reached ({why}): check that it is running and that the address is right, then run the command again"
+            "the installation at {at} cannot be reached ({why}): check that it is running and that the address is right, then run the command again"
         ),
     )
 }
 
-fn unexpected(connect: SocketAddr, what: &str) -> Ending {
+fn unexpected(at: Installation<'_>, what: &str) -> Ending {
     Ending::new(
         1,
         "unexpected-answer",
         format!(
-            "what answered at {connect} is not an installation of this platform, or not one this tool understands ({what}): check the address and the tool's version, then run the command again"
+            "what answered at {at} is not an installation of this platform, or not one this tool understands ({what}): check the address and the tool's version, then run the command again"
         ),
     )
 }
 
-fn failed(connect: SocketAddr, failure: Failure) -> Ending {
+fn failed(at: Installation<'_>, failure: Failure) -> Ending {
     match failure {
-        Failure::Unreachable(why) => unreachable(connect, &why),
-        Failure::Unexpected(what) => unexpected(connect, &what),
+        Failure::Unreachable(why) => unreachable(at, &why),
+        Failure::Unexpected(what) => unexpected(at, &what),
+        Failure::Certificate(message) => Ending::new(1, "certificate", message),
+        Failure::CaFile(message) => Ending::new(1, "ca-file", message),
     }
 }
 
 /// An answer that is not the success asked for: the API's own refusal (its
 /// reason and message), else what kind of answer it was.
-fn not_success(connect: SocketAddr, reply: &Reply) -> Ending {
+fn not_success(at: Installation<'_>, reply: &Reply) -> Ending {
     let error = reply.json.as_ref().and_then(|body| body.get("error"));
     let reason = error.and_then(|e| e.get("reason")).and_then(Value::as_str);
     let message = error.and_then(|e| e.get("message")).and_then(Value::as_str);
@@ -693,7 +726,7 @@ fn not_success(connect: SocketAddr, reply: &Reply) -> Ending {
             }
         }
         _ => unexpected(
-            connect,
+            at,
             &format!(
                 "it answered {} where the API answers otherwise",
                 reply.status
@@ -720,20 +753,20 @@ async fn get_signed_in(kept: &Kept, path: &str) -> Result<Value, Ending> {
         None,
     )
     .await
-    .map_err(|f| failed(kept.connect, f))?;
+    .map_err(|f| failed(kept.at(), f))?;
     match reply.status {
         StatusCode::OK => reply
             .json
-            .ok_or_else(|| unexpected(kept.connect, "its answer is not JSON")),
+            .ok_or_else(|| unexpected(kept.at(), "its answer is not JSON")),
         StatusCode::UNAUTHORIZED => Err(sign_in_expired(kept)),
-        _ => Err(not_success(kept.connect, &reply)),
+        _ => Err(not_success(kept.at(), &reply)),
     }
 }
 
 /// `value` read as `T`, else an unexpected answer.
-fn shaped<T: for<'de> Deserialize<'de>>(connect: SocketAddr, value: Value) -> Result<T, Ending> {
+fn shaped<T: for<'de> Deserialize<'de>>(at: Installation<'_>, value: Value) -> Result<T, Ending> {
     serde_json::from_value(value)
-        .map_err(|_| unexpected(connect, "its answer does not have the fields asked for"))
+        .map_err(|_| unexpected(at, "its answer does not have the fields asked for"))
 }
 
 /// What `POST /v1/tool-credentials` answers.
@@ -803,45 +836,45 @@ async fn sign_in(args: &SignInArgs) -> Result<Done, Ending> {
     };
     let at = Installation {
         domain: &args.domain,
-        connect: args.connect,
+        route: args.reach.route(),
     };
     let reply = client::send(&at, Method::GET, "/v1/installation", Sign::Anyone, None)
         .await
-        .map_err(|f| failed(args.connect, f))?;
+        .map_err(|f| failed(at, f))?;
     if reply.status != StatusCode::OK {
-        return Err(not_success(args.connect, &reply));
+        return Err(not_success(at, &reply));
     }
     let installation: InstallationAnswer = shaped(
-        args.connect,
+        at,
         reply
             .json
-            .ok_or_else(|| unexpected(args.connect, "its answer is not JSON"))?,
+            .ok_or_else(|| unexpected(at, "its answer is not JSON"))?,
     )?;
     let (made, through_browser) = match (installation.sign_in.as_str(), &args.stand_in_user) {
         ("none", _) => {
             return Err(sign_in_refused(format!(
                 "the installation at {} ({}) has no sign-in yet: OIDC is not connected. A Platform administrator connects it with `vibe admin connect-oidc`; then run this command again",
-                args.connect, args.domain
+                at, args.domain
             )));
         }
         ("stand-in", None) => {
             return Err(sign_in_refused(format!(
                 "the installation at {} ({}) takes the stand-in sign-in only, which needs --stand-in-user <id>: run the command again with it",
-                args.connect, args.domain
+                at, args.domain
             )));
         }
         ("stand-in", Some(user)) => (stand_in(args, user).await?, false),
         ("oidc", Some(_)) => {
             return Err(sign_in_refused(format!(
                 "the installation at {} ({}) signs in through the browser (OIDC), not with --stand-in-user: run the command again without --stand-in-user and --stand-in-groups",
-                args.connect, args.domain
+                at, args.domain
             )));
         }
         ("oidc", None) => {
             let address = installation
                 .sign_in_address
                 .as_deref()
-                .ok_or_else(|| unexpected(args.connect, "it gave no sign-in address"))?;
+                .ok_or_else(|| unexpected(at, "it gave no sign-in address"))?;
             let answer = browser::sign_in(
                 &at,
                 address,
@@ -849,20 +882,17 @@ async fn sign_in(args: &SignInArgs) -> Result<Done, Ending> {
                 std::time::Duration::from_secs(args.timeout),
             )
             .await?;
-            (shaped::<Made>(args.connect, answer)?, true)
+            (shaped::<Made>(at, answer)?, true)
         }
         (_, _) => {
-            return Err(unexpected(
-                args.connect,
-                "it names a sign-in this tool does not know",
-            ));
+            return Err(unexpected(at, "it names a sign-in this tool does not know"));
         }
     };
     let credential = Secret::new(made.credential)
-        .ok_or_else(|| unexpected(args.connect, "the credential it gave is not one"))?;
+        .ok_or_else(|| unexpected(at, "the credential it gave is not one"))?;
     let kept = Kept {
         domain: args.domain.clone(),
-        connect: args.connect,
+        route: args.reach.route(),
         user: made.user,
         groups: made.groups,
         credential,
@@ -904,7 +934,7 @@ async fn sign_in(args: &SignInArgs) -> Result<Done, Ending> {
 async fn stand_in(args: &SignInArgs, user: &str) -> Result<Made, Ending> {
     let at = Installation {
         domain: &args.domain,
-        connect: args.connect,
+        route: args.reach.route(),
     };
     let reply = client::send(
         &at,
@@ -917,22 +947,22 @@ async fn stand_in(args: &SignInArgs, user: &str) -> Result<Made, Ending> {
         Some(bytes::Bytes::from_static(b"{}")),
     )
     .await
-    .map_err(|f| failed(args.connect, f))?;
+    .map_err(|f| failed(at, f))?;
     match reply.status {
         StatusCode::CREATED => {}
         StatusCode::UNAUTHORIZED => {
             return Err(sign_in_refused(format!(
                 "the installation at {} ({}) does not accept this sign-in: it takes the stand-in only when started with --stand-in-sign-in; ask whoever runs it, or sign in to another",
-                args.connect, args.domain
+                at, args.domain
             )));
         }
-        _ => return Err(not_success(args.connect, &reply)),
+        _ => return Err(not_success(at, &reply)),
     }
     shaped(
-        args.connect,
+        at,
         reply
             .json
-            .ok_or_else(|| unexpected(args.connect, "its answer is not JSON"))?,
+            .ok_or_else(|| unexpected(at, "its answer is not JSON"))?,
     )
 }
 
@@ -985,7 +1015,7 @@ async fn sign_out() -> Result<Done, Ending> {
 async fn whoami() -> Result<Done, Ending> {
     let place = Place::from_environment().map_err(Ending::credential_file)?;
     let kept = read_kept(&place)?;
-    let me: Me = shaped(kept.connect, get_signed_in(&kept, "/v1/me").await?)?;
+    let me: Me = shaped(kept.at(), get_signed_in(&kept, "/v1/me").await?)?;
     Ok(Done {
         text: who_in_words(
             &kept.domain,
@@ -1022,7 +1052,7 @@ struct ResourceList {
 async fn resources() -> Result<Done, Ending> {
     let place = Place::from_environment().map_err(Ending::credential_file)?;
     let kept = read_kept(&place)?;
-    let list: ResourceList = shaped(kept.connect, get_signed_in(&kept, "/v1/resources").await?)?;
+    let list: ResourceList = shaped(kept.at(), get_signed_in(&kept, "/v1/resources").await?)?;
     let mut text = String::new();
     if list.resources.is_empty() {
         say!(
@@ -1079,10 +1109,7 @@ struct ApplicationList {
 async fn applications() -> Result<Done, Ending> {
     let place = Place::from_environment().map_err(Ending::credential_file)?;
     let kept = read_kept(&place)?;
-    let list: ApplicationList = shaped(
-        kept.connect,
-        get_signed_in(&kept, "/v1/applications").await?,
-    )?;
+    let list: ApplicationList = shaped(kept.at(), get_signed_in(&kept, "/v1/applications").await?)?;
     let mut text = String::new();
     if list.applications.is_empty() {
         say!(

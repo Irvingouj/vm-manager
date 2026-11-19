@@ -100,7 +100,7 @@ pub(super) fn signed_in_for(name: &str) -> Result<Kept, Ending> {
 
 async fn application(kept: &Kept, name: &str) -> Result<Application, Ending> {
     shaped(
-        kept.connect,
+        kept.at(),
         get_signed_in(kept, &format!("/v1/applications/{name}")).await?,
     )
 }
@@ -110,7 +110,7 @@ pub(super) async fn versions(args: &VersionsArgs) -> Result<Done, Ending> {
     let kept = signed_in_for(name)?;
     let application = application(&kept, name).await?;
     let list: VersionList = shaped(
-        kept.connect,
+        kept.at(),
         get_signed_in(
             &kept,
             &format!("/v1/applications/{name}/versions?limit={}", args.limit),
@@ -237,16 +237,16 @@ pub(super) async fn go_back(args: &GoBackArgs) -> Result<Done, Ending> {
         Some(body),
     )
     .await
-    .map_err(|f| super::failed(kept.connect, f))?;
+    .map_err(|f| super::failed(kept.at(), f))?;
     let gone: GoneBack = match reply.status {
         StatusCode::OK => shaped(
-            kept.connect,
+            kept.at(),
             reply
                 .json
-                .ok_or_else(|| unexpected(kept.connect, "its answer is not JSON"))?,
+                .ok_or_else(|| unexpected(kept.at(), "its answer is not JSON"))?,
         )?,
         StatusCode::UNAUTHORIZED => return Err(sign_in_expired(&kept)),
-        _ => return Err(not_success(kept.connect, &reply)),
+        _ => return Err(not_success(kept.at(), &reply)),
     };
     let mut text = String::new();
     writeln!(

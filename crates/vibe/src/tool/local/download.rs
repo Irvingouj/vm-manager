@@ -6,7 +6,8 @@
 //! final place and renamed.
 //!
 //! **Fetching.** HTTP/1.1 through hyper's client connection, over TLS
-//! (rustls, with ring and Mozilla's roots compiled in) for `https`; plain
+//! (rustls, with ring; the authorities of crate::trust: Mozilla's roots
+//! compiled in and those of `VIBE_CA_FILE`) for `https`; plain
 //! for an `http` mirror. Bounds: [`CONNECT_TIMEOUT`] to resolve and connect,
 //! [`READ_TIMEOUT`] for the answer's head and for each piece of the body,
 //! [`DOWNLOAD_TIMEOUT`] for all of it; at most [`MAX_REDIRECTS`] redirects,
@@ -396,23 +397,16 @@ async fn get(uri: &Uri, into: &Path) -> Result<Got, String> {
     }
 }
 
-/// TLS over `stream`, the server checked against Mozilla's roots.
+/// TLS over `stream`, the server checked against the authorities the
+/// program trusts (crate::trust).
 async fn tls_connect(
     host: &str,
     stream: TcpStream,
 ) -> Result<tokio_rustls::client::TlsStream<TcpStream>, String> {
-    let mut roots = rustls::RootCertStore::empty();
-    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let config = rustls::ClientConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
-    .with_safe_default_protocol_versions()
-    .map_err(|e| format!("TLS cannot be set up ({e})"))?
-    .with_root_certificates(roots)
-    .with_no_client_auth();
+    let config = crate::trust::client_config()?;
     let name = rustls::pki_types::ServerName::try_from(host.to_owned())
         .map_err(|_| format!("{host} is not a name TLS can check"))?;
-    tokio_rustls::TlsConnector::from(Arc::new(config))
+    tokio_rustls::TlsConnector::from(config)
         .connect(name, stream)
         .await
         .map_err(|e| format!("the TLS handshake with {host} failed ({e})"))

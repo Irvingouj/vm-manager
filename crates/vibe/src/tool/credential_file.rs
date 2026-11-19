@@ -14,12 +14,13 @@
 
 use std::fs::{self, DirBuilder, File, OpenOptions, Permissions};
 use std::io::{self, ErrorKind, Read, Write};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use super::client::{Installation, Route};
 use super::theirs::Theirs;
 use crate::registry::is_dns_label;
 
@@ -63,7 +64,9 @@ impl Secret {
 pub struct Kept {
     /// Checked: DNS labels joined by dots.
     pub domain: String,
-    pub connect: SocketAddr,
+    /// How the installation is reached: kept so that every later command
+    /// reaches it the same way.
+    pub route: Route,
     /// As the installation said.
     pub user: Theirs,
     pub groups: Vec<Theirs>,
@@ -74,12 +77,34 @@ pub struct Kept {
     pub through_browser: bool,
 }
 
+impl Kept {
+    /// The installation this is kept for.
+    pub fn at(&self) -> Installation<'_> {
+        Installation {
+            domain: &self.domain,
+            route: self.route,
+        }
+    }
+}
+
+/// How an installation is reached over HTTPS, in the file.
+#[derive(Serialize, Deserialize)]
+struct Https {
+    port: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resolve: Option<IpAddr>,
+}
+
 /// The file as written, borrowed from what is kept.
 #[derive(Serialize)]
 struct Written<'a> {
     form: u32,
     domain: &'a str,
-    connect: SocketAddr,
+    /// Plain HTTP to this loopback address; or, without it, [`Https`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    connect: Option<SocketAddr>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    https: Option<Https>,
     user: &'a Theirs,
     groups: &'a [Theirs],
     credential: &'a str,
@@ -92,7 +117,11 @@ struct Written<'a> {
 struct OnDisk {
     form: u32,
     domain: String,
-    connect: SocketAddr,
+    /// A file written before HTTPS has this alone.
+    #[serde(default)]
+    connect: Option<SocketAddr>,
+    #[serde(default)]
+    https: Option<Https>,
     user: Theirs,
     groups: Vec<Theirs>,
     credential: String,
@@ -169,8 +198,14 @@ impl Place {
             return Err(garbled());
         }
         let on_disk: OnDisk = serde_json::from_slice(&bytes).map_err(|_| garbled())?;
+        let route = match (on_disk.connect, on_disk.https) {
+            (Some(connect), None) if connect.ip().is_loopback() && connect.port() != 0 => {
+                Route::Plain(connect)
+            }
+            (None, Some(Https { port, resolve })) if port != 0 => Route::Https { port, resolve },
+            _ => return Err(garbled()),
+        };
         if on_disk.form != FORM
-            || !on_disk.connect.ip().is_loopback()
             || on_disk.domain.is_empty()
             || !on_disk.domain.split('.').all(is_dns_label)
         {
@@ -179,7 +214,7 @@ impl Place {
         let credential = Secret::new(on_disk.credential).ok_or_else(garbled)?;
         Ok(Found::Kept(Kept {
             domain: on_disk.domain,
-            connect: on_disk.connect,
+            route,
             user: on_disk.user,
             groups: on_disk.groups,
             credential,
@@ -230,7 +265,14 @@ impl Place {
         let mut text = serde_json::to_vec(&Written {
             form: FORM,
             domain: &kept.domain,
-            connect: kept.connect,
+            connect: match kept.route {
+                Route::Plain(connect) => Some(connect),
+                Route::Https { .. } => None,
+            },
+            https: match kept.route {
+                Route::Plain(_) => None,
+                Route::Https { port, resolve } => Some(Https { port, resolve }),
+            },
             user: &kept.user,
             groups: &kept.groups,
             credential: kept.credential.expose(),

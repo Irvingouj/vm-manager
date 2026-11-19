@@ -231,7 +231,7 @@ async fn read(
         add("request", request);
     }
     shaped(
-        kept.connect,
+        kept.at(),
         get_signed_in(kept, &format!("/v1/applications/{name}/logs{query}")).await?,
     )
 }

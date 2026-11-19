@@ -192,7 +192,7 @@ impl<'a> Pull<'a> {
             kind,
         } = self;
         let answered: Answered = shaped(
-            kept.connect,
+            kept.at(),
             get_signed_in(kept, &format!("/v1/resources/{name}/structure")).await?,
         )?;
         let definition_shape = answered
@@ -202,7 +202,7 @@ impl<'a> Pull<'a> {
         if answered.resource != name || !is_fingerprint(&answered.fingerprint) || !definition_shape
         {
             return Err(unexpected(
-                kept.connect,
+                kept.at(),
                 "its answer is not the structure of the Resource asked for",
             ));
         }
@@ -212,14 +212,14 @@ impl<'a> Pull<'a> {
             .find(|level| answered.your_access.is(level))
         else {
             return Err(unexpected(
-                kept.connect,
+                kept.at(),
                 "its answer's access is not one of structure, read and write",
             ));
         };
         let one_statement_each = answered.standin_sql.iter().all(|s| s.ends_with(';'));
         if !one_statement_each {
             return Err(unexpected(
-                kept.connect,
+                kept.at(),
                 "its answer's stand-in is not a list of statements",
             ));
         }

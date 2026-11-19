@@ -1,6 +1,7 @@
 //! Calls to the identity provider: HTTP/1.1 through hyper's client
-//! connection, over TLS (rustls with ring, Mozilla's roots compiled in) for
-//! `https`, plain for a loopback `http` issuer (crate::oidc::settings).
+//! connection, over TLS (rustls with ring; the authorities of
+//! crate::trust: Mozilla's roots compiled in and those of `VIBE_CA_FILE`)
+//! for `https`, plain for a loopback `http` issuer (crate::oidc::settings).
 //!
 //! **Bounds.** Every call, from resolving the name to the last byte of the
 //! answer, ends within [`CALL_TIMEOUT`], and by the caller's deadline when
@@ -26,6 +27,8 @@ use tokio::net::TcpStream;
 use tokio::time::Instant;
 use url::Url;
 
+use crate::trust::Refusal;
+
 /// The longest one call to the identity provider may take, all of it.
 pub const CALL_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -41,12 +44,16 @@ pub enum Failure {
     TimedOut,
     /// Its answer is larger than [`MAX_BODY_BYTES`].
     TooLarge,
+    /// The TLS handshake failed on its certificate: why, as rustls said it.
+    Certificate(Refusal),
 }
 
 impl Failure {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Unreachable => "unreachable",
+            // The log's words are the contract's: a provider whose
+            // certificate is not taken is one that cannot be reached.
+            Self::Unreachable | Self::Certificate(_) => "unreachable",
             Self::TimedOut => "timed-out",
             Self::TooLarge => "too-large",
         }
@@ -65,19 +72,11 @@ pub struct Client {
 }
 
 impl Client {
-    /// The error is a message for the operator.
+    /// The error is a message for the operator. `vibe serve` has built
+    /// the trust store at start (crate::trust), so this takes what it built.
     pub fn new() -> Result<Self, String> {
-        let mut roots = rustls::RootCertStore::empty();
-        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        let config = rustls::ClientConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_safe_default_protocol_versions()
-        .map_err(|e| format!("TLS for the identity provider cannot be set up ({e})"))?
-        .with_root_certificates(roots)
-        .with_no_client_auth();
         Ok(Self {
-            tls: Arc::new(config),
+            tls: crate::trust::client_config()?,
         })
     }
 
@@ -158,7 +157,10 @@ impl Client {
             let stream = tokio_rustls::TlsConnector::from(Arc::clone(&self.tls))
                 .connect(name, stream)
                 .await
-                .map_err(|_| Failure::Unreachable)?;
+                .map_err(|error| match crate::trust::refusal(&error) {
+                    Some(refusal) => Failure::Certificate(refusal),
+                    None => Failure::Unreachable,
+                })?;
             send(TokioIo::new(stream), request).await
         } else {
             send(TokioIo::new(stream), request).await

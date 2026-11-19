@@ -225,7 +225,7 @@ impl Registry {
 /// The registered Resources and what the signed-in Builder holds:
 /// `GET /v1/resources`.
 pub(super) async fn registry(kept: &super::credential_file::Kept) -> Result<Registry, Ending> {
-    shaped(kept.connect, get_signed_in(kept, "/v1/resources").await?)
+    shaped(kept.at(), get_signed_in(kept, "/v1/resources").await?)
 }
 
 /// The project's packages, as Node resolves them.

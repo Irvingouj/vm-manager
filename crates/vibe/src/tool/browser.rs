@@ -42,7 +42,7 @@ use tokio::time::Instant;
 use url::{Url, form_urlencoded};
 
 use super::client::{self, Installation, Reply, Sign};
-use super::{Ending, failed, not_success, shell_word, unexpected};
+use super::{Ending, failed, not_success, unexpected};
 use crate::oidc::secret::Secret;
 use crate::oidc::tool::{check_code, shown_code};
 
@@ -81,7 +81,7 @@ pub async fn sign_in(
     let base = Url::parse(sign_in_address)
         .ok()
         .filter(|u| matches!(u.scheme(), "http" | "https") && u.host_str().is_some())
-        .ok_or_else(|| unexpected(at.connect, "the sign-in address it gave is not one"))?;
+        .ok_or_else(|| unexpected(*at, "the sign-in address it gave is not one"))?;
     let verifier = Secret::random().ok_or_else(|| {
         Ending::new(
             1,
@@ -422,13 +422,13 @@ async fn poll(
         Ok(reply) => reply,
         // Late: asked again at the next poll, or ended at the deadline.
         Err(client::Failure::Unreachable(_)) if Instant::now() >= deadline => return Ok(None),
-        Err(failure) => return Err(failed(at.connect, failure)),
+        Err(failure) => return Err(failed(*at, failure)),
     };
     match reply.status {
         StatusCode::CREATED => reply
             .json
             .map(Some)
-            .ok_or_else(|| unexpected(at.connect, "its answer is not JSON")),
+            .ok_or_else(|| unexpected(*at, "its answer is not JSON")),
         StatusCode::CONFLICT
             if reply
                 .json
@@ -439,7 +439,7 @@ async fn poll(
         {
             Ok(None)
         }
-        _ => Err(not_success(at.connect, &reply)),
+        _ => Err(not_success(*at, &reply)),
     }
 }
 
@@ -449,10 +449,9 @@ fn not_finished(at: &Installation<'_>, address: &Url, timeout: Duration) -> Endi
         3,
         "sign-in-not-finished",
         format!(
-            "the sign-in was not finished within {} seconds: nobody confirmed it at {address} (nothing was kept). When you are ready, run `vibe sign-in --domain {} --connect {}` again and answer in the browser",
+            "the sign-in was not finished within {} seconds: nobody confirmed it at {address} (nothing was kept). When you are ready, run `vibe sign-in {}` again and answer in the browser",
             timeout.as_secs(),
-            shell_word(at.domain),
-            at.connect
+            at.options()
         ),
     )
 }
