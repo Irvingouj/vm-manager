@@ -2339,3 +2339,53 @@ In every one of them the browser's own `Origin`, `Referer` policy, `Sec-Fetch-..
 
 - Another browser than Firefox (Chromium, Safari), and a browser on Windows or macOS: the pages use nothing one of them lacks, but none of them runs here.
 - An Application's own pages: what a Builder writes is theirs to test.
+
+## The program serves TLS itself (ticket: The program serves TLS itself with a supplied wildcard certificate)
+
+For an installation with no reverse proxy before it: `vibe serve` ends TLS itself, with the wildcard certificate and the key the Platform administrator supplies. Without the two values below nothing changes: the program listens in plain HTTP, for a reverse proxy or a test, as before.
+
+### The two files
+
+- `VIBE_TLS_CERT_FILE` and `VIBE_TLS_KEY_FILE`, in the environment of `vibe serve` (as `VIBE_CA_FILE` is; there is no option for them): the certificate file, in PEM, the installation's certificate first and the certificates of its chain after it (one to ten certificates), and its private key, in PEM (`PRIVATE KEY`, `RSA PRIVATE KEY` or `EC PRIVATE KEY`; an RSA key of 2048 bits or more, an ECDSA key on P-256 or P-384, or an Ed25519 key). Each file is at most 1 MiB. An empty value counts as not set.
+- **Both or neither.** One set without the other is a start-up failure whose message names the one that is missing.
+- With both, the listening address serves **HTTPS only**: TLS 1.3 and TLS 1.2, HTTP/1.1 (the one protocol offered by ALPN). Bytes that are not a TLS handshake (a plain-HTTP request to that port) get no HTTP answer: the connection is closed. No client certificate is asked for. The same certificate is presented whatever server name the client asks for; which Application a request is for comes from its `Host`, as ever.
+- A handshake that is not finished within 10 seconds is ended, and the connection closed; a connection in its handshake counts against the same bounds as any other connection of the program.
+- `--public-scheme http` together with the two values is a start-up failure whose message names `--public-scheme` (what is served is HTTPS). The public port is as before: `443` unless `--public-port` says otherwise, whatever port the program listens on.
+- The listening line says `"tls": true` or `"tls": false`.
+
+### What is checked at start
+
+Each of these is a start-up failure as "Serving" says (exit code not `0`, within 15 seconds, before the listening line and before any connection is taken), with a message that names the variable and the file's path and says why in words; **no message, log line or error ever shows a byte of the key or of the key's file**:
+
+- a file that cannot be read, is empty, is larger than 1 MiB, or holds no certificate (no key);
+- a certificate file with more than ten certificates, or whose first certificate cannot be parsed;
+- a key file that holds more than one key, a key that is encrypted (a passphrase is not supported; the message says so), or a key of a kind not named above;
+- **a key that is not the key of the first certificate** (the message says the two do not belong together and names both files);
+- **a first certificate that does not cover `*.<domain>`**: among its DNS names (subject alternative names; the common name is not looked at) there is none that is exactly `*.<domain>` for the `--domain` given. The message names `*.<domain>` and lists the names the certificate does have (at most ten of them).
+
+A certificate that is expired or not valid yet is **not** a start-up failure: it is served (a browser will say what is wrong with it), and the log says so at each load, below. (Decided by the driving session: an installation that comes back after a restart with an expired certificate should say so in its log and to browsers, not refuse to run and take the tool's `vibe logs` with it.)
+
+### Read again when they change
+
+- The program looks at the two files every 5 seconds. When what they hold has changed and the pair passes every check above, connections accepted from then on get the new certificate: **within 10 seconds of the files' change**. Connections already open go on with the certificate they began with.
+- A changed pair that does not pass (the certificate replaced a moment before its key; a file half written; a certificate for another domain) changes nothing: the certificate in use goes on being served, and the log says why once for that content, not every 5 seconds. When the files change again, they are looked at again.
+- The files are found by their path each time, so a replacement by renaming, by writing in place, or by pointing a symbolic link elsewhere (as an orchestrator's mounted secret does) is seen all the same.
+- The log: `{"event":"tls-certificate-loaded","names":[...],"not_before":"<RFC 3339>","not_after":"<RFC 3339>","fingerprint_sha256":"<64 hex digits of the first certificate>","valid_now":<bool>}` at start and at each replacement taken; `{"event":"tls-certificate-refused","reason":"<words>"}` for a changed pair that was not taken. Neither holds anything of the key.
+
+### What is the same as behind a proxy
+
+Everything the platform derives from how it is reached is as with `--public-scheme https` behind a reverse proxy, and the tests that show it for that case are run this way too: the sign-in address and the redirect address (`https://auth.<domain>[:<port>]/callback`); every redirect of the sign-in, of an Application's first request and of the sign-out; the cookies (`__Host-`, `Secure`); the `Origin` a form's request is compared with; the address the tool's sign-in prints. The tool reaches such an installation as "The tool reaches an installation over HTTPS" says (`VIBE_CA_FILE` for a certificate of a company's own authority), and `vibe logs --follow` receives entries as they come. A browser walks it: one of the walks of "A real browser in the gate" (sign-in, the Dashboard, an Application opened from it) is run against the program's own TLS, with no front of the harness between them.
+
+### The Compose file
+
+- `deploy/compose.own-tls.yaml`, given after `compose.yaml` with `-f` as the other two: there is no `proxy` service; `vibe` itself is published at `VIBE_BIND:VIBE_HTTPS_PORT` (`127.0.0.1` and `443` without them) and reads `deploy/certs/fullchain.pem` and `deploy/certs/privkey.pem`, mounted read-only (`/etc/vibe/certs`), named by the two variables. The key must be readable by the image's user: `deploy/README.md` says which number that is and the two commands that give it the key. Everything else of `vibe` as started by the file stays as "Installing" says: read-only root filesystem, no capability, `no-new-privileges`, not root, no tmpfs; its mounts are then `/etc/vibe/ca` and `/etc/vibe/certs`, both read-only.
+- It cannot be given together with `compose.own-proxy.yaml` (each replaces the proxy with something else): `deploy/README.md` says so. With `compose.own-postgres.yaml` it can.
+- `deploy/README.md` documents it as the alternative to the file's reverse proxy: what it is for, the command, replacing the certificate (copy the new files over the old ones, key last or both by renaming; the program takes them within 10 seconds, no restart; `docker compose logs vibe` shows `tls-certificate-loaded`), and what it lacks beside the proxy (HTTP/2).
+- It is a file of a release from the next version on: `scripts/release-files.sh` writes it beside the two other files and `SHA256SUMS` has its line ("What a release holds": the list grows by it; `v0.1.0`, already published, does not have it, and nothing that names `v0.1.0`'s files changes).
+- The install tests show it: with `compose.own-tls.yaml` and the three required values, the installation comes up with no `proxy` container; `https://api.<domain>/v1/installation` is answered by `vibe` itself with the wildcard certificate; OIDC is connected, a person signs in, and the template's Application deployed with the tool answers her at `https://<application>.<domain>/`; `docker inspect` shows the same hardening and the two read-only mounts; the certificate files replaced in `deploy/certs/` are served to a new connection within 10 seconds with no container restarted; without the key readable by the image's user, `vibe` does not start and its log names `VIBE_TLS_KEY_FILE` and says the file cannot be read.
+
+### What this does not close
+
+- HTTP/2 and HTTP/3 from the program itself; a listener on port 80 that redirects to HTTPS; `Strict-Transport-Security`.
+- Certificates got by the program itself (ACME); a certificate per Application; client certificates.
+- TLS older than 1.2 is not offered (the library built in has none); no test of the gate shows a TLS 1.1 client being refused, since the harness's own client cannot speak it.
