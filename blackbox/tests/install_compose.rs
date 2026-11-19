@@ -17,9 +17,11 @@
 use blackbox::DOMAIN;
 use blackbox::connection::SecretKey;
 use blackbox::install::{
-    COMPOSE, DOCKER_WAIT, Install, OWN_POSTGRES, OWN_PROXY, read_deploy_file, tag_of,
+    COMPOSE, DOCKER_WAIT, Install, OWN_POSTGRES, OWN_PROXY, free_port, image, read_deploy_file,
+    tag_of,
 };
 use blackbox::shared_database::token;
+use blackbox::tls::Authority;
 use serde_json::Value;
 
 /// The values of the contract's table.
@@ -148,21 +150,107 @@ fn assert_option(words: &[String], option: &str, value: &str) {
 #[test]
 #[ignore = "needs Docker and a built image: scripts/install-gate.sh"]
 fn compose_refuses_each_missing_required_value_naming_it() {
-    for name in ["VIBE_DOMAIN", "VIBE_SECRET_KEY", "POSTGRES_PASSWORD"] {
+    for name in ["VIBE_DOMAIN", "VIBE_SECRET_KEY"] {
         let mut install = with_required(&[COMPOSE]);
         install.unset(name);
         assert_refused_naming(&install, name);
     }
-    // With the three, the file as downloaded is taken.
+    // With them, the file as downloaded is taken.
     configured(&with_required(&[COMPOSE]));
+    // POSTGRES_PASSWORD is not one Compose asks for: the bundled Postgres
+    // does (CONTRACT.md, "The Compose files"; see
+    // without_postgres_password_the_bundled_postgres_does_not_start_and_vibe_is_never_started).
+    // Not in the .env (and never in the environment the harness gives
+    // docker), or an empty line of it: `config` takes the file.
+    let mut install = with_required(&[COMPOSE]);
+    install.unset("POSTGRES_PASSWORD");
+    configured(&install);
+    let mut install = with_required(&[COMPOSE]);
+    install.set("POSTGRES_PASSWORD", "");
+    configured(&install);
+}
+
+/// How long `docker compose up -d` may take to end when the bundled
+/// Postgres does not start.
+const REFUSED_UP_WAIT: std::time::Duration = std::time::Duration::from_secs(180);
+
+/// `docker compose up -d` of `compose.yaml` with the two values Compose
+/// asks for and `postgres_password` as the `.env`'s line of it (`None`: no
+/// line at all), and what follows from the contract: `config` passes, `up`
+/// ends other than `0` within three minutes, `vibe` was never started, and
+/// the `postgres` service's log names `POSTGRES_PASSWORD`. Everything is
+/// taken down with its volumes when `install` is dropped, whatever
+/// happens.
+fn assert_postgres_asks_for_its_password(postgres_password: Option<&str>) {
+    let image = image();
+    let mut install = with_required(&[COMPOSE]);
+    install.unset("POSTGRES_PASSWORD");
+    install.set("VIBE_IMAGE", &image);
+    install.set("VIBE_HTTPS_PORT", &free_port().to_string());
+    let authority = Authority::new("Harness authority of the wildcard certificate");
+    install.certificates(&authority.issue(&[&format!("*.{DOMAIN}")]));
+    install.write_env();
+    if let Some(line) = postgres_password {
+        let env = std::fs::read_to_string(install.dir().join(".env")).unwrap();
+        install.write_file(".env", format!("{env}{line}\n").as_bytes());
+    }
+    let case = postgres_password.map_or_else(
+        || "no POSTGRES_PASSWORD in .env".to_owned(),
+        |line| format!("the line {line:?} in .env"),
+    );
+
+    let config = install.compose(&["config", "--quiet"], DOCKER_WAIT);
+    assert!(
+        config.ok(),
+        "expected `docker compose config` to take compose.yaml with {case}: Compose does not ask for POSTGRES_PASSWORD\n{}",
+        config.describe(&install.secrets())
+    );
+
+    let up = install.compose(&["up", "-d"], REFUSED_UP_WAIT);
+    assert!(
+        up.code.is_some_and(|c| c != 0),
+        "expected `docker compose up -d` with {case} to end other than 0 within {REFUSED_UP_WAIT:?}\n{}",
+        up.describe(&install.secrets())
+    );
+
+    for (service, id) in install.containers() {
+        if service != "vibe" {
+            continue;
+        }
+        let state = &install.inspect(&id)["State"];
+        let status = state["Status"].as_str().unwrap_or_default();
+        let started = state["StartedAt"].as_str().unwrap_or_default();
+        assert!(
+            status == "created" && started.starts_with("0001-01-01"),
+            "expected the vibe container never started with {case}: its state is {status:?}, started at {started:?}"
+        );
+    }
+
+    let logs = install.compose(&["logs", "--no-color", "postgres"], DOCKER_WAIT);
+    assert!(
+        logs.ok() && logs.stdout.contains("POSTGRES_PASSWORD"),
+        "expected `docker compose logs postgres` (ending with 0) to name POSTGRES_PASSWORD with {case}: the bundled Postgres itself asks for it\n{}",
+        logs.describe(&install.secrets())
+    );
+}
+
+#[test]
+#[ignore = "needs Docker and a built image: scripts/install-gate.sh"]
+fn without_postgres_password_the_bundled_postgres_does_not_start_and_vibe_is_never_started() {
+    assert_postgres_asks_for_its_password(None);
+}
+
+#[test]
+#[ignore = "needs Docker and a built image: scripts/install-gate.sh"]
+fn with_an_empty_postgres_password_the_bundled_postgres_does_not_start_and_vibe_is_never_started() {
+    assert_postgres_asks_for_its_password(Some("POSTGRES_PASSWORD="));
 }
 
 #[test]
 #[ignore = "needs Docker and a built image: scripts/install-gate.sh"]
 fn with_the_administrators_postgres_compose_refuses_a_missing_database_url_naming_it() {
-    // POSTGRES_PASSWORD stays set, so that no refusal of the base file
-    // hides this one; the message is only to name VIBE_DATABASE_URL (it may
-    // name others too).
+    // POSTGRES_PASSWORD stays set, so that nothing else is missing; the
+    // message is only to name VIBE_DATABASE_URL (it may name others too).
     let mut install = with_required(&[COMPOSE, OWN_POSTGRES]);
     install.unset("VIBE_DATABASE_URL");
     assert_refused_naming(&install, "VIBE_DATABASE_URL");

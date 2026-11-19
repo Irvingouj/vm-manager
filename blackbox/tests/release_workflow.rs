@@ -417,6 +417,37 @@ fn the_jobs_that_pack_the_tool_check_a_download_with_the_pages_command_of_each_s
 }
 
 #[test]
+fn the_workflow_runs_both_gates_with_no_fail_fast() {
+    let workflow = workflow();
+    for script in ["scripts/gate.sh", "scripts/install-gate.sh"] {
+        let calls: Vec<String> = jobs(&workflow)
+            .values()
+            .flat_map(|job| {
+                runs_of(job)
+                    .lines()
+                    .filter(|line| {
+                        line.split_whitespace()
+                            .any(|w| w == script || w == format!("./{script}"))
+                    })
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert!(
+            !calls.is_empty(),
+            "expected a step of the workflow to run {script}"
+        );
+        for call in &calls {
+            assert!(
+                call.split_whitespace().any(|w| w == "--no-fail-fast"),
+                "expected {script} run with --no-fail-fast, so that one run says everything that fails on the runner; the step runs {:?}",
+                call.trim()
+            );
+        }
+    }
+}
+
+#[test]
 fn the_jobs_that_publish_run_only_for_a_tag_and_need_every_job_that_checks() {
     let workflow = workflow();
     let jobs = jobs(&workflow);
