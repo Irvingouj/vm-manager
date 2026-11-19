@@ -9,7 +9,7 @@
 # the same way, keeps the files as the run's artefacts for 7 days, and
 # publishes nothing.
 #
-# Jobs: check (scripts/release-check.sh), gate (scripts/gate.sh), image
+# Jobs: check (scripts/release-check.sh), gate (scripts/gate-hosted.sh), image
 # (scripts/install-gate.sh; the image it passed is kept), tool (built,
 # packed and tried on Linux and on macOS), files (the Compose files and
 # SHA256SUMS beside the archives), and publish, which needs all of them and
@@ -61,9 +61,12 @@ jobs:
           fi
 
   gate:
-    name: gate.sh
+    name: gate-hosted.sh
     runs-on: ubuntu-24.04
-    timeout-minutes: 240
+    # The whole gate took 114 minutes in a rehearsal; the test
+    # files that fail side by side are then run again alone, one test at a
+    # time. 360 is a hosted job's limit.
+    timeout-minutes: 300
     steps:
       # All history: a test of the gate builds the program of an earlier
       # commit (blackbox/src/history_earlier.rs).
@@ -86,8 +89,33 @@ jobs:
           fi
       - name: libclang (pg_query's bindgen)
         run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends libclang-dev
-      - name: The gate
-        run: scripts/gate.sh --no-fail-fast
+      - name: Allow unprivileged user namespaces
+        run: |
+          # One test of the local run (blackbox/tests/local_offline.rs) makes
+          # a network namespace of its own without administrator rights.
+          # Ubuntu 24.04's kernel, with its apparmor package, restricts
+          # unprivileged user namespaces by default: a process may make one
+          # but has no capability in it, so writing its uid_map fails
+          # ("Operation not permitted" in a rehearsal). Ubuntu's 24.04
+          # release notes give this one switch to lift that restriction:
+          # https://discourse.ubuntu.com/t/ubuntu-24-04-lts-noble-numbat-release-notes/39890
+          # (the sysctl and its default of 1: https://bugs.launchpad.net/bugs/2046477;
+          # GitHub's runner image has it on: https://github.com/actions/runner-images/issues/10443).
+          # It is set until the machine stops; the runner is thrown away
+          # after this job.
+          setting=/proc/sys/kernel/apparmor_restrict_unprivileged_userns
+          if [ -e "$setting" ]; then
+            echo "kernel.apparmor_restrict_unprivileged_userns was $(cat "$setting")"
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          else
+            echo "this kernel has no kernel.apparmor_restrict_unprivileged_userns; nothing to allow"
+          fi
+      - name: A user can make a network namespace with only the loopback
+        # The test's own check (local_offline.rs), so that a runner that
+        # still forbids it fails here, saying so, not two hours later.
+        run: unshare -rn sh -c "ip link set lo up && exec unshare -U --map-user=$(id -u) --map-group=$(id -g) true"
+      - name: The gate (run whole, then each test file that failed once more alone)
+        run: scripts/gate-hosted.sh
 
   image:
     name: install-gate.sh
