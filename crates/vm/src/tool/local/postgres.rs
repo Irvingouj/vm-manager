@@ -456,14 +456,14 @@ impl Local {
     /// Makes the data folder with initdb, unless it is there; then makes
     /// `pg_hba.conf` its one line. `own` is the command's own folder. Its
     /// step is `initdb`: making the data folder with initdb; it fails
-    /// `timed-out` past [`INITDB_WAIT`], else `ended` (initdb failed, or
-    /// what it needs could not be written).
+    /// `timed-out` past [`INITDB_WAIT`], else `ended` (initdb failed). A
+    /// data folder or `pg_hba.conf` that cannot be written is `local-state`.
     pub(super) async fn initdb(
         &self,
         programs: &Programs,
         state: &State,
         own: &Path,
-    ) -> Result<(), PgFailed> {
+    ) -> Result<(), StartFailed> {
         const STEP: &str = "initdb";
         const WHAT: &str = "making its data folder with initdb";
         let ended = |said: String| PgFailed::new(STEP, WHAT, Cause::Ended).said(said);
@@ -473,8 +473,9 @@ impl Local {
         }
         // A folder left without a cluster (a reset's, or an initdb that
         // failed) is emptied, not removed: initdb takes an empty folder.
-        empty_folder(&data)
-            .map_err(|e| ended(format!("{} cannot be made anew ({e})", data.display())))?;
+        empty_folder(&data).map_err(|e| {
+            StartFailed::State(format!("{} cannot be made anew ({e})", data.display()))
+        })?;
         // In the command's own folder (private, in TMPDIR), not the project.
         let password_file = own.join(".initdb-password");
         fs::remove_file(&password_file).ok();
@@ -486,7 +487,7 @@ impl Local {
             .and_then(|mut file| file.write_all(state.superuser.0.as_bytes()));
         if let Err(error) = written {
             fs::remove_file(&password_file).ok();
-            return Err(ended(format!(
+            return Err(StartFailed::Own(format!(
                 "{} cannot be written ({error})",
                 password_file.display()
             )));
@@ -518,13 +519,13 @@ impl Local {
         )
         .await;
         fs::remove_file(&password_file).ok();
-        let failed = |failed: PgFailed| {
+        let failed = |failed: StartFailed| {
             fs::remove_dir_all(&data).ok();
             failed
         };
         let ran = ran
-            .map_err(|_| failed(PgFailed::timed_out(STEP, WHAT, INITDB_WAIT)))?
-            .map_err(|e| failed(ended(format!("initdb cannot be run ({e})"))))?;
+            .map_err(|_| failed(PgFailed::timed_out(STEP, WHAT, INITDB_WAIT).into()))?
+            .map_err(|e| failed(ended(format!("initdb cannot be run ({e})")).into()))?;
         if !ran.status.success() {
             let words = ran.err.text();
             let first: Vec<&str> = words
@@ -532,16 +533,15 @@ impl Local {
                 .filter(|l| !l.trim().is_empty())
                 .take(4)
                 .collect();
-            return Err(failed(ended(format!(
-                "initdb failed: {}",
-                first.join(" / ")
-            ))));
+            return Err(failed(
+                ended(format!("initdb failed: {}", first.join(" / "))).into(),
+            ));
         }
         fs::write(
             data.join("pg_hba.conf"),
             format!("# Written by vm: password logins from {HOST} only.\nhost all all {HOST}/32 scram-sha-256\n"),
         )
-        .map_err(|e| failed(ended(format!("pg_hba.conf cannot be written ({e})"))))
+        .map_err(|e| failed(StartFailed::State(format!("pg_hba.conf cannot be written ({e})"))))
     }
 
     /// The address of `database` as the superuser.
@@ -716,6 +716,38 @@ fn empty_folder(folder: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Why the private Postgres could not be made or started: Postgres's own
+/// failure (`postgres-failed`); `.vm/local/` that cannot be written
+/// (`local-state`); or something of the program's own that is not
+/// Postgres's, the command's own folder or a free port (`failed`).
+pub(super) enum StartFailed {
+    Pg(PgFailed),
+    State(String),
+    Own(String),
+}
+
+impl From<PgFailed> for StartFailed {
+    fn from(failed: PgFailed) -> Self {
+        Self::Pg(failed)
+    }
+}
+
+impl StartFailed {
+    pub(super) fn ending(&self, command: &str) -> super::super::Ending {
+        match self {
+            Self::Pg(failed) => failed.ending(command),
+            Self::State(why) => super::local_state_failed(why, command),
+            Self::Own(why) => super::super::Ending::new(
+                1,
+                "failed",
+                format!(
+                    "{command} could not start the private Postgres: {why}. Run {command} again"
+                ),
+            ),
+        }
+    }
+}
+
 /// Why a server started was not ready.
 enum Ready {
     Ended(std::process::ExitStatus),
@@ -755,14 +787,14 @@ impl Server {
     /// Starts the server on the data folder of `local`, on a free port.
     /// Its step is `start`: starting it until it says it is ready; it
     /// fails `timed-out` past [`READY_WAIT`], else `ended`.
-    pub(super) async fn start(local: &Local, programs: &Programs) -> Result<Self, PgFailed> {
+    pub(super) async fn start(local: &Local, programs: &Programs) -> Result<Self, StartFailed> {
         const STEP: &str = "start";
         const WHAT: &str = "starting";
         let ended = |said: String| PgFailed::new(STEP, WHAT, Cause::Ended).said(said);
         let log_path = local.dir.join("postgres.log");
         let mut last = ended(String::new());
         for _ in 0..PORT_ATTEMPTS {
-            let port = free_port().map_err(ended)?;
+            let port = free_port().map_err(StartFailed::Own)?;
             // In append mode (`O_APPEND`), which Postgres inherits: each of
             // its writes goes to the end of the file as it is at that
             // moment, so emptying the file while it runs ([`trim_log`])
@@ -777,10 +809,12 @@ impl Server {
                 .mode(0o600)
                 .open(&log_path)
                 .and_then(|file| file.set_len(0).map(|()| file))
-                .map_err(|e| ended(format!("{} cannot be written ({e})", log_path.display())))?;
-            let log_too = log
-                .try_clone()
-                .map_err(|e| ended(format!("{} cannot be written ({e})", log_path.display())))?;
+                .map_err(|e| {
+                    StartFailed::State(format!("{} cannot be written ({e})", log_path.display()))
+                })?;
+            let log_too = log.try_clone().map_err(|e| {
+                StartFailed::State(format!("{} cannot be written ({e})", log_path.display()))
+            })?;
             let mut command = tokio::process::Command::new(programs.program("postgres"));
             command
                 .arg("-D")
@@ -796,9 +830,17 @@ impl Server {
                     "max_connections=60",
                     "-c",
                     "shared_buffers=32MB",
-                    // Test rows: a commit need not wait for the disk.
+                    // Everything in it can be made again (blackbox/CONTRACT.md,
+                    // "The local databases do not wait on the disk"): nothing
+                    // waits on the disk, and the local databases are not kept
+                    // through a crash of the machine or a loss of power. A
+                    // commit is still with the operating system before it is
+                    // answered (synchronous_commit stays on), so a kill of vm
+                    // or of Postgres loses nothing answered.
                     "-c",
-                    "synchronous_commit=off",
+                    "fsync=off",
+                    "-c",
+                    "full_page_writes=off",
                 ])
                 .current_dir(local.data())
                 .stdin(Stdio::null())
@@ -846,7 +888,7 @@ impl Server {
                 }
             }
         }
-        Err(last)
+        Err(last.into())
     }
 
     /// Waits until `postmaster.pid` says the server is ready.

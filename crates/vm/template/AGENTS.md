@@ -80,6 +80,8 @@ The Resources there are stand-ins with the real structure and none of the compan
 
 Test rows are SQL files of the project, never deployed: `test-rows/<name>.sql` for the stand-in of a pulled Resource `<name>`, and `test-rows/own-database.sql` for the own database, mostly `INSERT` statements. Each is loaded when it changes (a stand-in emptied first; the own database made anew first). Run `vm local reset` to start the local databases over.
 
+The local databases are not kept through a crash of the machine or a loss of power: they do not wait on the disk, so that local runs stay fast. A kill of `vm` or of its Postgres loses nothing that was answered. After such a crash a local run may end `postgres-failed`; run `vm local reset`, which starts the local databases anew and loads the test rows again. Rows that must be there after that belong in the project's `test-rows/` files, not only in the local databases.
+
 For the Builder, run `vm dev` (where it can keep running, never as a step that must finish): it serves the project at `http://<name>.localhost:7480/` in their browser, where they choose the test User, and rebuilds it when the project changes. While it runs, your own `vm request` and `vm local` commands are answered by that `vm dev`, as fast as a page.
 
 ## Deploying
