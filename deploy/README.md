@@ -160,7 +160,7 @@ Instead of the proxy of `compose.yaml`, for an installation that wants no proxy 
 docker compose -f compose.yaml -f compose.own-tls.yaml up -d
 ```
 
-There is no `proxy` container then. `vibe` reads `certs/fullchain.pem` (your certificate for `*.vibe.example.com` first, its intermediate certificates after it, at most ten certificates) and `certs/privkey.pem` (its key, not encrypted: `PRIVATE KEY`, `RSA PRIVATE KEY` or `EC PRIVATE KEY`), mounted read-only at `/etc/vibe/certs`. It runs as the image's user `65532`, not as root, so the key must be readable by that user:
+There is no `proxy` container then. `vibe` reads `certs/fullchain.pem` (your certificate for `*.vibe.example.com` first, its intermediate certificates after it, at most ten certificates) and `certs/privkey.pem` (its key, not encrypted: `PRIVATE KEY`, `RSA PRIVATE KEY` or `EC PRIVATE KEY`; an RSA key of 2048 to 4096 bits, an ECDSA key on P-256 or P-384, or an Ed25519 key, the kinds the program takes), mounted read-only at `/etc/vibe/certs`. It runs as the image's user `65532`, not as root, so the key must be readable by that user:
 
 ```sh
 sudo chown 65532 certs/privkey.pem

@@ -475,8 +475,7 @@ fn pkcs8_kind(der: &[u8]) -> Option<KeyKind> {
             rsa_kind(private)?
         }
         OID_EC => {
-            let curve = algorithm.next(OID)?;
-            let kind = curve_kind(curve);
+            let kind = named_or_written_out(&mut algorithm)?;
             if matches!(kind, KeyKind::Taken) {
                 // The key itself must be a SEC 1 structure.
                 sec1_kind(private)?;
@@ -531,10 +530,27 @@ fn sec1_kind(der: &[u8]) -> Option<KeyKind> {
     }
     match key.peek() {
         Some(CONTEXT_0) => {
-            let curve = Der::whole(key.next(CONTEXT_0)?, OID)?.rest;
-            Some(curve_kind(curve))
+            let mut parameters = Der::new(key.next(CONTEXT_0)?);
+            let kind = named_or_written_out(&mut parameters)?;
+            parameters.is_empty().then_some(kind)
         }
         _ => Some(KeyKind::Taken),
+    }
+}
+
+/// An EC key's parameters: the curve named by its OID, or written out as a
+/// SEQUENCE of its parameters (a kind not taken: ring takes named curves
+/// only).
+fn named_or_written_out(parameters: &mut Der<'_>) -> Option<KeyKind> {
+    match parameters.peek()? {
+        OID => Some(curve_kind(parameters.next(OID)?)),
+        SEQUENCE => {
+            parameters.next(SEQUENCE)?;
+            Some(KeyKind::NotTaken(
+                "an ECDSA key whose curve is written out as parameters instead of named",
+            ))
+        }
+        _ => None,
     }
 }
 

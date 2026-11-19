@@ -59,6 +59,12 @@ enum Command {
     /// Serve Applications, each on <name>.<domain>, and the platform's API
     /// on api.<domain>. The platform database is named by VIBE_DATABASE_URL,
     /// the installation's key is VIBE_SECRET_KEY.
+    ///
+    /// To serve HTTPS itself, with no reverse proxy before it, set both
+    /// VIBE_TLS_CERT_FILE, the PEM file of the certificate for *.<domain>
+    /// and its chain, and VIBE_TLS_KEY_FILE, the PEM file of its private key
+    /// (RSA of 2048 to 4096 bits, ECDSA on P-256 or P-384, or Ed25519); they
+    /// are read again when they change. Without them it serves plain HTTP.
     Serve(Serve),
     /// Print the setup credential, good for 24 hours for connecting OIDC
     /// once (vibe admin connect-oidc). The platform database is named by
