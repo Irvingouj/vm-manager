@@ -1,0 +1,20 @@
+# Behind your own reverse proxy instead of the proxy of compose.yaml:
+#
+#   docker compose -f compose.yaml -f compose.own-proxy.yaml up -d
+#
+# There is no proxy service then, and the program's own port is published,
+# plain HTTP, for your proxy only:
+#   VIBE_HTTP_BIND   the address it is published on: 127.0.0.1 without it
+#   VIBE_HTTP_PORT   the port: 8080 without it
+#
+# Your proxy terminates TLS for *.<domain> and must pass Host on unchanged.
+# The addresses the platform writes come from --public-scheme https and
+# --public-port (VIBE_HTTPS_PORT, 443 without it): the port your proxy is
+# reached at.
+
+services:
+  proxy: !reset null
+
+  vibe:
+    ports:
+      - ${VIBE_HTTP_BIND:-127.0.0.1}:${VIBE_HTTP_PORT:-8080}:8080

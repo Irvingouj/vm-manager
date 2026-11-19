@@ -1,0 +1,172 @@
+# The platform, installed: the program `vibe`, a Postgres 18 for it, and a
+# reverse proxy that terminates TLS. This file works alone, as downloaded,
+# with a `.env` beside it holding the values (see .env.example; README.md
+# is the install document).
+#
+#   docker compose up -d
+#
+# Two other files change it, given after this one with -f:
+#   compose.own-proxy.yaml     your own reverse proxy instead of the proxy here
+#   compose.own-postgres.yaml  your own Postgres 18 instead of the one here
+#
+# The values, from .env:
+#   VIBE_DOMAIN        required. The installation's domain: Applications are
+#                      at <name>.<domain>, the API at api.<domain>, sign-in at
+#                      auth.<domain>.
+#   VIBE_SECRET_KEY    required. The installation's key: 32 random bytes in
+#                      base64 (openssl rand -base64 32). It seals the OIDC
+#                      connection and the sessions; keep it with the data.
+#   POSTGRES_PASSWORD  required with the Postgres here. The password of the
+#                      role vibe (openssl rand -hex 24).
+#   VIBE_BIND          the address the installation is published on:
+#                      127.0.0.1 without it (this machine only); 0.0.0.0
+#                      lets other machines in.
+#   VIBE_HTTPS_PORT    the port browsers and the tool reach: 443 without it.
+#   VIBE_IMAGE         the program's image: this release's without it.
+#   VIBE_CA_FILE       a file of the folder ca/ as the container sees it,
+#                      /etc/vibe/ca/<file>: your company's own certificate
+#                      authority, trusted beside the public ones (for an
+#                      identity provider whose certificate it issued).
+#                      Without it: the public authorities alone.
+
+name: vibe
+
+services:
+  vibe:
+    image: ${VIBE_IMAGE:-ghcr.io/irvingouj/vibe:0.0.0}
+    command:
+      - serve
+      - --domain
+      - ${VIBE_DOMAIN:?VIBE_DOMAIN is required in .env, the installation's domain (see .env.example)}
+      - --listen
+      - 0.0.0.0:8080
+      - --public-scheme
+      - https
+      - --public-port
+      - ${VIBE_HTTPS_PORT:-443}
+    environment:
+      VIBE_SECRET_KEY: ${VIBE_SECRET_KEY:?VIBE_SECRET_KEY is required in .env, the installation's key, made with openssl rand -base64 32}
+      # The platform database: the Postgres here, as the role vibe. With
+      # compose.own-postgres.yaml, VIBE_DATABASE_URL from .env instead.
+      VIBE_DATABASE_URL: ${VIBE_DATABASE_URL:-postgres://vibe:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required in .env, the bundled Postgres's password, made with openssl rand -hex 24}@postgres:5432/vibe}
+      VIBE_CA_FILE: ${VIBE_CA_FILE:-}
+    volumes:
+      # Your company's own certificate authority, if any (VIBE_CA_FILE).
+      - type: bind
+        source: ./ca
+        target: /etc/vibe/ca
+        read_only: true
+    # Hardened: nothing writable, no capability, no privilege to gain, the
+    # image's user (not root). The program writes its log to standard error.
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:18
+    # The image's own user postgres, by number: no root, so no capability.
+    user: "999:999"
+    environment:
+      # The password of the superuser postgres and of the role vibe. The
+      # superuser cannot connect over the network at all (see the script
+      # below); inside the container: docker compose exec postgres psql -U postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-}
+    volumes:
+      # Postgres 18's image keeps its data under /var/lib/postgresql
+      # (/var/lib/postgresql/18/docker). `docker compose down` keeps it;
+      # `docker compose down --volumes` removes it.
+      - postgres-data:/var/lib/postgresql
+    configs:
+      - source: postgres-first-start
+        target: /docker-entrypoint-initdb.d/vibe.sh
+    # Not read-only: Compose places the file of `configs` into the
+    # container, which it cannot do in a read-only one.
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    # Ready once it takes connections over TCP: the first start's script
+    # runs with the server on its socket only.
+    healthcheck:
+      test: ["CMD", "pg_isready", "--host", "127.0.0.1", "--username", "vibe", "--dbname", "vibe"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+    restart: unless-stopped
+    # Published nowhere: only vibe reaches it, on this file's network.
+
+  proxy:
+    image: caddy:2.11.9-alpine
+    # Not root: it listens on 8443 inside the container.
+    user: "65532:65532"
+    ports:
+      - ${VIBE_BIND:-127.0.0.1}:${VIBE_HTTPS_PORT:-443}:8443
+    volumes:
+      # Your wildcard certificate for *.<domain>: fullchain.pem and
+      # privkey.pem (readable by the user 65532).
+      - type: bind
+        source: ./certs
+        target: /etc/caddy/certs
+        read_only: true
+    configs:
+      - source: caddyfile
+        target: /etc/caddy/Caddyfile
+    # Not read-only, as postgres: Compose places the Caddyfile into it.
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      - vibe
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+
+configs:
+  # Run once by the Postgres image, at the first start with an empty data
+  # folder: the role vibe (no superuser; may create databases and roles),
+  # the platform database vibe, CONNECT on postgres and template1 taken from
+  # PUBLIC, and the superuser refused over the network whatever password.
+  postgres-first-start:
+    content: |
+      set -eu
+      psql --no-psqlrc --set ON_ERROR_STOP=1 --username postgres --dbname postgres \
+        --set password="$${POSTGRES_PASSWORD}" <<'SQL'
+      CREATE ROLE vibe LOGIN CREATEDB CREATEROLE NOSUPERUSER PASSWORD :'password';
+      CREATE DATABASE vibe OWNER vibe;
+      REVOKE CONNECT ON DATABASE postgres FROM PUBLIC;
+      REVOKE CONNECT ON DATABASE template1 FROM PUBLIC;
+      SQL
+      { printf 'host all postgres all reject\nhost replication postgres all reject\n'
+        cat "$${PGDATA}/pg_hba.conf"; } > "$${PGDATA}/pg_hba.conf.vibe"
+      mv "$${PGDATA}/pg_hba.conf.vibe" "$${PGDATA}/pg_hba.conf"
+
+  # The proxy: TLS 1.2 or later with the certificate of certs/, every
+  # request passed to vibe with its Host unchanged, no limit of its own on a
+  # request's size or time (the platform has its own), responses streamed
+  # as they come (vibe logs --follow).
+  caddyfile:
+    content: |
+      {
+      	admin off
+      	auto_https off
+      	persist_config off
+      	servers {
+      		protocols h1 h2
+      	}
+      }
+      :8443 {
+      	tls /etc/caddy/certs/fullchain.pem /etc/caddy/certs/privkey.pem {
+      		protocols tls1.2 tls1.3
+      	}
+      	reverse_proxy vibe:8080 {
+      		flush_interval -1
+      	}
+      }

@@ -1,0 +1,27 @@
+# With your own Postgres 18 instead of the Postgres of compose.yaml:
+#
+#   docker compose -f compose.yaml -f compose.own-postgres.yaml up -d
+#
+# There is no postgres service and no volume then. The values, from .env:
+#   VIBE_DATABASE_URL  required. postgres://<role>:<password>@<host>:<port>/<database>:
+#                      your Postgres 18 and the platform database in it, as a
+#                      role that may create databases and roles and is not a
+#                      superuser. The program makes the database when it is not
+#                      there. A server that is not Postgres 18 is refused at
+#                      start, and the vibe container's log says so.
+#   POSTGRES_PASSWORD  not needed.
+#
+# README.md says the two things to do on your Postgres first.
+
+services:
+  postgres: !reset null
+
+  vibe:
+    depends_on: !reset {}
+    environment:
+      VIBE_DATABASE_URL: ${VIBE_DATABASE_URL:?VIBE_DATABASE_URL is required in .env with compose.own-postgres.yaml, the address of your Postgres 18 and the platform database}
+
+volumes: !reset {}
+
+configs:
+  postgres-first-start: !reset null

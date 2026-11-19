@@ -1,0 +1,8 @@
+# The values of an installation, its certificate and its key are never in
+# git; the folders are, empty.
+.env
+!.env.example
+certs/*
+!certs/.gitkeep
+ca/*
+!ca/.gitkeep
