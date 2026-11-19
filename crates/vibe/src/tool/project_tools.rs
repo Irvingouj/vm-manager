@@ -1,5 +1,5 @@
-//! What the commands that run the project's own tools share (`vm check`,
-//! `vm generate`, `vm deploy`; blackbox/CONTRACT.md, "Checking a project",
+//! What the commands that run the project's own tools share (`vibe check`,
+//! `vibe generate`, `vibe deploy`; blackbox/CONTRACT.md, "Checking a project",
 //! "Generating migrations", "Deploying"): the command's own folder in
 //! `TMPDIR` ([`Scratch`]), its end and its signals ([`Signals`]), `node`
 //! and the project's packages as Node resolves them, and where and how a
@@ -53,7 +53,7 @@ const WORDS_CHARS: usize = 2000;
 /// The command that runs the project's tools, as its messages name it.
 #[derive(Clone, Copy)]
 pub(super) struct Who {
-    /// As the Builder runs it: `vm check`.
+    /// As the Builder runs it: `vibe check`.
     pub command: &'static str,
     /// As a message's subject: `the check`.
     pub the: &'static str,

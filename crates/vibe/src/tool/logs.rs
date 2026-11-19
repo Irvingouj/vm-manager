@@ -1,4 +1,4 @@
-//! `vm logs <application> [--request <id>] [--after <cursor>] [--limit
+//! `vibe logs <application> [--request <id>] [--after <cursor>] [--limit
 //! <n>] [--follow] [--json]` (blackbox/CONTRACT.md, "Versions, going back,
 //! and logs: The commands").
 //!
@@ -29,7 +29,7 @@ use super::theirs::Theirs;
 use super::versions::signed_in_for;
 use super::{Done, Ending, Output, get_signed_in, json_line, shaped};
 
-/// `vm logs`.
+/// `vibe logs`.
 #[derive(clap::Args)]
 pub struct LogsArgs {
     /// The Application, by name.
@@ -60,9 +60,9 @@ const FOLLOW_LIMIT: u16 = 1000;
 
 /// How the signals' messages name the command.
 const WHO: Who = Who {
-    command: "vm logs",
-    the: "vm logs",
-    folder: "vm-logs",
+    command: "vibe logs",
+    the: "vibe logs",
+    folder: "vibe-logs",
 };
 
 /// One answer of the API.
@@ -101,7 +101,7 @@ pub(super) async fn logs(args: &LogsArgs) -> Result<Done, Ending> {
     let next = Theirs::from(page.next.as_str());
     writeln!(
         text,
-        "Next: {next} (vm logs {name} --after {next} prints what comes after these)."
+        "Next: {next} (vibe logs {name} --after {next} prints what comes after these)."
     )
     .ok();
     Ok(Done {
@@ -116,7 +116,7 @@ async fn follow(args: &LogsArgs, kept: &Kept) -> Result<Done, Ending> {
         return Err(Ending::new(
             1,
             "output-closed",
-            "vm logs --follow has no standard output (it was closed when the command started), so it would print nothing for ever; it stopped. Run it with its output kept".into(),
+            "vibe logs --follow has no standard output (it was closed when the command started), so it would print nothing for ever; it stopped. Run it with its output kept".into(),
         ));
     }
     let mut signals = Signals::listen(&WHO)?;
@@ -201,7 +201,7 @@ fn print(text: &str) -> Result<(), Ending> {
             Ending::new(
                 1,
                 "output-closed",
-                format!("vm logs could not write its output ({error}), so it stopped"),
+                format!("vibe logs could not write its output ({error}), so it stopped"),
             )
         })
 }

@@ -17,8 +17,8 @@ scripts/fetch-libclang.sh   # libclang from the PyPI wheel into .tools/libclang 
 `.cargo/config.toml` adds `.tools/libclang` to where the build looks, so a plain `cargo build` and `scripts/gate.sh` find it without any variable exported by hand. A `LIBRARY_PATH` or `CLANG_PATH` already set in your shell takes precedence over that file.
 
 ```
-cargo build              # target/debug/vm
-target/debug/vm --version
+cargo build              # target/debug/vibe
+target/debug/vibe --version
 ```
 
 The gate is `scripts/gate.sh`: it checks that `blackbox` depends on no product crate, then runs
@@ -29,8 +29,8 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-- `crates/vm`: the platform program, one binary named `vm` (ADR 0015).
-- `blackbox`: the black-box tests, which start the real `vm` and depend on no product crate (see "How code gets written" in `AGENTS.md`).
+- `crates/vibe`: the platform program, one binary named `vibe` (ADR 0015).
+- `blackbox`: the black-box tests, which start the real `vibe` and depend on no product crate (see "How code gets written" in `AGENTS.md`).
 - `vendor/openworkers-runtime-v8`: the patched execution core (`vendor/VENDORED.md`).
 
 - [Vision](docs/vision.md)

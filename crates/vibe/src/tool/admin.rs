@@ -1,8 +1,8 @@
-//! `vm admin connect-oidc` (blackbox/CONTRACT.md, "The tool signs in
+//! `vibe admin connect-oidc` (blackbox/CONTRACT.md, "The tool signs in
 //! through the browser, and OIDC is connected from the tool: Connecting
-//! OIDC"): `PUT /v1/oidc` with the setup credential (`VM_SETUP_CREDENTIAL`,
+//! OIDC"): `PUT /v1/oidc` with the setup credential (`VIBE_SETUP_CREDENTIAL`,
 //! to `--domain` at `--connect`) or with the tool's own credential, the
-//! client secret from `VM_OIDC_CLIENT_SECRET`. Neither secret is printed
+//! client secret from `VIBE_OIDC_CLIENT_SECRET`. Neither secret is printed
 //! or kept: each is read from the environment, sent, and dropped.
 
 use std::net::SocketAddr;
@@ -21,12 +21,12 @@ use super::{
 use crate::oidc::secret::ClientSecret;
 
 /// The variable that holds the client secret.
-const CLIENT_SECRET_VARIABLE: &str = "VM_OIDC_CLIENT_SECRET";
+const CLIENT_SECRET_VARIABLE: &str = "VIBE_OIDC_CLIENT_SECRET";
 
 /// The variable that holds the setup credential.
-const SETUP_VARIABLE: &str = "VM_SETUP_CREDENTIAL";
+const SETUP_VARIABLE: &str = "VIBE_SETUP_CREDENTIAL";
 
-/// `vm admin`.
+/// `vibe admin`.
 #[derive(clap::Args)]
 pub struct AdminArgs {
     #[command(subcommand)]
@@ -36,13 +36,13 @@ pub struct AdminArgs {
 /// A command for Platform administrators.
 #[derive(clap::Subcommand)]
 pub enum AdminCommand {
-    /// Connect OIDC: with the setup credential in VM_SETUP_CREDENTIAL (and
+    /// Connect OIDC: with the setup credential in VIBE_SETUP_CREDENTIAL (and
     /// --domain and --connect), or as a Platform administrator signed in;
-    /// the client secret in VM_OIDC_CLIENT_SECRET.
+    /// the client secret in VIBE_OIDC_CLIENT_SECRET.
     ConnectOidc(ConnectOidcArgs),
 }
 
-/// `vm admin connect-oidc`.
+/// `vibe admin connect-oidc`.
 #[derive(clap::Args)]
 pub struct ConnectOidcArgs {
     /// With the setup credential: the installation's domain.
@@ -140,7 +140,7 @@ async fn connect_oidc(args: &ConnectOidcArgs) -> Result<Done, Ending> {
                     2,
                     "usage",
                     format!(
-                        "{SETUP_VARIABLE} does not hold a setup credential (vmsc_...): put the one `vm setup` printed in it, then run the command again"
+                        "{SETUP_VARIABLE} does not hold a setup credential (vmsc_...): put the one `vibe setup` printed in it, then run the command again"
                     ),
                 )
             })?;
@@ -159,7 +159,7 @@ async fn connect_oidc(args: &ConnectOidcArgs) -> Result<Done, Ending> {
                     3,
                     "setup-credential-refused",
                     format!(
-                        "the installation at {connect} ({domain}) refused the setup credential: it is used up, replaced by a later one or expired. Run `vm setup` again beside the platform database, put the new one in {SETUP_VARIABLE}, then run this command again"
+                        "the installation at {connect} ({domain}) refused the setup credential: it is used up, replaced by a later one or expired. Run `vibe setup` again beside the platform database, put the new one in {SETUP_VARIABLE}, then run this command again"
                     ),
                 ));
             }

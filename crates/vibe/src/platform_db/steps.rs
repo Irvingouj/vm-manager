@@ -399,7 +399,7 @@ pub const STEPS: &[Step] = &[
         -- OIDC as a connection (crate::oidc::connection; blackbox/
         -- CONTRACT.md, \"The tool signs in through the browser, and OIDC is
         -- connected from the tool\"; ADR 0018). One row at most. The client
-        -- secret is sealed (AES-256-GCM, a key made from VM_SECRET_KEY for
+        -- secret is sealed (AES-256-GCM, a key made from VIBE_SECRET_KEY for
         -- this use alone): this table alone gives no secret.
         CREATE TABLE oidc_connection (
             id integer PRIMARY KEY CHECK (id = 1),
@@ -416,7 +416,7 @@ pub const STEPS: &[Step] = &[
             generation bigint NOT NULL DEFAULT 1
         );
         -- The setup credential (crate::setup): only its SHA-256, and when it
-        -- ends. `vm setup` deletes every row before it makes one, so there
+        -- ends. `vibe setup` deletes every row before it makes one, so there
         -- is one at most.
         CREATE TABLE setup_credentials (
             digest bytea PRIMARY KEY CHECK (length(digest) = 32),

@@ -1,12 +1,12 @@
 //! The setup credential (blackbox/CONTRACT.md, "The setup credential"):
-//! what `vm setup` prints, once, for connecting OIDC when nobody can sign
+//! what `vibe setup` prints, once, for connecting OIDC when nobody can sign
 //! in yet.
 //!
 //! - `vmsc_` and 32 random bytes in base64url; the platform database keeps
 //!   only its SHA-256, and when it ends ([`LIFETIME_SECONDS`] after it was
 //!   made, by the database's clock).
 //! - [`make`] deletes every earlier one in the same transaction: there is
-//!   at most one, and a second `vm setup` ends the first one's.
+//!   at most one, and a second `vibe setup` ends the first one's.
 //! - It is good only for `PUT /v1/oidc` ([`is_live`] first, then used up
 //!   in the transaction that stores the connection,
 //!   crate::oidc::connection); anything else made with it is `401`.

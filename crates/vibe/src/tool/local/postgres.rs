@@ -1,6 +1,6 @@
 //! The project's private Postgres (blackbox/CONTRACT.md, "The local loop:
 //! What a run does", steps 1 to 3): its programs ([`programs`]), the
-//! project's local state under `.vm/local/` ([`Local`]: the lock, the
+//! project's local state under `.vibe/local/` ([`Local`]: the lock, the
 //! passwords, the data), and the server itself ([`Server`]), started for a
 //! run and stopped before the command ends.
 //!
@@ -9,7 +9,7 @@
 //! one line: `scram-sha-256` from `127.0.0.1`. Its superuser
 //! ([`SUPERUSER`]) and the platform's role ([`PLATFORM_ROLE`], `CREATEDB
 //! CREATEROLE`, no superuser) have passwords made from the system's
-//! randomness at the first run, kept only in `.vm/local/state.json` (mode
+//! randomness at the first run, kept only in `.vibe/local/state.json` (mode
 //! `0600`; the folder is `0700`). initdb is given the superuser's in a file
 //! of mode `0600` it reads and that is removed after; the platform's role
 //! gets only its SCRAM verifier. No password is ever an argument, printed or
@@ -43,15 +43,15 @@ use crate::platform_db::{Cause, Connection, DatabaseAddress};
 use tokio_postgres::error::SqlState;
 
 /// The variable naming a Postgres the Builder has.
-pub(super) const BIN_VARIABLE: &str = "VM_LOCAL_POSTGRES_BIN";
+pub(super) const BIN_VARIABLE: &str = "VIBE_LOCAL_POSTGRES_BIN";
 
 /// The variable naming a mirror of Maven Central.
-pub(super) const MIRROR_VARIABLE: &str = "VM_LOCAL_POSTGRES_MIRROR";
+pub(super) const MIRROR_VARIABLE: &str = "VIBE_LOCAL_POSTGRES_MIRROR";
 
 /// The superuser initdb makes.
 const SUPERUSER: &str = "vm_superuser";
 
-/// The platform's role: what `VM_DATABASE_URL`'s role is in an
+/// The platform's role: what `VIBE_DATABASE_URL`'s role is in an
 /// installation.
 pub(super) const PLATFORM_ROLE: &str = "vm";
 
@@ -139,8 +139,8 @@ impl Programs {
 }
 
 /// The user's own folder the programs are downloaded into:
-/// `$XDG_DATA_HOME/vm/postgres/` when that is absolute, else
-/// `$HOME/.local/share/vm/postgres/`.
+/// `$XDG_DATA_HOME/vibe/postgres/` when that is absolute, else
+/// `$HOME/.local/share/vibe/postgres/`.
 fn data_folder() -> Option<PathBuf> {
     let absolute = |name: &str| {
         std::env::var_os(name)
@@ -148,11 +148,11 @@ fn data_folder() -> Option<PathBuf> {
             .filter(|p| p.is_absolute())
     };
     absolute("XDG_DATA_HOME")
-        .map(|d| d.join("vm").join("postgres"))
-        .or_else(|| absolute("HOME").map(|h| h.join(".local/share/vm/postgres")))
+        .map(|d| d.join("vibe").join("postgres"))
+        .or_else(|| absolute("HOME").map(|h| h.join(".local/share/vibe/postgres")))
 }
 
-/// The programs: those `VM_LOCAL_POSTGRES_BIN` names, or those in the
+/// The programs: those `VIBE_LOCAL_POSTGRES_BIN` names, or those in the
 /// user's own folder, downloaded there first if they are not (`say` tells
 /// the Builder before it starts). `own` is the command's own folder.
 pub(super) async fn programs(
@@ -259,7 +259,7 @@ async fn checked(programs: &Programs, own: &Path) -> Result<(), String> {
     }
 }
 
-/// The project's local state: `.vm/local/`.
+/// The project's local state: `.vibe/local/`.
 pub(super) struct Local {
     pub dir: PathBuf,
 }
@@ -288,7 +288,7 @@ pub(super) struct Lock {
 impl Local {
     pub(super) fn of(project: &Path) -> Self {
         Self {
-            dir: project.join(".vm").join("local"),
+            dir: project.join(".vibe").join("local"),
         }
     }
 
@@ -302,7 +302,7 @@ impl Local {
         self.dir.join("postgres")
     }
 
-    /// Makes `.vm/local/` (mode `0700`) unless it is there.
+    /// Makes `.vibe/local/` (mode `0700`) unless it is there.
     pub(super) fn make(&self) -> Result<(), String> {
         let cannot = |e: std::io::Error| format!("{} cannot be made ({e})", self.dir.display());
         if let Some(parent) = self.dir.parent() {
@@ -346,7 +346,7 @@ impl Local {
     /// Takes the lock, trying every [`LOCK_POLL`] while another command
     /// holds it; the caller bounds the wait. While it is held, `other` is
     /// asked at each try whether what holds it is something the caller
-    /// would rather turn to (a `vm dev` that now listens): if so, the wait
+    /// would rather turn to (a `vibe dev` that now listens): if so, the wait
     /// ends with that. `waiting` is called once, when the lock was found
     /// held at two tries in a row: a command that only looks whether the
     /// lock is held takes it for a moment, which is not worth a line.
@@ -540,7 +540,7 @@ impl Local {
         }
         fs::write(
             data.join("pg_hba.conf"),
-            format!("# Written by vm: password logins from {HOST} only.\nhost all all {HOST}/32 scram-sha-256\n"),
+            format!("# Written by vibe: password logins from {HOST} only.\nhost all all {HOST}/32 scram-sha-256\n"),
         )
         .map_err(|e| failed(StartFailed::State(format!("pg_hba.conf cannot be written ({e})"))))
     }
@@ -717,9 +717,9 @@ fn empty_folder(folder: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Why the local state could not be had: `.vm/local/` that cannot be used
+/// Why the local state could not be had: `.vibe/local/` that cannot be used
 /// (`local-state`), or no randomness for a password or a secret (`failed`:
-/// removing `.vm/local/` would not help).
+/// removing `.vibe/local/` would not help).
 pub(super) enum StateFailed {
     State(String),
     NoRandomness(String),
@@ -733,7 +733,7 @@ impl StateFailed {
                 1,
                 "failed",
                 format!(
-                    "{command} could not make a secret: {why}. The operating system gave no randomness, which is not a fault of .vm/local/; run {command} again"
+                    "{command} could not make a secret: {why}. The operating system gave no randomness, which is not a fault of .vibe/local/; run {command} again"
                 ),
             ),
         }
@@ -741,7 +741,7 @@ impl StateFailed {
 }
 
 /// Why the private Postgres could not be made or started: Postgres's own
-/// failure (`postgres-failed`); `.vm/local/` that cannot be written
+/// failure (`postgres-failed`); `.vibe/local/` that cannot be written
 /// (`local-state`); or something of the program's own that is not
 /// Postgres's, the command's own folder or a free port (`failed`).
 pub(super) enum StartFailed {
@@ -823,7 +823,7 @@ impl Server {
             // its writes goes to the end of the file as it is at that
             // moment, so emptying the file while it runs ([`trim_log`])
             // makes its next line the first, not one after a hole of the
-            // size the file had. Checked by hand: with `vm dev` running,
+            // size the file had. Checked by hand: with `vibe dev` running,
             // the file emptied by truncate(1), the next line Postgres wrote
             // was the file's first (76 bytes, no NUL byte). Emptied here,
             // so that a run starts it anew.
@@ -859,7 +859,7 @@ impl Server {
                     // waits on the disk, and the local databases are not kept
                     // through a crash of the machine or a loss of power. A
                     // commit is still with the operating system before it is
-                    // answered (synchronous_commit stays on), so a kill of vm
+                    // answered (synchronous_commit stays on), so a kill of vibe
                     // or of Postgres loses nothing answered.
                     "-c",
                     "fsync=off",

@@ -185,7 +185,7 @@ pub(super) async fn load(
                     "reason": "test-rows-without-own-database",
                     "file": format!("{FOLDER}/{OWN_FILE}"),
                     "message": format!(
-                        "{FOLDER}/{OWN_FILE} holds rows for the own database, and {} has no tables of its own there (the project has no migration): it is not loaded. Describe the tables in src/db/schema.ts and run vm generate to have them, or remove the file",
+                        "{FOLDER}/{OWN_FILE} holds rows for the own database, and {} has no tables of its own there (the project has no migration): it is not loaded. Describe the tables in src/db/schema.ts and run vibe generate to have them, or remove the file",
                         target.application
                     ),
                 }));
@@ -196,7 +196,7 @@ pub(super) async fn load(
                 "file": format!("{FOLDER}/{stem}.sql"),
                 "resource": stem,
                 "message": format!(
-                    "{FOLDER}/{stem}.sql is for a Resource named {stem}, which is not pulled: it is not loaded. Run vm pull {stem} to have its stand-in, or remove the file"
+                    "{FOLDER}/{stem}.sql is for a Resource named {stem}, which is not pulled: it is not loaded. Run vibe pull {stem} to have its stand-in, or remove the file"
                 ),
             }));
         }

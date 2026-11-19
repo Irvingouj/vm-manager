@@ -6,7 +6,7 @@
 //! Interface: [`statements`], a migration's text in, where its single
 //! statements are in it (byte ranges), in order, or the rule it breaks
 //! ([`Refusal`]); and [`parsed`], the same statements with what the parser
-//! made of each (for `vm generate`, which decides on them what a migration
+//! made of each (for `vibe generate`, which decides on them what a migration
 //! destroys), or where it could not read the text ([`Unparseable`]).
 //!
 //! The text is split at `drizzle-kit`'s breakpoint lines, then each part

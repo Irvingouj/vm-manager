@@ -217,13 +217,13 @@ pub fn json(body: String) -> Response<Full<Bytes>> {
 }
 
 /// A sign-in of the tool that failed before it awaited an answer: what
-/// failed, and to run `vm sign-in` again. No link.
+/// failed, and to run `vibe sign-in` again. No link.
 pub fn tool_failed(status: StatusCode, what: &str) -> Response<Full<Bytes>> {
     page(
         status,
         "The tool was not signed in",
         &format!(
-            "<p>{}</p><p>To sign the tool in, run <code>vm sign-in</code> again on your computer.</p>",
+            "<p>{}</p><p>To sign the tool in, run <code>vibe sign-in</code> again on your computer.</p>",
             escape(what)
         ),
     )
@@ -235,7 +235,7 @@ pub fn tool_over() -> Response<Full<Bytes>> {
     page(
         StatusCode::BAD_REQUEST,
         "This sign-in of the tool is over",
-        "<p>It was answered already, pushed out by a newer one, or ended after five wrong check codes or 10 minutes; or it was begun in another browser. Nothing was signed in.</p><p>To sign the tool in, run <code>vm sign-in</code> again on your computer.</p>",
+        "<p>It was answered already, pushed out by a newer one, or ended after five wrong check codes or 10 minutes; or it was begun in another browser. Nothing was signed in.</p><p>To sign the tool in, run <code>vibe sign-in</code> again on your computer.</p>",
     )
 }
 
@@ -295,8 +295,8 @@ pub fn tool_ask(
         ""
     };
     let body = format!(
-        "<p>The command-line tool <code>vm</code> on {machine} asks to be signed in as {who}.</p>\
-         <p><strong>Go on only if you ran <code>vm sign-in</code> yourself, just now.</strong> If someone sent you this address, do not sign in: whoever runs that tool would act as you.</p>\
+        "<p>The command-line tool <code>vibe</code> on {machine} asks to be signed in as {who}.</p>\
+         <p><strong>Go on only if you ran <code>vibe sign-in</code> yourself, just now.</strong> If someone sent you this address, do not sign in: whoever runs that tool would act as you.</p>\
          <p>{where_}</p>{wrong}\
          <form method=\"post\" action=\"/tool\">\
          <input type=\"hidden\" name=\"sign_in\" value=\"{}\">{code}\
@@ -330,7 +330,7 @@ pub fn tool_declined() -> Response<Full<Bytes>> {
     page(
         StatusCode::OK,
         "Nothing was signed in",
-        "<p>The tool was not signed in, and this sign-in is over. If you did mean to sign it in, run <code>vm sign-in</code> again.</p>",
+        "<p>The tool was not signed in, and this sign-in is over. If you did mean to sign it in, run <code>vibe sign-in</code> again.</p>",
     )
 }
 

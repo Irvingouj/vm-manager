@@ -12,12 +12,12 @@
 //! and the order above depends on it. If whoever reads standard error
 //! stops reading, the program stops with it.
 //!
-//! The local run (`vm request`) sends the records to a file of the
+//! The local run (`vibe request`) sends the records to a file of the
 //! project's local state instead ([`to_file`]): its standard error is the
 //! Builder's terminal, and the command prints what matters of them itself.
 //! That file is bounded: once what was written into it passes
 //! [`MAX_FILE_BYTES`], it is emptied and written again from its start
-//! (`vm dev` runs for days).
+//! (`vibe dev` runs for days).
 
 use std::fs::File;
 use std::io::{Seek, SeekFrom, Write};

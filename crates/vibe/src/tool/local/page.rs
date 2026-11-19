@@ -1,4 +1,4 @@
-//! What `vm dev` answers by itself (blackbox/CONTRACT.md, "Which requests
+//! What `vibe dev` answers by itself (blackbox/CONTRACT.md, "Which requests
 //! it serves", "Choosing the test User", "The project as it is now"): its
 //! pages, its redirects, its refusals.
 //!
@@ -228,7 +228,7 @@ pub(super) fn no_user(address: &str) -> Response<Full<Bytes>> {
     plain(
         StatusCode::UNAUTHORIZED,
         format!(
-            "No test User is chosen, so the Application was not given the request. Choose one at {address}_vm/test-user, or send the header Cookie: {COOKIE}=<id> with the id of a test User of vm.dev.json.\n"
+            "No test User is chosen, so the Application was not given the request. Choose one at {address}_vm/test-user, or send the header Cookie: {COOKIE}=<id> with the id of a test User of vibe.dev.json.\n"
         ),
     )
 }
@@ -318,12 +318,12 @@ pub(super) fn chooser(
     let mut body = String::new();
     if let Said::NotInFile(id) = said {
         body.push_str(&format!(
-            "<p class=\"said\">{} is not a test User of vm.dev.json: choose one of those below.</p>\n",
+            "<p class=\"said\">{} is not a test User of vibe.dev.json: choose one of those below.</p>\n",
             escape(id)
         ));
     }
     body.push_str(
-        "<p>The Application runs on this machine and is given each request as the test User chosen here, from vm.dev.json as it is now.</p>\n<ul>\n",
+        "<p>The Application runs on this machine and is given each request as the test User chosen here, from vibe.dev.json as it is now.</p>\n<ul>\n",
     );
     for user in &file.users {
         let is_chosen = chosen == Some(user.id.as_str());

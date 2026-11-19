@@ -1,6 +1,6 @@
 //! The installation's key (blackbox/CONTRACT.md, "The installation's key";
-//! ADR 0018): `VM_SECRET_KEY`, 32 random bytes in base64, in the
-//! environment of `vm serve` only. Every key that seals something is made
+//! ADR 0018): `VIBE_SECRET_KEY`, 32 random bytes in base64, in the
+//! environment of `vibe serve` only. Every key that seals something is made
 //! from it, one for each use (crate::oidc::seal).
 //!
 //! [`InstallationKey`] has no `Debug` and no `Display`, and no message
@@ -10,7 +10,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 
 /// The variable that holds the key.
-pub const VARIABLE: &str = "VM_SECRET_KEY";
+pub const VARIABLE: &str = "VIBE_SECRET_KEY";
 
 /// How many bytes the key is.
 pub const KEY_BYTES: usize = 32;
@@ -19,7 +19,7 @@ pub const KEY_BYTES: usize = 32;
 pub struct InstallationKey([u8; KEY_BYTES]);
 
 impl InstallationKey {
-    /// The key in `VM_SECRET_KEY`: `None` when the variable is not set; a
+    /// The key in `VIBE_SECRET_KEY`: `None` when the variable is not set; a
     /// message naming the variable, never its value, when it is set to
     /// anything but 32 bytes in base64 (empty included).
     pub fn from_environment() -> Result<Option<Self>, String> {

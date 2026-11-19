@@ -262,7 +262,7 @@ pub(crate) fn list(
         if page_number == 1 {
             main.push_str(
                 "<p>Nothing is shared with you yet, and you contribute to no Application.</p>\
-                 <p>When someone shares an Application with you, it shows here. An Application is made with the command-line tool <code>vm</code>: a Coding agent runs it for you.</p>",
+                 <p>When someone shares an Application with you, it shows here. An Application is made with the command-line tool <code>vibe</code>: a Coding agent runs it for you.</p>",
             );
         } else {
             main.push_str("<p>There is no Application on this page.</p>");
@@ -493,7 +493,7 @@ pub(crate) fn application(
              <option value=\"everyone\">everyone who can sign in</option></select>\
              <label for=\"value\">Email address, user id or Group</label>\
              <input id=\"value\" type=\"text\" name=\"value\" autocomplete=\"off\" spellcheck=\"false\">\
-             <p class=\"muted\">Leave it empty for everyone. Contributors are changed with the <code>vm</code> tool.</p>\
+             <p class=\"muted\">Leave it empty for everyone. Contributors are changed with the <code>vibe</code> tool.</p>\
              <button type=\"submit\">Share</button></form>"
         ));
     } else if shared.is_some() {

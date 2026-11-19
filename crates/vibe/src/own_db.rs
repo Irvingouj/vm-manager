@@ -38,7 +38,7 @@
 //! generates, stores in the platform database (table `own_databases`) and
 //! never prints; Postgres is only ever sent SCRAM verifiers.
 //!
-//! The platform's own role (that of `VM_DATABASE_URL`) needs only
+//! The platform's own role (that of `VIBE_DATABASE_URL`) needs only
 //! `CREATEDB` and `CREATEROLE`: it creates the three roles, makes itself
 //! able to `SET ROLE` to the platform's role of the database (what Postgres
 //! asks of a non-superuser creating a database for another role), and
@@ -897,7 +897,7 @@ impl OwnDatabases {
 
     /// The local run's only (blackbox/CONTRACT.md, "Test rows": the own
     /// database made anew before its test rows are loaded again; never
-    /// called by `vm serve`): forgets the own database of `application`,
+    /// called by `vibe serve`): forgets the own database of `application`,
     /// whose database the caller has dropped (the local run's superuser
     /// may; the platform's role may not). Its pool and what this program
     /// knows of it are let go, and its rows of `own_databases` and

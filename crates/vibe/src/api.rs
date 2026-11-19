@@ -984,7 +984,7 @@ impl Api {
             return Some(Answer::error(
                 StatusCode::CONFLICT,
                 "no-secret-key",
-                "this installation was started without an installation's key (VM_SECRET_KEY), so it can keep no client secret: start it with one, then connect OIDC",
+                "this installation was started without an installation's key (VIBE_SECRET_KEY), so it can keep no client secret: start it with one, then connect OIDC",
             ));
         }
         None
@@ -1014,7 +1014,7 @@ impl Api {
             return Ok(match oidc_connection::read(&self.signing.database).await? {
                 Some(stored) => Answer::json(StatusCode::OK, &stored.view()),
                 None => Answer::not_found(
-                    "OIDC is not connected: a Platform administrator connects it with `vm admin connect-oidc`",
+                    "OIDC is not connected: a Platform administrator connects it with `vibe admin connect-oidc`",
                 ),
             });
         }
@@ -1228,7 +1228,7 @@ impl Api {
                 &json!({ "error": {
                     "reason": "unknown-email",
                     "message": format!(
-                        "nobody who signed in here has the email {email:?}: name the person by their user id instead (`vm whoami` shows it to them), or ask them to sign in once; nothing was changed"
+                        "nobody who signed in here has the email {email:?}: name the person by their user id instead (`vibe whoami` shows it to them), or ask them to sign in once; nothing was changed"
                     ),
                     "entry": { "email": email },
                 } }),
@@ -1238,7 +1238,7 @@ impl Api {
                 &json!({ "error": {
                     "reason": "ambiguous-email",
                     "message": format!(
-                        "more than one person who signed in here has the email {email:?}: name the one you mean by their user id (`vm whoami` shows it to them); nothing was changed"
+                        "more than one person who signed in here has the email {email:?}: name the one you mean by their user id (`vibe whoami` shows it to them); nothing was changed"
                     ),
                     "entry": { "email": email },
                 } }),
@@ -1867,7 +1867,7 @@ impl Api {
             return Answer::error(
                 StatusCode::FORBIDDEN,
                 "not-with-a-tool-credential",
-                "a tool credential cannot make another: sign in again with `vm sign-in`",
+                "a tool credential cannot make another: sign in again with `vibe sign-in`",
             );
         }
         if !body.iter().all(u8::is_ascii_whitespace)
@@ -2258,7 +2258,7 @@ fn not_signed_in() -> Answer {
     Answer::error(
         StatusCode::UNAUTHORIZED,
         "not-signed-in",
-        "not signed in: sign in with `vm sign-in`, then ask again",
+        "not signed in: sign in with `vibe sign-in`, then ask again",
     )
 }
 

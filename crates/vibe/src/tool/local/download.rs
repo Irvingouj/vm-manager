@@ -1,7 +1,7 @@
 //! Postgres downloaded once into the user's own folder (blackbox/CONTRACT.md,
 //! "The local loop: What a run does", step 1): zonky's build for this
 //! machine, from Maven Central (`https://repo1.maven.org/maven2`) or the
-//! mirror `VM_LOCAL_POSTGRES_MIRROR` names, checked against the SHA-256 this
+//! mirror `VIBE_LOCAL_POSTGRES_MIRROR` names, checked against the SHA-256 this
 //! program carries before anything of it is unpacked, and unpacked beside its
 //! final place and renamed.
 //!
@@ -52,7 +52,7 @@ use tokio::net::TcpStream;
 /// The version downloaded.
 pub(super) const VERSION: &str = "18.6.0";
 
-/// Where it is downloaded from without `VM_LOCAL_POSTGRES_MIRROR`.
+/// Where it is downloaded from without `VIBE_LOCAL_POSTGRES_MIRROR`.
 pub(super) const MAVEN_CENTRAL: &str = "https://repo1.maven.org/maven2";
 
 /// zonky's builds of [`VERSION`] this program has a checksum for: Rust's
@@ -378,7 +378,7 @@ async fn get(uri: &Uri, into: &Path) -> Result<Got, String> {
     let authority = uri.authority().map_or(host.as_str(), |a| a.as_str());
     let request = Request::get(path)
         .header(HOST, authority)
-        .header(USER_AGENT, "vm")
+        .header(USER_AGENT, "vibe")
         .body(Empty::<Bytes>::new())
         .map_err(|_| format!("{uri} cannot be asked for"))?;
     if tls {

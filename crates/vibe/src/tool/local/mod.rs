@@ -1,17 +1,17 @@
 //! The local loop (blackbox/CONTRACT.md, "The local loop: one request as a
-//! test User" and "The local loop, kept running"): `vm request` runs the
+//! test User" and "The local loop, kept running"): `vibe request` runs the
 //! project on the Builder's machine, beside a private Postgres with a
 //! stand-in of each pulled Resource, and hands it one request as a test
-//! User; `vm dev` ([`dev`]) keeps it running for the Builder's browser; `vm
-//! local operation-log` and `vm local change-history` read what the local
-//! runs recorded; `vm local reset` starts the local databases over.
+//! User; `vibe dev` ([`dev`]) keeps it running for the Builder's browser; `vibe
+//! local operation-log` and `vibe local change-history` read what the local
+//! runs recorded; `vibe local reset` starts the local databases over.
 //!
 //! **The same code.** Every command does its work by the functions of
 //! [`run`]: the private Postgres started, the installation's own parts on
 //! it, the project brought up, a request served through the installation's
-//! own Ingress and what it recorded collected. A command that finds a `vm
+//! own Ingress and what it recorded collected. A command that finds a `vibe
 //! dev` running in its project ([`control`]) does none of it: it hands
-//! itself to that `vm dev`, which does the same work and sends back what
+//! itself to that `vibe dev`, which does the same work and sends back what
 //! the command prints.
 //!
 //! **Endings.** A command is held to `--timeout` and ended by `SIGINT`,
@@ -102,36 +102,36 @@ const NO_COMMIT: &str = "0000000000000000000000000000000000000000";
 const DOMAIN: &str = "localhost";
 
 const WHO: Who = Who {
-    command: "vm request",
+    command: "vibe request",
     the: "the local run",
-    folder: "vm-request",
+    folder: "vibe-request",
 };
 
 const WHO_LOCAL: Who = Who {
-    command: "vm local",
+    command: "vibe local",
     the: "the local reading",
-    folder: "vm-local",
+    folder: "vibe-local",
 };
 
 const WHO_RESET: Who = Who {
-    command: "vm local reset",
+    command: "vibe local reset",
     the: "the reset",
-    folder: "vm-reset",
+    folder: "vibe-reset",
 };
 
 const WHO_DEV: Who = Who {
-    command: "vm dev",
+    command: "vibe dev",
     the: "the local run",
-    folder: "vm-dev",
+    folder: "vibe-dev",
 };
 
-/// `vm request`.
+/// `vibe request`.
 #[derive(clap::Args)]
 pub struct RequestArgs {
     /// The path to ask for: it begins with /, and may have a query.
     #[arg(value_parser = request_path)]
     pub path: String,
-    /// The test User of vm.dev.json to send the request as (builder, outsider, ...).
+    /// The test User of vibe.dev.json to send the request as (builder, outsider, ...).
     #[arg(long = "as", value_name = "TEST USER")]
     pub user: String,
     /// The method: GET without a body, POST with one; any token is taken.
@@ -158,7 +158,7 @@ pub struct RequestArgs {
     pub output: Output,
 }
 
-/// `vm dev`.
+/// `vibe dev`.
 #[derive(clap::Args)]
 pub struct DevArgs {
     /// The port to listen on, on 127.0.0.1 and ::1 only (1 to 65535).
@@ -172,14 +172,14 @@ pub struct DevArgs {
     pub output: Output,
 }
 
-/// `vm local`.
+/// `vibe local`.
 #[derive(clap::Args)]
 pub struct LocalArgs {
     #[command(subcommand)]
     pub command: LocalCommand,
 }
 
-/// What `vm local` does.
+/// What `vibe local` does.
 #[derive(clap::Subcommand)]
 pub enum LocalCommand {
     /// The local Operation log: the newest entries of the project's local
@@ -204,7 +204,7 @@ impl LocalArgs {
     }
 }
 
-/// `vm local operation-log`.
+/// `vibe local operation-log`.
 #[derive(clap::Args)]
 pub struct OperationLogArgs {
     /// How many entries, the newest (1 to 1000; 100 without it).
@@ -221,7 +221,7 @@ pub struct OperationLogArgs {
     pub output: Output,
 }
 
-/// `vm local change-history`.
+/// `vibe local change-history`.
 #[derive(clap::Args)]
 pub struct ChangeHistoryArgs {
     /// Only the changes of this table: [schema.]table (public without a
@@ -242,7 +242,7 @@ pub struct ChangeHistoryArgs {
     pub output: Output,
 }
 
-/// `vm local reset`.
+/// `vibe local reset`.
 #[derive(clap::Args)]
 pub struct ResetArgs {
     /// The project; without it, the current directory.
@@ -281,7 +281,7 @@ fn header(text: &str) -> Result<(HeaderName, HeaderValue), String> {
     let lower = name.as_str();
     if lower == "host" || lower == "content-length" || lower.starts_with(RESERVED_HEADER_PREFIX) {
         return Err(format!(
-            "{lower} is the tool's own: Host, Content-Length and every x-vm- header are set by vm request"
+            "{lower} is the tool's own: Host, Content-Length and every x-vm- header are set by vibe request"
         ));
     }
     let value =
@@ -359,7 +359,7 @@ impl Stage {
             Self::Packages => "finding the project's packages",
             Self::Programs => "finding (or downloading) the programs of the private Postgres",
             Self::Waiting => {
-                "waiting for another local command of this project (vm request, vm dev or vm local) to end"
+                "waiting for another local command of this project (vibe request, vibe dev or vibe local) to end"
             }
             Self::Starting => "starting the private Postgres",
             Self::Standins => "making the stand-ins of the pulled Resources",
@@ -369,13 +369,13 @@ impl Stage {
             Self::Request => "waiting for the Application's response",
             Self::Recording => "waiting for what the request recorded",
             Self::Reading => "reading what the local runs recorded",
-            Self::Dev => "waiting for vm dev, which runs in this project, to do it",
+            Self::Dev => "waiting for vibe dev, which runs in this project, to do it",
         }
     }
 }
 
 /// Where a command is now: set as it goes, read when it ran out of time.
-/// Shared between threads (`vm dev` serves on several), so an atomic.
+/// Shared between threads (`vibe dev` serves on several), so an atomic.
 pub(super) struct Progress(AtomicUsize);
 
 impl Progress {
@@ -468,14 +468,14 @@ fn project_path(given: Option<&Path>, command: &str) -> Result<PathBuf, Ending> 
     })
 }
 
-/// `local-state`: `.vm/local/` cannot be used (`why`, the tool's own
+/// `local-state`: `.vibe/local/` cannot be used (`why`, the tool's own
 /// words, which do not say the fix: this says it, for every caller).
 fn local_state_failed(why: &str, command: &str) -> Ending {
     Ending::new(
         1,
         "local-state",
         format!(
-            "The project's local state (.vm/local/) cannot be used: {why}. Removing the folder .vm/local/ starts the local databases anew (their test rows are lost); then run {command} again"
+            "The project's local state (.vibe/local/) cannot be used: {why}. Removing the folder .vibe/local/ starts the local databases anew (their test rows are lost); then run {command} again"
         ),
     )
 }
@@ -551,7 +551,7 @@ impl PgFailed {
             .map(|said| format!(" ({said})"))
             .unwrap_or_default();
         let message = format!(
-            "The private Postgres of the local run failed while {}: {cause}{said}. Its own words are in .vm/local/postgres.log. Run {command} again; vm local reset starts the local databases anew (their test rows are loaded again)",
+            "The private Postgres of the local run failed while {}: {cause}{said}. Its own words are in .vibe/local/postgres.log. Run {command} again; vibe local reset starts the local databases anew (their test rows are loaded again)",
             self.what
         );
         let mut error = Map::new();
@@ -611,7 +611,7 @@ fn open_failed(error: OpenError, command: &str) -> Ending {
 
 /// The size of the parts of a command that serves one request: a few
 /// connections, one engine thread. The request is given the time an
-/// installation gives one (the runner's own default), as under `vm dev`:
+/// installation gives one (the runner's own default), as under `vibe dev`:
 /// `--timeout` bounds the whole command, not the Application's code.
 fn one_request() -> Size {
     Size {
@@ -625,7 +625,7 @@ fn one_request() -> Size {
     }
 }
 
-/// The request of `vm request`, as the command line gives it.
+/// The request of `vibe request`, as the command line gives it.
 struct Wanted<'a> {
     path: &'a str,
     user: &'a str,
@@ -634,7 +634,7 @@ struct Wanted<'a> {
     body: Bytes,
 }
 
-/// `vm request`: answered by the `vm dev` of the project when one runs,
+/// `vibe request`: answered by the `vibe dev` of the project when one runs,
 /// else alone.
 pub(super) async fn request(args: &RequestArgs) -> Result<Done, Ending> {
     let project = project_path(args.project.as_deref(), WHO.command)?;
@@ -683,7 +683,7 @@ pub(super) async fn request(args: &RequestArgs) -> Result<Done, Ending> {
     .await
 }
 
-/// What a local command did alone, or the `vm dev` it found while it waited
+/// What a local command did alone, or the `vibe dev` it found while it waited
 /// for the project's lock.
 enum Alone {
     Did(Done),
@@ -696,11 +696,11 @@ fn left(deadline: tokio::time::Instant) -> Duration {
 }
 
 /// Runs a local command, the whole of it within its `--timeout` and its
-/// signals: handed to the project's `vm dev` when one runs (`found`, or
+/// signals: handed to the project's `vibe dev` when one runs (`found`, or
 /// found while the command waits for the project's lock), else done alone
 /// by `alone` (starting in `first`), in a scratch folder of its own, with
 /// what it starts kept in a [`Held`] that is let go of after it however it
-/// ends. A `vm dev` that does not answer it is not turned to again: the
+/// ends. A `vibe dev` that does not answer it is not turned to again: the
 /// command goes on alone.
 async fn handed_or_alone(
     project: &Path,
@@ -752,7 +752,7 @@ async fn handed_or_alone(
     }
 }
 
-/// `vm request` alone: the private Postgres, the project brought up, the
+/// `vibe request` alone: the private Postgres, the project brought up, the
 /// request served and what it recorded collected.
 async fn request_alone(
     base: &Base<'_>,
@@ -792,7 +792,7 @@ async fn request_alone(
     done
 }
 
-/// What `vm request` prints: the response, what the request recorded, and
+/// What `vibe request` prints: the response, what the request recorded, and
 /// what the bring-up before it did.
 fn request_output(brought: &Brought, served: &Served, asked: &run::Asked<'_>) -> Done {
     let mut headers = Map::new();
@@ -841,7 +841,7 @@ fn read_data_file(path: &Path) -> Result<Bytes, Ending> {
             1,
             "data-file",
             &format!(
-                "{} cannot be read ({error}): give a file you can read with --data-file, then run vm request again",
+                "{} cannot be read ({error}): give a file you can read with --data-file, then run vibe request again",
                 path.display()
             ),
         )
@@ -865,7 +865,7 @@ fn read_data_file(path: &Path) -> Result<Bytes, Ending> {
     Ok(Bytes::from(bytes))
 }
 
-/// What `vm local operation-log` and `vm local change-history` read.
+/// What `vibe local operation-log` and `vibe local change-history` read.
 pub(super) enum Reading {
     OperationLog {
         limit: u16,
@@ -876,7 +876,7 @@ pub(super) enum Reading {
     },
 }
 
-/// `vm local ...`: answered by the `vm dev` of the project when one runs,
+/// `vibe local ...`: answered by the `vibe dev` of the project when one runs,
 /// else alone.
 pub(super) async fn local(args: &LocalArgs) -> Result<Done, Ending> {
     let (project, timeout, json, reading) = match &args.command {
@@ -914,11 +914,11 @@ pub(super) async fn local(args: &LocalArgs) -> Result<Done, Ending> {
         return Ok(match reading {
             Reading::OperationLog { .. } => Done {
                 json: json!({ "entries": [] }),
-                text: "No local run was made in this project yet (vm request makes one): the local Operation log is empty.\n".to_owned(),
+                text: "No local run was made in this project yet (vibe request makes one): the local Operation log is empty.\n".to_owned(),
             },
             Reading::ChangeHistory { .. } => Done {
                 json: json!({ "changes": [] }),
-                text: "No local run was made in this project yet (vm request makes one): the local Change history is empty.\n".to_owned(),
+                text: "No local run was made in this project yet (vibe request makes one): the local Change history is empty.\n".to_owned(),
             },
         });
     }
@@ -1041,7 +1041,7 @@ async fn read_records(
     }
 }
 
-/// `vm local reset`: done by the `vm dev` of the project when one runs,
+/// `vibe local reset`: done by the `vibe dev` of the project when one runs,
 /// else alone.
 async fn reset(args: &ResetArgs) -> Result<Done, Ending> {
     let project = project_path(args.project.as_deref(), WHO_RESET.command)?;
@@ -1090,7 +1090,7 @@ async fn reset_alone(
     Ok(Alone::Did(reset_output(&brought?)))
 }
 
-/// What `vm local reset` prints.
+/// What `vibe local reset` prints.
 fn reset_output(brought: &Brought) -> Done {
     let json = json!({
         "reset": true,
@@ -1226,7 +1226,7 @@ fn one_line(value: &Value) -> String {
     }
 }
 
-/// What `vm request` prints in words.
+/// What `vibe request` prints in words.
 fn in_words(json: &Value, shown: &Shown) -> String {
     let mut text = String::new();
     let status = json["status"].as_u64().unwrap_or_default();

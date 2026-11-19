@@ -55,7 +55,7 @@ pub struct Public {
 }
 
 impl Public {
-    /// `vm serve`'s: the scheme, and the port (`--public-port`, else the
+    /// `vibe serve`'s: the scheme, and the port (`--public-port`, else the
     /// listening port with `http`, else `443`).
     pub fn new(scheme: Scheme, port: u16) -> Self {
         Self {

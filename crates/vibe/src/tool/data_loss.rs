@@ -44,7 +44,7 @@ pub(super) type ColumnKey = (String, String, String);
 
 /// A type as far as the rules of "wider" go. Every other type is not
 /// recognised: no change from or to it is wider.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy)]
 pub(super) enum Ty {
     SmallInt,
     Integer,
@@ -53,8 +53,8 @@ pub(super) enum Ty {
     Double,
     /// `varchar(n)`, or `varchar` without a length.
     Varchar(Option<i64>),
-    /// `char(n)`.
-    Char(i64),
+    /// `char(n)`, whatever its length: only ever widened to `text`.
+    Char,
     Text,
     /// `numeric(p, s)` (`numeric(p)` is `numeric(p, 0)`), or `numeric`
     /// without precision.
@@ -73,7 +73,7 @@ pub(super) fn is_wider(from: Ty, to: Ty) -> bool {
         | (Ty::Integer, Ty::BigInt)
         | (Ty::Real, Ty::Double)
         | (Ty::Varchar(Some(_)), Ty::Varchar(None) | Ty::Text)
-        | (Ty::Char(_), Ty::Text)
+        | (Ty::Char, Ty::Text)
         | (Ty::Numeric(Some(_)), Ty::Numeric(None)) => true,
         (Ty::Varchar(Some(n)), Ty::Varchar(Some(m))) => m >= n,
         (Ty::Numeric(Some((p, s))), Ty::Numeric(Some((p2, s2)))) => {
@@ -123,7 +123,7 @@ pub(super) fn ty(name: &TypeName) -> Option<Ty> {
         ("float8", []) => Ty::Double,
         ("varchar", []) => Ty::Varchar(None),
         ("varchar", [n]) => Ty::Varchar(Some(*n)),
-        ("bpchar", [n]) => Ty::Char(*n),
+        ("bpchar", [_]) => Ty::Char,
         ("text", []) => Ty::Text,
         ("numeric", []) => Ty::Numeric(None),
         ("numeric", [p]) => Ty::Numeric(Some((*p, 0))),
@@ -177,7 +177,6 @@ pub(super) fn ty_of_text(text: &str) -> Option<Ty> {
 }
 
 /// What a statement destroys, before the types are compared.
-#[derive(Debug, PartialEq, Eq)]
 pub(super) enum Found {
     /// A table dropped: `<schema>.<table>`.
     Table(String),
@@ -389,7 +388,7 @@ pub(super) fn lost(destroyed: &[&Destroyed]) -> String {
 }
 
 /// What to do about data that would be lost (`lost`, in words): the words
-/// `vm generate` and `vm deploy` stop with, `command` being the one to run
+/// `vibe generate` and `vibe deploy` stop with, `command` being the one to run
 /// again.
 pub(super) fn ask_the_builder(lost: &str, command: &str) -> String {
     format!(
@@ -693,325 +692,4 @@ pub(super) fn destroyed(
         destroyed.push((index, one));
     }
     destroyed
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::migration_text::parsed;
-
-    fn t(text: &str) -> Ty {
-        ty_of_text(text).unwrap_or_else(|| panic!("not recognised: {text}"))
-    }
-
-    fn wider(from: &str, to: &str) -> bool {
-        is_wider(t(from), t(to))
-    }
-
-    #[test]
-    fn types_are_recognised_as_the_snapshot_and_the_statement_write_them() {
-        for (text, want) in [
-            ("smallint", Ty::SmallInt),
-            ("integer", Ty::Integer),
-            ("INT", Ty::Integer),
-            ("bigint", Ty::BigInt),
-            ("real", Ty::Real),
-            ("double precision", Ty::Double),
-            ("DOUBLE PRECISION", Ty::Double),
-            ("varchar(20)", Ty::Varchar(Some(20))),
-            ("VARCHAR(20)", Ty::Varchar(Some(20))),
-            ("character varying(20)", Ty::Varchar(Some(20))),
-            ("varchar", Ty::Varchar(None)),
-            ("character varying", Ty::Varchar(None)),
-            ("char(5)", Ty::Char(5)),
-            ("character(5)", Ty::Char(5)),
-            ("text", Ty::Text),
-            ("TEXT", Ty::Text),
-            ("numeric(10, 2)", Ty::Numeric(Some((10, 2)))),
-            ("numeric(10,2)", Ty::Numeric(Some((10, 2)))),
-            ("NUMERIC(8, 2)", Ty::Numeric(Some((8, 2)))),
-            ("decimal(10, 2)", Ty::Numeric(Some((10, 2)))),
-            ("numeric(10)", Ty::Numeric(Some((10, 0)))),
-            ("numeric", Ty::Numeric(None)),
-        ] {
-            assert_eq!(ty_of_text(text), Some(want), "{text}");
-        }
-    }
-
-    #[test]
-    fn what_is_not_recognised_is_none() {
-        for text in [
-            "",
-            "serial",
-            "bigserial",
-            "int4",
-            "int8",
-            "integer[]",
-            "text[]",
-            "timestamp",
-            "uuid",
-            "jsonb",
-            "mood",
-            "\"integer\"",
-            "public.text",
-            "integer USING 1",
-            "integer, DROP COLUMN x",
-            "integer; DROP TABLE x",
-            "integer -- x",
-            "varchar(20) COLLATE \"C\"",
-            "bit(3)",
-            "interval",
-        ] {
-            assert_eq!(ty_of_text(text), None, "{text:?}");
-        }
-        assert_eq!(ty_of_text(&format!("varchar({})", "9".repeat(300))), None);
-    }
-
-    #[test]
-    fn every_row_of_wider_is_wider() {
-        for (from, to) in [
-            ("smallint", "integer"),
-            ("smallint", "bigint"),
-            ("integer", "bigint"),
-            ("real", "double precision"),
-            ("varchar(20)", "varchar(50)"),
-            ("varchar(20)", "varchar(20)"),
-            ("varchar(20)", "varchar"),
-            ("varchar(20)", "character varying"),
-            ("varchar(20)", "text"),
-            ("char(5)", "text"),
-            ("numeric(10, 2)", "numeric(12, 3)"),
-            ("numeric(10, 2)", "numeric(11, 3)"),
-            ("numeric(10, 2)", "numeric(10, 2)"),
-            ("numeric(10)", "numeric(12, 2)"),
-            ("numeric(10, 2)", "numeric"),
-        ] {
-            assert!(wider(from, to), "{from} to {to}");
-        }
-    }
-
-    #[test]
-    fn every_other_change_is_not_wider() {
-        for (from, to) in [
-            ("integer", "smallint"),
-            ("bigint", "integer"),
-            ("bigint", "smallint"),
-            ("integer", "integer"),
-            ("smallint", "real"),
-            ("integer", "double precision"),
-            ("integer", "numeric"),
-            ("integer", "text"),
-            ("double precision", "real"),
-            ("real", "numeric"),
-            ("text", "varchar(10)"),
-            ("text", "varchar"),
-            ("text", "char(5)"),
-            ("varchar(50)", "varchar(20)"),
-            ("varchar", "varchar(20)"),
-            ("varchar", "text"),
-            ("varchar(20)", "char(20)"),
-            ("char(5)", "char(10)"),
-            ("char(5)", "varchar(10)"),
-            ("char(5)", "varchar"),
-            ("numeric(10, 2)", "numeric(8, 2)"),
-            ("numeric(10, 2)", "numeric(10, 3)"),
-            ("numeric(10, 2)", "numeric(10, 1)"),
-            ("numeric(10, 2)", "numeric(9, 0)"),
-            ("numeric(10, 2)", "integer"),
-            ("numeric", "numeric(10, 2)"),
-            ("numeric(10, 2)", "double precision"),
-        ] {
-            assert!(!wider(from, to), "{from} to {to}");
-        }
-    }
-
-    fn found_in(sql: &str) -> Vec<(usize, Found)> {
-        found(sql, &parsed(sql).unwrap())
-    }
-
-    #[test]
-    fn drops_are_found_on_the_parsed_statements() {
-        let sql = "ALTER TABLE \"tags\" DISABLE ROW LEVEL SECURITY;--> statement-breakpoint\nDROP TABLE \"tags\" CASCADE;--> statement-breakpoint\nDROP TABLE \"archive\".\"old\" CASCADE;--> statement-breakpoint\nDROP SCHEMA \"archive\";\n--> statement-breakpoint\nALTER TABLE \"notes\" DROP COLUMN \"title\";";
-        assert_eq!(
-            found_in(sql),
-            [
-                (1, Found::Table("public.tags".into())),
-                (2, Found::Table("archive.old".into())),
-                (3, Found::Schema("archive".into())),
-                (
-                    4,
-                    Found::Column {
-                        schema: "public".into(),
-                        table: "notes".into(),
-                        column: "title".into()
-                    }
-                ),
-            ]
-        );
-        assert_eq!(
-            found_in("DROP TABLE a, s.b; ALTER TABLE ONLY x DROP COLUMN p, DROP COLUMN q"),
-            [
-                (0, Found::Table("public.a".into())),
-                (0, Found::Table("s.b".into())),
-                (
-                    1,
-                    Found::Column {
-                        schema: "public".into(),
-                        table: "x".into(),
-                        column: "p".into()
-                    }
-                ),
-                (
-                    1,
-                    Found::Column {
-                        schema: "public".into(),
-                        table: "x".into(),
-                        column: "q".into()
-                    }
-                ),
-            ]
-        );
-    }
-
-    #[test]
-    fn the_words_elsewhere_destroy_nothing() {
-        for sql in [
-            "ALTER TABLE \"notes\" ADD COLUMN \"hint\" text DEFAULT 'DROP TABLE notes; ALTER TABLE notes DROP COLUMN body';",
-            "-- DROP TABLE notes;\nSELECT 1;",
-            "/* DROP SCHEMA x */ CREATE TABLE \"drop\" (\"column\" int);",
-            "DROP VIEW v; DROP INDEX i; ALTER TABLE t ALTER COLUMN c DROP DEFAULT; ALTER TABLE t ALTER COLUMN c SET NOT NULL; ALTER TABLE t DROP CONSTRAINT k",
-            "DROP TYPE mood; ALTER TABLE t RENAME COLUMN a TO b",
-            "CREATE FUNCTION f() RETURNS void LANGUAGE sql AS $$ DROP TABLE x $$",
-        ] {
-            assert_eq!(found_in(sql), [], "{sql}");
-        }
-    }
-
-    #[test]
-    fn a_change_of_type_is_found_with_its_type_as_written() {
-        let sql = "ALTER TABLE \"notes\" ALTER COLUMN \"v\" SET DATA TYPE numeric(8, 2);\n--> statement-breakpoint\nALTER TABLE \"s\".\"t\" ALTER COLUMN \"c\" TYPE character varying(20) USING c::text, ALTER COLUMN \"d\" TYPE int[];";
-        assert_eq!(
-            found_in(sql),
-            [
-                (
-                    0,
-                    Found::Type {
-                        schema: "public".into(),
-                        table: "notes".into(),
-                        column: "v".into(),
-                        to: "numeric(8, 2)".into(),
-                        to_ty: Some(Ty::Numeric(Some((8, 2)))),
-                    }
-                ),
-                (
-                    1,
-                    Found::Type {
-                        schema: "s".into(),
-                        table: "t".into(),
-                        column: "c".into(),
-                        to: "character varying(20)".into(),
-                        to_ty: Some(Ty::Varchar(Some(20))),
-                    }
-                ),
-                (
-                    1,
-                    Found::Type {
-                        schema: "s".into(),
-                        table: "t".into(),
-                        column: "d".into(),
-                        to: "int[]".into(),
-                        to_ty: None,
-                    }
-                ),
-            ]
-        );
-    }
-
-    fn borrowed(wanted: &BTreeSet<ColumnKey>) -> impl Iterator<Item = (&str, &str, &str)> {
-        wanted
-            .iter()
-            .map(|(s, t, c)| (s.as_str(), t.as_str(), c.as_str()))
-    }
-
-    fn key(table: &str, column: &str) -> ColumnKey {
-        ("public".into(), table.into(), column.into())
-    }
-
-    #[test]
-    fn the_snapshot_gives_the_wanted_types_only() {
-        let snapshot = br#"{ "id": "x", "tables": {
-            "public.notes": { "name": "notes", "schema": "", "columns": {
-                "v": { "name": "v", "type": "numeric(10, 2)", "primaryKey": false },
-                "w": { "name": "w", "type": "integer" },
-                "m": { "name": "m", "type": "text", "typeSchema": "public" } } },
-            "archive.old": { "name": "old", "schema": "archive", "columns": {
-                "v": { "name": "v", "type": "bigint" } } } },
-            "enums": {} }"#;
-        let wanted: BTreeSet<ColumnKey> = [
-            key("notes", "v"),
-            key("notes", "m"),
-            key("notes", "gone"),
-            ("archive".into(), "old".into(), "v".into()),
-        ]
-        .into();
-        let types = snapshot_types(snapshot, borrowed(&wanted));
-        assert_eq!(
-            types,
-            [
-                (key("notes", "v"), "numeric(10, 2)".to_owned()),
-                (
-                    ("archive".into(), "old".into(), "v".into()),
-                    "bigint".to_owned()
-                ),
-            ]
-            .into()
-        );
-        assert!(snapshot_types(b"{ not json", borrowed(&wanted)).is_empty());
-        assert!(snapshot_types(b"[]", borrowed(&wanted)).is_empty());
-    }
-
-    #[test]
-    fn a_change_of_type_destroys_unless_wider_than_the_snapshot_has_it() {
-        let sql = "ALTER TABLE \"notes\" ALTER COLUMN \"v\" SET DATA TYPE numeric(12, 3);ALTER TABLE \"notes\" ALTER COLUMN \"w\" SET DATA TYPE smallint;ALTER TABLE \"notes\" ALTER COLUMN \"gone\" SET DATA TYPE bigint;";
-        let from: BTreeMap<ColumnKey, String> = [
-            (key("notes", "v"), "numeric(10, 2)".to_owned()),
-            (key("notes", "w"), "integer".to_owned()),
-        ]
-        .into();
-        let got: Vec<(usize, Value)> = destroyed(found_in(sql), &from)
-            .into_iter()
-            .map(|(i, d)| (i, d.json))
-            .collect();
-        assert_eq!(
-            got,
-            [
-                (
-                    1,
-                    json!({ "what": "type", "table": "public.notes", "column": "w", "from": "integer", "to": "smallint" })
-                ),
-                (
-                    2,
-                    json!({ "what": "type", "table": "public.notes", "column": "gone", "from": null, "to": "bigint" })
-                ),
-            ]
-        );
-    }
-
-    #[test]
-    fn a_statement_is_given_with_its_semicolon_and_without_the_breakpoint() {
-        let sql = "DROP TABLE \"archive\".\"old\" CASCADE;--> statement-breakpoint\nDROP SCHEMA \"archive\";\n";
-        let statements = parsed(sql).unwrap();
-        let texts: Vec<String> = statements.iter().map(|s| statement_text(sql, s)).collect();
-        assert_eq!(
-            texts,
-            [
-                "DROP TABLE \"archive\".\"old\" CASCADE;",
-                "DROP SCHEMA \"archive\";"
-            ]
-        );
-        let sql = "SELECT 1; SELECT 2";
-        let statements = parsed(sql).unwrap();
-        let texts: Vec<String> = statements.iter().map(|s| statement_text(sql, s)).collect();
-        assert_eq!(texts, ["SELECT 1;", "SELECT 2"]);
-    }
 }

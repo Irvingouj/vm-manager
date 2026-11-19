@@ -56,7 +56,7 @@ pub const MAX_LIVE: i64 = 16;
 /// made: "vm tc".
 const USER_LOCK: i32 = 0x766d_7463;
 
-/// A credential lives this long unless `vm serve --tool-credential-lifetime`
+/// A credential lives this long unless `vibe serve --tool-credential-lifetime`
 /// says otherwise: 30 days.
 pub const DEFAULT_LIFETIME: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 

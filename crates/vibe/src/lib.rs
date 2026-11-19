@@ -50,7 +50,7 @@
 //!   requests' path, and read through the API.
 //! - [`log`]: the program's log, one JSON record per line.
 //! - [`server`]: the listening socket and the connections.
-//! - [`platform`]: the parts above put together, for `vm serve` and for
+//! - [`platform`]: the parts above put together, for `vibe serve` and for
 //!   the local run alike.
 
 pub mod api;

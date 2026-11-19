@@ -1,4 +1,4 @@
-//! `vm generate [--project <directory>] [--name <name>] [--allow-data-loss]
+//! `vibe generate [--project <directory>] [--name <name>] [--allow-data-loss]
 //! [--empty] [--timeout <seconds>] [--json]` (blackbox/CONTRACT.md,
 //! "Generating migrations").
 //!
@@ -18,7 +18,7 @@
 //! [`drizzle::MAX_JOURNAL_BYTES`]), the migration's statements are read
 //! with the platform's parser ([`crate::migration_text::parsed`]) and what
 //! they destroy decided ([`data_loss`]). All of that is inside the time and
-//! the signals, as for `vm check`; any ending there leaves the project as
+//! the signals, as for `vibe check`; any ending there leaves the project as
 //! it was, and the own folder is removed.
 //!
 //! Only then, when there is a migration to keep, are its three files
@@ -33,8 +33,8 @@
 //! ([`Undo`]), and only what could not be removed is named as left. What
 //! only a crash or `SIGKILL` between two of them can leave:
 //! the `.sql` file alone, or with its snapshot, which the journal does not
-//! name (`vm check` and `vm generate` then say `migrations-unreadable`,
-//! naming it), and at most one temporary file `.<name>.vm-generate`,
+//! name (`vibe check` and `vibe generate` then say `migrations-unreadable`,
+//! naming it), and at most one temporary file `.<name>.vibe-generate`,
 //! which no command reads and the next write of that file removes.
 //!
 //! The tool writes inside the project only: when `migrations/` or
@@ -42,7 +42,7 @@
 //! before `drizzle-kit` runs, and nothing is written (looked at again when
 //! writing).
 //!
-//! **Blocking work.** As for `vm check`: the copying, the reading and the
+//! **Blocking work.** As for `vibe check`: the copying, the reading and the
 //! writing of the project's files, and the parsing of the generated
 //! migration (at most [`MAX_SQL_BYTES`]), are blocking calls on the tool's
 //! one thread, bounded as above; only the tools it runs can take long, and
@@ -67,7 +67,7 @@ use super::theirs::Theirs;
 use super::{Done, Ending, Output, project_of, write_whole};
 use crate::migration_text;
 
-/// `vm generate`.
+/// `vibe generate`.
 #[derive(clap::Args)]
 pub struct GenerateArgs {
     /// The project; without it, the current directory.
@@ -96,9 +96,9 @@ pub struct GenerateArgs {
 
 /// How the command's messages name it.
 const WHO: Who = Who {
-    command: "vm generate",
-    the: "vm generate",
-    folder: "vm-generate",
+    command: "vibe generate",
+    the: "vibe generate",
+    folder: "vibe-generate",
 };
 
 /// The longest migration read from what `drizzle-kit` wrote.
@@ -164,7 +164,7 @@ struct Migration {
 }
 
 pub(super) async fn generate(args: &GenerateArgs) -> Result<Done, Ending> {
-    let project = project_of(args.project.as_deref(), "vm generate")?;
+    let project = project_of(args.project.as_deref(), "vibe generate")?;
     // Node resolves packages from the real path, and the tools are given
     // absolute paths.
     let project = fs::canonicalize(&project).map_err(|error| {
@@ -172,7 +172,7 @@ pub(super) async fn generate(args: &GenerateArgs) -> Result<Done, Ending> {
             1,
             "project-file",
             format!(
-                "the project's folder cannot be read ({error}): make it readable by you, then run vm generate again"
+                "the project's folder cannot be read ({error}): make it readable by you, then run vibe generate again"
             ),
         )
     })?;
@@ -191,7 +191,7 @@ pub(super) async fn generate(args: &GenerateArgs) -> Result<Done, Ending> {
             1,
             "generate-timed-out",
             format!(
-                "vm generate did not end within {} s and was stopped, with everything it started; it was in {}, and nothing was written. Look at what that runs (src/db/schema.ts and what it imports are run by drizzle-kit), or give more time with --timeout <seconds>, then run vm generate again",
+                "vibe generate did not end within {} s and was stopped, with everything it started; it was in {}, and nothing was written. Look at what that runs (src/db/schema.ts and what it imports are run by drizzle-kit), or give more time with --timeout <seconds>, then run vibe generate again",
                 limit.as_secs(),
                 stage.get().words()
             ),
@@ -200,7 +200,7 @@ pub(super) async fn generate(args: &GenerateArgs) -> Result<Done, Ending> {
             1,
             "interrupted",
             format!(
-                "vm generate was interrupted ({signal}) in {}, and stopped everything it had started; nothing was written: run vm generate again",
+                "vibe generate was interrupted ({signal}) in {}, and stopped everything it had started; nothing was written: run vibe generate again",
                 stage.get().words()
             ),
         )),
@@ -290,7 +290,7 @@ fn stopped(outcome: Outcome) -> Ending {
             Ending::new(1, "own-schema-failed", drizzle::schema_failed(&how, &WHO))
         }
         Outcome::Written(_) | Outcome::InStep | Outcome::Asked => {
-            failed("drizzle-kit did what vm generate did not expect")
+            failed("drizzle-kit did what vibe generate did not expect")
         }
     }
 }
@@ -300,7 +300,7 @@ fn failed(what: &str) -> Ending {
         1,
         "failed",
         format!(
-            "{what}; nothing was written. Check that the project's packages are installed whole (run npm install), then run vm generate again"
+            "{what}; nothing was written. Check that the project's packages are installed whole (run npm install), then run vibe generate again"
         ),
     )
 }
@@ -308,7 +308,7 @@ fn failed(what: &str) -> Ending {
 /// `--empty` while the schema is not in step.
 fn behind(asked: bool) -> Ending {
     let question = if asked {
-        " (and drizzle-kit has a question about the change: run vm generate without --empty to see how to make it)"
+        " (and drizzle-kit has a question about the change: run vibe generate without --empty to see how to make it)"
     } else {
         ""
     };
@@ -316,7 +316,7 @@ fn behind(asked: bool) -> Ending {
         1,
         "migrations-behind",
         format!(
-            "src/db/schema.ts changed since the last migration in migrations/{question}, so no empty migration was written: generate the pending change first with `vm generate`, then run `vm generate --empty` again; nothing was written"
+            "src/db/schema.ts changed since the last migration in migrations/{question}, so no empty migration was written: generate the pending change first with `vibe generate`, then run `vibe generate --empty` again; nothing was written"
         ),
     )
 }
@@ -325,7 +325,7 @@ fn rename_not_generated() -> Ending {
     Ending::new(
         1,
         "rename-not-generated",
-        "drizzle-kit cannot tell a rename from a removal and an addition: a table or a column disappeared from src/db/schema.ts and another appeared in its place, and without a terminal drizzle-kit asks nothing and writes nothing, so nothing was written. Take the path that needs no question, one step at a time, each followed by vm generate: 1. add the new column (or table) to src/db/schema.ts, keeping the old one, then run `vm generate`; 2. copy the values: `vm generate --empty --name <name>` writes an empty migration, into which you put the one statement that copies the values (UPDATE <table> SET <new> = <old>;); 3. remove the old column (or table) from src/db/schema.ts, then run `vm generate`, which stops for the data the old one holds: ask the Builder, as it says".to_owned(),
+        "drizzle-kit cannot tell a rename from a removal and an addition: a table or a column disappeared from src/db/schema.ts and another appeared in its place, and without a terminal drizzle-kit asks nothing and writes nothing, so nothing was written. Take the path that needs no question, one step at a time, each followed by vibe generate: 1. add the new column (or table) to src/db/schema.ts, keeping the old one, then run `vibe generate`; 2. copy the values: `vibe generate --empty --name <name>` writes an empty migration, into which you put the one statement that copies the values (UPDATE <table> SET <new> = <old>;); 3. remove the old column (or table) from src/db/schema.ts, then run `vibe generate`, which stops for the data the old one holds: ask the Builder, as it says".to_owned(),
     )
 }
 
@@ -407,7 +407,7 @@ fn unparseable(what: &str) -> Ending {
         1,
         "migration-unparseable",
         format!(
-            "the migration drizzle-kit generated from src/db/schema.ts cannot be read by Postgres's parser, {what}. It comes from what src/db/schema.ts writes as SQL itself (a default or another expression given with sql`...`): correct that in src/db/schema.ts, then run vm generate again; nothing was written"
+            "the migration drizzle-kit generated from src/db/schema.ts cannot be read by Postgres's parser, {what}. It comes from what src/db/schema.ts writes as SQL itself (a default or another expression given with sql`...`): correct that in src/db/schema.ts, then run vibe generate again; nothing was written"
         ),
     )
 }
@@ -419,7 +419,7 @@ fn data_loss_ending(destroyed: &[(usize, Destroyed)], texts: &[String]) -> Endin
     let all: Vec<&Destroyed> = destroyed.iter().map(|(_, d)| d).collect();
     let message = format!(
         "The migration that src/db/schema.ts now needs destroys data, so nothing was written. {}",
-        data_loss::ask_the_builder(&lost(&all), "vm generate")
+        data_loss::ask_the_builder(&lost(&all), "vibe generate")
     );
     let destroys: Vec<&Value> = all.iter().map(|d| &d.json).collect();
     let mut text = format!("{}\n", Theirs::from(message.as_str()));
@@ -451,7 +451,7 @@ fn no_link(path: &Path, shown: &str) -> Result<(), Ending> {
             1,
             "not-a-project",
             format!(
-                "{shown} is a symbolic link: vm generate writes inside the project only. Replace it with a folder of the project's own, then run vm generate again; nothing was written"
+                "{shown} is a symbolic link: vibe generate writes inside the project only. Replace it with a folder of the project's own, then run vibe generate again; nothing was written"
             ),
         )),
         Ok(_) => Ok(()),
@@ -465,7 +465,7 @@ fn project_file(what: &str) -> Ending {
         1,
         "project-file",
         format!(
-            "{what}; nothing was written. Make migrations/ readable and writable by you, then run vm generate again"
+            "{what}; nothing was written. Make migrations/ readable and writable by you, then run vibe generate again"
         ),
     )
 }
@@ -518,7 +518,7 @@ fn folder<'a>(path: &'a Path, shown: &'a str, done: &mut Undo<'a>) -> Result<(),
     match fs::symlink_metadata(path) {
         Ok(meta) if meta.file_type().is_symlink() => Err(Stop {
             what: format!(
-                "{shown} became a symbolic link while vm generate ran: it writes inside the project only"
+                "{shown} became a symbolic link while vibe generate ran: it writes inside the project only"
             ),
             link: true,
         }),
@@ -564,7 +564,7 @@ fn write(project: &Path, migration: &Migration) -> Result<Vec<String>, Ending> {
         folder(&migrations, "migrations/", &mut done)?;
         folder(&meta, "migrations/meta/", &mut done)?;
         for (shown, path, content) in &files {
-            write_whole(path, content, "vm-generate")
+            write_whole(path, content, "vibe-generate")
                 .map_err(|error| Stop::file(format!("{shown} cannot be written ({error})")))?;
             done.written.push((path, shown));
         }
@@ -581,9 +581,9 @@ fn write(project: &Path, migration: &Migration) -> Result<Vec<String>, Ending> {
             )
         };
         let fix = if link {
-            "replace it with a folder of the project's own, then run vm generate again"
+            "replace it with a folder of the project's own, then run vibe generate again"
         } else {
-            "make migrations/ writable by you, then run vm generate again"
+            "make migrations/ writable by you, then run vibe generate again"
         };
         let reason = if link {
             "not-a-project"

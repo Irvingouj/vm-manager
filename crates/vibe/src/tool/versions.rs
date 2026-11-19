@@ -1,4 +1,4 @@
-//! `vm versions <application> [--limit <n>] [--json]` and `vm go-back <application>
+//! `vibe versions <application> [--limit <n>] [--json]` and `vibe go-back <application>
 //! [--to <number>] [--json]` (blackbox/CONTRACT.md, "Versions, going back,
 //! and logs: The commands").
 //!
@@ -25,7 +25,7 @@ use super::{
 };
 use crate::registry::check_name;
 
-/// `vm versions`.
+/// `vibe versions`.
 #[derive(clap::Args)]
 pub struct VersionsArgs {
     /// The Application, by name.
@@ -37,7 +37,7 @@ pub struct VersionsArgs {
     pub output: Output,
 }
 
-/// `vm go-back`.
+/// `vibe go-back`.
 #[derive(clap::Args)]
 pub struct GoBackArgs {
     /// The Application, by name.
@@ -90,7 +90,7 @@ pub(super) fn signed_in_for(name: &str) -> Result<Kept, Ending> {
             3,
             "not-found",
             format!(
-                "{} is not the name of an Application: see yours with vm applications",
+                "{} is not the name of an Application: see yours with vibe applications",
                 Theirs::from(name)
             ),
         ));
@@ -128,7 +128,7 @@ pub(super) async fn versions(args: &VersionsArgs) -> Result<Done, Ending> {
     if list.versions.is_empty() {
         writeln!(
             text,
-            "{name} ({}) has no Version yet: vm deploy sends the first.",
+            "{name} ({}) has no Version yet: vibe deploy sends the first.",
             application.address
         )
         .ok();
@@ -161,7 +161,7 @@ pub(super) async fn versions(args: &VersionsArgs) -> Result<Done, Ending> {
         };
         writeln!(
             text,
-            "{not_shown} older {versions} {are} not shown: vm versions {name} --limit <n> shows {them} too (up to 1000)."
+            "{not_shown} older {versions} {are} not shown: vibe versions {name} --limit <n> shows {them} too (up to 1000)."
         )
         .ok();
         if let Some(number) = serving.filter(|&n| n <= not_shown) {
@@ -224,7 +224,7 @@ pub(super) async fn go_back(args: &GoBackArgs) -> Result<Done, Ending> {
             3,
             "no-such-version",
             format!(
-                "Version {to} is not an earlier Version of {name}: Version {from} serves, and {earlier} (vm versions {name} lists them). Going back only goes to an earlier Version; to serve a later one again, deploy it again. Nothing was changed"
+                "Version {to} is not an earlier Version of {name}: Version {from} serves, and {earlier} (vibe versions {name} lists them). Going back only goes to an earlier Version; to serve a later one again, deploy it again. Nothing was changed"
             ),
         ));
     }

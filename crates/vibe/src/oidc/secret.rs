@@ -44,7 +44,7 @@ impl Secret {
     }
 }
 
-/// The client secret (`VM_OIDC_CLIENT_SECRET`): in no log, no message, no
+/// The client secret (`VIBE_OIDC_CLIENT_SECRET`): in no log, no message, no
 /// page.
 pub struct ClientSecret(String);
 

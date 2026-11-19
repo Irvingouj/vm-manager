@@ -1,15 +1,15 @@
 //! The platform program (ADR 0015).
 //!
-//! `VM_DATABASE_URL=postgres://... vm serve --domain <domain> --listen
+//! `VIBE_DATABASE_URL=postgres://... vibe serve --domain <domain> --listen
 //! <ip:port> [--stand-in-sign-in [--administrators-group <Group>]]` serves
 //! the Applications kept in the platform database, and the platform's API
-//! (blackbox/CONTRACT.md); with the installation's key in `VM_SECRET_KEY`,
+//! (blackbox/CONTRACT.md); with the installation's key in `VIBE_SECRET_KEY`,
 //! OIDC as the platform database's connection says (crate::oidc).
-//! `VM_DATABASE_URL=... vm setup` prints the setup credential (crate::setup).
-//! `vm admin connect-oidc`, `vm sign-in`, `vm sign-out`, `vm whoami`, `vm resources`, `vm
-//! applications`, `vm pull`, `vm new`, `vm check`, `vm generate`, `vm
-//! deploy`, `vm versions`, `vm go-back` and `vm logs` are the Builder's tool
-//! (vm::tool). `vm --version` names the execution core.
+//! `VIBE_DATABASE_URL=... vibe setup` prints the setup credential (crate::setup).
+//! `vibe admin connect-oidc`, `vibe sign-in`, `vibe sign-out`, `vibe whoami`, `vibe resources`, `vibe
+//! applications`, `vibe pull`, `vibe new`, `vibe check`, `vibe generate`, `vibe
+//! deploy`, `vibe versions`, `vibe go-back` and `vibe logs` are the Builder's tool
+//! (vibe::tool). `vibe --version` names the execution core.
 
 use std::io::Write;
 use std::net::SocketAddr;
@@ -21,24 +21,24 @@ use clap::{Parser, Subcommand};
 use serde_json::json;
 use tokio::net::TcpListener;
 
-use vm::api::{Api, Signing};
-use vm::executor;
-use vm::ingress::Ingress;
-use vm::oidc::key::InstallationKey;
-use vm::oidc::{Oidc, OidcParts, connection};
-use vm::origin::{Public, Scheme};
-use vm::platform::{Limits, Platform};
-use vm::platform_db::{self, DatabaseAddress, PlatformDatabase, PoolLimits};
-use vm::registry::is_dns_label;
-use vm::runner;
-use vm::sign_in::{NoSignIn, SignIn, StandInSignIn};
-use vm::tool;
-use vm::tool_credentials::{DEFAULT_LIFETIME, ToolCredentials, Unchecked};
-use vm::{log, server, setup};
+use vibe::api::{Api, Signing};
+use vibe::executor;
+use vibe::ingress::Ingress;
+use vibe::oidc::key::InstallationKey;
+use vibe::oidc::{Oidc, OidcParts, connection};
+use vibe::origin::{Public, Scheme};
+use vibe::platform::{Limits, Platform};
+use vibe::platform_db::{self, DatabaseAddress, PlatformDatabase, PoolLimits};
+use vibe::registry::is_dns_label;
+use vibe::runner;
+use vibe::sign_in::{NoSignIn, SignIn, StandInSignIn};
+use vibe::tool;
+use vibe::tool_credentials::{DEFAULT_LIFETIME, ToolCredentials, Unchecked};
+use vibe::{log, server, setup};
 
 #[derive(Parser)]
 #[command(
-    name = "vm",
+    name = "vibe",
     disable_version_flag = true,
     after_help = tool::EXIT_CODES
 )]
@@ -57,12 +57,12 @@ const DATABASE_START_TIMEOUT: Duration = Duration::from_secs(12);
 #[derive(Subcommand)]
 enum Command {
     /// Serve Applications, each on <name>.<domain>, and the platform's API
-    /// on api.<domain>. The platform database is named by VM_DATABASE_URL,
-    /// the installation's key is VM_SECRET_KEY.
+    /// on api.<domain>. The platform database is named by VIBE_DATABASE_URL,
+    /// the installation's key is VIBE_SECRET_KEY.
     Serve(Serve),
     /// Print the setup credential, good for 24 hours for connecting OIDC
-    /// once (vm admin connect-oidc). The platform database is named by
-    /// VM_DATABASE_URL.
+    /// once (vibe admin connect-oidc). The platform database is named by
+    /// VIBE_DATABASE_URL.
     Setup(SetupArgs),
     /// Commands for Platform administrators: connect-oidc.
     Admin(tool::AdminArgs),
@@ -89,14 +89,14 @@ enum Command {
     Share(tool::ChangeArgs<true>),
     /// Stop sharing the Application with people, Groups or everyone.
     Unshare(tool::ChangeArgs<true>),
-    /// Change who maintains the Application: vm contributors add|remove.
+    /// Change who maintains the Application: vibe contributors add|remove.
     Contributors(tool::ContributorsArgs),
     /// Pull a Resource's structure into the project, as a typed Drizzle
     /// definition (resources/<name>/schema.ts) and its link
     /// (resources/<name>/index.ts).
     Pull(tool::PullArgs),
     /// Make a new project from the template: an Application that answers
-    /// one page, ready for npm install and vm check.
+    /// one page, ready for npm install and vibe check.
     New(tool::NewArgs),
     /// Check whether the project will deploy: its Manifest, its Resources,
     /// its migrations and its types, every problem with its fix.
@@ -119,7 +119,7 @@ enum Command {
     Logs(tool::LogsArgs),
     /// Run the project on this machine, beside a private Postgres with an
     /// empty stand-in of each pulled Resource, and send it one request as a
-    /// test User of vm.dev.json (--as builder, --as outsider, ...).
+    /// test User of vibe.dev.json (--as builder, --as outsider, ...).
     Request(tool::RequestArgs),
     /// Keep the project running on this machine and serve it to your
     /// browser at http://<name>.localhost:7480/, as the test User you choose
@@ -142,7 +142,7 @@ struct Serve {
     #[arg(long)]
     stand_in_sign_in: bool,
     /// With the stand-in only: the Group whose members are Platform
-    /// administrators. With OIDC the connection names it (vm admin
+    /// administrators. With OIDC the connection names it (vibe admin
     /// connect-oidc).
     #[arg(long)]
     administrators_group: Option<String>,
@@ -166,7 +166,7 @@ struct Serve {
     session_lifetime: u64,
 }
 
-/// `vm setup`.
+/// `vibe setup`.
 #[derive(clap::Args)]
 struct SetupArgs {
     /// Print exactly one JSON object on standard output.
@@ -198,7 +198,7 @@ fn main() -> ExitCode {
         Some(Command::Serve(serve)) => match run(&serve) {
             Ok(()) => ExitCode::SUCCESS,
             Err(message) => {
-                say_on_stderr(&format!("vm serve: {message}"));
+                say_on_stderr(&format!("vibe serve: {message}"));
                 ExitCode::FAILURE
             }
         },
@@ -226,7 +226,7 @@ fn main() -> ExitCode {
         Some(Command::Contributors(args)) => tool::run(tool::Command::Contributors(args)),
         None => {
             say_on_stderr(
-                "vm: name a command (see vm --help): vm sign-in ..., vm serve ..., or vm --version",
+                "vibe: name a command (see vibe --help): vibe sign-in ..., vibe serve ..., or vibe --version",
             );
             ExitCode::from(2)
         }
@@ -248,7 +248,7 @@ fn version() -> std::io::Result<()> {
         None => "none",
     };
     let mut out = std::io::stdout().lock();
-    writeln!(out, "vm {}", env!("CARGO_PKG_VERSION"))?;
+    writeln!(out, "vibe {}", env!("CARGO_PKG_VERSION"))?;
     writeln!(
         out,
         "execution core: openworkers-core v0.18.1, openworkers-runtime-v8 v0.18.7 (patched, vendor/VENDORED.md)"
@@ -267,7 +267,7 @@ fn run(serve: &Serve) -> Result<(), String> {
     }
     if serve.administrators_group.is_some() && !serve.stand_in_sign_in {
         return Err(
-            "--administrators-group belongs to the stand-in (--stand-in-sign-in): with OIDC, the Group whose members are Platform administrators is named when OIDC is connected, with `vm admin connect-oidc --administrators-group <Group>`"
+            "--administrators-group belongs to the stand-in (--stand-in-sign-in): with OIDC, the Group whose members are Platform administrators is named when OIDC is connected, with `vibe admin connect-oidc --administrators-group <Group>`"
                 .to_owned(),
         );
     }
@@ -367,7 +367,7 @@ fn run(serve: &Serve) -> Result<(), String> {
                     "oidc-connection-unusable",
                     json!({
                         "reason": reason,
-                        "message": "the OIDC connection in the platform database cannot be used with this installation's key: connect OIDC again (vm setup, then vm admin connect-oidc)",
+                        "message": "the OIDC connection in the platform database cannot be used with this installation's key: connect OIDC again (vibe setup, then vibe admin connect-oidc)",
                     }),
                 );
             }
@@ -424,7 +424,7 @@ fn run(serve: &Serve) -> Result<(), String> {
     })
 }
 
-/// `vm setup`: the platform database brought up to date, then the setup
+/// `vibe setup`: the platform database brought up to date, then the setup
 /// credential made and printed once. Failures are those of a start-up:
 /// exit code 1, a message that never shows a password.
 fn run_setup(args: &SetupArgs) -> ExitCode {
@@ -439,9 +439,9 @@ fn run_setup(args: &SetupArgs) -> ExitCode {
             } else {
                 say_on_stderr(&format!(
                     "The setup credential, good until {} for connecting OIDC once:\n\
-                     put it in VM_SETUP_CREDENTIAL and the client secret in VM_OIDC_CLIENT_SECRET, then run\n\
-                     vm admin connect-oidc --domain <domain> --connect <ip:port> --issuer <URL> --client-id <id> --administrators-group <Group>\n\
-                     A second vm setup ends this credential.",
+                     put it in VIBE_SETUP_CREDENTIAL and the client secret in VIBE_OIDC_CLIENT_SECRET, then run\n\
+                     vibe admin connect-oidc --domain <domain> --connect <ip:port> --issuer <URL> --client-id <id> --administrators-group <Group>\n\
+                     A second vibe setup ends this credential.",
                     made.expires_at
                 ));
                 write_out(&format!("{}\n", made.credential.expose()))
@@ -450,13 +450,13 @@ fn run_setup(args: &SetupArgs) -> ExitCode {
                 ExitCode::SUCCESS
             } else {
                 say_on_stderr(
-                    "vm setup: the setup credential could not be written out: run vm setup again",
+                    "vibe setup: the setup credential could not be written out: run vibe setup again",
                 );
                 ExitCode::FAILURE
             }
         }
         Err(message) => {
-            say_on_stderr(&format!("vm setup: {message}"));
+            say_on_stderr(&format!("vibe setup: {message}"));
             ExitCode::FAILURE
         }
     }
@@ -491,11 +491,11 @@ fn setup_credential() -> Result<setup::Made, String> {
                 platform_db::VARIABLE
             )
         })??;
-        made.ok_or_else(|| "the operating system gave no randomness: run vm setup again".to_owned())
+        made.ok_or_else(|| "the operating system gave no randomness: run vibe setup again".to_owned())
     })
 }
 
-/// `VM_DATABASE_URL`, read. The message never repeats its value, which
+/// `VIBE_DATABASE_URL`, read. The message never repeats its value, which
 /// holds a password.
 fn database_address() -> Result<DatabaseAddress, String> {
     let variable = platform_db::VARIABLE;

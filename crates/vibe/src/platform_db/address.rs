@@ -1,4 +1,4 @@
-//! `VM_DATABASE_URL`: where the platform database is, and as whom to log
+//! `VIBE_DATABASE_URL`: where the platform database is, and as whom to log
 //! in. It holds a password, so it is a type that does not print it: its
 //! `Debug` hides the password, and no error made while reading it repeats
 //! what was given.
@@ -7,9 +7,9 @@ use std::fmt;
 use std::time::Duration;
 
 /// The environment variable that names the platform database.
-pub const VARIABLE: &str = "VM_DATABASE_URL";
+pub const VARIABLE: &str = "VIBE_DATABASE_URL";
 
-/// The form `VM_DATABASE_URL` takes, for messages.
+/// The form `VIBE_DATABASE_URL` takes, for messages.
 pub const FORM: &str = "postgres://<role>:<password>@<host>:<port>/<platform database>";
 
 /// A password. It has no `Display`, and its `Debug` shows nothing of it.

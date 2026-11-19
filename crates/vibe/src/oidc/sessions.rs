@@ -94,7 +94,7 @@ pub const RENEWAL_WAIT: Duration = Duration::from_secs(11);
 
 /// The most sessions being renewed at once.
 ///
-/// A quarter of the connections `vm serve` serves at once
+/// A quarter of the connections `vibe serve` serves at once
 /// ([`server::CONNECTIONS`], from which it is derived). Each request
 /// waiting for a renewal holds its connection for up to [`RENEWAL_WAIT`];
 /// with a provider that does not answer, as many waiting requests as

@@ -97,7 +97,7 @@ pub struct Ingress {
     /// The largest request body read; past it the answer is 413.
     pub max_request_body_bytes: usize,
     /// Whether a request is given to an Application only when its User can
-    /// open it (`vm serve`); the local run serves every test User of the
+    /// open it (`vibe serve`); the local run serves every test User of the
     /// project.
     pub decides_opening: bool,
 }
@@ -136,7 +136,7 @@ impl Ingress {
         }
     }
 
-    /// Answers one request: off the wire (`vm serve`, whose body is
+    /// Answers one request: off the wire (`vibe serve`, whose body is
     /// [`hyper::body::Incoming`]) or handed over in the process (the local
     /// run's).
     pub async fn handle<B>(&self, request: Request<B>) -> Response<Full<Bytes>>
@@ -284,7 +284,7 @@ impl Ingress {
                 ),
             );
         }
-        // The Dashboard (`vm serve`'s; the local run has none), past its
+        // The Dashboard (`vibe serve`'s; the local run has none), past its
         // sign-in and the origin rule, as an Application.
         if self.decides_opening && name == Some(DASHBOARD_NAME) {
             let known = Known {

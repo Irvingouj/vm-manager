@@ -1,5 +1,5 @@
 [package]
-name = "vm"
+name = "vibe"
 version = "0.0.0"
 description = "The platform program (ADR 0015)"
 edition.workspace = true
@@ -11,7 +11,7 @@ publish.workspace = true
 path = "src/lib.rs"
 
 [[bin]]
-name = "vm"
+name = "vibe"
 path = "src/main.rs"
 
 [dependencies]

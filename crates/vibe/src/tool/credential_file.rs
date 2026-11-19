@@ -1,8 +1,8 @@
 //! The credential file on the Builder's machine (blackbox/CONTRACT.md, "The
 //! tool: The credential").
 //!
-//! - The folder is `$XDG_CONFIG_HOME/vm/` when that variable holds an
-//!   absolute path, else `$HOME/.config/vm/`. When it is not there it is made
+//! - The folder is `$XDG_CONFIG_HOME/vibe/` when that variable holds an
+//!   absolute path, else `$HOME/.config/vibe/`. When it is not there it is made
 //!   with mode `0700` (set again after making, whatever the umask).
 //! - The file is written whole to a file of its own in the folder, made new
 //!   with mode `0600` (set again on the open file, whatever the umask),
@@ -121,13 +121,13 @@ impl Place {
             let config = PathBuf::from(config);
             if config.is_absolute() {
                 return Ok(Self {
-                    folder: config.join("vm"),
+                    folder: config.join("vibe"),
                 });
             }
         }
         match std::env::var_os("HOME").map(PathBuf::from) {
             Some(home) if home.is_absolute() => Ok(Self {
-                folder: home.join(".config").join("vm"),
+                folder: home.join(".config").join("vibe"),
             }),
             _ => Err(
                 "neither XDG_CONFIG_HOME nor HOME is an absolute path, so the tool has no folder to keep its credential in: set HOME, then run the command again"
@@ -154,14 +154,14 @@ impl Place {
             Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Found::Nothing),
             Err(error) => {
                 return Err(format!(
-                    "the credential file {} cannot be read ({error}): make it readable by you, or remove it and run `vm sign-in` again",
+                    "the credential file {} cannot be read ({error}): make it readable by you, or remove it and run `vibe sign-in` again",
                     path.display()
                 ));
             }
         }
         let garbled = || {
             format!(
-                "the credential file {} does not hold what `vm sign-in` wrote there: remove it, then run `vm sign-in` again",
+                "the credential file {} does not hold what `vibe sign-in` wrote there: remove it, then run `vibe sign-in` again",
                 path.display()
             )
         };
@@ -193,14 +193,14 @@ impl Place {
         let folder = &self.folder;
         let problem = |what: &str, error: &io::Error| {
             format!(
-                "the credential folder {} {what} ({error}): make it a folder you can write, then run `vm sign-in` again",
+                "the credential folder {} {what} ({error}): make it a folder you can write, then run `vibe sign-in` again",
                 folder.display()
             )
         };
         match fs::metadata(folder) {
             Ok(meta) if meta.is_dir() => Ok(()),
             Ok(_) => Err(format!(
-                "the credential folder {} cannot be made: something that is not a folder is there; move it away, then run `vm sign-in` again",
+                "the credential folder {} cannot be made: something that is not a folder is there; move it away, then run `vibe sign-in` again",
                 folder.display()
             )),
             Err(error) if error.kind() == ErrorKind::NotFound => {
@@ -223,7 +223,7 @@ impl Place {
         let temporary = self.folder.join(TEMPORARY_NAME);
         let problem = |error: &io::Error| {
             format!(
-                "the credential file {} cannot be written ({error}): make its folder writable by you, then run `vm sign-in` again",
+                "the credential file {} cannot be written ({error}): make its folder writable by you, then run `vibe sign-in` again",
                 path.display()
             )
         };
@@ -275,7 +275,7 @@ impl Place {
             Ok(()) => Ok(true),
             Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
             Err(error) => Err(format!(
-                "the credential file {} cannot be removed ({error}): make its folder writable by you, then run `vm sign-out` again",
+                "the credential file {} cannot be removed ({error}): make its folder writable by you, then run `vibe sign-out` again",
                 path.display()
             )),
         }

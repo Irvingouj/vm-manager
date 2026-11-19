@@ -9,7 +9,7 @@
 //!   unless the stand-in is switched on.
 //! - [`StandInSignIn`]: development only. The caller states the User and
 //!   their Groups in two headers.
-//! - [`LocalSignIn`]: the local run's (`vm request`, `vm dev`): the test
+//! - [`LocalSignIn`]: the local run's (`vibe request`, `vibe dev`): the test
 //!   User the local run chose is put in the request's extensions, where
 //!   nothing that comes over the wire can put anything.
 //!
@@ -69,7 +69,7 @@ impl SignIn for NoSignIn {
 }
 
 /// The test User the local run chose for a request, put in the request's
-/// extensions by the local run itself (`vm request`, `vm dev`).
+/// extensions by the local run itself (`vibe request`, `vibe dev`).
 #[derive(Clone, Debug)]
 pub struct ChosenTestUser(pub User);
 

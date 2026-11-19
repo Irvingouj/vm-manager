@@ -1,4 +1,4 @@
-//! The test Users file, `vm.dev.json` (blackbox/CONTRACT.md, "The local
+//! The test Users file, `vibe.dev.json` (blackbox/CONTRACT.md, "The local
 //! loop: The test Users file"): read and checked ([`read`]), and the
 //! Builder's own Grant copied into it by a pull ([`TestUsersFile::copy_grant`]).
 //!
@@ -19,7 +19,7 @@ use super::Ending;
 use crate::resources::is_resource_name;
 
 /// The file's name in the project.
-pub const FILE: &str = "vm.dev.json";
+pub const FILE: &str = "vibe.dev.json";
 
 /// The largest file read; past it the file is refused.
 const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
@@ -217,7 +217,7 @@ pub fn as_new() -> Result<TestUsersFile, Ending> {
         Ending::new(
             1,
             "tool-failed",
-            "the template's vm.dev.json is not JSON".to_owned(),
+            "the template's vibe.dev.json is not JSON".to_owned(),
         )
     })?;
     checked(whole).map_err(|what| Ending::new(1, "tool-failed", what))

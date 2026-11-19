@@ -1,4 +1,4 @@
-//! `vm new <name> [--directory <directory>] [--json]` (blackbox/
+//! `vibe new <name> [--directory <directory>] [--json]` (blackbox/
 //! CONTRACT.md, "Creating a project").
 //!
 //! The name is checked on the command line, as the API checks an
@@ -20,7 +20,7 @@ use super::theirs::Theirs;
 use super::{Done, Ending, Output, file_problem};
 use crate::registry::{NameProblem, check_name};
 
-/// `vm new`.
+/// `vibe new`.
 #[derive(clap::Args)]
 pub struct NewArgs {
     /// The Application's name: a lower-case DNS label (letters, digits and
@@ -36,7 +36,7 @@ pub struct NewArgs {
 }
 
 /// What to run in a new project, in order.
-const NEXT: [&str; 2] = ["npm install", "vm check"];
+const NEXT: [&str; 2] = ["npm install", "vibe check"];
 
 fn application_name(text: &str) -> Result<String, String> {
     match check_name(text) {
@@ -56,7 +56,7 @@ pub(super) fn new(args: &NewArgs) -> Result<Done, Ending> {
     let files = template::files(&args.name);
     for file in &files {
         write_new(&dir.join(&file.path), &file.bytes)
-            .map_err(|(how, error)| file_problem(&file.path, how, &error, "vm new"))?;
+            .map_err(|(how, error)| file_problem(&file.path, how, &error, "vibe new"))?;
     }
     let project = fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
     let project = project.to_string_lossy();
@@ -99,7 +99,7 @@ fn prepare(dir: &Path, shown: &str) -> Result<(), Ending> {
         )),
         Ok(_) => {
             let mut entries = fs::read_dir(dir).map_err(|error| {
-                file_problem(&shown.to_string(), "cannot be read", &error, "vm new")
+                file_problem(&shown.to_string(), "cannot be read", &error, "vibe new")
             })?;
             if entries.next().is_some() {
                 Err(Ending::new(
@@ -113,13 +113,16 @@ fn prepare(dir: &Path, shown: &str) -> Result<(), Ending> {
                 Ok(())
             }
         }
-        Err(error) if error.kind() == ErrorKind::NotFound => fs::create_dir_all(dir)
-            .map_err(|error| file_problem(&shown.to_string(), "cannot be made", &error, "vm new")),
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            fs::create_dir_all(dir).map_err(|error| {
+                file_problem(&shown.to_string(), "cannot be made", &error, "vibe new")
+            })
+        }
         Err(error) => Err(file_problem(
             &shown.to_string(),
             "cannot be read",
             &error,
-            "vm new",
+            "vibe new",
         )),
     }
 }

@@ -1,5 +1,5 @@
-//! `vm dev` (blackbox/CONTRACT.md, "The local loop, kept running"): the
-//! project brought up as `vm request` brings it up, then served on the
+//! `vibe dev` (blackbox/CONTRACT.md, "The local loop, kept running"): the
+//! project brought up as `vibe request` brings it up, then served on the
 //! loopback address to the Builder's browser, as the test User chosen on
 //! its page, and to the tool's own commands of the project, until a signal.
 //!
@@ -35,7 +35,7 @@
 //! **Files.** Every read or write of the file system goes off the tool's
 //! one thread ([`run::off_thread`]): the connections are served on it.
 //! `postgres.log` is emptied once larger than 16 MiB, looked at every
-//! [`LOG_EVERY`]; `vm.log` bounds itself (crate::log).
+//! [`LOG_EVERY`]; `vibe.log` bounds itself (crate::log).
 //!
 //! **Bounds.** Jobs waiting: [`JOBS`] (a request that finds the queue full
 //! waits for room). Lines waiting to be printed: [`LINES`] (the request
@@ -48,7 +48,7 @@
 //! [`server::Limits::drain`] to finish their request then dropped, the job
 //! under way is dropped (which stops the tools it runs), the parts are
 //! closed, the private Postgres is stopped and waited for, the file that
-//! finds this `vm dev` removed, then the project's lock let go.
+//! finds this `vibe dev` removed, then the project's lock let go.
 
 use std::io::{ErrorKind, Write};
 use std::net::{Ipv4Addr, Ipv6Addr};
@@ -111,7 +111,7 @@ const OUTPUT_WAIT: Duration = Duration::from_secs(60);
 const LOG_EVERY: Duration = Duration::from_secs(10);
 
 /// A look at the project that took longer than this is recorded in
-/// `vm.log`, beside every look that caused a rebuild.
+/// `vibe.log`, beside every look that caused a rebuild.
 const SLOW_LOOK: Duration = Duration::from_millis(50);
 
 /// The largest form posted to the page.
@@ -126,20 +126,20 @@ struct Session {
     live: Live,
 }
 
-/// What `vm dev` serves from. See the module's text.
+/// What `vibe dev` serves from. See the module's text.
 struct State {
     session: Option<Session>,
     /// What the last bring-up that ended well did, as a request that
     /// causes none reports it.
     last: Option<Brought>,
-    /// How the bring-up of the project as it is now failed: what `vm
+    /// How the bring-up of the project as it is now failed: what `vibe
     /// request` prints of it, and its exit code.
     failed: Option<(u8, Done)>,
     /// The look at the project the state is of.
     seen: Option<Look>,
 }
 
-/// Why `vm dev` stops.
+/// Why `vibe dev` stops.
 #[derive(Clone, Copy)]
 enum Why {
     Signal,
@@ -165,7 +165,7 @@ enum Asked {
     Reset,
 }
 
-/// The request of a `vm request` answered here, as it sent it.
+/// The request of a `vibe request` answered here, as it sent it.
 struct Wanted {
     path: String,
     user: String,
@@ -213,7 +213,7 @@ fn dev_size() -> Size {
     }
 }
 
-/// `vm dev`.
+/// `vibe dev`.
 pub(in super::super) async fn dev(args: &DevArgs) -> Result<Done, Ending> {
     let name = WHO_DEV.command;
     let project = super::project_path(args.project.as_deref(), name)?;
@@ -296,7 +296,7 @@ pub(in super::super) async fn dev(args: &DevArgs) -> Result<Done, Ending> {
             "version": brought.version,
         }),
         &format!(
-            "vm dev serves {} at {} (local Version {}), as the test User you choose there. It runs until interrupted (Ctrl-C).",
+            "vibe dev serves {} at {} (local Version {}), as the test User you choose there. It runs until interrupted (Ctrl-C).",
             Theirs::from(&*application),
             front.address(&application),
             brought.version
@@ -350,13 +350,13 @@ pub(in super::super) async fn dev(args: &DevArgs) -> Result<Done, Ending> {
         Some(Why::OutputClosed) => Err(Ending::new(
             1,
             "output-closed",
-            "vm dev could not write its output, so it stopped, with everything it started".into(),
+            "vibe dev could not write its output, so it stopped, with everything it started".into(),
         )),
         _ => Ok(Done::printed()),
     }
 }
 
-/// A secret made for this run, and the file that finds this `vm dev`
+/// A secret made for this run, and the file that finds this `vibe dev`
 /// written with it.
 async fn write_control(
     project: &Path,
@@ -370,7 +370,7 @@ async fn write_control(
     Ok(secret)
 }
 
-/// The file that finds this `vm dev` written (again), off the tool's thread.
+/// The file that finds this `vibe dev` written (again), off the tool's thread.
 async fn rewrite_control(
     project: &Path,
     port: u16,
@@ -384,16 +384,16 @@ async fn rewrite_control(
     let secret = Arc::clone(secret);
     run::off_thread(move || control::write(&Local::of(&project), port, &application, &secret))
         .await
-        .unwrap_or_else(|| Err("the file that finds vm dev could not be written".to_owned()))
+        .unwrap_or_else(|| Err("the file that finds vibe dev could not be written".to_owned()))
 }
 
-/// `already-running`: another `vm dev` serves this project at `address`.
+/// `already-running`: another `vibe dev` serves this project at `address`.
 fn already_running(address: &str) -> Ending {
     Ending::new(
         1,
         "already-running",
         format!(
-            "vm dev already runs in this project, at {address}: use that one, or end it (Ctrl-C where it runs) before starting another"
+            "vibe dev already runs in this project, at {address}: use that one, or end it (Ctrl-C where it runs) before starting another"
         ),
     )
 }
@@ -407,7 +407,7 @@ struct Started {
     seen: Look,
 }
 
-/// What `vm dev` does before it listens: what `vm request` does up to the
+/// What `vibe dev` does before it listens: what `vibe request` does up to the
 /// request.
 async fn start(base: &Base<'_>, progress: &Progress, held: &Held) -> Result<Started, Ending> {
     let packages = run::tools(base, progress).await?;
@@ -415,7 +415,7 @@ async fn start(base: &Base<'_>, progress: &Progress, held: &Held) -> Result<Star
     let local = Local::of(base.project);
     // Another one may begin to listen while this one waits for the lock.
     // Its file is believed when it is still there, the same, one
-    // LOCK_POLL later: a file a killed `vm dev` left is removed by the
+    // LOCK_POLL later: a file a killed `vibe dev` left is removed by the
     // next holder of the lock right after it takes the lock, so it cannot
     // be seen twice that far apart, while a listening one's stays. A file
     // seen once is not turned to again; the wait goes on.
@@ -459,7 +459,7 @@ fn bind(port: u16) -> Result<Vec<TcpListener>, Ending> {
             1,
             "port-in-use",
             format!(
-                "Port {port} of this machine's loopback address is taken: give vm dev another with --port <n>, or end what holds it"
+                "Port {port} of this machine's loopback address is taken: give vibe dev another with --port <n>, or end what holds it"
             ),
         )
     };
@@ -468,7 +468,7 @@ fn bind(port: u16) -> Result<Vec<TcpListener>, Ending> {
             1,
             "failed",
             format!(
-                "vm dev cannot listen on 127.0.0.1:{port} ({error}): give it another port with --port <n>"
+                "vibe dev cannot listen on 127.0.0.1:{port} ({error}): give it another port with --port <n>"
             ),
         )
     };
@@ -533,7 +533,7 @@ async fn write_out(text: String) -> Result<(), ()> {
 }
 
 /// Prints the lines as they come; an output that cannot be written stops
-/// `vm dev`.
+/// `vibe dev`.
 async fn printer(mut lines: mpsc::Receiver<String>, stop: &watch::Sender<Option<Why>>) {
     let mut stopped = stop.subscribe();
     loop {
@@ -564,7 +564,7 @@ async fn printer(mut lines: mpsc::Receiver<String>, stop: &watch::Sender<Option<
 }
 
 /// Empties `postgres.log` once it is past its bound, every [`LOG_EVERY`],
-/// until `vm dev` stops.
+/// until `vibe dev` stops.
 async fn keeper(project: &Arc<Path>, stop: &watch::Sender<Option<Why>>) {
     let mut stopped = stop.subscribe();
     loop {
@@ -577,7 +577,7 @@ async fn keeper(project: &Arc<Path>, stop: &watch::Sender<Option<Why>>) {
     }
 }
 
-/// Does the jobs one after the other, until `vm dev` stops.
+/// Does the jobs one after the other, until `vibe dev` stops.
 async fn jobs(
     front: &Front,
     ctx: &Ctx<'_>,
@@ -626,7 +626,7 @@ fn outcome(result: Result<Done, Ending>) -> (u8, Done) {
 
 fn too_many_message() -> String {
     format!(
-        "The project has more than {} files and folders (those under node_modules/, .vm/ and .git/ aside), so vm dev does not look for changes before each request: a change is served once vm dev is started again.",
+        "The project has more than {} files and folders (those under node_modules/, .vibe/ and .git/ aside), so vibe dev does not look for changes before each request: a change is served once vibe dev is started again.",
         walk::MAX_ENTRIES
     )
 }
@@ -643,7 +643,7 @@ struct Looked {
 }
 
 impl Looked {
-    /// Writes it in `vm.log`.
+    /// Writes it in `vibe.log`.
     fn record(&self) {
         crate::log::record(
             "project-looked-at",
@@ -655,7 +655,7 @@ impl Looked {
     }
 }
 
-/// The project looked at, off the tool's thread. Recorded in `vm.log` when
+/// The project looked at, off the tool's thread. Recorded in `vibe.log` when
 /// it took longer than [`SLOW_LOOK`] (a rebuild records the look that
 /// caused it).
 async fn look_at(project: &Path) -> Looked {
@@ -726,7 +726,7 @@ impl Front {
         Some(looked)
     }
 
-    /// The Application's name after a bring-up: the file that finds `vm
+    /// The Application's name after a bring-up: the file that finds `vibe
     /// dev` says it too.
     async fn named(&self, application: &str) {
         let changed = {
@@ -877,7 +877,7 @@ impl Front {
         }
     }
 
-    /// `vm request`, answered here: served as a request of the browser is,
+    /// `vibe request`, answered here: served as a request of the browser is,
     /// after the same look at the project, as the User it names.
     async fn forwarded_request(&self, ctx: &Ctx<'_>, wanted: &Wanted) -> Result<Done, Ending> {
         let Some(mut state) = self.write_state().await else {
@@ -936,7 +936,7 @@ impl Front {
         Ok(request_output(&brought, &served, &asked))
     }
 
-    /// `vm local operation-log` or `change-history`, answered here, once
+    /// `vibe local operation-log` or `change-history`, answered here, once
     /// what the requests before recorded is in.
     async fn forwarded_read(&self, ctx: &Ctx<'_>, reading: &Reading) -> Result<Done, Ending> {
         let Some(mut state) = self.write_state().await else {
@@ -962,7 +962,7 @@ impl Front {
         read_records(&session.live.database, reading, WHO_LOCAL.command).await
     }
 
-    /// `vm local reset`, done here: the parts closed, the private Postgres
+    /// `vibe local reset`, done here: the parts closed, the private Postgres
     /// stopped and made anew, the project brought up on it.
     async fn forwarded_reset(&self, ctx: &Ctx<'_>) -> Result<Done, Ending> {
         let Some(mut state) = self.write_state().await else {
@@ -1165,7 +1165,7 @@ impl Front {
             .find_map(|value| page::percent_decode(std::str::from_utf8(value).ok()?, false))
     }
 
-    /// `vm.dev.json` as it is now, and (for the page, `with_pulled`) the
+    /// `vibe.dev.json` as it is now, and (for the page, `with_pulled`) the
     /// pulled Resources, read off the async workers.
     async fn users(&self, with_pulled: bool) -> Result<(TestUsersFile, Vec<String>), Ending> {
         let project = Arc::clone(&self.project);
@@ -1273,10 +1273,10 @@ impl Front {
         let (reply, answered) = oneshot::channel();
         let sent = tokio::time::timeout(READ_WAIT, self.jobs.send(Job::Control { asked, reply }));
         if !matches!(sent.await, Ok(Ok(()))) {
-            return page::unavailable("vm dev is stopping.");
+            return page::unavailable("vibe dev is stopping.");
         }
         let Ok(Ok((code, done))) = tokio::time::timeout(READ_WAIT, answered).await else {
-            return page::unavailable("vm dev could not do the command in time, or is stopping.");
+            return page::unavailable("vibe dev could not do the command in time, or is stopping.");
         };
         page::json(json!({ "code": code, "json": done.json, "text": done.text }).to_string())
     }
@@ -1291,7 +1291,7 @@ impl Front {
         {
             let state = tokio::time::timeout(READ_WAIT, self.state.read())
                 .await
-                .map_err(|_| Box::new(page::unavailable("vm dev is busy: try again shortly.")))?;
+                .map_err(|_| Box::new(page::unavailable("vibe dev is busy: try again shortly.")))?;
             if state.seen == Some(looked.look) {
                 return Ok(());
             }
@@ -1299,12 +1299,12 @@ impl Front {
         let (reply, answered) = oneshot::channel();
         let sent = tokio::time::timeout(READ_WAIT, self.jobs.send(Job::Rebuild { reply }));
         if !matches!(sent.await, Ok(Ok(()))) {
-            return Err(Box::new(page::unavailable("vm dev is stopping.")));
+            return Err(Box::new(page::unavailable("vibe dev is stopping.")));
         }
         match tokio::time::timeout(READ_WAIT, answered).await {
             Ok(Ok(())) => Ok(()),
             _ => Err(Box::new(page::unavailable(
-                "vm dev could not bring the project up in time, or is stopping.",
+                "vibe dev could not bring the project up in time, or is stopping.",
             ))),
         }
     }
@@ -1317,13 +1317,13 @@ impl Front {
     ) -> Response<Full<Bytes>> {
         let users = self.users(false).await;
         let Ok(state) = tokio::time::timeout(READ_WAIT, self.state.read()).await else {
-            return page::unavailable("vm dev is busy: try again shortly.");
+            return page::unavailable("vibe dev is busy: try again shortly.");
         };
         if let Some((_, report)) = &state.failed {
             return page::failed(error_of(report));
         }
         let Some(session) = state.session.as_ref() else {
-            return page::unavailable("vm dev is starting the local databases over.");
+            return page::unavailable("vibe dev is starting the local databases over.");
         };
         let file = match users {
             Ok((file, _)) => file,
@@ -1416,13 +1416,13 @@ enum Which {
     Other,
 }
 
-/// `vm dev` could not take the command now.
+/// `vibe dev` could not take the command now.
 fn busy(who: &Who) -> Ending {
     Ending::new(
         1,
         "failed",
         format!(
-            "vm dev, which runs in this project, could not do {} now (it is busy or starting the local databases over): run it again",
+            "vibe dev, which runs in this project, could not do {} now (it is busy or starting the local databases over): run it again",
             who.command
         ),
     )
@@ -1487,7 +1487,7 @@ fn unhex(text: &str) -> Option<Vec<u8>> {
         .collect()
 }
 
-/// The request a `vm request` sent.
+/// The request a `vibe request` sent.
 fn wanted_of(value: &Value) -> Option<Wanted> {
     let mut headers = Vec::new();
     for pair in value["headers"].as_array()? {
@@ -1504,7 +1504,7 @@ fn wanted_of(value: &Value) -> Option<Wanted> {
     })
 }
 
-/// What a `vm local` sent.
+/// What a `vibe local` sent.
 fn reading_of(value: &Value) -> Option<Reading> {
     let limit = u16::try_from(value["limit"].as_u64()?).ok()?;
     match value["read"].as_str()? {

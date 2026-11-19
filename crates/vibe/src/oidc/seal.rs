@@ -1,5 +1,5 @@
 //! Sealing with AES-256-GCM under a key derived with HKDF-SHA256 from the
-//! installation's key (`VM_SECRET_KEY`, crate::oidc::key), which is never in
+//! installation's key (`VIBE_SECRET_KEY`, crate::oidc::key), which is never in
 //! the platform database. Each use has a key of its own, by its own HKDF
 //! salt ([`Use`]):
 //!

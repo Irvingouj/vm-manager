@@ -287,7 +287,7 @@ pub fn setup_refused() -> Answer {
     Answer::error(
         StatusCode::UNAUTHORIZED,
         "not-signed-in",
-        "the setup credential is used up, replaced or expired: run `vm setup` again",
+        "the setup credential is used up, replaced or expired: run `vibe setup` again",
     )
 }
 

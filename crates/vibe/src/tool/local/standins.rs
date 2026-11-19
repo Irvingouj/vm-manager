@@ -81,7 +81,7 @@ pub(super) fn pulled(project: &Path, command: &str) -> Pulled {
                 "reason": "stand-in-not-pulled",
                 "resource": name,
                 "message": format!(
-                    "{name} was pulled before the local run could make a stand-in of it (it has no resources/{name}/standin.sql the tool wrote): it has no stand-in, so its operations are refused not-registered. Run vm pull {name} again, then {command} again"
+                    "{name} was pulled before the local run could make a stand-in of it (it has no resources/{name}/standin.sql the tool wrote): it has no stand-in, so its operations are refused not-registered. Run vibe pull {name} again, then {command} again"
                 ),
             })),
         }
@@ -410,7 +410,7 @@ async fn make(
                 "statement": "",
                 "error": "Postgres's scanner cannot split the file into statements",
                 "message": format!(
-                    "resources/{}/standin.sql cannot be split into statements, so its stand-in is empty: run vm pull {} again",
+                    "resources/{}/standin.sql cannot be split into statements, so its stand-in is empty: run vibe pull {} again",
                     file.resource, file.resource
                 ),
             }));

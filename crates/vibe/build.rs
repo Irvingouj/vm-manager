@@ -1,4 +1,4 @@
-//! What `vm new` carries into a new project that is made from the
+//! What `vibe new` carries into a new project that is made from the
 //! repository at build time (blackbox/CONTRACT.md, "What a new project
 //! holds"), so that it cannot drift from what the gate tested and the build
 //! needs neither `npm` nor `node`:
@@ -45,7 +45,7 @@ fn main() -> Result<(), String> {
     let root = crate_dir
         .parent()
         .and_then(Path::parent)
-        .ok_or("crates/vm is not two folders below the repository's root")?;
+        .ok_or("crates/vibe is not two folders below the repository's root")?;
     let sdk = root.join("sdk");
     let lock = root.join("package-lock.json");
     println!("cargo::rerun-if-changed={}", sdk.display());

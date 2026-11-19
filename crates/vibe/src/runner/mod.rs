@@ -134,7 +134,7 @@ pub struct RequestRunner {
     lanes: Vec<mpsc::Sender<Job>>,
     next: AtomicUsize,
     deadline: Duration,
-    /// The engine threads, kept rather than detached. `vm serve` runs them
+    /// The engine threads, kept rather than detached. `vibe serve` runs them
     /// until the program is killed (blackbox/CONTRACT.md); the local run
     /// ends them with [`RequestRunner::stop`].
     threads: Vec<JoinHandle<()>>,
@@ -155,7 +155,7 @@ impl RequestRunner {
                 gateway: Arc::clone(gateway),
             };
             let thread = std::thread::Builder::new()
-                .name(format!("vm-engine-{index}"))
+                .name(format!("vibe-engine-{index}"))
                 .spawn(move || engine.run(receiver))?;
             lanes.push(sender);
             threads.push(thread);

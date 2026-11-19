@@ -21,7 +21,7 @@ openworkers-runtime-v8 = { git = "https://github.com/openworkers/openworkers-run
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
 http-body-util = "0.1"
-# The client side is the tool's (crates/vm/src/tool): plain HTTP/1.1 to the
+# The client side is the tool's (crates/vibe/src/tool): plain HTTP/1.1 to the
 # installation, driven on the tool's own single thread.
 hyper = { version = "1", features = ["server", "client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
@@ -46,16 +46,16 @@ postgres-protocol = "0.6"
 # How postgres-protocol hands over the fields of a message.
 fallible-iterator = "0.2"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "sync", "macros", "time", "io-util", "process", "signal"] }
-# Stopping a whole process group (`vm check` runs each of the project's
+# Stopping a whole process group (`vibe check` runs each of the project's
 # tools in a group of its own), behind a safe interface; and `fs`, to tell
-# whether standard output was closed when the tool started (`vm logs
+# whether standard output was closed when the tool started (`vibe logs
 # --follow`).
 rustix = { version = "1", default-features = false, features = ["std", "process", "fs", "system"] }
-# The SDK's tarball that `vm new` writes, made by crates/vm/build.rs.
+# The SDK's tarball that `vibe new` writes, made by crates/vibe/build.rs.
 tar = { version = "0.4", default-features = false }
 flate2 = "1"
 uuid = { version = "1", features = ["v4"] }
-# The local run's download of Postgres (crates/vm/src/tool/local/download.rs):
+# The local run's download of Postgres (crates/vibe/src/tool/local/download.rs):
 # TLS in Rust, with ring's cryptography and Mozilla's roots compiled in (no
 # system library, no certificate store read), driven by tokio under hyper's
 # client; and the archive unpacked: a jar (zip, deflate) holding a tar

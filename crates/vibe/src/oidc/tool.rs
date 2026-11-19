@@ -273,7 +273,7 @@ impl Oidc {
         let Some(asked) = read_query(parts.uri.query()) else {
             return pages::tool_failed(
                 StatusCode::BAD_REQUEST,
-                "This address is not one `vm sign-in` makes: it needs a challenge of 43 base64url characters, a port of 1024 to 65535 when there is one, and the machine's name of at most 64 bytes, each once.",
+                "This address is not one `vibe sign-in` makes: it needs a challenge of 43 base64url characters, a port of 1024 to 65535 when there is one, and the machine's name of at most 64 bytes, each once.",
             );
         };
         let configuration = match connected.provider.configuration(None).await {

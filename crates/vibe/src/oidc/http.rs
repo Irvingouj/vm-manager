@@ -140,7 +140,7 @@ impl Client {
             .method(method)
             .uri(target)
             .header(HOST, authority)
-            .header(USER_AGENT, "vm")
+            .header(USER_AGENT, "vibe")
             .header(ACCEPT, "application/json");
         if form.is_some() {
             builder = builder.header(CONTENT_TYPE, "application/x-www-form-urlencoded");

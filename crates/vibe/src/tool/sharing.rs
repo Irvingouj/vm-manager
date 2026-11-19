@@ -1,8 +1,8 @@
-//! `vm show`, `vm share`, `vm unshare` and `vm contributors add|remove`
+//! `vibe show`, `vibe share`, `vibe unshare` and `vibe contributors add|remove`
 //! (blackbox/CONTRACT.md, "Contributors and sharing: The tool"), and the
-//! words of an Application's two lists, which `vm deploy` says too.
+//! words of an Application's two lists, which `vibe deploy` says too.
 //!
-//! `vm show` is `GET /v1/applications/<name>`, printed as it is answered.
+//! `vibe show` is `GET /v1/applications/<name>`, printed as it is answered.
 //! The four that change something are one request each (`POST
 //! .../contributors` or `.../sharing`), whose answer is the Application as
 //! it is after, with the entries this request `added` and `removed`.
@@ -29,7 +29,7 @@ use super::{Done, Ending, Output, installation, not_success, sign_in_expired, un
 /// API's).
 const MAX_ENTRY_BYTES: usize = 256;
 
-/// `vm show`.
+/// `vibe show`.
 #[derive(clap::Args)]
 pub struct ShowArgs {
     /// The Application, by name.
@@ -38,14 +38,14 @@ pub struct ShowArgs {
     pub output: Output,
 }
 
-/// `vm contributors`.
+/// `vibe contributors`.
 #[derive(clap::Args)]
 pub struct ContributorsArgs {
     #[command(subcommand)]
     pub command: ContributorsCommand,
 }
 
-/// What `vm contributors` does.
+/// What `vibe contributors` does.
 #[derive(clap::Subcommand)]
 pub enum ContributorsCommand {
     /// Make people or Groups Contributors of the Application: they can
@@ -133,7 +133,7 @@ impl<const EVERYONE: bool> clap::Args for ChangeArgs<EVERYONE> {
             .arg(named(
                 "user",
                 "ID",
-                "A person, by their user id (vm whoami shows it)",
+                "A person, by their user id (vibe whoami shows it)",
             ))
             .arg(named(
                 "email",
@@ -279,7 +279,7 @@ async fn read(kept: &Kept, name: &str) -> Result<Result<Value, Reply>, Ending> {
     }
 }
 
-/// `vm show`.
+/// `vibe show`.
 pub(super) async fn show(args: &ShowArgs) -> Result<Done, Ending> {
     let name = args.application.as_str();
     let kept = signed_in_for(name)?;
@@ -294,7 +294,7 @@ pub(super) async fn show(args: &ShowArgs) -> Result<Done, Ending> {
     })
 }
 
-/// The words of `vm show`.
+/// The words of `vibe show`.
 fn shown(kept: &Kept, application: &Value) -> String {
     let field = |key: &str| application.get(key).and_then(Value::as_str);
     let mut text = String::new();
@@ -343,7 +343,7 @@ fn list(value: Option<&Value>) -> &[Value] {
     value.and_then(Value::as_array).map_or(&[], Vec::as_slice)
 }
 
-/// `vm share`, `vm unshare`, `vm contributors add|remove`.
+/// `vibe share`, `vibe unshare`, `vibe contributors add|remove`.
 pub(super) async fn change<const EVERYONE: bool>(
     change: Change,
     args: &ChangeArgs<EVERYONE>,
@@ -452,7 +452,7 @@ pub(super) fn entry_words(kept: &Kept, entry: &Value) -> String {
 }
 
 /// Who can see the Application now, each by name; or that it is visible
-/// to its Contributors only, and that `vm share` shares it.
+/// to its Contributors only, and that `vibe share` shares it.
 pub(super) fn visible_to_words(
     kept: &Kept,
     name: &str,
@@ -481,7 +481,7 @@ pub(super) fn visible_to_words(
     if shared_with.is_empty() {
         writeln!(
             text,
-            "{} ({address}) is visible to its Contributors only: {}. Nobody else can open it until it is shared: `vm share {} --user <id>` (or --email, --group, --everyone) shares it.",
+            "{} ({address}) is visible to its Contributors only: {}. Nobody else can open it until it is shared: `vibe share {} --user <id>` (or --email, --group, --everyone) shares it.",
             Theirs::from(name),
             named(contributors),
             Theirs::from(name),

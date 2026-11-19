@@ -1,9 +1,9 @@
 //! What every local command does, one implementation for all of them
-//! (`vm request` alone or answered by `vm dev`, `vm dev`, `vm local
+//! (`vibe request` alone or answered by `vibe dev`, `vibe dev`, `vibe local
 //! reset`): the private Postgres started ([`programs`], [`lock_project`],
 //! [`start_server`]); the installation's parts on it ([`Live`]); **the
 //! project brought up** ([`bring_up`]: the stand-ins, the Grants of
-//! `vm.dev.json`, the build, the local Version and its migrations, the test
+//! `vibe.dev.json`, the build, the local Version and its migrations, the test
 //! rows); and **one request served as a test User**, with what it recorded
 //! collected ([`serve_and_collect`]).
 //!
@@ -17,7 +17,7 @@
 //! ended (the engine answers after it dropped it). Then, each for at most
 //! [`DRAIN_WAIT`]: the operations still under way ([`PlatformGateway::drain`],
 //! which takes every one under way: the caller makes sure no other
-//! request's run meanwhile, `vm dev` by its lock); the log entry, written
+//! request's run meanwhile, `vibe dev` by its lock); the log entry, written
 //! by Logs' writer ([`Logs::settled`]); the changes, shipped to the Change
 //! history ([`OwnDatabases::ship_and_wait`]).
 
@@ -143,10 +143,10 @@ pub(super) async fn tools(base: &Base<'_>, progress: &Progress) -> Result<Packag
     packages(base.project, base.who).await
 }
 
-/// Makes `.vm/local/`, takes the project's lock (waiting for another local
+/// Makes `.vibe/local/`, takes the project's lock (waiting for another local
 /// command of the project, as long as the caller lets it), and starts
-/// `vm.log` anew. A file that finds a `vm dev` is a killed one's now, and
-/// is removed. `Some` instead of the lock: while it waited, a `vm dev` of
+/// `vibe.log` anew. A file that finds a `vibe dev` is a killed one's now, and
+/// is removed. `Some` instead of the lock: while it waited, a `vibe dev` of
 /// the project began to listen (one other than `tried`), and the command
 /// is to be handed to it.
 pub(super) async fn lock_project(
@@ -165,7 +165,7 @@ pub(super) async fn lock_project(
             || {
                 tell(
                     json,
-                    "Another local command of this project (vm request, vm dev or vm local) is running: waiting for it to end.",
+                    "Another local command of this project (vibe request, vibe dev or vibe local) is running: waiting for it to end.",
                 );
             },
             || control::found_while_waiting(local, tried),
@@ -178,7 +178,7 @@ pub(super) async fn lock_project(
     };
     held.keep_lock(lock);
     control::remove_left(local);
-    // The parts' own records go to .vm/local/vm.log, not the terminal;
+    // The parts' own records go to .vibe/local/vibe.log, not the terminal;
     // started anew by every run, so that it does not grow from run to run
     // (and bounded while one runs: see crate::log).
     if let Ok(file) = OpenOptions::new()
@@ -186,7 +186,7 @@ pub(super) async fn lock_project(
         .write(true)
         .truncate(true)
         .mode(0o600)
-        .open(local.dir.join("vm.log"))
+        .open(local.dir.join("vibe.log"))
     {
         crate::log::to_file(file);
     }
@@ -482,26 +482,26 @@ impl Brought {
     }
 }
 
-/// `test-users-file` for a project without `vm.dev.json`.
+/// `test-users-file` for a project without `vibe.dev.json`.
 pub(super) fn no_test_users_file(command: &str) -> Ending {
     Ending::new(
         1,
         "test-users-file",
         format!(
-            "The project has no {}: it holds the test Users a request is sent as. Make it as a new project has it (vm new makes one), or run vm pull <resource>, which adds your own; then run {command} again",
+            "The project has no {}: it holds the test Users a request is sent as. Make it as a new project has it (vibe new makes one), or run vibe pull <resource>, which adds your own; then run {command} again",
             test_users::FILE,
         ),
     )
 }
 
-/// `vm.dev.json` of the project, which must be there.
+/// `vibe.dev.json` of the project, which must be there.
 pub(super) fn test_users_of(project: &Path, command: &str) -> Result<TestUsersFile, Ending> {
     test_users::read(project, command)?.ok_or_else(|| no_test_users_file(command))
 }
 
 /// Runs `work`, which reads or writes the file system, on a thread of its
 /// own and not on the async worker: the one way the local commands do it
-/// (`vm dev` serves every connection on the tool's one thread). `None` when
+/// (`vibe dev` serves every connection on the tool's one thread). `None` when
 /// that thread ended abnormally.
 pub(super) async fn off_thread<T: Send + 'static>(
     work: impl FnOnce() -> T + Send + 'static,
@@ -671,7 +671,7 @@ pub(super) async fn bring_up(
 }
 
 /// Makes and readies the stand-ins, then makes them the Resources of the
-/// run, with the Grants of `vm.dev.json`: those of the file, all of them
+/// run, with the Grants of `vibe.dev.json`: those of the file, all of them
 /// and no other.
 async fn standins_of(
     base: &Base<'_>,
@@ -769,7 +769,7 @@ async fn standins_of(
                 "resource": grant.resource,
                 "group": grant.group,
                 "message": format!(
-                    "{} grants {} on {}, which has no stand-in here (it is not pulled): the Grant does nothing in the local run. Run vm pull {} to have it",
+                    "{} grants {} on {}, which has no stand-in here (it is not pulled): the Grant does nothing in the local run. Run vibe pull {} to have it",
                     test_users::FILE, grant.group, grant.resource, grant.resource
                 ),
             })),
@@ -869,7 +869,7 @@ async fn local_version(
                 1,
                 "local-migrations-diverged",
                 &format!(
-                    "migrations/ no longer begins with what the local own database has: it has the migration {migration}, which migrations/ does not have as it was (a migration not yet deployed was generated again). Removing the folder .vm/local/ (or vm local reset) starts the local databases anew (their test rows are loaded again); then run {name} again"
+                    "migrations/ no longer begins with what the local own database has: it has the migration {migration}, which migrations/ does not have as it was (a migration not yet deployed was generated again). Removing the folder .vibe/local/ (or vibe local reset) starts the local databases anew (their test rows are loaded again); then run {name} again"
                 ),
             ))
         }
@@ -1036,7 +1036,7 @@ pub(super) async fn serve_and_collect(
             warnings.push(incomplete(
                 "changes",
                 &format!(
-                    "the changes the request made in the own database did not reach the local Change history within {} seconds: vm local change-history may lack them until a later run ships them",
+                    "the changes the request made in the own database did not reach the local Change history within {} seconds: vibe local change-history may lack them until a later run ships them",
                     DRAIN_WAIT.as_secs()
                 ),
             ));

@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "dependencies": {
-    "@vm/sdk": "file:.vm/packages/vm-sdk-{{sdk}}.tgz",
+    "@vm/sdk": "file:.vibe/packages/vm-sdk-{{sdk}}.tgz",
     "drizzle-orm": "{{drizzle-orm}}"
   },
   "devDependencies": {

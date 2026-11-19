@@ -1,6 +1,6 @@
 //! Whether the project changed (blackbox/CONTRACT.md, "The project as it
 //! is now"): every entry of the project but those under a folder named
-//! `node_modules`, `.vm` or `.git`, by its path, its kind, its size and its
+//! `node_modules`, `.vibe` or `.git`, by its path, its kind, its size and its
 //! time of modification, hashed into one value that differs when any of
 //! them does.
 //!
@@ -21,7 +21,7 @@ use sha2::{Digest, Sha256};
 pub(super) const MAX_ENTRIES: usize = 20_000;
 
 /// Folders never looked into, wherever they are.
-const SKIPPED: [&str; 3] = ["node_modules", ".vm", ".git"];
+const SKIPPED: [&str; 3] = ["node_modules", ".vibe", ".git"];
 
 /// What a look at the project found.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -74,7 +74,7 @@ pub(super) fn look(project: &Path) -> (Look, usize) {
             let skipped = SKIPPED.iter().any(|s| name.as_bytes() == s.as_bytes());
             if skipped && meta.is_dir() {
                 // Only that it is there: nothing of it is looked at, its
-                // own time included (what the local run writes in .vm/
+                // own time included (what the local run writes in .vibe/
                 // changes it).
                 hash.update(b"s");
                 continue;

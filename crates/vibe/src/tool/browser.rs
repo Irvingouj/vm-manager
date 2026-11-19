@@ -1,4 +1,4 @@
-//! `vm sign-in` through the Builder's browser (blackbox/CONTRACT.md, "The
+//! `vibe sign-in` through the Builder's browser (blackbox/CONTRACT.md, "The
 //! tool signs in through the browser, and OIDC is connected from the tool:
 //! Signing the tool in").
 //!
@@ -368,9 +368,9 @@ async fn read_grant(stream: &mut TcpStream) -> Option<Secret> {
 
 const SIGNED_IN: &str = "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>Signed in</title></head><body><h1>The tool is signed in</h1><p>You can close this page and go back to the tool.</p></body></html>";
 
-const NOT_YET: &str = "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>Not signed in</title></head><body><h1>The tool is not signed in</h1><p>This answer is not for the sign-in the tool is waiting for. Run vm sign-in again if it has ended.</p></body></html>";
+const NOT_YET: &str = "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>Not signed in</title></head><body><h1>The tool is not signed in</h1><p>This answer is not for the sign-in the tool is waiting for. Run vibe sign-in again if it has ended.</p></body></html>";
 
-const FAILED: &str = "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>Not signed in</title></head><body><h1>The tool could not finish signing in</h1><p>See what the tool says, then run vm sign-in again.</p></body></html>";
+const FAILED: &str = "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>Not signed in</title></head><body><h1>The tool could not finish signing in</h1><p>See what the tool says, then run vibe sign-in again.</p></body></html>";
 
 const NOT_HERE: &str = "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>Not here</title></head><body><p>Nothing is here.</p></body></html>";
 
@@ -449,7 +449,7 @@ fn not_finished(at: &Installation<'_>, address: &Url, timeout: Duration) -> Endi
         3,
         "sign-in-not-finished",
         format!(
-            "the sign-in was not finished within {} seconds: nobody confirmed it at {address} (nothing was kept). When you are ready, run `vm sign-in --domain {} --connect {}` again and answer in the browser",
+            "the sign-in was not finished within {} seconds: nobody confirmed it at {address} (nothing was kept). When you are ready, run `vibe sign-in --domain {} --connect {}` again and answer in the browser",
             timeout.as_secs(),
             shell_word(at.domain),
             at.connect

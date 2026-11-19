@@ -600,7 +600,7 @@ fn literal(text: &str) -> String {
 /// The newest `limit` changes of the Change history, newest first, of every
 /// Application and table, or of the table `table` (`(schema, table)`): each
 /// as it is recorded, `old` and `new` the rows by column name, `id` as
-/// text. For the local run's `vm local change-history`, which reads the
+/// text. For the local run's `vibe local change-history`, which reads the
 /// private platform database whole.
 pub async fn recorded(
     platform: &crate::platform_db::PlatformDatabase,

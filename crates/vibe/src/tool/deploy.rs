@@ -1,8 +1,8 @@
-//! `vm deploy [--project <directory>] [--allow-data-loss] [--timeout
+//! `vibe deploy [--project <directory>] [--allow-data-loss] [--timeout
 //! <seconds>] [--json]` (blackbox/CONTRACT.md, "Deploying").
 //!
-//! Made of what the other commands have: `vm check`'s sign-in, packages and
-//! four checks ([`check`]), `vm pull` ([`Pull`]), `vm generate`'s data loss
+//! Made of what the other commands have: `vibe check`'s sign-in, packages and
+//! four checks ([`check`]), `vibe pull` ([`Pull`]), `vibe generate`'s data loss
 //! ([`data_loss`]) and journal ([`drizzle`]), the own folder, the time and
 //! the signals ([`project_tools`]), and `git` run as the project's tools are
 //! ([`Cx::git`]).
@@ -26,7 +26,7 @@
 //!
 //! **Endings.** Everything up to the bundle is held to `--timeout` (300 s
 //! without it, `deploy-timed-out`) and ended by `SIGINT`, `SIGTERM` and
-//! `SIGHUP` (`interrupted`), as for `vm check`: the future is dropped,
+//! `SIGHUP` (`interrupted`), as for `vibe check`: the future is dropped,
 //! which stops every tool's process group, and the own folder is removed
 //! after. Sending has its own ends: [`client::ANSWER_TIMEOUT`] to create
 //! the Application, [`SEND_TIMEOUT`] for the Version's answer (migrations
@@ -44,7 +44,7 @@
 //! them. A definition's second line is read in its first
 //! [`DEFINITION_HEAD_BYTES`].
 //!
-//! **Blocking work**, as for `vm check`: reading the project's files,
+//! **Blocking work**, as for `vibe check`: reading the project's files,
 //! writing a changed definition, parsing the added migrations; bounded as
 //! above, on the tool's one thread.
 //!
@@ -87,7 +87,7 @@ use crate::registry::check_name;
 use crate::resources::is_resource_name;
 use crate::structure::fingerprint_in;
 
-/// `vm deploy`.
+/// `vibe deploy`.
 #[derive(clap::Args)]
 pub struct DeployArgs {
     /// The project to deploy; without it, the current directory.
@@ -108,9 +108,9 @@ pub struct DeployArgs {
 
 /// How the deploy's messages name it.
 const WHO: Who = Who {
-    command: "vm deploy",
+    command: "vibe deploy",
     the: "the deploy",
-    folder: "vm-deploy",
+    folder: "vibe-deploy",
 };
 
 /// The longest the installation may take to answer a Version, once
@@ -158,7 +158,7 @@ impl Stage {
 }
 
 pub(super) async fn deploy(args: &DeployArgs) -> Result<Done, Ending> {
-    let project = project_of(args.project.as_deref(), "vm deploy")?;
+    let project = project_of(args.project.as_deref(), "vibe deploy")?;
     // Node resolves packages from the real path, and the tools are given
     // absolute paths.
     let project = std::fs::canonicalize(&project).map_err(|error| {
@@ -166,7 +166,7 @@ pub(super) async fn deploy(args: &DeployArgs) -> Result<Done, Ending> {
             1,
             "project-file",
             format!(
-                "the project's folder cannot be read ({error}): make it readable by you, then run vm deploy again"
+                "the project's folder cannot be read ({error}): make it readable by you, then run vibe deploy again"
             ),
         )
     })?;
@@ -185,7 +185,7 @@ pub(super) async fn deploy(args: &DeployArgs) -> Result<Done, Ending> {
             1,
             "deploy-timed-out",
             format!(
-                "vm deploy did not end within {} s and was stopped, with everything it started; it was in {}, and nothing was sent to the installation. Look at what that runs (src/db/schema.ts and what it imports are run by drizzle-kit), or give more time with --timeout <seconds>, then run vm deploy again",
+                "vibe deploy did not end within {} s and was stopped, with everything it started; it was in {}, and nothing was sent to the installation. Look at what that runs (src/db/schema.ts and what it imports are run by drizzle-kit), or give more time with --timeout <seconds>, then run vibe deploy again",
                 limit.as_secs(),
                 stage.get().words()
             ),
@@ -194,7 +194,7 @@ pub(super) async fn deploy(args: &DeployArgs) -> Result<Done, Ending> {
             1,
             "interrupted",
             format!(
-                "vm deploy was interrupted ({signal}) in {}, and stopped everything it had started; nothing was sent to the installation: run vm deploy again",
+                "vibe deploy was interrupted ({signal}) in {}, and stopped everything it had started; nothing was sent to the installation: run vibe deploy again",
                 stage.get().words()
             ),
         )),
@@ -219,7 +219,7 @@ pub(super) async fn deploy(args: &DeployArgs) -> Result<Done, Ending> {
         )),
         Bounded::Interrupted(signal) => Err(maybe_live(
             "interrupted",
-            &format!("vm deploy was interrupted ({signal}) while sending the Version"),
+            &format!("vibe deploy was interrupted ({signal}) while sending the Version"),
         )),
     };
     sent.map_err(|ending| {
@@ -238,11 +238,11 @@ fn created_stays(ending: Ending, name: &str) -> Ending {
     let unsure = ending.reason == json!("unreachable") || ending.reason == json!("interrupted");
     let sentence = if unsure {
         format!(
-            "This deploy created the Application {name}, which stays: unless the Version went live, {name} now exists with no Version (nothing is at its address), and the next vm deploy will send its first Version."
+            "This deploy created the Application {name}, which stays: unless the Version went live, {name} now exists with no Version (nothing is at its address), and the next vibe deploy will send its first Version."
         )
     } else {
         format!(
-            "This deploy created the Application {name}, which stays: it now exists with no Version (nothing is at its address), and the next vm deploy will send its first Version."
+            "This deploy created the Application {name}, which stays: it now exists with no Version (nothing is at its address), and the next vibe deploy will send its first Version."
         )
     };
     ending.amended(&sentence, "created", json!(true))
@@ -255,7 +255,7 @@ fn maybe_live(reason: &str, why: &str) -> Ending {
         1,
         reason,
         format!(
-            "no answer the tool understands came back for the Version ({why}): it may or may not have gone live. Look with vm applications (the Application's serving Version) before deploying again"
+            "no answer the tool understands came back for the Version ({why}): it may or may not have gone live. Look with vibe applications (the Application's serving Version) before deploying again"
         ),
     )
 }
@@ -419,7 +419,7 @@ async fn prepared(
         // The check's own ending, which a problem always makes.
         return Err(match check::report(found, &changed_preface(&changed)) {
             Err(ending) => ending,
-            Ok(_) => tool_failed("vm deploy", "found problems and no ending", &WHO),
+            Ok(_) => tool_failed("vibe deploy", "found problems and no ending", &WHO),
         });
     }
     let Some(manifest) = manifest else {
@@ -522,7 +522,7 @@ fn not_pulled(name: &str, no_grant: bool, unread: bool, found: &mut Found) {
     found.warnings.push(json!({
         "reason": "structure-not-pulled",
         "resource": name,
-        "message": format!("{said} Pull it again with `vm pull {name}` when it answers, and deploy again to build against its structure as it is then"),
+        "message": format!("{said} Pull it again with `vibe pull {name}` when it answers, and deploy again to build against its structure as it is then"),
     }));
 }
 
@@ -541,7 +541,7 @@ async fn pull_again(
     {
         return Ok(Again::Left);
     }
-    let pull = Pull::prepare(project, name, "vm deploy", true)?;
+    let pull = Pull::prepare(project, name, "vibe deploy", true)?;
     match pull.fetch(kept).await {
         Ok(pulled) => Ok(Again::Pulled(
             pulled.fingerprint,
@@ -606,7 +606,7 @@ async fn application(kept: &Kept, manifest: &Manifest) -> Result<Option<Existing
                 3,
                 "not-a-contributor",
                 format!(
-                    "An Application named {name} exists on the installation and is not shared with you, so you cannot deploy to it. Choose another `name` in manifest.ts (it becomes the address), commit, then run vm deploy again; or, if that Application is meant to be this project, ask whoever maintains it to make you a Contributor. Nothing was built or sent"
+                    "An Application named {name} exists on the installation and is not shared with you, so you cannot deploy to it. Choose another `name` in manifest.ts (it becomes the address), commit, then run vibe deploy again; or, if that Application is meant to be this project, ask whoever maintains it to make you a Contributor. Nothing was built or sent"
                 ),
             ));
         }
@@ -623,7 +623,7 @@ async fn application(kept: &Kept, manifest: &Manifest) -> Result<Option<Existing
             3,
             "not-a-contributor",
             format!(
-                "The installation already has an Application named {name}, and you are not one of its Contributors ({}), so you cannot deploy to it. Ask one of them to make you a Contributor, or choose another `name` in manifest.ts (it becomes the address), commit, then run vm deploy again; nothing was built or sent",
+                "The installation already has an Application named {name}, and you are not one of its Contributors ({}), so you cannot deploy to it. Ask one of them to make you a Contributor, or choose another `name` in manifest.ts (it becomes the address), commit, then run vibe deploy again; nothing was built or sent",
                 names.join(", ")
             ),
         ));
@@ -715,7 +715,7 @@ async fn run_git<O: Sink>(
                 1,
                 "git-missing",
                 format!(
-                    "vm deploy needs git, to send the commit the project is at and to see that everything is committed, and {found}: install git and put it on the PATH, then run vm deploy again"
+                    "vibe deploy needs git, to send the commit the project is at and to see that everything is committed, and {found}: install git and put it on the PATH, then run vibe deploy again"
                 ),
             )
         })
@@ -729,7 +729,7 @@ async fn committed(cx: &Cx<'_>) -> Result<String, Ending> {
             1,
             "not-a-repository",
             &format!(
-                "the project is not in a Git repository with a commit ({why}): a deploy sends the commit the project is at. Make it one (git init, then commit everything), then run vm deploy again"
+                "the project is not in a Git repository with a commit ({why}): a deploy sends the commit the project is at. Make it one (git init, then commit everything), then run vibe deploy again"
             ),
         )
     };
@@ -776,7 +776,7 @@ async fn committed(cx: &Cx<'_>) -> Result<String, Ending> {
             1,
             "failed",
             &format!(
-                "git status {} ({}): look at what git says, then run vm deploy again",
+                "git status {} ({}): look at what git says, then run vibe deploy again",
                 ended(ran.status),
                 cx.words(&ran.err.text(), "")
             ),
@@ -798,7 +798,7 @@ fn uncommitted(named: &Named) -> Ending {
         String::new()
     };
     let message = format!(
-        "files of the project are not committed (changed, staged, removed or untracked): {}{and_more}. A deploy sends the commit the project is at, so everything must be committed: commit them (or add what is not part of the Application to .gitignore), then run vm deploy again; nothing was sent",
+        "files of the project are not committed (changed, staged, removed or untracked): {}{and_more}. A deploy sends the commit the project is at, so everything must be committed: commit them (or add what is not part of the Application to .gitignore), then run vibe deploy again; nothing was sent",
         files.join(", ")
     );
     let mut error = Map::new();
@@ -878,7 +878,7 @@ fn too_large(who: &Who) -> Ending {
     let mib = MAX_VERSION_BYTES / (1024 * 1024);
     let message = if who.command == WHO.command {
         format!(
-            "the Version (its bundle and its migrations together) is larger than the {mib} MiB the installation takes, so nothing was sent: make the bundle smaller (fewer or smaller packages imported), then run vm deploy again"
+            "the Version (its bundle and its migrations together) is larger than the {mib} MiB the installation takes, so nothing was sent: make the bundle smaller (fewer or smaller packages imported), then run vibe deploy again"
         )
     } else {
         format!(
@@ -904,7 +904,7 @@ fn loses_nothing(
                 1,
                 "migration-unparseable",
                 &format!(
-                    "migrations/{}.sql cannot be read by Postgres's parser, from line {}{}: correct it (if you wrote it by hand) or bring migrations/ back as it was last committed, then run vm deploy again; nothing was sent",
+                    "migrations/{}.sql cannot be read by Postgres's parser, from line {}{}: correct it (if you wrote it by hand) or bring migrations/ back as it was last committed, then run vibe deploy again; nothing was sent",
                     migration.name,
                     refused.line,
                     refused.words.map(|w| format!(" ({w})")).unwrap_or_default()
@@ -958,8 +958,8 @@ fn loses_nothing(
         }));
     }
     let message = format!(
-        "A migration this Version adds destroys data, and the Application already has a Version, so the rows are there now: this is asked again at deploy, even when vm generate was allowed to write it, and nothing was sent. {}",
-        data_loss::ask_the_builder(&lost.join("; "), "vm deploy")
+        "A migration this Version adds destroys data, and the Application already has a Version, so the rows are there now: this is asked again at deploy, even when vibe generate was allowed to write it, and nothing was sent. {}",
+        data_loss::ask_the_builder(&lost.join("; "), "vibe deploy")
     );
     let text = format!("{}\n{text}", Theirs::from(message.as_str()));
     Err(Ending::detailed(
@@ -1005,7 +1005,7 @@ fn continues(latest: &[Recorded], migrations: &[ProjectMigration]) -> Result<(),
             1,
             "migrations-diverged",
             &format!(
-                "The project's migrations do not continue the Application's latest Version's (its migrations are the ones applied, also after going back): {why}. Bring migrations/ in line with the repository's history (a deployed migration is never changed or removed; another Contributor's migrations may not be pulled into your copy yet: git pull), then run vm deploy again; nothing was sent"
+                "The project's migrations do not continue the Application's latest Version's (its migrations are the ones applied, also after going back): {why}. Bring migrations/ in line with the repository's history (a deployed migration is never changed or removed; another Contributor's migrations may not be pulled into your copy yet: git pull), then run vibe deploy again; nothing was sent"
             ),
         ));
     }
@@ -1067,7 +1067,7 @@ pub(super) async fn bundle(
             // A deploy checked the types and sends nothing; the local run
             // builds what is there, committed or not.
             let next = if who.command == WHO.command {
-                "It type-checks, and esbuild cannot bundle it: correct what the errors name (an import of a package that is not installed, or of one that runs only on Node), commit, then run vm deploy again; nothing was sent".to_owned()
+                "It type-checks, and esbuild cannot bundle it: correct what the errors name (an import of a package that is not installed, or of one that runs only on Node), commit, then run vibe deploy again; nothing was sent".to_owned()
             } else {
                 format!(
                     "esbuild cannot bundle it: correct what the errors name (an import of a package that is not installed, or of one that runs only on Node), then run {} again",
@@ -1150,7 +1150,7 @@ pub(super) fn body(
 async fn create(ready: &Ready) -> Result<Application, Ending> {
     let kept = &ready.kept;
     let body = serde_json::to_vec(&json!({ "name": ready.name, "description": ready.description }))
-        .map_err(|_| tool_failed("vm deploy", "cannot write the Application as JSON", &WHO))?;
+        .map_err(|_| tool_failed("vibe deploy", "cannot write the Application as JSON", &WHO))?;
     let reply = client::send(
         &installation(kept),
         Method::POST,
@@ -1200,7 +1200,7 @@ async fn send(ready: &Ready, creating: &Cell<bool>) -> Result<Done, Ending> {
     let application = match (&application, &ready.existing) {
         (Some(made), _) => made,
         (None, Some(existing)) => &existing.application,
-        (None, None) => return Err(tool_failed("vm deploy", "has no Application", &WHO)),
+        (None, None) => return Err(tool_failed("vibe deploy", "has no Application", &WHO)),
     };
     let reply = client::send_waiting(
         &installation(kept),
@@ -1232,7 +1232,7 @@ async fn send(ready: &Ready, creating: &Cell<bool>) -> Result<Done, Ending> {
             1,
             "unexpected",
             format!(
-                "the Version was taken and went live, but the installation's answer could not be read for its number: look with vm applications ({}), and tell the Builder",
+                "the Version was taken and went live, but the installation's answer could not be read for its number: look with vibe applications ({}), and tell the Builder",
                 ready.name
             ),
         ));
@@ -1253,7 +1253,7 @@ fn refused(kept: &Kept, reply: &client::Reply, serving: Option<u64>) -> Ending {
                 .map(|n| format!(" Version {n} goes on serving."))
                 .unwrap_or_default();
             let message = format!(
-                "The migration {migration} failed in the Application's own database: {database} (SQLSTATE {code}). Nothing was changed: the Application's own database is as it was.{serving} The rows already there may not fit what the migration does (a column made NOT NULL over rows without a value, say): tell the Builder, correct src/db/schema.ts or the migration while it is not deployed, commit, then run vm deploy again"
+                "The migration {migration} failed in the Application's own database: {database} (SQLSTATE {code}). Nothing was changed: the Application's own database is as it was.{serving} The rows already there may not fit what the migration does (a column made NOT NULL over rows without a value, say): tell the Builder, correct src/db/schema.ts or the migration while it is not deployed, commit, then run vibe deploy again"
             );
             detailed_refusal(
                 "migration-failed",
@@ -1271,7 +1271,7 @@ fn refused(kept: &Kept, reply: &client::Reply, serving: Option<u64>) -> Ending {
             let said = field("message").unwrap_or_default();
             let ended = if said.ends_with('.') { "" } else { "." };
             let message = format!(
-                "The installation refused the Version: {said}{ended} Correct the migration while it is not deployed, commit, then run vm deploy again"
+                "The installation refused the Version: {said}{ended} Correct the migration while it is not deployed, commit, then run vibe deploy again"
             );
             detailed_refusal(
                 "migration-refused",

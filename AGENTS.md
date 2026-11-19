@@ -39,7 +39,7 @@ The driving session orchestrates; one agent works at a time.
 
 Then the ticket's commits are pushed and the issue is closed with what was run. A finding that cannot be fixed inside the ticket, because only the product owner can decide it, is put to the product owner at once and the ticket stays open until it is answered.
 
-- Black-box tests live in the `blackbox` crate. That crate depends on no product crate, so it cannot reach inside: it starts the real `vm` binary beside a real Postgres, drives it with commands and HTTP as different Users, and asserts on what an outsider can observe (a response, a command's output and exit code, an Operation log entry, a Change history row, a refusal's reason). Fixture Applications, hostile ones included, live there too.
+- Black-box tests live in the `blackbox` crate. That crate depends on no product crate, so it cannot reach inside: it starts the real `vibe` binary beside a real Postgres, drives it with commands and HTTP as different Users, and asserts on what an outsider can observe (a response, a command's output and exit code, an Operation log entry, a Change history row, a refusal's reason). Fixture Applications, hostile ones included, live there too.
 - Tests below that seam are allowed only where the spec's Testing Decisions name one (the Authorization decision as a pure function, the Request runner with a scripted Application, the SDK's type tests). The test agent still writes them first.
 
 ### Git

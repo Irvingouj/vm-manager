@@ -1,5 +1,5 @@
-//! `drizzle-kit generate` against a copy of `migrations/`, as `vm check`
-//! and `vm generate` run it (blackbox/CONTRACT.md, "Checking a project:
+//! `drizzle-kit generate` against a copy of `migrations/`, as `vibe check`
+//! and `vibe generate` run it (blackbox/CONTRACT.md, "Checking a project:
 //! migrations", "Generating migrations"), and the copy read by the command
 //! itself.
 //!
@@ -64,22 +64,22 @@ pub(super) fn number_of(tag: &str) -> Option<&str> {
 /// message.
 const MAX_NAMED: usize = 10;
 
-/// The message of `migrations-unreadable`, the same from `vm check` and
-/// `vm generate`: what is wrong (`what`, named as the project's), and the
+/// The message of `migrations-unreadable`, the same from `vibe check` and
+/// `vibe generate`: what is wrong (`what`, named as the project's), and the
 /// fix: bring the folder back as it was last committed, remove a `.sql`
 /// file the journal does not name if it was never committed (when there is
-/// one: `stray`), then `vm generate` for the migrations the schema needs.
+/// one: `stray`), then `vibe generate` for the migrations the schema needs.
 pub(super) fn unreadable_message(what: &str, stray: bool, who: &Who) -> String {
     let stray = if stray {
         "; a .sql file the journal does not name is not removed by that if it was never committed (git does not know it): remove it yourself"
     } else {
         ""
     };
-    let then = if who.command == "vm generate" {
-        "then run `vm generate` again for the migrations the schema then needs".to_owned()
+    let then = if who.command == "vibe generate" {
+        "then run `vibe generate` again for the migrations the schema then needs".to_owned()
     } else {
         format!(
-            "then generate the migrations the schema then needs with `vm generate` and run {} again",
+            "then generate the migrations the schema then needs with `vibe generate` and run {} again",
             who.command
         )
     };

@@ -1,9 +1,9 @@
 //! The platform database: where the program keeps everything it must
-//! remember (ADR 0015), on the Postgres `VM_DATABASE_URL` names.
+//! remember (ADR 0015), on the Postgres `VIBE_DATABASE_URL` names.
 //!
 //! Interface:
 //!
-//! - [`DatabaseAddress`]: `VM_DATABASE_URL` read, a type that never prints
+//! - [`DatabaseAddress`]: `VIBE_DATABASE_URL` read, a type that never prints
 //!   its password.
 //! - [`PlatformDatabase::open`]: at start, connects (creating the database
 //!   if it does not exist), brings its structure up to date ([`steps`]), and

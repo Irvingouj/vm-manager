@@ -1,5 +1,5 @@
-//! A tool run by the commands that work on a project (`vm check`, `vm
-//! generate`, `vm deploy`; blackbox/CONTRACT.md, "Checking a project",
+//! A tool run by the commands that work on a project (`vibe check`, `vibe
+//! generate`, `vibe deploy`; blackbox/CONTRACT.md, "Checking a project",
 //! "Deploying"): a program from the `PATH` (`node`, `git`) with the
 //! arguments given, in the project's folder, with the command's own folder
 //! as its `TMPDIR` and nothing on its standard input.

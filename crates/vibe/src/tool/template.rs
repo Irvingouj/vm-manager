@@ -1,7 +1,7 @@
 //! What a new project holds (blackbox/CONTRACT.md, "What a new project
-//! holds"): the files of `crates/vm/template/`, kept there as files, with
+//! holds"): the files of `crates/vibe/template/`, kept there as files, with
 //! `{{name}}` and the versions filled in; and the SDK's tarball, made by
-//! `crates/vm/build.rs` from `sdk/`. The versions come from the root's
+//! `crates/vibe/build.rs` from `sdk/`. The versions come from the root's
 //! `package-lock.json` and `sdk/package.json` at build time (`versions`).
 
 use std::borrow::Cow;
@@ -39,15 +39,15 @@ const TEXT_FILES: [(&str, &str); 11] = [
         "tsconfig.json",
         include_str!("../../template/tsconfig.json"),
     ),
-    ("vm.dev.json", NEW_TEST_USERS),
+    ("vibe.dev.json", NEW_TEST_USERS),
 ];
 
 /// The test Users file of a new project.
-pub const NEW_TEST_USERS: &str = include_str!("../../template/vm.dev.json");
+pub const NEW_TEST_USERS: &str = include_str!("../../template/vibe.dev.json");
 
 /// The path of the SDK's tarball in a project.
 pub fn tarball_path() -> String {
-    format!(".vm/packages/vm-sdk-{}.tgz", versions::SDK)
+    format!(".vibe/packages/vm-sdk-{}.tgz", versions::SDK)
 }
 
 /// One file of a new project.

@@ -1,5 +1,5 @@
-//! The program's parts, put together: what `vm serve` serves with, and what
-//! the local run (`vm request`, crate::tool's `local`) runs one request
+//! The program's parts, put together: what `vibe serve` serves with, and what
+//! the local run (`vibe request`, crate::tool's `local`) runs one request
 //! with. One assembly for both callers, so that the local run is the
 //! installation's own machinery pointed at another Postgres.
 //!

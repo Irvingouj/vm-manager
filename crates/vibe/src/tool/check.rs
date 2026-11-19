@@ -1,8 +1,8 @@
-//! `vm check [--project <directory>] [--timeout <seconds>] [--json]`
+//! `vibe check [--project <directory>] [--timeout <seconds>] [--json]`
 //! (blackbox/CONTRACT.md, "Checking a project").
 //!
 //! Its pieces (the registry, the packages, each of the four checks and the
-//! report) are also `vm deploy`'s, which runs them in its own order: their
+//! report) are also `vibe deploy`'s, which runs them in its own order: their
 //! problems are worded as the check's whichever command runs them, and
 //! their endings name the command that runs them.
 //!
@@ -83,7 +83,7 @@ use super::{Done, Ending, Output, get_signed_in, project_of, read_kept, shaped};
 use crate::resources::is_resource_name;
 use crate::structure::FIRST_LINE as SCHEMA_FIRST_LINE;
 
-/// `vm check`.
+/// `vibe check`.
 #[derive(clap::Args)]
 pub struct CheckArgs {
     /// The project to check; without it, the current directory.
@@ -99,9 +99,9 @@ pub struct CheckArgs {
 
 /// How the check's messages name it.
 const WHO: Who = Who {
-    command: "vm check",
+    command: "vibe check",
     the: "the check",
-    folder: "vm-check",
+    folder: "vibe-check",
 };
 
 /// What is kept of the SDK's tooling's answer on the Manifest.
@@ -145,7 +145,7 @@ impl Stage {
 }
 
 pub(super) async fn check(args: &CheckArgs) -> Result<Done, Ending> {
-    let project = project_of(args.project.as_deref(), "vm check")?;
+    let project = project_of(args.project.as_deref(), "vibe check")?;
     // Node resolves packages from the real path, and the tools are given
     // absolute paths.
     let project = fs::canonicalize(&project).map_err(|error| {
@@ -153,7 +153,7 @@ pub(super) async fn check(args: &CheckArgs) -> Result<Done, Ending> {
             1,
             "project-file",
             format!(
-                "the project's folder cannot be read ({error}): make it readable by you, then run vm check again"
+                "the project's folder cannot be read ({error}): make it readable by you, then run vibe check again"
             ),
         )
     })?;
@@ -175,7 +175,7 @@ pub(super) async fn check(args: &CheckArgs) -> Result<Done, Ending> {
             1,
             "check-timed-out",
             format!(
-                "the check did not end within {} s and was stopped, with everything it started; it was in {}. Look at what that runs (src/db/schema.ts and what it imports are run by drizzle-kit), or give more time with --timeout <seconds>, then run vm check again",
+                "the check did not end within {} s and was stopped, with everything it started; it was in {}. Look at what that runs (src/db/schema.ts and what it imports are run by drizzle-kit), or give more time with --timeout <seconds>, then run vibe check again",
                 limit.as_secs(),
                 stage.get().words()
             ),
@@ -191,7 +191,7 @@ fn interrupted(signal: &str, stage: Stage) -> Ending {
         1,
         "interrupted",
         format!(
-            "the check was interrupted ({signal}) in {}, and stopped everything it had started; nothing was decided: run vm check again",
+            "the check was interrupted ({signal}) in {}, and stopped everything it had started; nothing was decided: run vibe check again",
             stage.words()
         ),
     )
@@ -432,7 +432,7 @@ pub(super) async fn manifest(
                 _ => "manifest.ts".to_owned(),
             };
             let message =
-                format!("{place}: {message} Correct manifest.ts, then run vm check again.");
+                format!("{place}: {message} Correct manifest.ts, then run vibe check again.");
             let file = error.get_mut("file").map(Value::take).unwrap_or_default();
             found.problems.push(json!({
                 "check": "manifest",
@@ -467,7 +467,7 @@ enum FirstLine {
 /// Whether the file at `path` begins with `line` (followed by a line end,
 /// or nothing): only that much of it is read.
 /// Whether the declared Resource `name` is pulled: both its files there,
-/// each beginning with the first line `vm pull` gives it.
+/// each beginning with the first line `vibe pull` gives it.
 pub(super) fn is_pulled(project: &Path, name: &str) -> bool {
     let folder = project.join("resources").join(name);
     matches!(
@@ -543,7 +543,7 @@ pub(super) fn resources(
                 "check": "resources",
                 "reason": "resource-not-registered",
                 "resource": name,
-                "message": format!("manifest.ts declares the Resource {name}, and no Resource of that name is registered on the installation ({those}): correct the name in manifest.ts, or ask a Platform administrator to register it, then run vm check again"),
+                "message": format!("manifest.ts declares the Resource {name}, and no Resource of that name is registered on the installation ({those}): correct the name in manifest.ts, or ask a Platform administrator to register it, then run vibe check again"),
             }));
             continue;
         };
@@ -593,7 +593,7 @@ pub(super) fn resources(
 }
 
 /// That the declared Resource `name` is pulled: both files there, each
-/// written by `vm pull`.
+/// written by `vibe pull`.
 fn pulled(project: &Path, name: &str, found: &mut Found) {
     let mut wrong = Vec::new();
     let mut by_hand = false;
@@ -608,7 +608,7 @@ fn pulled(project: &Path, name: &str, found: &mut Found) {
             FirstLine::Other => {
                 by_hand = true;
                 wrong.push(format!(
-                    "{shown} was not written by vm pull (it does not begin with `{line}`)"
+                    "{shown} was not written by vibe pull (it does not begin with `{line}`)"
                 ));
             }
             FirstLine::Unreadable(error) => {
@@ -620,15 +620,17 @@ fn pulled(project: &Path, name: &str, found: &mut Found) {
         return;
     }
     let fix = if by_hand {
-        format!("move the file that vm pull did not write away first, then run `vm pull {name}`")
+        format!(
+            "move the file that vibe pull did not write away first, then run `vibe pull {name}`"
+        )
     } else {
-        format!("run `vm pull {name}`")
+        format!("run `vibe pull {name}`")
     };
     found.problems.push(json!({
         "check": "resources",
         "reason": "resource-not-pulled",
         "resource": name,
-        "message": format!("manifest.ts declares {name}, and it is not pulled: {}. To pull it, {fix}, then run vm check again", wrong.join("; ")),
+        "message": format!("manifest.ts declares {name}, and it is not pulled: {}. To pull it, {fix}, then run vibe check again", wrong.join("; ")),
     }));
 }
 /// The `migrations` check: `drizzle-kit generate` against a copy of
@@ -652,11 +654,11 @@ pub(super) async fn migrations(
             "message": drizzle::unreadable_message(&what, stray, &WHO),
         })),
         Outcome::Written(_) => found.problems.push(behind(
-            "src/db/schema.ts changed since the last migration in migrations/: generating migrations now would write one. Generate it with `vm generate`, which writes it into migrations/ and stops before one that destroys data (then ask the Builder, as it says), read the SQL it wrote, then run vm check again",
+            "src/db/schema.ts changed since the last migration in migrations/: generating migrations now would write one. Generate it with `vibe generate`, which writes it into migrations/ and stops before one that destroys data (then ask the Builder, as it says), read the SQL it wrote, then run vibe check again",
         )),
         Outcome::InStep => {}
         Outcome::Asked => found.problems.push(behind(
-            "src/db/schema.ts changed since the last migration in migrations/, and drizzle-kit has a question about the change (a table or column renamed, or removed and made anew?) that it cannot ask without a terminal, so `vm generate` writes nothing for it: make the change in steps, each followed by `vm generate` (add the new column or table, keeping the old one; copy the values in an empty migration made with `vm generate --empty`; then remove the old one), then run vm check again",
+            "src/db/schema.ts changed since the last migration in migrations/, and drizzle-kit has a question about the change (a table or column renamed, or removed and made anew?) that it cannot ask without a terminal, so `vibe generate` writes nothing for it: make the change in steps, each followed by `vibe generate` (add the new column or table, keeping the old one; copy the values in an empty migration made with `vibe generate --empty`; then remove the old one), then run vibe check again",
         )),
         Outcome::SchemaFailed(how) => found.problems.push(json!({
             "check": "migrations",
@@ -812,11 +814,11 @@ pub(super) async fn types(
     for error in &errors.kept {
         let message = match (&error.file, error.line, error.column) {
             (Some(file), Some(line), Some(column)) => format!(
-                "{file}, line {line}, column {column}: {}. Correct {file} at line {line}, then run vm check again",
+                "{file}, line {line}, column {column}: {}. Correct {file} at line {line}, then run vibe check again",
                 error.message.trim_end_matches('.')
             ),
             _ => format!(
-                "{}. The compiler gives this with no place in a file: correct what it names, then run vm check again",
+                "{}. The compiler gives this with no place in a file: correct what it names, then run vibe check again",
                 error.message.trim_end_matches('.')
             ),
         };
@@ -835,7 +837,7 @@ pub(super) async fn types(
         found.problems.push(json!({
             "check": "types",
             "reason": "type-error",
-            "message": format!("and {more} more type error{s} after these {MAX_TYPE_ERRORS}: correct these first, then run vm check again to see the rest"),
+            "message": format!("and {more} more type error{s} after these {MAX_TYPE_ERRORS}: correct these first, then run vibe check again to see the rest"),
             "more": more,
         }));
     }
@@ -846,7 +848,7 @@ pub(super) async fn types(
         problem.insert(
             "message".into(),
             json!(format!(
-                "tsc {} and gave no error it could place ({}): correct what it names, then run vm check again",
+                "tsc {} and gave no error it could place ({}): correct what it names, then run vibe check again",
                 ended(ran.status),
                 cx.words(&ran.err.text(), &errors.other.text())
             )),

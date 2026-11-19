@@ -1,12 +1,12 @@
 //! The tool: the same program run on a Builder's machine by their Coding
 //! agent (ADR 0006, ADR 0015; blackbox/CONTRACT.md, "The tool").
 //!
-//! `vm sign-in` (through the browser: [`browser`]), `vm admin
-//! connect-oidc` ([`admin`]), `vm sign-out`, `vm whoami`, `vm resources`, `vm
-//! applications`, `vm pull` ([`pull`]), `vm new` ([`new`]), `vm check`
-//! ([`check`]), `vm generate` ([`generate`]), `vm deploy` ([`deploy`]),
-//! `vm versions` and `vm go-back` ([`versions`]), `vm logs` ([`logs`]),
-//! `vm show`, `vm share`, `vm unshare` and `vm contributors` ([`sharing`]),
+//! `vibe sign-in` (through the browser: [`browser`]), `vibe admin
+//! connect-oidc` ([`admin`]), `vibe sign-out`, `vibe whoami`, `vibe resources`, `vibe
+//! applications`, `vibe pull` ([`pull`]), `vibe new` ([`new`]), `vibe check`
+//! ([`check`]), `vibe generate` ([`generate`]), `vibe deploy` ([`deploy`]),
+//! `vibe versions` and `vibe go-back` ([`versions`]), `vibe logs` ([`logs`]),
+//! `vibe show`, `vibe share`, `vibe unshare` and `vibe contributors` ([`sharing`]),
 //! each with `--json`. Each command is one short run on one
 //! thread: a current-thread runtime, at most a few requests to the
 //! installation ([`client`]), the credential file ([`credential_file`]), and
@@ -88,14 +88,14 @@ use theirs::Theirs;
 use crate::registry::is_dns_label;
 use crate::sign_in::MAX_STAND_IN_VALUE_BYTES;
 
-/// What `vm --help` says about exit codes.
+/// What `vibe --help` says about exit codes.
 pub const EXIT_CODES: &str = "\
 Exit codes:
   0  done
   1  failed: the installation cannot be reached, it answered something unexpected, or a file cannot be read or written
   2  the command line is wrong
   3  refused, or waiting for the Builder: the platform said no, or the next step is a person's (the message says whose and what)
-  4  not signed in (no credential, or one that expired or was signed out): run vm sign-in, then the command again
+  4  not signed in (no credential, or one that expired or was signed out): run vibe sign-in, then the command again
 
 With --json, standard output is one JSON object; a command that does not end with 0 prints { \"error\": { \"reason\", \"message\" } } there.";
 
@@ -107,7 +107,7 @@ pub struct Output {
     pub json: bool,
 }
 
-/// `vm sign-in`.
+/// `vibe sign-in`.
 #[derive(clap::Args)]
 pub struct SignInArgs {
     /// The installation's domain; the tool sends Host: api.<domain>.
@@ -289,7 +289,7 @@ impl Ending {
     }
 
     /// The ending that prints `report` with exit code `code`: one
-    /// [`Ending::printed`] gave, sent from elsewhere (a `vm dev` that
+    /// [`Ending::printed`] gave, sent from elsewhere (a `vibe dev` that
     /// answered the command).
     fn from_printed(code: u8, report: Done) -> Self {
         let reason = report
@@ -318,7 +318,7 @@ struct Done {
 }
 
 impl Done {
-    /// A command that printed as it went (`vm logs --follow`): nothing more
+    /// A command that printed as it went (`vibe logs --follow`): nothing more
     /// is printed at its end.
     fn printed() -> Self {
         Self {
@@ -396,7 +396,7 @@ pub fn run(command: Command) -> ExitCode {
                 }
             });
             // A blocking task still running (a write to an output that
-            // takes nothing, `vm dev`'s) is waited for a bounded time, not
+            // takes nothing, `vibe dev`'s) is waited for a bounded time, not
             // for ever.
             runtime.shutdown_timeout(RUNTIME_END_WAIT);
             outcome
@@ -434,7 +434,7 @@ pub fn run(command: Command) -> ExitCode {
             // Standard error may be gone too: then there is no one to tell.
             write_to(
                 &mut io::stderr().lock(),
-                &format!("vm: the output could not be written ({error}); the command's outcome is lost: run it again with its output kept\n"),
+                &format!("vibe: the output could not be written ({error}); the command's outcome is lost: run it again with its output kept\n"),
             )
             .ok();
             ExitCode::from(1)
@@ -603,17 +603,17 @@ fn shell_word(text: &str) -> String {
     }
 }
 
-/// The whole `vm sign-in` command that signs in again as what is kept.
+/// The whole `vibe sign-in` command that signs in again as what is kept.
 fn sign_in_again(kept: &Kept) -> String {
     if kept.through_browser {
         return format!(
-            "vm sign-in --domain {} --connect {}",
+            "vibe sign-in --domain {} --connect {}",
             shell_word(&kept.domain),
             kept.connect
         );
     }
     let mut command = format!(
-        "vm sign-in --domain {} --connect {} --stand-in-user {}",
+        "vibe sign-in --domain {} --connect {} --stand-in-user {}",
         shell_word(&kept.domain),
         kept.connect,
         shell_word(&kept.user.to_string())
@@ -632,7 +632,7 @@ fn not_signed_in() -> Ending {
     Ending::new(
         4,
         "not-signed-in",
-        "not signed in: run `vm sign-in --domain <domain> --connect <ip:port>` (it opens the browser, or shows an address to open), then run this command again".into(),
+        "not signed in: run `vibe sign-in --domain <domain> --connect <ip:port>` (it opens the browser, or shows an address to open), then run this command again".into(),
     )
 }
 
@@ -820,7 +820,7 @@ async fn sign_in(args: &SignInArgs) -> Result<Done, Ending> {
     let (made, through_browser) = match (installation.sign_in.as_str(), &args.stand_in_user) {
         ("none", _) => {
             return Err(sign_in_refused(format!(
-                "the installation at {} ({}) has no sign-in yet: OIDC is not connected. A Platform administrator connects it with `vm admin connect-oidc`; then run this command again",
+                "the installation at {} ({}) has no sign-in yet: OIDC is not connected. A Platform administrator connects it with `vibe admin connect-oidc`; then run this command again",
                 args.connect, args.domain
             )));
         }
@@ -885,7 +885,7 @@ async fn sign_in(args: &SignInArgs) -> Result<Done, Ending> {
     );
     say!(
         text,
-        "The sign-in lasts until {}; then run vm sign-in again.",
+        "The sign-in lasts until {}; then run vibe sign-in again.",
         kept.expires_at
     );
     Ok(Done {
@@ -1087,7 +1087,7 @@ async fn applications() -> Result<Done, Ending> {
     if list.applications.is_empty() {
         say!(
             text,
-            "You contribute to no Application on {}, and none is shared with you yet. vm deploy creates one; to open or maintain another, ask one of its Contributors to share it with you or to add you.",
+            "You contribute to no Application on {}, and none is shared with you yet. vibe deploy creates one; to open or maintain another, ask one of its Contributors to share it with you or to add you.",
             kept.domain
         );
     }

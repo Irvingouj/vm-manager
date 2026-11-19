@@ -1,6 +1,6 @@
 //! The listening sockets: accept HTTP/1.1 connections and hand each request
-//! to a [`Handler`]: [`Ingress`] for `vm serve`, the local run's own front
-//! for `vm dev` (crate::tool's `local`), which hands the Application's
+//! to a [`Handler`]: [`Ingress`] for `vibe serve`, the local run's own front
+//! for `vibe dev` (crate::tool's `local`), which hands the Application's
 //! requests on to its own [`Ingress`].
 //!
 //! **Bounds.** At most [`Limits::connections`] connections at once, over
@@ -48,7 +48,7 @@ pub struct Limits {
     pub drain: Duration,
 }
 
-/// The connections `vm serve` serves at once ([`Limits::connections`] by
+/// The connections `vibe serve` serves at once ([`Limits::connections`] by
 /// default). The bound on sessions renewed at once
 /// (crate::oidc::sessions::MAX_RENEWALS) is a quarter of it, derived from
 /// it: raising one moves the other.
