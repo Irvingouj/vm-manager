@@ -489,7 +489,7 @@ impl Notices {
     /// that form.
     ///
     /// A licence's text may hold a line beginning `## ` of its own (a
-    /// Markdown heading: unicode-ident's carries `## 1. Provision of the
+    /// Markdown heading: webpki-roots' CDLA text carries `## 1. Provision of the
     /// Data`), so a line beginning `## ` is a header only when the line
     /// after it begins `License: `; any other is text.
     pub fn read(text: &str) -> Result<Self, String> {
