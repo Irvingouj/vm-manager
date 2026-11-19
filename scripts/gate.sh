@@ -8,12 +8,14 @@ cd "$(dirname "$0")/.."
 # in the gate"), looked for first, before anything is built, so that a gate
 # without one ends in seconds. The finding and its words are the harness's
 # (find_with in blackbox/src/firefox.rs): the program VIBE_TEST_BROWSER
-# names (a path, or a name on the PATH; empty counts as unset), else
+# names (an absolute path, or a name on the PATH; empty counts as unset; a
+# relative path is refused, the tests and the gate run in different folders), else
 # `firefox` on the PATH; asked `--version` within 30 seconds; it must say
 # `Mozilla Firefox <major>...` with a major of 128 or later.
 echo "== a browser for the browser tests"
 no_browser="No browser for the browser tests"
-what_to_do="Install Firefox 128 or later, or set VIBE_TEST_BROWSER to the Firefox to use (a path, or a name on the PATH)."
+what_to_do="Install Firefox 128 or later, or set VIBE_TEST_BROWSER to the Firefox to use (an absolute path, or a name on the PATH)."
+not_absolute="which is a relative path; a path in VIBE_TEST_BROWSER must be absolute"
 min_firefox=128
 
 # An executable file at the path $1.
@@ -42,6 +44,10 @@ trimmed() {
 
 browser_named="${VIBE_TEST_BROWSER:-}"
 browser=""
+if [ -n "$browser_named" ] && [[ "$browser_named" == */* ]] && [[ "$browser_named" != /* ]]; then
+  echo "$no_browser: looked for VIBE_TEST_BROWSER=$browser_named, $not_absolute. $what_to_do" >&2
+  exit 1
+fi
 if [ -n "$browser_named" ]; then
   looked_for="VIBE_TEST_BROWSER=$browser_named"
   wanted="$browser_named"

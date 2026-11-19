@@ -23,7 +23,7 @@ cargo build              # target/debug/vibe
 target/debug/vibe --version
 ```
 
-The gate needs Firefox 128 or later, for the browser tests: `firefox` on the `PATH`, or the one `VIBE_TEST_BROWSER` names (a path, or a name on the `PATH`). The gate is `scripts/gate.sh`: it looks for that browser first and stops at once without one, checks that `blackbox` depends on no product crate, then runs
+The gate needs Firefox 128 or later, for the browser tests: `firefox` on the `PATH`, or the one `VIBE_TEST_BROWSER` names (an absolute path, or a name on the `PATH`). The gate is `scripts/gate.sh`: it looks for that browser first and stops at once without one, checks that `blackbox` depends on no product crate, then runs
 
 ```
 cargo fmt --all --check

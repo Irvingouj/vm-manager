@@ -50,7 +50,7 @@ That pipeline is `.github/workflows/release.yml`. A release is made from a commi
 
 ### The gate
 
-`scripts/gate.sh` first looks for the browser the browser tests drive: Firefox 128 or later, the program `VIBE_TEST_BROWSER` names (a path, or a name on the `PATH`), else `firefox` on the `PATH`. Without one it stops at once, before anything is built, in the same words as the browser tests' own failure; with one it says in one line which it found and its version. It then checks that `blackbox` depends on no product crate, and runs:
+`scripts/gate.sh` first looks for the browser the browser tests drive: Firefox 128 or later, the program `VIBE_TEST_BROWSER` names (an absolute path, or a name on the `PATH`), else `firefox` on the `PATH`. Without one it stops at once, before anything is built, in the same words as the browser tests' own failure; with one it says in one line which it found and its version. It then checks that `blackbox` depends on no product crate, and runs:
 
 ```
 cargo fmt --all --check
