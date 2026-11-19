@@ -2253,7 +2253,7 @@ A release is what an administrator and a Builder take from outside the repositor
 
 ### The licence
 
-- The program's own licence is the product owner's to state, in a file `LICENSE` at the repository's root. Nothing is published without it: `scripts/release-check.sh` given a tag fails while it is missing, saying so. A rehearsal goes on without it, saying that it is missing.
+- The program's own licence is the product owner's to state, in a file `LICENSE` at the repository's root (stated on 2026-11-19: the MIT licence, as the manifests say). Nothing is published without it: `scripts/release-check.sh` given a tag fails while it is missing, saying so. A rehearsal goes on without it, saying that it is missing.
 - When the repository has it, it is in the image at `/usr/share/doc/vibe/LICENSE` and in each archive of the tool, unchanged; when it has not, neither holds one.
 
 ### What a release holds
