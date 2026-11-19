@@ -39,7 +39,7 @@ while [ "$#" -gt 0 ]; do
 done
 [ -n "$archive" ] || usage
 case "$archive" in /*) ;; *) archive="$(pwd)/$archive" ;; esac
-[ -f "$archive" ] || { echo "try-tool: $archive is not there" >&2; exit 1; }
+[ -f "$archive" ] || { echo "try-tool: $archive is not there (or is not a file): nothing was tried" >&2; exit 1; }
 
 cd "$(dirname "$0")/.."
 package="$(awk '/^\[/ { p = ($0 == "[package]") } p && /^version *=/ { sub(/^version *= *"/, ""); sub(/".*/, ""); print; exit }' crates/vibe/Cargo.toml)"
@@ -68,15 +68,39 @@ fail() {
   exit 1
 }
 
+# The archive must hold exactly one folder, named as the archive is without
+# .tar.gz (vibe-<the package's version>-<target>), with an executable vibe
+# in it; anything else is refused, saying what was found, before anything
+# is started.
 step "unpack $(basename "$archive")"
+file_name="$(basename "$archive")"
+case "$file_name" in
+  "vibe-$package-"?*.tar.gz) folder="${file_name%.tar.gz}" ;;
+  *) fail "$file_name is not named vibe-$package-<target>.tar.gz (the package's version is $package): nothing was tried" ;;
+esac
+if ! tar -tzf "$archive" >"$work/listing" 2>"$work/listing.err"; then
+  fail "$archive is not a gzip'd tar ($(head -n 1 "$work/listing.err")): nothing was tried"
+fi
+if [ -z "$(awk 'NF' "$work/listing")" ]; then
+  fail "$file_name holds nothing tar can list: it is not a gzip'd tar of the tool, or an empty one; nothing was tried"
+fi
+if grep -E -q -e '^/' -e '(^|/)\.\.(/|$)' "$work/listing"; then
+  fail "$file_name holds a path outside its folder (absolute, or with ..): nothing was tried"
+fi
+tops="$(sed -e 's|^\./||' -e 's|/.*$||' "$work/listing" | awk 'NF' | sort -u)"
+if [ "$tops" != "$folder" ]; then
+  fail "$file_name must hold exactly one folder, $folder/, and holds at its top: $(printf '%s' "$tops" | tr '\n' ' ' | sed 's/ $//'); nothing was tried"
+fi
 mkdir "$work/unpacked"
 tar -xzf "$archive" -C "$work/unpacked"
-vibe="$(echo "$work"/unpacked/vibe-*/vibe)"
-[ -x "$vibe" ] || fail "the archive holds no executable vibe-*/vibe"
-said="$("$vibe" --version)"
+vibe="$work/unpacked/$folder/vibe"
+if [ -L "$vibe" ] || [ ! -f "$vibe" ] || [ ! -x "$vibe" ]; then
+  fail "$file_name holds no executable file $folder/vibe (it holds: $(sed -e 's|^\./||' "$work/listing" | tr '\n' ' ')): nothing was tried"
+fi
+said="$("$vibe" --version 2>/dev/null)" || fail "$folder/vibe --version failed: nothing was tried"
 first="${said%%$'\n'*}"
 echo "$first"
-[ "$first" = "vibe $package" ] || fail "the unpacked vibe says \"$first\" first, not \"vibe $package\""
+[ "$first" = "vibe $package" ] || fail "the unpacked vibe says \"$first\" first, not \"vibe $package\": nothing was tried"
 
 step "vibe new"
 cd "$work"
