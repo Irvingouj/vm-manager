@@ -245,6 +245,51 @@ pub fn image() -> String {
     image
 }
 
+/// How long one `docker pull` of a public image may take.
+pub const PULL_WAIT: Duration = Duration::from_secs(600);
+
+/// Makes sure a public image the harness runs a container of its own from
+/// (`postgres:17`, `postgres:18`) is on the machine: pulled when it is not,
+/// at most [`PULL_WAIT`], failing the test saying the pull failed. So no
+/// test depends on what the machine already holds or on an earlier test
+/// (whose Compose pulled an image). The image under test
+/// (`VIBE_INSTALL_IMAGE`) is never pulled: it must be on the machine,
+/// built by `scripts/install-gate.sh`.
+pub fn public_image(image: &str) {
+    let present = || {
+        docker(
+            &["image", "inspect", "--format", "{{.Id}}", image],
+            DOCKER_WAIT,
+        )
+        .ok()
+    };
+    if present() {
+        return;
+    }
+    let under_test = std::env::var("VIBE_INSTALL_IMAGE").ok();
+    assert!(
+        under_test.as_deref() != Some(image),
+        "the image under test {image:?} is not on the machine, and is never pulled: {INSTALL_GATE}"
+    );
+    let ran = docker(&["pull", "--quiet", image], PULL_WAIT);
+    assert!(
+        ran.ok() && present(),
+        "the harness's own container needs the public image {image:?}, which is not on this machine, and pulling it failed (`docker pull`, at most {PULL_WAIT:?})\n{}",
+        ran.describe(&[])
+    );
+}
+
+/// The images a Compose text of the harness's own names (its `image:`
+/// lines).
+pub fn images_named_in(compose_text: &str) -> Vec<String> {
+    compose_text
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("image:"))
+        .map(|i| i.trim().trim_matches(['"', '\'']).to_owned())
+        .filter(|i| !i.is_empty())
+        .collect()
+}
+
 /// `docker image inspect <image>`, its one object.
 pub fn inspect_image(image: &str) -> Value {
     let ran = docker_ok(&["image", "inspect", image], DOCKER_WAIT);
@@ -388,7 +433,13 @@ impl Install {
 
     /// For the harness's own tests: a folder as [`Install::new`] makes, with
     /// a `compose.yaml` of this text in place of `deploy/`'s.
+    /// Every image the text names is made sure of first ([`public_image`]),
+    /// so that a text with `pull_policy: never` does not depend on what the
+    /// machine holds.
     pub fn with_compose_text(text: &str) -> Self {
+        for image in images_named_in(text) {
+            public_image(&image);
+        }
         let mut install = Self::new(&[]);
         install.write_file(COMPOSE, text.as_bytes());
         install.files.push(COMPOSE.to_owned());
@@ -677,25 +728,48 @@ impl Install {
     }
 
     /// Runs a container of the test's own (`docker run --rm --pull never
-    /// --name <project>-own-<random> <args>`), removed when the test ends
-    /// whatever happens, with these variables in `docker`'s environment
-    /// (given to the container with `-e NAME`).
-    pub fn run_own(&self, args: &[&str], env: &[(&str, &str)], timeout: Duration) -> Ran {
+    /// --name <project>-own-<random> <options> <image> <command>`), removed
+    /// when the test ends whatever happens, with these variables in
+    /// `docker`'s environment (given to the container with `-e NAME`). The
+    /// public `image` is pulled first when the machine does not have it
+    /// ([`public_image`]).
+    pub fn run_own(
+        &self,
+        options: &[&str],
+        image: &str,
+        command: &[&str],
+        env: &[(&str, &str)],
+        timeout: Duration,
+    ) -> Ran {
+        public_image(image);
         let name = format!("{}-own-{}", self.project, token());
         self.own_containers.borrow_mut().push(name.clone());
         let mut all = vec!["run", "--rm", "--pull", "never", "--name", name.as_str()];
-        all.extend_from_slice(args);
+        all.extend_from_slice(options);
+        all.push(image);
+        all.extend_from_slice(command);
         docker_with(None, &all, env, timeout)
     }
 
     /// Starts a container of the test's own in the background (`docker run
-    /// -d --pull never --name <project>-own-<random> <args>`); returns its
-    /// name. Removed when the test ends.
-    pub fn start_own(&self, args: &[&str], env: &[(&str, &str)]) -> String {
+    /// -d --pull never --name <project>-own-<random> <options> <image>
+    /// <command>`); returns its name. Removed when the test ends. The
+    /// public `image` is pulled first when the machine does not have it
+    /// ([`public_image`]).
+    pub fn start_own(
+        &self,
+        options: &[&str],
+        image: &str,
+        command: &[&str],
+        env: &[(&str, &str)],
+    ) -> String {
+        public_image(image);
         let name = format!("{}-own-{}", self.project, token());
         self.own_containers.borrow_mut().push(name.clone());
         let mut all = vec!["run", "-d", "--pull", "never", "--name", name.as_str()];
-        all.extend_from_slice(args);
+        all.extend_from_slice(options);
+        all.push(image);
+        all.extend_from_slice(command);
         let ran = docker_with(None, &all, env, DOCKER_WAIT);
         if !ran.ok() {
             self.fail(&format!(
@@ -720,7 +794,9 @@ impl Install {
                 "PGPASSWORD",
                 "-e",
                 "PGCONNECT_TIMEOUT=10",
-                POSTGRES_18_IMAGE,
+            ],
+            POSTGRES_18_IMAGE,
+            &[
                 "psql",
                 "-X",
                 "-A",
@@ -739,8 +815,8 @@ impl Install {
         )
     }
 
-    /// Starts a Postgres of the test's own from `image` (on the machine
-    /// already: `postgres:18`, `postgres:17`), published on `bridge` (the
+    /// Starts a Postgres of the test's own from `image` (`postgres:18`,
+    /// `postgres:17`; pulled when the machine does not have it), published on `bridge` (the
     /// Docker bridge's address) at a free port, with a role `vibe` that may
     /// log in and create databases and roles, made by a script of the
     /// image's first start (so that no password is on a command line).
@@ -772,8 +848,9 @@ impl Install {
                     "{}:/docker-entrypoint-initdb.d/init.sql:ro",
                     script.display()
                 ),
-                image,
             ],
+            image,
+            &[],
             &[("POSTGRES_PASSWORD", superuser_password.as_str())],
         );
         // Over TCP only once the first start's script has run and the

@@ -11,7 +11,8 @@
 //! - An installation is taken down whatever happens: containers, networks
 //!   and volumes of the project, containers and tags of the test's own.
 //!
-//! They need Docker (and the image `postgres:18`, already on the machine),
+//! They need Docker (the image `postgres:18` is pulled when the machine
+//! does not have it),
 //! not the image under test; they are run by `scripts/install-gate.sh`
 //! with the install tests.
 #![allow(
@@ -80,7 +81,7 @@ fn something_of_everything() -> Install {
     ));
     install.set_secret("POSTGRES_PASSWORD", &blackbox::shared_database::token());
     install.up();
-    install.start_own(&["--entrypoint", "sleep", POSTGRES_18_IMAGE, "600"], &[]);
+    install.start_own(&["--entrypoint", "sleep"], POSTGRES_18_IMAGE, &["600"], &[]);
     install.second_tag(POSTGRES_18_IMAGE);
     let left = install.left_behind();
     for kind in ["container", "network", "volume", "tag"] {
@@ -358,10 +359,9 @@ fn the_administrators_postgres_of_the_test_is_reached_from_a_container_by_the_br
     let reach = format!("{}/postgres", url.strip_suffix("/vibe").unwrap());
     install.hide(&reach);
     let ran = install.run_own(
+        &["-e", "DATABASE"],
+        POSTGRES_18_IMAGE,
         &[
-            "-e",
-            "DATABASE",
-            POSTGRES_18_IMAGE,
             "sh",
             "-c",
             "psql \"$DATABASE\" -X -A -t -c 'select current_user'",
@@ -375,4 +375,49 @@ fn the_administrators_postgres_of_the_test_is_reached_from_a_container_by_the_br
         ran.describe(&install.secrets())
     );
     install.take_down_now();
+}
+
+/// The harness's own check of [`blackbox::install::images_named_in`].
+#[test]
+fn the_images_a_compose_text_names_are_found() {
+    assert_eq!(
+        blackbox::install::images_named_in(
+            "services:\n  a:\n    image: postgres:18\n    pull_policy: never\n  b:\n    image: \"caddy:2\"\n"
+        ),
+        vec!["postgres:18".to_owned(), "caddy:2".to_owned()]
+    );
+}
+
+/// A tiny public image this harness uses nowhere else, for the check below.
+const TINY_PUBLIC_IMAGE: &str = "hello-world:linux";
+
+/// Removes [`TINY_PUBLIC_IMAGE`] by name when dropped, only when this test
+/// pulled it (it was not on the machine before).
+struct PulledHere(bool);
+
+impl Drop for PulledHere {
+    fn drop(&mut self) {
+        if self.0 {
+            drop(blackbox::install::docker(
+                &["image", "rm", TINY_PUBLIC_IMAGE],
+                DOCKER_WAIT,
+            ));
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs Docker: scripts/install-gate.sh"]
+fn a_container_of_the_tests_own_from_a_public_image_the_machine_lacks_is_pulled_first() {
+    let present =
+        || blackbox::install::docker(&["image", "inspect", TINY_PUBLIC_IMAGE], DOCKER_WAIT).ok();
+    let _pulled_here = PulledHere(!present());
+    let install = Install::with_compose_text("services: {}\n");
+    let ran = install.run_own(&[], TINY_PUBLIC_IMAGE, &[], &[], DOCKER_WAIT);
+    assert!(
+        ran.ok() && ran.stdout.contains("Hello from Docker"),
+        "expected a container of the test's own from {TINY_PUBLIC_IMAGE} to run, pulled when the machine did not have it\n{}",
+        ran.describe(&[])
+    );
+    assert!(present(), "expected {TINY_PUBLIC_IMAGE} on the machine now");
 }
