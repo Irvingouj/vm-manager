@@ -94,7 +94,12 @@
 //!   built image, and are run by `scripts/install-gate.sh`): the image, the
 //!   files of `deploy/` copied unchanged to a folder of the test's, an
 //!   installation started from them with Compose and taken down whatever
-//!   happens, and the identity provider on the Docker bridge's address.
+//!   happens, and the identity provider on the Docker bridge's address;
+//! - [`release`] is what the tests of the first release share: the
+//!   package's version, the scripts of `scripts/` run by their interface
+//!   with a time limit, a throwaway clone of the repository for a tag or a
+//!   `LICENSE`, the notices read into their two parts, and a tool archive
+//!   read entry by entry.
 //!
 //! Every wait has a timeout, so a failing test fails within seconds and
 //! never hangs. Each test starts its own program on its own port, so tests
@@ -139,6 +144,7 @@ pub mod postgres;
 pub mod program;
 pub mod project;
 pub mod records;
+pub mod release;
 pub mod scenario;
 pub mod sdk;
 pub mod sdk_history;

@@ -669,3 +669,57 @@ fn the_images_third_party_licenses_have_a_part_for_the_code_built_in_v8_and_its_
         }
     }
 }
+
+/// Where the image holds the program's own licence (CONTRACT.md, "The
+/// first release: The licence").
+const OWN_LICENSE: &str = "/usr/share/doc/vibe/LICENSE";
+
+#[test]
+#[ignore = "needs Docker and a built image: scripts/install-gate.sh"]
+fn the_image_holds_the_programs_licence_exactly_when_the_repository_has_one() {
+    let image = image();
+    let created = Created::of(&image);
+    let folder = Folder::new();
+    let copied = folder.0.join("LICENSE");
+    let ran = created.copy_out(OWN_LICENSE, &copied);
+    match std::fs::read(repository_root().join("LICENSE")) {
+        Ok(licence) => {
+            assert!(
+                ran.ok(),
+                "expected {OWN_LICENSE} in the image, since the repository has a LICENSE\n{}",
+                ran.describe(&[])
+            );
+            assert_eq!(
+                std::fs::read(&copied).unwrap(),
+                licence,
+                "expected the image's {OWN_LICENSE} to be the repository's LICENSE, unchanged"
+            );
+        }
+        Err(_) => assert!(
+            !ran.ok(),
+            "expected no {OWN_LICENSE} in the image, since the repository has no LICENSE"
+        ),
+    }
+}
+
+#[test]
+#[ignore = "needs Docker and a built image: scripts/install-gate.sh"]
+fn the_images_notices_are_what_third_party_licenses_sh_writes_for_its_target() {
+    let image = image();
+    let target = target_of(&inspect_image(&image));
+    let created = Created::of(&image);
+    let folder = Folder::new();
+    let copied = folder.0.join("THIRD-PARTY-LICENSES");
+    let ran = created.copy_out(LICENSES, &copied);
+    assert!(
+        ran.ok(),
+        "expected {LICENSES} in the image\n{}",
+        ran.describe(&[])
+    );
+    let in_image = std::fs::read_to_string(&copied).unwrap();
+    let written = blackbox::release::notices_text(&["--target", &target]);
+    assert!(
+        in_image == written,
+        "expected the image's {LICENSES} to be what `scripts/third-party-licenses.sh --target {target}` writes (CONTRACT.md, \"The first release: The scripts that make it\")"
+    );
+}

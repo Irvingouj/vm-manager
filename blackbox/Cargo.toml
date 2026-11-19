@@ -21,6 +21,10 @@ sha2 = "0.10"
 zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
 liblzma = { version = "0.4", default-features = false, features = ["static"] }
 tar = { version = "0.4", default-features = false }
+# The release's tool archives are gzip'd tars (CONTRACT.md, "The first
+# release"): read entry by entry with `tar` above and flate2's pure-Rust
+# gzip (already in the lock file through `zip`).
+flate2 = "1"
 # To set up the shared databases the tests register as Resources, and to
 # look at them from outside the program: a client of the harness's own,
 # never the program's.
@@ -38,6 +42,12 @@ url.workspace = true
 rustls.workspace = true
 tokio-rustls.workspace = true
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
+
+[dev-dependencies]
+# The release workflow is read as YAML, not grepped (CONTRACT.md, "The first
+# release: The workflow"): a maintained YAML 1.2 parser, in which `on` is a
+# key and not a boolean.
+yaml-rust2 = { version = "0.13", default-features = false }
 
 [lints]
 workspace = true
