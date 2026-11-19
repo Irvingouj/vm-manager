@@ -201,6 +201,36 @@ fn a_postgres_data_folder_that_is_a_file_is_local_state() {
 }
 
 #[test]
+fn a_data_folder_without_postgres_data_that_cannot_be_made_anew_is_local_state() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let local = Local::new();
+    let project = project_with(&local, "data-kept-board", |dir| {
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let kept = dir.join("postgres").join("kept");
+        fs::create_dir_all(&kept).unwrap();
+        fs::write(kept.join("file"), "cannot be removed\n").unwrap();
+    });
+    let kept = project.dir.join(".vm/local/postgres/kept");
+    if fs::metadata(&kept).unwrap().uid() == 0 {
+        eprintln!(
+            "this test runs as root, for whom a folder of mode 0500 does not stop a removal: the case cannot be provoked here"
+        );
+        return;
+    }
+    // No PG_VERSION: no Postgres data yet. What `kept/` holds cannot be
+    // removed, so the data folder cannot be made anew.
+    fs::set_permissions(&kept, fs::Permissions::from_mode(0o500)).unwrap();
+    let run = local.request(&project.dir, "/", OUTSIDER, &[]);
+    // Given back before anything is asserted, so that the test's folder can
+    // be removed whatever the outcome.
+    if kept.exists() {
+        fs::set_permissions(&kept, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    assert_local_state_not_postgres(&run, "a data folder that cannot be made anew");
+    assert_nothing_left(&local, "a data folder that cannot be made anew");
+}
+
+#[test]
 fn vm_dev_with_a_postgres_log_that_is_a_folder_is_local_state() {
     let local = Local::new();
     let project = project_with(&local, "dev-log-folder", |dir| {
