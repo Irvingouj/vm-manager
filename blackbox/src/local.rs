@@ -18,7 +18,8 @@
 //! - a mirror of Maven's layout, served by the harness on 127.0.0.1, that
 //!   hands over zonky's real archive of Postgres 18 (fetched once into the
 //!   harness's cache), a cut-short one, other bytes, nothing, or more than
-//!   256 MiB, and records every path asked for ([`Mirror`]);
+//!   256 MiB, and records every path asked for ([`Mirror`]); and one that
+//!   sends every path on to another base URL ([`Redirector`]);
 //! - a project made by `vibe new` whose Manifest declares `devops` and whose
 //!   one handler does what each path says ([`handler`], [`local_project`]),
 //!   and `vibe.dev.json` read and written ([`dev_json`], [`write_dev_json`]);
@@ -866,6 +867,11 @@ impl Mirror {
         format!("http://{}/maven2", self.address)
     }
 
+    /// Where it listens (for a TLS front before it).
+    pub fn address(&self) -> SocketAddr {
+        self.address
+    }
+
     /// Every path asked for, in order.
     pub fn requests(&self) -> Vec<String> {
         self.requests
@@ -948,6 +954,102 @@ fn serve(mut stream: TcpStream, serving: Serving, seen: &Mutex<Vec<String>>) {
             }
         }
     }
+    drop(stream.flush());
+}
+
+/// A plain `http` mirror that sends every path under `/maven2` on to
+/// another base URL (`https://localhost:<port>/maven2`, say) with `302`,
+/// and records every path asked for. Stopped and joined when dropped.
+pub struct Redirector {
+    address: SocketAddr,
+    requests: Arc<Mutex<Vec<String>>>,
+    stop: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl Redirector {
+    /// Redirects `/maven2/<rest>` to `<to_base>/<rest>`.
+    pub fn start(to_base: &str) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("cannot bind 127.0.0.1:0");
+        listener
+            .set_nonblocking(true)
+            .expect("cannot make the listener non-blocking");
+        let address = listener.local_addr().expect("the listener has an address");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopping = Arc::clone(&stop);
+        let seen = Arc::clone(&requests);
+        let to_base = to_base.trim_end_matches('/').to_owned();
+        let thread = thread::spawn(move || {
+            while !stopping.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((stream, _)) => redirect(stream, &to_base, &seen),
+                    Err(_) => thread::sleep(Duration::from_millis(10)),
+                }
+            }
+        });
+        Self {
+            address,
+            requests,
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    /// The base URL to give `VIBE_LOCAL_POSTGRES_MIRROR`.
+    pub fn base_url(&self) -> String {
+        format!("http://{}/maven2", self.address)
+    }
+
+    /// Every path asked for, in order.
+    pub fn requests(&self) -> Vec<String> {
+        self.requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+impl Drop for Redirector {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            drop(thread.join());
+        }
+    }
+}
+
+fn redirect(mut stream: TcpStream, to_base: &str, seen: &Mutex<Vec<String>>) {
+    drop(stream.set_nonblocking(false));
+    drop(stream.set_read_timeout(Some(Duration::from_secs(5))));
+    drop(stream.set_write_timeout(Some(Duration::from_secs(5))));
+    let mut head = Vec::new();
+    let mut chunk = [0_u8; 1024];
+    while !head.windows(4).any(|w| w == b"\r\n\r\n") && head.len() < 64 * 1024 {
+        match stream.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => head.extend_from_slice(chunk.get(..n).unwrap_or_default()),
+        }
+    }
+    let text = String::from_utf8_lossy(&head);
+    let path = text
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .unwrap_or_default()
+        .to_owned();
+    seen.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(path.clone());
+    let answer = match path.strip_prefix("/maven2") {
+        Some(rest) => format!(
+            "HTTP/1.1 302 Found\r\nlocation: {to_base}{rest}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+        ),
+        None => {
+            "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_owned()
+        }
+    };
+    drop(stream.write_all(answer.as_bytes()));
     drop(stream.flush());
 }
 
