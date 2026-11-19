@@ -14,6 +14,9 @@
 # not built into the image.
 !blackbox/Cargo.toml
 !blackbox/src/
+# The licence texts of what is built in and is not a crate's own
+# (THIRD-PARTY-LICENSES, its second part).
+!deploy/third-party-licenses/
 **/node_modules
 **/target
 **/.DS_Store

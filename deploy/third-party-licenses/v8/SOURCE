@@ -1,0 +1,11 @@
+Name: V8
+Version: 15.2.124.1
+License: BSD-3-Clause
+Built in through: openworkers-v8 152.2.0
+Taken from: https://github.com/denoland/v8 at commit c4ca1eccb90c5464d826b7713dc27178a53b0cfe
+Version established: v8/include/v8-version.h in the crate openworkers-v8 152.2.0 says 15.2.124 patch 1; the crate downloads its prebuilt static library from https://github.com/openworkers/rusty-v8 releases v152.2.0, whose v8 submodule at that tag is denoland/v8 c4ca1eccb90c5464d826b7713dc27178a53b0cfe, whose include/v8-version.h says the same.
+Why these files: LICENSE is V8's; the files it names for what is compiled into V8 are LICENSE.strongtalk (the assemblers) and LICENSE.fdlibm (src/base/ieee754), with LICENSE.v8 beside them in V8's root. The PCRE and layout tests are tests, not built in.
+File: LICENSE https://raw.githubusercontent.com/denoland/v8/c4ca1eccb90c5464d826b7713dc27178a53b0cfe/LICENSE sha256:6ab33af8774a0f396ee3aeeb761e3229057682d6f9fa7f572e390c2cb3a6e509
+File: LICENSE.v8 https://raw.githubusercontent.com/denoland/v8/c4ca1eccb90c5464d826b7713dc27178a53b0cfe/LICENSE.v8 sha256:4af93c12062c58058378de2397dc1c92bbff9ddfb1d583a01c84127557ce97ca
+File: LICENSE.strongtalk https://raw.githubusercontent.com/denoland/v8/c4ca1eccb90c5464d826b7713dc27178a53b0cfe/LICENSE.strongtalk sha256:6a585a9f466654abc8fc0829d56b1bc987e3a073d31faa03bba37d33640a23cd
+File: LICENSE.fdlibm https://raw.githubusercontent.com/denoland/v8/c4ca1eccb90c5464d826b7713dc27178a53b0cfe/LICENSE.fdlibm sha256:e7115e18444dae09d17f361ddc365fb1d342640fe500796209c63f7c80dfae10

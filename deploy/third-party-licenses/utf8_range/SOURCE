@@ -1,0 +1,7 @@
+Name: utf8_range
+Version: protobuf-36.2
+License: MIT
+Built in through: pg_query 18.1.0
+Taken from: https://github.com/protocolbuffers/protobuf at tag v36.2, commit 2c74169b34066ceb8ddb6b882fcb3fb32d737a55 (third_party/utf8_range)
+Version established: libpg_query vendors it with upb (vendor/upb/third_party/utf8_range/utf8_range.c, compiled by the crate's build.rs), from the same protobuf tag v36.2. It has no version of its own. The same file as libpg_query's vendor/upb/third_party/utf8_range/LICENSE, which the crate's package does not carry.
+File: LICENSE https://raw.githubusercontent.com/protocolbuffers/protobuf/2c74169b34066ceb8ddb6b882fcb3fb32d737a55/third_party/utf8_range/LICENSE sha256:02de69b64fc36d9e938f418e52723e42f0b2b226d58a9cb3c8dcbdf7059f5074

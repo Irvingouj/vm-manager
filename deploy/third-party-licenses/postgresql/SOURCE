@@ -1,0 +1,7 @@
+Name: PostgreSQL
+Version: 18.6
+License: PostgreSQL
+Built in through: pg_query 18.1.0
+Taken from: https://github.com/postgres/postgres at tag REL_18_6, commit 724edf9bde9d356724ad384a2e196edc3c9f80f7
+Version established: libpg_query/Makefile in the crate pg_query 18.1.0 (libpg_query 18.1.0) says PG_VERSION = 18.6: the PostgreSQL source libpg_query is made of.
+File: COPYRIGHT https://raw.githubusercontent.com/postgres/postgres/REL_18_6/COPYRIGHT sha256:3d6af92ff8a4c2cdf69afb1cf44edea727922f5cd0cf8b5f72b11cdecac8fdfd

@@ -1,0 +1,7 @@
+Name: libpg_query
+Version: 18.1.0
+License: BSD-3-Clause
+Built in through: pg_query 18.1.0
+Taken from: https://github.com/pganalyze/libpg_query at tag 18.1.0, commit c1546e7e97edc93fe8474d7a59881e91fbf48cfc
+Version established: libpg_query/Makefile in the crate pg_query 18.1.0 says VERSION = 18.1.0; the libpg_query submodule of https://github.com/pganalyze/pg_query.rs at v18.1.0 is commit c1546e7e97edc93fe8474d7a59881e91fbf48cfc, the tag 18.1.0.
+File: LICENSE https://raw.githubusercontent.com/pganalyze/libpg_query/c1546e7e97edc93fe8474d7a59881e91fbf48cfc/LICENSE sha256:f9352c20940619a380a5e9f23cebe34d8f797cfbd747fc236a7a3e5fc8ef9b41

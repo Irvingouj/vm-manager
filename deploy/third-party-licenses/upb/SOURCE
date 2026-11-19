@@ -1,0 +1,7 @@
+Name: upb
+Version: 36.2
+License: BSD-3-Clause
+Built in through: pg_query 18.1.0
+Taken from: https://github.com/protocolbuffers/protobuf at tag v36.2, commit 2c74169b34066ceb8ddb6b882fcb3fb32d737a55
+Version established: libpg_query vendors upb (vendor/upb/upb.c, compiled by the crate's build.rs); vendor/upb/VERSION in libpg_query at c1546e7e97edc93fe8474d7a59881e91fbf48cfc (tag 18.1.0) says v36.2, the protobuf tag it was taken from. upb is part of the protobuf repository and under its LICENSE (the same file as libpg_query's vendor/upb/LICENSE, which the crate's package does not carry).
+File: LICENSE https://raw.githubusercontent.com/protocolbuffers/protobuf/2c74169b34066ceb8ddb6b882fcb3fb32d737a55/LICENSE sha256:6e5e117324afd944dcf67f36cf329843bc1a92229a8cd9bb573d7a83130fea7d

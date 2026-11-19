@@ -50,6 +50,8 @@ RUN --mount=type=cache,id=vibe-cargo-registry,target=/usr/local/cargo/registry \
       exit 1; \
     fi
 
+COPY deploy/third-party-licenses /build/third-party-licenses
+
 # /out/THIRD-PARTY-LICENSES: every crate of the lock file built into the
 # program for this target (`cargo tree -p vibe --edges normal,build`),
 # but the workspace's own, with its version, the licence its manifest
@@ -73,12 +75,16 @@ work="$(mktemp -d)"
 sep=$'\x1f'
 
 # The licence texts of a folder: its files named LICENSE*, LICENCE*,
-# COPYING*, NOTICE*, UNLICENSE* or COPYRIGHT* (any case), and the manifest's
-# license-file, one absolute path a line.
+# COPYING*, NOTICE*, UNLICENSE* or COPYRIGHT* (any case; not source files,
+# such as copying-phase.cc, nor a debian/ packaging folder's), in the folder
+# and the folders under it (for one, liblzma-sys carries xz's in xz/), and
+# the manifest's license-file; one absolute path a line. $3 is find's
+# -maxdepth (none: every depth).
 licence_files() {
   {
-    find "$1" -maxdepth 1 -type f \( -iname 'licen[cs]e*' -o -iname 'copying*' \
-      -o -iname 'notice*' -o -iname 'unlicen[cs]e*' -o -iname 'copyright*' \)
+    find "$1" ${3:+-maxdepth "$3"} -type f \( -iname 'licen[cs]e*' -o -iname 'copying*' \
+      -o -iname 'notice*' -o -iname 'unlicen[cs]e*' -o -iname 'copyright*' \) \
+      -not -iregex '.*\.\(c\|cc\|cpp\|h\|hh\|inc\|rs\|sh\|py\|js\|ts\)$' -not -path '*/debian/*'
     if [ -n "$2" ] && [ -f "$1/$2" ]; then echo "$1/$2"; fi
   } | while read -r f; do realpath "$f"; done | sort -u
 }
@@ -135,7 +141,7 @@ cargo tree -p vibe --edges normal,build --prefix none --locked --target "$host" 
         if [ "$up" = / ] || [ "$up" = /build ] || [ "$(dirname "$up")" = /usr/local/cargo/git/checkouts ]; then
           break
         fi
-        texts="$(licence_files "$up" "")"
+        texts="$(licence_files "$up" "" 1)"
         from="$up"
       done
     fi
@@ -153,6 +159,51 @@ cargo tree -p vibe --edges normal,build --prefix none --locked --target "$host" 
       sed 's/^/    /' "$file"
     done <<<"$texts"
   done < "$work/built"
+
+  # The second part: code built into the program that is not a crate's own
+  # and whose licence texts no crate's source carries (V8, Postgres's
+  # parser). The texts are kept in deploy/third-party-licenses/<name>/,
+  # each fetched from its project's own repository at the version built in;
+  # its SOURCE says from where, at which tag or commit, and each file's
+  # SHA-256, which is checked here. The build fails when the crate an entry
+  # is built in through is not built in at the version the entry names.
+  echo
+  echo "Code built into the program that is not a crate's own, whose licence"
+  echo "texts no crate's source carries. Taken from each project's own"
+  echo "repository at the version built in."
+  for source_file in /build/third-party-licenses/*/SOURCE; do
+    folder="$(dirname "$source_file")"
+    field() { sed -n "s/^$1: //p" "$source_file" | head -n 1; }
+    name="$(field Name)"; version="$(field Version)"; license="$(field License)"
+    through="$(field 'Built in through')"; taken="$(field 'Taken from')"
+    if [ -z "$name" ] || [ -z "$version" ] || [ -z "$license" ] || [ -z "$through" ] || [ -z "$taken" ]; then
+      echo "$source_file lacks Name, Version, License, Built in through or Taken from" >&2
+      exit 1
+    fi
+    if ! grep -qxF "$through" "$work/built"; then
+      echo "$source_file: $name is built in through $through, which is not built into the program (cargo tree)" >&2
+      exit 1
+    fi
+    echo
+    echo "## $name $version (built in through ${through% *})"
+    echo "License: $license"
+    echo "Taken from: $taken"
+    files="$(sed -n 's/^File: //p' "$source_file")"
+    if [ -z "$files" ]; then
+      echo "$source_file names no file" >&2
+      exit 1
+    fi
+    while read -r file address sum; do
+      if ! echo "${sum#sha256:}  $folder/$file" | sha256sum --check --quiet - >&2; then
+        echo "$folder/$file is not the file $source_file names (sha256)" >&2
+        exit 1
+      fi
+      echo
+      echo "  $file ($address):"
+      echo
+      sed 's/^/    /' "$folder/$file"
+    done <<<"$files"
+  done
 } > "$out"
 
 iconv -f UTF-8 -t UTF-8 "$out" > /dev/null

@@ -1,0 +1,7 @@
+Name: xxHash
+Version: 0.8.0
+License: BSD-2-Clause
+Built in through: pg_query 18.1.0
+Taken from: https://github.com/Cyan4973/xxHash at commit a340845f94ad708ce920cb3afecfa55c5f0b78dd (branch dev, after v0.8.0)
+Version established: libpg_query's vendor/xxhash/xxhash.h says 0.8.0 but is not the v0.8.0 release's file; of the dev branch's commits to xxhash.h between v0.8.0 and the day libpg_query vendored it (2021-03-07), a340845f94ad708ce920cb3afecfa55c5f0b78dd ("Fix the solaris patch", 2021-02-22) has xxhash.h and xxhash.c equal to the vendored ones but for the last line's end. The library is BSD-2-Clause; the file also covers xxHash's command-line program (GPL-2.0), which is not built in.
+File: LICENSE https://raw.githubusercontent.com/Cyan4973/xxHash/a340845f94ad708ce920cb3afecfa55c5f0b78dd/LICENSE sha256:9da63520e9293d82c4b1613be5c84058cadb82b02f5972179bad13731d589910
