@@ -87,7 +87,7 @@ jobs:
       - name: libclang (pg_query's bindgen)
         run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends libclang-dev
       - name: The gate
-        run: scripts/gate.sh
+        run: scripts/gate.sh --no-fail-fast
 
   image:
     name: install-gate.sh
@@ -117,7 +117,7 @@ jobs:
           docker version --format 'Docker Engine {{.Server.Version}}'
           docker compose version
       - name: The image, and the install tests against it
-        run: scripts/install-gate.sh
+        run: scripts/install-gate.sh --no-fail-fast
       - name: Keep the image the install tests passed
         run: |
           mkdir -p image
