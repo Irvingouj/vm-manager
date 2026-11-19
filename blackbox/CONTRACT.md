@@ -2328,6 +2328,8 @@ Each as a test of the gate (`blackbox/tests/browser_*.rs`), against the real pro
 
 In every one of them the browser's own `Origin`, `Referer` policy, `Sec-Fetch-...` headers and cookies are what the platform gets: no test sets a header.
 
+**Over HTTPS, as an installation is reached.** Every walk of an installation's pages (1 to 6, and the installation's pages of 8) goes over HTTPS: the program is started with `--public-scheme https` and stands behind the harness's TLS front ("The tool reaches an installation over HTTPS"), with a certificate for the installation's names issued by an authority of the test's own. The test's browser trusts that authority (put into its fresh profile by the harness; nothing is trusted on anyone's say-so: the browser does not accept a certificate it cannot check, and a harness test shows it refusing the front when the authority was not given to it). Only so does the browser do what it does at a real installation: it keeps and sends the `__Host-` cookies marked `Secure`, and it sends `Sec-Fetch-Site`, `Sec-Fetch-Mode` and `Sec-Fetch-Dest`, which a browser sends to no plain-HTTP address but the machine's own. A harness test shows the second: a form of an HTTPS page of the installation's names, submitted by the browser, arrives with `Origin` and `Sec-Fetch-Site: same-origin`. The identity provider of these walks is the harness's, as before; whether it stands behind TLS is the harness's choice. The local run (7, and its page of 8) is plain HTTP on a name under `.localhost`, as `vibe dev` serves it.
+
 ### What this adds to the gate
 
 - The time the browser tests take is measured and said in the ticket.
