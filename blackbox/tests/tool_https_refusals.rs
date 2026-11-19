@@ -160,6 +160,22 @@ fn an_expired_certificate_is_refused_saying_it_is_expired() {
 }
 
 #[test]
+fn a_certificate_not_valid_yet_is_refused_saying_it_is_not_valid_yet() {
+    let vm = Vm::with_stand_in(&[]);
+    let a = Authority::new("Harness authority A");
+    let identity = a.issue_not_valid_yet(&[&api_name(), &format!("*.{DOMAIN}")]);
+    let behind = Behind::with_identity(a, &identity, vm.address());
+    let machine = Machine::new();
+    let ca = text_of(behind.ca_file());
+    let run = run_with_ca(&machine, &https_sign_in(behind.port()), Some(&ca));
+    let message = assert_certificate_refused(&run, &behind.front, &machine);
+    assert!(
+        message.to_lowercase().contains("not valid yet"),
+        "expected the message to say the certificate is not valid yet, got {message:?}"
+    );
+}
+
+#[test]
 fn a_signed_in_tool_whose_installation_now_has_an_unknown_certificate_sends_nothing() {
     let vm = Vm::with_stand_in(&[]);
     let behind = Behind::before(vm.address());

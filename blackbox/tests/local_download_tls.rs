@@ -25,7 +25,7 @@ use blackbox::local::{
     Local, Mirror, OUTSIDER, Redirector, Requested, Serving, archive_path, holds_postgres_programs,
     local_project, port_open,
 };
-use blackbox::tls::{Authority, Files, Front, Handshake, private_key_pem, text_of};
+use blackbox::tls::{Authority, Files, Front, Handshake, Identity, private_key_pem, text_of};
 use blackbox::tool::Run;
 
 /// The archive's mirror behind a TLS front under authority A, and A's
@@ -40,9 +40,15 @@ struct HttpsMirror {
 
 impl HttpsMirror {
     fn start() -> Self {
+        Self::start_with(|a, names| a.issue(names))
+    }
+
+    /// As [`HttpsMirror::start`], the front's certificate made by `issue`
+    /// under A from the names it is for (`localhost`).
+    fn start_with(issue: impl FnOnce(&Authority, &[&str]) -> Identity) -> Self {
         let mirror = Mirror::start(Serving::Archive);
         let a = Authority::new("Harness authority A");
-        let front = Front::tls(&a.issue(&["localhost"]), mirror.address());
+        let front = Front::tls(&issue(&a, &["localhost"]), mirror.address());
         let files = Files::new();
         let ca_file = text_of(&files.authorities("authority-a.pem", &[&a]));
         Self {
@@ -282,4 +288,36 @@ fn vibe_dev_with_an_https_mirror_and_an_unusable_file_is_ca_file_and_listens_now
     assert!(!port_open(port), "expected nothing listening on {port}");
     assert_eq!(https.front.accepted(), 0, "{}", https.front.describe());
     https.assert_nothing_asked("vibe dev");
+}
+
+/// Fails unless a download from the `https` mirror whose certificate
+/// `issue` makes under A, with A in `VIBE_CA_FILE` (so that this is the one
+/// fault), is `postgres-unavailable`, exit `1`, the message saying `words`,
+/// nothing asked of the mirror and nothing unpacked.
+fn assert_certificate_fault(issue: impl FnOnce(&Authority, &[&str]) -> Identity, words: &str) {
+    let https = HttpsMirror::start_with(issue);
+    let local = Local::new().without_bin().with_mirror(&https.base_url());
+    let run = run_page(&local, "tls-fault", &[("VIBE_CA_FILE", &https.ca_file)]);
+    let message = run.json_error(1, "postgres-unavailable");
+    assert!(
+        message.to_lowercase().contains(words),
+        "expected the message to say {words:?}, got {message:?}"
+    );
+    https.assert_nothing_asked(words);
+    assert_nothing_unpacked(&local, words);
+}
+
+#[test]
+fn a_mirror_certificate_for_another_name_is_postgres_unavailable_saying_so() {
+    assert_certificate_fault(|a, _| a.issue(&["mirror.other.test"]), "another name");
+}
+
+#[test]
+fn an_expired_mirror_certificate_is_postgres_unavailable_saying_so() {
+    assert_certificate_fault(|a, names| a.issue_expired(names), "expired");
+}
+
+#[test]
+fn a_mirror_certificate_not_valid_yet_is_postgres_unavailable_saying_so() {
+    assert_certificate_fault(|a, names| a.issue_not_valid_yet(names), "not valid yet");
 }

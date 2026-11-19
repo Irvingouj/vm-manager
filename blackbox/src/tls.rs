@@ -132,15 +132,21 @@ impl Authority {
     /// A server certificate for these names (DNS names, `*.` wildcards
     /// allowed), valid now, issued under this authority.
     pub fn issue(&self, names: &[&str]) -> Identity {
-        self.issue_with(names, None)
+        self.issue_with(names, Validity::Now)
     }
 
     /// As [`Authority::issue`], valid from 2020-01-01 to 2021-01-01: expired.
     pub fn issue_expired(&self, names: &[&str]) -> Identity {
-        self.issue_with(names, Some((2020, 2021)))
+        self.issue_with(names, Validity::Expired)
     }
 
-    fn issue_with(&self, names: &[&str], years: Option<(i32, i32)>) -> Identity {
+    /// As [`Authority::issue`], valid from a day after now, for a year: not
+    /// valid yet.
+    pub fn issue_not_valid_yet(&self, names: &[&str]) -> Identity {
+        self.issue_with(names, Validity::NotYet)
+    }
+
+    fn issue_with(&self, names: &[&str], validity: Validity) -> Identity {
         let owned: Vec<String> = names.iter().map(|n| (*n).to_owned()).collect();
         let mut params = CertificateParams::new(owned.clone()).unwrap_or_else(|e| {
             panic!("cannot make a certificate's parameters for {names:?}: {e}")
@@ -154,9 +160,20 @@ impl Authority {
             KeyUsagePurpose::KeyEncipherment,
         ];
         params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
-        if let Some((from, to)) = years {
-            params.not_before = date_time_ymd(from, 1, 1);
-            params.not_after = date_time_ymd(to, 1, 1);
+        match validity {
+            Validity::Now => {}
+            Validity::Expired => {
+                params.not_before = date_time_ymd(2020, 1, 1);
+                params.not_after = date_time_ymd(2021, 1, 1);
+            }
+            Validity::NotYet => {
+                let since_epoch = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default();
+                let day = Duration::from_secs(24 * 60 * 60);
+                params.not_before = date_time_ymd(1970, 1, 1) + since_epoch + day;
+                params.not_after = date_time_ymd(1970, 1, 1) + since_epoch + day * 366;
+            }
         }
         let key = KeyPair::generate().unwrap_or_else(|e| panic!("cannot make a key: {e}"));
         let certificate = params
@@ -169,6 +186,17 @@ impl Authority {
             key: PrivatePkcs8KeyDer::from(key.serialize_der()),
         }
     }
+}
+
+/// When a certificate [`Authority`] issues is valid.
+#[derive(Clone, Copy, Debug)]
+enum Validity {
+    /// From long ago to far ahead.
+    Now,
+    /// 2020 only.
+    Expired,
+    /// From a day after now.
+    NotYet,
 }
 
 /// A server certificate and its key. The key is never printed.
@@ -937,10 +965,20 @@ pub fn place_at(port: u16) -> Vec<String> {
 /// front: a browser that is to reach its authorization endpoint trusts
 /// `authority` ([`crate::browser::Browser::trust`]).
 pub fn provider_behind_tls(people: &[Person], authority: &Authority) -> (Provider, Front) {
+    provider_behind_tls_with(people, |names| authority.issue(names))
+}
+
+/// As [`provider_behind_tls`], the front's certificate made by `issue` from
+/// the names it is for (`localhost`): one for another name, expired, or not
+/// valid yet, say.
+pub fn provider_behind_tls_with(
+    people: &[Person],
+    issue: impl FnOnce(&[&str]) -> Identity,
+) -> (Provider, Front) {
     let bound = Bound::new();
     let issuer = format!("https://{PROVIDER_HOST}:{}", bound.port());
     let provider = Provider::start_with_issuer(people, &issuer);
-    let identity = authority.issue(&[PROVIDER_HOST]);
+    let identity = issue(&[PROVIDER_HOST]);
     let front = bound.tls(&identity, provider.address());
     (provider, front)
 }

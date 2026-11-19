@@ -109,6 +109,19 @@ fn an_expired_certificate_is_refused_by_the_client() {
 }
 
 #[test]
+fn a_certificate_not_valid_yet_is_refused_by_the_client() {
+    let server = NotAnInstallation::start();
+    let a = Authority::new("Harness authority A");
+    let front = Front::tls(&a.issue_not_valid_yet(&[&api_name()]), server.address());
+    let error = assert_refused(
+        &front,
+        tls_get(front.address(), &api_name(), &[&a], "/", &api_name()),
+        "a certificate not valid yet",
+    );
+    assert!(error.to_lowercase().contains("not valid yet"), "{error}");
+}
+
+#[test]
 fn a_replaced_identity_counts_from_the_next_connection() {
     let server = NotAnInstallation::start();
     let a = Authority::new("Harness authority A");
