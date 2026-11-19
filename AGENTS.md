@@ -46,6 +46,8 @@ Then the ticket's commits are pushed and the issue is closed with what was run. 
 
 Work on `main` and push to `main`. No pull requests. No branch unless something truly needs one, and then it is deleted when merged. The gate is run locally, and nothing of the loop ever waits on a remote check: no workflow runs per push or per pull request. The one workflow there may be is the release pipeline, started by a version tag or by hand, which builds, tests and publishes a release (the product owner's decision of 2026-11-18).
 
+That pipeline is `.github/workflows/release.yml`. A release is made from a commit of `main` like this: change the version in every place `scripts/release-check.sh` names (the package `vibe`, `Cargo.lock`, the `Dockerfile`, `deploy/`, `docs/getting-started.md`) and write the notes `docs/releases/v<version>.md`; run `scripts/release-check.sh` until it passes; run the gate and `scripts/install-gate.sh`, both green; commit and push to `main`; then push the tag `v<version>` on that commit. The workflow checks, builds and tests everything again and publishes only if all of it passes. A run started by hand on a branch is a rehearsal and publishes nothing. The details, and what to do when a run fails, are in `docs/releasing.md`.
+
 ### The gate
 
 `scripts/gate.sh` checks that `blackbox` depends on no product crate, then runs:
