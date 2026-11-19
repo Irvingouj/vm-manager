@@ -59,6 +59,8 @@ npm ci && npm test          # once the root npm workspace exists; needs Node 22 
 cargo test --workspace
 ```
 
+On the release pipeline's hosted runner the gate is run by `scripts/gate-hosted.sh`: the whole gate once (`scripts/gate.sh --no-fail-fast`), then each test file that failed once more, alone and one test at a time. The gate's time limits are sized for the machines it runs on every day (12 cores); a hosted runner has 4, and there a few test files that start many programs at once run past those limits when every file runs side by side, though each passes alone. Nothing is skipped: a file that fails twice, npm's tests, or a step before the tests failing fails it, and the log says which files were run again and how each ended. Locally, the gate is `scripts/gate.sh` as above.
+
 `scripts/install-gate.sh` is beside it and not part of it: it builds the container image from the working tree and runs the install tests (`blackbox/tests/install_*.rs`, ignored in the gate) against it with Docker and Compose. It is run for a ticket that touches the image, the Compose files or what they start, and by the release pipeline before anything is published.
 
 The SDK (`sdk/`), its type tests and the fixture projects written with it are one npm workspace at the repository root. The black-box tests build those fixture projects with the SDK's tooling and send them to the real program.
