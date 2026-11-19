@@ -89,7 +89,12 @@
 //!   HTML it reads them with;
 //! - [`tls`] is what the tests of the tool over HTTPS and of `VIBE_CA_FILE`
 //!   share: test certificate authorities, TLS fronts before the program and
-//!   before the identity provider, and the harness's own TLS client.
+//!   before the identity provider, and the harness's own TLS client;
+//! - [`install`] is what the install tests share (they need Docker and a
+//!   built image, and are run by `scripts/install-gate.sh`): the image, the
+//!   files of `deploy/` copied unchanged to a folder of the test's, an
+//!   installation started from them with Compose and taken down whatever
+//!   happens, and the identity provider on the Docker bridge's address.
 //!
 //! Every wait has a timeout, so a failing test fails within seconds and
 //! never hangs. Each test starts its own program on its own port, so tests
@@ -120,6 +125,7 @@ pub mod history_rewrite;
 pub mod history_shipping;
 pub mod history_structure;
 pub mod http;
+pub mod install;
 pub mod left_behind;
 pub mod local;
 pub mod log;

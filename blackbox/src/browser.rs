@@ -7,7 +7,11 @@
 //! provider, `http://127.0.0.1:<port>`) is connected to as it says; any
 //! other host (`auth.vm.test`, `<application>.vm.test`) is connected to at
 //! the program's listening address. `Host` is the URL's host and port, as a
-//! browser sends it.
+//! browser sends it. A name given to [`Browser::resolve`] is reached at the
+//! address given there. A browser made [`Browser::behind_tls`] speaks TLS
+//! for an `https` address of the installation (the install tests: the
+//! Compose file's proxy ends TLS), asking for the URL's host as the server
+//! name; otherwise such an address goes to the program in plain HTTP.
 //!
 //! The jar follows RFC 6265 and what browsers do today:
 //!
@@ -538,6 +542,14 @@ pub struct Browser {
     /// The authorities it trusts for an `https` address (none unless a
     /// test adds one: no public authority is built in).
     trusted: Vec<rustls::pki_types::CertificateDer<'static>>,
+    /// Names reached at an address of their own (the install tests'
+    /// identity provider on the Docker bridge's address), whatever else
+    /// they would be: a host file of this browser's.
+    names: Vec<(String, IpAddr)>,
+    /// Whether an `https` address of the installation goes to the program's
+    /// address over TLS (an installation behind the Compose file's proxy),
+    /// rather than in plain HTTP (the program itself).
+    installation_over_tls: bool,
 }
 
 impl Browser {
@@ -548,7 +560,32 @@ impl Browser {
             program,
             jar: Jar::new(),
             trusted: Vec::new(),
+            names: Vec::new(),
+            installation_over_tls: false,
         }
+    }
+
+    /// A browser for an installation behind what ends TLS on `address`
+    /// (the Compose file's proxy, or a front of the test's): an `https`
+    /// address of the installation goes there over TLS, asking for the
+    /// address's host as the server name and trusting `authority` (the
+    /// wildcard certificate's), as a person's browser does.
+    pub fn behind_tls(
+        address: SocketAddr,
+        authority: rustls::pki_types::CertificateDer<'static>,
+    ) -> Self {
+        let mut browser = Self::new(address);
+        browser.installation_over_tls = true;
+        browser.trust(authority);
+        browser
+    }
+
+    /// Reaches `host` at `ip` (with the URL's port) from now on, whatever
+    /// else it would be: one line of a host file.
+    pub fn resolve(&mut self, host: &str, ip: IpAddr) {
+        let host = host.to_ascii_lowercase();
+        self.names.retain(|(n, _)| *n != host);
+        self.names.push((host, ip));
     }
 
     /// Trusts this authority for `https` addresses from now on (the
@@ -577,6 +614,14 @@ impl Browser {
 
     fn address_for(&self, url: &Url) -> SocketAddr {
         let port = url.port_or_known_default().unwrap_or(80);
+        if let Some(Host::Domain(name)) = url.host()
+            && let Some((_, ip)) = self
+                .names
+                .iter()
+                .find(|(n, _)| n.eq_ignore_ascii_case(name))
+        {
+            return SocketAddr::new(*ip, port);
+        }
         match url.host() {
             Some(Host::Ipv4(ip)) => SocketAddr::new(IpAddr::V4(ip), port),
             Some(Host::Ipv6(ip)) => SocketAddr::new(IpAddr::V6(ip), port),
@@ -598,9 +643,11 @@ impl Browser {
             .method(method)
             .timeout(STEP_TIMEOUT);
         // An `https` address of the installation goes to the program in
-        // plain HTTP, as before (it listens behind what ends TLS); one
-        // elsewhere (the identity provider behind its TLS front) over TLS.
-        let request = if url.scheme() == "https" && self.address_for(url) != self.program {
+        // plain HTTP, as before (it listens behind what ends TLS), unless
+        // this browser is [`Browser::behind_tls`]; one elsewhere (the
+        // identity provider behind its TLS front) over TLS.
+        let to_program = self.address_for(url) == self.program;
+        let request = if url.scheme() == "https" && (!to_program || self.installation_over_tls) {
             request.over_tls(url.host_str().unwrap_or_default(), &self.trusted)
         } else {
             request

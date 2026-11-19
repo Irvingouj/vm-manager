@@ -258,3 +258,134 @@ fn the_browser_reaches_the_authorization_endpoint_of_the_provider_behind_tls() {
     let mut stranger = Browser::new(NotAnInstallation::start().address());
     assert!(stranger.try_open(&at).is_err());
 }
+
+/// Serves one TLS connection on `127.0.0.1:<free port>` with the chain and
+/// the key read back from PEM text, answering any request with `200` and
+/// `pem-served`; returns the address and the thread.
+fn serve_once_from_pem(
+    chain_pem: &str,
+    key_pem: &str,
+) -> (std::net::SocketAddr, std::thread::JoinHandle<()>) {
+    use rustls::pki_types::pem::PemObject;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    use std::io::{Read, Write};
+    let chain: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(chain_pem.as_bytes())
+        .collect::<Result<_, _>>()
+        .unwrap_or_else(|e| panic!("expected fullchain.pem to hold certificates: {e}"));
+    assert_eq!(
+        chain.len(),
+        1,
+        "expected the server's own certificate alone"
+    );
+    let key = PrivateKeyDer::from_pem_slice(key_pem.as_bytes())
+        .unwrap_or_else(|e| panic!("expected privkey.pem to hold a private key: {e}"));
+    let config = rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_no_client_auth()
+    .with_single_cert(chain, key)
+    .unwrap_or_else(|e| panic!("expected the key to go with the certificate: {e}"));
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let thread = std::thread::spawn(move || {
+        let (socket, _) = listener.accept().unwrap();
+        socket
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        let connection = rustls::ServerConnection::new(std::sync::Arc::new(config)).unwrap();
+        let mut tls = rustls::StreamOwned::new(connection, socket);
+        let mut head = Vec::new();
+        let mut byte = [0_u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            if tls.read(&mut byte).unwrap_or(0) == 0 {
+                return;
+            }
+            head.push(byte[0]);
+        }
+        drop(tls.write_all(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\npem-served",
+        ));
+        tls.conn.send_close_notify();
+        drop(tls.flush());
+    });
+    (address, thread)
+}
+
+#[test]
+fn an_identitys_pem_files_are_its_certificate_and_the_key_that_goes_with_it() {
+    let a = Authority::new("Harness authority A");
+    let identity = a.issue(&[&format!("*.{DOMAIN}")]);
+    let (chain, key) = (identity.chain_pem(), identity.key_pem());
+    assert!(
+        chain.starts_with("-----BEGIN CERTIFICATE-----\n"),
+        "{chain}"
+    );
+    assert!(key.starts_with("-----BEGIN PRIVATE KEY-----\n"));
+    assert!(
+        !format!("{identity:?}").contains(key.trim()),
+        "the identity printed its key"
+    );
+    let (address, thread) = serve_once_from_pem(&chain, &key);
+    let name = format!("board.{DOMAIN}");
+    let answer = tls_get(address, &name, &[&a], "/", &name)
+        .unwrap_or_else(|e| panic!("expected a client trusting A to take the PEM files: {e}"));
+    assert!(answer.ends_with("pem-served"), "{answer}");
+    thread.join().unwrap();
+}
+
+#[test]
+fn a_browser_behind_tls_reaches_an_https_application_address_through_a_front_on_a_port_of_the_tests()
+ {
+    let vm = blackbox::Vm::with_stand_in(&[("board", "honest.js")]);
+    let a = Authority::new("Harness authority A");
+    let front = Front::tls(&a.issue(&[&format!("*.{DOMAIN}")]), vm.address());
+    let mut browser = Browser::behind_tls(front.address(), a.der());
+    let at = url(&format!("https://board.{DOMAIN}:{}/", front.port()));
+    let request = browser
+        .request("GET", &at)
+        .header("accept", "application/json")
+        .header("x-vm-stand-in-user", "dana");
+    let answer = browser.send(&at, &request);
+    assert_eq!(answer.status, 200, "{}", answer.describe());
+    assert_eq!(answer.json()["user"]["id"], "dana", "{}", answer.describe());
+    let seen = front.settled();
+    assert_eq!(seen.len(), 1, "{}", front.describe());
+    assert_eq!(
+        seen[0].server_name.as_deref(),
+        Some(format!("board.{DOMAIN}").as_str()),
+        "expected the browser to ask for the address's host as the server name"
+    );
+    assert_eq!(
+        front.hosts(),
+        vec![format!("board.{DOMAIN}:{}", front.port())]
+    );
+    // A browser that does not trust A is refused.
+    let mut stranger = Browser::behind_tls(front.address(), Authority::new("B").der());
+    assert!(stranger.try_open(&at).is_err());
+}
+
+#[test]
+fn a_resolved_name_is_reached_at_its_address_over_tls() {
+    use blackbox::install::IDP_HOST;
+    use blackbox::tls::Bound;
+    let a = Authority::new("Harness identity provider authority");
+    let bound = Bound::new();
+    let issuer = format!("https://{IDP_HOST}:{}", bound.port());
+    let provider = blackbox::oidc::Provider::start_with_issuer(&[], &issuer);
+    let front = bound.tls(&a.issue(&[IDP_HOST]), provider.address());
+    // The browser's installation is elsewhere: only the name leads here.
+    let mut browser = Browser::new(NotAnInstallation::start().address());
+    browser.resolve(IDP_HOST, std::net::IpAddr::from([127, 0, 0, 1]));
+    browser.trust(a.der());
+    let step = browser.open(&url(&format!("{issuer}/.well-known/openid-configuration")));
+    assert_eq!(step.response.status, 200, "{}", step.response.describe());
+    assert_eq!(step.response.json()["issuer"], issuer);
+    assert_eq!(
+        front.settled()[0].server_name.as_deref(),
+        Some(IDP_HOST),
+        "{}",
+        front.describe()
+    );
+}

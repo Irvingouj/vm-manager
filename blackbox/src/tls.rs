@@ -218,6 +218,22 @@ impl fmt::Debug for Identity {
 }
 
 impl Identity {
+    /// The certificate chain in PEM form, the server's own first (what a
+    /// proxy reads as `fullchain.pem`). The authority's certificate is not
+    /// in it.
+    pub fn chain_pem(&self) -> String {
+        self.chain
+            .iter()
+            .map(|c| pem("CERTIFICATE", c.as_ref()))
+            .collect()
+    }
+
+    /// The private key in PEM form (PKCS #8), for a file a proxy of the
+    /// test's own reads (`privkey.pem`). Never print it.
+    pub fn key_pem(&self) -> String {
+        pem("PRIVATE KEY", self.key.secret_pkcs8_der())
+    }
+
     fn server_config(&self) -> Arc<ServerConfig> {
         let config =
             ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
@@ -231,6 +247,19 @@ impl Identity {
                 .unwrap_or_else(|e| panic!("the harness's server certificate {self:?}: {e}"));
         Arc::new(config)
     }
+}
+
+/// `der` in PEM form under this label, 64 characters a line.
+fn pem(label: &str, der: &[u8]) -> String {
+    use base64::Engine;
+    let text = base64::engine::general_purpose::STANDARD.encode(der);
+    let mut out = format!("-----BEGIN {label}-----\n");
+    for line in text.as_bytes().chunks(64) {
+        out.push_str(std::str::from_utf8(line).unwrap_or_default());
+        out.push('\n');
+    }
+    out.push_str(&format!("-----END {label}-----\n"));
+    out
 }
 
 /// A PEM file holding a private key only (a fresh one, used nowhere): a
@@ -318,8 +347,19 @@ pub struct Bound {
 impl Bound {
     /// A socket on `127.0.0.1:<free port>`.
     pub fn new() -> Self {
-        let listener = StdListener::bind("127.0.0.1:0")
-            .unwrap_or_else(|e| panic!("a front cannot listen: {e}"));
+        Self::on(std::net::IpAddr::from([127, 0, 0, 1]))
+    }
+
+    /// A socket on `<ip>:<free port>`: the Docker bridge's address, for an
+    /// identity provider a container reaches (the install tests). Never
+    /// `0.0.0.0`.
+    pub fn on(ip: std::net::IpAddr) -> Self {
+        assert!(
+            !ip.is_unspecified(),
+            "a front of the harness's listens on one address, never on {ip}"
+        );
+        let listener = StdListener::bind(SocketAddr::new(ip, 0))
+            .unwrap_or_else(|e| panic!("a front cannot listen on {ip}: {e}"));
         let address = listener
             .local_addr()
             .unwrap_or_else(|e| panic!("a front has no address: {e}"));
