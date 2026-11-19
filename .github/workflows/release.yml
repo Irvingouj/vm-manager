@@ -1,0 +1,294 @@
+# The release pipeline (blackbox/CONTRACT.md, "The first release: The
+# workflow"; AGENTS.md, "Git"; docs/releasing.md). The only workflow of the
+# repository: it starts on a pushed version tag and by hand, never on a push
+# to a branch or a pull request.
+#
+# A run for a version tag (pushed, or chosen by hand) publishes: the image
+# ghcr.io/irvingouj/vibe:<version> and the GitHub release v<version>. A run
+# by hand for anything else is a rehearsal: it builds and checks everything
+# the same way, keeps the files as the run's artefacts for 7 days, and
+# publishes nothing.
+#
+# Jobs: check (scripts/release-check.sh), gate (scripts/gate.sh), image
+# (scripts/install-gate.sh; the image it passed is kept), tool (built,
+# packed and tried on Linux and on macOS), files (the Compose files and
+# SHA256SUMS beside the archives), and publish, which needs all of them and
+# runs only for a tag. Only publish may write.
+
+name: release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One run at a time for a ref: a second run for the same tag waits for the
+# first, so that two never publish over each other.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  check:
+    name: release-check.sh
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      # All history of every branch and tag: the check holds the tag's
+      # commit to origin/main.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: What must hold before a release is built
+        run: |
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            scripts/release-check.sh "$GITHUB_REF_NAME"
+          else
+            echo "A rehearsal: $GITHUB_REF is not a tag, nothing will be published."
+            scripts/release-check.sh
+          fi
+
+  gate:
+    name: gate.sh
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      # All history: a test of the gate builds the program of an earlier
+      # commit (blackbox/src/history_earlier.rs).
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Make room on the disk
+        run: |
+          # The gate's debug build takes about 20 GB; a hosted runner is
+          # promised 14 GB. Tools this repository does not use go first.
+          df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL /usr/share/swift
+          df -h /
+          free_gb="$(df -Pk / | awk 'NR == 2 { print int($4 / 1048576) }')"
+          if [ "$free_gb" -lt 25 ]; then
+            echo "only ${free_gb} GB free on /, the gate needs about 25" >&2
+            exit 1
+          fi
+      - name: libclang (pg_query's bindgen)
+        run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends libclang-dev
+      - name: The gate
+        run: scripts/gate.sh
+
+  image:
+    name: install-gate.sh
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Make room on the disk
+        run: |
+          # The image's release build (BuildKit's cache) and the install
+          # tests' debug build of the tool.
+          df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL /usr/share/swift
+          df -h /
+          free_gb="$(df -Pk / | awk 'NR == 2 { print int($4 / 1048576) }')"
+          if [ "$free_gb" -lt 25 ]; then
+            echo "only ${free_gb} GB free on /, the image and the install tests need about 25" >&2
+            exit 1
+          fi
+      - name: libclang (pg_query's bindgen, for the tool the install tests use)
+        run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends libclang-dev
+      - name: Docker and Compose
+        run: |
+          docker version --format 'Docker Engine {{.Server.Version}}'
+          docker compose version
+      - name: The image, and the install tests against it
+        run: scripts/install-gate.sh
+      - name: Keep the image the install tests passed
+        run: |
+          mkdir -p image
+          docker image inspect --format '{{.Id}}' vibe:install-gate > image/id
+          docker save vibe:install-gate | gzip -1 > image/vibe-image.tar.gz
+          echo "the image $(cat image/id), $(du -h image/vibe-image.tar.gz | cut -f1)"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: image
+          path: image/
+          if-no-files-found: error
+          retention-days: 7
+
+  tool:
+    name: tool (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # glibc 2.35: the Linux program asks for nothing newer.
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          # Apple silicon.
+          - runner: macos-15
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    env:
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: libclang (pg_query's bindgen)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends libclang-dev
+      - name: What the build runs on
+        run: |
+          uname -a
+          rustc -vV
+          node --version
+          if [ "$RUNNER_OS" = Linux ]; then ldd --version | head -n 1; fi
+      - name: Build vibe
+        run: cargo build --release --locked -p vibe --bin vibe --target "$TARGET"
+      - name: The Linux program asks for nothing newer than glibc 2.35
+        if: runner.os == 'Linux'
+        run: |
+          binary="target/$TARGET/release/vibe"
+          newest="$(objdump -T "$binary" | grep -o 'GLIBC_[0-9][0-9.]*' | sed 's/^GLIBC_//' | sort -u -V | tail -n 1)"
+          echo "the newest glibc version vibe asks for: $newest"
+          if [ "$(printf '%s\n%s\n' "$newest" 2.35 | sort -V | tail -n 1)" != 2.35 ]; then
+            echo "vibe asks for glibc $newest, newer than 2.35" >&2
+            exit 1
+          fi
+      - name: Pack it
+        run: |
+          archive="$(scripts/package-tool.sh --binary "target/$TARGET/release/vibe" --target "$TARGET" --out dist | tail -n 1)"
+          echo "ARCHIVE=$archive" >> "$GITHUB_ENV"
+      - name: Unpack it and try it (its version, vibe new, npm install, a request, vibe check)
+        run: scripts/try-tool.sh --archive "$ARCHIVE"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: tool-${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  files:
+    name: the release's files
+    needs: tool
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: tool-*
+          merge-multiple: true
+          path: dist
+      - name: The Compose files, env.example and SHA256SUMS beside the archives
+        run: |
+          scripts/release-files.sh --out dist
+          cd dist
+          ls -l
+          sha256sum --check SHA256SUMS
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-files
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: publish
+    needs: [check, gate, image, tool, files]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      packages: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      IMAGE: ghcr.io/irvingouj/vibe
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: image
+          path: image
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-files
+          path: files
+      - name: A published release is never overwritten
+        run: |
+          tag="$GITHUB_REF_NAME"
+          if draft="$(gh release view "$tag" --json isDraft --jq .isDraft 2>/dev/null)"; then
+            if [ "$draft" != true ]; then
+              echo "the release $tag is already published: it is never overwritten (nothing was pushed)" >&2
+              exit 1
+            fi
+            echo "a draft of $tag is there from an earlier run: it is replaced below"
+          fi
+      - name: Push the image the install tests passed
+        run: |
+          tag="$GITHUB_REF_NAME"
+          version="${tag#v}"
+          gunzip -c image/vibe-image.tar.gz | docker load
+          if [ "$(docker image inspect --format '{{.Id}}' vibe:install-gate)" != "$(cat image/id)" ]; then
+            echo "the loaded image is not the one the install tests passed" >&2
+            exit 1
+          fi
+          docker tag vibe:install-gate "$IMAGE:$version"
+          trap 'docker logout ghcr.io' EXIT
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          docker push "$IMAGE:$version"
+      - name: Anyone can pull the image
+        run: |
+          # A package is private when first published (GitHub's
+          # documentation, "Working with the Container registry"); the
+          # release is not made before the image can be pulled without a
+          # sign-in.
+          version="${GITHUB_REF_NAME#v}"
+          name="${IMAGE#ghcr.io/}"
+          if ! token="$(curl -fsS --max-time 30 "https://ghcr.io/token?scope=repository:$name:pull" \
+              | perl -MJSON::PP -0777 -ne 'print decode_json($_)->{token}')" \
+            || ! curl -fsS --max-time 30 -o /dev/null -H "Authorization: Bearer $token" \
+              -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json' \
+              "https://ghcr.io/v2/$name/manifests/$version"; then
+            echo "$IMAGE:$version was pushed, but it cannot be pulled without a sign-in: make the package public (https://github.com/users/${GITHUB_REPOSITORY_OWNER}/packages/container/package/${name#*/} , Package settings, Change visibility), then run this workflow again for $GITHUB_REF_NAME" >&2
+            exit 1
+          fi
+          echo "$IMAGE:$version can be pulled without a sign-in"
+      - name: The release, as a draft with every file, then published
+        run: |
+          tag="$GITHUB_REF_NAME"
+          notes="docs/releases/$tag.md"
+          for _ in 1 2 3 4 5; do
+            draft="$(gh release view "$tag" --json isDraft --jq .isDraft 2>/dev/null)" || break
+            if [ "$draft" != true ]; then
+              echo "the release $tag was published meanwhile: it is not overwritten" >&2
+              exit 1
+            fi
+            gh release delete "$tag" --yes
+          done
+          gh release create "$tag" --draft --verify-tag --title "$tag" --notes-file "$notes" files/*
+          gh release edit "$tag" --draft=false
+          gh release view "$tag"
