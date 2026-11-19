@@ -35,6 +35,7 @@ use blackbox::firefox::{
     no_wider_than, processes_naming,
 };
 use blackbox::program::{run_to_exit, write_program};
+use blackbox::release::Folder;
 
 /// Where a helper test writes what it holds: the profile's folder on the
 /// first line, then each process of the browser as `<pid> <start>`.
@@ -46,14 +47,23 @@ const CHILD_TIMEOUT: Duration = Duration::from_secs(120);
 /// How long the end of a browser may take once its test is gone.
 const GONE_WITHIN: Duration = Duration::from_secs(30);
 
-fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "vibe-blackbox-browser-check-{}-{name}",
-        std::process::id()
-    ));
-    drop(fs::remove_dir_all(&dir));
-    fs::create_dir_all(&dir).unwrap();
-    dir
+/// A folder of one test's own (its pretenders, a helper's record), under
+/// the temporary folder, removed when dropped: when the test passes, and
+/// when it fails or panics (the drop runs as the panic unwinds). Its name
+/// (`vm-blackbox-release-browser-check-...`) does not begin with
+/// [`firefox::PROFILE_PREFIX`], so it is never taken for a profile left
+/// behind.
+fn scratch(name: &str) -> Folder {
+    let folder = Folder::new(&format!("browser-check-{name}"));
+    assert!(
+        !folder
+            .path()
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with(firefox::PROFILE_PREFIX)),
+        "a test's scratch folder must not be named as a profile"
+    );
+    folder
 }
 
 /// This test binary run again for one test, with these environment
@@ -185,7 +195,8 @@ fn helper_a_test_that_fails_holding_a_browser() {
 
 #[test]
 fn a_browser_is_ended_with_every_process_and_its_profile_when_the_test_fails() {
-    let dir = scratch("fails");
+    let scratch = scratch("fails");
+    let dir = scratch.path();
     let record = dir.join("record");
     let run = run_to_exit(
         this_binary(
@@ -209,7 +220,6 @@ fn a_browser_is_ended_with_every_process_and_its_profile_when_the_test_fails() {
     );
     let (profile, processes) = read_record(&record).expect("the helper's record");
     assert_gone(&profile, &processes, "after the test failed");
-    drop(fs::remove_dir_all(&dir));
 }
 
 /// Run only as a child of the next test: holds a browser, writes its
@@ -225,7 +235,8 @@ fn helper_a_test_that_holds_a_browser_until_it_is_killed() {
 
 #[test]
 fn a_browser_is_ended_with_every_process_and_its_profile_when_the_test_process_is_killed() {
-    let dir = scratch("killed");
+    let scratch = scratch("killed");
+    let dir = scratch.path();
     let record = dir.join("record");
     let mut child = this_binary(
         "helper_a_test_that_holds_a_browser_until_it_is_killed",
@@ -257,7 +268,6 @@ fn a_browser_is_ended_with_every_process_and_its_profile_when_the_test_process_i
     child.kill().unwrap();
     child.wait().unwrap();
     assert_gone(&profile, &processes, "after the test process was killed");
-    drop(fs::remove_dir_all(&dir));
 }
 
 /// A machine without a usable browser: what it is, the environment the
@@ -280,12 +290,13 @@ fn pretender(dir: &Path, name: &str, said: &str) -> PathBuf {
 #[test]
 fn without_firefox_128_or_later_every_browser_test_fails_saying_what_was_looked_for_and_what_to_do()
 {
-    let dir = scratch("none");
+    let scratch = scratch("none");
+    let dir = scratch.path();
     let empty = dir.join("empty-path");
     fs::create_dir_all(&empty).unwrap();
     let missing = dir.join("no-such-firefox");
-    let old = pretender(&dir, "old-firefox", "Mozilla Firefox 127.0.2");
-    let other = pretender(&dir, "chromium", "Chromium 140.0.7339.80 built on Debian");
+    let old = pretender(dir, "old-firefox", "Mozilla Firefox 127.0.2");
+    let other = pretender(dir, "chromium", "Chromium 140.0.7339.80 built on Debian");
     // A Firefox 128 that is there, reached from the folder the browser
     // test is run from by a relative path: refused all the same.
     let relative_dir = dir.join("relative");
@@ -377,7 +388,6 @@ fn without_firefox_128_or_later_every_browser_test_fails_saying_what_was_looked_
             began.elapsed()
         );
     }
-    drop(fs::remove_dir_all(&dir));
 }
 
 #[test]
