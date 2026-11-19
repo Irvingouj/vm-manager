@@ -357,26 +357,34 @@ fn downloaded(major: u32) -> Result<PathBuf, String> {
         home.display()
     );
     let began = Instant::now();
-    let published = fetch(&format!("{url}.sha256"), 1024)?;
-    let published = String::from_utf8_lossy(&published);
-    let published = published.split_whitespace().next().unwrap_or_default();
-    if !published.eq_ignore_ascii_case(sha256) {
-        return Err(format!(
-            "the SHA-256 published for {url} is {published:?}, not the {sha256} pinned in the harness: refusing it"
-        ));
-    }
-    let archive = fetch(&url, MAX_ARCHIVE_BYTES)?;
+    // A published checksum that is not the pinned one is a wrong file: it
+    // stops the harness at once, never tried again.
+    download(&format!("{url}.sha256"), 1024, &DOWNLOAD_PAUSES, |bytes| {
+        let published = String::from_utf8_lossy(bytes);
+        let published = published.split_whitespace().next().unwrap_or_default();
+        if published.eq_ignore_ascii_case(sha256) {
+            Ok(())
+        } else {
+            Err(format!(
+                "the SHA-256 published for {url} is {published:?}, not the {sha256} pinned in the harness: refusing it"
+            ))
+        }
+    })?;
+    let archive = download(&url, MAX_ARCHIVE_BYTES, &DOWNLOAD_PAUSES, |bytes| {
+        let actual = hex(&Sha256::digest(bytes));
+        if actual == sha256 {
+            Ok(())
+        } else {
+            Err(format!(
+                "the archive downloaded from {url} has SHA-256 {actual}, not the published {sha256}: refusing it"
+            ))
+        }
+    })?;
     eprintln!(
         "blackbox: downloaded {} bytes of Postgres {zonky_version} in {:?}",
         archive.len(),
         began.elapsed()
     );
-    let actual = hex(&Sha256::digest(&archive));
-    if actual != sha256 {
-        return Err(format!(
-            "the archive downloaded from {url} has SHA-256 {actual}, not the published {sha256}: refusing it"
-        ));
-    }
     let unpacking = cache.join(format!(
         ".postgres-{zonky_version}-{platform}.unpacking-{}-{}",
         std::process::id(),
@@ -478,12 +486,18 @@ pub fn archive_bytes(major: u32) -> Vec<u8> {
         "blackbox: downloading the Postgres archive once, from {url}, to {}",
         file.display()
     );
-    let bytes = fetch(&url, MAX_ARCHIVE_BYTES).unwrap_or_else(|problem| panic!("{problem}"));
-    let actual = hex(&Sha256::digest(&bytes));
-    assert_eq!(
-        actual, archive.sha256,
-        "the archive downloaded from {url} is not the one pinned in the harness"
-    );
+    let bytes = download(&url, MAX_ARCHIVE_BYTES, &DOWNLOAD_PAUSES, |bytes| {
+        let actual = hex(&Sha256::digest(bytes));
+        if actual == archive.sha256 {
+            Ok(())
+        } else {
+            Err(format!(
+                "the archive downloaded from {url} has SHA-256 {actual}, not the {} pinned in the harness: refusing it",
+                archive.sha256
+            ))
+        }
+    })
+    .unwrap_or_else(|problem| panic!("{problem}"));
     fs::create_dir_all(&cache)
         .unwrap_or_else(|e| panic!("cannot create the cache {}: {e}", cache.display()));
     let partial = cache.join(format!(".archive-{}-{}", std::process::id(), unique()));
@@ -495,20 +509,99 @@ pub fn archive_bytes(major: u32) -> Vec<u8> {
     bytes
 }
 
-fn fetch(url: &str, limit: u64) -> Result<Vec<u8>, String> {
+/// How many tries one download of the harness makes in all (CONTRACT.md:
+/// "four tries in all").
+pub const DOWNLOAD_TRIES: usize = 4;
+
+/// The pauses between the tries of the harness's own downloads: two, four
+/// and eight seconds.
+pub const DOWNLOAD_PAUSES: [Duration; 3] = [
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+    Duration::from_secs(8),
+];
+
+/// Why one try of a download did not bring a file that may be used.
+enum Failed {
+    /// It did not bring the file (the connection failed or was cut, the
+    /// time limit passed, the status was not 200): tried again.
+    Again(String),
+    /// It brought one, and it is wrong (larger than the limit): never
+    /// tried again.
+    Wrong(String),
+}
+
+/// One try: `GET url` within [`DOWNLOAD_TIMEOUT`], at most `limit` bytes.
+fn fetch_once(url: &str, limit: u64) -> Result<Vec<u8>, Failed> {
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(DOWNLOAD_TIMEOUT))
         .build()
         .into();
-    agent
+    let mut response = agent
         .get(url)
         .call()
-        .map_err(|e| format!("cannot download {url}: {e}"))?
+        .map_err(|e| Failed::Again(e.to_string()))?;
+    let status = response.status().as_u16();
+    if status != 200 {
+        return Err(Failed::Again(format!("http status: {status}")));
+    }
+    response
         .body_mut()
         .with_config()
         .limit(limit)
         .read_to_vec()
-        .map_err(|e| format!("cannot download {url}: {e}"))
+        .map_err(|e| match e {
+            ureq::Error::BodyExceedsLimit(_) => Failed::Wrong(format!(
+                "larger than the limit of {limit} bytes: refusing it"
+            )),
+            other => Failed::Again(other.to_string()),
+        })
+}
+
+/// Downloads `url` (at most `limit` bytes) and hands it to `check`. A try
+/// that does not bring the file is said on standard error, with the address
+/// and what happened, and tried again after the next of `pauses` (the
+/// harness's callers give [`DOWNLOAD_PAUSES`]; the last is kept if there
+/// are fewer), [`DOWNLOAD_TRIES`] tries in all; then it fails with the last
+/// failure and the number of tries. A file over the limit, or one `check`
+/// refuses (its words are the failure), fails at once, never tried again.
+pub fn download(
+    url: &str,
+    limit: u64,
+    pauses: &[Duration],
+    check: impl Fn(&[u8]) -> Result<(), String>,
+) -> Result<Vec<u8>, String> {
+    let mut last = String::new();
+    for attempt in 1..=DOWNLOAD_TRIES {
+        match fetch_once(url, limit) {
+            Ok(bytes) => {
+                check(&bytes)?;
+                return Ok(bytes);
+            }
+            Err(Failed::Wrong(problem)) => return Err(format!("cannot download {url}: {problem}")),
+            Err(Failed::Again(problem)) => {
+                if attempt < DOWNLOAD_TRIES {
+                    let pause = pauses
+                        .get(attempt - 1)
+                        .or_else(|| pauses.last())
+                        .copied()
+                        .unwrap_or(Duration::ZERO);
+                    eprintln!(
+                        "blackbox: try {attempt} of {DOWNLOAD_TRIES} to download {url} failed: {problem}; trying again in {pause:?}"
+                    );
+                    thread::sleep(pause);
+                } else {
+                    eprintln!(
+                        "blackbox: try {attempt} of {DOWNLOAD_TRIES} to download {url} failed: {problem}"
+                    );
+                }
+                last = problem;
+            }
+        }
+    }
+    Err(format!(
+        "cannot download {url}: {last} ({DOWNLOAD_TRIES} tries)"
+    ))
 }
 
 /// Writes each program of `bin` again through
