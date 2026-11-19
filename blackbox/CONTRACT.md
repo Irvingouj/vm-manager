@@ -2299,3 +2299,41 @@ So that the gate can test the making without a hosted run, each piece is a scrip
 - The npm package, Windows, and the local run's tests on three systems: the ticket "The tool on Linux, macOS and Windows, installed as an npm package". On macOS this release's tool is built and checked as far as "The workflow" says, and no further.
 - An image for `linux/arm64`; a signed and notarised macOS program; signatures or provenance for the release's files beyond `SHA256SUMS`.
 - The program serving TLS itself: its own ticket.
+
+## A real browser in the gate (ticket: The gate runs a real browser)
+
+The platform's own pages are walked by a real browser in the gate, as a person walks them: the browser loads them, fills and submits their forms and follows their redirects, and sends its own headers and cookies and keeps to its own policies. Nothing here changes what a page is or what the platform answers: every sentence about a page above holds as it is, and from this ticket on a browser holds the platform to it. What a browser shows that was written wrong above is corrected there, through the loop.
+
+### The browser
+
+- It is **Firefox**, without a window (`--headless`), driven by the harness over the protocol Firefox itself speaks (Marionette): nothing is installed but Firefox, 128 or later. The harness depends on no product crate, as ever.
+- It is found as: the program `VIBE_TEST_BROWSER` names (a path, or a name on the path), else `firefox` on the path. Its version is asked (`--version`) before it is used.
+- **No browser, no gate.** When none is found, or the one found is older than 128 or is not Firefox, every browser test **fails** (it is never skipped, and never passes without a browser), and the failure says what was looked for and what to do: install Firefox 128 or later, or set `VIBE_TEST_BROWSER`. `scripts/gate.sh` looks for it first, with its other checks before anything is built, and stops there with the same words, so that a gate without a browser ends in seconds.
+- Each test's browser is its own: a fresh profile in a folder of the test's, no history, no cookie of another test, no add-on, no update, no page of the browser's own opened, nothing sent to the browser's maker. Names of the installation's domain reach the program under test on this machine and nothing else is asked of the network.
+- **Each browser a test starts is ended by it**, with every process it started and its profile's folder removed: when the test passes, when it fails, and when the test process itself is killed. After the gate no browser of it runs and no profile of it is left.
+- The release workflow's gate has a browser too: the hosted runner's Firefox, whose version the job prints.
+
+### What it walks
+
+Each as a test of the gate (`blackbox/tests/browser_*.rs`), against the real program with OIDC connected to the harness's identity provider, unless said otherwise. A test finds what it clicks and reads by what the pages are said to hold above (the `data-vm-...` marks, the forms, the words), never by a structure nothing above promises.
+
+1. **Sign-in.** The browser asks for the Dashboard with no session, is sent to the identity provider and back, and is on the Dashboard, which says who is signed in.
+2. **Opening an Application from the Dashboard.** A click on an Application's link (`a[data-vm-open]`) shows that Application's page, answered for that person, without the identity provider being asked again.
+3. **Sharing and unsharing by the Dashboard's forms.** A Contributor shares the Application with another person by the form of its page; the page then shows it shared with them, and that person's own browser finds it on their Dashboard and opens it. The Contributor takes it back by the form; the page then no longer shows it, and the other person's browser is refused the Application.
+4. **A refusal in words.** Sharing with an email address the platform does not know is refused on the page, in words that say why, and nothing is shared.
+5. **Sign-out.** By the sign-out page's form; afterwards the Dashboard sends the browser to sign in again, and an Application opened before asks for a sign-in again.
+6. **The tool's sign-in.** Both ways of `vibe sign-in`: with `--no-browser`, the address the tool prints is opened, the check code it prints is typed into the page's form, and the tool ends signed in (`vibe whoami` says who); with a browser on the machine (`BROWSER` naming a command of the test's that hands the address to the test's browser), the page's confirmation is submitted and the tool ends signed in. A wrong check code is refused on the page in words and the tool is not signed in.
+7. **The local run's test-User page.** With `vibe dev` running in a project made from the template, the browser opens the Application's local address, is shown the page of test Users, chooses one by its form, and is shown the Application's page for that User; choosing another shows it for the other.
+8. **No page is wider than a narrow window.** In a window 320 CSS pixels wide (the test first holds the window to that width as the page itself sees it), none of these scrolls sideways (the document is no wider than the window): the Dashboard's list with Applications in it, one Application's page as a Contributor sees it, the sign-out page, the tool's sign-in page, a page of refusal, and the local run's test-User page.
+
+In every one of them the browser's own `Origin`, `Referer` policy, `Sec-Fetch-...` headers and cookies are what the platform gets: no test sets a header.
+
+### What this adds to the gate
+
+- The time the browser tests take is measured and said in the ticket.
+- The harness's own small browser (`blackbox/src/browser.rs`) stays for the tests that look at one redirect at a time; it is no longer the only thing that holds a form.
+
+### What this does not close
+
+- Another browser than Firefox (Chromium, Safari), and a browser on Windows or macOS: the pages use nothing one of them lacks, but none of them runs here.
+- An Application's own pages: what a Builder writes is theirs to test.
