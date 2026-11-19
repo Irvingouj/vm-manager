@@ -2238,3 +2238,59 @@ Against the image `VIBE_INSTALL_IMAGE` names, started by the files of `deploy/` 
 - without `VIBE_DOMAIN`, `VIBE_SECRET_KEY` or `POSTGRES_PASSWORD`, `docker compose config` fails naming the missing value;
 - the image's `THIRD-PARTY-LICENSES` names every crate `cargo tree -p vibe --edges normal,build --prefix none` lists for the image's target with its version (but the workspace's own), and each has a licence stated; its second part names V8, ICU, libc++, abseil, libpg_query and PostgreSQL, each with a licence, where it was taken from and a text; the base's own `/usr/share/doc/*/copyright` files are in the image;
 - the image has no shell (`docker run --rm --entrypoint /bin/sh <image>` cannot start) and its user is a number other than `0`.
+
+## The first release (ticket: A first, minimal release: the image, the Compose file, the tool for Linux and macOS)
+
+A release is what an administrator and a Builder take from outside the repository: the image on the registry, and a GitHub release holding the Compose files and the tool for two systems. This says what is in one, how it is made, and what holds in the repository so that it can be made. What the gate can see of it is tested in the gate (`blackbox/tests/release_*.rs`); what only a hosted run can show is shown by the release workflow's own steps, and a run of it by hand is its rehearsal.
+
+### One version
+
+- The program's version is the version of the package `vibe` (`crates/vibe/Cargo.toml`). The first line of `vibe --version` is `vibe <version>`.
+- Everything that names a version names that one: the default of `VIBE_VERSION` in the `Dockerfile`; the image `deploy/compose.yaml` takes without `VIBE_IMAGE`, `ghcr.io/irvingouj/vibe:<version>`, and the same name where `deploy/.env.example` and `deploy/README.md` show it; every address of a release's file in `docs/getting-started.md` (`.../releases/download/v<version>/...`) and every archive's name there; the file of the release's notes, `docs/releases/v<version>.md`, which exists.
+- For this ticket the version is `0.1.0`.
+
+### The licence
+
+- The program's own licence is the product owner's to state, in a file `LICENSE` at the repository's root. Nothing is published without it: `scripts/release-check.sh` given a tag fails while it is missing, saying so. A rehearsal goes on without it, saying that it is missing.
+- When the repository has it, it is in the image at `/usr/share/doc/vibe/LICENSE` and in each archive of the tool, unchanged; when it has not, neither holds one.
+
+### What a release holds
+
+For the version `<v>`:
+
+- **The image** `ghcr.io/irvingouj/vibe:<v>`, for `linux/amd64`: the image of "Installing: one image and a Compose file", built by `docker build .` from the tagged commit, the same image the install tests of that run passed against.
+- **A GitHub release** named and tagged `v<v>`, whose text is `docs/releases/v<v>.md`, with these files and no other:
+  - `compose.yaml`, `compose.own-proxy.yaml`, `compose.own-postgres.yaml`: the files of `deploy/`, unchanged;
+  - `env.example`: `deploy/.env.example`, unchanged (under this name because a release cannot hold a file whose name begins with a dot);
+  - `vibe-<v>-x86_64-unknown-linux-gnu.tar.gz` and `vibe-<v>-aarch64-apple-darwin.tar.gz`: the tool;
+  - `SHA256SUMS`: one line for each of the files above, `<64 hex digits>`, two spaces, the file's name, in the names' order: what `sha256sum` writes, so that `sha256sum --check SHA256SUMS` (Linux) and `shasum -a 256 --check SHA256SUMS` (macOS) pass in a folder holding them all, and `--ignore-missing` checks the ones that were downloaded.
+- **An archive of the tool** is a gzip'd tar with one folder, `vibe-<v>-<target>/`, holding exactly: `vibe` (the program built `--release --locked` for that target, executable), `THIRD-PARTY-LICENSES`, and `LICENSE` when the repository has one ("The licence") (the notices in the form "Installing" gives the image's, made for that target from the lock file by the same means as the image's: the crates built into the program for that target, then the part for what is built in and is no crate's own).
+- The Linux program asks the system's C library for nothing newer than glibc 2.35 (Ubuntu 22.04, Debian 12 and later). The macOS program is not signed with a developer's identity and not notarised: downloaded with `curl` it runs; downloaded with a browser macOS holds it back until its quarantine mark is removed (`xattr -d com.apple.quarantine vibe`), and the page says so.
+
+### The scripts that make it
+
+So that the gate can test the making without a hosted run, each piece is a script of `scripts/` that the workflow calls and does nothing else for:
+
+- `scripts/third-party-licenses.sh [--target <triple>]` writes the notices to standard output, for the given target (without one: the machine's). The image's build uses it: the notices of the image and of an archive for the same target are the same text.
+- `scripts/package-tool.sh --binary <file> --target <triple> --out <folder>` makes `<folder>/vibe-<v>-<target>.tar.gz` as said above, `<v>` being what the binary's `--version` says, and prints the archive's path. It refuses (exit code other than 0, saying why, nothing left in the folder) a file that is not there or does not say `vibe <version>` as its first line, and a `<v>` other than the package's version.
+- `scripts/release-files.sh --out <folder>` copies the three Compose files and `env.example` into the folder (which may already hold the archives) and writes `SHA256SUMS` over every file then in it.
+- `scripts/release-check.sh [<tag>]` checks what must hold before a release is built, and says each thing that does not: the versions of "One version" agree; `docs/releases/v<version>.md` exists; with a tag given, the tag is `v<version>`, its commit is on `main` (`origin/main` itself or an ancestor of it), and `LICENSE` exists. Exit code 0 only when everything asked holds.
+
+### The workflow
+
+- `.github/workflows/` holds one file, `release.yml`, and no other workflow. It starts on a pushed tag of the form `v<digits>.<digits>.<digits>` and by hand (`workflow_dispatch`), and on nothing else: no `push` to a branch, no `pull_request`, no `pull_request_target`, no `schedule`, no other event.
+- A run **publishes** only when it runs for a version tag (started by the tag's push, or by hand with that tag chosen). A run by hand for anything else is a **rehearsal**: it builds and checks everything the same way, keeps the files as the run's artefacts, and publishes nothing: no image pushed, no release made.
+- Before anything is published, in the same run, all of this has passed: `scripts/release-check.sh` (with the tag, when there is one); the gate (`scripts/gate.sh`) on Linux; `scripts/install-gate.sh`, whose image is the one then pushed; on each of the two systems, the tool built there, packed by `scripts/package-tool.sh`, unpacked again, and the unpacked `vibe` saying `vibe <version>`, making a project (`vibe new`), and passing `vibe check` on it after `npm install`; the Linux program's glibc ceiling.
+- Publishing is last and in this order: the image pushed; the release made as a draft with every file, then published. A run that fails part-way is run again by hand for the same tag.
+- Its permissions are `contents: read` for the workflow; only the job that publishes has `contents: write` and `packages: write`. It uses no secret but the run's own token. Every action it uses is one of GitHub's own (`actions/...`), named by a full commit id, not by a tag or a branch.
+
+### The page and the notes
+
+- `docs/getting-started.md` takes someone from nothing to an Application opened in the browser, with the published files only: installing with Compose (the release's `compose.yaml` and `env.example`; `deploy/README.md` is where the detail is), registering the installation at the identity provider and connecting OIDC, installing the tool (download, check against `SHA256SUMS`, unpack, put on the path) on Linux and on macOS, signing in, a project from the template, running it locally, deploying it, sharing it. The repository's `README.md` leads to it. Every command of the program it shows is one the program has (`vibe <command> --help` knows the command and each option shown).
+- `docs/releases/v0.1.0.md`, the release's notes: what works; what is missing, in a user's words; that this release is **not for untrusted Applications or real company data** until the work on credentials, limits and the runtime's hardening is done; that the Postgres a local run downloads is a third party's build, pinned by its checksum; which systems the tool is built for and what was not tried on them; that the image is for `linux/amd64` only.
+
+### What this does not close
+
+- The npm package, Windows, and the local run's tests on three systems: the ticket "The tool on Linux, macOS and Windows, installed as an npm package". On macOS this release's tool is built and checked as far as "The workflow" says, and no further.
+- An image for `linux/arm64`; a signed and notarised macOS program; signatures or provenance for the release's files beyond `SHA256SUMS`.
+- The program serving TLS itself: its own ticket.
