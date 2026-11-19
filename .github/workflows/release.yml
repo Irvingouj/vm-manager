@@ -335,10 +335,10 @@ jobs:
           docker push "$IMAGE:$version"
       - name: Anyone can pull the image
         run: |
-          # A package is private when first published (GitHub's
-          # documentation, "Working with the Container registry"); the
-          # release is not made before the image can be pulled without a
-          # sign-in.
+          # The release is not made before the image can be pulled without
+          # a sign-in. GitHub's documentation ("Working with the Container
+          # registry") says a package is private when first published; for
+          # v0.1.0 it could be pulled at once (docs/releasing.md).
           version="${GITHUB_REF_NAME#v}"
           name="${IMAGE#ghcr.io/}"
           if ! token="$(curl -fsS --max-time 30 "https://ghcr.io/token?scope=repository:$name:pull" \

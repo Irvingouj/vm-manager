@@ -37,9 +37,11 @@ The workflow then runs for the tag. `scripts/release-check.sh v<version>` also c
 
 ## When a run fails
 
-Fix the cause, and run the workflow again for the same tag, by hand ("Run workflow", and choose the tag `v<version>` instead of a branch). A draft left by the failed run is replaced. If the fix needs a new commit, the tag must move to it: delete the tag (`git push origin :refs/tags/v<version>` and `git tag -d v<version>`), and tag the new commit of `main`.
+When a job was lost to something outside the repository (a download that failed, a runner that went away), wait for the run to end and run only what failed again: `gh run rerun <run id> --failed`. The jobs that passed keep their results, and `publish` runs once every job before it has passed. The run for `v0.1.0` was published so: its image job had been answered `404` for a download of the test harness, and passed when run again.
 
-The first time an image is published, GitHub makes its package private. The run then stops after pushing the image, before the release is made, saying so. Make the package public once (on GitHub: your profile, Packages, `vibe`, Package settings, Change visibility, Public), and run the workflow again for the tag.
+Otherwise fix the cause, and run the workflow again for the same tag, by hand ("Run workflow", and choose the tag `v<version>` instead of a branch). A draft left by the failed run is replaced. If the fix needs a new commit, the tag must move to it: delete the tag (`git push origin :refs/tags/v<version>` and `git tag -d v<version>`), and tag the new commit of `main`.
+
+After pushing the image, the run checks that anyone can pull it without a sign-in, and makes the release only then. GitHub's documentation says a package is private when first published; for `v0.1.0` that did not happen: the image, pushed by this public repository's workflow, could be pulled without a sign-in seconds after the push, and nobody had touched the package. Should a run ever stop there, saying that the image cannot be pulled without a sign-in: make the package public once (on GitHub: your profile, Packages, `vibe`, Package settings, Change visibility, Public), and run what failed again (`gh run rerun <run id> --failed`).
 
 ## What the workflow runs on
 
