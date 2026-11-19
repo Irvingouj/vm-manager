@@ -91,13 +91,21 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
-    # Ready once it takes connections over TCP: the first start's script
-    # runs with the server on its socket only.
+    # Healthy only once the first start finished whole (the mark its script
+    # leaves as its last act, in the data folder) and the server takes
+    # connections over TCP (the first start's script runs with the server
+    # on its socket only). A first start that was interrupted leaves no
+    # mark: the service is unhealthy at every later start and vibe is not
+    # started (README.md, "If the first start was interrupted"). The check
+    # runs as the user postgres, signs in nowhere, and is asked every second
+    # for the first two minutes, then every 30 seconds.
     healthcheck:
-      test: ["CMD", "pg_isready", "--host", "127.0.0.1", "--username", "vibe", "--dbname", "vibe"]
-      interval: 2s
+      test: ["CMD-SHELL", "test -f \"$$PGDATA/vibe-first-start-finished\" || { echo 'the first start of this Postgres did not finish: see deploy/README.md'; exit 1; }; pg_isready --host 127.0.0.1 --username vibe --dbname vibe"]
+      start_period: 120s
+      start_interval: 1s
+      interval: 30s
       timeout: 5s
-      retries: 60
+      retries: 3
     restart: unless-stopped
     # Published nowhere: only vibe reaches it, on this file's network.
 
@@ -131,22 +139,29 @@ volumes:
 
 configs:
   # Run once by the Postgres image, at the first start with an empty data
-  # folder: the role vibe (no superuser; may create databases and roles),
-  # the platform database vibe, CONNECT on postgres and template1 taken from
-  # PUBLIC, and the superuser refused over the network whatever password.
+  # folder (after the image has made the folder). First, before anything is
+  # made: the superuser refused over the network whatever password. Then
+  # the role vibe (no superuser; may create databases and roles) with the
+  # password POSTGRES_PASSWORD, which psql reads from the environment
+  # (\getenv) so that it is on no command line; the platform database vibe;
+  # CONNECT on postgres and template1 taken from PUBLIC. Last, the mark the
+  # health check asks for: however the script ends before its end, there
+  # is none.
   postgres-first-start:
     content: |
       set -eu
-      psql --no-psqlrc --set ON_ERROR_STOP=1 --username postgres --dbname postgres \
-        --set password="$${POSTGRES_PASSWORD}" <<'SQL'
+      { printf 'host all postgres all reject\nhost replication postgres all reject\n'
+        cat "$${PGDATA}/pg_hba.conf"; } > "$${PGDATA}/pg_hba.conf.vibe"
+      mv "$${PGDATA}/pg_hba.conf.vibe" "$${PGDATA}/pg_hba.conf"
+      psql --no-psqlrc --set ON_ERROR_STOP=1 --username postgres --dbname postgres <<'SQL'
+      \getenv password POSTGRES_PASSWORD
       CREATE ROLE vibe LOGIN CREATEDB CREATEROLE NOSUPERUSER PASSWORD :'password';
       CREATE DATABASE vibe OWNER vibe;
       REVOKE CONNECT ON DATABASE postgres FROM PUBLIC;
       REVOKE CONNECT ON DATABASE template1 FROM PUBLIC;
       SQL
-      { printf 'host all postgres all reject\nhost replication postgres all reject\n'
-        cat "$${PGDATA}/pg_hba.conf"; } > "$${PGDATA}/pg_hba.conf.vibe"
-      mv "$${PGDATA}/pg_hba.conf.vibe" "$${PGDATA}/pg_hba.conf"
+      echo "The first start of this Postgres finished at $$(date -u +%FT%TZ)." \
+        > "$${PGDATA}/vibe-first-start-finished"
 
   # The proxy: TLS 1.2 or later with the certificate of certs/, every
   # request passed to vibe with its Host unchanged, no limit of its own on a
