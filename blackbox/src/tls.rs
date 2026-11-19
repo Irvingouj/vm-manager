@@ -421,25 +421,28 @@ impl Front {
             .count()
     }
 
-    /// Everything the clients sent after their handshakes (or, plain,
-    /// everything), connection after connection.
-    pub fn received(&self) -> Vec<u8> {
+    /// The requests the clients sent, read connection by connection (a
+    /// connection may carry several, one after another), in order.
+    pub fn requests(&self) -> Vec<SeenRequest> {
         self.connections()
             .iter()
-            .flat_map(|s| s.received.iter().copied())
+            .flat_map(|s| requests(&s.received))
             .collect()
     }
 
-    /// The request lines (`GET /v1/me HTTP/1.1`) among what the clients
+    /// The request lines (`GET /v1/me HTTP/1.1`) of the requests the clients
     /// sent, in order.
     pub fn request_lines(&self) -> Vec<String> {
-        request_lines(&self.received())
+        self.requests().into_iter().map(|r| r.line).collect()
     }
 
-    /// The values of the `Host` headers among what the clients sent, in
+    /// The values of the `Host` headers of the requests the clients sent, in
     /// order.
     pub fn hosts(&self) -> Vec<String> {
-        header_values(&self.received(), "host")
+        self.requests()
+            .iter()
+            .flat_map(|r| r.header_values("host"))
+            .collect()
     }
 
     /// What the front saw, for a failure message: each connection's server
@@ -606,36 +609,124 @@ where
     tokio::join!(up, down);
 }
 
-/// The request lines among these bytes: lines that are a method in
-/// capitals, a target and `HTTP/1.x`.
-pub fn request_lines(bytes: &[u8]) -> Vec<String> {
-    String::from_utf8_lossy(bytes)
-        .split("\r\n")
-        .filter(|line| {
-            let parts: Vec<&str> = line.split(' ').collect();
-            parts.len() == 3
-                && parts[0].chars().all(|c| c.is_ascii_uppercase())
-                && !parts[0].is_empty()
-                && parts[2].starts_with("HTTP/1.")
-        })
-        .map(str::to_owned)
-        .collect()
+/// One HTTP/1 request as a front saw it: its request line and its header
+/// lines (the body is skipped).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SeenRequest {
+    pub line: String,
+    pub headers: Vec<(String, String)>,
 }
 
-/// The values of every header line `name: value` (the name in any letter
-/// case) among these bytes.
-pub fn header_values(bytes: &[u8], name: &str) -> Vec<String> {
-    let prefix = format!("{}:", name.to_ascii_lowercase());
-    String::from_utf8_lossy(bytes)
-        .split("\r\n")
-        .filter(|line| line.to_ascii_lowercase().starts_with(&prefix))
-        .map(|line| {
-            line.get(prefix.len()..)
-                .unwrap_or_default()
-                .trim()
-                .to_owned()
-        })
-        .collect()
+impl SeenRequest {
+    /// The values of the headers of this name (any letter case).
+    pub fn header_values(&self, name: &str) -> Vec<String> {
+        self.headers
+            .iter()
+            .filter(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.clone())
+            .collect()
+    }
+}
+
+/// Whether `line` is an HTTP/1 request line: a method in capitals, a target
+/// and `HTTP/1.x`.
+fn is_request_line(line: &str) -> bool {
+    let parts: Vec<&str> = line.split(' ').collect();
+    parts.len() == 3
+        && !parts[0].is_empty()
+        && parts[0].chars().all(|c| c.is_ascii_uppercase())
+        && parts[2].starts_with("HTTP/1.")
+}
+
+/// The position just after the first `\r\n` at or after `from`.
+fn after_line(bytes: &[u8], from: usize) -> Option<usize> {
+    bytes
+        .get(from..)?
+        .windows(2)
+        .position(|w| w == b"\r\n")
+        .map(|at| from + at + 2)
+}
+
+/// Where a chunked body that begins at `from` ends, if all of it is here.
+fn chunked_end(bytes: &[u8], from: usize) -> Option<usize> {
+    let mut at = from;
+    loop {
+        let line_end = after_line(bytes, at)?;
+        let size_text = String::from_utf8_lossy(bytes.get(at..line_end - 2)?).into_owned();
+        let size_text = size_text.split(';').next().unwrap_or_default().trim().to_owned();
+        let size = usize::from_str_radix(&size_text, 16).ok()?;
+        if size == 0 {
+            // Trailers, then an empty line.
+            let mut trailer = line_end;
+            loop {
+                let end = after_line(bytes, trailer)?;
+                if end == trailer + 2 {
+                    return Some(end);
+                }
+                trailer = end;
+            }
+        }
+        at = line_end.checked_add(size)?.checked_add(2)?;
+        if at > bytes.len() {
+            return None;
+        }
+    }
+}
+
+/// The HTTP/1 requests in what one connection's client sent, one after
+/// another: each head read up to its empty line, its body skipped by
+/// `Content-Length` or chunked framing. Reading stops at the first thing
+/// that is not a whole request (bytes that are no HTTP, say a TLS
+/// handshake, give none).
+pub fn requests(bytes: &[u8]) -> Vec<SeenRequest> {
+    let mut found = Vec::new();
+    let mut at = 0;
+    while at < bytes.len() {
+        let Some(head_len) = bytes
+            .get(at..)
+            .and_then(|rest| rest.windows(4).position(|w| w == b"\r\n\r\n"))
+        else {
+            break;
+        };
+        let head = String::from_utf8_lossy(bytes.get(at..at + head_len).unwrap_or_default())
+            .into_owned();
+        let mut lines = head.split("\r\n");
+        let line = lines.next().unwrap_or_default().to_owned();
+        if !is_request_line(&line) {
+            break;
+        }
+        let headers: Vec<(String, String)> = lines
+            .filter_map(|l| l.split_once(':'))
+            .map(|(n, v)| (n.trim().to_owned(), v.trim().to_owned()))
+            .collect();
+        let request = SeenRequest { line, headers };
+        let body_at = at + head_len + 4;
+        let chunked = request
+            .header_values("transfer-encoding")
+            .iter()
+            .any(|v| v.to_ascii_lowercase().contains("chunked"));
+        let end = if chunked {
+            chunked_end(bytes, body_at)
+        } else {
+            let length = request
+                .header_values("content-length")
+                .first()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(0);
+            body_at.checked_add(length)
+        };
+        found.push(request);
+        match end {
+            Some(end) if end <= bytes.len() => at = end,
+            _ => break,
+        }
+    }
+    found
+}
+
+/// The request lines of the requests in what one connection's client sent.
+pub fn request_lines(bytes: &[u8]) -> Vec<String> {
+    requests(bytes).into_iter().map(|r| r.line).collect()
 }
 
 /// The harness's own TLS client: connects to `address`, asks for
@@ -834,11 +925,26 @@ mod tests {
             request_lines(bytes),
             vec!["GET /v1/me HTTP/1.1", "POST /v1/x HTTP/1.1"]
         );
-        assert_eq!(
-            header_values(bytes, "Host"),
-            vec!["api.vm.test:4430", "api.vm.test:4430"]
-        );
+        let hosts: Vec<String> = requests(bytes)
+            .iter()
+            .flat_map(|r| r.header_values("Host"))
+            .collect();
+        assert_eq!(hosts, vec!["api.vm.test:4430", "api.vm.test:4430"]);
         assert!(request_lines(b"\x16\x03\x01\x02\x00").is_empty());
+    }
+
+    #[test]
+    fn requests_on_one_connection_are_read_past_bodies_without_a_line_end() {
+        let bytes = b"PUT /v1/oidc HTTP/1.1\r\nhost: a\r\ncontent-length: 2\r\n\r\n{}GET /v1/me HTTP/1.1\r\nhost: b\r\n\r\nPOST /c HTTP/1.1\r\ntransfer-encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\nDELETE /d HTTP/1.1\r\n\r\n";
+        assert_eq!(
+            request_lines(bytes),
+            vec![
+                "PUT /v1/oidc HTTP/1.1",
+                "GET /v1/me HTTP/1.1",
+                "POST /c HTTP/1.1",
+                "DELETE /d HTTP/1.1"
+            ]
+        );
     }
 
     #[test]
