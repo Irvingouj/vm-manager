@@ -1,0 +1,8 @@
+Name: libc
+Version: 0.2.189
+License: MIT OR Apache-2.0
+Built in through: rustc 1.99.1
+Taken from: https://static.crates.io/crates/libc/libc-0.2.189.crate (crates.io package, sha256 3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2)
+Version established: library/Cargo.lock of rust-lang/rust at tag 1.99.1 names libc 0.2.189 with that checksum, which the downloaded package has; the standard library depends on it, and the binary holds code of a libc that is not the lock file's (the lock file has libc 0.2.191; the standard library's is 0.2.189). The License line is the package's manifest's statement.
+File: LICENSE-APACHE https://static.crates.io/crates/libc/libc-0.2.189.crate#libc-0.2.189/LICENSE-APACHE sha256:62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a
+File: LICENSE-MIT https://static.crates.io/crates/libc/libc-0.2.189.crate#libc-0.2.189/LICENSE-MIT sha256:123a331b5dbf04c30097fa43b8f858bc85df671fe776de498d01f3d6b7c1f69e

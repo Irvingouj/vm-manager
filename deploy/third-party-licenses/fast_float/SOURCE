@@ -1,0 +1,9 @@
+Name: fast_float
+Version: 8.2.10
+License: Apache-2.0 OR BSL-1.0 OR MIT
+Built in through: openworkers-v8 152.2.0
+Taken from: https://chromium.googlesource.com/external/github.com/fastfloat/fast_float at commit 34164f547b7df3f5d794ff67e9f885c36819ebfc
+Version established: the third_party/fast_float/src submodule of openworkers/rusty-v8 at tag v152.2.0 (the crate openworkers-v8 152.2.0 downloads its prebuilt static library, librusty_v8, from that repository's release v152.2.0) is https://chromium.googlesource.com/external/github.com/fastfloat/fast_float at 34164f547b7df3f5d794ff67e9f885c36819ebfc; a file of the crate's copy (include/fast_float/float_common.h, which says 8.2.10) is byte for byte the file at that commit. Code of it is in the program: the image's binary defines 18 symbols in fast_float.
+File: LICENSE-APACHE https://chromium.googlesource.com/external/github.com/fastfloat/fast_float/+/34164f547b7df3f5d794ff67e9f885c36819ebfc/LICENSE-APACHE sha256:097a889aa954d04e088b790b10a4014d6189561d0a6013935a73ce3d4ddaaf06
+File: LICENSE-BOOST https://chromium.googlesource.com/external/github.com/fastfloat/fast_float/+/34164f547b7df3f5d794ff67e9f885c36819ebfc/LICENSE-BOOST sha256:8d8291caf1cee26d23acf3eb67c9f9a2d58f1c681b16a4fbe8cbfb9e3c0b5a9b
+File: LICENSE-MIT https://chromium.googlesource.com/external/github.com/fastfloat/fast_float/+/34164f547b7df3f5d794ff67e9f885c36819ebfc/LICENSE-MIT sha256:e562f3f974ced7e69dd1db77b820b36bcf8f30377f1aa105723fba449c53c4e6

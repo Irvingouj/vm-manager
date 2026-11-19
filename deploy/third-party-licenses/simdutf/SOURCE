@@ -1,0 +1,8 @@
+Name: simdutf
+Version: 7.7.0
+License: Apache-2.0 OR MIT
+Built in through: openworkers-v8 152.2.0
+Taken from: https://chromium.googlesource.com/chromium/src/third_party/simdutf at commit f7356eed293f8208c40b3c1b344a50bd70971983
+Version established: the third_party/simdutf submodule of openworkers/rusty-v8 at tag v152.2.0 (the crate openworkers-v8 152.2.0 downloads its prebuilt static library, librusty_v8, from that repository's release v152.2.0) is https://chromium.googlesource.com/chromium/src/third_party/simdutf at f7356eed293f8208c40b3c1b344a50bd70971983; a file of the crate's copy (simdutf.h, which says SIMDUTF_VERSION "7.7.0") is byte for byte the file at that commit. Code of it is in the program: the image's binary defines 679 symbols in simdutf.
+Why these files: Chromium's copy carries this one licence file (MIT text).
+File: LICENSE https://chromium.googlesource.com/chromium/src/third_party/simdutf/+/f7356eed293f8208c40b3c1b344a50bd70971983/LICENSE sha256:fc8dbc04e03ad4efc08a647ffe7f995b811a95bc04c0e85a56d5277c6593fa5f

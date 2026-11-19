@@ -1,0 +1,8 @@
+Name: addr2line
+Version: 0.27.1
+License: Apache-2.0 OR MIT
+Built in through: rustc 1.99.1
+Taken from: https://static.crates.io/crates/addr2line/addr2line-0.27.1.crate (crates.io package, sha256 e567177890eb1617b1f774005b66b26b2377afd138a2ca37aae7d8f0c81429d4)
+Version established: library/Cargo.lock of rust-lang/rust at tag 1.99.1 names addr2line 0.27.1 with that checksum, which the downloaded package has; the standard library depends on it, and the binary holds code of a addr2line that is not the lock file's (the lock file has no addr2line). The License line is the package's manifest's statement.
+File: LICENSE-APACHE https://static.crates.io/crates/addr2line/addr2line-0.27.1.crate#addr2line-0.27.1/LICENSE-APACHE sha256:a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2
+File: LICENSE-MIT https://static.crates.io/crates/addr2line/addr2line-0.27.1.crate#addr2line-0.27.1/LICENSE-MIT sha256:e99d88d232bf57d70f0fb87f6b496d44b6653f99f8a63d250a54c61ea4bcde40

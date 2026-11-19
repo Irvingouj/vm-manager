@@ -1,0 +1,8 @@
+Name: ICU
+Version: 78.2
+License: Unicode-3.0 AND ICU AND BSD-3-Clause AND NAIST-2003
+Built in through: openworkers-v8 152.2.0
+Taken from: https://chromium.googlesource.com/chromium/deps/icu at commit d578f2e8b7bd5938e21cfb6bf15c079e0aa5b738
+Version established: the third_party/icu submodule of openworkers/rusty-v8 at tag v152.2.0 (the crate openworkers-v8 152.2.0 downloads its prebuilt static library, librusty_v8, from that repository's release v152.2.0) is https://chromium.googlesource.com/chromium/deps/icu at d578f2e8b7bd5938e21cfb6bf15c079e0aa5b738; a file of the crate's copy (source/common/unicode/uvernum.h, which says U_ICU_VERSION "78.2") is byte for byte the file at that commit. Code of it is in the program: the image's binary defines 7127 symbols in ICU's namespace icu_78 (nm -C).
+Why these files: ICU's licence file at that commit, whole: the Unicode License v3 and the licences of the third-party parts it lists. The License line is the driving agent's reading of those parts.
+File: LICENSE https://chromium.googlesource.com/chromium/deps/icu/+/d578f2e8b7bd5938e21cfb6bf15c079e0aa5b738/LICENSE sha256:e55522d81edc687a341a4411e0776e54ca654e90147f354a90458aaced4116af

@@ -1,0 +1,7 @@
+Name: libc++
+Version: 23.0.0
+License: Apache-2.0 WITH LLVM-exception
+Built in through: openworkers-v8 152.2.0
+Taken from: https://chromium.googlesource.com/external/github.com/llvm/llvm-project/libcxx at commit b16984ce99c702355a5b2b4c52574e82cec41fb9
+Version established: the third_party/libc++/src submodule of openworkers/rusty-v8 at tag v152.2.0 (the crate openworkers-v8 152.2.0 downloads its prebuilt static library, librusty_v8, from that repository's release v152.2.0) is https://chromium.googlesource.com/external/github.com/llvm/llvm-project/libcxx at b16984ce99c702355a5b2b4c52574e82cec41fb9; a file of the crate's copy (include/__config, which says _LIBCPP_VERSION 230000) is byte for byte the file at that commit. Code of it is in the program: the image's binary defines 8316 symbols in std::__Cr, Chromium's libc++ namespace (the crate's default feature use_custom_libcxx).
+File: LICENSE.TXT https://chromium.googlesource.com/external/github.com/llvm/llvm-project/libcxx/+/b16984ce99c702355a5b2b4c52574e82cec41fb9/LICENSE.TXT sha256:539dd7aed86e8a4f12cbdd0e6c50c189c7d74847e4fecc64ce2c6ee3a01da38b

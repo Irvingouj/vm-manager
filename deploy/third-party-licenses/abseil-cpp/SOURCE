@@ -1,0 +1,7 @@
+Name: abseil-cpp
+Version: d16e32215c3a
+License: Apache-2.0
+Built in through: openworkers-v8 152.2.0
+Taken from: https://chromium.googlesource.com/chromium/src/third_party/abseil-cpp at commit d16e32215c3ab90ba57c2e904a5344d85c7353e4
+Version established: the third_party/abseil-cpp submodule of openworkers/rusty-v8 at tag v152.2.0 (the crate openworkers-v8 152.2.0 downloads its prebuilt static library, librusty_v8, from that repository's release v152.2.0) is https://chromium.googlesource.com/chromium/src/third_party/abseil-cpp at d16e32215c3ab90ba57c2e904a5344d85c7353e4; a file of the crate's copy (absl/base/config.h; Chromium's copy has no release number, so the version is the commit) is byte for byte the file at that commit. Code of it is in the program: the image's binary defines 769 symbols in absl.
+File: LICENSE https://chromium.googlesource.com/chromium/src/third_party/abseil-cpp/+/d16e32215c3ab90ba57c2e904a5344d85c7353e4/LICENSE sha256:c79a7fea0e3cac04cd43f20e7b648e5a0ff8fa5344e644b0ee09ca1162b62747

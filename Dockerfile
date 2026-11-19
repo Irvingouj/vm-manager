@@ -161,8 +161,9 @@ cargo tree -p vibe --edges normal,build --prefix none --locked --target "$host" 
   done < "$work/built"
 
   # The second part: code built into the program that is not a crate's own
-  # and whose licence texts no crate's source carries (V8, Postgres's
-  # parser). The texts are kept in deploy/third-party-licenses/<name>/,
+  # and whose licence texts no crate's source carries (V8 and the libraries
+  # linked into its prebuilt library, Postgres's parser, the Rust standard
+  # library and its own dependencies). The texts are kept in deploy/third-party-licenses/<name>/,
   # each fetched from its project's own repository at the version built in;
   # its SOURCE says from where, at which tag or commit, and each file's
   # SHA-256, which is checked here. The build fails when the crate an entry
@@ -180,7 +181,15 @@ cargo tree -p vibe --edges normal,build --prefix none --locked --target "$host" 
       echo "$source_file lacks Name, Version, License, Built in through or Taken from" >&2
       exit 1
     fi
-    if ! grep -qxF "$through" "$work/built"; then
+    # The standard library and its own dependencies come with the compiler:
+    # those entries name `rustc <release>`, held to the compiler building
+    # this image; every other entry names a crate cargo tree has built in.
+    if [ "${through%% *}" = rustc ]; then
+      if [ "$through" != "rustc $(rustc -vV | sed -n 's/^release: //p')" ]; then
+        echo "$source_file: $name is built in through $through, which is not the compiler building the program" >&2
+        exit 1
+      fi
+    elif ! grep -qxF "$through" "$work/built"; then
       echo "$source_file: $name is built in through $through, which is not built into the program (cargo tree)" >&2
       exit 1
     fi

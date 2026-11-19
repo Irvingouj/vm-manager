@@ -1,0 +1,8 @@
+Name: gimli
+Version: 0.34.0
+License: MIT OR Apache-2.0
+Built in through: rustc 1.99.1
+Taken from: https://static.crates.io/crates/gimli/gimli-0.34.0.crate (crates.io package, sha256 1033caf0b349c518623b5396bfb2cf0bddf44f0306d543a250e5743297aafd10)
+Version established: library/Cargo.lock of rust-lang/rust at tag 1.99.1 names gimli 0.34.0 with that checksum, which the downloaded package has; the standard library depends on it, and the binary holds code of a gimli that is not the lock file's (the lock file has no gimli). The License line is the package's manifest's statement.
+File: LICENSE-APACHE https://static.crates.io/crates/gimli/gimli-0.34.0.crate#gimli-0.34.0/LICENSE-APACHE sha256:a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2
+File: LICENSE-MIT https://static.crates.io/crates/gimli/gimli-0.34.0.crate#gimli-0.34.0/LICENSE-MIT sha256:7b63ecd5f1902af1b63729947373683c32745c16a10e8e6292e2e2dcd7e90ae0

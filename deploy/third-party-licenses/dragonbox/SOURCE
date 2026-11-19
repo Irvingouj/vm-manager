@@ -1,0 +1,8 @@
+Name: dragonbox
+Version: beeeef91cf6f
+License: Apache-2.0 WITH LLVM-exception OR BSL-1.0
+Built in through: openworkers-v8 152.2.0
+Taken from: https://chromium.googlesource.com/external/github.com/jk-jeon/dragonbox at commit beeeef91cf6fef89a4d4ba5e95d47ca64ccb3a44
+Version established: the third_party/dragonbox/src submodule of openworkers/rusty-v8 at tag v152.2.0 (the crate openworkers-v8 152.2.0 downloads its prebuilt static library, librusty_v8, from that repository's release v152.2.0) is https://chromium.googlesource.com/external/github.com/jk-jeon/dragonbox at beeeef91cf6fef89a4d4ba5e95d47ca64ccb3a44; a file of the crate's copy (include/dragonbox/dragonbox.h; no release number in it, so the version is the commit) is byte for byte the file at that commit. Code of it is in the program: the image's binary defines 2 symbols in jkj::dragonbox.
+File: LICENSE-Apache2-LLVM https://chromium.googlesource.com/external/github.com/jk-jeon/dragonbox/+/beeeef91cf6fef89a4d4ba5e95d47ca64ccb3a44/LICENSE-Apache2-LLVM sha256:9e45e856bedccee9f67254082ca11851d954de2fed7448c4bed19ad9aab99a91
+File: LICENSE-Boost https://chromium.googlesource.com/external/github.com/jk-jeon/dragonbox/+/beeeef91cf6fef89a4d4ba5e95d47ca64ccb3a44/LICENSE-Boost sha256:c9bff75738922193e67fa726fa225535870d2aa1059f91452c411736284ad566

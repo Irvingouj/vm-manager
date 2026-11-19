@@ -1,0 +1,7 @@
+Name: FP16
+Version: 782eea126dc5
+License: MIT
+Built in through: openworkers-v8 152.2.0
+Taken from: https://github.com/Maratyszcza/FP16 at commit 782eea126dc5c755827be751a099eb01826175cf
+Version established: the third_party/fp16/src submodule of openworkers/rusty-v8 at tag v152.2.0 (the crate openworkers-v8 152.2.0 downloads its prebuilt static library, librusty_v8, from that repository's release v152.2.0) is https://github.com/Maratyszcza/FP16 at 782eea126dc5c755827be751a099eb01826175cf; the crate's include/fp16/fp16.h is byte for byte the file at that commit. No release number: the version is the commit. Code of it is in the program: V8's src/base/float16.h and src/codegen/external-reference.cc include its fp16.h (header-only, inlined: Float16Array and the fp16 conversions).
+File: LICENSE https://raw.githubusercontent.com/Maratyszcza/FP16/782eea126dc5c755827be751a099eb01826175cf/LICENSE sha256:17e4f539024be2749ee729d1e2f01d24cef12ece8c9bf18e91a4349be29c80bf

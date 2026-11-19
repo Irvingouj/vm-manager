@@ -1,0 +1,7 @@
+Name: libc++abi
+Version: 8f11bb1d4438
+License: Apache-2.0 WITH LLVM-exception
+Built in through: openworkers-v8 152.2.0
+Taken from: https://chromium.googlesource.com/external/github.com/llvm/llvm-project/libcxxabi at commit 8f11bb1d4438d0239d0dfc1bd9456a9f31629dda
+Version established: the third_party/libc++abi/src submodule of openworkers/rusty-v8 at tag v152.2.0 (the crate openworkers-v8 152.2.0 downloads its prebuilt static library, librusty_v8, from that repository's release v152.2.0) is https://chromium.googlesource.com/external/github.com/llvm/llvm-project/libcxxabi at 8f11bb1d4438d0239d0dfc1bd9456a9f31629dda; a file of the crate's copy (src/cxa_exception.cpp; it has no version of its own, so the version is the commit) is byte for byte the file at that commit. Code of it is in the program: the image's binary defines 57 symbols in __cxxabiv1 and defines __cxa_throw and __cxa_demangle itself.
+File: LICENSE.TXT https://chromium.googlesource.com/external/github.com/llvm/llvm-project/libcxxabi/+/8f11bb1d4438d0239d0dfc1bd9456a9f31629dda/LICENSE.TXT sha256:e2b35be49f7284a45b7baca8fc7b3ab7440e7902392b2528a457816b5bb2a15c

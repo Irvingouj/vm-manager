@@ -1,0 +1,11 @@
+Name: Rust standard library
+Version: 1.99.1
+License: MIT OR Apache-2.0
+Built in through: rustc 1.99.1
+Taken from: https://github.com/rust-lang/rust at tag 1.99.1, commit 58cf8f9c35b355199727627d07ae34a4e2846d67
+Version established: rust-toolchain.toml names the toolchain 1.99.1, the one the image is built with (the build checks rustc's release); its standard library (core, alloc, std, panic_unwind, std_detect, compiler_builtins) is linked into every Rust program, and the binary's symbols name these crates.
+Why these files: The Rust project's licence files at that tag, and compiler-builtins' own (MIT AND Apache-2.0 WITH LLVM-exception, for code from LLVM's compiler-rt).
+File: COPYRIGHT https://raw.githubusercontent.com/rust-lang/rust/58cf8f9c35b355199727627d07ae34a4e2846d67/COPYRIGHT sha256:172020dbfd5b53a226dfde77616190a48dcff519b0bc0e6deb91a8450782c4af
+File: LICENSE-APACHE https://raw.githubusercontent.com/rust-lang/rust/58cf8f9c35b355199727627d07ae34a4e2846d67/LICENSE-APACHE sha256:62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a
+File: LICENSE-MIT https://raw.githubusercontent.com/rust-lang/rust/58cf8f9c35b355199727627d07ae34a4e2846d67/LICENSE-MIT sha256:b71bd43a069ca0641a9ecfe585ca7b3c53b5cc1608f8b68321168698e28b5ea1
+File: library/compiler-builtins/LICENSE.txt https://raw.githubusercontent.com/rust-lang/rust/58cf8f9c35b355199727627d07ae34a4e2846d67/library/compiler-builtins/LICENSE.txt sha256:ab6eec6caf0fa5775e411c7a8bc6a45c4ef2956b0980b157ab74fc5cd62a928b
