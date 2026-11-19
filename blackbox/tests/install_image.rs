@@ -592,7 +592,8 @@ fn the_images_third_party_licenses_name_every_crate_built_into_the_program_with_
 
 #[test]
 #[ignore = "needs Docker and a built image: scripts/install-gate.sh"]
-fn the_images_third_party_licenses_have_a_part_for_v8_libpg_query_and_postgresql_built_in() {
+fn the_images_third_party_licenses_have_a_part_for_the_code_built_in_v8_and_its_libraries_libpg_query_and_postgresql()
+ {
     let image = image();
     let created = Created::of(&image);
     let folder = Folder::new();
@@ -606,25 +607,14 @@ fn the_images_third_party_licenses_have_a_part_for_v8_libpg_query_and_postgresql
     let text = std::fs::read_to_string(&copied).unwrap();
     let (_, built_in) = notices(&text);
     let headers: Vec<&str> = built_in.iter().map(|b| b.header.as_str()).collect();
-    for (name, words) in [
-        ("V8", "Redistribution and use in source and binary forms"),
-        (
-            "libpg_query",
-            "Redistribution and use in source and binary forms",
-        ),
-        ("PostgreSQL", "PostgreSQL Global Development Group"),
-    ] {
-        let entry = built_in
-            .iter()
-            .find(|b| b.name.eq_ignore_ascii_case(name))
-            .unwrap_or_else(|| {
-                panic!(
-                    "expected an entry for {name} in the part of code built in through crates (`## {name} <version> (built in through <crate>)`); its headers are {headers:?}"
-                )
-            });
+    // Every entry of the second part, whatever its name, has the form.
+    for entry in &built_in {
         assert!(
-            entry.license.as_deref().is_some_and(|l| !l.is_empty()),
-            "expected a licence for {:?}",
+            entry
+                .license
+                .as_deref()
+                .is_some_and(|l| !l.trim().is_empty()),
+            "expected a licence (`License: <SPDX>`) for {:?}",
             entry.header
         );
         assert!(
@@ -637,9 +627,45 @@ fn the_images_third_party_licenses_have_a_part_for_v8_libpg_query_and_postgresql
             entry.taken_from
         );
         assert!(
-            !entry.text.trim().is_empty() && entry.text.contains(words),
-            "expected the texts of {:?} to hold {words:?}",
+            !entry.text.trim().is_empty(),
+            "expected the texts of {:?} not to be empty",
             entry.header
         );
+    }
+    // The named ones: each of the alternatives is a way of writing the name;
+    // the words, where given, are in its texts.
+    for (names, words) in [
+        (
+            &["V8"][..],
+            Some("Redistribution and use in source and binary forms"),
+        ),
+        (
+            &["libpg_query"][..],
+            Some("Redistribution and use in source and binary forms"),
+        ),
+        (
+            &["PostgreSQL"][..],
+            Some("PostgreSQL Global Development Group"),
+        ),
+        (&["ICU"][..], None),
+        (&["libc++"][..], None),
+        (&["abseil", "abseil-cpp"][..], None),
+    ] {
+        let name = names.first().unwrap();
+        let entry = built_in
+            .iter()
+            .find(|b| names.iter().any(|n| b.name.eq_ignore_ascii_case(n)))
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected an entry for {name} in the part of code built in through crates (`## {name} <version> (built in through <crate>)`); its headers are {headers:?}"
+                )
+            });
+        if let Some(words) = words {
+            assert!(
+                entry.text.contains(words),
+                "expected the texts of {:?} to hold {words:?}",
+                entry.header
+            );
+        }
     }
 }
