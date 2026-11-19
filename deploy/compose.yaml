@@ -33,7 +33,7 @@ name: vibe
 
 services:
   vibe:
-    image: ${VIBE_IMAGE:-ghcr.io/irvingouj/vibe:0.0.0}
+    image: ${VIBE_IMAGE:-ghcr.io/irvingouj/vibe:0.1.0}
     command:
       - serve
       - --domain
