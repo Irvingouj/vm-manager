@@ -61,13 +61,17 @@ sudo chmod 600 certs/privkey.pem
 
 The proxy speaks TLS 1.2 and 1.3 with this certificate and passes every request on to the platform with its `Host` unchanged. It sets no limit of its own on a request's size or time: the platform's own apply (a request body of at most 16 MiB).
 
+When the proxy cannot read the key, it does not start: `docker compose ps` shows it restarting, and `docker compose logs proxy` says `open /etc/caddy/certs/privkey.pem: permission denied`. Give the key to the user `65532` as above and run `docker compose restart proxy`.
+
 ## 4. Start it
 
 ```sh
 docker compose up -d
 ```
 
-This starts three containers: `postgres` (the bundled Postgres 18, its data in the volume `postgres-data`, published nowhere), `vibe` (the program, published nowhere) and `proxy` (published on `VIBE_BIND:VIBE_HTTPS_PORT`). The first start of Postgres makes the role `vibe` and the platform database `vibe`; `vibe` starts once Postgres takes connections.
+This starts three containers: `postgres` (the bundled Postgres 18, its data in the volume `postgres-data`, published nowhere), `vibe` (the program, published nowhere) and `proxy` (published on `VIBE_BIND:VIBE_HTTPS_PORT`). The first start of Postgres makes the role `vibe` and the platform database `vibe`; `vibe` starts once that first start has finished and Postgres takes connections (`docker compose ps` shows `postgres` as `healthy`).
+
+Only HTTPS is served, on the published port alone. Nothing listens for plain `http://` (port 80 is not published) and nothing redirects it to `https://`; a plain HTTP request sent to the published port is refused with `400`. If you want `http://` addresses to be redirected, do it in a proxy of your own (see "Your own reverse proxy").
 
 Check that it answers:
 
@@ -172,6 +176,24 @@ docker compose up -d
 ```
 
 It is trusted beside the public authorities built into the program, read when the program starts. The tool takes the same variable: when the installation's own certificate is issued by such an authority, set `VIBE_CA_FILE=/path/to/company-ca.pem` in the tool's environment on each computer that uses it.
+
+## If the first start was interrupted
+
+The first start of the bundled Postgres makes its data folder, then the role `vibe`, the platform database and the rest, and leaves a mark when it has finished. If the container was stopped or killed in between (the machine went down, `docker compose down` during the first `up`), Postgres starts again on what was made so far and skips the rest. It is then never healthy: `docker compose ps` shows `postgres` as `health: starting` for two minutes and as `unhealthy` after that, `vibe` is not started, and `docker compose up -d` ends with `dependency failed to start: container ... is unhealthy`. The health check says why:
+
+```sh
+docker compose ps
+docker inspect --format '{{json .State.Health.Log}}' $(docker compose ps --quiet postgres)
+```
+
+Its output says `the first start of this Postgres did not finish`. Meanwhile you can look inside as the superuser: `docker compose exec postgres psql -U postgres`.
+
+Nothing is in it yet, since `vibe` never started on it: remove it and start again.
+
+```sh
+docker compose down --volumes
+docker compose up -d
+```
 
 ## The bundled Postgres
 
