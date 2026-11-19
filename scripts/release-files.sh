@@ -6,7 +6,8 @@
 #   scripts/release-files.sh --out <folder>
 #
 # copies deploy/compose.yaml, deploy/compose.own-proxy.yaml,
-# deploy/compose.own-postgres.yaml and deploy/.env.example (as env.example:
+# deploy/compose.own-postgres.yaml, deploy/compose.own-tls.yaml (from the
+# version after v0.1.0 on) and deploy/.env.example (as env.example:
 # a release cannot hold a file whose name begins with a dot) into the
 # folder, unchanged, and writes <folder>/SHA256SUMS over every file then in
 # it (the archives packed there before included): one line a file,
@@ -49,6 +50,7 @@ mkdir -p "$out"
 cp deploy/compose.yaml "$out/compose.yaml"
 cp deploy/compose.own-proxy.yaml "$out/compose.own-proxy.yaml"
 cp deploy/compose.own-postgres.yaml "$out/compose.own-postgres.yaml"
+cp deploy/compose.own-tls.yaml "$out/compose.own-tls.yaml"
 cp deploy/.env.example "$out/env.example"
 
 sums="$(mktemp "${TMPDIR:-/tmp}/release-files.XXXXXX")"

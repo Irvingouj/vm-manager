@@ -1,0 +1,31 @@
+# The program serves TLS itself, instead of the proxy of compose.yaml:
+#
+#   docker compose -f compose.yaml -f compose.own-tls.yaml up -d
+#
+# There is no proxy service then: vibe itself is published at
+#   VIBE_BIND         the address: 127.0.0.1 without it
+#   VIBE_HTTPS_PORT   the port: 443 without it
+# and serves HTTPS only (TLS 1.2 and 1.3, HTTP/1.1) with the wildcard
+# certificate for *.<domain> of certs/fullchain.pem (its chain after it) and
+# its key certs/privkey.pem, which must be readable by the image's user
+# 65532 (README.md, "The program serves TLS itself"). Replaced, the two
+# files are taken within 10 seconds, with no restart.
+#
+# Not together with compose.own-proxy.yaml (each replaces the proxy with
+# something else); with compose.own-postgres.yaml it can be.
+
+services:
+  proxy: !reset null
+
+  vibe:
+    ports:
+      - ${VIBE_BIND:-127.0.0.1}:${VIBE_HTTPS_PORT:-443}:8080
+    environment:
+      VIBE_TLS_CERT_FILE: /etc/vibe/certs/fullchain.pem
+      VIBE_TLS_KEY_FILE: /etc/vibe/certs/privkey.pem
+    volumes:
+      # Your wildcard certificate for *.<domain> and its key.
+      - type: bind
+        source: ./certs
+        target: /etc/vibe/certs
+        read_only: true
