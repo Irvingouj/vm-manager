@@ -32,7 +32,7 @@ const WORKFLOW: &str = ".github/workflows/release.yml";
 const SCRIPTS: [&str; 6] = [
     "scripts/release-check.sh",
     "scripts/try-tool.sh",
-    "scripts/gate.sh",
+    "scripts/gate-hosted.sh",
     "scripts/install-gate.sh",
     "scripts/package-tool.sh",
     "scripts/release-files.sh",
@@ -416,34 +416,47 @@ fn the_jobs_that_pack_the_tool_check_a_download_with_the_pages_command_of_each_s
     }
 }
 
+/// Every line of a `run:` of the workflow that calls `script` (as a word,
+/// with or without `./`).
+fn lines_calling(workflow: &Value, script: &str) -> Vec<String> {
+    jobs(workflow)
+        .values()
+        .flat_map(|job| {
+            runs_of(job)
+                .lines()
+                .filter(|line| {
+                    line.split_whitespace()
+                        .any(|w| w == script || w == format!("./{script}"))
+                })
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
 #[test]
-fn the_workflow_runs_both_gates_with_no_fail_fast() {
+fn the_workflow_runs_the_gate_through_gate_hosted_and_the_install_gate_with_no_fail_fast() {
     let workflow = workflow();
-    for script in ["scripts/gate.sh", "scripts/install-gate.sh"] {
-        let calls: Vec<String> = jobs(&workflow)
-            .values()
-            .flat_map(|job| {
-                runs_of(job)
-                    .lines()
-                    .filter(|line| {
-                        line.split_whitespace()
-                            .any(|w| w == script || w == format!("./{script}"))
-                    })
-                    .map(str::to_owned)
-                    .collect::<Vec<_>>()
-            })
-            .collect();
+    assert!(
+        !lines_calling(&workflow, "scripts/gate-hosted.sh").is_empty(),
+        "expected the gate run on the runner by scripts/gate-hosted.sh"
+    );
+    let direct = lines_calling(&workflow, "scripts/gate.sh");
+    assert!(
+        direct.is_empty(),
+        "expected no step to call scripts/gate.sh directly any more (scripts/gate-hosted.sh runs it), found {direct:?}"
+    );
+    let calls = lines_calling(&workflow, "scripts/install-gate.sh");
+    assert!(
+        !calls.is_empty(),
+        "expected a step of the workflow to run scripts/install-gate.sh"
+    );
+    for call in &calls {
         assert!(
-            !calls.is_empty(),
-            "expected a step of the workflow to run {script}"
+            call.split_whitespace().any(|w| w == "--no-fail-fast"),
+            "expected scripts/install-gate.sh run with --no-fail-fast, so that one run says everything that fails on the runner; the step runs {:?}",
+            call.trim()
         );
-        for call in &calls {
-            assert!(
-                call.split_whitespace().any(|w| w == "--no-fail-fast"),
-                "expected {script} run with --no-fail-fast, so that one run says everything that fails on the runner; the step runs {:?}",
-                call.trim()
-            );
-        }
     }
 }
 

@@ -726,3 +726,110 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     let digest = sha2::Sha256::digest(bytes);
     digest.iter().map(|b| format!("{b:02x}")).collect()
 }
+
+/// What a stand-in for `cargo` or `npm` does when its arguments begin
+/// with `prefix`: prints `stderr` to its standard error and ends with
+/// `code`. The first rule whose prefix matches decides; with none, it
+/// prints nothing and ends with `0`.
+#[derive(Debug, Clone)]
+pub struct Rule {
+    pub prefix: String,
+    pub code: i32,
+    pub stderr: String,
+}
+
+impl Rule {
+    pub fn new(prefix: &str, code: i32, stderr: &str) -> Self {
+        Self {
+            prefix: prefix.to_owned(),
+            code,
+            stderr: stderr.to_owned(),
+        }
+    }
+}
+
+/// The seam of the tests of `scripts/gate.sh` and `scripts/gate-hosted.sh`:
+/// the scripts of the repository run as they are, from its root, with a
+/// `PATH` whose `cargo` and `npm` come first and are stand-ins of the
+/// test's own (and no `CARGO` in the environment), so that no real gate
+/// runs inside the gate. Each stand-in records every call (its arguments,
+/// one line) and answers as the case's [`Rule`]s say.
+pub struct GateStandIns {
+    folder: Folder,
+}
+
+impl GateStandIns {
+    pub fn new(cargo: &[Rule], npm: &[Rule]) -> Self {
+        let stand_ins = Self {
+            folder: Folder::new("gate"),
+        };
+        fs::create_dir_all(stand_ins.folder.path().join("bin")).unwrap();
+        stand_ins.write_stand_in("cargo", cargo);
+        stand_ins.write_stand_in("npm", npm);
+        stand_ins
+    }
+
+    fn write_stand_in(&self, program: &str, rules: &[Rule]) {
+        let calls = self.folder.path().join(format!("{program}.calls"));
+        let mut text = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncase \"$*\" in\n",
+            calls.display()
+        );
+        for (at, rule) in rules.iter().enumerate() {
+            assert!(
+                !rule.prefix.contains(['"', '\'', '\\', '*', '?', '[']),
+                "the harness writes no quote or glob in a rule's prefix"
+            );
+            let said = self.folder.path().join(format!("{program}.{at}.stderr"));
+            fs::write(&said, &rule.stderr).unwrap();
+            text.push_str(&format!(
+                "  \"{}\"*) cat '{}' >&2; exit {} ;;\n",
+                rule.prefix,
+                said.display(),
+                rule.code
+            ));
+        }
+        text.push_str("  *) exit 0 ;;\nesac\n");
+        crate::program::write_program(
+            &self.folder.path().join("bin").join(program),
+            text.as_bytes(),
+        )
+        .unwrap_or_else(|problem| panic!("cannot write the stand-in {program}: {problem}"));
+    }
+
+    /// The folder holding the stand-ins, to put first on a `PATH`.
+    pub fn bin(&self) -> PathBuf {
+        self.folder.path().join("bin")
+    }
+
+    /// Every call of the stand-in `program` (`cargo` or `npm`), its
+    /// arguments as one line, in order.
+    pub fn calls(&self, program: &str) -> Vec<String> {
+        fs::read_to_string(self.folder.path().join(format!("{program}.calls")))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// Runs `scripts/<name> <args>` of the repository with the stand-ins
+    /// first on the path, at most `timeout`.
+    pub fn run(&self, name: &str, args: &[&str], timeout: Duration) -> Ran {
+        let root = repository_root();
+        let path = script(&root, name);
+        let mut command = Command::new(&path);
+        command.args(args).current_dir(&root);
+        let search = format!(
+            "{}:{}",
+            self.bin().display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        command.env("PATH", search).env_remove("CARGO");
+        let mut ran = run(command, timeout);
+        ran.command = format!(
+            "scripts/{name} {} (cargo and npm stand-ins)",
+            args.join(" ")
+        );
+        ran
+    }
+}
