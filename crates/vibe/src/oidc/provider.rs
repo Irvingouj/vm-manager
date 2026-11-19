@@ -457,7 +457,7 @@ fn untrusted(refusal: Refusal) -> &'static str {
             "its certificate was not trusted: it is issued by a certificate authority the program does not know. If that is your company's own authority, start vibe serve with VIBE_CA_FILE naming a file with its certificate (PEM)"
         }
         Refusal::OtherName => {
-            "its certificate was not trusted: it is not for the issuer's name (VIBE_CA_FILE adds authorities, it does not change this)"
+            "its certificate was not trusted: it is for another name, not for the issuer's (VIBE_CA_FILE adds authorities, it does not change this)"
         }
         Refusal::Expired => {
             "its certificate was not trusted: it is expired (VIBE_CA_FILE adds authorities, it does not change this)"
