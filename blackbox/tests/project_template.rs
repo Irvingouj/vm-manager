@@ -479,3 +479,24 @@ fn agents_md_says_grants_unknown_and_log_unavailable_are_nothing_to_fix() {
         );
     }
 }
+
+#[test]
+fn agents_md_says_the_local_databases_are_not_kept_through_a_crash_and_what_to_do() {
+    // CONTRACT.md, "The local run on a busy machine: The local databases do
+    // not wait on the disk": where the template's AGENTS.md describes `vm
+    // local reset`, it says that the local databases are not kept through
+    // a crash of the machine or a loss of power, that `vm local reset`
+    // starts them anew, and that rows which must be there belong in
+    // `test-rows/`.
+    let text = agents_md();
+    let found = paragraphs(&text).into_iter().find(|p| {
+        let lower = squashed(p).to_lowercase();
+        lower.contains("vm local reset")
+            && (lower.contains("crash") || lower.contains("power"))
+            && lower.contains("test-rows")
+    });
+    assert!(
+        found.is_some(),
+        "expected one paragraph of AGENTS.md naming `vm local reset` to say that the local databases are not kept through a crash of the machine or a loss of power, and that rows which must be there belong in `test-rows/`\n{text}"
+    );
+}
