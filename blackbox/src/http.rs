@@ -74,6 +74,9 @@ pub struct Request {
     /// A `Content-Length` to send in place of the body's own (a body held
     /// back: the request says more than it sends).
     declared_length: Option<usize>,
+    /// Sent over TLS, asking for this server name and trusting only these
+    /// roots ([`Request::over_tls`]); plain HTTP when `None`.
+    tls: Option<(String, Vec<rustls::pki_types::CertificateDer<'static>>)>,
 }
 
 impl Request {
@@ -90,7 +93,21 @@ impl Request {
             chunked: false,
             timeout: REQUEST_TIMEOUT,
             declared_length: None,
+            tls: None,
         }
+    }
+
+    /// Sends the request over TLS (the harness's own client,
+    /// [`crate::tls::tls_exchange`]), asking for `server_name` and trusting
+    /// only `roots`: what a browser does for an `https` address.
+    #[must_use]
+    pub fn over_tls(
+        mut self,
+        server_name: &str,
+        roots: &[rustls::pki_types::CertificateDer<'static>],
+    ) -> Self {
+        self.tls = Some((server_name.to_owned(), roots.to_vec()));
+        self
     }
 
     #[must_use]
@@ -189,6 +206,16 @@ impl Request {
 
     /// Sends the request; an error says what went wrong on the wire.
     pub fn try_send(&self) -> Result<Response, String> {
+        if let Some((server_name, roots)) = &self.tls {
+            let raw = crate::tls::tls_exchange(
+                self.address,
+                server_name,
+                roots,
+                &self.wire_bytes(),
+                self.timeout,
+            )?;
+            return Response::parse_answer(&raw, self.to_string(), self.method == "HEAD");
+        }
         let deadline = Instant::now() + self.timeout;
         let mut stream = TcpStream::connect_timeout(&self.address, self.timeout)
             .map_err(|e| format!("cannot connect to {}: {e}", self.address))?;

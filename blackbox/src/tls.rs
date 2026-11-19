@@ -18,15 +18,18 @@
 //!   when the handshake failed. Its identity can be replaced while it runs
 //!   (an installation's certificate replaced). Dropping it ends it and
 //!   every connection it holds.
-//! - [`tls_get`] is the harness's own TLS client, for the harness's own
-//!   checks.
+//! - [`tls_get`] and [`tls_exchange`] are the harness's own TLS client, for
+//!   the harness's own checks and for its browser's `https` addresses
+//!   ([`crate::http::Request::over_tls`]).
 //! - [`Files`] is a folder of a test's own for the PEM files it names in
 //!   `VIBE_CA_FILE`.
 //! - [`Behind`] is an installation behind a front: authority A, a
 //!   certificate for `api.<domain>` and `*.<domain>` under it, the front
 //!   before the program, and A's PEM in a file; [`provider_behind_tls`] is
 //!   the harness's identity provider with an `https://localhost:<port>`
-//!   issuer behind a front of its own.
+//!   issuer, every endpoint under it, behind a front of its own.
+//! - Front request reading is per connection ([`requests`]): the bytes of
+//!   two connections are never read as one stream.
 
 use std::fmt;
 use std::fs;
@@ -653,7 +656,12 @@ fn chunked_end(bytes: &[u8], from: usize) -> Option<usize> {
     loop {
         let line_end = after_line(bytes, at)?;
         let size_text = String::from_utf8_lossy(bytes.get(at..line_end - 2)?).into_owned();
-        let size_text = size_text.split(';').next().unwrap_or_default().trim().to_owned();
+        let size_text = size_text
+            .split(';')
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_owned();
         let size = usize::from_str_radix(&size_text, 16).ok()?;
         if size == 0 {
             // Trailers, then an empty line.
@@ -688,8 +696,8 @@ pub fn requests(bytes: &[u8]) -> Vec<SeenRequest> {
         else {
             break;
         };
-        let head = String::from_utf8_lossy(bytes.get(at..at + head_len).unwrap_or_default())
-            .into_owned();
+        let head =
+            String::from_utf8_lossy(bytes.get(at..at + head_len).unwrap_or_default()).into_owned();
         let mut lines = head.split("\r\n");
         let line = lines.next().unwrap_or_default().to_owned();
         if !is_request_line(&line) {
@@ -740,32 +748,48 @@ pub fn tls_get(
     target: &str,
     host: &str,
 ) -> Result<String, String> {
-    let mut roots = RootCertStore::empty();
-    for authority in trusted {
-        roots
-            .add(authority.der())
-            .map_err(|e| format!("cannot trust {authority:?}: {e}"))?;
+    let request = format!("GET {target} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+    let roots: Vec<CertificateDer<'static>> = trusted.iter().map(|a| a.der()).collect();
+    let answer = tls_exchange(address, server_name, &roots, request.as_bytes(), FRONT_WAIT)?;
+    Ok(String::from_utf8_lossy(&answer).into_owned())
+}
+
+/// The harness's own TLS client at its plainest: connects to `address`
+/// (within `timeout`), asks for `server_name`, trusts only `roots`, sends
+/// `wire` as it is, and reads until the server closes (each read within
+/// `timeout`). `Err` with the handshake's words when it fails.
+pub fn tls_exchange(
+    address: SocketAddr,
+    server_name: &str,
+    roots: &[CertificateDer<'static>],
+    wire: &[u8],
+    timeout: Duration,
+) -> Result<Vec<u8>, String> {
+    let mut store = RootCertStore::empty();
+    for root in roots {
+        store
+            .add(root.clone())
+            .map_err(|e| format!("cannot trust a root: {e}"))?;
     }
     let config =
         ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
             .with_safe_default_protocol_versions()
             .map_err(|e| format!("the harness's TLS versions: {e}"))?
-            .with_root_certificates(roots)
+            .with_root_certificates(store)
             .with_no_client_auth();
     let name = ServerName::try_from(server_name.to_owned())
         .map_err(|e| format!("not a server name {server_name:?}: {e}"))?;
     let connection = ClientConnection::new(Arc::new(config), name)
         .map_err(|e| format!("cannot begin TLS: {e}"))?;
-    let socket = StdStream::connect_timeout(&address, FRONT_WAIT)
+    let socket = StdStream::connect_timeout(&address, timeout)
         .map_err(|e| format!("cannot connect to {address}: {e}"))?;
     socket
-        .set_read_timeout(Some(FRONT_WAIT))
-        .and_then(|()| socket.set_write_timeout(Some(FRONT_WAIT)))
+        .set_read_timeout(Some(timeout))
+        .and_then(|()| socket.set_write_timeout(Some(timeout)))
         .map_err(|e| format!("cannot set timeouts: {e}"))?;
     let mut stream = StreamOwned::new(connection, socket);
-    let request = format!("GET {target} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
     stream
-        .write_all(request.as_bytes())
+        .write_all(wire)
         .and_then(|()| stream.flush())
         .map_err(|e| format!("TLS: {e}"))?;
     let mut answer = Vec::new();
@@ -776,11 +800,19 @@ pub fn tls_get(
             Ok(n) => answer.extend_from_slice(chunk.get(..n).unwrap_or_default()),
             // A server that closes without TLS's own goodbye, after it
             // answered: the answer stands.
-            Err(e) if e.kind() == ErrorKind::UnexpectedEof && !answer.is_empty() => break,
+            Err(e)
+                if !answer.is_empty()
+                    && matches!(
+                        e.kind(),
+                        ErrorKind::UnexpectedEof | ErrorKind::ConnectionReset
+                    ) =>
+            {
+                break;
+            }
             Err(e) => return Err(format!("TLS: {e}")),
         }
     }
-    Ok(String::from_utf8_lossy(&answer).into_owned())
+    Ok(answer)
 }
 
 /// A folder of a test's own for PEM files (certificates; a private key
@@ -900,11 +932,10 @@ pub fn place_at(port: u16) -> Vec<String> {
 
 /// The harness's identity provider with the issuer
 /// `https://localhost:<port>`, behind a TLS front on that port whose
-/// certificate for `localhost` is issued under `authority`. The token
-/// endpoint and the keys are on the issuer (so the platform reaches them
-/// over TLS); the authorization endpoint, which only the harness's browser
-/// visits (and which speaks plain HTTP), stays on the provider's own plain
-/// address.
+/// certificate for `localhost` is issued under `authority`. Every endpoint
+/// its configuration names is under the issuer, so `https` through the
+/// front: a browser that is to reach its authorization endpoint trusts
+/// `authority` ([`crate::browser::Browser::trust`]).
 pub fn provider_behind_tls(people: &[Person], authority: &Authority) -> (Provider, Front) {
     let bound = Bound::new();
     let issuer = format!("https://{PROVIDER_HOST}:{}", bound.port());

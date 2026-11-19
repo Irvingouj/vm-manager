@@ -216,6 +216,18 @@ pub enum ConfigFault {
     Status(u16),
     /// Answered `200` with a body that is not JSON.
     NotJson,
+    /// This endpoint named on the provider's own plain address,
+    /// `http://127.0.0.1:<port>/...` (where it does answer), the others
+    /// under the issuer.
+    PlainEndpoint(Endpoint),
+}
+
+/// One of the three endpoints a configuration names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Endpoint {
+    Authorization,
+    Token,
+    Keys,
 }
 
 /// Whether the provider answers.
@@ -342,9 +354,10 @@ struct Shared {
     keys: Keys,
     rng: SystemRandom,
     issuer: String,
-    /// Where the authorization endpoint is: the provider's own plain
-    /// address, which is the issuer unless it was started with another.
-    authorize_base: String,
+    /// The provider's own plain address, `http://127.0.0.1:<port>`: the
+    /// issuer unless it was started with another, and what
+    /// [`ConfigFault::PlainEndpoint`] names.
+    plain: String,
     secret: String,
     stop: AtomicBool,
 }
@@ -403,9 +416,9 @@ impl Provider {
 
     /// As [`Provider::start`], with this issuer (`https://localhost:<port>`
     /// of a TLS front before it, say) in place of `http://127.0.0.1:<port>`:
-    /// its configuration names it, and its token endpoint and keys under it;
-    /// the authorization endpoint stays on the provider's own plain address,
-    /// where the harness's browser reaches it.
+    /// its configuration names it, and every endpoint under it (the
+    /// harness's browser reaches the authorization endpoint through the
+    /// same front, over TLS).
     pub fn start_with_issuer(people: &[Person], issuer: &str) -> Self {
         Self::start_as(people, Some(issuer))
     }
@@ -468,7 +481,7 @@ impl Provider {
             keys,
             rng,
             issuer: issuer.map_or_else(|| plain.clone(), str::to_owned),
-            authorize_base: plain,
+            plain,
             secret,
             stop: AtomicBool::new(false),
         });
@@ -1073,7 +1086,7 @@ fn configuration(shared: &Shared) -> Answer {
     }
     let mut body = json!({
             "issuer": issuer,
-            "authorization_endpoint": format!("{}/authorize", shared.authorize_base),
+            "authorization_endpoint": format!("{issuer}/authorize"),
             "token_endpoint": format!("{issuer}/token"),
             "jwks_uri": format!("{issuer}/jwks"),
             "response_types_supported": ["code"],
@@ -1096,6 +1109,14 @@ fn configuration(shared: &Shared) -> Answer {
         }
         Some(ConfigFault::Oversize) => {
             body["padding"] = Value::String("x".repeat(OVERSIZE_BYTES));
+        }
+        Some(ConfigFault::PlainEndpoint(endpoint)) => {
+            let (member, path) = match endpoint {
+                Endpoint::Authorization => ("authorization_endpoint", "authorize"),
+                Endpoint::Token => ("token_endpoint", "token"),
+                Endpoint::Keys => ("jwks_uri", "jwks"),
+            };
+            body[member] = json!(format!("{}/{path}", shared.plain));
         }
         Some(ConfigFault::Status(_) | ConfigFault::NotJson) | None => {}
     }

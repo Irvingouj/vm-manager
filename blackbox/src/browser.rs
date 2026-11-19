@@ -535,6 +535,9 @@ pub fn set_cookies(response: &Response) -> Vec<SetCookie> {
 pub struct Browser {
     program: SocketAddr,
     pub jar: Jar,
+    /// The authorities it trusts for an `https` address (none unless a
+    /// test adds one: no public authority is built in).
+    trusted: Vec<rustls::pki_types::CertificateDer<'static>>,
 }
 
 impl Browser {
@@ -544,7 +547,14 @@ impl Browser {
         Self {
             program,
             jar: Jar::new(),
+            trusted: Vec::new(),
         }
+    }
+
+    /// Trusts this authority for `https` addresses from now on (the
+    /// harness's identity provider behind TLS).
+    pub fn trust(&mut self, authority: rustls::pki_types::CertificateDer<'static>) {
+        self.trusted.push(authority);
     }
 
     /// Reaches names at this address from now on: the program started
@@ -556,8 +566,13 @@ impl Browser {
     /// Signs this browser in at the provider as the person with this `sub`
     /// (the provider's own session, [`PERSON_COOKIE`]).
     pub fn sign_in_at_provider(&mut self, provider: &Provider, sub: &str) {
-        self.jar
-            .insert(&provider.address().ip().to_string(), PERSON_COOKIE, sub);
+        // On the issuer's host: `127.0.0.1` for a plain provider,
+        // `localhost` for one behind TLS.
+        let host = Url::parse(provider.issuer())
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_owned))
+            .unwrap_or_else(|| provider.address().ip().to_string());
+        self.jar.insert(&host, PERSON_COOKIE, sub);
     }
 
     fn address_for(&self, url: &Url) -> SocketAddr {
@@ -565,6 +580,8 @@ impl Browser {
         match url.host() {
             Some(Host::Ipv4(ip)) => SocketAddr::new(IpAddr::V4(ip), port),
             Some(Host::Ipv6(ip)) => SocketAddr::new(IpAddr::V6(ip), port),
+            // The harness's identity provider behind TLS.
+            Some(Host::Domain("localhost")) => SocketAddr::from(([127, 0, 0, 1], port)),
             _ => self.program,
         }
     }
@@ -580,6 +597,14 @@ impl Browser {
         let request = Request::new(self.address_for(url), &target_of(url), &host)
             .method(method)
             .timeout(STEP_TIMEOUT);
+        // An `https` address of the installation goes to the program in
+        // plain HTTP, as before (it listens behind what ends TLS); one
+        // elsewhere (the identity provider behind its TLS front) over TLS.
+        let request = if url.scheme() == "https" && self.address_for(url) != self.program {
+            request.over_tls(url.host_str().unwrap_or_default(), &self.trusted)
+        } else {
+            request
+        };
         match self.jar.header_for(url) {
             Some(cookies) => request.header("cookie", cookies),
             None => request,
