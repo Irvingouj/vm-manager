@@ -2111,7 +2111,7 @@ A local run that ends `postgres-failed` (exit code `1`; "The local loop: one req
 - Nothing of a password or a connection string is in any of them.
 - The exit code, the reason, and that nothing the run started is left running are unchanged.
 
-- Only a failure of the private Postgres is `postgres-failed`. A `.vm/local/` that cannot be written (its `state.json` included) is `local-state`, as before; something of the program's own that is not Postgres's (no randomness for a password, a local platform database written by a newer program) is `failed`, with what to do.
+- Only a failure of the private Postgres is `postgres-failed`. A `.vm/local/` that cannot be written (its `state.json` included) is `local-state`, as before, with the same words (removing `.vm/local/` starts the local databases anew): so is a `.vm/local/postgres.log` that cannot be written (for instance, it is a folder), and a data folder `.vm/local/postgres/` that holds no Postgres data yet and cannot be made anew (for instance, it is a file). Neither has a `step` or a `cause`; something of the program's own that is not Postgres's (no randomness for a password, a local platform database written by a newer program) is `failed`, with what to do.
 
 ### The local databases do not wait on the disk
 
