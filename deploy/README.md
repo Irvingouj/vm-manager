@@ -4,19 +4,13 @@ This takes you from a Linux machine with Docker to a person signed in. The platf
 
 You need:
 
-- a machine with Docker Engine 25.0 or later and its Compose plugin 2.24.1 or later: `docker version --format '{{.Server.Version}}'` prints the Engine's version, `docker compose version` the plugin's (see below why these);
+- a machine with Docker Engine 25.0 or later and its Compose plugin 2.24.1 or later: `docker version --format '{{.Server.Version}}'` prints the Engine's version, `docker compose version` the plugin's (why these: [Why these versions of Docker](#why-these-versions-of-docker), at the end);
 - a domain for the installation, here `vibe.example.com`, whose names all reach the machine: Applications are at `<name>.vibe.example.com`, the platform's API at `api.vibe.example.com`, sign-in at `auth.vibe.example.com`, the Dashboard at `dashboard.vibe.example.com` (a DNS record for `*.vibe.example.com`);
 - a certificate for `*.vibe.example.com` and its private key, in PEM;
 - an OIDC identity provider at which you can register a client;
 - the tool `vibe` on the computer you connect OIDC from.
 
 Replace `vibe.example.com` with your domain in every command below.
-
-Why these versions. The Compose files use three things that older versions do not have, each according to Docker's own notes:
-
-- a config written in the file itself (`configs: ... content:`), for the Postgres first-start script and the proxy's configuration: Compose 2.23.1 ([Compose file reference, configs](https://docs.docker.com/reference/compose-file/configs/): "`content`: The content is created with the inlined value. Introduced in Docker Compose version 2.23.1");
-- the health check's `start_interval`, so that a fresh install is seen healthy within seconds: Docker Engine 25.0.0 ([Engine 25.0 release notes](https://docs.docker.com/engine/release-notes/25.0/), "Add an additional interval to be used by healthchecks during the container start period") and Compose 2.24.0, whose [release notes](https://github.com/docker/compose/releases/tag/v2.24.0) list "Add support for start_interval", with the check of the Engine's version it needs fixed in [2.24.1](https://github.com/docker/compose/releases/tag/v2.24.1) ("fix engine version require to use healthcheck.start_interval");
-- `!reset`, by which `compose.own-proxy.yaml` and `compose.own-postgres.yaml` remove the bundled proxy or Postgres: compose-go [v1.13.5](https://github.com/compose-spec/compose-go/releases/tag/v1.13.5) ("allow override compose.yaml to REMOVE elements"), first in Compose 2.18.0 (its `go.mod` names compose-go v1.13.5), well below the others.
 
 ## 1. The files
 
@@ -102,6 +96,7 @@ At your identity provider, register a client for the platform (an OpenID Connect
 
 - the redirect address: `https://auth.vibe.example.com/callback`; with `VIBE_HTTPS_PORT` other than 443, the port is in it: `https://auth.vibe.example.com:8443/callback`;
 - the scopes: `openid profile email offline_access` (another list can be given to `vibe admin connect-oidc` with `--scopes`);
+- a refresh token for the platform: the provider must allow `offline_access` for this client and for every person who signs in, or the sign-in fails. In Keycloak, for example, a person needs its role `offline_access`: people made in its console have it by default, people made by a realm import may not, and for them the sign-in ended on the platform's page with "The company's sign-in refused the code it gave" and the log record `identity-provider-refused` with the error `not_allowed`;
 - the person's Groups in the ID token, in the claim `groups` (another claim can be given with `--groups-claim`);
 - the ID token signed with `RS256` or `ES256`.
 
@@ -132,6 +127,17 @@ In a browser, open `https://dashboard.vibe.example.com/`: it sends you to the id
 vibe sign-in --domain vibe.example.com
 vibe whoami
 ```
+
+An Application can be shared with someone by their email address once that person has signed in here once; before that the platform refuses (`unknown-email`, and the Dashboard says nobody who signed in here has that email address).
+
+### When a sign-in fails
+
+The platform's page says in one sentence what failed, and the program's log has the record of it (`docker compose logs vibe`):
+
+- `{"event":"identity-provider-refused","status",...,"error",...}`: the identity provider refused the platform's call to its token endpoint; `error` is the provider's own error code (never its description), for example `not_allowed` when it does not allow `offline_access` (step 6);
+- `{"event":"identity-provider-unanswered","call",...,"problem",...}`: a call to the provider brought no answer the platform could use; `call` is `configuration`, `keys` or `token`, `problem` says what was wrong (`unreachable`, `timed-out`, `too-large`, `status`, `not-json`, `no-id-token`, `another-issuer`, `lacks-endpoint`, `unreadable-keys`), with the answer's `status` when it had one.
+
+The person's browser and the tool's computer must trust the installation's certificate: one from a public authority, or the company's own authority installed on them (for the tool, `VIBE_CA_FILE`: see [Your company's own certificate authority](#your-companys-own-certificate-authority)).
 
 ## Your own reverse proxy
 
@@ -241,3 +247,11 @@ removes the bundled Postgres's data, every Application's included, for good.
 - `vibe` runs with a read-only root filesystem, every capability dropped, `no-new-privileges`, as the image's user `65532` (not root), with no writable volume and no tmpfs; its one mount is `ca/`, read-only, at `/etc/vibe/ca`. The installation's key and the database's address are in its environment, in no command line.
 - `postgres` runs as its image's user `999` and `proxy` as `65532`, neither as root, each with every capability dropped and `no-new-privileges`.
 - Not possible: a read-only root filesystem for `postgres` and `proxy`. Each takes a file of `compose.yaml`'s `configs` (Postgres's first-start script, the proxy's configuration), and Compose cannot place such a file into a read-only container.
+
+## Why these versions of Docker
+
+The Compose files use three things that older versions do not have, each according to Docker's own notes:
+
+- a config written in the file itself (`configs: ... content:`), for the Postgres first-start script and the proxy's configuration: Compose 2.23.1 ([Compose file reference, configs](https://docs.docker.com/reference/compose-file/configs/): "`content`: The content is created with the inlined value. Introduced in Docker Compose version 2.23.1");
+- the health check's `start_interval`, so that a fresh install is seen healthy within seconds: Docker Engine 25.0.0 ([Engine 25.0 release notes](https://docs.docker.com/engine/release-notes/25.0/), "Add an additional interval to be used by healthchecks during the container start period") and Compose 2.24.0, whose [release notes](https://github.com/docker/compose/releases/tag/v2.24.0) list "Add support for start_interval", with the check of the Engine's version it needs fixed in [2.24.1](https://github.com/docker/compose/releases/tag/v2.24.1) ("fix engine version require to use healthcheck.start_interval");
+- `!reset`, by which `compose.own-proxy.yaml` and `compose.own-postgres.yaml` remove the bundled proxy or Postgres: compose-go [v1.13.5](https://github.com/compose-spec/compose-go/releases/tag/v1.13.5) ("allow override compose.yaml to REMOVE elements"), first in Compose 2.18.0 (its `go.mod` names compose-go v1.13.5), well below the others.
