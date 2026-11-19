@@ -50,7 +50,7 @@ That pipeline is `.github/workflows/release.yml`. A release is made from a commi
 
 ### The gate
 
-`scripts/gate.sh` checks that `blackbox` depends on no product crate, then runs:
+`scripts/gate.sh` first looks for the browser the browser tests drive: Firefox 128 or later, the program `VIBE_TEST_BROWSER` names (a path, or a name on the `PATH`), else `firefox` on the `PATH`. Without one it stops at once, before anything is built, in the same words as the browser tests' own failure; with one it says in one line which it found and its version. It then checks that `blackbox` depends on no product crate, and runs:
 
 ```
 cargo fmt --all --check
@@ -58,6 +58,8 @@ cargo clippy --workspace --all-targets -- -D warnings
 npm ci && npm test          # once the root npm workspace exists; needs Node 22 or later
 cargo test --workspace
 ```
+
+The browser walks (`blackbox/tests/browser_*.rs`) are part of `cargo test --workspace`: they start that Firefox, headless, against the real program.
 
 On the release pipeline's hosted runner the gate is run by `scripts/gate-hosted.sh`: the whole gate once (`scripts/gate.sh --no-fail-fast`), then each test file that failed once more, alone and one test at a time. The gate's time limits are sized for the machines it runs on every day (12 cores); a hosted runner has 4, and there a few test files that start many programs at once run past those limits when every file runs side by side, though each passes alone. Nothing is skipped: a file that fails twice, npm's tests, or a step before the tests failing fails it, and the log says which files were run again and how each ended. Locally, the gate is `scripts/gate.sh` as above.
 

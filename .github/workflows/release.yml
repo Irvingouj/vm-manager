@@ -114,6 +114,13 @@ jobs:
         # The test's own check (local_offline.rs), so that a runner that
         # still forbids it fails here, saying so, not two hours later.
         run: unshare -rn sh -c "ip link set lo up && exec unshare -U --map-user=$(id -u) --map-group=$(id -g) true"
+      - name: The runner's Firefox, which the browser tests drive
+        # The gate looks for it first (VIBE_TEST_BROWSER, else firefox on
+        # the PATH; Firefox 128 or later) and stops if there is none; this
+        # step says which one the runner has, and fails if it has none.
+        run: |
+          command -v firefox
+          firefox --version
       - name: The gate (run whole, then each test file that failed once more alone)
         run: scripts/gate-hosted.sh
 
