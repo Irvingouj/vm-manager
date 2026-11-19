@@ -4,8 +4,8 @@
 //! The binaries come from the directory `VIBE_TEST_PG_BIN` names, else from a
 //! Postgres found on the machine, else from zonky's prebuilt binaries on
 //! Maven Central, downloaded once to a per-user cache and checked against
-//! the SHA-256 pinned here and published beside them
-//! (`docs/research/local-postgres-without-docker.md`). No Docker, no
+//! the SHA-256 pinned here; the archive alone is fetched, never the checksum
+//! file published beside it (`docs/research/local-postgres-without-docker.md`). No Docker, no
 //! administrator rights. It is a Postgres 18 ([`MAJOR`]), the one version
 //! the platform supports (CONTRACT.md, "One Postgres version"): nothing
 //! chooses another. `VIBE_TEST_PG_BIN` naming a Postgres of another version
@@ -56,9 +56,10 @@ pub const OTHER_MAJOR: u32 = 17;
 
 /// Per major version and platform: the major, the version of zonky's build
 /// that is downloaded, Rust's `(OS, ARCH)`, zonky's name for the platform,
-/// and the SHA-256 of its archive as published on Maven Central
-/// (`<jar>.sha256`) when this was written. Pinned, so that an archive that
-/// changes under the same version is refused rather than run.
+/// and the SHA-256 of its archive, taken from the `.sha256` files Maven
+/// Central publishes, when this was written. Pinned, so that an archive
+/// that changes under the same version is refused rather than run; the
+/// harness never fetches those files, only the archive.
 const ARCHIVES: &[(u32, &str, &str, &str, &str, &str)] = &[
     (
         18,
@@ -349,37 +350,21 @@ fn downloaded(major: u32) -> Result<PathBuf, String> {
     fs::create_dir_all(&cache)
         .map_err(|e| format!("cannot create the cache {}: {e}", cache.display()))?;
     let artifact = format!("embedded-postgres-binaries-{platform}");
-    let url = format!(
-        "https://repo1.maven.org/maven2/io/zonky/test/postgres/{artifact}/{zonky_version}/{artifact}-{zonky_version}.jar"
-    );
+    let pinned = Archive {
+        version: zonky_version.to_owned(),
+        platform: platform.to_owned(),
+        sha256: sha256.to_owned(),
+        maven_path: format!(
+            "io/zonky/test/postgres/{artifact}/{zonky_version}/{artifact}-{zonky_version}.jar"
+        ),
+    };
+    let url = format!("{MAVEN_CENTRAL}/{}", pinned.maven_path);
     eprintln!(
         "blackbox: downloading Postgres {zonky_version} once, from {url}, to {}",
         home.display()
     );
     let began = Instant::now();
-    // A published checksum that is not the pinned one is a wrong file: it
-    // stops the harness at once, never tried again.
-    download(&format!("{url}.sha256"), 1024, &DOWNLOAD_PAUSES, |bytes| {
-        let published = String::from_utf8_lossy(bytes);
-        let published = published.split_whitespace().next().unwrap_or_default();
-        if published.eq_ignore_ascii_case(sha256) {
-            Ok(())
-        } else {
-            Err(format!(
-                "the SHA-256 published for {url} is {published:?}, not the {sha256} pinned in the harness: refusing it"
-            ))
-        }
-    })?;
-    let archive = download(&url, MAX_ARCHIVE_BYTES, &DOWNLOAD_PAUSES, |bytes| {
-        let actual = hex(&Sha256::digest(bytes));
-        if actual == sha256 {
-            Ok(())
-        } else {
-            Err(format!(
-                "the archive downloaded from {url} has SHA-256 {actual}, not the published {sha256}: refusing it"
-            ))
-        }
-    })?;
+    let archive = fetch_archive(MAVEN_CENTRAL, &pinned, &DOWNLOAD_PAUSES)?;
     eprintln!(
         "blackbox: downloaded {} bytes of Postgres {zonky_version} in {:?}",
         archive.len(),
@@ -433,6 +418,34 @@ pub struct Archive {
     pub maven_path: String,
 }
 
+/// Maven Central's repository, where the archives are fetched from.
+pub const MAVEN_CENTRAL: &str = "https://repo1.maven.org/maven2";
+
+/// Fetches `archive` from the Maven repository at `base` (the harness gives
+/// [`MAVEN_CENTRAL`]): the archive alone, at `<base>/<maven_path>`, never the
+/// checksum file published beside it. A try that does not bring it is tried
+/// again ([`download`], after `pauses`); an archive larger than the limit,
+/// or whose SHA-256 is not the one pinned, stops at once. Nothing is
+/// unpacked or kept.
+pub fn fetch_archive(
+    base: &str,
+    archive: &Archive,
+    pauses: &[Duration],
+) -> Result<Vec<u8>, String> {
+    let url = format!("{}/{}", base.trim_end_matches('/'), archive.maven_path);
+    download(&url, MAX_ARCHIVE_BYTES, pauses, |bytes| {
+        let actual = hex(&Sha256::digest(bytes));
+        if actual.eq_ignore_ascii_case(&archive.sha256) {
+            Ok(())
+        } else {
+            Err(format!(
+                "the archive downloaded from {url} has SHA-256 {actual}, not the {} pinned in the harness: refusing it",
+                archive.sha256
+            ))
+        }
+    })
+}
+
 /// The [`Archive`] of this major version for this machine; `None` when the
 /// harness knows none.
 pub fn archive_of(major: u32) -> Option<Archive> {
@@ -481,23 +494,13 @@ pub fn archive_bytes(major: u32) -> Vec<u8> {
     {
         return bytes;
     }
-    let url = format!("https://repo1.maven.org/maven2/{}", archive.maven_path);
+    let url = format!("{MAVEN_CENTRAL}/{}", archive.maven_path);
     eprintln!(
         "blackbox: downloading the Postgres archive once, from {url}, to {}",
         file.display()
     );
-    let bytes = download(&url, MAX_ARCHIVE_BYTES, &DOWNLOAD_PAUSES, |bytes| {
-        let actual = hex(&Sha256::digest(bytes));
-        if actual == archive.sha256 {
-            Ok(())
-        } else {
-            Err(format!(
-                "the archive downloaded from {url} has SHA-256 {actual}, not the {} pinned in the harness: refusing it",
-                archive.sha256
-            ))
-        }
-    })
-    .unwrap_or_else(|problem| panic!("{problem}"));
+    let bytes = fetch_archive(MAVEN_CENTRAL, &archive, &DOWNLOAD_PAUSES)
+        .unwrap_or_else(|problem| panic!("{problem}"));
     fs::create_dir_all(&cache)
         .unwrap_or_else(|e| panic!("cannot create the cache {}: {e}", cache.display()));
     let partial = cache.join(format!(".archive-{}-{}", std::process::id(), unique()));
