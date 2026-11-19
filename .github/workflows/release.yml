@@ -176,6 +176,44 @@ jobs:
         run: |
           archive="$(scripts/package-tool.sh --binary "target/$TARGET/release/vibe" --target "$TARGET" --out dist | tail -n 1)"
           echo "ARCHIVE=$archive" >> "$GITHUB_ENV"
+      - name: The page's command for checking a download passes for the archive, and fails for a wrong sum
+        run: |
+          # As a person following docs/getting-started.md would: a SHA256SUMS
+          # that also names a file not downloaded, checked with the page's
+          # command of this system. Made outside dist/, which is uploaded.
+          check="$RUNNER_TEMP/download-check"
+          rm -rf "$check"
+          mkdir -p "$check"
+          cp "$ARCHIVE" "$check/"
+          name="$(basename "$ARCHIVE")"
+          cd "$check"
+          page_check() {
+            if [ "$RUNNER_OS" = macOS ]; then
+              shasum -a 256 --check --ignore-missing SHA256SUMS
+            else
+              sha256sum --check --ignore-missing SHA256SUMS
+            fi
+          }
+          if [ "$RUNNER_OS" = macOS ]; then
+            sum="$(shasum -a 256 "$name" | awk '{ print $1 }')"
+          else
+            sum="$(sha256sum "$name" | awk '{ print $1 }')"
+          fi
+          missing=vibe-0.0.0-not-downloaded.tar.gz
+          zeros=0000000000000000000000000000000000000000000000000000000000000000
+          printf '%s  %s\n%s  %s\n' "$zeros" "$missing" "$sum" "$name" > SHA256SUMS
+          cat SHA256SUMS
+          page_check
+          echo "the page's command passed for $name"
+          wrong=ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+          printf '%s  %s\n%s  %s\n' "$zeros" "$missing" "$wrong" "$name" > SHA256SUMS
+          if page_check; then
+            echo "the page's command passed for $name against a wrong sum: it checks nothing" >&2
+            exit 1
+          fi
+          echo "the page's command failed for $name against a wrong sum, as it must"
+          cd /
+          rm -rf "$check"
       - name: Unpack it and try it (its version, vibe new, npm install, a request, vibe check)
         run: scripts/try-tool.sh --archive "$ARCHIVE"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
