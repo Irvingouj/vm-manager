@@ -21,12 +21,15 @@
 
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use blackbox::postgres::{DOWNLOAD_PAUSES, DOWNLOAD_TRIES, download};
+use blackbox::postgres::{
+    Archive, DOWNLOAD_PAUSES, DOWNLOAD_TRIES, MAJOR, archive_of, download, fetch_archive,
+};
+use sha2::{Digest, Sha256};
 
 /// What the stand-in does with one request.
 #[derive(Clone)]
@@ -39,11 +42,24 @@ enum Answer {
     File(Vec<u8>),
 }
 
-/// A stand-in HTTP server on 127.0.0.1: the n-th request gets the n-th
-/// answer, and every request after the last gets the last.
+/// How the stand-in chooses its answers.
+enum Rule {
+    /// The n-th request gets the n-th answer, and every request after the
+    /// last gets the last.
+    InTurn(Vec<Answer>),
+    /// The file at this path (`/` and all), `404` for any other.
+    At(String, Vec<u8>),
+}
+
+/// The most request paths the stand-in records.
+const PATHS_KEPT: usize = 100;
+
+/// A stand-in HTTP server on 127.0.0.1, answering by its [`Rule`], that
+/// counts the requests and records the path each asked for.
 struct StandIn {
     port: u16,
     requests: Arc<AtomicUsize>,
+    paths: Arc<Mutex<Vec<String>>>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
@@ -51,20 +67,40 @@ struct StandIn {
 impl StandIn {
     fn start(answers: Vec<Answer>) -> Self {
         assert!(!answers.is_empty());
+        Self::with_rule(Rule::InTurn(answers))
+    }
+
+    /// Serves `bytes` at `path` alone.
+    fn serving(path: &str, bytes: &[u8]) -> Self {
+        Self::with_rule(Rule::At(path.to_owned(), bytes.to_vec()))
+    }
+
+    fn with_rule(rule: Rule) -> Self {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         listener.set_nonblocking(true).unwrap();
         let port = listener.local_addr().unwrap().port();
         let requests = Arc::new(AtomicUsize::new(0));
         let stop = Arc::new(AtomicBool::new(false));
+        let paths = Arc::new(Mutex::new(Vec::new()));
         let counted = Arc::clone(&requests);
+        let recorded = Arc::clone(&paths);
         let stopping = Arc::clone(&stop);
         let thread = thread::spawn(move || {
             while !stopping.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((stream, _)) => {
                         let n = counted.fetch_add(1, Ordering::SeqCst);
-                        let answer = answers[n.min(answers.len() - 1)].clone();
-                        answer_one(stream, &answer);
+                        answer_one(stream, |path| {
+                            let mut kept = recorded.lock().unwrap();
+                            if kept.len() < PATHS_KEPT {
+                                kept.push(path.to_owned());
+                            }
+                            match &rule {
+                                Rule::InTurn(answers) => answers[n.min(answers.len() - 1)].clone(),
+                                Rule::At(at, bytes) if at == path => Answer::File(bytes.clone()),
+                                Rule::At(..) => Answer::NotFound,
+                            }
+                        });
                     }
                     Err(_) => thread::sleep(Duration::from_millis(10)),
                 }
@@ -73,6 +109,7 @@ impl StandIn {
         Self {
             port,
             requests,
+            paths,
             stop,
             thread: Some(thread),
         }
@@ -85,6 +122,10 @@ impl StandIn {
     fn requests(&self) -> usize {
         self.requests.load(Ordering::SeqCst)
     }
+
+    fn paths(&self) -> Vec<String> {
+        self.paths.lock().unwrap().clone()
+    }
 }
 
 impl Drop for StandIn {
@@ -96,7 +137,7 @@ impl Drop for StandIn {
     }
 }
 
-fn answer_one(mut stream: TcpStream, answer: &Answer) {
+fn answer_one(mut stream: TcpStream, choose: impl FnOnce(&str) -> Answer) {
     stream.set_nonblocking(false).unwrap();
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
@@ -109,7 +150,9 @@ fn answer_one(mut stream: TcpStream, answer: &Answer) {
             Ok(n) => seen.extend_from_slice(&buffer[..n]),
         }
     }
-    match answer {
+    let head = String::from_utf8_lossy(&seen);
+    let path = head.split_whitespace().nth(1).unwrap_or_default();
+    match &choose(path) {
         Answer::NotFound => {
             drop(stream.write_all(
                 b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
@@ -164,7 +207,7 @@ fn a_404_on_the_first_tries_is_tried_again_and_the_file_had() {
         Answer::NotFound,
         Answer::File(FILE.to_vec()),
     ]);
-    let got = download(&stand_in.url("a.jar.sha256"), 1024, &SHORT, is_the_file);
+    let got = download(&stand_in.url("a.jar"), 1024, &SHORT, is_the_file);
     assert_eq!(got.as_deref(), Ok(FILE), "{got:?}");
     assert_eq!(
         stand_in.requests(),
@@ -193,7 +236,7 @@ fn a_connection_closed_without_an_answer_is_tried_again_and_the_file_had() {
 #[test]
 fn always_404_stops_after_four_tries_saying_the_address_the_failure_and_the_tries() {
     let stand_in = StandIn::start(vec![Answer::NotFound]);
-    let url = stand_in.url("missing.jar.sha256");
+    let url = stand_in.url("missing.jar");
     let began = Instant::now();
     let got = download(&url, 1024, &SHORT, is_the_file);
     let words = got.expect_err("expected the download to fail");
@@ -239,5 +282,55 @@ fn a_file_larger_than_the_limit_is_asked_for_once() {
         stand_in.requests(),
         1,
         "expected a file over the limit never asked for again"
+    );
+}
+
+/// The harness's archive of Postgres 18 for this machine, its path as
+/// Maven lays it out, but pinned to the sum of `bytes`: a small file of the
+/// test's own stands in for it.
+fn pinned_to(bytes: &[u8]) -> Archive {
+    let mut archive = archive_of(MAJOR).expect("the harness knows an archive for this machine");
+    archive.sha256 = format!("{:x}", Sha256::digest(bytes));
+    archive
+}
+
+#[test]
+fn the_postgres_download_asks_for_the_archive_and_nothing_else() {
+    let bytes = b"a small file standing in for the archive\n";
+    let archive = pinned_to(bytes);
+    let stand_in = StandIn::serving(&format!("/{}", archive.maven_path), bytes);
+    let base = format!("http://127.0.0.1:{}", stand_in.port);
+    let got = fetch_archive(&base, &archive, &SHORT);
+    assert_eq!(got.as_deref(), Ok(&bytes[..]), "{got:?}");
+    assert_eq!(
+        stand_in.paths(),
+        vec![format!("/{}", archive.maven_path)],
+        "expected one request, for the archive alone (no .sha256)"
+    );
+    assert_eq!(stand_in.requests(), 1);
+}
+
+#[test]
+fn a_postgres_archive_whose_sum_is_not_the_pinned_one_is_refused_after_one_request() {
+    let archive = pinned_to(b"the archive that was pinned\n");
+    let served = b"another archive\n";
+    let found = format!("{:x}", Sha256::digest(served));
+    let stand_in = StandIn::serving(&format!("/{}", archive.maven_path), served);
+    let base = format!("http://127.0.0.1:{}", stand_in.port);
+    let words = fetch_archive(&base, &archive, &SHORT).expect_err("expected the archive refused");
+    assert!(
+        words.contains(&archive.sha256),
+        "expected the pinned sum in {words:?}"
+    );
+    assert!(
+        words.contains(&found),
+        "expected the sum found in {words:?}"
+    );
+    assert!(words.contains("pinned"), "{words:?}");
+    assert!(!words.contains("published"), "{words:?}");
+    assert_eq!(
+        stand_in.paths(),
+        vec![format!("/{}", archive.maven_path)],
+        "expected one request, for the archive alone"
     );
 }
