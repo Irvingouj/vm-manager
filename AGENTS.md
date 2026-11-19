@@ -44,7 +44,7 @@ Then the ticket's commits are pushed and the issue is closed with what was run. 
 
 ### Git
 
-Work on `main` and push to `main`. No pull requests. No branch unless something truly needs one, and then it is deleted when merged. There is no continuous integration for now: the gate is run locally, and nothing ever waits on a remote check.
+Work on `main` and push to `main`. No pull requests. No branch unless something truly needs one, and then it is deleted when merged. The gate is run locally, and nothing of the loop ever waits on a remote check: no workflow runs per push or per pull request. The one workflow there may be is the release pipeline, started by a version tag or by hand, which builds, tests and publishes a release (the product owner's decision of 2026-11-18).
 
 ### The gate
 
