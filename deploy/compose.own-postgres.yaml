@@ -6,9 +6,11 @@
 #   VIBE_DATABASE_URL  required. postgres://<role>:<password>@<host>:<port>/<database>:
 #                      your Postgres 18 and the platform database in it, as a
 #                      role that may create databases and roles and is not a
-#                      superuser. The program makes the database when it is not
-#                      there. A server that is not Postgres 18 is refused at
-#                      start, and the vibe container's log says so.
+#                      superuser. Make the database beforehand, owned by that
+#                      role (README.md): the program makes it itself only
+#                      through the database postgres, which README.md has you
+#                      close to PUBLIC. A server that is not Postgres 18 is
+#                      refused at start, and the vibe container's log says so.
 #   POSTGRES_PASSWORD  not needed.
 #
 # README.md says the two things to do on your Postgres first.
