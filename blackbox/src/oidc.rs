@@ -10,8 +10,11 @@
 //!   request is answered `302` to its `redirect_uri` with a `code`, `state`
 //!   and `iss`, for the person the browser is signed in as here. The
 //!   browser says who that is with the cookie [`PERSON_COOKIE`] on the
-//!   provider's host (`Browser::sign_in_at_provider`); without it the
-//!   answer is a `200` page asking who you are, which no test fills in;
+//!   provider's host (`Browser::sign_in_at_provider`); without it (or
+//!   always, when a test turns [`Provider::ask_who_every_time`]) the answer
+//!   is a `200` page asking who you are, with one form for each person,
+//!   which a real browser submits as a person does (`POST /sign-in-as`:
+//!   the cookie is set and the request answered for that person);
 //! - `POST /token`: the `authorization_code` grant, PKCE `S256` checked
 //!   when the request had a `code_challenge`, and the `refresh_token`
 //!   grant; the client authenticated with `client_secret_basic` or
@@ -329,6 +332,9 @@ struct State {
     groups_claim: String,
     auth_methods: Vec<String>,
     deny: bool,
+    /// Whether the authorization endpoint asks who you are every time,
+    /// even of a browser signed in here.
+    ask_who: bool,
     token_delay: Duration,
     oversize_jwks: bool,
     token_answer: TokenAnswer,
@@ -462,6 +468,7 @@ impl Provider {
                 "client_secret_post".to_owned(),
             ],
             deny: false,
+            ask_who: false,
             token_delay: Duration::ZERO,
             oversize_jwks: false,
             token_answer: TokenAnswer::Normal,
@@ -602,6 +609,13 @@ impl Provider {
     /// `error=access_denied`.
     pub fn deny(&self, deny: bool) {
         self.shared.lock().deny = deny;
+    }
+
+    /// Whether the authorization endpoint shows its page asking who you
+    /// are to every browser, signed in here or not (as a provider asked to
+    /// prompt does): so that a test sees a browser sent to sign in.
+    pub fn ask_who_every_time(&self, ask: bool) {
+        self.shared.lock().ask_who = ask;
     }
 
     /// How long the token endpoint waits before answering.
@@ -1058,6 +1072,7 @@ fn answer(incoming: &Incoming, shared: &Shared) -> Answer {
         ("GET", "/.well-known/openid-configuration") => configuration(shared),
         ("GET", "/jwks") => jwks(shared),
         ("GET", "/authorize") => authorize(&recorded, shared),
+        ("POST", "/sign-in-as") => sign_in_as(&recorded, shared),
         ("POST", "/token") => token(&mut recorded, shared),
         _ => Answer::json(404, &json!({ "error": "not_found" })),
     };
@@ -1189,7 +1204,86 @@ fn person_of(cookie_header: Option<&str>) -> Option<String> {
 }
 
 fn authorize(recorded: &Recorded, shared: &Shared) -> Answer {
-    let param = |name: &str| recorded.query_param(name);
+    let ask = shared.lock().ask_who;
+    let person = if ask {
+        None
+    } else {
+        person_of(recorded.header("cookie"))
+    };
+    authorize_as(&recorded.query, person, shared)
+}
+
+/// The person's step at the provider, as a person takes it: the page
+/// asking who you are has one form for each person, which posts here their
+/// `sub` and the authorization request it was shown for (`back`, a path
+/// under `/authorize?`). The browser is then signed in here as them (the
+/// cookie [`PERSON_COOKIE`]) and the request is answered for them.
+fn sign_in_as(recorded: &Recorded, shared: &Shared) -> Answer {
+    let Some(sub) = recorded
+        .form_param("sub")
+        .filter(|s| shared.lock().people.contains_key(*s))
+        .map(str::to_owned)
+    else {
+        return Answer::html(400, "no such person here");
+    };
+    let Some(back) = recorded
+        .form_param("back")
+        .filter(|b| b.starts_with("/authorize?"))
+        .and_then(|b| Url::parse(&format!("http://provider{b}")).ok())
+    else {
+        return Answer::html(400, "no authorization request to go back to");
+    };
+    let query: Vec<(String, String)> = back.query_pairs().into_owned().collect();
+    let mut answer = authorize_as(&query, Some(sub.clone()), shared);
+    answer.headers.push((
+        "Set-Cookie".to_owned(),
+        format!("{PERSON_COOKIE}={sub}; Path=/; HttpOnly; SameSite=Lax"),
+    ));
+    answer
+}
+
+/// The page asking who you are: one form a person, each posting to
+/// `/sign-in-as` with the request it was shown for.
+fn who_are_you(query: &[(String, String)], shared: &Shared) -> Answer {
+    let back = format!(
+        "/authorize?{}",
+        url::form_urlencoded::Serializer::new(String::new())
+            .extend_pairs(query.iter())
+            .finish()
+    );
+    let mut people: Vec<Person> = shared.lock().people.values().cloned().collect();
+    people.sort_by(|a, b| a.sub.cmp(&b.sub));
+    let mut forms = String::new();
+    for person in &people {
+        let shown = person.name.as_deref().unwrap_or(person.sub.as_str());
+        forms.push_str(&format!(
+            "<form method=\"post\" action=\"/sign-in-as\" data-harness-person=\"{sub}\"><input type=\"hidden\" name=\"sub\" value=\"{sub}\"><input type=\"hidden\" name=\"back\" value=\"{back}\"><button type=\"submit\">Sign in as {shown}</button></form>",
+            sub = escape_html(&person.sub),
+            back = escape_html(&back),
+            shown = escape_html(shown),
+        ));
+    }
+    Answer {
+        status: 200,
+        content_type: "text/html; charset=utf-8",
+        headers: Vec::new(),
+        body: format!(
+            "<!doctype html><title>Harness identity provider</title><p>Who are you? (The browser is signed in as no one at the harness's provider.)</p>{forms}"
+        )
+        .into_bytes(),
+    }
+}
+
+fn escape_html(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
+fn authorize_as(query: &[(String, String)], person: Option<String>, shared: &Shared) -> Answer {
+    let param = |name: &str| find(query, name);
     if param("response_type") != Some("code") {
         return Answer::html(400, "unsupported response_type");
     }
@@ -1216,13 +1310,10 @@ fn authorize(recorded: &Recorded, shared: &Shared) -> Answer {
         }
         return Answer::redirect(back.as_str());
     }
-    let person = person_of(recorded.header("cookie"))
-        .and_then(|sub| state.people.get(&sub).map(|p| p.sub.clone()));
+    let person = person.and_then(|sub| state.people.get(&sub).map(|p| p.sub.clone()));
     let Some(sub) = person else {
-        return Answer::html(
-            200,
-            "Who are you? (The browser is signed in as no one at the harness's provider.)",
-        );
+        drop(state);
+        return who_are_you(query, shared);
     };
     let code = shared.random();
     state.codes.insert(

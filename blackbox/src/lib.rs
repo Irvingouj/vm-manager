@@ -66,6 +66,11 @@
 //! - [`oidc`] is the harness's own identity provider, [`browser`] a small
 //!   browser with a cookie jar that follows redirects a step at a time, and
 //!   [`sessions`] what the tests of sign-in and sessions share;
+//! - [`firefox`] is the harness's real browser: Firefox without a window on
+//!   a fresh profile of the test's own, driven over Marionette, and ended
+//!   with every process it started and its profile whatever happens to the
+//!   test; [`walks`] is what the tests that walk the platform's pages in it
+//!   share;
 //! - [`connection`] connects OIDC as an administrator would (the
 //!   installation's key, `vibe setup`, `vibe admin connect-oidc`, `PUT
 //!   /v1/oidc`), and [`tool_sign_ins`] is what the tests of the tool's
@@ -120,6 +125,7 @@ pub mod dashboard;
 pub mod deploy;
 pub mod dev;
 pub mod expect;
+pub mod firefox;
 pub mod generate;
 pub mod history;
 pub mod history_earlier;
@@ -160,6 +166,7 @@ pub mod tool;
 pub mod tool_sign_ins;
 pub mod transactions;
 pub mod vm;
+pub mod walks;
 
 pub use api::{Api, assert_api_error};
 pub use http::{Request, Response, User};
