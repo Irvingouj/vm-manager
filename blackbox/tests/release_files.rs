@@ -1,6 +1,8 @@
 //! `scripts/release-files.sh --out <folder>` (CONTRACT.md, "The first
-//! release: What a release holds" and "The scripts that make it"): it
-//! copies the three Compose files and `env.example` (`deploy/.env.example`)
+//! release: What a release holds" and "The scripts that make it"; "The
+//! program serves TLS itself: The Compose file": from the next version on
+//! the list grows by `compose.own-tls.yaml`): it copies the four Compose
+//! files and `env.example` (`deploy/.env.example`)
 //! into the folder, which may already hold the archives, unchanged, and
 //! writes `SHA256SUMS` over every file then in it: one line each, `<64 hex
 //! digits>`, two spaces, the name, in the names' order, so that
@@ -24,13 +26,14 @@ use blackbox::release::{
 
 /// The release's files copied from `deploy/`, by their name in the release
 /// and in the repository.
-const COPIED: [(&str, &str); 4] = [
+const COPIED: [(&str, &str); 5] = [
     ("compose.yaml", "deploy/compose.yaml"),
     ("compose.own-proxy.yaml", "deploy/compose.own-proxy.yaml"),
     (
         "compose.own-postgres.yaml",
         "deploy/compose.own-postgres.yaml",
     ),
+    ("compose.own-tls.yaml", "deploy/compose.own-tls.yaml"),
     ("env.example", "deploy/.env.example"),
 ];
 
@@ -70,7 +73,7 @@ fn the_compose_files_and_env_example_are_copied_unchanged_beside_the_archives() 
     assert_eq!(
         out.names(),
         expected,
-        "expected the folder to hold the archives, the three Compose files, env.example and SHA256SUMS, and nothing else\n{}",
+        "expected the folder to hold the archives, the four Compose files, env.example and SHA256SUMS, and nothing else\n{}",
         ran.describe()
     );
     for (name, source) in COPIED {
@@ -183,5 +186,38 @@ fn sha256sum_check_passes_in_the_folder_and_fails_once_a_file_is_changed() {
         "expected the failure to name {}\n{}",
         archives[0],
         changed.describe()
+    );
+}
+
+#[test]
+fn sha256sums_has_a_line_for_compose_own_tls_yaml() {
+    let (out, ran, _) = release_folder();
+    ran.expect_ok();
+    let sums = fs::read_to_string(out.path().join("SHA256SUMS")).unwrap();
+    let want = sha256_hex(
+        &fs::read(repository_root().join("deploy/compose.own-tls.yaml"))
+            .expect("expected deploy/compose.own-tls.yaml in the repository"),
+    );
+    assert!(
+        sums.lines()
+            .any(|l| l == format!("{want}  compose.own-tls.yaml")),
+        "expected SHA256SUMS to have the line of compose.own-tls.yaml, the file of deploy/ unchanged:\n{sums}"
+    );
+}
+
+/// Nothing that names `v0.1.0`'s published files changes: `v0.1.0` does
+/// not have `compose.own-tls.yaml`, so neither its notes nor any address of
+/// the page under `releases/download/v0.1.0/` names it.
+#[test]
+fn nothing_names_compose_own_tls_yaml_among_v0_1_0s_published_files() {
+    let notes = blackbox::release::read_repository_file("docs/releases/v0.1.0.md");
+    assert!(
+        !notes.contains("compose.own-tls.yaml"),
+        "expected the notes of v0.1.0, already published, not to name compose.own-tls.yaml"
+    );
+    let page = blackbox::release::read_repository_file("docs/getting-started.md");
+    assert!(
+        !page.contains("/releases/download/v0.1.0/compose.own-tls.yaml"),
+        "expected no address of v0.1.0 to name compose.own-tls.yaml, which it does not have"
     );
 }

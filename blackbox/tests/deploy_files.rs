@@ -33,10 +33,11 @@
 use blackbox::release::read_repository_file;
 use yaml_rust2::{Yaml, YamlLoader};
 
-const COMPOSE_FILES: [&str; 3] = [
+const COMPOSE_FILES: [&str; 4] = [
     "deploy/compose.yaml",
     "deploy/compose.own-proxy.yaml",
     "deploy/compose.own-postgres.yaml",
+    "deploy/compose.own-tls.yaml",
 ];
 
 /// One piece of an interpolated value.

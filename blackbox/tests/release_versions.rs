@@ -106,6 +106,7 @@ fn the_image_compose_takes_without_vibe_image_and_the_one_env_example_and_readme
         "deploy/compose.yaml",
         "deploy/compose.own-proxy.yaml",
         "deploy/compose.own-postgres.yaml",
+        "deploy/compose.own-tls.yaml",
         "deploy/.env.example",
         "deploy/README.md",
     ] {
