@@ -342,6 +342,9 @@ struct Shared {
     keys: Keys,
     rng: SystemRandom,
     issuer: String,
+    /// Where the authorization endpoint is: the provider's own plain
+    /// address, which is the issuer unless it was started with another.
+    authorize_base: String,
     secret: String,
     stop: AtomicBool,
 }
@@ -395,6 +398,19 @@ pub struct Provider {
 impl Provider {
     /// Starts a provider on a free loopback port with these people.
     pub fn start(people: &[Person]) -> Self {
+        Self::start_as(people, None)
+    }
+
+    /// As [`Provider::start`], with this issuer (`https://localhost:<port>`
+    /// of a TLS front before it, say) in place of `http://127.0.0.1:<port>`:
+    /// its configuration names it, and its token endpoint and keys under it;
+    /// the authorization endpoint stays on the provider's own plain address,
+    /// where the harness's browser reaches it.
+    pub fn start_with_issuer(people: &[Person], issuer: &str) -> Self {
+        Self::start_as(people, Some(issuer))
+    }
+
+    fn start_as(people: &[Person], issuer: Option<&str>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0")
             .unwrap_or_else(|e| panic!("the identity provider cannot listen: {e}"));
         listener
@@ -446,11 +462,13 @@ impl Provider {
             own_secret_revoked: false,
             parked: 0,
         };
+        let plain = format!("http://127.0.0.1:{}", address.port());
         let shared = Arc::new(Shared {
             state: Mutex::new(state),
             keys,
             rng,
-            issuer: format!("http://127.0.0.1:{}", address.port()),
+            issuer: issuer.map_or_else(|| plain.clone(), str::to_owned),
+            authorize_base: plain,
             secret,
             stop: AtomicBool::new(false),
         });
@@ -1055,7 +1073,7 @@ fn configuration(shared: &Shared) -> Answer {
     }
     let mut body = json!({
             "issuer": issuer,
-            "authorization_endpoint": format!("{issuer}/authorize"),
+            "authorization_endpoint": format!("{}/authorize", shared.authorize_base),
             "token_endpoint": format!("{issuer}/token"),
             "jwks_uri": format!("{issuer}/jwks"),
             "response_types_supported": ["code"],

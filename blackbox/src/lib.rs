@@ -86,7 +86,10 @@
 //!   requests to it as a User, its pages read into what their `data-vm-...`
 //!   attributes say, its forms filled as a person fills them, and the rules
 //!   every page of it keeps; [`page`] is the harness's own small reader of
-//!   HTML it reads them with.
+//!   HTML it reads them with;
+//! - [`tls`] is what the tests of the tool over HTTPS and of `VIBE_CA_FILE`
+//!   share: test certificate authorities, TLS fronts before the program and
+//!   before the identity provider, and the harness's own TLS client.
 //!
 //! Every wait has a timeout, so a failing test fails within seconds and
 //! never hangs. Each test starts its own program on its own port, so tests
@@ -139,6 +142,7 @@ pub mod shared_database;
 pub mod sharing;
 pub mod sql;
 pub mod structure;
+pub mod tls;
 pub mod tool;
 pub mod tool_sign_ins;
 pub mod transactions;

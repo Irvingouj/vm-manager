@@ -650,9 +650,26 @@ impl Installation {
     /// provider, confirms, and is sent to the tool, which must answer it
     /// `200` and end with `0`. Returns what the tool printed.
     pub fn sign_in_tool(&self, machine: &Machine, sub: &str) -> Value {
+        let args = self.sign_in_args(&["--json"]);
+        self.sign_in_tool_with(machine, sub, &args, &[])
+    }
+
+    /// As [`Installation::sign_in_tool`], with these arguments of `vibe`
+    /// (all of them: `sign-in`, where, `--json`) and these environment
+    /// variables beside the harness's `BROWSER`.
+    pub fn sign_in_tool_with(
+        &self,
+        machine: &Machine,
+        sub: &str,
+        args: &[String],
+        env: &[(&str, &str)],
+    ) -> Value {
         let opener = BrowserCommand::on(machine);
         let (name, value) = opener.env();
-        let running = self.spawn_sign_in(machine, &["--json"], &[(name, value.as_str())]);
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let mut all_env: Vec<(&str, &str)> = vec![(name, value.as_str())];
+        all_env.extend_from_slice(env);
+        let running = machine.spawn_into_files(&machine.cwd(), &refs, &all_env);
         let Some(opened) = opener.wait_opened(OPEN_TIMEOUT) else {
             let stderr = running.stderr_so_far();
             drop(running);

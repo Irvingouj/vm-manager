@@ -24,13 +24,20 @@ tar = { version = "0.4", default-features = false }
 # To set up the shared databases the tests register as Resources, and to
 # look at them from outside the program: a client of the harness's own,
 # never the program's.
-tokio = { version = "1", features = ["rt", "net", "time"] }
+tokio = { version = "1", features = ["rt", "net", "time", "io-util", "macros"] }
 tokio-postgres = "0.7"
 # The harness's identity provider and browser (src/oidc.rs, src/browser.rs):
 # signing ID tokens, base64url, and URLs with their query strings.
 ring.workspace = true
 base64.workspace = true
 url.workspace = true
+# The harness's TLS fronts and client (src/tls.rs): an installation and an
+# identity provider behind TLS under test authorities the harness makes per
+# test (rcgen, with ring's cryptography: no system library), terminated by
+# rustls (the same crates, with the same features, as the workspace's).
+rustls.workspace = true
+tokio-rustls.workspace = true
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
 
 [lints]
 workspace = true
