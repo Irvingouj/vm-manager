@@ -37,7 +37,7 @@ use url::form_urlencoded::{Serializer, byte_serialize};
 
 use super::http::{Client, Failure};
 use super::secret::Secret;
-use super::settings::{Settings, check_issuer};
+use super::settings::Settings;
 use super::token::{self, Claims, Expected, Keys, Refused};
 use crate::log;
 use crate::trust::Refusal;
@@ -173,10 +173,10 @@ impl Provider {
                 return None;
             }
             let url = Url::parse(text).ok()?;
-            // `http` as for an issuer: with a loopback `http` issuer, or to
-            // a loopback host (crate::oidc::settings::check_issuer).
-            let scheme_ok = url.scheme() == "https"
-                || (url.scheme() == "http" && (plain || check_issuer(url.as_str()).is_ok()));
+            // An endpoint's scheme follows the issuer's: `http` only under
+            // an `http` (loopback) issuer; under an `https` one every
+            // endpoint is `https`, on a loopback host too.
+            let scheme_ok = url.scheme() == "https" || (plain && url.scheme() == "http");
             (scheme_ok && url.host().is_some() && url.fragment().is_none()).then_some(url)
         };
         let methods: Vec<&str> = json

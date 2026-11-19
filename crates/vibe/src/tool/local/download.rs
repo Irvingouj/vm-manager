@@ -229,14 +229,31 @@ fn remove_stale(folder: &Path) {
     }
 }
 
+/// Why a download failed.
+pub(super) enum Failed {
+    /// `VIBE_CA_FILE` cannot be used (crate::trust's message): found when
+    /// a connection is about to be made over `https`, whether the base
+    /// address is one (in any letter case: `HTTPS://` is `https` to the URI
+    /// parser) or an `http` mirror redirects to one; nothing was asked.
+    CaFile(String),
+    /// Anything else, in words.
+    Other(String),
+}
+
+impl From<String> for Failed {
+    fn from(words: String) -> Self {
+        Self::Other(words)
+    }
+}
+
 /// Downloads `archive` from `base` (a repository's base address) into
 /// `folder` (made with mode `0700` if it is not there), and answers the
-/// folder its programs are in. The error says what failed, in words.
+/// folder its programs are in. The error says what failed.
 pub(super) async fn download(
     archive: &Archive,
     base: &str,
     folder: &Path,
-) -> Result<PathBuf, String> {
+) -> Result<PathBuf, Failed> {
     DirBuilder::new()
         .recursive(true)
         .mode(0o700)
@@ -270,10 +287,10 @@ pub(super) async fn download(
             )
         })??;
     if fetched != archive.sha256 {
-        return Err(format!(
+        return Err(Failed::Other(format!(
             "what {url} sent has the SHA-256 {fetched}, not the {} this program carries for it: it is not the archive this program runs, and nothing of it was unpacked",
             archive.sha256
-        ));
+        )));
     }
     let from = jar.clone();
     let thread = Arc::clone(&shared);
@@ -292,14 +309,14 @@ pub(super) async fn download(
     let bin = unpacking.join("bin");
     for program in ["postgres", "initdb", "pg_ctl"] {
         if !bin.join(program).is_file() {
-            return Err(format!(
+            return Err(Failed::Other(format!(
                 "the archive from {url} has no bin/{program}: it is not a build of Postgres"
-            ));
+            )));
         }
     }
     let home = folder.join(archive.folder_name());
     if fs::rename(&unpacking, &home).is_err() && !home.join("bin").join("postgres").is_file() {
-        return Err(format!("{} cannot be made", home.display()));
+        return Err(Failed::Other(format!("{} cannot be made", home.display())));
     }
     // Another run that unpacked it first left its own, as good as this
     // one's; this one's is removed with the leftovers.
@@ -308,13 +325,15 @@ pub(super) async fn download(
 
 /// Fetches `url` (following redirects) into the file `into`, and answers
 /// the SHA-256 of what came, in lower-case hex.
-async fn fetch(url: &str, into: &Path) -> Result<String, String> {
+async fn fetch(url: &str, into: &Path) -> Result<String, Failed> {
     let first: Uri = url
         .parse()
         .map_err(|_| format!("{url} is not an address the tool can download from"))?;
     let scheme = first.scheme_str().unwrap_or_default().to_owned();
     if scheme != "https" && scheme != "http" {
-        return Err(format!("{url} is neither http:// nor https://"));
+        return Err(Failed::Other(format!(
+            "{url} is neither http:// nor https://"
+        )));
     }
     let mut at = first;
     for _ in 0..=MAX_REDIRECTS {
@@ -325,15 +344,17 @@ async fn fetch(url: &str, into: &Path) -> Result<String, String> {
                     .ok_or_else(|| format!("{at} redirects to an address that cannot be read"))?;
                 let to = next.scheme_str().unwrap_or_default();
                 if to != "https" && to != scheme {
-                    return Err(format!(
+                    return Err(Failed::Other(format!(
                         "{at} redirects to {next}, which is neither https:// nor the mirror's own scheme"
-                    ));
+                    )));
                 }
                 at = next;
             }
         }
     }
-    Err(format!("{url} redirects more than {MAX_REDIRECTS} times"))
+    Err(Failed::Other(format!(
+        "{url} redirects more than {MAX_REDIRECTS} times"
+    )))
 }
 
 /// What one `GET` came to.
@@ -356,7 +377,7 @@ fn resolve(from: &Uri, location: &str) -> Option<Uri> {
 }
 
 /// One `GET` of `uri`, its body into `into`.
-async fn get(uri: &Uri, into: &Path) -> Result<Got, String> {
+async fn get(uri: &Uri, into: &Path) -> Result<Got, Failed> {
     let host = uri
         .host()
         .ok_or_else(|| format!("{uri} names no host"))?
@@ -365,6 +386,13 @@ async fn get(uri: &Uri, into: &Path) -> Result<Got, String> {
         .to_owned();
     let tls = uri.scheme_str() == Some("https");
     let port = uri.port_u16().unwrap_or(if tls { 443 } else { 80 });
+    // The authorities before connecting: a VIBE_CA_FILE that cannot be
+    // used ends the download, as its own cause, before anything is asked.
+    let config = if tls {
+        Some(crate::trust::client_config().map_err(Failed::CaFile)?)
+    } else {
+        None
+    };
     let connected =
         tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect((host.as_str(), port)))
             .await
@@ -382,8 +410,8 @@ async fn get(uri: &Uri, into: &Path) -> Result<Got, String> {
         .header(USER_AGENT, "vibe")
         .body(Empty::<Bytes>::new())
         .map_err(|_| format!("{uri} cannot be asked for"))?;
-    if tls {
-        let stream = tokio::time::timeout(CONNECT_TIMEOUT, tls_connect(&host, connected))
+    if let Some(config) = config {
+        let stream = tokio::time::timeout(CONNECT_TIMEOUT, tls_connect(config, &host, connected))
             .await
             .map_err(|_| {
                 format!(
@@ -391,19 +419,19 @@ async fn get(uri: &Uri, into: &Path) -> Result<Got, String> {
                     CONNECT_TIMEOUT.as_secs()
                 )
             })??;
-        exchange(TokioIo::new(stream), request, uri, into).await
+        Ok(exchange(TokioIo::new(stream), request, uri, into).await?)
     } else {
-        exchange(TokioIo::new(connected), request, uri, into).await
+        Ok(exchange(TokioIo::new(connected), request, uri, into).await?)
     }
 }
 
 /// TLS over `stream`, the server checked against the authorities the
 /// program trusts (crate::trust).
 async fn tls_connect(
+    config: Arc<rustls::ClientConfig>,
     host: &str,
     stream: TcpStream,
 ) -> Result<tokio_rustls::client::TlsStream<TcpStream>, String> {
-    let config = crate::trust::client_config()?;
     let name = rustls::pki_types::ServerName::try_from(host.to_owned())
         .map_err(|_| format!("{host} is not a name TLS can check"))?;
     tokio_rustls::TlsConnector::from(config)

@@ -204,20 +204,25 @@ pub(super) async fn programs(
             .ok()
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| download::MAVEN_CENTRAL.to_owned());
-        // The authorities the download trusts, before anything is asked:
-        // a VIBE_CA_FILE that cannot be used is the tool's `ca-file`.
-        if base.starts_with("https://") {
-            crate::trust::client_config()
-                .map_err(|message| super::super::Ending::new(1, "ca-file", message))?;
-        }
         say(&format!(
             "Postgres {} is not on this machine yet: downloading it, once, from {base} into {} (it is kept there for every project)",
             download::VERSION,
             folder.display()
         ));
+        // A VIBE_CA_FILE that cannot be used is found by the download when
+        // it is about to connect over https (the base address, in any
+        // letter case, or a redirect to one), and carried here as its own
+        // cause: the tool's `ca-file`.
         download::download(&archive, &base, &folder)
             .await
-            .map_err(|why| unavailable(&format!("the download failed: {why}"), command))?;
+            .map_err(|failed| match failed {
+                download::Failed::CaFile(message) => {
+                    super::super::Ending::new(1, "ca-file", message)
+                }
+                download::Failed::Other(why) => {
+                    unavailable(&format!("the download failed: {why}"), command)
+                }
+            })?;
     }
     let programs = Programs { bin };
     match checked(&programs, own).await {

@@ -34,9 +34,14 @@ pub struct AdminArgs {
 /// A command for Platform administrators.
 #[derive(clap::Subcommand)]
 pub enum AdminCommand {
-    /// Connect OIDC: with the setup credential in VIBE_SETUP_CREDENTIAL (and
-    /// --domain, with --port and --resolve or --connect), or as a Platform administrator signed in;
-    /// the client secret in VIBE_OIDC_CLIENT_SECRET.
+    /// Connect OIDC, with the setup credential or as a Platform
+    /// administrator signed in.
+    ///
+    /// With the setup credential in VIBE_SETUP_CREDENTIAL, --domain says
+    /// where the installation is: over HTTPS, with --port and --resolve as
+    /// for vibe sign-in, or over plain HTTP on this machine with --connect.
+    /// Without it, the command goes to the installation the tool is signed
+    /// in to. The client secret is read from VIBE_OIDC_CLIENT_SECRET.
     ConnectOidc(ConnectOidcArgs),
 }
 
