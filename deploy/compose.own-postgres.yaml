@@ -11,7 +11,7 @@
 #                      through the database postgres, which README.md has you
 #                      close to PUBLIC. A server that is not Postgres 18 is
 #                      refused at start, and the vibe container's log says so.
-#   POSTGRES_PASSWORD  not needed.
+#   POSTGRES_PASSWORD  not needed, and never asked for.
 #
 # README.md says the two things to do on your Postgres first.
 

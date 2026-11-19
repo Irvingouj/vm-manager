@@ -13,7 +13,7 @@ Every command below uses the domain `vibe.example.com`. Put your own domain in i
 
 For the installation:
 
-- a Linux server with Docker Engine 25.0 or later and its Compose plugin 2.24.1 or later, on `x86-64` (the image is for `linux/amd64` only);
+- a Linux server with Docker Engine 25.0 or later and its Compose plugin 2.24.1 or later, on `x86-64` (the image is for `linux/amd64` only). That minimum is read from Docker's notes and was not tried; [`deploy/README.md`](../deploy/README.md) names the versions the install tests ran with;
 - a domain whose names all reach the server: a DNS record for `*.vibe.example.com`. Applications are at `<name>.vibe.example.com`;
 - a certificate for `*.vibe.example.com` and its private key, in PEM;
 - an OIDC identity provider at which you can register a client.
@@ -49,7 +49,7 @@ sed -i "s|^VIBE_SECRET_KEY=.*|VIBE_SECRET_KEY=$(openssl rand -base64 32)|" .env
 sed -i "s|^POSTGRES_PASSWORD=.*|POSTGRES_PASSWORD=$(openssl rand -hex 24)|" .env
 ```
 
-Keep `.env` as long as you keep the data. As downloaded, the installation answers on `127.0.0.1` only. To let other machines in, add `VIBE_BIND=0.0.0.0`:
+Without the domain or the key, `docker compose` refuses to start and names the value. Without the password, the bundled Postgres does not start and `docker compose logs postgres` names `POSTGRES_PASSWORD`: set it and run `docker compose up -d` again. Keep `.env` as long as you keep the data. As downloaded, the installation answers on `127.0.0.1` only. To let other machines in, add `VIBE_BIND=0.0.0.0`:
 
 ```sh
 echo "VIBE_BIND=0.0.0.0" >> .env

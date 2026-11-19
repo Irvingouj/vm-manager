@@ -4,7 +4,7 @@ This takes you from a Linux machine with Docker to a person signed in. The platf
 
 You need:
 
-- a machine with Docker Engine 25.0 or later and its Compose plugin 2.24.1 or later: `docker version --format '{{.Server.Version}}'` prints the Engine's version, `docker compose version` the plugin's (why these: [Why these versions of Docker](#why-these-versions-of-docker), at the end);
+- a machine with Docker Engine 25.0 or later and its Compose plugin 2.24.1 or later: `docker version --format '{{.Server.Version}}'` prints the Engine's version, `docker compose version` the plugin's. That minimum is read from Docker's notes and was not run; the install tests ran with Engine 28.0.4 and Compose 2.38.2, and with Engine 29.2.1 and Compose 5.0.2 (see [Why these versions of Docker](#why-these-versions-of-docker), at the end);
 - a domain for the installation, here `vibe.example.com`, whose names all reach the machine: Applications are at `<name>.vibe.example.com`, the platform's API at `api.vibe.example.com`, sign-in at `auth.vibe.example.com`, the Dashboard at `dashboard.vibe.example.com` (a DNS record for `*.vibe.example.com`);
 - a certificate for `*.vibe.example.com` and its private key, in PEM;
 - an OIDC identity provider at which you can register a client;
@@ -37,7 +37,8 @@ sed -i "s|^POSTGRES_PASSWORD=.*|POSTGRES_PASSWORD=$(openssl rand -hex 24)|" .env
 
 - `VIBE_SECRET_KEY` is the installation's key (`openssl rand -base64 32`). It seals the OIDC connection and the sessions in the platform database. Keep `.env` as long as you keep the data: with another key, OIDC has to be connected again.
 - `POSTGRES_PASSWORD` is the password of the role `vibe` in the bundled Postgres (`openssl rand -hex 24`).
-- Without one of the three, `docker compose` refuses to start and names the value.
+- Without `VIBE_DOMAIN` or `VIBE_SECRET_KEY`, `docker compose` refuses to start and names the value.
+- Without `POSTGRES_PASSWORD`, or with it empty, the bundled Postgres does not start: `docker compose up -d` ends with an error (`dependency failed to start: container ... is unhealthy`), `vibe` is not started, `docker compose ps` shows `postgres` restarting, and `docker compose logs postgres` names `POSTGRES_PASSWORD`. Set it in `.env` and run `docker compose up -d` again.
 
 As downloaded, the installation is published on `127.0.0.1` only: it is reached from this machine alone. To let other machines in, set:
 
@@ -250,7 +251,7 @@ removes the bundled Postgres's data, every Application's included, for good.
 
 ## Why these versions of Docker
 
-The Compose files use three things that older versions do not have, each according to Docker's own notes:
+The install tests ran with two pairs of versions: Docker Engine 28.0.4 with Compose 2.38.2 (GitHub's hosted runner, in the release workflow), and Docker Engine 29.2.1 with Compose 5.0.2 (the machine of the install gate). The minimum this document gives, Engine 25.0 and Compose 2.24.1, was not run: it is read from Docker's notes. The Compose files use three things that older versions do not have, each according to Docker's own notes:
 
 - a config written in the file itself (`configs: ... content:`), for the Postgres first-start script and the proxy's configuration: Compose 2.23.1 ([Compose file reference, configs](https://docs.docker.com/reference/compose-file/configs/): "`content`: The content is created with the inlined value. Introduced in Docker Compose version 2.23.1");
 - the health check's `start_interval`, so that a fresh install is seen healthy within seconds: Docker Engine 25.0.0 ([Engine 25.0 release notes](https://docs.docker.com/engine/release-notes/25.0/), "Add an additional interval to be used by healthchecks during the container start period") and Compose 2.24.0, whose [release notes](https://github.com/docker/compose/releases/tag/v2.24.0) list "Add support for start_interval", with the check of the Engine's version it needs fixed in [2.24.1](https://github.com/docker/compose/releases/tag/v2.24.1) ("fix engine version require to use healthcheck.start_interval");

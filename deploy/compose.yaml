@@ -17,7 +17,16 @@
 #                      base64 (openssl rand -base64 32). It seals the OIDC
 #                      connection and the sessions; keep it with the data.
 #   POSTGRES_PASSWORD  required with the Postgres here. The password of the
-#                      role vibe (openssl rand -hex 24).
+#                      role vibe (openssl rand -hex 24). Compose does not ask
+#                      for it: without it, or empty, the Postgres here does
+#                      not start (its log names POSTGRES_PASSWORD) and vibe
+#                      is not started; set it, then docker compose up -d.
+#
+# Compose itself refuses to start without VIBE_DOMAIN or VIBE_SECRET_KEY,
+# naming the value. A value Compose asks for (${NAME:?...}) is never written
+# inside another value's default: Compose versions differ in whether they
+# look at it when the outer value is set (2.38.2 always, 5.0.2 only when the
+# outer one is missing).
 #   VIBE_BIND          the address the installation is published on:
 #                      127.0.0.1 without it (this machine only); 0.0.0.0
 #                      lets other machines in.
@@ -48,7 +57,10 @@ services:
       VIBE_SECRET_KEY: ${VIBE_SECRET_KEY:?VIBE_SECRET_KEY is required in .env, the installation's key, made with openssl rand -base64 32}
       # The platform database: the Postgres here, as the role vibe. With
       # compose.own-postgres.yaml, VIBE_DATABASE_URL from .env instead.
-      VIBE_DATABASE_URL: ${VIBE_DATABASE_URL:-postgres://vibe:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required in .env, the bundled Postgres's password, made with openssl rand -hex 24}@postgres:5432/vibe}
+      # POSTGRES_PASSWORD is not asked for here (see above): without it the
+      # Postgres here never becomes healthy, so vibe is never started with
+      # an empty password.
+      VIBE_DATABASE_URL: ${VIBE_DATABASE_URL:-postgres://vibe:${POSTGRES_PASSWORD:-}@postgres:5432/vibe}
       VIBE_CA_FILE: ${VIBE_CA_FILE:-}
     volumes:
       # Your company's own certificate authority, if any (VIBE_CA_FILE).
@@ -76,6 +88,10 @@ services:
       # The password of the superuser postgres and of the role vibe. The
       # superuser cannot connect over the network at all (see the script
       # below); inside the container: docker compose exec postgres psql -U postgres
+      # Empty or missing: the image refuses to make a new Postgres, saying
+      # POSTGRES_PASSWORD in its log, and the container is restarted (and
+      # refuses again) until the value is set and `docker compose up -d` run
+      # again; on a Postgres already made, the health check below fails.
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-}
     volumes:
       # Postgres 18's image keeps its data under /var/lib/postgresql
@@ -96,11 +112,13 @@ services:
     # connections over TCP (the first start's script runs with the server
     # on its socket only). A first start that was interrupted leaves no
     # mark: the service is unhealthy at every later start and vibe is not
-    # started (README.md, "If the first start was interrupted"). The check
+    # started (README.md, "If the first start was interrupted"). Never
+    # healthy either while POSTGRES_PASSWORD is empty, so that vibe is not
+    # started with an empty password on a Postgres made earlier. The check
     # runs as the user postgres, signs in nowhere, and is asked every second
     # for the first two minutes, then every 30 seconds.
     healthcheck:
-      test: ["CMD-SHELL", "test -f \"$$PGDATA/vibe-first-start-finished\" || { echo 'the first start of this Postgres did not finish: see deploy/README.md'; exit 1; }; pg_isready --host 127.0.0.1 --username vibe --dbname vibe"]
+      test: ["CMD-SHELL", "test -n \"$$POSTGRES_PASSWORD\" || { echo 'POSTGRES_PASSWORD is empty in .env: set it, then docker compose up -d'; exit 1; }; test -f \"$$PGDATA/vibe-first-start-finished\" || { echo 'the first start of this Postgres did not finish: see deploy/README.md'; exit 1; }; pg_isready --host 127.0.0.1 --username vibe --dbname vibe"]
       start_period: 120s
       start_interval: 1s
       interval: 30s
