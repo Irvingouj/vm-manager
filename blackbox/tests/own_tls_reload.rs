@@ -23,9 +23,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use blackbox::own_tls::{
-    KeyKind, KeyLabel, Pair, Serving, Shaken, TAKEN_WITHIN, Validity, assert_loaded_record,
-    installation_names, options_for, replace_by_renaming, served_fingerprint, shake,
-    start_on_a_port, wait_until_served, write_in_place,
+    CANNOT_BE_READ, KeyKind, KeyLabel, Pair, Serving, Shaken, TAKEN_WITHIN, Validity,
+    assert_loaded_record, damaged_keys, hide_keys, installation_names, options_for,
+    replace_by_renaming, served_fingerprint, shake, start_on_a_port, wait_until_served,
+    write_in_place,
 };
 use blackbox::tls::{Authority, Files, api_name, text_of};
 use blackbox::{Vm, VmOptions};
@@ -270,6 +271,87 @@ fn a_replacement_for_another_domain_is_refused_and_the_old_certificate_stays() {
         &old,
         "after a refusal",
     );
+}
+
+/// Watches for [`WATCH`]: every new connection gets `old`, and `open`
+/// goes on with it.
+fn old_stays(serving: &Serving, old: &str, open: &mut Shaken, context: &str) {
+    let began = Instant::now();
+    while began.elapsed() < WATCH {
+        assert_eq!(
+            served_fingerprint(serving.address()).as_deref(),
+            Ok(old),
+            "{context}: expected the certificate in use to go on being served ({:?} after)",
+            began.elapsed()
+        );
+        still_served(open, old, context);
+        thread::sleep(Duration::from_millis(500));
+    }
+}
+
+#[test]
+fn a_damaged_key_written_under_the_running_program_changes_nothing_and_is_refused_once_as_unreadable()
+ {
+    let serving = Serving::start();
+    let old = serving.pair.fingerprint();
+    let mut open = open_connection(&serving);
+    let (what, damaged) = damaged_keys(KeyLabel::Pkcs8).into_iter().next().unwrap();
+    write_in_place(&serving.place.key, damaged.as_bytes());
+    old_stays(
+        &serving,
+        &old,
+        &mut open,
+        &format!("{what} written as the key"),
+    );
+    let refused = serving.refused();
+    assert_eq!(
+        refused.len(),
+        1,
+        "expected the damaged key logged once for that content: {}",
+        hide_keys(&format!("{refused:?}"), &[&damaged])
+    );
+    assert_refused_records(&refused);
+    let reason = refused[0]["reason"].as_str().unwrap_or_default();
+    let lower = reason.to_lowercase();
+    assert!(
+        CANNOT_BE_READ.iter().any(|w| lower.contains(w)),
+        "expected the reason to say the key cannot be read (one of {CANNOT_BE_READ:?}): {}",
+        hide_keys(reason, &[&damaged])
+    );
+    for wrong in ["not supported", "unsupported"] {
+        assert!(
+            !lower.contains(wrong),
+            "expected the reason not to call the damaged key a kind {wrong:?}: {}",
+            hide_keys(reason, &[&damaged])
+        );
+    }
+    assert_loaded(&serving, &[&serving.pair]);
+    serving.assert_no_key_logged(&[&damaged]);
+    // The right key written back: the pair in use. Nothing more is
+    // refused; it is served still, and is either not logged again or
+    // logged loaded as the same pair.
+    write_in_place(&serving.place.key, serving.pair.key_pem().as_bytes());
+    old_stays(&serving, &old, &mut open, "the right key written back");
+    let refused = serving.refused();
+    assert_eq!(
+        refused.len(),
+        1,
+        "expected nothing more refused once the right key is back: {}",
+        hide_keys(&format!("{refused:?}"), &[&damaged])
+    );
+    let loaded = serving.loaded();
+    assert!(
+        loaded.len() <= 2,
+        "expected the pair in use logged loaded at most once more: {loaded:?}"
+    );
+    for record in &loaded {
+        assert_loaded_record(record, &serving.pair, true);
+    }
+    eprintln!(
+        "a damaged key, then the right one back: 1 refused, {} loaded records",
+        loaded.len()
+    );
+    serving.assert_no_key_logged(&[&damaged]);
 }
 
 #[test]

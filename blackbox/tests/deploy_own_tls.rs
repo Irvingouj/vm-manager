@@ -310,3 +310,45 @@ fn the_install_document_gives_the_own_tls_file_as_the_alternative_to_the_proxy()
         "expected deploy/README.md to say, in one paragraph, that compose.own-tls.yaml cannot be given together with compose.own-proxy.yaml"
     );
 }
+
+/// The section of a Markdown text whose heading holds `title`: from that
+/// heading to the next heading of the same level or above.
+fn section(text: &str, title: &str) -> Option<String> {
+    let lines: Vec<&str> = text.lines().collect();
+    let level = |l: &str| l.chars().take_while(|c| *c == '#').count();
+    let at = lines
+        .iter()
+        .position(|l| level(l) > 0 && l.contains(title))?;
+    let own = level(lines[at]);
+    let end = lines
+        .iter()
+        .skip(at + 1)
+        .position(|l| (1..=own).contains(&level(l)))
+        .map_or(lines.len(), |n| at + 1 + n);
+    Some(lines[at..end].join("\n"))
+}
+
+#[test]
+fn the_install_documents_own_tls_section_names_the_kinds_of_key_taken_with_the_bounds_of_an_rsa_key()
+ {
+    let readme = read_repository_file("deploy/README.md");
+    let title = "The program serves TLS itself";
+    let part = section(&readme, title)
+        .unwrap_or_else(|| panic!("expected deploy/README.md to have a section \"{title}\""));
+    let lower = part.to_lowercase();
+    for (words, what) in [
+        (&["2048"][..], "the lower bound of an RSA key"),
+        (&["4096"][..], "the upper bound of an RSA key"),
+        (
+            &["p-256", "p256", "secp256r1", "prime256v1"][..],
+            "ECDSA on P-256",
+        ),
+        (&["p-384", "p384", "secp384r1"][..], "ECDSA on P-384"),
+        (&["ed25519"][..], "Ed25519"),
+    ] {
+        assert!(
+            words.iter().any(|w| lower.contains(w)),
+            "expected the section \"{title}\" of deploy/README.md to name the kinds of key taken: {what} (one of {words:?}); it says:\n{part}"
+        );
+    }
+}

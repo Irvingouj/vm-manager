@@ -24,9 +24,9 @@ use std::time::Duration;
 
 use blackbox::DOMAIN;
 use blackbox::own_tls::{
-    CERT_VAR, Hello, KEY_VAR, KeyKind, KeyLabel, MIB, Pair, Place, Serving, Validity,
-    assert_loaded_record, assert_no_key_in, certificate, damaged_keys, fingerprint, fixture_text,
-    hide_keys, installation_names, listened, serve_once, shake, wildcard,
+    CANNOT_BE_READ, CERT_VAR, Hello, KEY_VAR, KeyKind, KeyLabel, MIB, Pair, Place, Serving,
+    Validity, assert_loaded_record, assert_no_key_in, certificate, damaged_keys, fingerprint,
+    fixture_text, hide_keys, installation_names, listened, serve_once, shake, wildcard,
 };
 use blackbox::program::Finished;
 use blackbox::tls::{Authority, api_name, pem, text_of};
@@ -564,34 +564,133 @@ fn an_rsa_key_of_1024_bits_is_refused_as_a_kind_not_taken() {
         &[],
         &g.env(),
         &[KEY_VAR, &path],
-        &[
-            &[
-                "1024",
-                "2048",
-                "kind",
-                "not supported",
-                "unsupported",
-                "too small",
-                "too short",
-            ],
-            KINDS_TAKEN[0],
-            KINDS_TAKEN[1],
-            KINDS_TAKEN[2],
-            KINDS_TAKEN[3],
-        ],
+        &not_taken(&[
+            "1024",
+            "kind",
+            "not supported",
+            "unsupported",
+            "too small",
+            "too short",
+        ]),
         &[&key],
     );
 }
 
-/// The kinds a key may be of, each in the words it may be named by: the
-/// message of a key of a kind not taken names them all ("the message names
-/// the kinds that are taken").
-const KINDS_TAKEN: [&[&str]; 4] = [
+#[test]
+fn an_rsa_key_of_6144_bits_is_refused_as_a_kind_not_taken_naming_both_bounds() {
+    let g = given();
+    let large = Pair::issued(
+        &g.authority,
+        KeyKind::Rsa6144,
+        KeyLabel::Pkcs8,
+        &installation_names(),
+        Validity::Now,
+    );
+    g.place.write(&large);
+    let key = large.key_pem();
+    let path = g.key();
+    assert_refused(
+        "an RSA key of 6144 bits, with its certificate",
+        &[],
+        &g.env(),
+        &[KEY_VAR, &path],
+        &not_taken(&[
+            "6144",
+            "kind",
+            "not supported",
+            "unsupported",
+            "too large",
+            "too big",
+            "too long",
+            "not taken",
+        ]),
+        &[&key],
+    );
+}
+
+/// Fails unless a P-256 key with its curve written out as parameters,
+/// under `label`, its certificate (naming the curve) beside it, is refused
+/// as a kind not taken naming the kinds that are, and not as a key that
+/// cannot be read or is damaged.
+fn explicit_curve_is_refused(label: KeyLabel) {
+    let g = given();
+    let explicit = Pair::issued(
+        &g.authority,
+        KeyKind::EcdsaP256Explicit,
+        label,
+        &installation_names(),
+        Validity::Now,
+    );
+    g.place.write(&explicit);
+    let key = explicit.key_pem();
+    let path = g.key();
+    let what = format!(
+        "a P-256 key with its curve written out as parameters, as `{}`",
+        key.lines().next().unwrap_or_default()
+    );
+    let said = assert_refused(
+        &what,
+        &[],
+        &g.env(),
+        &[KEY_VAR, &path],
+        &not_taken(&[
+            "kind",
+            "not supported",
+            "unsupported",
+            "not taken",
+            "parameters",
+            "explicit",
+            "named",
+        ]),
+        &[&key],
+    );
+    let lower = said.to_lowercase();
+    for wrong in [
+        "cannot be read",
+        "can't be read",
+        "could not be read",
+        "unreadable",
+        "damaged",
+        "corrupt",
+        "malformed",
+    ] {
+        assert!(
+            !lower.contains(wrong),
+            "expected {what} said to be of a kind not taken, not a key that cannot be read ({wrong:?}):\n{}",
+            hide_keys(&said, &[&key])
+        );
+    }
+}
+
+#[test]
+fn a_p256_private_key_with_its_curve_written_out_is_refused_as_a_kind_not_taken() {
+    explicit_curve_is_refused(KeyLabel::Pkcs8);
+}
+
+#[test]
+fn a_p256_ec_private_key_with_its_curve_written_out_is_refused_as_a_kind_not_taken() {
+    explicit_curve_is_refused(KeyLabel::Ec);
+}
+
+/// The kinds a key may be of, each in the words it may be named by, with
+/// the two bounds of an RSA key: the message of a key of a kind not taken
+/// names them all ("the message names the kinds that are taken, with the
+/// two bounds of an RSA key").
+const KINDS_TAKEN: [&[&str]; 6] = [
     &["rsa"],
+    &["2048"],
+    &["4096"],
     &["p-256", "p256", "secp256r1", "prime256v1"],
     &["p-384", "p384", "secp384r1"],
     &["ed25519"],
 ];
+
+/// `first` (one of its words says why), then each of the kinds taken.
+fn not_taken<'a>(first: &'a [&'a str]) -> Vec<&'a [&'a str]> {
+    let mut why = vec![first];
+    why.extend(KINDS_TAKEN);
+    why
+}
 
 #[test]
 fn an_ecdsa_key_on_p_521_is_refused_as_a_kind_not_taken_naming_the_kinds_that_are() {
@@ -600,7 +699,7 @@ fn an_ecdsa_key_on_p_521_is_refused_as_a_kind_not_taken_naming_the_kinds_that_ar
     g.place.write_cert(fixture_text("p521-cert.pem").as_bytes());
     g.place.write_key(key.as_bytes());
     let path = g.key();
-    let mut why: Vec<&[&str]> = vec![&[
+    let why = not_taken(&[
         "kind",
         "not supported",
         "unsupported",
@@ -608,8 +707,7 @@ fn an_ecdsa_key_on_p_521_is_refused_as_a_kind_not_taken_naming_the_kinds_that_ar
         "p-521",
         "p521",
         "secp521r1",
-    ]];
-    why.extend(KINDS_TAKEN);
+    ]);
     assert_refused(
         "an ECDSA key on P-521 (PRIVATE KEY), with its certificate for api and the wildcard",
         &[],
@@ -626,8 +724,7 @@ fn a_dsa_private_key_is_refused_as_a_kind_not_taken_naming_the_kinds_that_are() 
     let key = fixture_text("dsa.pem");
     g.place.write_key(key.as_bytes());
     let path = g.key();
-    let mut why: Vec<&[&str]> = vec![&["kind", "not supported", "unsupported", "not taken", "dsa"]];
-    why.extend(KINDS_TAKEN);
+    let why = not_taken(&["kind", "not supported", "unsupported", "not taken", "dsa"]);
     assert_refused(
         "a key file holding a `DSA PRIVATE KEY`",
         &[],
@@ -637,26 +734,6 @@ fn a_dsa_private_key_is_refused_as_a_kind_not_taken_naming_the_kinds_that_are() 
         &[&key],
     );
 }
-
-/// The words a message may use to say a key cannot be read.
-const CANNOT_BE_READ: &[&str] = &[
-    "cannot be read",
-    "can't be read",
-    "could not be read",
-    "cannot read",
-    "could not read",
-    "unreadable",
-    "damaged",
-    "corrupt",
-    "malformed",
-    "cannot be parsed",
-    "could not be parsed",
-    "cannot parse",
-    "could not parse",
-    "failed to parse",
-    "not a valid",
-    "invalid",
-];
 
 /// Fails unless each damaged key of `label`, the installation's
 /// certificate beside it, is a start-up failure saying the key cannot be
@@ -859,4 +936,52 @@ fn a_certificate_valid_now_is_logged_at_start_with_the_contracts_fields() {
         serving.pair.fingerprint()
     );
     serving.assert_no_key_logged(&[]);
+}
+
+// --- The program's help -----------------------------------------------------
+
+#[test]
+fn serve_help_names_the_two_variables_and_what_they_are_for() {
+    let mut command = std::process::Command::new(blackbox::program::vm_binary());
+    command
+        .args(["serve", "--help"])
+        .env_remove(CERT_VAR)
+        .env_remove(KEY_VAR);
+    let finished = blackbox::program::run_to_exit(command, Duration::from_secs(15))
+        .unwrap_or_else(|problem| panic!("cannot run `vibe serve --help`: {problem}"));
+    let shown = format!(
+        "exit: {}\nstandard output:\n{}\nstandard error:\n{}",
+        finished.status_text(),
+        finished.stdout,
+        finished.stderr
+    );
+    assert!(
+        finished.status.is_some_and(|s| s.success()),
+        "expected `vibe serve --help` to end with 0\n{shown}"
+    );
+    for name in [CERT_VAR, KEY_VAR] {
+        assert!(
+            finished.stdout.contains(name),
+            "expected `vibe serve --help` to name {name} on standard output, as it names VIBE_DATABASE_URL and VIBE_SECRET_KEY\n{shown}"
+        );
+    }
+    // A sentence saying what they are for: in the lines that name them, or
+    // the one after each.
+    let lines: Vec<&str> = finished.stdout.lines().collect();
+    for name in [CERT_VAR, KEY_VAR] {
+        let said: String = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.contains(name))
+            .flat_map(|(at, _)| lines.iter().skip(at).take(3))
+            .map(|l| l.to_lowercase())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            ["certificate", "key", "tls", "https"]
+                .iter()
+                .any(|w| said.replace(&name.to_lowercase(), "").contains(w)),
+            "expected `vibe serve --help` to say what {name} is for (\"certificate\", \"key\", \"TLS\" or \"HTTPS\", near its name)\n{shown}"
+        );
+    }
 }

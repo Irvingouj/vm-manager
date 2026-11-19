@@ -3,12 +3,15 @@
 //! `VIBE_TLS_KEY_FILE`, with no front of the harness's before it.
 //!
 //! - [`Key`] is a private key of one of the kinds the contract names (RSA
-//!   2048, ECDSA P-256 and P-384, Ed25519) or of one it does not (RSA
-//!   1024), written under any of the three PEM labels it names
-//!   ([`KeyLabel`]). ring (through rcgen) makes the ECDSA and Ed25519 keys
-//!   per test; it cannot make an RSA key, so the two RSA keys are files of
-//!   `fixtures/tls/`, made once with `openssl genpkey` (OpenSSL 3.0.2) and
-//!   kept: the gate never runs `openssl`. The `RSA PRIVATE KEY` and `EC
+//!   2048, 3072 and 4096, ECDSA P-256 and P-384, Ed25519) or of one it does
+//!   not (RSA 1024 and 6144, P-256 with its curve written out as
+//!   parameters), written under any of the three PEM labels it names
+//!   ([`KeyLabel`]), and as the usual tools write a key file ([`Written`]).
+//!   ring (through rcgen) makes the ECDSA and Ed25519 keys per test; it
+//!   cannot make an RSA key nor write a curve out, so those keys (and the
+//!   P-521 and DSA keys of the start-up tests) are files of
+//!   `fixtures/tls/`, test keys only, made once with `openssl` (OpenSSL
+//!   3.0.2) and kept: the gate never runs `openssl`. The `RSA PRIVATE KEY` and `EC
 //!   PRIVATE KEY` forms are taken out of the PKCS #8 form by the harness's
 //!   own small DER reader (the EC one with its curve named, as OpenSSL
 //!   writes it). No key is ever printed: a `Debug` shows its kind only, and
@@ -93,9 +96,18 @@ pub fn installation_names() -> Vec<String> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KeyKind {
     Rsa2048,
+    Rsa3072,
+    Rsa4096,
     /// Not a kind the program takes: RSA under 2048 bits.
     Rsa1024,
+    /// Not a kind the program takes: RSA over 4096 bits.
+    Rsa6144,
     EcdsaP256,
+    /// Not a kind the program takes: P-256 with its curve written out as
+    /// explicit parameters instead of named (the fixture's, as `openssl
+    /// genpkey -pkeyopt ec_param_enc:explicit` writes it; `EC PRIVATE KEY`
+    /// as `openssl ec -param_enc explicit` writes it).
+    EcdsaP256Explicit,
     EcdsaP384,
     Ed25519,
 }
@@ -146,7 +158,11 @@ impl Key {
     pub fn new(kind: KeyKind) -> Self {
         match kind {
             KeyKind::Rsa2048 => Self::rsa_fixture(kind, "rsa-2048.pem"),
+            KeyKind::Rsa3072 => Self::rsa_fixture(kind, "rsa-3072.pem"),
+            KeyKind::Rsa4096 => Self::rsa_fixture(kind, "rsa-4096.pem"),
             KeyKind::Rsa1024 => Self::rsa_fixture(kind, "rsa-1024.pem"),
+            KeyKind::Rsa6144 => Self::rsa_fixture(kind, "rsa-6144.pem"),
+            KeyKind::EcdsaP256Explicit => Self::explicit_fixture(kind),
             KeyKind::EcdsaP256 => Self::generated(kind, &rcgen::PKCS_ECDSA_P256_SHA256),
             KeyKind::EcdsaP384 => Self::generated(kind, &rcgen::PKCS_ECDSA_P384_SHA384),
             KeyKind::Ed25519 => Self::generated(kind, &rcgen::PKCS_ED25519),
@@ -186,6 +202,55 @@ impl Key {
         }
     }
 
+    /// The P-256 key of `p256-explicit-pkcs8.pem`; its certificate names
+    /// the curve (the same point), as a certificate the harness issues for
+    /// any P-256 key does: only the key file writes the curve out.
+    fn explicit_fixture(kind: KeyKind) -> Self {
+        let text = fixture_text("p256-explicit-pkcs8.pem");
+        let pkcs8 = pem_body(&text, "PRIVATE KEY")
+            .unwrap_or_else(|| panic!("p256-explicit-pkcs8.pem holds no PRIVATE KEY"));
+        let point = pkcs8_private_key(&pkcs8)
+            .and_then(|inner| sequence(&inner))
+            .and_then(|parts| {
+                parts
+                    .iter()
+                    .find(|(tag, _, _)| *tag == 0xa1)
+                    .map(|(_, _, content)| content.clone())
+            })
+            .and_then(|bit_string| {
+                element(&bit_string)
+                    .and_then(|(_, _, range)| bit_string.get(range)?.get(1..).map(<[u8]>::to_vec))
+            })
+            .unwrap_or_else(|| panic!("p256-explicit-pkcs8.pem holds no public point"));
+        Self {
+            kind,
+            pkcs8,
+            public: RawPublic {
+                bytes: point,
+                alg: &rcgen::PKCS_ECDSA_P256_SHA256,
+            },
+        }
+    }
+
+    /// Whether the PKCS #8 form the harness writes holds the public key
+    /// (`[1]`, version 2): ring's Ed25519 keys do.
+    pub fn pkcs8_holds_public_key(&self) -> bool {
+        sequence(&self.pkcs8)
+            .is_some_and(|parts| parts.iter().any(|(tag, _, _)| *tag == 0x81 || *tag == 0xa1))
+    }
+
+    /// The key as `PRIVATE KEY` in PKCS #8 version 1: version, algorithm
+    /// and private key, without the public key. Never print it.
+    pub fn pem_without_public_key(&self) -> String {
+        let parts =
+            sequence(&self.pkcs8).unwrap_or_else(|| panic!("the harness's own key is not PKCS #8"));
+        let mut content = encode(0x02, &[0]);
+        for (_, whole, _) in parts.iter().skip(1).take(2) {
+            content.extend_from_slice(whole);
+        }
+        pem("PRIVATE KEY", &encode(0x30, &content))
+    }
+
     pub fn kind(&self) -> KeyKind {
         self.kind
     }
@@ -196,13 +261,23 @@ impl Key {
             KeyLabel::Pkcs8 => pem("PRIVATE KEY", &self.pkcs8),
             KeyLabel::Rsa => {
                 assert!(
-                    matches!(self.kind, KeyKind::Rsa2048 | KeyKind::Rsa1024),
+                    matches!(
+                        self.kind,
+                        KeyKind::Rsa2048
+                            | KeyKind::Rsa3072
+                            | KeyKind::Rsa4096
+                            | KeyKind::Rsa1024
+                            | KeyKind::Rsa6144
+                    ),
                     "the harness's own check: `RSA PRIVATE KEY` is for an RSA key, not {:?}",
                     self.kind
                 );
                 let inner = pkcs8_private_key(&self.pkcs8)
                     .unwrap_or_else(|| panic!("the harness's own key is not PKCS #8"));
                 pem("RSA PRIVATE KEY", &inner)
+            }
+            KeyLabel::Ec if self.kind == KeyKind::EcdsaP256Explicit => {
+                fixture_text("p256-explicit-ec.pem")
             }
             KeyLabel::Ec => {
                 assert!(
@@ -260,6 +335,26 @@ pub fn damaged_keys(label: KeyLabel) -> Vec<(String, String)> {
         ),
     ]
 }
+
+/// The words a message may use to say a key cannot be read.
+pub const CANNOT_BE_READ: &[&str] = &[
+    "cannot be read",
+    "can't be read",
+    "could not be read",
+    "cannot read",
+    "could not read",
+    "unreadable",
+    "damaged",
+    "corrupt",
+    "malformed",
+    "cannot be parsed",
+    "could not be parsed",
+    "cannot parse",
+    "could not parse",
+    "failed to parse",
+    "not a valid",
+    "invalid",
+];
 
 /// The path of a file of `fixtures/tls/`.
 pub fn fixture_path(file: &str) -> PathBuf {
@@ -461,6 +556,27 @@ pub fn fingerprint(certificate: &[u8]) -> String {
         .collect()
 }
 
+/// How the two files are written beyond the key's label: as the usual
+/// tools write them (CONTRACT.md, "The two files": "A key file is taken as
+/// the usual tools write it").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Written {
+    /// The PEM sections alone, LF line ends.
+    Plain,
+    /// `Bag Attributes` lines before the key's PEM section, as `openssl
+    /// pkcs12 -nodes` exports it.
+    BagAttributes,
+    /// An `EC PARAMETERS` section (the curve named) before the `EC PRIVATE
+    /// KEY`, as `openssl ecparam -name <curve> -genkey` writes it.
+    EcParametersFirst,
+    /// Both files with CR LF line ends.
+    CrLf,
+    /// An Ed25519 key in PKCS #8 version 1 without its public key, as
+    /// `openssl genpkey -algorithm ed25519` writes it (ring writes version
+    /// 2, with it).
+    WithoutPublicKey,
+}
+
 /// What the two files hold: a chain, the certificate first, and its key
 /// under a label. The key is never printed.
 pub struct Pair {
@@ -468,6 +584,7 @@ pub struct Pair {
     pub key: Key,
     pub label: KeyLabel,
     pub names: Vec<String>,
+    pub written: Written,
 }
 
 impl fmt::Debug for Pair {
@@ -500,6 +617,7 @@ impl Pair {
             key,
             label,
             names: names.to_vec(),
+            written: Written::Plain,
         }
     }
 
@@ -527,6 +645,12 @@ impl Pair {
         )
     }
 
+    /// The same pair, its files written so.
+    pub fn written(mut self, written: Written) -> Self {
+        self.written = written;
+        self
+    }
+
     /// The certificate's fingerprint.
     pub fn fingerprint(&self) -> String {
         fingerprint(self.chain.first().map(AsRef::as_ref).unwrap_or_default())
@@ -535,15 +659,35 @@ impl Pair {
     /// The certificate file's text: the chain in PEM, the certificate
     /// first.
     pub fn cert_pem(&self) -> String {
-        self.chain
+        let text: String = self
+            .chain
             .iter()
             .map(|c| pem("CERTIFICATE", c.as_ref()))
-            .collect()
+            .collect();
+        if self.written == Written::CrLf {
+            text.replace('\n', "\r\n")
+        } else {
+            text
+        }
     }
 
     /// The key file's text. Never print it.
     pub fn key_pem(&self) -> String {
-        self.key.pem(self.label)
+        let key = self.key.pem(self.label);
+        match self.written {
+            Written::Plain => key,
+            Written::BagAttributes => format!(
+                "Bag Attributes\n    localKeyID: 01 02 03 \nKey Attributes: <No Attributes>\n{key}"
+            ),
+            Written::EcParametersFirst => {
+                let curve = pkcs8_curve(&self.key.pkcs8).unwrap_or_else(|| {
+                    panic!("the harness's own check: {:?} has no curve", self.key)
+                });
+                format!("{}{key}", pem("EC PARAMETERS", &curve))
+            }
+            Written::CrLf => key.replace('\n', "\r\n"),
+            Written::WithoutPublicKey => self.key.pem_without_public_key(),
+        }
     }
 }
 
