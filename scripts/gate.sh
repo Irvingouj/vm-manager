@@ -36,5 +36,17 @@ if [ -f package.json ]; then
 fi
 
 echo "== cargo test"
-cargo test --workspace --locked "$@" || exit 1
-exit "$npm_failed"
+cargo_failed=0
+cargo test --workspace --locked "$@" || cargo_failed=1
+
+# The closing lines: which steps failed, when the gate went on past one
+# (--no-fail-fast). scripts/gate-hosted.sh reads them.
+if [ "$npm_failed" = 1 ]; then
+  echo "== gate: npm test failed"
+fi
+if [ "$cargo_failed" = 1 ]; then
+  echo "== gate: cargo test failed"
+fi
+if [ "$npm_failed" = 1 ] || [ "$cargo_failed" = 1 ]; then
+  exit 1
+fi
