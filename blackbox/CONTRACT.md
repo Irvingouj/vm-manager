@@ -2257,7 +2257,7 @@ A release is what an administrator and a Builder take from outside the repositor
 
 - The program's version is the version of the package `vibe` (`crates/vibe/Cargo.toml`). The first line of `vibe --version` is `vibe <version>`.
 - Everything that names a version names that one: the default of `VIBE_VERSION` in the `Dockerfile`; the image `deploy/compose.yaml` takes without `VIBE_IMAGE`, `ghcr.io/irvingouj/vibe:<version>`, and the same name where `deploy/.env.example` and `deploy/README.md` show it; every address of a release's file in `docs/getting-started.md` (`.../releases/download/v<version>/...`) and every archive's name there; the file of the release's notes, `docs/releases/v<version>.md`, which exists.
-- For this ticket the version is `0.1.0`.
+- For this ticket the version was `0.1.0` (published). It is now `0.1.1` (ticket: The program may open fewer files than the connections it serves at once, released with "The program serves TLS itself"); each release changes it as `docs/releasing.md` says.
 
 ### The licence
 

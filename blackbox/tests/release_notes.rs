@@ -1,5 +1,5 @@
 //! The release's notes (CONTRACT.md, "The first release: The page and the
-//! notes"): `docs/releases/v0.1.0.md` says what works; what is missing;
+//! notes"): `docs/releases/v<version>.md` (now v0.1.1) says what works; what is missing;
 //! that the release is **not for untrusted Applications or real company
 //! data** until the work on credentials, limits and the runtime's
 //! hardening is done; that the Postgres a local run downloads is a third
