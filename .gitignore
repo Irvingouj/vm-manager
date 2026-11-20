@@ -7,3 +7,7 @@ node_modules/
 /vendor/*/Cargo.lock
 /.tools/
 media/out/
+/site/dist/
+/site/node_modules/
+/site/media/*.mp4
+/site/media/*-poster.jpg

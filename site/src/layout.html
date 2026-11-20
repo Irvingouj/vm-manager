@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>{{title}} · Vibe Manager docs</title>
+<meta name="description" content="Vibe Manager documentation: {{title}}.">
+<link rel="icon" href="{{base}}assets/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="{{base}}assets/style.css">
+<script src="{{base}}assets/search.js" defer></script>
+</head>
+<body class="docs" data-base="{{base}}">
+<a class="skip" href="#main">Skip to the content</a>
+<header class="topbar">
+  <a class="wordmark" href="{{base}}" title="Vibe Manager: the landing page"><span class="mark" aria-hidden="true"></span>Vibe&nbsp;Manager</a>
+  <a class="crumb" href="{{base}}docs/">Docs</a>
+  <div class="search" role="search">
+    <label class="visually-hidden" for="q">Search the documentation</label>
+    <input id="q" type="search" placeholder="Search the docs" autocomplete="off" spellcheck="false" aria-controls="results" aria-expanded="false">
+    <kbd aria-hidden="true">/</kbd>
+    <div id="results" class="results" hidden></div>
+  </div>
+  <nav class="toplinks" aria-label="Elsewhere">
+    <a href="{{github}}/releases/tag/v{{version}}">v{{version}}</a>
+    <a href="{{github}}">GitHub</a>
+  </nav>
+</header>
+<div class="docs-grid">
+  <aside class="sidebar">
+    <details class="nav-details" open>
+      <summary>Menu</summary>
+      <nav aria-label="Documentation">
+        {{sidebar}}
+        <p class="nav-group">Elsewhere</p>
+        <ul><li><a href="{{base}}">The website</a></li><li><a href="{{github}}/releases/tag/v{{version}}">The latest release</a></li><li><a href="{{github}}">The repository</a></li></ul>
+      </nav>
+    </details>
+<script>
+  // The menu is open on wide screens and closed on narrow ones, decided before it is painted.
+  (function () { var d = document.querySelector(".nav-details"); if (d && window.matchMedia("(max-width: 59.99rem)").matches) d.open = false; })();
+</script>
+  </aside>
+  <main id="main" class="doc">
+    <p class="kicker">{{group}}</p>
+    <h1>{{h1}}</h1>
+    {{toc}}
+    <article class="prose">
+{{content}}
+    </article>
+    {{source}}
+    {{pager}}
+  </main>
+</div>
+<footer class="foot">
+  <p>Vibe Manager is open source under the MIT licence. <a href="{{base}}">Home</a> · <a href="{{base}}docs/">Docs</a> · <a href="{{github}}">GitHub</a></p>
+</footer>
+</body>
+</html>

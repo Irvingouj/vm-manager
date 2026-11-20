@@ -1,0 +1,18 @@
+{
+  "name": "vibe-manager-site",
+  "private": true,
+  "description": "The website of Vibe Manager and its documentation site, built as static files into dist/ (see README.md). Not part of the repository's root npm workspace.",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "node build.mjs",
+    "check": "node scripts/check-links.mjs",
+    "preview": "node scripts/preview.mjs"
+  },
+  "dependencies": {
+    "marked": "18.2.1"
+  }
+}

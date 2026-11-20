@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Vibe Manager: a self-hosted platform for the internal applications your people and their coding agents build</title>
+<meta name="description" content="An open-source, self-hosted platform on which an enterprise's employees and their AI coding agents build, deploy and run internal applications against shared, IT-governed infrastructure.">
+<link rel="icon" href="{{base}}assets/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="{{base}}assets/style.css">
+</head>
+<body class="landing">
+<a class="skip" href="#main">Skip to the content</a>
+<header class="topbar">
+  <a class="wordmark" href="{{base}}"><span class="mark" aria-hidden="true"></span>Vibe&nbsp;Manager</a>
+  <nav class="toplinks" aria-label="Site">
+    <a href="{{base}}docs/">Docs</a>
+    <a href="{{github}}/releases/tag/v{{version}}">v{{version}}</a>
+    <a href="{{github}}">GitHub</a>
+  </nav>
+</header>
+
+<main id="main">
+  <section class="hero">
+    <div class="hero-text">
+    <p class="kicker">Open source · Self-hosted · MIT</p>
+    <h1><em>IT configures once.</em> Humans and AI build freely within authorized boundaries.</h1>
+    <p class="lede">An open-source, self-hosted platform on which an enterprise's employees and their AI coding agents build, deploy and run internal applications against shared, IT-governed infrastructure. Think PocketBase for the enterprise, built for the AI coding era.</p>
+    <p class="actions">
+      <a class="button primary" href="{{base}}docs/getting-started/">Get started</a>
+      <a class="button" href="{{github}}/releases/tag/v{{version}}">Download v{{version}}</a>
+      <a class="button quiet" href="{{github}}">Source on GitHub</a>
+    </p>
+    </div>
+    <div class="terminal" aria-label="The four steps as commands">
+      <pre><code><span class="c"># make it</span>
+<span class="p">$</span> vibe new hello
+<span class="c"># run it on your computer</span>
+<span class="p">$</span> vibe dev
+<span class="c"># send it as a new Version</span>
+<span class="p">$</span> vibe deploy
+<span class="c"># let others open it</span>
+<span class="p">$</span> vibe share hello --group engineering</code></pre>
+    </div>
+  </section>
+{{launch}}
+  <aside class="notice" aria-label="Status of the release">
+    <p><strong>v{{version}} is still a minimal release, to try it.</strong> It is not for untrusted Applications or real company data yet. <a href="{{base}}docs/releases/">The release notes</a> say what works and what is missing.</p>
+  </aside>
+{{video}}
+  <section class="band" aria-labelledby="who">
+    <p class="kicker">§ 1 · Who it is for</p>
+    <h2 id="who">One environment, set up by IT, built on by everyone.</h2>
+    <div class="cols">
+      <div class="col">
+        <h3>Platform administrators</h3>
+        <p>Install it once: one image and one Compose file start the platform beside a bundled Postgres&nbsp;18 and a reverse proxy that terminates TLS with your wildcard certificate. People sign in with your company's identity provider (OIDC); their Groups come from it.</p>
+        <p><a href="{{base}}docs/admin/install/">Installing with Compose →</a></p>
+      </div>
+      <div class="col">
+        <h3>Builders</h3>
+        <p>An employee who creates and deploys an Application, normally by directing a coding agent. No authentication to write, no credentials to manage, no infrastructure to provision: the platform supplies them.</p>
+        <p><a href="{{base}}docs/getting-started/">Getting started →</a></p>
+      </div>
+      <div class="col">
+        <h3>Coding agents</h3>
+        <p>AI generates application logic; the platform supplies the governed environment. Agents use the tool's commands, each with <code>--json</code>, and the project's <code>AGENTS.md</code> tells them how to work in it.</p>
+        <p><a href="{{base}}docs/builders/commands/">The tool's commands →</a></p>
+      </div>
+    </div>
+  </section>
+
+  <section class="band" aria-labelledby="how">
+    <p class="kicker">§ 2 · How it works</p>
+    <h2 id="how">From nothing to an Application open in a browser.</h2>
+    <ol class="steps">
+      <li>
+        <div class="step-text">
+          <h3>Make a project</h3>
+          <p><code>vibe new</code> makes a project from the template. <code>vibe check</code> says whether it will deploy, with each problem and its fix.</p>
+        </div>
+        <pre class="cmd"><code>vibe new hello
+cd hello
+npm install
+vibe check</code></pre>
+      </li>
+      <li>
+        <div class="step-text">
+          <h3>Run it on your computer</h3>
+          <p><code>vibe dev</code> serves the Application to your browser as a test User you choose, with test rows, beside a private Postgres. Open <code>http://hello.localhost:7480/</code>.</p>
+        </div>
+        <pre class="cmd"><code>vibe dev
+vibe request --as outsider /</code></pre>
+      </li>
+      <li>
+        <div class="step-text">
+          <h3>Deploy it</h3>
+          <p><code>vibe deploy</code> builds the Application on your computer from its last commit and sends it as a new Version, which goes live at <code>https://hello.vibe.example.com/</code>.</p>
+        </div>
+        <pre class="cmd"><code>git add --all
+git commit -m "The first version"
+vibe deploy</code></pre>
+      </li>
+      <li>
+        <div class="step-text">
+          <h3>Share it</h3>
+          <p>It opens for its Contributors alone until one of them shares it with people, Groups or everyone, with <code>vibe share</code> or on the Dashboard.</p>
+        </div>
+        <pre class="cmd"><code>vibe share hello --email colleague@example.com
+vibe share hello --group engineering
+vibe share hello --everyone</code></pre>
+      </li>
+    </ol>
+  </section>
+
+  <section class="band" aria-labelledby="governed">
+    <p class="kicker">§ 3 · Governed by default</p>
+    <h2 id="governed">The context is the platform's. The records are the platform's.</h2>
+    <div class="split">
+      <div>
+        <p>Every operation an Application makes carries a Trusted context: which User, which Application, which request. Application code receives it and cannot construct one. An Application reads and writes a shared database only as its Grants allow, as the person who uses it.</p>
+        <p>Every operation of an Application on a shared database is in the Operation log, and every row it changes in its own database is in the Change history, with who did it and through which Application.</p>
+        <p><a href="{{base}}docs/builders/sdk/">The SDK's types →</a></p>
+      </div>
+      <pre class="cmd sdk"><code><span class="c">// manifest.ts</span>
+export default defineManifest({ name, description, resources })
+<span class="c">// src/index.ts</span>
+export default defineApp(manifest, { fetch(request, ctx) { ... } })
+
+ctx.user().db("devops")  <span class="c">// a shared database, as the User</span>
+ctx.user().ownDb()       <span class="c">// its own database, as the User</span>
+ctx.app().ownDb()        <span class="c">// its own database, as the Application</span></code></pre>
+    </div>
+  </section>
+
+  <section class="band" aria-labelledby="release">
+    <p class="kicker">§ 4 · In v{{version}}</p>
+    <h2 id="release">What works, and what does not yet.</h2>
+{{releaselists}}
+  </section>
+
+  <section class="closing" aria-labelledby="start">
+    <h2 id="start">Try it on one machine.</h2>
+    <p>A Linux server with Docker, a wildcard domain and certificate, and an OIDC provider. The image is <code>ghcr.io/irvingouj/vibe:{{version}}</code>.</p>
+    <p class="actions">
+      <a class="button primary" href="{{base}}docs/">Read the documentation</a>
+      <a class="button" href="{{github}}/releases/tag/v{{version}}">The latest release</a>
+      <a class="button quiet" href="{{github}}">The repository</a>
+    </p>
+  </section>
+</main>
+
+<footer class="foot">
+  <p>Vibe Manager (working title) is open source under the MIT licence. <a href="{{base}}docs/">Docs</a> · <a href="{{github}}/releases/tag/v{{version}}">Releases</a> · <a href="{{github}}">GitHub</a>{{videolink}}</p>
+</footer>
+</body>
+</html>
