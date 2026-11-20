@@ -1,0 +1,10 @@
+# The rig's own, for want of real DNS: the installation joins the network on
+# which the rig's identity provider answers as idp.vibe.acme.test.
+services:
+  vibe:
+    networks:
+      - default
+      - t74-net
+networks:
+  t74-net:
+    external: true
