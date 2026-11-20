@@ -62,6 +62,8 @@ fn assert_hardened_with_two_mounts_and_published_itself(at: &Installed) {
         host, vibe["Config"]["User"], vibe["Mounts"]
     );
     assert_eq!(vibe["State"]["Running"], true, "{context}");
+    // The open files its bounds need (CONTRACT.md, "The open files").
+    blackbox::install::assert_open_files(install, &vibe);
     assert_eq!(host["ReadonlyRootfs"], true, "read-only root: {context}");
     let dropped: Vec<String> = host["CapDrop"]
         .as_array()

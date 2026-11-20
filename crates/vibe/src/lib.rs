@@ -66,6 +66,7 @@ pub mod ingress;
 pub mod log;
 pub mod migration_text;
 pub mod oidc;
+pub mod open_files;
 pub mod oplog;
 pub mod origin;
 pub mod own_db;

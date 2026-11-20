@@ -85,6 +85,8 @@ fn assert_hardened_and_published_on_loopback_only(at: &Installed) {
         )
     };
     assert_eq!(vibe["State"]["Running"], true, "{}", context());
+    // The open files its bounds need (CONTRACT.md, "The open files").
+    blackbox::install::assert_open_files(install, &vibe);
     assert_eq!(
         host["ReadonlyRootfs"],
         true,

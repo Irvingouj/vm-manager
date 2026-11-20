@@ -311,6 +311,8 @@ fn run(serve: &Serve) -> Result<(), String> {
         Box::new(NoSignIn)
     };
     let administrators: Option<Arc<str>> = serve.administrators_group.as_deref().map(Arc::from);
+    // The open files its bounds need, before anything is opened for them.
+    vibe::open_files::raise_and_log();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

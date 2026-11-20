@@ -273,6 +273,7 @@ removes the bundled Postgres's data, every Application's included, for good.
 ## How it is hardened
 
 - `vibe` runs with a read-only root filesystem, every capability dropped, `no-new-privileges`, as the image's user `65532` (not root), with no writable volume and no tmpfs; its one mount is `ca/`, read-only, at `/etc/vibe/ca` (with `compose.own-tls.yaml`, `certs/` too, read-only, at `/etc/vibe/certs`). The installation's key and the database's address are in its environment, in no command line.
+- `vibe` may open 65,536 files (`ulimits: nofile`, soft and hard), whatever the Docker daemon's default, so that it never runs out of files before its own bound of 1,024 connections at once; started elsewhere, the program raises its own soft limit towards the hard one and logs `open-files-limit-low` when even the hard limit is below 4,096.
 - `postgres` runs as its image's user `999` and `proxy` as `65532`, neither as root, each with every capability dropped and `no-new-privileges`.
 - Not possible: a read-only root filesystem for `postgres` and `proxy`. Each takes a file of `compose.yaml`'s `configs` (Postgres's first-start script, the proxy's configuration), and Compose cannot place such a file into a read-only container.
 

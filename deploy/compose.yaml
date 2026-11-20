@@ -78,6 +78,13 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
+    # The open files its bounds need (1,024 connections at once, its
+    # connections to Postgres, its files), whatever the Docker daemon's
+    # default (often a soft limit of 1,024).
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     depends_on:
       postgres:
         condition: service_healthy

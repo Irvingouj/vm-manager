@@ -622,6 +622,11 @@ impl Vm {
         self.address
     }
 
+    /// The program's process id.
+    pub fn pid(&self) -> u32 {
+        self.process.0.id()
+    }
+
     /// The `listening` record.
     pub fn listening(&self) -> &Value {
         &self.listening

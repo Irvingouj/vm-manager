@@ -1803,6 +1803,45 @@ pub fn tag_of(reference: &str) -> Option<String> {
     last.split_once(':').map(|(_, tag)| tag.to_owned())
 }
 
+/// The limit of open files the Compose file gives the `vibe` service
+/// (CONTRACT.md, "Installing: one image and a Compose file": "The open
+/// files"), soft and hard.
+pub const VIBE_OPEN_FILES: u64 = 65536;
+
+/// Fails unless the running `vibe` container (its `docker inspect`,
+/// `inspected`) has `nofile` [`VIBE_OPEN_FILES`] soft and hard in
+/// `HostConfig.Ulimits`, and its program logged `open-files-limit` with
+/// that soft limit and nothing raised (`raised_from` null) and no
+/// `open-files-limit-low`.
+pub fn assert_open_files(install: &Install, inspected: &Value) {
+    let ulimits = &inspected["HostConfig"]["Ulimits"];
+    let nofile = ulimits
+        .as_array()
+        .and_then(|all| all.iter().find(|u| u["Name"] == "nofile"));
+    assert!(
+        nofile.is_some_and(|u| u["Soft"].as_u64() == Some(VIBE_OPEN_FILES)
+            && u["Hard"].as_u64() == Some(VIBE_OPEN_FILES)),
+        "expected HostConfig.Ulimits of the vibe container to hold nofile {VIBE_OPEN_FILES} soft and hard, it is {ulimits}"
+    );
+    let logs = install.logs();
+    let records: Vec<Value> = logs
+        .lines()
+        .filter_map(|l| l.find('{').and_then(|at| l.get(at..)))
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .collect();
+    let said = records.iter().find(|r| r["event"] == "open-files-limit");
+    assert!(
+        said.is_some_and(|r| r["soft"].as_u64() == Some(VIBE_OPEN_FILES)
+            && r["hard"].as_u64() == Some(VIBE_OPEN_FILES)
+            && r["raised_from"].is_null()),
+        "expected the program in the vibe container to log `open-files-limit` with soft and hard {VIBE_OPEN_FILES} and `raised_from` null, it logged {said:?}"
+    );
+    assert!(
+        !records.iter().any(|r| r["event"] == "open-files-limit-low"),
+        "expected no `open-files-limit-low` from the program in the vibe container"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

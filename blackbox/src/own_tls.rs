@@ -1448,12 +1448,21 @@ impl Begun {
 /// The soft and hard limits of open files of this process, from
 /// `/proc/self/limits` (`None` for unlimited).
 pub fn open_files_limits() -> Result<(Option<u64>, Option<u64>), String> {
-    let text = std::fs::read_to_string("/proc/self/limits")
-        .map_err(|e| format!("cannot read /proc/self/limits: {e}"))?;
+    open_files_limits_at("/proc/self/limits")
+}
+
+/// The soft and hard limits of open files of the process `pid`, from
+/// `/proc/<pid>/limits` (`None` for unlimited).
+pub fn open_files_limits_of(pid: u32) -> Result<(Option<u64>, Option<u64>), String> {
+    open_files_limits_at(&format!("/proc/{pid}/limits"))
+}
+
+fn open_files_limits_at(path: &str) -> Result<(Option<u64>, Option<u64>), String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;
     let line = text
         .lines()
         .find(|l| l.starts_with("Max open files"))
-        .ok_or("no `Max open files` in /proc/self/limits")?;
+        .ok_or_else(|| format!("no `Max open files` in {path}"))?;
     let words: Vec<&str> = line.split_whitespace().collect();
     let value = |at: usize| -> Result<Option<u64>, String> {
         match words.get(at).copied() {

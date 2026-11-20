@@ -19,11 +19,14 @@
 //! connection is accepted any more, every connection is asked to end once
 //! the request it serves is answered, and those still open after
 //! [`Limits::drain`] are dropped.
+//!
+//! **A failed accept** (too many open files, say) is tried again 50 ms
+//! later, and logged once per cause while it lasts ([`AcceptFailures`]).
 
 use std::convert::Infallible;
 use std::future::Future;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use http_body_util::Full;
@@ -132,6 +135,7 @@ pub async fn serve_until<H: Handler>(
         let accepted = accepted.clone();
         let permits = Arc::clone(&permits);
         accepting.spawn(async move {
+            let mut failures = AcceptFailures::default();
             loop {
                 // A permit before accepting: the backlog holds the rest.
                 let Ok(permit) = Arc::clone(&permits).acquire_owned().await else {
@@ -139,6 +143,7 @@ pub async fn serve_until<H: Handler>(
                 };
                 match listener.accept().await {
                     Ok((stream, _)) => {
+                        failures.ended();
                         // The permit goes with the stream to the
                         // connection's task, which holds it until it ends,
                         // however it ends. Not sent: dropped here.
@@ -148,10 +153,7 @@ pub async fn serve_until<H: Handler>(
                     }
                     Err(error) => {
                         drop(permit);
-                        log::record(
-                            "accept-failed",
-                            serde_json::json!({ "error": error.to_string() }),
-                        );
+                        failures.failed(&error, Instant::now());
                         // An error such as too many open files passes; do
                         // not spin on it.
                         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -247,5 +249,113 @@ impl<H: Handler> Connection<H> {
         })
         .await
         .ok();
+    }
+}
+
+/// How often a failure of `accept` that goes on is logged again, with the
+/// count of failures since the last line.
+pub const ACCEPT_FAILED_EVERY: Duration = Duration::from_secs(10);
+
+/// The failures of one listener's `accept` and what of them was logged:
+/// `accept-failed` once when a cause begins (`failures: 1`), then at most
+/// once every [`ACCEPT_FAILED_EVERY`] while it lasts, with the failures
+/// since the last line; the failures not yet said are said when the cause
+/// changes or an accept succeeds again. Not twenty lines a second.
+#[derive(Debug, Default)]
+pub struct AcceptFailures {
+    /// The cause going on (the error's words) and when it was last said.
+    going_on: Option<(String, Instant)>,
+    /// Failures of that cause since the last line.
+    unsaid: u64,
+}
+
+impl AcceptFailures {
+    /// An accept failed with `error` at `now`.
+    pub fn failed(&mut self, error: &std::io::Error, now: Instant) {
+        self.failed_saying(&error.to_string(), now, &mut say_accept_failed);
+    }
+
+    /// An accept succeeded: the failures not yet said are said.
+    pub fn ended(&mut self) {
+        self.ended_saying(&mut say_accept_failed);
+    }
+
+    fn failed_saying(&mut self, cause: &str, now: Instant, say: &mut impl FnMut(&str, u64)) {
+        match &mut self.going_on {
+            Some((going, said_at)) if going == cause => {
+                self.unsaid = self.unsaid.saturating_add(1);
+                if now.saturating_duration_since(*said_at) >= ACCEPT_FAILED_EVERY {
+                    say(cause, self.unsaid);
+                    *said_at = now;
+                    self.unsaid = 0;
+                }
+            }
+            _ => {
+                self.ended_saying(say);
+                say(cause, 1);
+                self.going_on = Some((cause.to_owned(), now));
+            }
+        }
+    }
+
+    fn ended_saying(&mut self, say: &mut impl FnMut(&str, u64)) {
+        if let Some((cause, _)) = self.going_on.take()
+            && self.unsaid > 0
+        {
+            say(&cause, self.unsaid);
+        }
+        self.unsaid = 0;
+    }
+}
+
+fn say_accept_failed(cause: &str, failures: u64) {
+    log::record(
+        "accept-failed",
+        serde_json::json!({ "error": cause, "failures": failures }),
+    );
+}
+
+#[cfg(test)]
+mod accept_failures_tests {
+    use super::*;
+
+    #[test]
+    fn a_failure_that_goes_on_is_said_once_then_every_ten_seconds_with_a_count() {
+        let mut failures = AcceptFailures::default();
+        let mut said = Vec::new();
+        let mut say = |cause: &str, n: u64| said.push((cause.to_owned(), n));
+        let start = Instant::now();
+        // Twenty a second for 25 seconds.
+        for tick in 0..500_u64 {
+            let now = start + Duration::from_millis(tick * 50);
+            failures.failed_saying("Too many open files (os error 24)", now, &mut say);
+        }
+        failures.ended_saying(&mut say);
+        let counts: Vec<u64> = said.iter().map(|(_, n)| *n).collect();
+        // At 0 s, at 10 s (200 failures since), at 20 s (200), and the
+        // last 99 when it ended.
+        assert_eq!(counts, vec![1, 200, 200, 99]);
+        assert_eq!(counts.iter().sum::<u64>(), 500);
+    }
+
+    #[test]
+    fn another_cause_is_said_at_once() {
+        let mut failures = AcceptFailures::default();
+        let mut said = Vec::new();
+        let mut say = |cause: &str, n: u64| said.push((cause.to_owned(), n));
+        let now = Instant::now();
+        failures.failed_saying("a", now, &mut say);
+        failures.failed_saying("a", now, &mut say);
+        failures.failed_saying("b", now, &mut say);
+        failures.ended_saying(&mut say);
+        failures.ended_saying(&mut say);
+        assert_eq!(
+            said,
+            vec![
+                ("a".to_owned(), 1),
+                ("a".to_owned(), 1),
+                ("b".to_owned(), 1)
+            ]
+        );
     }
 }
