@@ -33,12 +33,32 @@ const BOUND: usize = 1024;
 /// each side, and room for everything else (Postgres, logs, the harness).
 const OPEN_FILES: u64 = 4096;
 
-/// How long after it was opened a held connection may be ended at the
-/// latest: the 10 seconds of the handshake, and a little.
-const ENDED_WITHIN: Duration = Duration::from_millis(11_500);
+/// How long after the held connections were all open each may be ended
+/// at the latest, counted from then and not from each one's `connect`:
+/// the program's 10 seconds begin when it accepts a connection, and a
+/// connection the client already believes open may reach the program a
+/// retransmission later (the kernel drops the last step of a connection
+/// when the listening queue is full and resends its SYN-ACK 1 s, then 3 s
+/// later). So: the 10 seconds, the 3 s of two retransmissions, and 2 s for
+/// a busy machine. The exact 10 seconds of one handshake is held by
+/// `own_tls_serving.rs` (`a_handshake_left_unfinished_is_ended_...`).
+const ENDED_WITHIN: Duration = Duration::from_secs(15);
+
+/// The held connections are opened this many at a time, with [`PAUSE`]
+/// between, so that the listening queue is not overfilled (which only
+/// delays some by the kernel's retransmissions; the limits are wide for
+/// that all the same).
+const BATCH: usize = 100;
+const PAUSE: Duration = Duration::from_millis(50);
 
 /// How long the one more connection may wait to be served, from when the
-/// held ones were all open.
+/// held ones were all open. A place frees when the first connection the
+/// program accepted is ended, 10 s after that accept, which came before
+/// they were all open; the one more connection is opened a second after,
+/// when the queue is empty again, and should its SYN be dropped all the
+/// same, the client resends it 1 s, then 3 s later, still within the
+/// 10 s it waits for a place. So 10 s, and 5 s for retransmissions and a
+/// busy machine.
 const SERVED_WITHIN: Duration = Duration::from_secs(15);
 
 /// How long the one more connection must get no answer.
@@ -55,6 +75,9 @@ fn handshakes_held_open_count_against_the_bound_and_one_more_is_served_once_they
     let began = Instant::now();
     let mut held: Vec<(TcpStream, Instant)> = Vec::with_capacity(BOUND);
     for n in 0..BOUND {
+        if n > 0 && n % BATCH == 0 {
+            thread::sleep(PAUSE);
+        }
         let socket = TcpStream::connect_timeout(&address, Duration::from_secs(5))
             .unwrap_or_else(|e| panic!("could not open held connection {n} of {BOUND}: {e}"));
         held.push((socket, Instant::now()));
@@ -107,9 +130,10 @@ fn handshakes_held_open_count_against_the_bound_and_one_more_is_served_once_they
     );
 
     // Every held connection was ended by the program, none later than
-    // ENDED_WITHIN after it was opened.
+    // ENDED_WITHIN after they were all open (see there why it is counted
+    // so).
     for (n, (socket, opened)) in held.iter_mut().enumerate() {
-        let wait = (*opened + ENDED_WITHIN)
+        let wait = (all_open + ENDED_WITHIN)
             .saturating_duration_since(Instant::now())
             .max(Duration::from_millis(1));
         socket.set_read_timeout(Some(wait)).unwrap();
@@ -128,14 +152,16 @@ fn handshakes_held_open_count_against_the_bound_and_one_more_is_served_once_they
                 Err(e) => break Err(e.to_string()),
             }
         };
-        let after = opened.elapsed();
+        let after = all_open.elapsed();
+        let since_its_connect = opened.elapsed();
         if let Err(how) = ended {
             panic!(
-                "expected held connection {n} ended by the program within {ENDED_WITHIN:?} of its opening; {after:?} after, it is {how}"
+                "expected held connection {n} ended by the program within {ENDED_WITHIN:?} of all {BOUND} being open; {after:?} after ({since_its_connect:?} after its own connect), it is {how}"
             );
         }
     }
     eprintln!(
-        "all {BOUND} held connections were ended by the program, each within {ENDED_WITHIN:?} of its opening"
+        "all {BOUND} held connections were ended by the program within {ENDED_WITHIN:?} of all being open (all seen ended {:?} after)",
+        all_open.elapsed()
     );
 }
