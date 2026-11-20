@@ -1340,6 +1340,25 @@ fn read_answer(stream: &mut impl Read) -> Result<(u16, Vec<u8>), String> {
 /// words when it fails. Each wait (connecting, each read) is held to
 /// [`CLIENT_WAIT`].
 pub fn shake(address: SocketAddr, hello: &Hello) -> Result<Shaken, String> {
+    begin_handshake(address, hello)?.finish(CLIENT_WAIT)
+}
+
+/// A TLS handshake begun: the connection made and the ClientHello sent,
+/// nothing read yet.
+pub struct Begun {
+    stream: StreamOwned<ClientConnection, TcpStream>,
+    asked: Arc<AskedForCertificate>,
+}
+
+impl fmt::Debug for Begun {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Begun({:?})", self.stream.sock.peer_addr().ok())
+    }
+}
+
+/// Connects to `address` and sends the ClientHello [`shake`] would send,
+/// and no more.
+pub fn begin_handshake(address: SocketAddr, hello: &Hello) -> Result<Begun, String> {
     let asked = Arc::new(AskedForCertificate::default());
     let config = client_config(hello, &asked)?;
     let name = match &hello.server_name {
@@ -1357,30 +1376,145 @@ pub fn shake(address: SocketAddr, hello: &Hello) -> Result<Shaken, String> {
         .and_then(|()| socket.set_write_timeout(Some(CLIENT_WAIT)))
         .map_err(|e| format!("cannot set timeouts: {e}"))?;
     let mut stream = StreamOwned::new(connection, socket);
-    let deadline = Instant::now() + CLIENT_WAIT;
-    while stream.conn.is_handshaking() {
-        if Instant::now() >= deadline {
-            return Err(format!("the handshake did not end within {CLIENT_WAIT:?}"));
-        }
+    while stream.conn.wants_write() {
         stream
             .conn
-            .complete_io(&mut stream.sock)
-            .map_err(|e| format!("TLS: {e}"))?;
+            .write_tls(&mut stream.sock)
+            .map_err(|e| format!("cannot send the ClientHello: {e}"))?;
     }
-    let chain = stream
-        .conn
-        .peer_certificates()
-        .map(|c| c.iter().map(|d| d.clone().into_owned()).collect())
-        .unwrap_or_default();
-    let version = stream.conn.protocol_version();
-    let alpn = stream.conn.alpn_protocol().map(<[u8]>::to_vec);
-    Ok(Shaken {
-        chain,
-        version,
-        alpn,
-        asked_for_client_certificate: asked.0.load(std::sync::atomic::Ordering::SeqCst),
-        stream,
-    })
+    Ok(Begun { stream, asked })
+}
+
+impl Begun {
+    /// Whether any byte of an answer came within `wait` (it is left to be
+    /// read). A connection closed meanwhile is an error.
+    pub fn answered_within(&mut self, wait: Duration) -> Result<bool, String> {
+        let socket = &self.stream.sock;
+        socket
+            .set_read_timeout(Some(wait.max(Duration::from_millis(1))))
+            .map_err(|e| format!("cannot set a timeout: {e}"))?;
+        let mut byte = [0_u8; 1];
+        let seen = match socket.peek(&mut byte) {
+            Ok(0) => Err("the connection was closed with no answer".to_owned()),
+            Ok(_) => Ok(true),
+            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => Ok(false),
+            Err(e) => Err(format!("the connection failed: {e}")),
+        };
+        socket
+            .set_read_timeout(Some(CLIENT_WAIT))
+            .map_err(|e| format!("cannot set a timeout: {e}"))?;
+        seen
+    }
+
+    /// Ends the handshake, at most `within` from now.
+    pub fn finish(self, within: Duration) -> Result<Shaken, String> {
+        let Self { mut stream, asked } = self;
+        let deadline = Instant::now() + within;
+        while stream.conn.is_handshaking() {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(format!("the handshake did not end within {within:?}"));
+            }
+            stream
+                .sock
+                .set_read_timeout(Some(left.max(Duration::from_millis(1))))
+                .map_err(|e| format!("cannot set a timeout: {e}"))?;
+            stream
+                .conn
+                .complete_io(&mut stream.sock)
+                .map_err(|e| format!("TLS: {e}"))?;
+        }
+        stream
+            .sock
+            .set_read_timeout(Some(CLIENT_WAIT))
+            .map_err(|e| format!("cannot set a timeout: {e}"))?;
+        let chain = stream
+            .conn
+            .peer_certificates()
+            .map(|c| c.iter().map(|d| d.clone().into_owned()).collect())
+            .unwrap_or_default();
+        let version = stream.conn.protocol_version();
+        let alpn = stream.conn.alpn_protocol().map(<[u8]>::to_vec);
+        Ok(Shaken {
+            chain,
+            version,
+            alpn,
+            asked_for_client_certificate: asked.0.load(std::sync::atomic::Ordering::SeqCst),
+            stream,
+        })
+    }
+}
+
+/// The soft and hard limits of open files of this process, from
+/// `/proc/self/limits` (`None` for unlimited).
+pub fn open_files_limits() -> Result<(Option<u64>, Option<u64>), String> {
+    let text = std::fs::read_to_string("/proc/self/limits")
+        .map_err(|e| format!("cannot read /proc/self/limits: {e}"))?;
+    let line = text
+        .lines()
+        .find(|l| l.starts_with("Max open files"))
+        .ok_or("no `Max open files` in /proc/self/limits")?;
+    let words: Vec<&str> = line.split_whitespace().collect();
+    let value = |at: usize| -> Result<Option<u64>, String> {
+        match words.get(at).copied() {
+            Some("unlimited") => Ok(None),
+            Some(n) => n
+                .parse()
+                .map(Some)
+                .map_err(|e| format!("cannot read {n:?} in {line:?}: {e}")),
+            None => Err(format!("cannot read {line:?}")),
+        }
+    };
+    Ok((value(3)?, value(4)?))
+}
+
+/// Makes sure this process may hold `needed` open files (and so the
+/// programs it starts from now on, which inherit the limit): raises its
+/// soft limit to `needed` with `prlimit` (util-linux) when it is lower.
+/// Fails in words when the hard limit is lower than `needed`, or the
+/// limit cannot be raised.
+pub fn ensure_open_files(needed: u64) {
+    let (soft, hard) = open_files_limits().unwrap_or_else(|problem| panic!("{problem}"));
+    let enough = |limit: Option<u64>| limit.is_none_or(|l| l >= needed);
+    if enough(soft) {
+        return;
+    }
+    let shown = |l: Option<u64>| l.map_or("unlimited".to_owned(), |n| n.to_string());
+    assert!(
+        enough(hard),
+        "this test needs {needed} open files for itself and for the program it starts; the hard limit of open files here is {} (soft {}): raise it (`ulimit -Hn {needed}` as root, or `nofile` in /etc/security/limits.conf) and run it again",
+        shown(hard),
+        shown(soft)
+    );
+    let pid = std::process::id().to_string();
+    let mut command = Command::new("prlimit");
+    command.args([
+        "--pid",
+        &pid,
+        &format!(
+            "--nofile={needed}:{}",
+            hard.map_or("unlimited".to_owned(), |h| h.to_string())
+        ),
+    ]);
+    let finished = run_to_exit(command, Duration::from_secs(10)).unwrap_or_else(|problem| {
+        panic!(
+            "this test needs {needed} open files and the soft limit here is {}; it raises it with `prlimit` (util-linux), which could not be run: {problem}",
+            shown(soft)
+        )
+    });
+    let (now, _) = open_files_limits().unwrap_or_else(|problem| panic!("{problem}"));
+    assert!(
+        finished.status.is_some_and(|s| s.success()) && enough(now),
+        "this test needs {needed} open files; `prlimit --pid {pid} --nofile={needed}:...` did not raise the soft limit from {} (now {}): {}",
+        shown(soft),
+        shown(now),
+        finished.stderr.trim()
+    );
+    eprintln!(
+        "the soft limit of open files was {}, raised to {needed} (hard {})",
+        shown(soft),
+        shown(hard)
+    );
 }
 
 /// The fingerprint of the certificate a new connection to `address` is
