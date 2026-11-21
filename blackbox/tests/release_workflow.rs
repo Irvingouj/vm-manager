@@ -5,13 +5,16 @@
 //! permissions are `contents: read`, and only the job that publishes has
 //! `contents: write` and `packages: write`; it uses no secret but the run's
 //! token; every action is GitHub's own, named by a full commit id; it calls
-//! each script of "The scripts that make it" and the two gates; the tool
-//! is built on Linux and on macOS; and the jobs that publish run only for a
-//! tag and need every job that checks.
+//! the release check, the packing, the trying and the release's files of
+//! "The scripts that make it"; it runs no gate, no install tests and no
+//! test of the program (the product owner's decision of 2026-11-21); it
+//! builds the image with `docker build` in a job of its own; the tool is
+//! built on Linux and on macOS; and the jobs that publish run only for a
+//! tag and need every job that checks or builds.
 //!
 //! What a run does (that a rehearsal publishes nothing, that the image
-//! pushed is the one the install tests passed against, the order of
-//! publishing, the glibc ceiling) only a run shows: a rehearsal by hand.
+//! pushed is the one built, the order of publishing, the glibc ceiling)
+//! only a run shows: a rehearsal by hand.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -29,13 +32,19 @@ use yaml_rust2::{Yaml, YamlLoader};
 const WORKFLOW: &str = ".github/workflows/release.yml";
 
 /// The scripts the workflow calls.
-const SCRIPTS: [&str; 6] = [
+const SCRIPTS: [&str; 4] = [
     "scripts/release-check.sh",
     "scripts/try-tool.sh",
-    "scripts/gate-hosted.sh",
-    "scripts/install-gate.sh",
     "scripts/package-tool.sh",
     "scripts/release-files.sh",
+];
+
+/// The scripts no job of the workflow calls until the product is in use:
+/// the gate, the gate as a hosted runner runs it, and the install tests.
+const GATES: [&str; 3] = [
+    "scripts/gate.sh",
+    "scripts/gate-hosted.sh",
+    "scripts/install-gate.sh",
 ];
 
 /// A YAML value as JSON: keys as text, scalars as themselves.
@@ -357,7 +366,7 @@ fn every_action_the_workflow_uses_is_githubs_own_named_by_a_full_commit_id() {
 }
 
 #[test]
-fn the_workflow_calls_the_release_check_both_gates_the_packing_and_the_release_files() {
+fn the_workflow_calls_the_release_check_the_packing_the_trying_and_the_release_files() {
     let workflow = workflow();
     let runs: String = jobs(&workflow)
         .values()
@@ -416,115 +425,111 @@ fn the_jobs_that_pack_the_tool_check_a_download_with_the_pages_command_of_each_s
     }
 }
 
-/// Every line of a `run:` of the workflow that calls `script` (as a word,
-/// with or without `./`).
-fn lines_calling(workflow: &Value, script: &str) -> Vec<String> {
-    jobs(workflow)
-        .values()
-        .flat_map(|job| {
-            runs_of(job)
-                .lines()
-                .filter(|line| {
-                    line.split_whitespace()
-                        .any(|w| w == script || w == format!("./{script}"))
-                })
-                .map(str::to_owned)
-                .collect::<Vec<_>>()
+/// The command a line runs after `program` (its first word that is not an
+/// option), for each time `program` is a word of the line.
+fn subcommands_of<'a>(line: &'a str, program: &str) -> Vec<&'a str> {
+    let words: Vec<&str> = line.split_whitespace().collect();
+    words
+        .iter()
+        .enumerate()
+        .filter(|(_, w)| **w == program || w.ends_with(&format!("/{program}")))
+        .filter_map(|(at, _)| {
+            words
+                .iter()
+                .skip(at + 1)
+                .find(|w| !w.starts_with('-') && !w.starts_with('+'))
+                .copied()
         })
         .collect()
 }
 
+/// CONTRACT.md, "The first release: The workflow": "The workflow runs no
+/// gate and no install tests ... no job of it calls `scripts/gate.sh`,
+/// `scripts/gate-hosted.sh` or `scripts/install-gate.sh`, and none runs
+/// `cargo test`, `npm test` or `cargo clippy`."
 #[test]
-fn the_workflow_runs_the_gate_through_gate_hosted_and_the_install_gate_with_no_fail_fast() {
+fn no_job_of_the_workflow_runs_a_gate_the_install_tests_or_a_test_of_the_program() {
     let workflow = workflow();
-    assert!(
-        !lines_calling(&workflow, "scripts/gate-hosted.sh").is_empty(),
-        "expected the gate run on the runner by scripts/gate-hosted.sh"
-    );
-    let direct = lines_calling(&workflow, "scripts/gate.sh");
-    assert!(
-        direct.is_empty(),
-        "expected no step to call scripts/gate.sh directly any more (scripts/gate-hosted.sh runs it), found {direct:?}"
-    );
-    let calls = lines_calling(&workflow, "scripts/install-gate.sh");
-    assert!(
-        !calls.is_empty(),
-        "expected a step of the workflow to run scripts/install-gate.sh"
-    );
-    for call in &calls {
+    let mut all = Vec::new();
+    texts(&workflow, &mut all);
+    for script in GATES {
+        let named: Vec<&String> = all.iter().filter(|t| t.contains(script)).collect();
         assert!(
-            call.split_whitespace().any(|w| w == "--no-fail-fast"),
-            "expected scripts/install-gate.sh run with --no-fail-fast, so that one run says everything that fails on the runner; the step runs {:?}",
-            call.trim()
+            named.is_empty(),
+            "expected no job of the workflow to call {script} (it runs no gate and no install tests until the product is in use); found {named:?}"
         );
     }
-}
-
-/// CONTRACT.md, "A real browser in the gate: The browser": "The release
-/// workflow's gate has a browser too: the hosted runner's Firefox, whose
-/// version the job prints." The job that runs `scripts/gate-hosted.sh` has
-/// a step before that one whose `run:` asks the browser its version
-/// (`firefox --version`, or `"${VIBE_TEST_BROWSER:-firefox}" --version`),
-/// and that step does not swallow a failure.
-#[test]
-fn the_gate_job_prints_the_runners_firefox_version_before_it_runs_the_gate() {
-    let workflow = workflow();
-    let calls_gate_hosted = |step: &Value| {
-        step["run"].as_str().is_some_and(|run| {
-            run.split_whitespace()
-                .any(|w| w == "scripts/gate-hosted.sh" || w == "./scripts/gate-hosted.sh")
-        })
-    };
-    let (id, steps) = jobs(&workflow)
-        .iter()
-        .find_map(|(id, job)| {
-            let steps = job["steps"].as_array()?;
-            steps.iter().any(calls_gate_hosted).then_some((id, steps))
-        })
-        .unwrap_or_else(|| panic!("expected a job whose step runs scripts/gate-hosted.sh"));
-    let gate_at = steps.iter().position(calls_gate_hosted).unwrap();
-    let asks = |step: &Value| {
-        step["run"].as_str().is_some_and(|run| {
-            run.lines()
-                .any(|line| line.contains("firefox") && line.contains("--version"))
-        })
-    };
-    let Some(at) = steps.iter().position(asks) else {
-        panic!(
-            "expected the job {id} to have a step whose `run:` asks the runner's Firefox its version (`firefox --version`); its steps run {:?}",
-            steps
-                .iter()
-                .filter_map(|s| s["run"].as_str())
+    let mut tests = Vec::new();
+    for (id, job) in jobs(&workflow) {
+        for line in runs_of(job).lines() {
+            let cargo = subcommands_of(line, "cargo");
+            let npm = subcommands_of(line, "npm");
+            let npm_runs_test = line
+                .split_whitespace()
                 .collect::<Vec<_>>()
-        );
-    };
-    assert!(
-        at < gate_at,
-        "expected the step that asks Firefox its version (step {at}) before the step that runs scripts/gate-hosted.sh (step {gate_at}) in the job {id}"
-    );
-    let step = &steps[at];
-    let run = step["run"].as_str().unwrap_or_default();
-    let swallowed = match &step["continue-on-error"] {
-        Value::Null | Value::Bool(false) => false,
-        Value::String(text) => text.trim() != "false",
-        _ => true,
-    };
-    assert!(
-        !swallowed,
-        "expected the step that asks Firefox its version not to go on past its failure (`continue-on-error: {}`)",
-        step["continue-on-error"]
-    );
-    let squeezed: String = run.split_whitespace().collect::<Vec<_>>().join(" ");
-    for swallowing in ["|| true", "|| :", "||true", "||:", "set +e"] {
-        assert!(
-            !squeezed.contains(swallowing),
-            "expected the step that asks Firefox its version not to swallow a failure; its `run:` holds {swallowing:?}: {run:?}"
-        );
+                .windows(3)
+                .any(|w| w[0] == "npm" && w[1] == "run" && w[2].starts_with("test"));
+            if cargo
+                .iter()
+                .any(|c| matches!(*c, "test" | "t" | "clippy" | "nextest"))
+                || npm.iter().any(|c| matches!(*c, "test" | "t" | "tst"))
+                || npm_runs_test
+            {
+                tests.push(format!("{id}: {}", line.trim()));
+            }
+        }
     }
+    assert!(
+        tests.is_empty(),
+        "expected no job of the workflow to run `cargo test`, `npm test` or `cargo clippy` (it runs no test of the program until the product is in use); found {tests:?}"
+    );
 }
 
+/// Whether a line of a `run:` builds an image (`docker build`, `docker
+/// buildx build`, `docker image build`).
+fn builds_an_image(line: &str) -> bool {
+    let words: Vec<&str> = line.split_whitespace().collect();
+    words
+        .windows(2)
+        .any(|w| w[0] == "docker" && w[1] == "build")
+        || words
+            .windows(3)
+            .any(|w| w[0] == "docker" && matches!(w[1], "buildx" | "image") && w[2] == "build")
+}
+
+/// CONTRACT.md, "The first release: The workflow": before anything is
+/// published, "the image built from the run's commit with `docker build`,
+/// which is the one then pushed". A job that does not publish builds it,
+/// and the job that pushes it builds no image of its own.
 #[test]
-fn the_jobs_that_publish_run_only_for_a_tag_and_need_every_job_that_checks() {
+fn a_job_of_the_workflow_builds_the_image_with_docker_build_and_the_publishing_job_builds_none() {
+    let workflow = workflow();
+    let publishing = publishing_jobs(&workflow);
+    let building: Vec<&String> = jobs(&workflow)
+        .iter()
+        .filter(|(_, job)| runs_of(job).lines().any(builds_an_image))
+        .map(|(id, _)| id)
+        .collect();
+    assert!(
+        building.iter().any(|id| !publishing.contains(*id)),
+        "expected a job that does not publish to build the image with `docker build`; the jobs that build one are {building:?}, those that publish {publishing:?}"
+    );
+    let rebuilding: Vec<&&String> = building
+        .iter()
+        .filter(|id| publishing.contains(**id))
+        .collect();
+    assert!(
+        rebuilding.is_empty(),
+        "expected the job that publishes to push the image the run built and checked, not to build one of its own; {rebuilding:?} build one"
+    );
+}
+
+/// CONTRACT.md, "The first release: The workflow": a run publishes only
+/// for a version tag, and "the job that publishes needs every one of these
+/// jobs": the release check, the image, the tool built, packed and tried on
+/// each system, and the release's files.
+#[test]
+fn the_jobs_that_publish_run_only_for_a_tag_and_need_every_job_that_checks_or_builds() {
     let workflow = workflow();
     let jobs = jobs(&workflow);
     let publishing = publishing_jobs(&workflow);
@@ -573,8 +578,40 @@ fn the_jobs_that_publish_run_only_for_a_tag_and_need_every_job_that_checks() {
             .collect();
         assert!(
             missing.is_empty(),
-            "expected the job {id}, which publishes, to need every job that checks; it does not need {missing:?}"
+            "expected the job {id}, which publishes, to need every job that checks or builds; it does not need {missing:?}"
         );
+        for (what, does) in [
+            (
+                "runs scripts/release-check.sh",
+                &(|runs: &str| runs.contains("scripts/release-check.sh")) as &dyn Fn(&str) -> bool,
+            ),
+            ("builds the image", &|runs: &str| {
+                runs.lines().any(builds_an_image)
+            }),
+            (
+                "packs the tool with scripts/package-tool.sh",
+                &|runs: &str| runs.contains("scripts/package-tool.sh"),
+            ),
+            ("tries the tool with scripts/try-tool.sh", &|runs: &str| {
+                runs.contains("scripts/try-tool.sh")
+            }),
+            (
+                "makes the release's files with scripts/release-files.sh",
+                &|runs: &str| runs.contains("scripts/release-files.sh"),
+            ),
+        ] {
+            let doing: Vec<&String> = jobs
+                .iter()
+                .filter(|(_, job)| does(&runs_of(job)))
+                .map(|(other, _)| other)
+                .collect();
+            assert!(
+                doing
+                    .iter()
+                    .any(|other| !publishing.contains(*other) && needed.contains(*other)),
+                "expected a job that {what}, apart from the job {id} that publishes and needed by it; the jobs that do are {doing:?}, {id} needs {needed:?}"
+            );
+        }
     }
 }
 
