@@ -8,8 +8,9 @@
 //! through, requests are answered as the database says (disabled, or
 //! served). Nobody is served, and nobody told it is disabled, on a guess.
 //!
-//! Each test takes about half a minute (the program's limit for a write,
-//! then a few seconds for the write to be settled).
+//! A disable or an enable has its own bound of 10 seconds, whatever longer
+//! bound another request of the API has: the `503` must come within
+//! [`OWN_BOUND`] and a margin, not at some other request's limit.
 
 use std::thread;
 use std::time::{Duration, Instant};
@@ -56,9 +57,20 @@ fn open_quickly(vm: &Vm, context: &str) -> Response {
     response
 }
 
+/// The bound of a disable's or an enable's write (CONTRACT.md, "What
+/// Platform administrators see and stop").
+const OWN_BOUND: Duration = Duration::from_secs(10);
+
+/// What a `503` may come after [`OWN_BOUND`]: the request's way there and
+/// back on a busy machine.
+const MARGIN: Duration = Duration::from_secs(3);
+
 /// Sends `action` as the administrator while commits are held: answered
-/// `503` `unavailable`.
+/// `503` `unavailable`, within [`OWN_BOUND`] and [`MARGIN`]. The request's
+/// own timeout is only an outer cap so that a program that never answers
+/// fails the test rather than hanging it.
 fn lost(vm: &Vm, action: &str) {
+    let began = Instant::now();
     let answer = vm
         .api_as(&administrator())
         .request(&format!("/v1/applications/board/{action}"))
@@ -66,7 +78,12 @@ fn lost(vm: &Vm, action: &str) {
         .json(&json!({}))
         .timeout(Duration::from_secs(60))
         .send();
+    let took = began.elapsed();
     assert_api_error(&answer, 503, "unavailable");
+    assert!(
+        took < OWN_BOUND + MARGIN,
+        "expected the {action}'s `503` within its own {OWN_BOUND:?} (and {MARGIN:?}), it took {took:?}"
+    );
 }
 
 /// For a few seconds: every request is the `503` with `retry-after`, at

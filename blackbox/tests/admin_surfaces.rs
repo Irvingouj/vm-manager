@@ -20,9 +20,9 @@ use blackbox::deploy::{
 };
 use blackbox::project::{manifest_ts, squashed};
 use blackbox::sharing::{TRACED, add, create_unshared, share_ok, user};
-use blackbox::tool::Machine;
+use blackbox::tool::{Machine, Run};
 use blackbox::{DOMAIN, User, Vm};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 fn alice() -> User {
     User::new("alice").in_groups(&["staff"])
@@ -117,6 +117,39 @@ fn vm_show_says_since_when_by_whom_and_that_an_administrator_enables_it() {
     }
 }
 
+/// Fails unless go-back's `--json` output has `disabled` after
+/// `migrations_not_undone`, as the contract orders its members.
+fn assert_disabled_after_migrations(run: &Run) {
+    let migrations = run.stdout.find("\"migrations_not_undone\"");
+    let disabled = run.stdout.find("\"disabled\"");
+    assert!(
+        matches!((migrations, disabled), (Some(m), Some(d)) if m < d),
+        "expected `disabled` after `migrations_not_undone`\n{}",
+        run.describe()
+    );
+}
+
+#[test]
+fn vm_go_back_on_an_application_that_is_not_disabled_has_disabled_null_and_no_warnings() {
+    let vm = admin::start();
+    let api = vm.api_as(&alice());
+    api.create_with_bundle("board", &marked_bundle("v1"));
+    api.send_version("board", &version_body(&marked_bundle("v2")))
+        .expect_status(201);
+    let machine = signed_in_as(&vm, &alice());
+    let run = machine.run(&["go-back", "board", "--json"]);
+    let gone = run.ok_json();
+    assert_eq!(
+        gone,
+        json!({ "application": "board", "address": format!("board.{DOMAIN}"),
+                "serving_version": 1, "was": 2, "migrations_not_undone": [],
+                "disabled": null }),
+        "go-back's output on an Application that is not disabled, exactly (no `warnings`)\n{}",
+        run.describe()
+    );
+    assert_disabled_after_migrations(&run);
+}
+
 #[test]
 fn vm_go_back_on_a_disabled_application_is_made_and_warns() {
     let vm = admin::start();
@@ -128,12 +161,15 @@ fn vm_go_back_on_a_disabled_application_is_made_and_warns() {
     let machine = signed_in_as(&vm, &alice());
     let run = machine.run(&["go-back", "board", "--json"]);
     let gone = run.ok_json();
-    assert_eq!(gone["serving_version"], 1, "{gone}");
-    assert_eq!(gone["was"], 2, "{gone}");
+    assert_disabled_after_migrations(&run);
+    let message = gone["warnings"][0]["message"].clone();
     assert_eq!(
-        gone["disabled"],
-        disabled,
-        "the `disabled` member\n{}",
+        gone,
+        json!({ "application": "board", "address": format!("board.{DOMAIN}"),
+                "serving_version": 1, "was": 2, "migrations_not_undone": [],
+                "disabled": disabled,
+                "warnings": [ { "reason": "application-disabled", "message": message } ] }),
+        "go-back's output on a disabled Application, exactly\n{}",
         run.describe()
     );
     assert_disabled_warning(&gone, &run.describe());

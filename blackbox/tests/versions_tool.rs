@@ -273,7 +273,8 @@ fn vm_go_back_goes_back_from_the_serving_version_to_the_one_before() {
     assert_eq!(
         gone,
         json!({ "application": "board", "address": format!("board.{DOMAIN}"),
-                "serving_version": 2, "was": 3, "migrations_not_undone": [] })
+                "serving_version": 2, "was": 3, "migrations_not_undone": [],
+                "disabled": null })
     );
     assert_served_by(
         &own.vm,
