@@ -349,6 +349,103 @@ fn vm_admin_applications_pages_and_says_how_to_read_the_next_page() {
 }
 
 #[test]
+fn vm_admin_applications_after_a_name_with_none_after_it_says_so() {
+    let vm = admin::start();
+    let machine = signed_in_as(&vm, &administrator());
+    vm.api_as(&alice())
+        .create_application("board")
+        .expect_status(201);
+    // A name no Application has, after every one; and the last
+    // Application's own name.
+    for after in ["zzz", "board"] {
+        let none = json_run(&machine, &["applications", "--after", after]).ok_json();
+        assert_eq!(
+            none,
+            json!({ "applications": [], "next": null }),
+            "--after {after} --json: the API's answer as it is"
+        );
+        let words = words_run(&machine, &["applications", "--after", after]).ok_text();
+        let lower = squashed(&words).to_lowercase();
+        assert!(
+            words.contains(after) && lower.contains("after"),
+            "--after {after}: expected the words to say that no Application comes after {after:?}\n{words}"
+        );
+        assert!(
+            !lower.contains("yet"),
+            "--after {after}: the installation has an Application; expected the words not to say it has none yet\n{words}"
+        );
+        assert!(
+            !words.contains("--after"),
+            "--after {after}: no paging line when `next` is null\n{words}"
+        );
+    }
+}
+
+#[test]
+fn vm_admin_operation_log_takes_a_time_whose_t_and_z_are_lower_case() {
+    let s = Scenario::ready();
+    let rita = User::new("rita").in_groups(&[READERS]);
+    for n in 0..4 {
+        s.query(
+            &rita,
+            "board",
+            &json!({ "resource": RESOURCE, "sql": format!("select {n} as n") }),
+        );
+    }
+    let all = log_page(&s.vm, "?limit=1000");
+    let entries = all["entries"].as_array().unwrap();
+    assert!(
+        entries.len() >= 4,
+        "the harness's own check: expected the four queries' entries, got {all}"
+    );
+    let pivot = entries[entries.len() / 2]["time"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let lower = pivot.replace('T', "t").replace('Z', "z");
+    assert_ne!(lower, pivot, "the harness's own check");
+    let machine = signed_in_as(&s.vm, &administrator());
+    for option in ["--since", "--until"] {
+        let upper = json_run(&machine, &["operation-log", option, &pivot]).ok_json();
+        let lowered = json_run(&machine, &["operation-log", option, &lower]).ok_json();
+        assert_eq!(
+            lowered, upper,
+            "`vibe admin operation-log {option} {lower}`: expected exactly what {pivot} answers"
+        );
+        assert!(
+            !upper["entries"].as_array().unwrap().is_empty(),
+            "the harness's own check: {option} {pivot} matches an entry: {upper}"
+        );
+    }
+    let both = json_run(
+        &machine,
+        &[
+            "operation-log",
+            "--since",
+            &lower,
+            "--until",
+            "2999-01-01t00:00:00z",
+        ],
+    )
+    .ok_json();
+    assert_eq!(
+        both,
+        json_run(
+            &machine,
+            &[
+                "operation-log",
+                "--since",
+                &pivot,
+                "--until",
+                "2999-01-01T00:00:00Z"
+            ]
+        )
+        .ok_json(),
+        "both in lower case: exactly what the upper case answers"
+    );
+}
+
+#[test]
 fn vm_admin_disable_and_enable_print_what_they_did() {
     let (vm, machine) = with_board();
     let printed = json_run(&machine, &["disable", "board"]).ok_json();

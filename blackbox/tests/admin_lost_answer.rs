@@ -11,15 +11,28 @@
 //! A disable or an enable has its own bound of 10 seconds, whatever longer
 //! bound another request of the API has: the `503` must come within
 //! [`OWN_BOUND`] and a margin, not at some other request's limit.
+//!
+//! And a disable made while the program is finding out an Application's
+//! lists after a change of them lost its answer still stops the request in
+//! flight (CONTRACT.md, "What Platform administrators see and stop:
+//! Requests in flight": "whatever the program then knew of the
+//! Application").
 
 use std::thread;
 use std::time::{Duration, Instant};
 
-use blackbox::admin::{self, administrator, assert_disabled_plain, disable_ok};
-use blackbox::lost_answer::{HeldPostgres, QUICK, SETTLE, assert_503_retry};
-use blackbox::sharing::TRACED;
-use blackbox::{Response, User, Vm, assert_api_error, fixture_bundle};
-use serde_json::json;
+use blackbox::admin::{
+    self, IN_FLIGHT_ALLOWED, administrator, assert_disabled_plain, disable, disable_ok,
+};
+use blackbox::lost_answer::{HeldPostgres, LOST_WRITE_TIMEOUT, QUICK, SETTLE, assert_503_retry};
+use blackbox::scenario::{READERS, RESOURCE, Scenario, WRITERS, lines};
+use blackbox::sharing::{TRACED, add, user};
+use blackbox::transactions::{
+    self, APP, TX_REQUEST_TIMEOUT, Target, begin, commit, execute_in, insert_marker, outside,
+    sleep, wanda,
+};
+use blackbox::{INSTALLER, Response, User, Vm, VmOptions, assert_api_error, fixture_bundle};
+use serde_json::{Value, json};
 
 fn bob() -> User {
     User::new("bob")
@@ -160,4 +173,164 @@ fn an_enable_whose_answer_is_lost_is_not_refused_for_ever_and_settles_served() {
         thread::sleep(Duration::from_millis(200));
     }
     assert!(vm.api_as(&administrator()).application("board")["disabled"].is_null());
+}
+
+/// How long the request in flight waits in its code, after its first
+/// query, before it begins its transaction: past the lost change's `503`
+/// (the program gives up on a write after 20 s) and the harness letting
+/// commits through, so that the transaction is begun and written while the
+/// program has not yet found out the lists, and is open for less than the
+/// 10 s a transaction may be; and short of the 30 s a request is given.
+const BEGIN_AFTER_MS: u64 = 23_000;
+
+/// The request's whole time: what an answer must come before for it not to
+/// be the program's answer to a request past its time.
+const REQUEST_TIME: Duration = Duration::from_secs(30);
+
+/// Waits until the Operation log satisfies `done`.
+fn wait_for_log(s: &Scenario, within: Duration, done: impl Fn(&[Value]) -> bool, context: &str) {
+    let deadline = Instant::now() + within;
+    loop {
+        let entries = s.log();
+        if done(&entries) {
+            return;
+        }
+        if Instant::now() >= deadline {
+            s.vm.fail(&format!(
+                "the harness's own wait, {context}: the Operation log did not come to it within {within:?}:\n{}",
+                lines(&entries)
+            ));
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn a_disable_while_the_program_finds_out_lost_lists_still_stops_the_request_in_flight() {
+    let postgres = HeldPostgres::start();
+    let platform = postgres.platform("vm_platform_lost_lists_disable");
+    let scenario = Scenario::start_with(&VmOptions::new().platform(&platform));
+    scenario.register_writable(RESOURCE);
+    scenario.grant(RESOURCE, READERS, "read");
+    scenario.grant(RESOURCE, WRITERS, "write");
+    transactions::install(&scenario.vm, APP, &[(RESOURCE, "write")]);
+    let s = &scenario;
+    let vm = &s.vm;
+    let devops = Target::Shared(RESOURCE);
+    let marker = format!("lost-lists-{}", blackbox::shared_database::token());
+    let steps = vec![
+        outside("query", devops, "select 1 as one"),
+        sleep(BEGIN_AFTER_MS),
+        begin(devops, "write", "t"),
+        execute_in("t", &insert_marker(devops, &marker)),
+        sleep(20_000),
+        commit("t"),
+    ];
+    let is_wandas = |e: &Value, operation: &str| {
+        e["user"] == "wanda"
+            && e["application"] == APP
+            && e["operation"] == operation
+            && e["outcome"] == "allowed"
+    };
+    let started = Instant::now();
+    let (answer, answered_at, disabled_at) = thread::scope(|scope| {
+        let running = scope.spawn(|| {
+            let r = vm
+                .request(APP, "/")
+                .as_user(&wanda())
+                .method("POST")
+                .json(&json!({ "steps": steps }))
+                .timeout(TX_REQUEST_TIMEOUT)
+                .send();
+            (r, Instant::now())
+        });
+        // The request is in its code: its first query's entry is written,
+        // before commits are held.
+        wait_for_log(
+            s,
+            Duration::from_secs(10),
+            |entries| entries.iter().any(|e| is_wandas(e, "query")),
+            "the request's first query",
+        );
+        // A change of the Application's lists loses its answer.
+        postgres.hold();
+        let lost = vm
+            .api_as(&User::new(INSTALLER))
+            .request(&format!("/v1/applications/{APP}/sharing"))
+            .method("POST")
+            .json(&add(&[user("carol")]))
+            .timeout(LOST_WRITE_TIMEOUT)
+            .send();
+        assert_api_error(&lost, 503, "unavailable");
+        postgres.assert_waiting(1, "after the sharing change's `503`");
+        postgres.let_through();
+        // The harness's own check of the timing: the request's code has
+        // not begun its transaction yet.
+        let through = started.elapsed();
+        assert!(
+            through + Duration::from_millis(500) < Duration::from_millis(BEGIN_AFTER_MS),
+            "the harness's own check: commits were let through {through:?} after the request began, too late for its transaction ({BEGIN_AFTER_MS} ms)"
+        );
+        // Nothing has been sent to the Application's address since: the
+        // program has not had to find out its lists. The transaction is
+        // begun and has written.
+        wait_for_log(
+            s,
+            Duration::from_millis(BEGIN_AFTER_MS) + Duration::from_secs(5),
+            |entries| entries.iter().any(|e| is_wandas(e, "execute")),
+            "the request's transaction written",
+        );
+        let answer = disable(vm, &administrator(), APP);
+        let disabled_at = Instant::now();
+        if answer.status != 200 {
+            vm.fail(&format!(
+                "expected `200` disabling {APP:?} while the program finds out its lists after a change whose answer was lost, got\n{}",
+                answer.describe()
+            ));
+        }
+        let (response, at) = running.join().unwrap();
+        (response, at, disabled_at)
+    });
+    let after = answered_at.saturating_duration_since(disabled_at);
+    assert!(
+        after <= IN_FLIGHT_ALLOWED && answered_at.duration_since(started) < REQUEST_TIME,
+        "expected the request in flight answered within 1 s of the disable's `200` ({IN_FLIGHT_ALLOWED:?} allowed on a loaded machine), whatever the program then knew of the Application; it was answered {after:?} after it\n{}",
+        answer.describe()
+    );
+    assert_disabled_plain(&answer, APP, "the request in flight");
+    // Its transaction is rolled back by the host, `error`
+    // `application-disabled`; its row is not kept.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let entries = loop {
+        let entries = s.entries_of(&answer);
+        if entries.iter().any(|e| e["operation"] == "rollback") || Instant::now() >= deadline {
+            break entries;
+        }
+        thread::sleep(Duration::from_millis(100));
+    };
+    let began = entries
+        .iter()
+        .find(|e| e["operation"] == "begin")
+        .unwrap_or_else(|| vm.fail(&format!("no `begin` entry:\n{}", lines(&entries))));
+    let id = began["transaction"].as_str().unwrap_or_default().to_owned();
+    let rollback = transactions::the_rollback(&entries, &id, "the disabled request");
+    assert_eq!(
+        rollback["error"], "application-disabled",
+        "expected the host's rollback to say why: {rollback}"
+    );
+    assert!(
+        !entries
+            .iter()
+            .any(|e| e["operation"] == "commit" && e["outcome"] == "allowed"),
+        "nothing it had not committed is kept:\n{}",
+        lines(&entries)
+    );
+    let kept = s.db.superuser().value(&format!(
+        "SELECT count(*) FROM notes WHERE body LIKE '%{marker}%'"
+    ));
+    assert_eq!(
+        kept.as_deref(),
+        Some("0"),
+        "the row written in the transaction is not kept"
+    );
 }

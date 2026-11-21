@@ -280,6 +280,122 @@ fn since_is_inclusive_and_until_exclusive_and_an_offset_is_taken() {
     assert_filtered(&t, "until=2000-01-01T00:00:00Z", &[]);
 }
 
+#[test]
+fn since_and_until_take_t_and_z_in_lower_case() {
+    let (t, all) = populated();
+    let pivot = &all[all.len() / 2];
+    let time = pivot["time"].as_str().unwrap().to_owned();
+    let shifted = shift_to_plus_one(&time);
+    let whole_seconds = format!("{}Z", &time[..19]);
+    for upper in [time.as_str(), shifted.as_str(), whole_seconds.as_str()] {
+        let written = [
+            upper.replace('T', "t"),
+            upper.replace('Z', "z"),
+            upper.replace('T', "t").replace('Z', "z"),
+        ];
+        for parameter in ["since", "until"] {
+            let want = log_page(
+                t.vm(),
+                &format!("?{parameter}={}&limit=1000", encode(upper)),
+            );
+            for lower in &written {
+                if lower == upper {
+                    continue;
+                }
+                let answer = operation_log(
+                    t.vm(),
+                    &administrator(),
+                    &format!("?{parameter}={}&limit=1000", encode(lower)),
+                );
+                assert_eq!(
+                    answer.status,
+                    200,
+                    "?{parameter}={lower}: the letters `T` and `Z` may be lower case\n{}",
+                    answer.describe()
+                );
+                assert_eq!(
+                    answer.json(),
+                    want,
+                    "?{parameter}={lower}: expected exactly the entries {upper} answers"
+                );
+            }
+        }
+    }
+    // Both, in lower case.
+    let first = all[0]["time"].as_str().unwrap();
+    let last = all[all.len() - 1]["time"].as_str().unwrap();
+    let lower = |s: &str| s.replace('T', "t").replace('Z', "z");
+    assert_eq!(
+        log_page(
+            t.vm(),
+            &format!(
+                "?since={}&until={}&limit=1000",
+                encode(&lower(first)),
+                encode(&lower(last))
+            )
+        ),
+        log_page(
+            t.vm(),
+            &format!("?since={}&until={}&limit=1000", encode(first), encode(last))
+        ),
+        "since and until both in lower case"
+    );
+}
+
+#[test]
+fn a_plus_in_a_filter_is_a_space_and_a_plus_is_written_2b() {
+    let s = Scenario::ready();
+    // Two Users whose ids differ only in a plus and a space.
+    let plus = User::new("ann+ops").in_groups(&[READERS]);
+    let space = User::new("ann ops").in_groups(&[READERS]);
+    s.query(
+        &plus,
+        "board",
+        &json!({ "resource": RESOURCE, "sql": "select 1 as n" }),
+    );
+    s.query(
+        &space,
+        "board",
+        &json!({ "resource": RESOURCE, "sql": "select 2 as n" }),
+    );
+    s.query(
+        &space,
+        "board",
+        &json!({ "resource": RESOURCE, "sql": "select 3 as n" }),
+    );
+    let all = log_page(&s.vm, "?limit=1000");
+    let entries = all["entries"].as_array().unwrap();
+    let of = |id: &str| -> Vec<Value> {
+        entries
+            .iter()
+            .filter(|e| e["user"] == id)
+            .cloned()
+            .collect()
+    };
+    assert_eq!(
+        (of("ann+ops").len(), of("ann ops").len()),
+        (1, 2),
+        "the harness's own check: one entry by `ann+ops`, two by `ann ops`, in\n{}",
+        lines(entries)
+    );
+    let by = |query: &str| log_page(&s.vm, &format!("?{query}&limit=1000"))["entries"].clone();
+    assert_eq!(
+        by("user=ann%2Bops"),
+        json!(of("ann+ops")),
+        "user=ann%2Bops: a plus written `%2B` matches the User whose id holds a plus"
+    );
+    assert_eq!(
+        by("user=ann+ops"),
+        json!(of("ann ops")),
+        "user=ann+ops: a `+` is read as a space, as a form writes one"
+    );
+    assert_eq!(
+        by("user=ann%20ops"),
+        json!(of("ann ops")),
+        "user=ann%20ops: the User whose id holds a space"
+    );
+}
+
 /// The same instant as `utc` (`...Z`), written with the offset `+01:00`.
 fn shift_to_plus_one(utc: &str) -> String {
     let hour: u32 = utc[11..13].parse().unwrap();
