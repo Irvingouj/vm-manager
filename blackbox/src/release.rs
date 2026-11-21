@@ -321,8 +321,8 @@ pub fn stand_in_program(dir: &Path, name: &str, first_line: &str) -> PathBuf {
 /// checked out (its `HEAD`), in a folder of the test's own, removed when
 /// dropped (CONTRACT.md, "The first release": the gate's release tests hold
 /// for the commit checked out, whether or not a branch `main` names it; the
-/// workflow runs the gate on a tag's commit, a detached `HEAD` with no
-/// local branch). The copy is made as a checkout on a runner is: `git
+/// workflow, when it runs the gate, runs it on a tag's commit, a detached
+/// `HEAD` with no local branch). The copy is made as a checkout on a runner is: `git
 /// init`, a remote `origin` naming the repository, `git fetch` of `HEAD`
 /// alone and no tag (a tag of the repository, `v<version>` in a tag's run,
 /// is not carried over); then a branch `main` and `origin/main` are made in
