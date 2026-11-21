@@ -690,13 +690,11 @@ fn with_the_delimiter_keys_roll_up_into_folders_listed_once_in_byte_order_with_t
         "expected folders and files in byte order across pages of 2:\n{}",
         lines(&pages)
     );
-    assert_eq!(pages.len(), 3, "five names, two a page: {}", lines(&pages));
-    for page in &pages[..2] {
+    for page in &pages {
         let (f, d) = listed_names(page);
-        assert_eq!(
-            f.len() + d.len(),
-            2,
-            "each page holds `limit` names: {page}"
+        assert!(
+            f.len() + d.len() <= 2,
+            "a page holds at most `limit` names: {page}"
         );
     }
     let partial = s.as_writer(&list(
@@ -717,21 +715,37 @@ fn the_limit_is_100_without_it_and_a_page_holds_at_most_limit() {
     for n in 0..105 {
         place(&dir.join(format!("f{n:03}.txt")), b"x");
     }
+    // A page may be short ("list"): at most `limit`, the cursor null only
+    // at the end.
     let page = s.as_writer(&list(MARKETING, &json!({})));
     let (files, _) = listed_names(&page["ok"]);
-    assert_eq!(
-        files.len(),
-        100,
-        "expected 100 files without a limit, got {}",
+    assert!(
+        files.len() <= 100,
+        "expected at most 100 files without a limit, got {}",
         files.len()
     );
     assert!(
         page["ok"]["cursor"].is_string(),
-        "more follow: {}",
+        "more follow, so a cursor: {}",
         page["ok"]["cursor"]
     );
-    let one = s.as_writer(&list(MARKETING, &json!({ "limit": 1 })));
-    assert_eq!(listed_names(&one["ok"]).0, ["f000.txt"]);
+    let mut all = files;
+    let mut cursor = page["ok"]["cursor"].as_str().map(str::to_owned);
+    while let Some(c) = cursor {
+        let next = s.as_writer(&list(MARKETING, &json!({ "cursor": c })));
+        let (files, _) = listed_names(&next["ok"]);
+        assert!(files.len() <= 100, "at most 100 without a limit: {next}");
+        all.extend(files);
+        cursor = next["ok"]["cursor"].as_str().map(str::to_owned);
+        assert!(all.len() <= 105, "the pages do not end: {}", all.len());
+    }
+    let expected: Vec<String> = (0..105).map(|n| format!("f{n:03}.txt")).collect();
+    assert_eq!(all, expected, "the pages together, in order");
+    let ones = s.every_page(&json!({}), 1);
+    for one in &ones {
+        assert!(listed_names(one).0.len() <= 1, "`limit` 1: {one}");
+    }
+    assert_eq!(every_name(&ones), expected, "pages of `limit` 1 together");
 }
 
 #[test]
@@ -740,22 +754,36 @@ fn a_cursor_answers_the_next_page_also_when_files_were_put_and_deleted_meanwhile
     for key in ["b", "d", "f", "h", "j", "l"] {
         s.put_ok(key, b"x", None);
     }
-    let first = s.as_writer(&list(MARKETING, &json!({ "limit": 2 })));
-    assert_eq!(listed_names(&first["ok"]).0, ["b", "d"]);
-    let cursor = first["ok"]["cursor"].as_str().unwrap().to_owned();
-    assert!(
-        cursor.len() <= 2048,
-        "a cursor is at most 2,048 bytes, got {}",
-        cursor.len()
-    );
+    // Pages of at most 2 until `d` is answered (a page may be short).
+    let mut seen: Vec<String> = Vec::new();
+    let mut cursor: Option<String> = None;
+    while !seen.contains(&"d".to_owned()) {
+        let mut args = json!({ "limit": 2 });
+        if let Some(c) = &cursor {
+            args["cursor"] = json!(c);
+        }
+        let page = s.as_writer(&list(MARKETING, &args));
+        let names = listed_names(&page["ok"]).0;
+        assert!(names.len() <= 2, "at most `limit`: {page}");
+        seen.extend(names);
+        cursor = page["ok"]["cursor"].as_str().map(str::to_owned);
+        let c = cursor
+            .as_deref()
+            .unwrap_or_else(|| panic!("more follow `d`, so a cursor: {page}"));
+        assert!(
+            c.len() <= 2048,
+            "a cursor is at most 2,048 bytes, got {}",
+            c.len()
+        );
+    }
+    let before = seen.len();
+    let last = seen.last().unwrap().clone();
     // Meanwhile: put behind the cursor and ahead of it, delete ahead.
     s.put_ok("a", b"x", None);
     s.put_ok("c", b"x", None);
     s.put_ok("e", b"x", None);
     s.as_writer(&delete(MARKETING, "f"));
     s.as_writer(&delete(MARKETING, "d"));
-    let mut seen: Vec<String> = vec!["b".into(), "d".into()];
-    let mut cursor = Some(cursor);
     while let Some(c) = cursor {
         let page = s.as_writer(&list(MARKETING, &json!({ "limit": 2, "cursor": c })));
         assert!(page["ok"].is_object(), "expected a page, got {page}");
@@ -773,17 +801,29 @@ fn a_cursor_answers_the_next_page_also_when_files_were_put_and_deleted_meanwhile
         !seen.contains(&"a".to_owned()) && !seen.contains(&"c".to_owned()),
         "a key put meanwhile behind the cursor is not answered: {seen:?}"
     );
-    assert!(
-        seen.contains(&"e".to_owned()),
-        "a key put ahead is answered: {seen:?}"
-    );
-    assert!(
-        !seen.contains(&"f".to_owned()),
-        "a key deleted ahead is not answered: {seen:?}"
-    );
+    // `e` and `f` are ahead of the cursor when the last key answered is
+    // `d`; a short page may have stopped there or a page later.
+    if last.as_str() < "e" {
+        assert!(
+            seen.contains(&"e".to_owned()),
+            "a key put ahead is answered: {seen:?}"
+        );
+    }
+    if last.as_str() < "f" {
+        assert!(
+            !seen.contains(&"f".to_owned()),
+            "a key deleted ahead is not answered: {seen:?}"
+        );
+    }
+    // The rest: what is there now beyond the last key answered, in byte
+    // order.
+    let rest: Vec<&str> = ["a", "b", "c", "e", "h", "j", "l"]
+        .into_iter()
+        .filter(|k| *k > last.as_str())
+        .collect();
     assert_eq!(
-        &seen[2..],
-        ["e", "h", "j", "l"],
+        &seen[before..],
+        rest,
         "expected the rest in byte order: {seen:?}"
     );
 }
@@ -794,24 +834,39 @@ fn a_folder_answered_on_one_page_is_not_answered_again_on_the_next() {
     for key in ["a.txt", "b/1", "b/2", "b/3", "c.txt", "d/1"] {
         s.put_ok(key, b"x", None);
     }
-    let first = s.as_writer(&list(MARKETING, &json!({ "delimiter": "/", "limit": 2 })));
-    let (f, d) = listed_names(&first["ok"]);
-    assert_eq!((f, d), (vec!["a.txt".to_owned()], vec!["b/".to_owned()]));
-    let cursor = first["ok"]["cursor"].as_str().unwrap().to_owned();
+    // Pages of at most 2 until `b/` is answered (a page may be short).
+    let mut seen: Vec<String> = Vec::new();
+    let mut cursor: Option<String> = None;
+    let page_of = |cursor: &Option<String>| {
+        let mut args = json!({ "delimiter": "/", "limit": 2 });
+        if let Some(c) = cursor {
+            args["cursor"] = json!(c);
+        }
+        let page = s.as_writer(&list(MARKETING, &args));
+        let names = every_name(std::slice::from_ref(&page["ok"]));
+        assert!(names.len() <= 2, "at most `limit`: {page}");
+        (names, page["ok"]["cursor"].as_str().map(str::to_owned))
+    };
+    while !seen.contains(&"b/".to_owned()) {
+        let (names, next) = page_of(&cursor);
+        seen.extend(names);
+        cursor = next;
+        assert!(cursor.is_some(), "more follow `b/`, so a cursor: {seen:?}");
+    }
     // A file put meanwhile in the folder already answered.
     s.put_ok("b/0", b"x", None);
     s.put_ok("b/9", b"x", None);
-    let second = s.as_writer(&list(
-        MARKETING,
-        &json!({ "delimiter": "/", "limit": 2, "cursor": cursor }),
-    ));
-    let (f, d) = listed_names(&second["ok"]);
+    while cursor.is_some() {
+        let (names, next) = page_of(&cursor);
+        seen.extend(names);
+        cursor = next;
+        assert!(seen.len() < 50, "the pages do not end: {seen:?}");
+    }
     assert_eq!(
-        (f, d),
-        (vec!["c.txt".to_owned()], vec!["d/".to_owned()]),
-        "expected the next page after the folder `b/`, not `b/` again: {second}"
+        seen,
+        ["a.txt", "b/", "c.txt", "d/"],
+        "expected the pages after the folder `b/` not to answer `b/` again"
     );
-    assert!(second["ok"]["cursor"].is_null(), "{second}");
 }
 
 #[test]

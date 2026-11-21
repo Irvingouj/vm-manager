@@ -8,7 +8,8 @@
 //! refused registration registers nothing and writes nothing; no answer,
 //! message or log record holds the directory's path; a registration that
 //! passes writes `.vibe-resource` and `.vibe-staging/`; a `.vibe-resource`
-//! naming the same Resource is taken.
+//! naming the same Resource is taken; registrations asked at the same
+//! moment are decided one after the other.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -18,14 +19,17 @@
 )]
 
 use std::os::unix::fs::symlink;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Barrier;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use blackbox::api::{assert_json_content_type, assert_recent_rfc3339};
 use blackbox::postgres::Platform;
 use blackbox::scenario::administrator;
 use blackbox::storage::{
-    FILE_READERS, FILE_WRITERS, FILES_CONTACT, MARKETING, Place, Storage, postgres_body, set_mode,
-    storage_body, tree,
+    FILE_READERS, FILE_WRITERS, FILES_CONTACT, MARKETING, Place, Storage, b64, get, list,
+    postgres_body, put, set_mode, storage_body, tree, wanda,
 };
 use blackbox::{User, VmOptions, assert_api_error};
 use serde_json::{Value, json};
@@ -252,6 +256,12 @@ fn a_storage_resource_takes_a_names_rules_as_a_database_does() {
     }
     let taken = s.try_register("devops", &dir.to_string_lossy());
     assert_api_error(&taken, 409, "name-taken");
+    assert!(
+        tree(&dir).is_empty(),
+        "expected nothing written in the directory asked for a name taken, found {:?}",
+        tree(&dir)
+    );
+    // The same directory can be registered afterwards.
     s.register_on("files", &dir);
     let other = s.dir("other");
     std::fs::create_dir_all(&other).unwrap();
@@ -582,4 +592,186 @@ fn one_slash_at_the_end_of_the_directory_is_dropped() {
     assert_marked(&dir, "after a registration with one slash at the end");
     let again = s.try_register("other", &dir.to_string_lossy());
     assert_api_error(&again, 409, "directory-in-use");
+}
+
+/// One pair of registrations asked at the same moment: two names, their
+/// directories, and the status each was answered.
+struct Pair {
+    names: [String; 2],
+    dirs: [PathBuf; 2],
+    statuses: [u16; 2],
+}
+
+/// Keeps the program's file threads busy: lists of a folder of 20,000
+/// empty folders through an Application, eight at once, until `stop`.
+fn keep_the_file_threads_busy(s: &Storage, stop: &AtomicBool) {
+    let calls: Vec<Value> = (0..8)
+        .map(|_| list("big", &json!({ "prefix": "d/", "limit": 1 })))
+        .collect();
+    while !stop.load(Ordering::Relaxed) {
+        // Only the load matters, not the answer.
+        drop(
+            s.vm.request("lister", "/")
+                .as_user(&wanda())
+                .method("POST")
+                .json(&json!({ "mode": "together", "calls": calls }))
+                .timeout(Duration::from_secs(60))
+                .try_send(),
+        );
+    }
+}
+
+#[test]
+fn registrations_asked_at_the_same_moment_are_decided_one_after_the_other() {
+    let s = Storage::start();
+    let root = s.root();
+    // Another Resource, of 20,000 empty folders, whose lists keep the file
+    // threads busy.
+    let big = s.dir("big");
+    std::fs::create_dir_all(big.join("d")).unwrap();
+    for n in 0..20_000 {
+        std::fs::create_dir(big.join("d").join(format!("{n:05}"))).unwrap();
+    }
+    s.register("big");
+    s.grant("big", FILE_WRITERS, "write");
+    s.install("lister", "operations.js", &[("big", "storage", "write")]);
+
+    let mut pairs: Vec<Pair> = Vec::new();
+    // (a) a directory and one inside it, under two names: 12 pairs.
+    for i in 0..12 {
+        let outer = root.join(format!("p{i}"));
+        let inner = outer.join("inner");
+        std::fs::create_dir_all(&inner).unwrap();
+        pairs.push(Pair {
+            names: [format!("inner_{i}"), format!("outer_{i}")],
+            dirs: [inner, outer],
+            statuses: [0, 0],
+        });
+    }
+    // (b) the same directory under two names: 6 pairs.
+    for i in 0..6 {
+        let dir = root.join(format!("same{i}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        pairs.push(Pair {
+            names: [format!("first_{i}"), format!("second_{i}")],
+            dirs: [dir.clone(), dir],
+            statuses: [0, 0],
+        });
+    }
+
+    let stop = AtomicBool::new(false);
+    let program = &s;
+    std::thread::scope(|scope| {
+        let listers: Vec<_> = (0..4)
+            .map(|_| scope.spawn(|| keep_the_file_threads_busy(program, &stop)))
+            .collect();
+        // The lists running before the registrations are asked.
+        std::thread::sleep(Duration::from_secs(3));
+        for pair in &mut pairs {
+            let barrier = Barrier::new(2);
+            let [a, b] = std::thread::scope(|both| {
+                let asked: Vec<_> = (0..2)
+                    .map(|k| {
+                        let (name, dir, barrier) = (&pair.names[k], &pair.dirs[k], &barrier);
+                        both.spawn(move || {
+                            barrier.wait();
+                            program.try_register(name, &dir.to_string_lossy()).status
+                        })
+                    })
+                    .collect();
+                let mut statuses = asked.into_iter().map(|h| h.join().unwrap());
+                [statuses.next().unwrap(), statuses.next().unwrap()]
+            });
+            pair.statuses = [a, b];
+        }
+        stop.store(true, Ordering::Relaxed);
+        for lister in listers {
+            lister.join().unwrap();
+        }
+    });
+    let seen: Vec<String> = pairs
+        .iter()
+        .map(|p| format!("{} {:?}: {:?}", p.names[0], p.names, p.statuses))
+        .collect();
+
+    // A `503` registered nothing: asked again alone.
+    for pair in &mut pairs {
+        for k in 0..2 {
+            if pair.statuses[k] == 503 {
+                pair.statuses[k] = s
+                    .try_register(&pair.names[k], &pair.dirs[k].to_string_lossy())
+                    .status;
+            }
+        }
+    }
+
+    // What it means: no file put through one Resource of a pair can be
+    // read through the other.
+    let registered: Vec<&str> = pairs
+        .iter()
+        .flat_map(|p| {
+            p.names
+                .iter()
+                .zip(p.statuses)
+                .filter(|(_, st)| *st == 201)
+                .map(|(n, _)| n.as_str())
+        })
+        .collect();
+    for name in &registered {
+        s.grant(name, FILE_WRITERS, "write");
+    }
+    let declared: Vec<(&str, &str, &str)> = registered
+        .iter()
+        .map(|n| (*n, "storage", "write"))
+        .collect();
+    s.install("cross", "operations.js", &declared);
+    let mut crossed = Vec::new();
+    for pair in &pairs {
+        for (from, to) in [(0, 1), (1, 0)] {
+            if pair.statuses[from] != 201 {
+                continue;
+            }
+            // The key, in each Resource, of one file at the inner directory.
+            let (put_key, get_key) = if pair.dirs[0] == pair.dirs[1] {
+                ("crossed.txt", "crossed.txt")
+            } else if from == 0 {
+                ("crossed.txt", "inner/crossed.txt")
+            } else {
+                ("inner/crossed.txt", "crossed.txt")
+            };
+            let secret = format!("put through {}", pair.names[from]);
+            s.one(
+                &wanda(),
+                "cross",
+                &put(&pair.names[from], put_key, secret.as_bytes(), None),
+            );
+            let got = s.one(&wanda(), "cross", &get(&pair.names[to], get_key)).1;
+            if got["ok"]["body"] == b64(secret.as_bytes()).as_str() {
+                crossed.push(format!(
+                    "{} read what was put through {}",
+                    pair.names[to], pair.names[from]
+                ));
+            }
+        }
+    }
+    assert!(
+        crossed.is_empty(),
+        "expected no Resource of a pair to read another's files, got {crossed:?}; asked at once:\n{}",
+        seen.join("\n")
+    );
+    for pair in &pairs {
+        let mut statuses = pair.statuses;
+        statuses.sort_unstable();
+        assert_eq!(
+            statuses,
+            [201, 409],
+            "expected exactly one of {:?} registered and the other `409 directory-in-use` (a `503` asked again alone), got {:?}; asked at once:\n{}",
+            pair.names,
+            pair.statuses,
+            seen.join("\n")
+        );
+        let refused = if pair.statuses[0] == 409 { 0 } else { 1 };
+        let again = s.try_register(&pair.names[refused], &pair.dirs[refused].to_string_lossy());
+        assert_api_error(&again, 409, "directory-in-use");
+    }
 }

@@ -203,17 +203,22 @@ fn put_get_head_list_and_delete_through_the_sdk_each_one_host_operation() {
     assert_eq!(listed["folders"], json!(["notes/", "reports/"]), "{listed}");
     assert_eq!(listed["files"], json!([]), "{listed}");
     assert_eq!(listed["cursor"], Value::Null);
-    let (_, page) = ok_json(&s, &rita(), "GET", "/list?prefix=notes/&limit=1", b"");
-    assert_eq!(page["files"].as_array().unwrap().len(), 1, "{page}");
-    let cursor = page["cursor"].as_str().unwrap().to_owned();
-    let (_, next) = ok_json(
-        &s,
-        &rita(),
-        "GET",
-        &format!("/list?prefix=notes/&limit=1&cursor={}", encode(&cursor)),
-        b"",
-    );
-    assert_eq!(next["files"][0]["key"], "notes/b.bin", "{next}");
+    // Pages of `limit` 1 through the SDK, with the cursor until it is
+    // null (a page may be short: at most `limit`).
+    let mut paged = Vec::new();
+    let mut target = "/list?prefix=notes/&limit=1".to_owned();
+    for pages in 1.. {
+        let (_, page) = ok_json(&s, &rita(), "GET", &target, b"");
+        let files = page["files"].as_array().unwrap();
+        assert!(files.len() <= 1, "at most `limit`: {page}");
+        paged.extend(files.iter().map(|f| f["key"].as_str().unwrap().to_owned()));
+        let Some(cursor) = page["cursor"].as_str() else {
+            break;
+        };
+        assert!(pages < 100, "the pages do not end: {paged:?}");
+        target = format!("/list?prefix=notes/&limit=1&cursor={}", encode(cursor));
+    }
+    assert_eq!(paged, ["notes/a.txt", "notes/b.bin"], "the pages together");
     let (_, all) = ok_json(&s, &rita(), "GET", "/list-all", b"");
     assert_eq!(
         all["files"].as_array().unwrap().len(),

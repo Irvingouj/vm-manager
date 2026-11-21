@@ -24,7 +24,7 @@ use std::time::Duration;
 use blackbox::scenario::Expected;
 use blackbox::storage::{
     BODY_BOUND, MARKETING, REQUEST_BODY_BOUND, Storage, assert_metadata, assert_ok_metadata,
-    assert_storage_entry, head, list, listed_names, place, storage_expected, wanda,
+    assert_storage_entry, head, listed_names, place, storage_expected, wanda,
 };
 use serde_json::{Value, json};
 
@@ -239,24 +239,28 @@ fn a_list_page_holds_up_to_1000_and_its_cursor_is_at_most_2048_bytes() {
             b"",
         );
     }
-    let page = s.as_writer(&list(MARKETING, &json!({ "limit": 1000 })));
-    let (files, _) = listed_names(&page["ok"]);
-    assert_eq!(files.len(), 1000, "expected a page of 1,000");
-    let cursor = page["ok"]["cursor"]
-        .as_str()
-        .unwrap_or_else(|| panic!("expected a cursor: one more follows"));
-    assert!(
-        cursor.len() <= 2048,
-        "expected a cursor of at most 2,048 bytes after a key of {} bytes, got {}",
-        files.last().unwrap().len(),
-        cursor.len()
-    );
-    let next = s.as_writer(&list(
-        MARKETING,
-        &json!({ "limit": 1000, "cursor": cursor }),
-    ));
-    assert_eq!(listed_names(&next["ok"]).0.len(), 1, "{next}");
-    assert!(next["ok"]["cursor"].is_null());
+    // Pages of at most 1,000 (a page may be short), each cursor at most
+    // 2,048 bytes, until the cursor is null.
+    let pages = s.every_page(&json!({ "limit": 1000 }), 1000);
+    let mut count = 0;
+    for page in &pages {
+        let (files, _) = listed_names(page);
+        assert!(
+            files.len() <= 1000,
+            "a page of at most 1,000: {}",
+            files.len()
+        );
+        count += files.len();
+        if let Some(cursor) = page["cursor"].as_str() {
+            assert!(
+                cursor.len() <= 2048,
+                "expected a cursor of at most 2,048 bytes after keys of {} bytes, got {}",
+                files.last().map_or(0, String::len),
+                cursor.len()
+            );
+        }
+    }
+    assert_eq!(count, 1001, "the pages together");
     // A cursor after the longest key there can be.
     let longest = [
         "a".repeat(255),
@@ -268,14 +272,26 @@ fn a_list_page_holds_up_to_1000_and_its_cursor_is_at_most_2048_bytes() {
     .join("/");
     s.put_ok(&longest, b"x", None);
     s.put_ok("zzz", b"x", None);
-    let page = s.as_writer(&list(MARKETING, &json!({ "limit": 1 })));
-    let cursor = page["ok"]["cursor"].as_str().unwrap();
-    assert!(
-        cursor.len() <= 2048,
-        "a cursor after a key of 1,024 bytes: {} bytes",
-        cursor.len()
-    );
-    assert_eq!(listed_names(&page["ok"]).0, std::slice::from_ref(&longest));
+    // Pages of `limit` 1 (a page may be short): every cursor, the one
+    // after the key of 1,024 bytes included, is at most 2,048 bytes.
+    let pages = s.every_page(&json!({}), 1);
+    let mut names = Vec::new();
+    for page in &pages {
+        if let Some(cursor) = page["cursor"].as_str() {
+            assert!(
+                cursor.len() <= 2048,
+                "a cursor among keys of up to 1,024 bytes: {} bytes",
+                cursor.len()
+            );
+        }
+        names.extend(
+            listed_names(page)
+                .0
+                .into_iter()
+                .filter(|n| !n.starts_with(&format!("{folder}/"))),
+        );
+    }
+    assert_eq!(names, [longest, "zzz".to_owned()]);
 }
 
 #[test]
