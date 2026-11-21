@@ -261,7 +261,10 @@ function validate(read, argument) {
     const where = `\`resources.${resource}\``;
     if (resource.length === 0) throw invalid("A Resource name in `resources` is empty.", declaration.node);
     if (declaration.entries === null) {
-      throw invalid(`${where} must be { kind: "postgres", access: "read" | "write" }.`, declaration.node);
+      throw invalid(
+        `${where} must be { kind: "postgres", access: "read" | "write" } or { kind: "storage", access: "read" | "write" }.`,
+        declaration.node,
+      );
     }
     for (const [key, field] of declaration.entries) {
       if (key !== "kind" && key !== "access") {
@@ -269,13 +272,27 @@ function validate(read, argument) {
       }
     }
     const kind = declaration.entries.get("kind");
-    if (kind === undefined) throw invalid(`${where} has no \`kind\`: give kind: "postgres".`, declaration.node);
-    if (kind.value !== "postgres") {
-      throw invalid(`${where}.kind is ${JSON.stringify(kind.value)}: the only kind is "postgres".`, kind.node);
+    if (kind === undefined) {
+      throw invalid(
+        `${where} has no \`kind\`: give kind: "postgres" (a shared database) or kind: "storage" (a Storage Resource).`,
+        declaration.node,
+      );
+    }
+    if (kind.value !== "postgres" && kind.value !== "storage") {
+      throw invalid(
+        `${where}.kind is ${JSON.stringify(kind.value)}: the kinds are "postgres" (a shared database) and "storage" (a Storage Resource).`,
+        kind.node,
+      );
     }
     const access = declaration.entries.get("access");
     if (access === undefined) {
       throw invalid(`${where} has no \`access\`: give access: "read" or access: "write".`, declaration.node);
+    }
+    if (access.value === "structure" && kind.value === "storage") {
+      throw invalid(
+        `${where}.access is "structure": a Storage Resource has two levels, declare "read" or "write".`,
+        access.node,
+      );
     }
     if (access.value === "structure") {
       throw invalid(
@@ -286,7 +303,7 @@ function validate(read, argument) {
     if (access.value !== "read" && access.value !== "write") {
       throw invalid(`${where}.access is ${JSON.stringify(access.value)}: it must be "read" or "write".`, access.node);
     }
-    declared[resource] = { kind: "postgres", access: access.value };
+    declared[resource] = { kind: kind.value, access: access.value };
   }
   return { name: name.value, description: description.value, declared_access: { resources: declared } };
 }

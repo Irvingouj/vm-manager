@@ -22,6 +22,7 @@ use crate::platform_db::{self, Cause, DatabaseAddress, OpenError, PlatformDataba
 use crate::registry::Registry;
 use crate::resources::Resources;
 use crate::runner::{self, RequestRunner};
+use crate::storage::{self, Bodies, Files, Root, Storage};
 use crate::usage::{self, Usage};
 
 /// The bounds the parts are made with.
@@ -54,13 +55,36 @@ pub struct Platform {
     pub usage: Arc<Usage>,
     /// The writer of the counts: owned here; dropping it ends its task.
     pub usage_writer: usage::Writer,
+    /// The file threads, the budget of bodies, the cursors' key and the
+    /// storage root. Its threads are ended by [`Files::stop`], which the
+    /// caller calls as it stops.
+    pub storage: Arc<Storage>,
 }
 
 impl Platform {
     /// Assembles the parts on the platform database at `address`. The
     /// error is a message for whoever started the program; it never holds
     /// the password.
-    pub async fn open(address: &DatabaseAddress, limits: Limits) -> Result<Self, OpenError> {
+    pub async fn open(
+        address: &DatabaseAddress,
+        limits: Limits,
+        storage_root: Option<Root>,
+    ) -> Result<Self, OpenError> {
+        let files = Files::start()
+            .map_err(|e| OpenError::new(None, format!("cannot start the file threads: {e}")))?;
+        let opened = Self::assemble(address, limits, storage_root, Arc::clone(&files)).await;
+        if opened.is_err() {
+            files.stop(storage::files::STOP_WAIT).await;
+        }
+        opened
+    }
+
+    async fn assemble(
+        address: &DatabaseAddress,
+        limits: Limits,
+        storage_root: Option<Root>,
+        files: Arc<Files>,
+    ) -> Result<Self, OpenError> {
         let Limits {
             pool,
             executor,
@@ -89,13 +113,19 @@ impl Platform {
                 Registry::load(Arc::clone(&database), Arc::clone(&own), Arc::clone(&read_backs))
                     .await
                     .map_err(unreadable)?;
-            let resources = Resources::load(Arc::clone(&database), executor, read_backs)
-                .await
-                .map_err(unreadable)?;
-            Ok::<_, OpenError>((database, own, registry, resources))
+            let resources = Resources::load(
+                Arc::clone(&database),
+                executor,
+                read_backs,
+                Arc::clone(&files),
+            )
+            .await
+            .map_err(unreadable)?;
+            let cursor_key = cursor_key(&database).await.map_err(unreadable)?;
+            Ok::<_, OpenError>((database, own, registry, resources, cursor_key))
         })
         .await;
-        let (database, own, registry, resources) = match started {
+        let (database, own, registry, resources, cursor_key) = match started {
             Ok(started) => started?,
             Err(_) => {
                 return Err(OpenError::new(
@@ -121,8 +151,15 @@ impl Platform {
         let logs = Arc::new(logs);
         let (usage, usage_writer) = usage::start(Arc::clone(&database));
         let log = Arc::new(OperationLog::new(Arc::clone(&database)));
+        let storage = Arc::new(Storage {
+            files,
+            bodies: Arc::new(Bodies::default()),
+            cursors: storage::cursor::Sealer::new(&cursor_key),
+            root: storage_root.map(Arc::new),
+        });
         let gateway = Arc::new(PlatformGateway::new(
             Arc::clone(&resources),
+            Arc::clone(&storage),
             Arc::clone(&own),
             Arc::clone(&log),
             tokio::runtime::Handle::current(),
@@ -142,6 +179,23 @@ impl Platform {
             runner,
             usage,
             usage_writer,
+            storage,
         })
     }
+}
+
+/// The key Storage lists' cursors are sealed with, as the platform database
+/// keeps it (step 17). Never printed.
+async fn cursor_key(database: &PlatformDatabase) -> Result<Vec<u8>, platform_db::DbError> {
+    database
+        .pool()
+        .run(async |client: &mut tokio_postgres::Client| {
+            let row = client
+                .query_one("SELECT key FROM storage_cursor_key", &[])
+                .await
+                .map_err(platform_db::DbError::from)?;
+            row.try_get::<_, Vec<u8>>(0)
+                .map_err(platform_db::DbError::from)
+        })
+        .await
 }

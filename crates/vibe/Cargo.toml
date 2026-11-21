@@ -51,6 +51,8 @@ url.workspace = true
 zip.workspace = true
 liblzma.workspace = true
 tar.workspace = true
+# Whether a Storage key is in NFC (src/storage/key.rs).
+unicode-normalization.workspace = true
 
 [build-dependencies]
 flate2.workspace = true

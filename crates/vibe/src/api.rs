@@ -49,15 +49,17 @@ use crate::own_db::Migration;
 use crate::platform_db::DbError;
 use crate::platform_db::PlatformDatabase;
 use crate::registry::{
-    AdminApplication, ApplicationRecord, Asked, Change, Changed, Created, DeclaredAccess, Disabled,
-    Entry, List, Listing, MAX_CONTRIBUTORS, MAX_SHARED_WITH, NameProblem, Named, NewVersion,
-    Registry, Resource, Sent, Standing, VersionRecord, WentBack, check_name,
+    Access, AdminApplication, ApplicationRecord, Asked, Change, Changed, Created, DeclaredAccess,
+    Disabled, Entry, List, Listing, MAX_CONTRIBUTORS, MAX_SHARED_WITH, NameProblem, Named,
+    NewVersion, Registry, Resource, ResourceKind, Sent, Standing, VersionRecord, WentBack,
+    check_name,
 };
 use crate::resources::{
-    self, Connection, GrantWritten, Login, NewResource, Registered, Resources, is_resource_name,
-    level_of,
+    self, Connection, GrantWritten, Login, NewReach, NewResource, Registered, Resources,
+    is_resource_name, level_of,
 };
 use crate::setup;
+use crate::storage::{self, Storage};
 use crate::structure;
 use crate::tool_credentials::{Digest, MakeError, ToolCredentials};
 
@@ -364,8 +366,16 @@ fn read_structures(
         Object::read_value(value).map_err(|e| format!("structures is not an object: {e}"))?;
     let mut structures = BTreeMap::new();
     for (name, value) in entries.0 {
-        if !declared.contains_key(&name) {
-            return Err("structures names a Resource the Version does not declare".into());
+        match declared.get(&name) {
+            None => {
+                return Err("structures names a Resource the Version does not declare".into());
+            }
+            Some(resource) if resource.kind == ResourceKind::Storage => {
+                return Err(
+                    "structures names a Resource declared storage, which has no structure".into(),
+                );
+            }
+            Some(_) => {}
         }
         let fingerprint: String = serde_json::from_str(value.get())
             .map_err(|_| "a value of structures is not a string".to_owned())?;
@@ -392,6 +402,11 @@ pub(crate) fn read_version(body: &[u8]) -> Result<NewVersion, String> {
             kind: resource.required("kind")?,
             access: resource.required("access")?,
         };
+        if resource.kind == ResourceKind::Storage && matches!(resource.access, Access::Structure) {
+            return Err(format!(
+                "the Resource {name:?} is declared storage, whose access is read or write, not structure"
+            ));
+        }
         resources.insert(name, resource);
     }
     let structures = read_structures(&object, &resources)?;
@@ -407,9 +422,22 @@ pub(crate) fn read_version(body: &[u8]) -> Result<NewVersion, String> {
 /// `POST /v1/resources`
 const RESOURCE_FORM: &str = r#"{ "name": "<name>", "kind": "postgres", "description": "<text>", "owner": "<text>", "contact": "<whom to ask for access>", "connection": { "host": "<host>", "port": <1 to 65535>, "database": "<database>", "read": { "role": "<role>", "password": "<password>" }, "write": { "role": "<role>", "password": "<password>" } (optional), "structure": { "role": "<role>", "password": "<password>" } (optional) } }"#;
 
+/// A Resource to register, as the body asks.
+enum ToRegister {
+    Database(NewResource),
+    /// A Storage Resource on `directory`, not yet checked.
+    Storage {
+        name: String,
+        description: String,
+        owner: String,
+        contact: String,
+        directory: String,
+    },
+}
+
 /// Reads a Resource to register. Its problems are told in fixed words that
 /// name a field, never anything the body holds.
-fn read_resource(body: &[u8]) -> Result<NewResource, &'static str> {
+fn read_resource(body: &[u8]) -> Result<ToRegister, &'static str> {
     const PORT: &str = "connection.port is missing or not a number from 1 to 65535";
     let object =
         Object::read(body).map_err(|_| "the body is not a JSON object with each key once")?;
@@ -418,6 +446,33 @@ fn read_resource(body: &[u8]) -> Result<NewResource, &'static str> {
     let description = object.fixed("description", "description is missing or not a string")?;
     let owner = object.fixed("owner", "owner is missing or not a string")?;
     let contact = object.fixed("contact", "contact is missing or not a string")?;
+    match kind.as_str() {
+        "postgres" => {
+            if object.0.contains_key("location") {
+                return Err("a postgres Resource has connection and no location");
+            }
+        }
+        "storage" => {
+            if object.0.contains_key("connection") {
+                return Err("a storage Resource has location and no connection");
+            }
+            const LOCATION: &str = "location is missing or not an object { backend: \"directory\", directory: <a string> } with each key once";
+            let location = object.object("location").map_err(|_| LOCATION)?;
+            let backend: String = location.fixed("backend", LOCATION)?;
+            if backend != "directory" {
+                return Err("location.backend is not \"directory\", the one backend there is");
+            }
+            let directory = location.fixed("directory", LOCATION)?;
+            return Ok(ToRegister::Storage {
+                name,
+                description,
+                owner,
+                contact,
+                directory,
+            });
+        }
+        _ => return Err("kind is not \"postgres\" or \"storage\""),
+    }
     let connection = object
         .object("connection")
         .map_err(|_| "connection is missing or not an object with each key once")?;
@@ -462,23 +517,20 @@ fn read_resource(body: &[u8]) -> Result<NewResource, &'static str> {
     if port == 0 {
         return Err(PORT);
     }
-    if kind != "postgres" {
-        return Err("kind is not \"postgres\"");
-    }
-    Ok(NewResource {
+    Ok(ToRegister::Database(NewResource {
         name,
         description,
         owner,
         contact,
-        connection: Connection::new(
+        reach: NewReach::Database(Connection::new(
             host,
             port,
             database,
             Login::new(role, password),
             write,
             structure,
-        ),
-    })
+        )),
+    }))
 }
 
 /// `POST /v1/resources/<name>/grants`
@@ -806,6 +858,9 @@ pub(crate) enum ListChanged {
 pub struct Api {
     registry: Arc<Registry>,
     resources: Arc<Resources>,
+    /// The storage root and the file threads, for registering a Storage
+    /// Resource.
+    storage: Arc<Storage>,
     log: Arc<OperationLog>,
     /// Applications' log entries, read here.
     logs: Arc<Logs>,
@@ -837,9 +892,14 @@ const MAX_DECLARED_LISTED: usize = 200;
 pub(crate) const MAX_ADMIN_PAGE: u8 = 100;
 
 impl Api {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the parts the API answers from, each named, made once at start"
+    )]
     pub fn new(
         registry: Arc<Registry>,
         resources: Arc<Resources>,
+        storage: Arc<Storage>,
         log: Arc<OperationLog>,
         logs: Arc<Logs>,
         credentials: Arc<ToolCredentials>,
@@ -849,6 +909,7 @@ impl Api {
         Self {
             registry,
             resources,
+            storage,
             log,
             logs,
             credentials,
@@ -1594,23 +1655,105 @@ impl Api {
             Ok(new) => new,
             Err(problem) => return Ok(Answer::malformed(problem, RESOURCE_FORM)),
         };
-        if !is_resource_name(&new.name) {
+        let name = match &new {
+            ToRegister::Database(new) => &new.name,
+            ToRegister::Storage { name, .. } => name,
+        };
+        if !is_resource_name(name) {
             return Ok(Answer::error(
                 StatusCode::BAD_REQUEST,
                 "invalid-name",
                 "a Resource's name is 1 to 63 lower-case letters, digits and underscores, starting with a letter",
             ));
         }
+        let new = match new {
+            ToRegister::Database(new) => new,
+            ToRegister::Storage {
+                name,
+                description,
+                owner,
+                contact,
+                directory,
+            } => {
+                return self
+                    .register_storage(user, name, description, owner, contact, &directory)
+                    .await;
+            }
+        };
         Ok(match self.resources.register(new, &user.id).await? {
             Registered::Registered(resource) => {
                 Answer::json(StatusCode::CREATED, &ResourceView::of(&resource))
             }
-            Registered::NameTaken => Answer::error(
-                StatusCode::CONFLICT,
-                "name-taken",
-                "a Resource with this name is registered: choose another name",
-            ),
+            Registered::NameTaken => name_taken(),
         })
+    }
+
+    /// `POST /v1/resources` of a Storage Resource (blackbox/CONTRACT.md,
+    /// "Registering a Storage Resource"): the name, then the directory's
+    /// checks in the table's order (crate::storage::Root), its marker and
+    /// `.vibe-staging/` written, then the Resource registered. Nothing of
+    /// the directory is in any answer.
+    async fn register_storage(
+        &self,
+        user: &User,
+        name: String,
+        description: String,
+        owner: String,
+        contact: String,
+        directory: &str,
+    ) -> Result<Answer, DbError> {
+        if self.resources.find(&name).await?.is_some() {
+            return Ok(name_taken());
+        }
+        let Some(root) = &self.storage.root else {
+            return Ok(storage_refused(storage::directory::Refused::NotConfigured));
+        };
+        let taken = self.resources.storage_taken();
+        let prepared = match root
+            .prepare(&self.storage.files, &name, directory, taken)
+            .await
+        {
+            Ok(prepared) => prepared,
+            Err(refused) => return Ok(storage_refused(refused)),
+        };
+        let backend = storage::Directory::registered(
+            &name,
+            &prepared.directory,
+            Arc::clone(&prepared.opened),
+            &self.storage.files,
+        );
+        let new = NewResource {
+            name,
+            description,
+            owner,
+            contact,
+            reach: NewReach::Storage {
+                location: storage::Location::Directory {
+                    directory: prepared.directory.to_string_lossy().into_owned(),
+                },
+                backend,
+            },
+        };
+        match self.resources.register(new, &user.id).await {
+            Ok(Registered::Registered(resource)) => {
+                root.release(prepared.claim());
+                Ok(Answer::json(
+                    StatusCode::CREATED,
+                    &ResourceView::of(&resource),
+                ))
+            }
+            Ok(Registered::NameTaken) => {
+                root.undo(&self.storage.files, prepared).await;
+                Ok(name_taken())
+            }
+            Err(error) => {
+                // The insert may still land: the marker is kept, so that
+                // the Resource is usable if it does (and a registration
+                // asked again takes it).
+                root.release(prepared.claim());
+                Err(error)
+            }
+        }
     }
 
     async fn resource(&self, user: &User, method: &Method, name: &str) -> Result<Answer, DbError> {
@@ -1664,6 +1807,12 @@ impl Api {
             Ok(grant) => grant,
             Err(problem) => return Ok(Answer::malformed(&problem, GRANT_FORM)),
         };
+        if resource.kind == ResourceKind::Storage && level == authz::AccessLevel::Structure {
+            return Ok(Answer::malformed(
+                "access is not read or write: a Storage Resource has two levels, read and write",
+                GRANT_FORM,
+            ));
+        }
         Ok(match self.resources.grant(name, &group, level).await? {
             GrantWritten::Written => Answer::json(
                 StatusCode::OK,
@@ -1690,6 +1839,11 @@ impl Api {
         };
         if method != Method::GET {
             return Answer::method_not_allowed(method, "GET");
+        }
+        // A Storage Resource has no structure to pull (its answer here is
+        // the ticket's later stage): as no database of that name.
+        if resource.structure_pool().is_none() {
+            return no_resource();
         }
         self.resources
             .read_back(
@@ -1768,7 +1922,11 @@ impl Api {
             );
         };
         let started = tokio::time::Instant::now();
-        let pulled = structure::pull(resource.structure_pool(), name).await;
+        let pulled = match resource.structure_pool() {
+            Some(pool) => structure::pull(pool, name).await,
+            // Not reached: a Storage Resource was answered above.
+            None => Err(structure::Failed::Unavailable),
+        };
         let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         let answer = pulled.and_then(|pulled| {
             let answer = Answer::json(
@@ -2431,7 +2589,7 @@ impl<'a> ResourceView<'a> {
     fn of(resource: &'a resources::Resource) -> Self {
         Self {
             name: &resource.name,
-            kind: "postgres",
+            kind: resource.kind.name(),
             description: &resource.description,
             owner: &resource.owner,
             contact: &resource.contact,
@@ -2460,6 +2618,26 @@ impl<'a> ResourceRead<'a> {
             your_access: held.map(resources::level_name),
         })
     }
+}
+
+/// `409` `name-taken`.
+fn name_taken() -> Answer {
+    Answer::error(
+        StatusCode::CONFLICT,
+        "name-taken",
+        "a Resource with this name is registered: choose another name",
+    )
+}
+
+/// A Storage registration refused by its directory's checks.
+fn storage_refused(refused: storage::directory::Refused) -> Answer {
+    use storage::directory::Refused;
+    let status = match refused {
+        Refused::InUse => StatusCode::CONFLICT,
+        Refused::Busy => StatusCode::SERVICE_UNAVAILABLE,
+        _ => StatusCode::UNPROCESSABLE_ENTITY,
+    };
+    Answer::error(status, refused.reason(), refused.message())
 }
 
 /// `503` `unavailable`: the Grants on the Resource `name` are not known now

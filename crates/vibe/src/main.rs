@@ -170,6 +170,11 @@ struct Serve {
     /// How long a session lives from its sign-in, in seconds.
     #[arg(long, default_value_t = 43_200, value_parser = clap::value_parser!(u64).range(60..=2_592_000))]
     session_lifetime: u64,
+    /// The one directory beneath which every Storage Resource's directory
+    /// is: an absolute path. Without it, no Storage Resource can be
+    /// registered.
+    #[arg(long)]
+    storage_root: Option<String>,
 }
 
 /// `vibe setup`.
@@ -313,6 +318,19 @@ fn run(serve: &Serve) -> Result<(), String> {
             Some((files, loaded))
         }
     };
+    // The storage root: an absolute path, or a start-up failure. One that is
+    // not there or is no directory is said once, and the program starts
+    // all the same (blackbox/CONTRACT.md, "Storage: The storage root").
+    let storage_root = match serve.storage_root.as_deref() {
+        None => None,
+        Some(text) => {
+            let root = vibe::storage::Root::new(text)?;
+            if let Some(problem) = root.problem() {
+                log::record("storage-root-unusable", json!({ "problem": problem }));
+            }
+            Some(root)
+        }
+    };
     let key = InstallationKey::from_environment()?;
     let address = database_address()?;
     let sign_in: Box<dyn SignIn> = if serve.stand_in_sign_in {
@@ -344,8 +362,9 @@ fn run(serve: &Serve) -> Result<(), String> {
             runner,
             usage,
             usage_writer,
+            storage,
             ..
-        } = Platform::open(&address, limits).await.map_err(|error| {
+        } = Platform::open(&address, limits, storage_root).await.map_err(|error| {
             if let Some(found) = &error.unsupported_version {
                 log::record(
                     "postgres-version-unsupported",
@@ -468,6 +487,7 @@ fn run(serve: &Serve) -> Result<(), String> {
             api: Api::new(
                 Arc::clone(&registry),
                 resources,
+                Arc::clone(&storage),
                 log,
                 Arc::clone(&logs),
                 Arc::clone(&credentials),
@@ -488,12 +508,15 @@ fn run(serve: &Serve) -> Result<(), String> {
             credentials,
             runner,
             logs,
-            max_request_body_bytes: 1024 * 1024,
+            // 8 MiB and 64 KiB: a file of Storage's bound uploaded through
+            // a form (blackbox/CONTRACT.md, "Storage: Bounds").
+            max_request_body_bytes: vibe::storage::BODY_BYTES + 64 * 1024,
             decides_opening: true,
             usage: Some(usage),
         });
         server::serve(listener, ingress, server::Limits::default(), tls).await;
         watching.shutdown().await;
+        storage.files.stop(vibe::storage::files::STOP_WAIT).await;
         drop(writer);
         drop(usage_writer);
         Ok(())

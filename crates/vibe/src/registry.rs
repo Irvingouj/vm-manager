@@ -121,9 +121,16 @@ pub fn check_name(name: &str) -> Result<(), NameProblem> {
     }
 }
 
-/// The Resources a Version declares, with the Access level of each: what
-/// the Authorization decision reads.
-pub type Declared = BTreeMap<String, AccessLevel>;
+/// The Resources a Version declares, with the kind and the Access level of
+/// each: what the Authorization decision reads.
+pub type Declared = BTreeMap<String, Declaration>;
+
+/// One Resource a Version declares: its kind and its Access level.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Declaration {
+    pub kind: ResourceKind,
+    pub level: AccessLevel,
+}
 
 /// The Version that serves an Application: what the Request runner runs.
 /// Shared, never copied, between the registry and the requests running it.
@@ -621,10 +628,21 @@ pub struct Resource {
     pub access: Access,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ResourceKind {
     Postgres,
+    Storage,
+}
+
+impl ResourceKind {
+    /// Its name, as the manifest, the API and refusals write it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Postgres => "postgres",
+            Self::Storage => "storage",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
@@ -650,21 +668,37 @@ impl DeclaredAccess {
     fn levels(&self) -> Declared {
         self.resources
             .iter()
-            .map(|(name, resource)| (name.clone(), resource.access.into()))
+            .map(|(name, resource)| {
+                (
+                    name.clone(),
+                    Declaration {
+                        kind: resource.kind,
+                        level: resource.access.into(),
+                    },
+                )
+            })
             .collect()
     }
 }
 
 /// The Declared access as stored (`{ "resources": { name: { kind, access }
 /// } }`), read back. A Resource whose entry cannot be read is left out: it is
-/// then not declared, and so refused.
+/// then not declared, and so refused. A kind not stored (none was, before
+/// Storage) is `postgres`.
 pub(crate) fn declared_of(stored: &Value) -> Declared {
     let mut declared = Declared::new();
     if let Some(resources) = stored.get("resources").and_then(Value::as_object) {
         for (name, resource) in resources {
             let access = resource.get("access").and_then(Value::as_str);
-            if let Some(access) = access.and_then(crate::resources::level_of) {
-                declared.insert(name.clone(), access);
+            let kind = match resource.get("kind").and_then(Value::as_str) {
+                None | Some("postgres") => Some(ResourceKind::Postgres),
+                Some("storage") => Some(ResourceKind::Storage),
+                Some(_) => None,
+            };
+            if let Some(level) = access.and_then(crate::resources::level_of)
+                && let Some(kind) = kind
+            {
+                declared.insert(name.clone(), Declaration { kind, level });
             }
         }
     }

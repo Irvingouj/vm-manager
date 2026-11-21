@@ -82,6 +82,7 @@ pub mod server;
 pub mod setup;
 pub mod sign_in;
 pub mod statement;
+pub mod storage;
 pub mod structure;
 pub mod theme;
 pub mod tool;

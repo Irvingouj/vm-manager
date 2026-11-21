@@ -633,7 +633,7 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 /// Seconds since the Unix epoch as RFC 3339 in UTC (`2026-11-19T10:00:00Z`).
-fn rfc3339(seconds: i64) -> String {
+pub(crate) fn rfc3339(seconds: i64) -> String {
     let days = seconds.div_euclid(86_400);
     let of_day = seconds.rem_euclid(86_400);
     // Howard Hinnant's civil_from_days.

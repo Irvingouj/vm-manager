@@ -50,6 +50,12 @@
 //! write login, and its structure pool when it was registered with a
 //! structure login (the Structure puller's, crate::structure). A pool
 //! connects on first use.
+//!
+//! A Resource is of a kind (blackbox/CONTRACT.md, "Storage"): `postgres`, a
+//! shared database as above, or `storage`, a named place of files, whose
+//! location (crate::storage::Location) is stored where a database's
+//! connection is and which holds its backend (crate::storage::Directory),
+//! opened as it is loaded or registered, in place of pools.
 
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;
@@ -68,6 +74,8 @@ use tokio_postgres::{Client, Row};
 use crate::executor::{self, Level, Levels, Password, Source, Target};
 use crate::log;
 use crate::platform_db::{DbError, PlatformDatabase, rfc3339};
+use crate::registry::ResourceKind;
+use crate::storage::{Directory, Files, Location};
 
 /// The name of an Access level, as the API and the Operation log write it.
 pub fn level_name(level: AccessLevel) -> &'static str {
@@ -203,8 +211,8 @@ struct Pools {
     structure: Option<executor::Pool>,
 }
 
-/// The stored form of a [`Connection`]: the one place that writes and reads
-/// it. For now the Connection as JSON; the ticket "Resources and Grants in
+/// The stored form of a [`Connection`] (and of a Storage Resource's
+/// location): the one place that writes and reads it. For now the Connection as JSON; the ticket "Resources and Grants in
 /// full" encrypts it here, and nothing else changes.
 mod sealed {
     use super::Connection;
@@ -218,6 +226,15 @@ mod sealed {
     pub(super) fn open(stored: &[u8]) -> Option<Connection> {
         serde_json::from_slice(stored).ok()
     }
+
+    /// A Storage Resource's location, kept as a connection is.
+    pub(super) fn seal_location(location: &crate::storage::Location) -> Option<Vec<u8>> {
+        serde_json::to_vec(location).ok()
+    }
+
+    pub(super) fn open_location(stored: &[u8]) -> Option<crate::storage::Location> {
+        serde_json::from_slice(stored).ok()
+    }
 }
 
 /// A Resource being registered.
@@ -227,7 +244,30 @@ pub struct NewResource {
     pub description: String,
     pub owner: String,
     pub contact: String,
-    pub connection: Connection,
+    pub reach: NewReach,
+}
+
+/// How a Resource being registered is reached.
+#[derive(Debug)]
+pub enum NewReach {
+    /// A shared database.
+    Database(Connection),
+    /// A place of files: its location as stored, and its backend, opened.
+    Storage {
+        location: Location,
+        backend: Directory,
+    },
+}
+
+/// How a Resource is reached: by its pools, or by its backend.
+#[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "one per Resource, inside its Arc, never moved after it is made"
+)]
+enum Reach {
+    Database(Pools),
+    Storage(Directory),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -272,8 +312,10 @@ pub struct Resource {
     pub created_by: String,
     /// RFC 3339, UTC.
     pub created_at: String,
-    /// One pool per login: a connection of one never serves the other.
-    pools: Pools,
+    pub kind: ResourceKind,
+    /// A database's pools, one per login (a connection of one never serves
+    /// the other); or a place of files' backend.
+    reach: Reach,
     /// Held only for a lookup or a change, never across an await.
     grants: RwLock<Grants>,
     /// The pulls of its structure running now: at most [`PULLS_AT_ONCE`].
@@ -287,21 +329,39 @@ pub struct Resource {
 pub const PULLS_AT_ONCE: usize = 2;
 
 impl Resource {
-    /// The pool of the read login.
-    pub fn read_pool(&self) -> &executor::Pool {
-        &self.pools.read
+    fn pools(&self) -> Option<&Pools> {
+        match &self.reach {
+            Reach::Database(pools) => Some(pools),
+            Reach::Storage(_) => None,
+        }
     }
 
-    /// The pool of the write login, if the Resource has one.
+    /// The pool of the read login; `None` for a Resource that is no
+    /// database.
+    pub fn read_pool(&self) -> Option<&executor::Pool> {
+        self.pools().map(|pools| &pools.read)
+    }
+
+    /// The pool of the write login, if the Resource is a database and has
+    /// one.
     pub fn write_pool(&self) -> Option<&executor::Pool> {
-        self.pools.write.as_ref()
+        self.pools().and_then(|pools| pools.write.as_ref())
     }
 
     /// The pool the Structure puller reads the catalogs with: the structure
     /// login's when the Resource has one, else the read login's. Never the
-    /// write login's.
-    pub fn structure_pool(&self) -> &executor::Pool {
-        self.pools.structure.as_ref().unwrap_or(&self.pools.read)
+    /// write login's. `None` for a Resource that is no database.
+    pub fn structure_pool(&self) -> Option<&executor::Pool> {
+        self.pools()
+            .map(|pools| pools.structure.as_ref().unwrap_or(&pools.read))
+    }
+
+    /// The backend of a Storage Resource; `None` for a database.
+    pub fn storage(&self) -> Option<&Directory> {
+        match &self.reach {
+            Reach::Storage(backend) => Some(backend),
+            Reach::Database(_) => None,
+        }
     }
 
     /// A place among the pulls of this Resource running now, held until it
@@ -446,6 +506,8 @@ pub enum GrantWritten {
 pub struct Resources {
     database: Arc<PlatformDatabase>,
     limits: executor::Limits,
+    /// The file threads Storage Resources' directories are opened on.
+    files: Arc<Files>,
     /// By name. Held only for a lookup or an insert, never across an await.
     all: RwLock<BTreeMap<String, Arc<Resource>>>,
     /// The number of forgettings of Grants so far, each one's `epoch`.
@@ -482,12 +544,14 @@ pub fn read_backs() -> Arc<Semaphore> {
 
 const RESOURCE_COLUMNS: &str = concat!(
     "r.id, r.name, r.description, r.owner, r.contact, r.connection, r.created_by, ",
-    rfc3339!("r.created_at")
+    rfc3339!("r.created_at"),
+    ", r.kind"
 );
 
 impl Resources {
     /// Reads every Resource and Grant from the platform database. Each
-    /// Resource's pool uses `limits`.
+    /// Resource's pool uses `limits`; each Storage Resource's directory is
+    /// opened on `files`.
     ///
     /// In one transaction, every Resource's row share lock is taken
     /// without waiting for the rows a write of a Grant holds (`SKIP
@@ -499,6 +563,7 @@ impl Resources {
         database: Arc<PlatformDatabase>,
         limits: executor::Limits,
         reading_back: Arc<Semaphore>,
+        files: Arc<Files>,
     ) -> Result<Self, DbError> {
         let (locked, resources, grants) = database
             .pool()
@@ -539,6 +604,7 @@ impl Resources {
         let this = Self {
             database,
             limits,
+            files,
             all: RwLock::new(BTreeMap::new()),
             forgotten: AtomicU64::new(0),
             unknown: AtomicUsize::new(0),
@@ -555,7 +621,7 @@ impl Resources {
         let mut unknown = Vec::new();
         let mut all = BTreeMap::new();
         for row in &resources {
-            let resource = this.resource_of(row)?;
+            let resource = this.resource_of(row).await?;
             let grants = read.remove(&resource.id).unwrap_or_default();
             if locked.contains(&resource.id) {
                 *resource
@@ -579,13 +645,35 @@ impl Resources {
         Ok(this)
     }
 
-    fn resource_of(&self, row: &Row) -> Result<Resource, DbError> {
+    async fn resource_of(&self, row: &Row) -> Result<Resource, DbError> {
         let name: String = get(row, 1)?;
-        let connection = sealed::open(get(row, 5)?)
-            .ok_or_else(|| DbError::unexpected("a Resource's stored connection cannot be read"))?;
+        let kind: &str = get(row, 8)?;
+        let (kind, reach) = match kind {
+            "storage" => {
+                let location = sealed::open_location(get(row, 5)?).ok_or_else(|| {
+                    DbError::unexpected("a Storage Resource's stored location cannot be read")
+                })?;
+                let backend = match location {
+                    Location::Directory { directory } => {
+                        Directory::load(&name, std::path::Path::new(&directory), &self.files).await
+                    }
+                };
+                (ResourceKind::Storage, Reach::Storage(backend))
+            }
+            _ => {
+                let connection = sealed::open(get(row, 5)?).ok_or_else(|| {
+                    DbError::unexpected("a Resource's stored connection cannot be read")
+                })?;
+                (
+                    ResourceKind::Postgres,
+                    Reach::Database(connection.into_pools(&name, &self.limits)),
+                )
+            }
+        };
         Ok(Resource {
             id: get(row, 0)?,
-            pools: connection.into_pools(&name, &self.limits),
+            kind,
+            reach,
             name,
             description: get(row, 2)?,
             owner: get(row, 3)?,
@@ -606,6 +694,18 @@ impl Resources {
             .map(Arc::clone)
     }
 
+    /// The directories of the Storage Resources registered, for the check
+    /// that a new one is not one of them, inside one or holding one. From
+    /// memory.
+    pub fn storage_taken(&self) -> Vec<crate::storage::directory::Taken> {
+        self.all
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .values()
+            .filter_map(|resource| resource.storage().map(Directory::taken))
+            .collect()
+    }
+
     /// Every Resource, by name. From memory.
     pub fn list(&self) -> Vec<Arc<Resource>> {
         self.all
@@ -619,8 +719,15 @@ impl Resources {
     /// Registers `new`, by `by`. The name must have passed
     /// [`is_resource_name`]. Does not connect to the database.
     pub async fn register(&self, new: NewResource, by: &str) -> Result<Registered, DbError> {
-        let stored = sealed::seal(&new.connection)
+        let (kind, stored) = match &new.reach {
+            NewReach::Database(connection) => (ResourceKind::Postgres, sealed::seal(connection)),
+            NewReach::Storage { location, .. } => {
+                (ResourceKind::Storage, sealed::seal_location(location))
+            }
+        };
+        let stored = stored
             .ok_or_else(|| DbError::unexpected("a Resource's connection cannot be stored"))?;
+        let kind_name = kind.name();
         let inserted = self
             .database
             .pool()
@@ -630,7 +737,7 @@ impl Resources {
                         concat!(
                             "INSERT INTO resources (name, kind, description, owner, contact,
                                                     connection, created_by)
-                             VALUES ($1, 'postgres', $2, $3, $4, $5, $6)
+                             VALUES ($1, $7, $2, $3, $4, $5, $6)
                              ON CONFLICT (name) DO NOTHING
                              RETURNING id, ",
                             rfc3339!("created_at")
@@ -642,6 +749,7 @@ impl Resources {
                             &new.contact,
                             &stored,
                             &by,
+                            &kind_name,
                         ],
                     )
                     .await
@@ -666,7 +774,13 @@ impl Resources {
         let resource = Arc::new(Resource {
             id: get(&row, 0)?,
             created_at: get(&row, 1)?,
-            pools: new.connection.into_pools(&new.name, &self.limits),
+            kind,
+            reach: match new.reach {
+                NewReach::Database(connection) => {
+                    Reach::Database(connection.into_pools(&new.name, &self.limits))
+                }
+                NewReach::Storage { backend, .. } => Reach::Storage(backend),
+            },
             name: new.name,
             description: new.description,
             owner: new.owner,
@@ -835,7 +949,7 @@ impl Resources {
         let Some((row, grants)) = read else {
             return Ok(None);
         };
-        let resource = self.resource_of(&row)?;
+        let resource = self.resource_of(&row).await?;
         *resource
             .grants
             .write()

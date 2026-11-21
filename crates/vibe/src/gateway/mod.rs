@@ -54,6 +54,14 @@
 //! the same way. The request's end, the cap ([`CAP`]) and a limit end a
 //! transaction from the host's side.
 //!
+//! Storage (blackbox/CONTRACT.md, "Storage"; [`storage`]): `storage.head`,
+//! `storage.get`, `storage.put`, `storage.delete` and `storage.list`, each
+//! on a Storage Resource as the User, decided by the same Authorization
+//! decision after matching kinds (a Storage operation only against names
+//! declared and registered `storage`, a database operation only against
+//! `postgres` ones), logged the same way, and run on the Resource's backend
+//! (crate::storage).
+//!
 //! Later tickets add outbound calls here.
 
 use std::future::Future;
@@ -67,6 +75,7 @@ use tokio::runtime::Handle;
 use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio::task::JoinSet;
 
+mod storage;
 mod transaction;
 
 pub use transaction::{CAP, PER_REQUEST, Transactions};
@@ -76,6 +85,7 @@ use crate::executor::{Failure, Held, Isolation, Label, Level, Outcome, Param, Po
 use crate::log;
 use crate::oplog::{Ending, Entry, OperationLog};
 use crate::own_db::{HistoryRead, OwnDatabases};
+use crate::registry::ResourceKind;
 use crate::resources::{READ_BACK_WAIT, Resource, Resources, level_name};
 use crate::runner::InFlight;
 use crate::statement;
@@ -176,8 +186,43 @@ impl Refusal {
         name: &str,
         user: &str,
         resource: Option<&Resource>,
+        kinds: Kinds,
     ) -> Self {
         let mut refusal = match reason {
+            authz::Reason::NotDeclared if kinds.told() => {
+                let fix = match (kinds.asked, kinds.declared) {
+                    (ResourceKind::Storage, Some(_)) => format!(
+                        "the serving Version declares {name:?} with kind \"postgres\", a database, and this is an operation on Storage: declare it with kind \"storage\" (access {:?} or higher), or use it as a database with db(...)",
+                        level_name(needed)
+                    ),
+                    (ResourceKind::Storage, None) => format!(
+                        "the serving Version does not declare the Storage Resource {name:?}: add it to declared_access.resources with kind \"storage\" (access {:?} or higher) and send a new Version",
+                        level_name(needed)
+                    ),
+                    (ResourceKind::Postgres, _) => format!(
+                        "the serving Version declares {name:?} with kind \"storage\", a place of files, and this is an operation on a database: use its files with storage(...), or declare a database with kind \"postgres\""
+                    ),
+                };
+                let mut refusal = Self::new("not-declared", fix);
+                kinds.detail(&mut refusal.details);
+                refusal
+            }
+            authz::Reason::NotRegistered if kinds.told() => {
+                let fix = match (kinds.asked, kinds.registered) {
+                    (ResourceKind::Storage, Some(_)) => format!(
+                        "the Resource {name:?} is registered as a database, not as Storage: declare it with kind \"postgres\" and use it as a database, or ask a Platform administrator for the Storage Resource you need"
+                    ),
+                    (ResourceKind::Storage, None) => format!(
+                        "no Storage Resource named {name:?} is registered: check the name, or ask a Platform administrator to register it"
+                    ),
+                    (ResourceKind::Postgres, _) => format!(
+                        "the Resource {name:?} is registered as Storage (a place of files), not as a database: declare it with kind \"storage\" and use its files with storage(...)"
+                    ),
+                };
+                let mut refusal = Self::new("not-registered", fix);
+                kinds.detail(&mut refusal.details);
+                refusal
+            }
             authz::Reason::NoRequest => return Self::no_request(),
             authz::Reason::NotOwnDatabase => Self::new(
                 "not-own-database",
@@ -250,6 +295,34 @@ impl Refusal {
         let mut refusal = self.details.clone();
         refusal.insert("reason".into(), self.reason.into());
         json!({ "refused": { "refusal": refusal, "fix": self.fix } })
+    }
+}
+
+/// The kinds an operation was decided with: the kind it works on, and the
+/// other kind the name is declared or registered as, if it is.
+#[derive(Clone, Copy, Debug)]
+struct Kinds {
+    asked: ResourceKind,
+    declared: Option<ResourceKind>,
+    registered: Option<ResourceKind>,
+}
+
+impl Kinds {
+    /// Whether a `not-declared` or `not-registered` says the kinds: always
+    /// for Storage; for a database only when the name is Storage's, so that
+    /// nothing else of a database's refusals changes.
+    fn told(self) -> bool {
+        self.asked == ResourceKind::Storage || self.declared.is_some() || self.registered.is_some()
+    }
+
+    fn detail(self, details: &mut Map<String, Value>) {
+        details.insert("kind".into(), self.asked.name().into());
+        if let Some(declared) = self.declared {
+            details.insert("declared_kind".into(), declared.name().into());
+        }
+        if let Some(registered) = self.registered {
+            details.insert("registered_kind".into(), registered.name().into());
+        }
     }
 }
 
@@ -359,7 +432,7 @@ pub trait Gateway: Send + Sync {
         in_flight: &Arc<InFlight>,
         active: bool,
         operation: &str,
-        args: &Value,
+        args: Value,
     ) -> Decision;
 }
 
@@ -400,6 +473,8 @@ impl Operations {
 /// The platform's operations.
 pub struct PlatformGateway {
     resources: Arc<Resources>,
+    /// The file threads, the budget of bodies and the cursors' key.
+    storage: Arc<crate::storage::Storage>,
     own: Arc<OwnDatabases>,
     log: Arc<OperationLog>,
     operations: Arc<Operations>,
@@ -410,12 +485,14 @@ impl PlatformGateway {
     /// platform database's and the shared databases' connections live.
     pub fn new(
         resources: Arc<Resources>,
+        storage: Arc<crate::storage::Storage>,
         own: Arc<OwnDatabases>,
         log: Arc<OperationLog>,
         runtime: Handle,
     ) -> Self {
         Self {
             resources,
+            storage,
             own,
             log,
             operations: Arc::new(Operations {
@@ -649,7 +726,27 @@ impl PlatformGateway {
         in_flight: &InFlight,
         active: bool,
     ) -> (On, Option<Refusal>) {
-        let (on, refusal) = self.decide_access(needed, actor, target, in_flight, active);
+        self.decide_kind(
+            needed,
+            actor,
+            target,
+            ResourceKind::Postgres,
+            in_flight,
+            active,
+        )
+    }
+
+    /// [`PlatformGateway::decide`] for an operation on Resources of `kind`.
+    fn decide_kind(
+        &self,
+        needed: AccessLevel,
+        actor: authz::Actor,
+        target: Target<'_>,
+        kind: ResourceKind,
+        in_flight: &InFlight,
+        active: bool,
+    ) -> (On, Option<Refusal>) {
+        let (on, refusal) = self.decide_access(needed, actor, target, kind, in_flight, active);
         // Disabled: refused before every other check but `no-request`.
         if active && in_flight.stop.is_stopped() {
             return (on, Some(Refusal::application_disabled()));
@@ -663,6 +760,7 @@ impl PlatformGateway {
         needed: AccessLevel,
         actor: authz::Actor,
         target: Target<'_>,
+        kind: ResourceKind,
         in_flight: &InFlight,
         active: bool,
     ) -> (On, Option<Refusal>) {
@@ -687,14 +785,25 @@ impl PlatformGateway {
                 (On::Own, refusal)
             }
             Target::Resource(name) => {
-                let resource = self.resources.get(name);
+                // Only Resources of the operation's kind are its: a name
+                // declared or registered as the other kind is as if not
+                // declared or not registered, and the refusal says so.
+                let found = self.resources.get(name);
+                let declaration = in_flight.declared.get(name).copied();
+                let kinds = Kinds {
+                    asked: kind,
+                    declared: declaration.map(|d| d.kind).filter(|k| *k != kind),
+                    registered: found.as_ref().map(|r| r.kind).filter(|k| *k != kind),
+                };
+                let declared = declaration.filter(|d| d.kind == kind).map(|d| d.level);
+                let resource = found.filter(|r| r.kind == kind);
                 let decide = |grants: &[authz::Grant<'_>]| {
                     authz::decide(&Question {
                         request_in_flight: active,
                         actor,
                         own_database: false,
                         groups: &groups,
-                        declared: in_flight.declared.get(name).copied(),
+                        declared,
                         registered: resource.is_some(),
                         grants,
                         needed,
@@ -724,6 +833,7 @@ impl PlatformGateway {
                         name,
                         &in_flight.user.id,
                         resource.as_deref(),
+                        kinds,
                     )),
                 };
                 // Copied: the operation runs on another thread, beyond the
@@ -779,9 +889,10 @@ impl PlatformGateway {
     /// Runs `task` on `work` in a task of its own, owned here, once one of
     /// [`OPERATIONS_AT_ONCE`] is free (waiting up to [`PERMIT_WAIT`]), and
     /// answers what it answers.
-    fn dispatch<F, Fut>(&self, work: Work, refused: Option<&'static str>, task: F) -> Decision
+    fn dispatch<W, F, Fut>(&self, work: W, refused: Option<&'static str>, task: F) -> Decision
     where
-        F: FnOnce(Work) -> Fut + Send + 'static,
+        W: Dispatched,
+        F: FnOnce(W) -> Fut + Send + 'static,
         Fut: Future<Output = Value> + Send + 'static,
     {
         let operations = Arc::clone(&self.operations);
@@ -789,7 +900,7 @@ impl PlatformGateway {
         // the Resource's Grants back, so that the operations after it are
         // decided by the Grants the database has once the write is
         // settled.
-        let read_back = match (&work.refusal, &work.target) {
+        let read_back = match (work.refusal(), work.on()) {
             (
                 Some(refusal),
                 On::Resource {
@@ -854,13 +965,23 @@ impl PlatformGateway {
     /// own. Past [`OPERATIONS_AT_ONCE`] the entry is not written, and the
     /// program's log says so.
     fn refused_unawaited(&self, work: Work) -> Decision {
-        let Some(refusal) = &work.refusal else {
+        self.refused_unawaited_with(work, Work::run)
+    }
+
+    /// [`PlatformGateway::refused_unawaited`], its entry written by `run`.
+    fn refused_unawaited_with<W, F, Fut>(&self, work: W, run: F) -> Decision
+    where
+        W: Dispatched,
+        F: FnOnce(W) -> Fut + Send + 'static,
+        Fut: Future<Output = Value> + Send + 'static,
+    {
+        let Some(refusal) = work.refusal() else {
             return Decision::refused(&Refusal::no_request());
         };
         let decision = Decision::refused(refusal);
         match Arc::clone(&self.operations.permits).try_acquire_owned() {
             Ok(permit) => self.operations.spawn(async move {
-                work.run().await;
+                run(work).await;
                 drop(permit);
             }),
             Err(_) => {
@@ -877,8 +998,13 @@ impl Gateway for PlatformGateway {
         in_flight: &Arc<InFlight>,
         active: bool,
         operation: &str,
-        args: &Value,
+        args: Value,
     ) -> Decision {
+        if let Some(op) = storage::Op::of(operation) {
+            // Owned: a put's body is moved on, never copied.
+            return self.storage(op, in_flight, active, args);
+        }
+        let args = &args;
         match operation {
             "query" => self.on_database(Kind::Query, in_flight, active, args),
             "execute" => self.on_database(Kind::Execute, in_flight, active, args),
@@ -1191,6 +1317,29 @@ fn read_history(args: &Value) -> Result<(authz::Actor, HistoryRead), &'static st
     ))
 }
 
+/// A decided operation, as [`PlatformGateway::dispatch`] runs it.
+trait Dispatched: Send + 'static {
+    fn refusal(&self) -> Option<&Refusal>;
+    fn on(&self) -> &On;
+    /// Too many operations under way: a refused one is still refused, an
+    /// allowed one is not run.
+    fn busy(&self) -> Value;
+}
+
+impl Dispatched for Work {
+    fn refusal(&self) -> Option<&Refusal> {
+        self.refusal.as_ref()
+    }
+
+    fn on(&self) -> &On {
+        &self.target
+    }
+
+    fn busy(&self) -> Value {
+        Work::busy(self)
+    }
+}
+
 /// What a decided operation is on.
 enum On {
     Own,
@@ -1269,7 +1418,11 @@ impl Work {
                 resource: Some(resource),
                 ..
             } => match self.kind {
-                Kind::Query | Kind::Begin(_) | Kind::History => resource.read_pool(),
+                Kind::Query | Kind::Begin(_) | Kind::History => match resource.read_pool() {
+                    Some(pool) => pool,
+                    // Allowed means registered as a database: not reached.
+                    None => return error_to_wire(json!({ "kind": "unavailable" })),
+                },
                 Kind::Execute => match resource.write_pool() {
                     Some(pool) => pool,
                     None => {

@@ -14,6 +14,7 @@ import { PgDialect } from "drizzle-orm/pg-core";
 import { PgProxyTransaction, PgRemoteDatabase, PgRemoteSession } from "drizzle-orm/pg-proxy";
 import { failedOf, OperationFailed, Refused, refusedOf } from "./errors.js";
 import { NOT_SHARED, readHistory } from "./history.js";
+import { storageHandle } from "./storage.js";
 import { decodeRows, encodeParam, operationOf, rowsAsObjects } from "./values.js";
 
 const freeze = Object.freeze;
@@ -204,6 +205,16 @@ function context(raw, structures, declared) {
     }
     return db;
   };
+  const run = async (operation, args) => settle(await invoke(operation, args));
+  const files = (name, as) => {
+    const key = `${as} storage ${name}`;
+    let made = handles.get(key);
+    if (made === undefined) {
+      made = storageHandle(name, as, run);
+      handles.set(key, made);
+    }
+    return made;
+  };
   const structureOf = (name) => (hasOwn(shared, name) ? shared[name] : undefined);
   // A Resource not declared is `write` here: the host refuses it anyway.
   const accessOf = (name) => (hasOwn(declared, name) && declared[name]?.access === "read" ? "read" : "write");
@@ -216,6 +227,7 @@ function context(raw, structures, declared) {
         db: (name) =>
           handle(`user resource ${name}`, { resource: name, as: "user" }, structureOf(name), accessOf(name)),
         ownDb: () => handle("user own", { own: true, as: "user" }, own, "write"),
+        storage: (name) => files(name, "user"),
       });
     },
     app() {
@@ -230,6 +242,8 @@ function context(raw, structures, declared) {
             structureOf(name),
             accessOf(name),
           ),
+        // Not in the types either: the host's `not-own-database`.
+        storage: (name) => files(name, "application"),
       });
     },
   });

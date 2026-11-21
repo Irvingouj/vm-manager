@@ -499,7 +499,7 @@ fn attention(block: &Block<'_>) -> Attention {
     let mut worst = Attention::None;
     for (resource, level) in declared {
         if let Some(seen) = block.seen.get(resource.as_str()) {
-            let this = match standing(*level, seen).1 {
+            let this = match standing(level.level, seen).1 {
                 "lower" | "none" => Attention::MissingAccess,
                 "not-registered" => Attention::NotRegistered,
                 "unknown" => Attention::Unknown,
@@ -610,7 +610,7 @@ fn whole(out: &mut String, block: &Block<'_>, people: &str, notice: Option<Notic
         );
         for (resource, level) in declared {
             if let Some(seen) = block.seen.get(resource.as_str()) {
-                resource_row(out, resource, *level, seen);
+                resource_row(out, resource, level.level, seen);
             }
         }
         out.push_str("</tbody></table></section>");

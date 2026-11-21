@@ -59,9 +59,10 @@ use crate::own_db::OwnDatabases;
 use crate::platform::{Limits, Platform};
 use crate::platform_db::{Connection, DatabaseAddress, DbError, PlatformDatabase, PoolLimits};
 use crate::registry::{NewVersion, Registry, Sent};
-use crate::resources::{self, Login, NewResource, Resources};
+use crate::resources::{self, Login, NewReach, NewResource, Resources};
 use crate::runner;
 use crate::sign_in::{ChosenTestUser, LocalSignIn};
+use crate::storage::{self, Storage};
 use crate::tool_credentials::{DEFAULT_LIFETIME, ToolCredentials, Unchecked};
 use crate::user::User;
 
@@ -294,6 +295,8 @@ pub(super) struct Live {
     pub log: Arc<OperationLog>,
     pub gateway: Arc<PlatformGateway>,
     pub ingress: Ingress,
+    /// The file threads: ended by [`Live::close`].
+    storage: Arc<Storage>,
 }
 
 /// How many requests the parts are made for.
@@ -318,6 +321,7 @@ impl Live {
             // The local run counts nothing: its writer ends here.
             usage: _,
             usage_writer: _,
+            storage,
         } = Platform::open(
             &pg.platform_address(),
             Limits {
@@ -329,6 +333,8 @@ impl Live {
                 runner: size.runner,
                 start: PLATFORM_WAIT,
             },
+            // The local loop's Storage is a later stage of the ticket.
+            None,
         )
         .await
         .map_err(|error| open_failed(error, who.command))?;
@@ -350,6 +356,7 @@ impl Live {
             api: Api::new(
                 Arc::clone(&registry),
                 Arc::clone(&resources),
+                Arc::clone(&storage),
                 Arc::clone(&log),
                 Arc::clone(&logs),
                 Arc::clone(&credentials),
@@ -381,6 +388,7 @@ impl Live {
             log,
             gateway,
             ingress,
+            storage,
         })
     }
 
@@ -399,6 +407,7 @@ impl Live {
             log,
             gateway,
             ingress,
+            storage,
         } = self;
         let Ingress {
             runner, logs, api, ..
@@ -407,6 +416,7 @@ impl Live {
         runner.stop(DRAIN_WAIT).await;
         gateway.drain(DRAIN_WAIT).await;
         drop(gateway);
+        storage.files.stop(storage::files::STOP_WAIT).await;
         if let Some(logs) = Arc::into_inner(logs) {
             writer.finish(logs, DRAIN_WAIT).await;
         }
@@ -751,7 +761,7 @@ async fn standins_of(
                     description: format!("The local stand-in of {}", standin.resource),
                     owner: "the local run".to_owned(),
                     contact: standin.contact.clone(),
-                    connection,
+                    reach: NewReach::Database(connection),
                     name: standin.resource.clone(),
                 },
                 BUILDER,

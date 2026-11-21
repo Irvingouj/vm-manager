@@ -179,7 +179,7 @@ impl OperationsHandler for HostOps {
         // The gateway reads `active` too: a `query` with no request in
         // flight is refused and still has its Operation log entry.
         let Decision { refused, answer } =
-            self.gateway.operate(&self.in_flight, active, name, &args);
+            self.gateway.operate(&self.in_flight, active, name, args);
         self.host_call(name, refused);
         Box::pin(async move { InvokeResult::Value(answer.await) })
     }

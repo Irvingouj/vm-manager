@@ -276,7 +276,15 @@ pub(super) async fn run(
             resource: Some(resource),
             ..
         } => match opened.level {
-            Level::Read => resource.read_pool(),
+            Level::Read => match resource.read_pool() {
+                Some(pool) => pool,
+                // Allowed means registered as a database; not reached.
+                None => {
+                    let answer = error_to_wire(json!({ "kind": "unavailable" }));
+                    began.send(opened.failed("unavailable", answer).await).ok();
+                    return;
+                }
+            },
             Level::Write => {
                 if let Some(pool) = resource.write_pool() {
                     pool

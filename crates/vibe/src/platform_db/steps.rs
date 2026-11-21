@@ -543,6 +543,22 @@ pub const STEPS: &[Step] = &[
         CREATE INDEX operation_log_time ON operation_log (time);
     ",
     },
+    Step {
+        number: 17,
+        name: "the key storage lists' cursors are sealed with",
+        sql: "
+        -- One row: the key a Storage list's cursor is sealed with (blackbox/
+        -- CONTRACT.md, \"Storage: Through the raw interface\"), kept here
+        -- so that a cursor outlives a restart. 244 random bits from two
+        -- version 4 UUIDs (Postgres's strong random source). Never printed.
+        CREATE TABLE storage_cursor_key (
+            only_row boolean PRIMARY KEY DEFAULT true CHECK (only_row),
+            key bytea NOT NULL CHECK (length(key) = 32)
+        );
+        INSERT INTO storage_cursor_key (key)
+            VALUES (decode(replace(gen_random_uuid()::text || gen_random_uuid()::text, '-', ''), 'hex'));
+    ",
+    },
 ];
 
 /// The advisory lock every step's transaction takes first: "vm steps".

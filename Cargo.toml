@@ -79,6 +79,10 @@ url = "2"
 # tree at this version through rcgen (the harness's certificates); no
 # feature of it is used (no verification: rustls does that).
 x509-parser = { version = "0.18", default-features = false }
+# Storage keys must be in Unicode normalisation form C (ADR 0019): checked,
+# never normalised. Already in the tree at this version through
+# stringprep (tokio-postgres's SCRAM).
+unicode-normalization = { version = "0.1", default-features = false }
 
 # Lints are set here once; every crate of ours inherits them with
 # `[lints] workspace = true`. See "Rust rules" in AGENTS.md, and clippy.toml.

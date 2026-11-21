@@ -6,6 +6,7 @@
 //   ctx.user().db("devops")   a shared database declared in manifest.ts, as the User
 //   ctx.user().ownDb()        the Application's own database, as the User
 //   ctx.app().ownDb()         the Application's own database, as the Application
+//   ctx.user().storage("marketing")  a Storage Resource declared in manifest.ts, as the User
 //
 // A handle is a Drizzle database typed with that database's structure: a
 // shared one from resources/<name>/ (linked by its generated index.ts), the
@@ -25,17 +26,26 @@ declare const contextBrand: unique symbol;
 export type DeclaredAccess = "read" | "write";
 
 /** A shared database the Application uses. */
-export interface ResourceDeclaration {
+export interface DatabaseDeclaration {
   readonly kind: "postgres";
   readonly access: DeclaredAccess;
 }
+
+/** A Storage Resource (a named place of files) the Application uses. */
+export interface StorageDeclaration {
+  readonly kind: "storage";
+  readonly access: "read" | "write";
+}
+
+/** A Resource the Application uses: a shared database or a Storage Resource. */
+export type ResourceDeclaration = DatabaseDeclaration | StorageDeclaration;
 
 export interface Manifest {
   /** The Application's name: a lower-case DNS label, as the platform's API takes it. */
   readonly name: string;
   /** One sentence saying what the Application does, and for whom. */
   readonly description: string;
-  /** Every shared database the Application uses, by its Resource name. */
+  /** Every Resource the Application uses (shared databases and Storage), by its name. */
   readonly resources: { readonly [name: string]: ResourceDeclaration };
 }
 
@@ -52,8 +62,22 @@ export type Refusal =
   | { readonly reason: "no-request" }
   | { readonly reason: "unknown-operation" }
   | { readonly reason: "not-own-database"; readonly resource: string }
-  | { readonly reason: "not-declared"; readonly resource: string }
-  | { readonly reason: "not-registered"; readonly resource: string }
+  | {
+      readonly reason: "not-declared";
+      readonly resource: string;
+      /** The kind the operation works on, when the kinds matter (always for Storage). */
+      readonly kind?: string;
+      /** The other kind the name is declared as. */
+      readonly declared_kind?: string;
+    }
+  | {
+      readonly reason: "not-registered";
+      readonly resource: string;
+      /** The kind the operation works on, when the kinds matter (always for Storage). */
+      readonly kind?: string;
+      /** The other kind a Resource of that name is registered as. */
+      readonly registered_kind?: string;
+    }
   | {
       readonly reason: "declared-lower";
       readonly resource: string;
@@ -320,14 +344,106 @@ interface ReadsHistory {
 /** A handle of the own database: a Drizzle database, and its Change history. */
 export type OwnDatabase = Database<OwnStructure> & ReadsHistory;
 
+// ---------------------------------------------------------------- Storage
+
+/** A file's metadata, as every Storage answer gives it. */
+export interface FileInfo {
+  readonly key: string;
+  /** Bytes. */
+  readonly size: number;
+  readonly contentType: string;
+  /** The time of the file's last change, to the second. */
+  readonly lastModified: Date;
+}
+
+/** A file read whole. */
+export interface StoredFile extends FileInfo {
+  /** Its bytes, over an ArrayBuffer of their own: a Response's body as it is. */
+  readonly body: Uint8Array<ArrayBuffer>;
+  /** The body decoded as UTF-8 (malformed bytes become U+FFFD). */
+  text(): string;
+}
+
+export interface ListOptions {
+  /** Only keys that begin with it; "" without it. */
+  readonly prefix?: string;
+  /** Roll up every key holding a `/` after the prefix into its folder. */
+  readonly delimiter?: "/";
+  /** 1 to 1000; 100 without it. */
+  readonly limit?: number;
+  /** A cursor a list of the same prefix and delimiter answered: the next page. */
+  readonly cursor?: string;
+}
+
+export interface FileList {
+  readonly files: readonly FileInfo[];
+  /** With delimiter "/" only; each ends with "/". */
+  readonly folders: readonly string[];
+  /** null when nothing follows. */
+  readonly cursor: string | null;
+}
+
+/** What a put writes: a string is written as UTF-8. */
+export type FileBody = string | Uint8Array | ArrayBuffer;
+
+export interface PutOptions {
+  /** 1 to 255 printable ASCII characters holding a `/`; without it, the key's extension gives it. */
+  readonly contentType?: string;
+}
+
+type FilesDeclaredAtRead<N extends string> =
+  `'${N}' is declared at 'read' in manifest.ts. Declare it at 'write' to change files.`;
+
+/**
+ * A Storage Resource declared at `read`, as the User: reads only. Each call
+ * is one host operation. `N` is its name, for the message of a change made
+ * through it.
+ */
+export interface ReadOnlyStorage<N extends string = string> {
+  /** The file's metadata, or null when no file has the key. */
+  head(key: string): Promise<FileInfo | null>;
+  /** The file read whole, or null when no file has the key. */
+  get(key: string): Promise<StoredFile | null>;
+  /** A page of the keys beginning with the prefix, in the byte order of their UTF-8. */
+  list(options?: ListOptions): Promise<FileList>;
+  put(this: FilesDeclaredAtRead<N>, key: string, body: FileBody, options?: PutOptions): Promise<FileInfo>;
+  delete(this: FilesDeclaredAtRead<N>, key: string): Promise<void>;
+}
+
+/** A Storage Resource declared at `write`, as the User. Each call is one host operation. */
+export interface Storage {
+  /** The file's metadata, or null when no file has the key. */
+  head(key: string): Promise<FileInfo | null>;
+  /** The file read whole, or null when no file has the key. */
+  get(key: string): Promise<StoredFile | null>;
+  /** A page of the keys beginning with the prefix, in the byte order of their UTF-8. */
+  list(options?: ListOptions): Promise<FileList>;
+  /** Creates the file or replaces it whole; resolves to its metadata as written. */
+  put(key: string, body: FileBody, options?: PutOptions): Promise<FileInfo>;
+  /** Removes the file if there is one, and every folder it leaves empty. */
+  delete(key: string): Promise<void>;
+}
+
+type StorageHandle<R extends Declarations, N extends keyof R & string> = R[N]["access"] extends "write"
+  ? Storage
+  : ReadOnlyStorage<N>;
+
 // ---------------------------------------------------------------- context
 
-/** Acting as the User of the request: the shared databases declared in manifest.ts, and the own database. */
+/** Acting as the User of the request: the Resources declared in manifest.ts, and the own database. */
 export interface ActingAsUser<R extends Declarations> {
   readonly id: string;
   readonly groups: readonly string[];
-  /** A shared database declared in manifest.ts, with this User's Access. */
-  db<N extends keyof R & string>(name: N): SharedDatabase<R, N>;
+  /** A shared database declared in manifest.ts (kind "postgres"), with this User's Access. */
+  // The names are written out here, not through an alias, so that a
+  // compile error lists them.
+  db<N extends keyof { [K in keyof R & string as R[K] extends { readonly kind: "postgres" } ? K : never]: 0 }>(
+    name: N,
+  ): SharedDatabase<R, N & keyof R & string>;
+  /** A Storage Resource declared in manifest.ts (kind "storage"), with this User's Access. */
+  storage<N extends keyof { [K in keyof R & string as R[K] extends { readonly kind: "storage" } ? K : never]: 0 }>(
+    name: N,
+  ): StorageHandle<R, N & keyof R & string>;
   /** The Application's own database, as this User. */
   ownDb(): OwnDatabase;
 }
