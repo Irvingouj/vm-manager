@@ -666,3 +666,46 @@ pub fn prepare_site(site: &crate::walks::Site, admin: &str, other: &str) -> Prep
     }
     PreparedSite { db, credential }
 }
+
+/// The tables of the platform database the two readings of
+/// [`while_two_readings_run`] are held on: the usage that every Application
+/// reads and the Operation log. Their names are what the platform database
+/// shows (`pg_tables`).
+pub const READINGS_TABLES: [&str; 2] = ["public.application_usage", "public.operation_log"];
+
+/// While two readings for Platform administrators run (`GET
+/// /v1/admin/applications` and `GET /v1/operation-log` as
+/// [`crate::admin::administrator`], each held by [`READINGS_TABLES`]
+/// locked, and only those: what does not read them is answered as ever
+/// meanwhile), runs `during`; then lets them end. Returns what `during`
+/// returned.
+pub fn while_two_readings_run<T>(vm: &Vm, during: impl FnOnce() -> T) -> T {
+    let sql = crate::admin::platform_sql(vm);
+    let all = tables(&sql);
+    for table in READINGS_TABLES {
+        assert!(
+            all.iter().any(|t| t == table),
+            "the harness's own check: the platform database has {table}, it has {all:?}"
+        );
+    }
+    sql.batch(&format!(
+        "BEGIN; SET LOCAL lock_timeout = '10s'; LOCK TABLE {} IN ACCESS EXCLUSIVE MODE",
+        READINGS_TABLES.join(", ")
+    ));
+    let read = |target: &str| {
+        vm.api_as(&crate::admin::administrator())
+            .request(target)
+            .timeout(Duration::from_secs(40))
+            .send()
+    };
+    thread::scope(|scope| {
+        let first = scope.spawn(|| read(crate::admin::LIST));
+        let second = scope.spawn(|| read(crate::admin::OPERATION_LOG));
+        wait_for_lock_waiters(vm, 2, "two readings");
+        let result = during();
+        let_go(&sql);
+        drop(first.join());
+        drop(second.join());
+        result
+    })
+}

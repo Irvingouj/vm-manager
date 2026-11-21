@@ -453,6 +453,60 @@ fn a_time_from_a_datetime_local_field_is_read_as_utc_and_rfc_3339_is_taken_from_
     );
 }
 
+/// The ways a field may hold `typed` (`YYYY-MM-DDTHH:MM:SS.ffffff`) to the
+/// millisecond: cut or rounded, with or without trailing zeros of the
+/// fraction.
+fn to_the_millisecond(typed: &str) -> Vec<String> {
+    let (whole, fraction) = typed.split_once('.').unwrap();
+    let micros: u64 = format!("{fraction:0<6}").parse().unwrap();
+    let mut held = Vec::new();
+    for millis in [micros / 1000, (micros + 500) / 1000] {
+        if millis >= 1000 {
+            continue;
+        }
+        let three = format!("{whole}.{millis:03}");
+        let trimmed = three.trim_end_matches('0').trim_end_matches('.').to_owned();
+        held.push(three);
+        held.push(trimmed);
+    }
+    held
+}
+
+#[test]
+fn a_time_typed_with_microseconds_is_held_by_its_field_to_the_millisecond_and_the_entries_are_the_apis_for_it()
+ {
+    let (t, all) = populated();
+    let vm = t.vm();
+    // An entry's time, with its microseconds, as an address typed by hand
+    // (no `Z`: a `datetime-local` value, read as UTC).
+    let pivot = all
+        .iter()
+        .filter_map(|e| e["time"].as_str())
+        .find(|time| {
+            time.split_once('.')
+                .is_some_and(|(_, f)| f.trim_end_matches('Z').len() == 6)
+        })
+        .unwrap_or_else(|| {
+            panic!("the harness's own check: an entry's time with six digits of a second")
+        })
+        .to_owned();
+    let typed = as_datetime_local(&pivot);
+    let held = to_the_millisecond(&typed);
+    for field in ["since", "until"] {
+        let page = log_page_at(vm, &log_target(&[(field, &typed)]));
+        let value = field_value(&page, field);
+        assert!(
+            value.as_ref().is_some_and(|v| held.contains(v)),
+            "`{field}={typed}`: expected the field to hold the time to the millisecond (one of {held:?}), it holds {value:?}"
+        );
+        assert_eq!(
+            entry_ids(&page),
+            api_newest_first(vm, &format!("{field}={}", encode(&pivot))),
+            "`{field}={typed}`: the entries the API answers for the time as typed (to the microsecond)"
+        );
+    }
+}
+
 #[test]
 fn following_older_to_the_end_shows_every_matching_entry_once_and_newest_leads_back() {
     let t = Txs::start_with(&stand_in_options());

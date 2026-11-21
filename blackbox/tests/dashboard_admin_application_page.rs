@@ -17,10 +17,13 @@
 )]
 
 use blackbox::admin::{disable_ok, place_usage, usage_of};
-use blackbox::admin_pages::{OPERATION_LOG, disable_target, enable_target, query_pairs};
+use blackbox::admin_pages::{
+    OPERATION_LOG, disable_target, enable_target, query_pairs, while_two_readings_run,
+};
 use blackbox::dashboard::{Dashboard, Page, administrator, create, deploy, start};
 use blackbox::sharing::{add, share_ok, user};
 use blackbox::{User, Vm};
+use std::time::{Duration, Instant};
 
 const APP: &str = "board";
 
@@ -258,4 +261,53 @@ fn a_contributor_who_is_not_a_platform_administrator_sees_none_of_it() {
         ["nothing"],
         "the notice of a change of sharing that changed nothing"
     );
+}
+
+#[test]
+fn while_two_readings_run_an_administrators_view_is_503_at_once_and_a_contributors_is_answered_as_ever()
+ {
+    let vm = with_board();
+    let target = format!("/applications/{APP}");
+    let admin = Dashboard::new(&vm, &administrator());
+    let contributor = Dashboard::new(&vm, &alice());
+    admin.page(&target, 200, "before");
+    let (answer, took, contributors, contributor_took) = while_two_readings_run(&vm, || {
+        let began = Instant::now();
+        let answer = admin
+            .navigation("GET", &target)
+            .timeout(Duration::from_secs(40))
+            .send();
+        let took = began.elapsed();
+        let began = Instant::now();
+        let contributors = contributor
+            .navigation("GET", &target)
+            .timeout(Duration::from_secs(40))
+            .send();
+        (answer, took, contributors, began.elapsed())
+    });
+    assert!(
+        answer.status == 503
+            && answer.header("retry-after").is_some()
+            && took < Duration::from_secs(2),
+        "a Platform administrator's view of board's page is a reading (its usage): expected `503` with `retry-after` at once while two others run, got after {took:?}\n{}",
+        answer.describe()
+    );
+    let page = Page::read(answer, admin.url(&target), "the third reading");
+    let errors = page.errors();
+    assert!(
+        matches!(errors.as_slice(), [(r, w)] if r == "unavailable" && w.to_lowercase().contains("again")),
+        "expected `data-vm-error=\"unavailable\"` saying to try again shortly, got {errors:?}"
+    );
+    assert!(
+        contributors.status == 200 && contributor_took < Duration::from_secs(2),
+        "alice's view of her Application's page is no such reading: answered as ever, meanwhile (after {contributor_took:?})\n{}",
+        contributors.describe()
+    );
+    assert_eq!(
+        contributors.status,
+        200,
+        "alice's view of her Application's page is no such reading: answered as ever\n{}",
+        contributors.describe()
+    );
+    admin.page(&target, 200, "once they are done");
 }

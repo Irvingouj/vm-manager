@@ -874,11 +874,28 @@ impl PrivatePostgres {
     }
 
     fn serve(&mut self) -> Result<(), String> {
+        self.serve_at(None)
+    }
+
+    /// Starts the server again on its own data and its own port after
+    /// [`PrivatePostgres::stop`]: what a program that lost its Postgres
+    /// finds when it comes back.
+    pub fn start_again(&mut self) -> Result<(), String> {
+        if self.server.is_some() {
+            return Ok(());
+        }
+        self.serve_at(Some(self.port))
+    }
+
+    fn serve_at(&mut self, fixed: Option<u16>) -> Result<(), String> {
         let log_path = self.root.join("postgres.log");
         let began = Instant::now();
         let mut last_problem = String::new();
         for _ in 0..PORT_ATTEMPTS {
-            let port = free_port()?;
+            let port = match fixed {
+                Some(port) => port,
+                None => free_port()?,
+            };
             let log = fs::OpenOptions::new()
                 .create(true)
                 .append(true)

@@ -32,6 +32,7 @@ use blackbox::admin::{
 };
 use blackbox::admin_pages::{
     APPLICATIONS, confirm_disable, disable_target, enable_target, press_enable,
+    while_two_readings_run,
 };
 use blackbox::api::{assert_served_by, marked_bundle, version_body};
 use blackbox::dashboard::{
@@ -543,4 +544,35 @@ fn a_disable_whose_answer_is_lost_is_503_saying_it_cannot_be_told_and_settles_as
         );
         thread::sleep(Duration::from_millis(200));
     }
+}
+
+#[test]
+fn while_two_readings_run_the_page_that_confirms_is_503_at_once_with_retry_after() {
+    let vm = with_board();
+    let target = disable_target(APP);
+    let dashboard = Dashboard::new(&vm, &administrator());
+    dashboard.page(&target, 200, "before");
+    let (answer, took) = while_two_readings_run(&vm, || {
+        let began = Instant::now();
+        let answer = dashboard
+            .navigation("GET", &target)
+            .timeout(Duration::from_secs(40))
+            .send();
+        (answer, began.elapsed())
+    });
+    assert!(
+        answer.status == 503
+            && answer.header("retry-after").is_some()
+            && took < Duration::from_secs(2),
+        "the page that confirms a disable is a reading (its usage): expected `503` with `retry-after` at once while two others run, got after {took:?}\n{}",
+        answer.describe()
+    );
+    let page = Page::read(answer, dashboard.url(&target), "the third reading");
+    let errors = page.errors();
+    assert!(
+        matches!(errors.as_slice(), [(r, w)] if r == "unavailable" && w.to_lowercase().contains("again")),
+        "expected `data-vm-error=\"unavailable\"` saying to try again shortly, got {errors:?}"
+    );
+    assert!(disabled_now(&vm).is_null(), "nothing changed");
+    dashboard.page(&target, 200, "once they are done");
 }

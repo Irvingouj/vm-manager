@@ -6,7 +6,8 @@
 //! headers and `form-action 'self'`, its `<title>` the page's name then
 //! ` — Dashboard`; the order: sign-in first, then the origin rule, then
 //! whether the person is a Platform administrator; `503` with `retry-after`
-//! while the platform database cannot be reached.
+//! while the platform database cannot be reached (the Resources and the
+//! installation too), and the pages again once it can.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -317,6 +318,11 @@ fn with_the_platform_database_stopped_an_administrators_page_is_503_with_retry_a
     let disable = dashboard
         .form_request(&disable_target(APP), "")
         .timeout(Duration::from_secs(40));
+    // Everything written so far on disk first: the harness's Postgres
+    // runs without fsync and is stopped as a crash, which would otherwise
+    // lose what it had not yet written (`application_usage` was lost so
+    // once: "relation does not exist" after the restart).
+    blackbox::admin::platform_sql(&vm).batch("CHECKPOINT");
     postgres.stop();
     for target in [APPLICATIONS, OPERATION_LOG, RESOURCES, INSTALLATION] {
         let target = target.to_owned();
@@ -350,4 +356,29 @@ fn with_the_platform_database_stopped_an_administrators_page_is_503_with_retry_a
         words.contains("whether"),
         "expected the words of a disable's `503` to say it cannot be told whether it was made, got {words:?}"
     );
+    // Once the platform database can be reached again, the pages answer
+    // again: the Resources and the installation too, which show what the
+    // program holds in memory but read the database all the same
+    // (`10e00ff`).
+    postgres
+        .start_again()
+        .unwrap_or_else(|e| panic!("the harness could not start its Postgres again: {e}"));
+    for target in [RESOURCES, INSTALLATION, APPLICATIONS, OPERATION_LOG] {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let response = dashboard
+                .navigation("GET", target)
+                .timeout(Duration::from_secs(40))
+                .send();
+            if response.status == 200 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{target}: expected `200` again within 30 s of the platform database coming back\n{}",
+                response.describe()
+            );
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
 }
