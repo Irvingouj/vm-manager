@@ -5,7 +5,12 @@
 //! and no one it is shared with, and the person's id once, in the header;
 //! an Application's own page holds what the list leaves out; a page of the
 //! sign-in address says which installation it is; the local run's
-//! test-User page says which Application it is for. (That every `<svg>`
+//! test-User page says which Application it is for; on the pages of
+//! Platform administrators ("The Dashboard for Platform administrators: How
+//! the pages look"), the person's id once, in the header, no entry,
+//! Contributor or Grant carrying `data-vm-user`, "in the last 30 days" once
+//! on every Application, the way in in the header only and the four
+//! sections in their `nav` only. (That every `<svg>`
 //! has a name or is hidden beside its words is measured on the pages of
 //! the walk, `browser_look.rs`.)
 //!
@@ -22,14 +27,18 @@
     reason = "test code: a failed expectation is a failing test"
 )]
 
+use blackbox::admin_pages::{
+    APPLICATIONS, INSTALLATION, OPERATION_LOG, RESOURCES, SECTIONS, disable_target,
+};
 use blackbox::browser::url;
 use blackbox::dashboard::{
-    Dashboard, Page, assert_attention, assert_attention_attribute,
+    Dashboard, Page, administrator, assert_attention, assert_attention_attribute,
     assert_list_holds_nothing_of_an_applications_own_page, create, deploy, start,
 };
 use blackbox::dev::Dev;
 use blackbox::local::{Local, local_project};
 use blackbox::page::Document;
+use blackbox::scenario::{READERS, RESOURCE, Scenario};
 use blackbox::sessions::{ADA, Installation, ada};
 use blackbox::sharing::{add, contributors_ok, everyone, group, share_ok, user};
 use blackbox::tool_sign_ins::Challenge;
@@ -274,4 +283,102 @@ fn the_local_runs_test_user_page_names_the_application_outside_its_title() {
         "expected the Application's name {NAME:?} in the text of the test-User page, outside its <title>; its <body> says {text:?}"
     );
     dev.stop("INT").expect_code(0);
+}
+
+#[test]
+fn the_pages_of_platform_administrators_say_each_thing_once() {
+    let s = Scenario::start_with(&blackbox::dashboard::stand_in_options());
+    s.register(RESOURCE);
+    s.grant(RESOURCE, READERS, "read");
+    let vm = &s.vm;
+    create(vm, &alice(), "ledger", Some("The quarterly ledger"));
+    deploy(vm, &alice(), "ledger", &[(RESOURCE, "read")]);
+    contributors_ok(
+        &vm.api_as(&alice()),
+        vm,
+        "ledger",
+        &add(&[group("staff"), user("carol")]),
+    );
+    // An entry of the Operation log: a pull of the Resource's structure.
+    vm.api_as(&User::new("rita").in_groups(&[READERS]))
+        .get(&format!("/v1/resources/{RESOURCE}/structure"))
+        .expect_status(200);
+    let admin = administrator();
+    let dashboard = Dashboard::new(vm, &admin);
+    let pages = [
+        APPLICATIONS.to_owned(),
+        "/applications/ledger".to_owned(),
+        disable_target("ledger"),
+        OPERATION_LOG.to_owned(),
+        INSTALLATION.to_owned(),
+        RESOURCES.to_owned(),
+    ];
+    let section_paths: Vec<&str> = SECTIONS.iter().map(|(_, path)| *path).collect();
+    for target in &pages {
+        let context = format!("{target} as a Platform administrator");
+        let page = dashboard.page(target, 200, &context);
+        assert_eq!(
+            page.count("data-vm-user"),
+            1,
+            "{context}: one `data-vm-user`\n{}",
+            page.describe()
+        );
+        assert_id_once_in_the_header(&page, &admin.id, &context);
+        let root = page.root();
+        for kind in ["data-vm-entry", "data-vm-contributor", "data-vm-grant"] {
+            for e in root.with_attr(kind) {
+                assert!(
+                    !e.has("data-vm-user") && e.with_attr("data-vm-user").is_empty(),
+                    "{context}: `{kind}` carries no `data-vm-user`: {:?}",
+                    e.text()
+                );
+            }
+        }
+        let headers = root.named("header");
+        let in_header: usize = headers
+            .iter()
+            .map(|h| h.with_attr("data-vm-admin").len())
+            .sum();
+        assert!(
+            page.count("data-vm-admin") == 1 && in_header == 1,
+            "{context}: the way in once, in the header only\n{}",
+            page.describe()
+        );
+        let navs = root.with_attr("data-vm-admin-sections");
+        let in_nav: usize = navs
+            .iter()
+            .map(|n| n.with_attr("data-vm-section").len())
+            .sum();
+        assert!(
+            page.count("data-vm-section") == in_nav,
+            "{context}: the sections in `nav[data-vm-admin-sections]` only\n{}",
+            page.describe()
+        );
+        // No other link to a section's page, outside the header and the
+        // sections' `nav`.
+        let outside: Vec<String> = root
+            .named("a")
+            .iter()
+            .filter(|a| !a.has("data-vm-section") && !a.has("data-vm-admin"))
+            .filter_map(|a| a.attr("href").and_then(|h| page.url.join(h).ok()))
+            .filter(|u| u.query().is_none() && section_paths.contains(&u.path()))
+            .map(|u| u.to_string())
+            .collect();
+        assert!(
+            outside.is_empty(),
+            "{context}: a section's page is linked only from the sections' `nav` (and the way in): {outside:?}"
+        );
+    }
+    let list = dashboard.page(APPLICATIONS, 200, "every Application");
+    let said = list
+        .body_text()
+        .to_lowercase()
+        .matches("in the last 30 days")
+        .count();
+    assert_eq!(
+        said,
+        1,
+        "\"In the last 30 days\" once on the list of every Application\n{}",
+        list.describe()
+    );
 }

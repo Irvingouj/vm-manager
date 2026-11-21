@@ -66,10 +66,17 @@ impl Site {
     /// `--public-scheme https --public-port <the front's port>` and an
     /// installation's key, OIDC connected, and the front serving.
     pub fn start(people: &[Person]) -> Self {
+        Self::start_with(people, &[])
+    }
+
+    /// As [`Site::start`], with more arguments of `vibe serve`
+    /// (`--session-renewal 3`, say).
+    pub fn start_with(people: &[Person], more: &[&str]) -> Self {
         let bound = Bound::new();
         let port = bound.port().to_string();
         let options = VmOptions::new()
             .args_extra(&["--public-scheme", "https", "--public-port", &port])
+            .args_extra(more)
             .env("VIBE_SECRET_KEY", SecretKey::fresh().expose());
         let at = Installation::from(Provider::start(people), &options);
         let authority = Authority::new("Harness authority of the walks");

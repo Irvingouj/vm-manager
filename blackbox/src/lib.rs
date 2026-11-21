@@ -110,6 +110,10 @@
 //!   stop share: the list of every Application, disabling and enabling,
 //!   what a disabled Application answers, usage, and the Operation log
 //!   read with its filters a page at a time;
+//! - [`admin_pages`] is what the tests of the Dashboard for Platform
+//!   administrators share: the paths under `/admin`, the way in and the
+//!   sections, the refusal page, the forms of a disable and an enable, and
+//!   the Operation log page read into its entries and fields;
 //! - [`release`] is what the tests of the first release share: the
 //!   package's version, the scripts of `scripts/` run by their interface
 //!   with a time limit, a throwaway clone of the repository for a tag or a
@@ -128,6 +132,7 @@
 )]
 
 pub mod admin;
+pub mod admin_pages;
 pub mod api;
 pub mod browser;
 pub mod changed_outside;

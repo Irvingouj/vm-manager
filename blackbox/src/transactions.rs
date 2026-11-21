@@ -237,7 +237,14 @@ pub struct Txs {
 
 impl Txs {
     pub fn start() -> Self {
-        let scenario = Scenario::start();
+        Self::start_with(&crate::vm::VmOptions::new())
+    }
+
+    /// As [`Txs::start`], the program started from these options (the
+    /// Dashboard's, say), with the stand-in on and the administrators'
+    /// Group.
+    pub fn start_with(options: &crate::vm::VmOptions) -> Self {
+        let scenario = Scenario::start_with(options);
         scenario.register_writable(RESOURCE);
         scenario.register(RO);
         scenario.grant(RESOURCE, READERS, "read");

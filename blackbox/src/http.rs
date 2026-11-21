@@ -432,6 +432,11 @@ impl Response {
             .unwrap_or_else(|e| panic!("{e}"))
     }
 
+    /// Every header, as (name in lower case, value), in order.
+    pub fn headers(&self) -> &[(String, String)] {
+        &self.headers
+    }
+
     /// The first value of a header, by name in any letter case.
     pub fn header(&self, name: &str) -> Option<&str> {
         self.headers

@@ -16,7 +16,17 @@
 //! dark, each visiting the six pages in turn: the Dashboard's list with
 //! Applications in it, one Application's page as a Contributor sees it
 //! (its sharing form on it), a page of refusal, the sign-out page, the
-//! tool's sign-in page, and the local run's test-User page. On each it
+//! tool's sign-in page, and the local run's test-User page; then, Ada
+//! being a Platform administrator (CONTRACT.md, "The Dashboard for
+//! Platform administrators: How the pages look, and the browser's walks"),
+//! every Application with a disabled one and one not deployed on it, one
+//! Application's page as she sees it with its enable form, the page that
+//! confirms a disable, the Operation log with entries of three outcomes
+//! (allowed, refused, failed: an unfinished entry is not made here) and a
+//! `<details>` opened, the Operation log with a malformed filter, the
+//! installation with OIDC connected, the Resources with Grants; and, in a
+//! browser of Grace's, the refusal page of someone who is not a Platform
+//! administrator. On each it
 //! presses Tab through the page, reads the computed styles and boxes
 //! ([`blackbox::look::measure`]) and holds the window to 320 CSS pixels.
 //! Each promise is then a test of its own reading those measurements (the
@@ -41,6 +51,10 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+use blackbox::admin_pages::{
+    APPLICATIONS as ADMIN_APPLICATIONS, INSTALLATION, OPERATION_LOG, PreparedSite, RESOURCES,
+    SITE_DISABLED, SITE_RESOURCE, disable_target, prepare_site,
+};
 use blackbox::browser::url;
 use blackbox::dashboard::{Page, oidc_post};
 use blackbox::dev::Dev;
@@ -50,8 +64,10 @@ use blackbox::look::{
     Colour, FocusWalk, backdrop, contrast, measure, narrowed, pictures_in, policy_problems,
     walk_focus,
 };
+use blackbox::oidc::Person;
 use blackbox::page::Document;
-use blackbox::sessions::{ADA, GRACE, ada, grace};
+use blackbox::scenario::ADMINISTRATORS;
+use blackbox::sessions::{ADA, GRACE, grace};
 use blackbox::tool::Machine;
 use blackbox::tool_sign_ins::{BrowserCommand, Challenge, Decision, OPEN_TIMEOUT};
 use blackbox::walks::{
@@ -80,9 +96,41 @@ const REFUSAL: &str = "a page of refusal";
 const SIGN_OUT: &str = "the sign-out page";
 const TOOL_SIGN_IN: &str = "the tool's sign-in page";
 const TEST_USER: &str = "the local run's test-User page";
+const ADMIN_LIST: &str = "every Application, a disabled one and one not deployed among them";
+const ADMIN_DETAILS: &str =
+    "one Application's page as a Platform administrator sees it, with its enable form";
+const CONFIRM: &str = "the page that confirms a disable";
+const LOG: &str = "the Operation log with entries of each outcome, a <details> opened";
+const LOG_MALFORMED: &str = "the Operation log with a malformed filter";
+const INSTALLATION_PAGE: &str = "the installation with OIDC connected";
+const RESOURCES_PAGE: &str = "the Resources with Grants";
+const NOT_ADMIN: &str = "the refusal page of someone who is not a Platform administrator";
 
 /// The pages, in the order each browser visits them.
-const PAGES: [&str; 6] = [LIST, DETAILS, REFUSAL, SIGN_OUT, TOOL_SIGN_IN, TEST_USER];
+const PAGES: [&str; 14] = [
+    LIST,
+    DETAILS,
+    REFUSAL,
+    ADMIN_LIST,
+    ADMIN_DETAILS,
+    CONFIRM,
+    LOG,
+    LOG_MALFORMED,
+    INSTALLATION_PAGE,
+    RESOURCES_PAGE,
+    SIGN_OUT,
+    TOOL_SIGN_IN,
+    TEST_USER,
+    NOT_ADMIN,
+];
+
+/// Ada, in `finance` and a Platform administrator.
+fn ada() -> Person {
+    Person::new(ADA)
+        .named("Ada Lovelace")
+        .email("ada@example.test")
+        .in_groups(&["finance", ADMINISTRATORS])
+}
 
 const SCHEMES: [Scheme; 2] = [Scheme::Light, Scheme::Dark];
 
@@ -160,7 +208,7 @@ fn run_walk() -> Walk {
         policies: Vec::new(),
         tool_page: Err("not read".to_owned()),
     };
-    let site = match caught(|| {
+    let (site, _prepared) = match caught(|| {
         let site = Site::start(&[ada(), grace()]);
         site.application_of(ADA, APPLICATIONS[0], Some("The incident board"));
         site.application_of(ADA, APPLICATIONS[1], None);
@@ -172,7 +220,8 @@ fn run_walk() -> Walk {
             Some(200),
             "expected Grace on the Dashboard"
         );
-        site
+        let prepared: PreparedSite = prepare_site(&site, ADA, GRACE);
+        (site, prepared)
     }) {
         Ok(site) => site,
         Err(e) => {
@@ -249,6 +298,8 @@ fn walk_in(scheme: Scheme, site: &Site, dev: &Dev<'_>, looks: &mut Vec<Look>) {
     expect_on_page(&mut browser, "[data-vm-error]", REFUSAL);
     looks.push(look(&mut browser, scheme, REFUSAL));
 
+    walk_admin_pages(&mut browser, scheme, site, looks);
+
     browser.navigate(&site.auth("/sign-out"));
     assert_eq!(browser.status(), Some(200), "{}", browser.describe());
     expect_on_page(&mut browser, "form", SIGN_OUT);
@@ -267,6 +318,67 @@ fn walk_in(scheme: Scheme, site: &Site, dev: &Dev<'_>, looks: &mut Vec<Look>) {
     assert_eq!(browser.status(), Some(200), "{}", browser.describe());
     expect_on_page(&mut browser, "form", TEST_USER);
     looks.push(look(&mut browser, scheme, TEST_USER));
+    drop(browser);
+
+    let mut browser = Firefox::start_with(
+        &Options::reaching(&names_of(&APPLICATIONS))
+            .trusting(site.authority.der().as_ref())
+            .in_scheme(scheme)
+            .reducing_motion(),
+    );
+    browser.set_window(WIDE.0, WIDE.1);
+    sign_in_to_dashboard(&mut browser, site, GRACE);
+    browser.navigate(&site.dashboard(ADMIN_APPLICATIONS));
+    expect_on_page(
+        &mut browser,
+        "[data-vm-error=\"not-an-administrator\"]",
+        NOT_ADMIN,
+    );
+    looks.push(look(&mut browser, scheme, NOT_ADMIN));
+}
+
+/// Ada's way through the pages of Platform administrators.
+fn walk_admin_pages(browser: &mut Firefox, scheme: Scheme, site: &Site, looks: &mut Vec<Look>) {
+    browser.navigate(&site.dashboard(ADMIN_APPLICATIONS));
+    expect_on_page(
+        browser,
+        &format!("[data-vm-application=\"{SITE_DISABLED}\"][data-vm-disabled]"),
+        ADMIN_LIST,
+    );
+    looks.push(look(browser, scheme, ADMIN_LIST));
+
+    browser.navigate(&site.dashboard(&format!("/applications/{SITE_DISABLED}")));
+    expect_on_page(browser, "form[data-vm-form=\"enable\"]", ADMIN_DETAILS);
+    looks.push(look(browser, scheme, ADMIN_DETAILS));
+
+    browser.navigate(&site.dashboard(&disable_target(APPLICATIONS[0])));
+    expect_on_page(browser, "form[data-vm-form=\"disable\"]", CONFIRM);
+    looks.push(look(browser, scheme, CONFIRM));
+
+    browser.navigate(&site.dashboard(OPERATION_LOG));
+    for outcome in ["allowed", "refused", "failed"] {
+        expect_on_page(browser, &format!("[data-vm-outcome=\"{outcome}\"]"), LOG);
+    }
+    let summary = browser.the("[data-vm-entry] details summary");
+    browser.click(&summary);
+    expect_on_page(browser, "[data-vm-entry] details[open]", LOG);
+    looks.push(look(browser, scheme, LOG));
+
+    browser.navigate(&site.dashboard(&format!("{OPERATION_LOG}?outcome=nonsense")));
+    expect_on_page(browser, "[data-vm-field-error=\"outcome\"]", LOG_MALFORMED);
+    looks.push(look(browser, scheme, LOG_MALFORMED));
+
+    browser.navigate(&site.dashboard(INSTALLATION));
+    expect_on_page(browser, "[data-vm-issuer]", INSTALLATION_PAGE);
+    looks.push(look(browser, scheme, INSTALLATION_PAGE));
+
+    browser.navigate(&site.dashboard(RESOURCES));
+    expect_on_page(
+        browser,
+        &format!("[data-vm-resource=\"{SITE_RESOURCE}\"] [data-vm-grant]"),
+        RESOURCES_PAGE,
+    );
+    looks.push(look(browser, scheme, RESOURCES_PAGE));
 }
 
 /// The tool's sign-in page without a port (it asks for the check code), as
@@ -374,6 +486,22 @@ fn policies(site: &Site, dev: &Dev<'_>) -> Vec<(&'static str, Option<String>)> {
         refused.describe()
     );
     found.push((REFUSAL, policy_of(&refused)));
+
+    for (page, target) in [
+        (ADMIN_LIST, ADMIN_APPLICATIONS.to_owned()),
+        (ADMIN_DETAILS, format!("/applications/{SITE_DISABLED}")),
+        (CONFIRM, disable_target(APPLICATIONS[0])),
+        (LOG, OPERATION_LOG.to_owned()),
+        (LOG_MALFORMED, format!("{OPERATION_LOG}?outcome=nonsense")),
+        (INSTALLATION_PAGE, INSTALLATION.to_owned()),
+        (RESOURCES_PAGE, RESOURCES.to_owned()),
+    ] {
+        let answer = browser.open(&url(&site.dashboard(&target))).response;
+        found.push((page, policy_of(&answer)));
+    }
+    let mut grace_browser = site.at.browser_as(GRACE);
+    let steps = grace_browser.navigate(&url(&site.dashboard(ADMIN_APPLICATIONS)));
+    found.push((NOT_ADMIN, policy_of(&steps.last().unwrap().response)));
 
     let sign_out = browser.open(&url(&site.auth("/sign-out")));
     assert_eq!(

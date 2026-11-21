@@ -19,9 +19,15 @@
     reason = "test code: a failed expectation is a failing test"
 )]
 
+use blackbox::admin_pages::{
+    APPLICATIONS, INSTALLATION, OPERATION_LOG, RESOURCES, SITE_RESOURCE, disable_target,
+    prepare_site,
+};
 use blackbox::dev::Dev;
 use blackbox::firefox::{self, Firefox, Options, no_wider_than};
 use blackbox::local::{Local, local_project};
+use blackbox::oidc::Person;
+use blackbox::scenario::ADMINISTRATORS;
 use blackbox::sessions::{ADA, GRACE, ada, grace};
 use blackbox::tool::Machine;
 use blackbox::tool_sign_ins::{OPEN_TIMEOUT, tool_address_in};
@@ -138,6 +144,120 @@ fn the_platforms_pages_are_no_wider_than_a_window_320_css_pixels_wide() {
     );
     assert_narrow(&mut browser, "the tool's sign-in page");
     drop(running);
+}
+
+/// A Group's name as long as the harness makes one, with no place to break.
+fn long_group() -> String {
+    "incident-responders-of-the-north-atlantic-region".repeat(2)
+}
+
+#[test]
+fn the_pages_of_platform_administrators_are_no_wider_than_a_window_320_css_pixels_wide() {
+    firefox::required();
+    let admin = Person::new(ADA)
+        .named("Ada Lovelace")
+        .email("ada@example.test")
+        .in_groups(&["finance", ADMINISTRATORS]);
+    let site = Site::start(&[admin, grace()]);
+    let long = longest_name();
+    let credential = site.application_of(ADA, &long, Some(&long_description()));
+    let prepared = prepare_site(&site, ADA, GRACE);
+    let post = |target: &str, body: &serde_json::Value| {
+        blackbox::tool::bearer(&site.at.vm, target, &credential)
+            .method("POST")
+            .json(body)
+            .send()
+    };
+    post(
+        &format!("/v1/applications/{long}/disable"),
+        &serde_json::json!({}),
+    )
+    .expect_status(200);
+    post(
+        &format!("/v1/resources/{SITE_RESOURCE}/grants"),
+        &serde_json::json!({ "group": long_group(), "access": "write" }),
+    )
+    .expect_status(200);
+
+    let mut browser = site.browser(&[long.as_str()]);
+    browser.narrow(NARROW);
+    sign_in_to_dashboard(&mut browser, &site, ADA);
+    for (target, css, page) in [
+        (
+            APPLICATIONS.to_owned(),
+            format!("[data-vm-application=\"{long}\"]"),
+            "every Application",
+        ),
+        (
+            format!("/applications/{long}"),
+            "form[data-vm-form=\"enable\"]".to_owned(),
+            "the page of the longest name as a Platform administrator sees it",
+        ),
+        (
+            disable_target(&long),
+            "[data-vm-disabled]".to_owned(),
+            "the page that confirms a disable, of one disabled already",
+        ),
+        (
+            disable_target("board-not-there"),
+            "[data-vm-error]".to_owned(),
+            "the page of a disable of a name no Application has",
+        ),
+        (
+            format!("{OPERATION_LOG}?outcome=nonsense&user={}", long_group()),
+            "[data-vm-field-error]".to_owned(),
+            "the Operation log with a malformed filter",
+        ),
+        (
+            format!("{OPERATION_LOG}?user={}", long_group()),
+            "[data-vm-empty]".to_owned(),
+            "the Operation log with nothing matching a long filter",
+        ),
+        (
+            INSTALLATION.to_owned(),
+            "[data-vm-issuer]".to_owned(),
+            "the installation",
+        ),
+        (
+            RESOURCES.to_owned(),
+            format!("[data-vm-grant=\"{}\"]", long_group()),
+            "the Resources with a long Group",
+        ),
+    ] {
+        browser.navigate(&site.dashboard(&target));
+        assert!(
+            browser.find(&css).is_some(),
+            "{page}: expected `{css}`\n{}",
+            browser.describe()
+        );
+        assert_narrow(&mut browser, page);
+    }
+    browser.navigate(&site.dashboard(OPERATION_LOG));
+    let summaries = browser.find_all("[data-vm-entry] details summary");
+    assert!(
+        !summaries.is_empty(),
+        "expected entries with a `<details>`\n{}",
+        browser.describe()
+    );
+    for summary in &summaries {
+        browser.click(summary);
+    }
+    assert_narrow(
+        &mut browser,
+        "the Operation log with every `<details>` opened",
+    );
+    drop(browser);
+
+    let mut browser = site.browser(&[long.as_str()]);
+    browser.narrow(NARROW);
+    sign_in_to_dashboard(&mut browser, &site, GRACE);
+    browser.navigate(&site.dashboard(APPLICATIONS));
+    assert_eq!(browser.status(), Some(403), "{}", browser.describe());
+    assert_narrow(
+        &mut browser,
+        "the refusal page of someone who is not a Platform administrator",
+    );
+    drop(prepared);
 }
 
 #[test]
