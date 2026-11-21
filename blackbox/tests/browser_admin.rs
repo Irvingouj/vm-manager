@@ -291,15 +291,33 @@ fn a_platform_administrator_walks_every_page_of_theirs() {
     browser.click(&refused);
     let show = submit_button_of(&mut browser, form);
     click_to_another_page(&mut browser, &show);
-    let mut query = query_of(&mut browser);
-    query.sort();
+    // The address a browser makes by sending the form holds every field,
+    // the empty ones too (CONTRACT.md, `10e00ff`).
+    let query = query_of(&mut browser);
+    let mut names: Vec<&str> = query.iter().map(|(k, _)| k.as_str()).collect();
+    names.sort_unstable();
     assert_eq!(
-        query,
+        names,
+        [
+            "application",
+            "outcome",
+            "resource",
+            "since",
+            "until",
+            "user"
+        ],
+        "the address the form makes holds every field: {query:?}"
+    );
+    let mut given: Vec<(String, String)> =
+        query.into_iter().filter(|(_, v)| !v.is_empty()).collect();
+    given.sort();
+    assert_eq!(
+        given,
         [
             ("application".to_owned(), APP.to_owned()),
             ("outcome".to_owned(), "refused".to_owned())
         ],
-        "the address holds the filters, the empty ones left out"
+        "the filters given, the others empty"
     );
     let filtered = attributes(&mut browser, "[data-vm-entry]", "data-vm-entry");
     let api: Vec<String> = bearer(
@@ -335,12 +353,25 @@ fn a_platform_administrator_walks_every_page_of_theirs() {
     let all = attributes(&mut browser, "[data-vm-entry]", "data-vm-entry");
     assert_eq!(all.len(), 100, "a page of 100 entries");
     let newest_time = {
-        let top = browser.the("[data-vm-entry]");
-        browser.attribute(&top, "data-vm-time").unwrap()
+        let entries = browser.find_all("[data-vm-entry]");
+        browser.attribute(&entries[0], "data-vm-time").unwrap()
     };
     let typed: String = newest_time.chars().take(19).collect();
-    let since = browser.the(&format!("{form} input[name=\"since\"]"));
-    browser.type_into(&since, &typed);
+    // The time is set as the field's value by WebDriver's script, then
+    // the form sent by its button: keys sent into a `datetime-local` field
+    // land in its segments in the order of the browser's locale (send-keys
+    // gave `6112-02-02T11:08:32` in headless Firefox), which is the
+    // browser's matter, not the page's.
+    let since_field = format!("{form} input[name=\"since\"]");
+    let set = browser.script(
+        "const f = document.querySelector(arguments[0]); f.value = arguments[1]; return f.value;",
+        &[json!(since_field), json!(typed)],
+    );
+    assert_eq!(
+        set.as_str(),
+        Some(typed.as_str()),
+        "the harness's own check: the field holds the time set"
+    );
     let show = submit_button_of(&mut browser, form);
     click_to_another_page(&mut browser, &show);
     let narrowed = attributes(&mut browser, "[data-vm-entry]", "data-vm-entry");
@@ -361,8 +392,13 @@ fn a_platform_administrator_walks_every_page_of_theirs() {
         "the older entries, none of the first page's: {page_two:?}"
     );
     browser.navigate(&site.dashboard(&format!("{OPERATION_LOG}?application={APP}")));
-    let by_user = browser.the("a[data-vm-filter=\"user\"]");
-    click_to_another_page(&mut browser, &by_user);
+    let by_user = browser.find_all("a[data-vm-filter=\"user\"]");
+    assert!(
+        !by_user.is_empty(),
+        "an entry's user link\n{}",
+        browser.describe()
+    );
+    click_to_another_page(&mut browser, &by_user[0]);
     let query = query_of(&mut browser);
     assert!(
         query.contains(&("user".to_owned(), GRACE.to_owned()))

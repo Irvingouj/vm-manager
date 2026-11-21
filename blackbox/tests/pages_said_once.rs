@@ -7,7 +7,9 @@
 //! sign-in address says which installation it is; the local run's
 //! test-User page says which Application it is for; on the pages of
 //! Platform administrators ("The Dashboard for Platform administrators: How
-//! the pages look"), the person's id once, in the header, no entry,
+//! the pages look"), the person's id once as the person signed in, in the
+//! header (and as a fact of something else, who registered a Resource,
+//! where it is one), no entry,
 //! Contributor or Grant carrying `data-vm-user`, "in the last 30 days" once
 //! on every Application, the way in in the header only and the four
 //! sections in their `nav` only. (That every `<svg>`
@@ -299,6 +301,22 @@ fn the_pages_of_platform_administrators_say_each_thing_once() {
         "ledger",
         &add(&[group("staff"), user("carol")]),
     );
+    // A Resource registered by another Platform administrator, whose id
+    // is not part of the reader's.
+    let other = User::new("ops-admin").in_groups(&[blackbox::scenario::ADMINISTRATORS]);
+    let registered = vm
+        .api_as(&other)
+        .create_resource(&blackbox::scenario::resource_body(
+            "otherdb",
+            &s.db,
+            &s.db.reader,
+        ));
+    assert_eq!(
+        registered.status,
+        201,
+        "the harness's own check: {}",
+        registered.describe()
+    );
     // An entry of the Operation log: a pull of the Resource's structure.
     vm.api_as(&User::new("rita").in_groups(&[READERS]))
         .get(&format!("/v1/resources/{RESOURCE}/structure"))
@@ -323,7 +341,19 @@ fn the_pages_of_platform_administrators_say_each_thing_once() {
             "{context}: one `data-vm-user`\n{}",
             page.describe()
         );
-        assert_id_once_in_the_header(&page, &admin.id, &context);
+        // Said once as the person signed in, in the header; where the
+        // same id is a fact of something else (who registered a Resource)
+        // it is there as that fact.
+        let (_, header) = page.user();
+        assert!(
+            header.contains(&admin.id),
+            "{context}: the one `data-vm-user` holds the signed-in id {:?}, it says {header:?}",
+            admin.id
+        );
+        assert!(
+            !header.contains("ops-admin"),
+            "{context}: the header names only the person signed in"
+        );
         let root = page.root();
         for kind in ["data-vm-entry", "data-vm-contributor", "data-vm-grant"] {
             for e in root.with_attr(kind) {
@@ -367,6 +397,17 @@ fn the_pages_of_platform_administrators_say_each_thing_once() {
         assert!(
             outside.is_empty(),
             "{context}: a section's page is linked only from the sections' `nav` (and the way in): {outside:?}"
+        );
+    }
+    // On the Resources, who registered each is its fact: the reader's own
+    // id for the one they registered, the other administrator's for theirs.
+    let resources = dashboard.page(RESOURCES, 200, "the Resources");
+    for (name, by) in [(RESOURCE, admin.id.as_str()), ("otherdb", "ops-admin")] {
+        let found = resources.root().with_attr_value("data-vm-resource", name);
+        assert!(
+            matches!(found.as_slice(), [e] if e.text().contains(by) && e.with_attr("data-vm-user").is_empty()),
+            "the Resource {name}: who registered it ({by}) is there as that fact, with no `data-vm-user`\n{}",
+            resources.describe()
         );
     }
     let list = dashboard.page(APPLICATIONS, 200, "every Application");

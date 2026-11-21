@@ -60,19 +60,27 @@ fn with_board() -> Vm {
 
 /// Every kind of page of the Dashboard as this person gets it, with the
 /// status expected: the list, an Application's page, a refusal of a change
-/// of sharing, a `404`, a `405`, an Application of no name it has.
+/// of sharing, a `404`, a `405`, an Application of no name it has. To
+/// someone `board` is not shared with (carol), its page is the `403` page
+/// of an Application not shared with them: one more kind of page.
 fn every_kind_of_page(dashboard: &Dashboard<'_>) -> Vec<(String, u16, Response)> {
     let share = form_body(&[("action", "share"), ("kind", "user"), ("value", "carol")]);
+    let opens = dashboard.user.id != "carol";
+    let (own, own_what) = if opens {
+        (200, "an Application's page")
+    } else {
+        (403, "the page of an Application not shared with the person")
+    };
     vec![
         ("the list".into(), 200, dashboard.get("/")),
         (
-            "an Application's page".into(),
-            200,
+            own_what.into(),
+            own,
             dashboard.get(&format!("/applications/{APP}")),
         ),
         (
-            "an Application's page with a notice".into(),
-            200,
+            format!("{own_what}, with a notice"),
+            own,
             dashboard.get(&format!("/applications/{APP}?changed=shared")),
         ),
         (

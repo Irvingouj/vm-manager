@@ -359,8 +359,14 @@ fn walk_admin_pages(browser: &mut Firefox, scheme: Scheme, site: &Site, looks: &
     for outcome in ["allowed", "refused", "failed"] {
         expect_on_page(browser, &format!("[data-vm-outcome=\"{outcome}\"]"), LOG);
     }
-    let summary = browser.the("[data-vm-entry] details summary");
-    browser.click(&summary);
+    // One `<details>` opened without giving anything the focus: the
+    // keyboard walk must begin as on a page just loaded (a click on its
+    // summary would leave the browser's starting point of the next Tab
+    // there).
+    browser.script(
+        "document.querySelector('[data-vm-entry] details').open = true; return null;",
+        &[],
+    );
     expect_on_page(browser, "[data-vm-entry] details[open]", LOG);
     looks.push(look(browser, scheme, LOG));
 

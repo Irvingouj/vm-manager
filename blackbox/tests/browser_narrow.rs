@@ -20,7 +20,7 @@
 )]
 
 use blackbox::admin_pages::{
-    APPLICATIONS, INSTALLATION, OPERATION_LOG, RESOURCES, SITE_RESOURCE, disable_target,
+    APPLICATIONS, INSTALLATION, OPERATION_LOG, RESOURCES, SECTIONS, SITE_RESOURCE, disable_target,
     prepare_site,
 };
 use blackbox::dev::Dev;
@@ -258,6 +258,174 @@ fn the_pages_of_platform_administrators_are_no_wider_than_a_window_320_css_pixel
         "the refusal page of someone who is not a Platform administrator",
     );
     drop(prepared);
+}
+
+/// Ada, a Platform administrator, signed in at the Dashboard of a site of
+/// her own, in a browser held to [`NARROW`].
+fn admin_at_320() -> (Site, Firefox) {
+    let admin = Person::new(ADA)
+        .named("Ada Lovelace")
+        .email("ada@example.test")
+        .in_groups(&["finance", ADMINISTRATORS]);
+    let site = Site::start(&[admin, grace()]);
+    let mut browser = site.browser(&[]);
+    browser.narrow(NARROW);
+    sign_in_to_dashboard(&mut browser, &site, ADA);
+    (site, browser)
+}
+
+/// Each section's name as the contract gives it.
+const SECTION_NAMES: [(&str, &str); 4] = [
+    ("applications", "Applications"),
+    ("operation-log", "Operation log"),
+    ("resources", "Resources"),
+    ("installation", "Installation"),
+];
+
+#[test]
+fn at_320_css_pixels_the_four_sections_are_on_one_row_named_and_the_pages_own_shows_its_word() {
+    firefox::required();
+    let (site, mut browser) = admin_at_320();
+    for (section, path) in SECTIONS {
+        let at = format!("{path} at {NARROW} CSS pixels");
+        browser.navigate(&site.dashboard(path));
+        let measured = browser.script(
+            "const nav = document.querySelector('nav[data-vm-admin-sections]');
+if (!nav) { return null; }
+const r = nav.getBoundingClientRect();
+const links = Array.from(nav.querySelectorAll('a[data-vm-section]')).map((a) => {
+  const b = a.getBoundingClientRect();
+  // The rendered width of the text of the link (not of a mark): a word
+  // hidden off screen or clipped to a pixel has none to speak of.
+  let text = 0;
+  const walker = document.createTreeWalker(a, NodeFilter.SHOW_TEXT);
+  for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+    if (n.textContent.trim() === '') { continue; }
+    const range = document.createRange();
+    range.selectNodeContents(n);
+    const t = range.getBoundingClientRect();
+    let clip = n.parentElement;
+    let clipped = false;
+    for (let e = clip; e && e !== a.parentElement; e = e.parentElement) {
+      const s = getComputedStyle(e);
+      if (s.display === 'none' || s.visibility !== 'visible' || (s.clip && s.clip !== 'auto') || s.clipPath !== 'none') { clipped = true; }
+      const eb = e.getBoundingClientRect();
+      if ((s.overflow === 'hidden' || s.overflowX === 'hidden') && eb.width < 2) { clipped = true; }
+    }
+    if (!clipped) { text = Math.max(text, t.width); }
+  }
+  return { section: a.getAttribute('data-vm-section'), top: b.top, bottom: b.bottom, current: a.getAttribute('aria-current'), text };
+});
+return { height: r.height, links };",
+            &[],
+        );
+        assert!(
+            !measured.is_null(),
+            "{at}: expected `nav[data-vm-admin-sections]`\n{}",
+            browser.describe()
+        );
+        let height = measured["height"].as_f64().unwrap_or(f64::MAX);
+        assert!(
+            height <= 64.0,
+            "{at}: the sections' `nav` is {height} CSS pixels high, at most 64"
+        );
+        let links = measured["links"].as_array().cloned().unwrap_or_default();
+        assert_eq!(links.len(), 4, "{at}: four links: {links:?}");
+        let tops: Vec<f64> = links
+            .iter()
+            .map(|l| l["top"].as_f64().unwrap_or(0.0))
+            .collect();
+        let bottoms: Vec<f64> = links
+            .iter()
+            .map(|l| l["bottom"].as_f64().unwrap_or(0.0))
+            .collect();
+        let lowest_top = tops.iter().copied().fold(f64::MIN, f64::max);
+        let highest_bottom = bottoms.iter().copied().fold(f64::MAX, f64::min);
+        assert!(
+            lowest_top < highest_bottom,
+            "{at}: the four links on one row (each link's box shares a line with every other): {links:?}"
+        );
+        for link in &links {
+            let this = link["section"].as_str().unwrap_or("?");
+            if this == section {
+                assert_eq!(
+                    link["current"], "page",
+                    "{at}: the page's own link is `aria-current=\"page\"`"
+                );
+                assert!(
+                    link["text"].as_f64().unwrap_or(0.0) > 8.0,
+                    "{at}: the page's own link shows its word: {link}"
+                );
+            }
+        }
+        // Each link's name as a screen reader says it.
+        for (name_of, name) in SECTION_NAMES {
+            let found = browser.find_all(&format!(
+                "nav[data-vm-admin-sections] a[data-vm-section=\"{name_of}\"]"
+            ));
+            assert_eq!(found.len(), 1, "{at}: one link of the section {name_of}");
+            let label = browser.must(
+                "WebDriver:GetComputedLabel",
+                &serde_json::json!({ "id": found[0].0 }),
+            );
+            assert_eq!(
+                label["value"]
+                    .as_str()
+                    .or_else(|| label.as_str())
+                    .map(str::trim),
+                Some(name),
+                "{at}: the accessible name of the section {name_of}"
+            );
+        }
+    }
+}
+
+#[test]
+fn at_320_css_pixels_no_field_of_the_operation_logs_filters_is_wider_than_its_form_or_overlaps_another()
+ {
+    firefox::required();
+    let (site, mut browser) = admin_at_320();
+    browser.navigate(&site.dashboard(OPERATION_LOG));
+    let measured = browser.script(
+        "const form = document.querySelector('form[data-vm-form=\"operation-log\"]');
+if (!form) { return null; }
+const f = form.getBoundingClientRect();
+const boxes = Array.from(form.querySelectorAll('input:not([type=\"hidden\" i]), select, button, textarea')).map((el) => {
+  const b = el.getBoundingClientRect();
+  return { el: el.getAttribute('name') || el.localName, left: b.left, right: b.right, top: b.top, bottom: b.bottom };
+});
+return { form: { left: f.left, right: f.right }, boxes };",
+        &[],
+    );
+    assert!(
+        !measured.is_null(),
+        "expected the filter form\n{}",
+        browser.describe()
+    );
+    let n = |v: &serde_json::Value, k: &str| v[k].as_f64().unwrap_or(0.0);
+    let form = &measured["form"];
+    let boxes = measured["boxes"].as_array().cloned().unwrap_or_default();
+    assert!(boxes.len() >= 7, "the six fields and the button: {boxes:?}");
+    let mut failures = Vec::new();
+    for b in &boxes {
+        if n(b, "left") < n(form, "left") - 0.5 || n(b, "right") > n(form, "right") + 0.5 {
+            failures.push(format!("{} is wider than its form: {b} in {form}", b["el"]));
+        }
+    }
+    for (i, a) in boxes.iter().enumerate() {
+        for b in boxes.iter().skip(i + 1) {
+            let x = n(a, "right").min(n(b, "right")) - n(a, "left").max(n(b, "left"));
+            let y = n(a, "bottom").min(n(b, "bottom")) - n(a, "top").max(n(b, "top"));
+            if x > 0.5 && y > 0.5 {
+                failures.push(format!("{} overlaps {}: {a} and {b}", a["el"], b["el"]));
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "at {NARROW} CSS pixels, the Operation log's filter form:\n{}",
+        failures.join("\n")
+    );
 }
 
 #[test]

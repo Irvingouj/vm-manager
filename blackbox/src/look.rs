@@ -299,6 +299,12 @@ const chain = (el) => {
   return out;
 };
 const rendered = (el) => {
+  // Inside a closed <details>, only its own <summary> is shown.
+  for (let d = el.parentElement ? el.parentElement.closest('details:not([open])') : null; d;
+       d = d.parentElement ? d.parentElement.closest('details:not([open])') : null) {
+    const summary = d.querySelector(':scope > summary');
+    if (!summary || !summary.contains(el)) { return false; }
+  }
   const s = getComputedStyle(el);
   if (s.visibility !== 'visible') { return false; }
   const r = el.getBoundingClientRect();
@@ -431,7 +437,8 @@ const a = document.activeElement;
 if (!a || a === document.body || a === document.documentElement) { return null; }
 const s = getComputedStyle(a);
 const list = window.__harnessFocusables || [];
-return { index: list.indexOf(a), el: describe(a), focus_visible: a.matches(':focus-visible'),
+if (a.__harnessUid === undefined) { window.__harnessUids = (window.__harnessUids || 0) + 1; a.__harnessUid = window.__harnessUids; }
+return { uid: a.__harnessUid, index: list.indexOf(a), el: describe(a), focus_visible: a.matches(':focus-visible'),
   style: s.outlineStyle, width: parseFloat(s.outlineWidth), color: col(s.outlineColor),
   behind: chain(a.parentElement), canvas: canvasColour() };
 "#;
@@ -446,16 +453,28 @@ pub struct FocusWalk {
     /// radio}` (`radio`: the group of a radio button, which one Tab
     /// reaches as a whole).
     pub wanted: Vec<Value>,
-    /// Where each Tab brought the focus: `{index (in wanted, or -1), el,
-    /// focus_visible, style, width, color, behind, canvas}`.
+    /// Where each Tab brought the focus: `{uid (the element's own number
+    /// for this walk), index (in wanted, or -1), el, focus_visible, style,
+    /// width, color, behind, canvas}`.
     pub steps: Vec<Value>,
 }
 
 /// Presses Tab, as a person does, from the start of the page shown until
-/// the focus leaves the page or comes back to where it was, at most once
-/// more than there are links, buttons and fields (and 5 more); reads the
-/// outline of each thing it reaches. Call it on a page just loaded, before
-/// anything else has had the focus.
+/// the focus leaves the page or comes back to something it reached before;
+/// reads the outline of each thing it reaches. Call it on a page just
+/// loaded, before anything else has had the focus (a click leaves the
+/// browser's starting point of the next Tab where it clicked).
+///
+/// Two things take more than one press without being links, buttons or
+/// fields of their own, and both are counted in the presses allowed: each
+/// rendered `<summary>` is a stop, and a field of a date or a time
+/// (`date`, `time`, `datetime-local`, `month`, `week`) is one stop for each
+/// of its segments (at most 7: year, month, day, hours, minutes, seconds,
+/// and the hour's half), during which the focus stays on the field. So a
+/// press that leaves the focus on the field it was on is not a return; a
+/// return to anything reached before, not just now, ends the walk. The
+/// presses allowed are the stops counted so, and 5 more: a field that holds
+/// the focus for ever still leaves every later one never reached.
 pub fn walk_focus(firefox: &mut Firefox) -> FocusWalk {
     let page_focused = firefox.focus_page();
     let wanted = firefox.script(
@@ -468,18 +487,36 @@ return want.map((el) => ({{ el: describe(el), radio: (el.localName === 'input' &
         &[],
     );
     let wanted = wanted.as_array().cloned().unwrap_or_default();
+    let more = firefox.script(
+        &format!(
+            "{PRELUDE}
+const summaries = Array.from(document.querySelectorAll('details > summary')).filter(rendered).length;
+const timed = Array.from(document.querySelectorAll('input')).filter((el) => rendered(el) && !el.disabled
+  && ['date', 'time', 'datetime-local', 'month', 'week'].includes((el.getAttribute('type') || '').toLowerCase())).length;
+return summaries + timed * 6;"
+        ),
+        &[],
+    );
+    let more = more
+        .as_u64()
+        .and_then(|n| usize::try_from(n).ok())
+        .unwrap_or(0);
     let mut steps: Vec<Value> = Vec::new();
     let script = format!("{PRELUDE}{FOCUSED}");
-    for _ in 0..wanted.len() + 5 {
+    for _ in 0..wanted.len() + more + 5 {
         firefox.press_key(TAB);
         let at = firefox.script(&script, &[]);
         if at.is_null() {
             break;
         }
-        let again = steps
-            .iter()
-            .any(|s| s["el"] == at["el"] && s["index"] == at["index"]);
-        if again {
+        // The same element, not merely one described alike (every
+        // `<summary>` is described `summary`).
+        let same = |s: &Value| s["uid"] == at["uid"];
+        if steps.last().is_some_and(same) {
+            // The next segment of the same field.
+            continue;
+        }
+        if steps.iter().any(same) {
             break;
         }
         steps.push(at);

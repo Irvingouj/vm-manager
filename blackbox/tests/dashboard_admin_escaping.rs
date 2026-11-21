@@ -3,7 +3,8 @@
 //! What it answers", which "The Dashboard for Platform administrators"
 //! keeps on every page of its own, and its parts that name it: an entry's
 //! statement, user id and reason; a Resource's description, owner, contact
-//! and Groups; a filter's value): a description of `<script>alert(1)</script>`
+//! and Groups; a filter's value; markup in an alias of a statement, since
+//! a statement is recorded without its values): a description of `<script>alert(1)</script>`
 //! is shown as those characters, never as markup.
 #![allow(
     clippy::unwrap_used,
@@ -55,14 +56,16 @@ fn every_text_of_an_application_an_entry_and_a_resource_is_escaped_on_every_page
     create(vm, &h, HOSTILE_APP, Some(DESCRIPTION));
     deploy(vm, &h, HOSTILE_APP, &[]);
     share_ok(&vm.api_as(&h), vm, HOSTILE_APP, &add(&[group(GROUP)]));
-    // An entry by the hostile User whose statement holds markup.
+    // An entry by the hostile User whose statement holds markup in an
+    // alias (a statement is recorded without its values: the markup is in
+    // the statement's own text, not in a literal).
     t.run(
         &h,
         APP,
         &[outside(
             "query",
             Target::Shared(RESOURCE),
-            &format!("select '{STATEMENT_MARK}' as x"),
+            &format!("select 1 as \"{STATEMENT_MARK}\""),
         )],
     );
     // A Resource whose texts hold markup, granted to the hostile Group.
