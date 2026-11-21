@@ -69,7 +69,8 @@ export type Refusal =
       readonly contact: string;
     }
   | { readonly reason: "grants-unknown"; readonly resource: string }
-  | { readonly reason: "log-unavailable"; readonly resource?: string };
+  | { readonly reason: "log-unavailable"; readonly resource?: string }
+  | { readonly reason: "application-disabled" };
 
 /**
  * An operation the platform refused. Escaping `fetch`, it becomes the

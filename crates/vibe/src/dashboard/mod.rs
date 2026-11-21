@@ -231,6 +231,7 @@ impl Ingress {
                     contributors: Vec::new(),
                     declared: shown.map(|s| &s.declared),
                     seen: &seen,
+                    disabled: listed.disabled_since.as_deref(),
                 }
             })
             .collect();
@@ -307,6 +308,7 @@ impl Ingress {
                 .collect(),
             declared,
             seen: &seen,
+            disabled: record.disabled.as_ref().map(|d| d.since.as_str()),
         };
         let shared: Option<Vec<pages::Person<'_>>> = (contributor || administrator).then(|| {
             record

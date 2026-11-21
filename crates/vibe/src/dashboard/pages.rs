@@ -186,6 +186,9 @@ pub(crate) struct Block<'a> {
     /// What its serving Version declares.
     pub declared: Option<&'a Declared>,
     pub seen: &'a BTreeMap<&'a str, Seen>,
+    /// Since when a Platform administrator has disabled it (RFC 3339);
+    /// `None` when it is not disabled. Who did is not shown.
+    pub disabled: Option<&'a str>,
 }
 
 /// What a change led to.
@@ -324,14 +327,40 @@ pub(crate) fn list(
 
 /// The attributes every element of an Application carries, in the list
 /// and on its own page.
-fn application_attributes(block: &Block<'_>, name: &str) -> String {
+fn application_attributes(block: &Block<'_>, name: &str, since: bool) -> String {
     let serving = block
         .serving
         .map_or_else(|| "none".to_owned(), |number| number.to_string());
-    format!(
+    let mut attributes = format!(
         "data-vm-application=\"{name}\" data-vm-relation=\"{}\" data-vm-serving=\"{serving}\" data-vm-attention=\"{}\"",
         block.relation,
         attention(block).word()
+    );
+    if let Some(disabled) = block.disabled {
+        if since {
+            attributes.push_str(&format!(" data-vm-disabled=\"{}\"", escape(disabled)));
+        } else {
+            attributes.push_str(" data-vm-disabled");
+        }
+    }
+    attributes
+}
+
+/// An RFC 3339 time as a person reads it: `2026-11-21 16:25 UTC`; the
+/// time as it is when it is not of that form.
+fn when(rfc3339: &str) -> String {
+    match (rfc3339.get(..10), rfc3339.get(11..16)) {
+        (Some(day), Some(minute)) if rfc3339.ends_with('Z') => format!("{day} {minute} UTC"),
+        _ => rfc3339.to_owned(),
+    }
+}
+
+/// The mark of an Application a Platform administrator has disabled: a
+/// lock and the word.
+fn disabled_mark() -> String {
+    format!(
+        "<span class=\"pill err\" data-vm-disabled-mark>{}Disabled</span>",
+        Icon::Lock.svg()
     )
 }
 
@@ -362,9 +391,11 @@ fn card(out: &mut String, block: &Block<'_>) {
     out.push_str(&format!(
         "<article class=\"app card\" {}><div class=\"text\"><div class=\"app-head\">\
          <h3><a class=\"name\" data-vm-details href=\"/applications/{name}\">{name}</a></h3>",
-        application_attributes(block, &name)
+        application_attributes(block, &name, false)
     ));
-    if block.serving.is_none() {
+    if block.disabled.is_some() {
+        out.push_str(&disabled_mark());
+    } else if block.serving.is_none() {
         out.push_str(&not_deployed());
     } else if let Some(mark) = attention(block).mark() {
         out.push_str(&mark);
@@ -377,7 +408,7 @@ fn card(out: &mut String, block: &Block<'_>) {
         ));
     }
     out.push_str("</div>");
-    if let (Some(open), Some(_)) = (&block.open, block.serving) {
+    if let (Some(open), Some(_), None) = (&block.open, block.serving, block.disabled) {
         out.push_str(&open_link(open, &name, "btn"));
     }
     out.push_str("</article>");
@@ -463,7 +494,7 @@ fn whole(out: &mut String, block: &Block<'_>, people: &str) {
     let name = escape(block.name);
     out.push_str(&format!(
         "<article class=\"app whole\" {}><div class=\"app-head\"><h1>{name}</h1>",
-        application_attributes(block, &name)
+        application_attributes(block, &name, true)
     ));
     match block.serving {
         Some(number) => out.push_str(&format!(
@@ -478,8 +509,19 @@ fn whole(out: &mut String, block: &Block<'_>, people: &str) {
             escape(description)
         ));
     }
+    if let Some(since) = block.disabled {
+        out.push_str(&theme::notice(
+            Mark::Warn,
+            "data-vm-disabled-notice",
+            &format!(
+                "A Platform administrator disabled this Application on <time datetime=\"{}\">{}</time>. Only a Platform administrator enables it again: ask your company's IT.",
+                escape(since),
+                escape(&when(since))
+            ),
+        ));
+    }
     out.push_str("<div class=\"actions\">");
-    if let (Some(open), Some(_)) = (&block.open, block.serving) {
+    if let (Some(open), Some(_), None) = (&block.open, block.serving, block.disabled) {
         out.push_str(&open_link(open, &name, "btn"));
     }
     if block.relation == "none" {
