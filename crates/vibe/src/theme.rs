@@ -113,8 +113,8 @@ input[aria-invalid=true]{border-color:var(--danger);border-width:2px}
 .app-head h1{flex:0 1 auto}
 .app .desc{color:var(--ink-2)}
 .app .actions{margin-top:1rem;column-gap:1.5rem}
-.app .actions .quiet{padding-inline:0}
-.app .actions .quiet:hover{background:transparent}
+.btn.link{background:transparent;border-color:transparent;padding-inline:0;color:var(--accent);font-weight:400;text-decoration:underline}
+.btn.link:hover{background:transparent;border-color:transparent;color:var(--accent-strong)}
 .meta{padding-top:.75rem;border-top:1px solid var(--line)}
 .meta+.meta{border-top:0;padding-top:0}
 .meta>h2,.meta>h3,.meta>h4{margin-bottom:.375rem}
@@ -128,8 +128,9 @@ input[aria-invalid=true]{border-color:var(--danger);border-width:2px}
 .whole .inline-people li{font-size:1rem;line-height:1.5rem}
 .rows{list-style:none;padding:0;border-top:1px solid var(--line)}
 .rows>li{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:.5rem 1rem;padding:.75rem 0;border-bottom:1px solid var(--line)}
-.rows .who-is{min-width:0;flex:1 1 0}
-.rows form{flex:none}
+.rows .who-is{min-width:0;flex:1 1 auto;overflow-wrap:break-word}
+.rows .who-is .soft{font-size:.875rem;line-height:1.25rem}
+.rows form{flex:none;margin-left:auto}
 .rows .who-is>*{display:block}
 .rows .who-is .name{font-weight:600}
 .resources{list-style:none;padding:0;display:grid;gap:.5rem}
@@ -227,7 +228,8 @@ pub enum Place<'a> {
     /// right holds whom it is for (`who`, HTML).
     Dashboard { who: &'a str },
     /// The sign-in address, and the pages an Application's address answers
-    /// in the platform's name.
+    /// in the platform's name: the mark and the name alone (the person may
+    /// be signing out, or refused an Application, not signing in).
     SignIn,
     /// The local run (`vibe dev`).
     LocalRun,
@@ -254,9 +256,9 @@ pub fn page(title: &str, place: Place<'_>, layout: Layout, main: &str) -> String
             ),
             who,
         ),
-        Place::SignIn => (brand_text("Sign-in"), ""),
-        Place::LocalRun => (brand_text("Local run"), ""),
-        Place::Tool => (brand_text("The tool"), ""),
+        Place::SignIn => (brand_text(None), ""),
+        Place::LocalRun => (brand_text(Some("Local run")), ""),
+        Place::Tool => (brand_text(Some("The tool")), ""),
     };
     let (open, close) = match layout {
         Layout::Column => ("<main class=\"column\">", "</main>"),
@@ -274,10 +276,11 @@ pub fn page(title: &str, place: Place<'_>, layout: Layout, main: &str) -> String
 
 /// The header's mark and name with no link (a page of the sign-in address
 /// or of the local run promises its links, and this is none of them).
-fn brand_text(place: &str) -> String {
-    format!(
-        "<span class=\"brand\">{LOGO}<span>Vibe Manager</span><span class=\"place\">{place}</span></span>"
-    )
+fn brand_text(place: Option<&str>) -> String {
+    let place = place.map_or_else(String::new, |place| {
+        format!("<span class=\"place\">{place}</span>")
+    });
+    format!("<span class=\"brand\">{LOGO}<span>Vibe Manager</span>{place}</span>")
 }
 
 /// A notice: its mark and `words` (HTML), in a `<p>` with `attributes`

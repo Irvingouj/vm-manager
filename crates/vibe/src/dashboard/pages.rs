@@ -370,8 +370,10 @@ fn application_block(out: &mut String, block: &Block<'_>, level: u8) {
             out.push_str(open);
         }
         if block.details {
+            // Lesser than opening, when there is opening; else the card's one way on.
+            let class = if open.is_some() { "btn link" } else { "btn" };
             out.push_str(&format!(
-                "<a class=\"btn quiet\" data-vm-details href=\"/applications/{name}\">Details and sharing</a>"
+                "<a class=\"{class}\" data-vm-details href=\"/applications/{name}\">Details and sharing</a>"
             ));
         }
         out.push_str("</div>");
