@@ -2966,7 +2966,7 @@ export interface FileInfo {
   readonly lastModified: Date;      // whole seconds
 }
 export interface StoredFile extends FileInfo {
-  readonly body: Uint8Array;        // over an ArrayBuffer of its own: a Response's body as it is
+  readonly body: Uint8Array<ArrayBuffer>;   // over an ArrayBuffer of its own: a Response's body as it is
   text(): string;                   // body decoded as UTF-8 (malformed bytes become U+FFFD)
 }
 export interface ListOptions {
@@ -2983,18 +2983,18 @@ export interface FileList {
 export type FileBody = string | Uint8Array | ArrayBuffer;   // a string is written as UTF-8
 export interface PutOptions { readonly contentType?: string }
 
-export interface ReadOnlyStorage {
+export interface ReadOnlyStorage<Name extends string = string> {   // Name: the Resource's name, so that a compile error can say it
   head(key: string): Promise<FileInfo | null>;
   get(key: string): Promise<StoredFile | null>;
   list(options?: ListOptions): Promise<FileList>;
 }
-export interface Storage extends ReadOnlyStorage {
+export interface Storage<Name extends string = string> extends ReadOnlyStorage<Name> {
   put(key: string, body: FileBody, options?: PutOptions): Promise<FileInfo>;
   delete(key: string): Promise<void>;
 }
 ```
 
-- `ctx.user().storage(name)`: a Storage Resource the Manifest declares, as the User: a `Storage` when declared at `write`, a `ReadOnlyStorage` when declared at `read`. A handle holds no identity; every call is one host operation decided from the request in flight, as for databases.
+- `ctx.user().storage(name)`: a Storage Resource the Manifest declares, as the User: a `Storage<"<name>">` when declared at `write`, a `ReadOnlyStorage<"<name>">` when declared at `read` (each assignable to `Storage` and `ReadOnlyStorage` written without a name). A handle holds no identity; every call is one host operation decided from the request in flight, as for databases.
 - `ctx.user().db(name)` takes only names declared `postgres`, and `storage(name)` only names declared `storage`.
 - Each call is exactly one host operation (below), and so one Operation log entry. `files`, `folders` and `cursor` are the host's answer; `lastModified` is a `Date` of the host's time.
 - A refusal rejects with `Refused`, a failure with `OperationFailed` (`kind` the host's `error.kind`, `detail` its whole error), as for databases ("The SDK: Refusals and failures"). A `Refused` that escapes `fetch` is the `403` with `{ refusal, fix }`; an `OperationFailed` the fixed `500`.
