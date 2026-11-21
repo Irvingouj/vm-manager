@@ -287,10 +287,14 @@ async fn applications(args: &ApplicationsArgs) -> Result<Done, Ending> {
         .and_then(Value::as_array)
         .ok_or_else(|| unexpected(kept.at(), "its answer has no list of Applications"))?;
     let mut words = String::new();
-    if listed.is_empty() && args.after.is_none() {
-        say!(words, "The installation has no Application yet.");
-    } else if listed.is_empty() {
-        say!(words, "No Application comes after {}.", text(&page, "next"));
+    if listed.is_empty() {
+        // The name given, checked to be one an Application could have, so
+        // nothing in it needs escaping; with it, also when the installation
+        // has none at all.
+        match &args.after {
+            Some(after) => say!(words, "No Application comes after {after}."),
+            None => say!(words, "The installation has no Application yet."),
+        }
     }
     for application in listed {
         application_block(&mut words, application);

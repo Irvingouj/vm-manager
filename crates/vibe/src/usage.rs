@@ -83,16 +83,17 @@ impl Usage {
             keys,
             dropped,
         } = &mut *waiting;
-        let full = *keys >= MAX_WAITING;
-        let of_day = counts.entry((Arc::clone(application), day)).or_default();
-        if let Some(count) = of_day.get_mut(user) {
+        let key = (Arc::clone(application), day);
+        if let Some(count) = counts.get_mut(&key).and_then(|of_day| of_day.get_mut(user)) {
             *count = count.saturating_add(1);
-        } else if full {
+        } else if *keys >= MAX_WAITING {
+            // Nothing is put in for a request not counted: `keys` says what
+            // the map holds.
             *dropped = dropped.saturating_add(1);
         } else {
             // Copied once per (Application, day, User) every few seconds,
             // not at each request.
-            of_day.insert(user.to_owned(), 1);
+            counts.entry(key).or_default().insert(user.to_owned(), 1);
             *keys += 1;
         }
     }

@@ -69,6 +69,10 @@ pub struct GivenToCode;
 /// The name under the domain where the platform's API is.
 const API_NAME: &str = "api";
 
+/// The longest a disabled Application's page waits for the person's name
+/// (see [`Ingress::disabled_answer`] for the budget it fits in).
+const NAME_READ_WAIT: Duration = Duration::from_millis(300);
+
 /// The longest a client may take to send a request's body.
 pub(crate) const BODY_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -127,7 +131,7 @@ impl Ingress {
         id: &str,
         port: Option<u16>,
     ) -> Response<Full<Bytes>> {
-        let (name, sign_out) = self.who_is_signed_in(id, port).await;
+        let (name, sign_out) = self.who_is_signed_in(id, port, None).await;
         pages::not_shared(
             &self.domain,
             application,
@@ -141,15 +145,27 @@ impl Ingress {
     /// fails, the page shows the id alone) and the sign-in address's
     /// sign-out; the stand-in keeps no record of people and has no
     /// sign-out.
+    /// With `limit`, the read of the person's name is given that long at
+    /// most, and the page names them by id alone when it does not come.
     async fn who_is_signed_in(
         &self,
         id: &str,
         port: Option<u16>,
+        limit: Option<Duration>,
     ) -> (Option<String>, Option<String>) {
         if self.oidc.as_ref().is_some_and(|o| o.connected().is_some()) {
             // A page of the platform's own, not a request of the
-            // Application's: one read, bounded by the pool's own limits.
-            let name = self.registry.person_name(id).await.ok().flatten();
+            // Application's: one read, bounded by the pool's own limits and
+            // by `limit` when given.
+            let read = self.registry.person_name(id);
+            let name = match limit {
+                Some(limit) => tokio::time::timeout(limit, read)
+                    .await
+                    .ok()
+                    .and_then(Result::ok),
+                None => read.await.ok(),
+            }
+            .flatten();
             let sign_out = format!(
                 "{}/sign-out",
                 self.public
@@ -164,6 +180,12 @@ impl Ingress {
     /// What a disabled Application answers: its page to a page's request,
     /// else one sentence (blackbox/CONTRACT.md, "What Platform
     /// administrators see and stop: What a disabled Application answers").
+    ///
+    /// The read of the person's name is bounded by [`NAME_READ_WAIT`]: a
+    /// request stopped in flight is answered within 1 second of the
+    /// disable's `200`, and the runner may already have waited its 500 ms
+    /// for the engine (crate::runner's `STOPPED_WAIT`): 500 + 300 ms leaves
+    /// 200 ms for the rest.
     async fn disabled_answer(
         &self,
         parts: &hyper::http::request::Parts,
@@ -172,7 +194,7 @@ impl Ingress {
         port: Option<u16>,
     ) -> Response<Full<Bytes>> {
         if asks_for_a_page(parts) {
-            let (name, sign_out) = self.who_is_signed_in(id, port).await;
+            let (name, sign_out) = self.who_is_signed_in(id, port, Some(NAME_READ_WAIT)).await;
             pages::disabled(
                 &self.domain,
                 application,

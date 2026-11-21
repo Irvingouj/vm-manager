@@ -1102,9 +1102,10 @@ impl Registry {
 
     /// Puts into memory whether `name` is disabled, as a disable or an
     /// enable committed it at `generation`: over a lower generation; over a
-    /// forgotten Application it only raises `seen`. A disable put in fires
-    /// the Application's [`Stop`]. An Application memory does not hold is
-    /// held as not known.
+    /// forgotten Application it raises `seen`. Whatever memory holds, a
+    /// disable of a higher generation fires the Application's [`Stop`] (the
+    /// requests in flight hold it) and an enable takes a fired one away. An
+    /// Application memory does not hold is held as not known.
     fn install_disabled(&self, name: &str, disabled: bool, generation: i64) {
         let mut all = self.held.write().unwrap_or_else(PoisonError::into_inner);
         match all.get_mut(name) {
@@ -1115,6 +1116,8 @@ impl Registry {
                 };
                 let epoch = self.forgotten.fetch_add(1, Ordering::Relaxed);
                 all.insert(Arc::from(name), Held::Unknown { seen, epoch });
+                // Requests begun while it was known hold its stop.
+                self.settle_stop(name, disabled);
             }
             Some(Held::Known(kept)) => {
                 if kept.disabled_generation < generation {
@@ -1129,7 +1132,16 @@ impl Registry {
                 }
             }
             Some(Held::Unknown { seen, .. }) => {
-                seen.disabled = seen.disabled.max(generation);
+                // Not known now, but requests begun while it was known are
+                // in flight with its stop: a disable stops them at once. An
+                // enable takes a fired stop away, so that the requests after
+                // the read-back get a new one (as the read-back's own
+                // install does). An earlier generation, installed late,
+                // changes nothing.
+                if seen.disabled < generation {
+                    seen.disabled = generation;
+                    self.settle_stop(name, disabled);
+                }
             }
         }
     }
