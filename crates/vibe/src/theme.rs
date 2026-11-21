@@ -245,7 +245,7 @@ details[open]>summary{margin-bottom:.5rem}
 .filter-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(18rem,100%),1fr));gap:1rem 1.25rem}
 .filter-grid .field+.field{margin-top:0}
 .filter-grid .control{max-width:none}
-.filter-grid input[type=datetime-local]{padding-inline:.25rem;letter-spacing:-.03em}
+.filter-grid input[type=datetime-local]{padding-inline:.25rem}
 .field-error{display:flex;align-items:flex-start;gap:.375rem;margin-top:.5rem;font-size:.875rem;line-height:1.25rem;color:var(--danger)}
 .field-error .i{width:1rem;height:1rem;margin-top:.125rem}
 .filters .form-actions{display:flex;flex-wrap:wrap;align-items:center;gap:.5rem .75rem;margin-top:1.25rem}

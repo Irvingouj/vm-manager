@@ -334,11 +334,10 @@ fn as_rfc3339(text: &str) -> Option<String> {
 }
 
 /// Microseconds since 1970 as a `datetime-local` field holds them, in UTC:
-/// `YYYY-MM-DDTHH:MM:SS`, with milliseconds when there are any (a field
-/// holds no finer time).
+/// `YYYY-MM-DDTHH:MM:SS`, to the second, its fraction cut (not rounded):
+/// the field shows no finer time, and none fits it at 320 pixels.
 fn datetime_local(micros: i64) -> String {
     let seconds = micros.div_euclid(1_000_000);
-    let millis = micros.rem_euclid(1_000_000) / 1000;
     let days = seconds.div_euclid(86_400);
     let of_day = seconds.rem_euclid(86_400);
     // Howard Hinnant's civil_from_days.
@@ -352,17 +351,12 @@ fn datetime_local(micros: i64) -> String {
     let day = day_of_year - (153 * mp + 2) / 5 + 1;
     let month = if mp < 10 { mp + 3 } else { mp - 9 };
     let year = year_of_era + era * 400 + i64::from(month <= 2);
-    let time = format!(
+    format!(
         "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}",
         of_day / 3600,
         of_day / 60 % 60,
         of_day % 60
-    );
-    if millis == 0 {
-        time
-    } else {
-        format!("{time}.{millis:03}")
-    }
+    )
 }
 
 /// The field a refused filter is beside, and words saying what was wrong
@@ -448,9 +442,12 @@ mod tests {
     }
 
     #[test]
-    fn a_time_is_held_as_a_datetime_local_field_holds_it_in_utc() {
+    fn a_time_is_held_as_a_datetime_local_field_holds_it_in_utc_to_the_second() {
         let micros = rfc3339_micros("2026-11-21T10:00:05.123456+01:00").unwrap_or_default();
-        assert_eq!(datetime_local(micros), "2026-11-21T09:00:05.123");
+        assert_eq!(datetime_local(micros), "2026-11-21T09:00:05");
+        // The fraction is cut, not rounded.
+        let micros = rfc3339_micros("2026-11-21T09:00:05.999999Z").unwrap_or_default();
+        assert_eq!(datetime_local(micros), "2026-11-21T09:00:05");
         let micros = rfc3339_micros("2024-02-29T23:59:59Z").unwrap_or_default();
         assert_eq!(datetime_local(micros), "2024-02-29T23:59:59");
         let micros = rfc3339_micros("1970-01-01T00:00:00Z").unwrap_or_default();
