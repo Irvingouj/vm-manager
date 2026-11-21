@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Deploying · Vibe Manager docs</title>
+<meta name="description" content="Vibe Manager documentation: Deploying.">
+<link rel="icon" href="/vm-manager/assets/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/vm-manager/assets/style.css">
+<script src="/vm-manager/assets/search.js" defer></script>
+</head>
+<body class="docs" data-base="/vm-manager/">
+<a class="skip" href="#main">Skip to the content</a>
+<header class="topbar">
+  <a class="wordmark" href="/vm-manager/" title="Vibe Manager: the landing page"><span class="mark" aria-hidden="true"></span>Vibe&nbsp;Manager</a>
+  <a class="crumb" href="/vm-manager/docs/">Docs</a>
+  <div class="search" role="search">
+    <label class="visually-hidden" for="q">Search the documentation</label>
+    <input id="q" type="search" placeholder="Search the docs" autocomplete="off" spellcheck="false" aria-controls="results" aria-expanded="false">
+    <kbd aria-hidden="true">/</kbd>
+    <div id="results" class="results" hidden></div>
+  </div>
+  <nav class="toplinks" aria-label="Elsewhere">
+    <a href="https://github.com/Irvingouj/vm-manager/releases/tag/v0.1.3">v0.1.3</a>
+    <a href="https://github.com/Irvingouj/vm-manager">GitHub</a>
+  </nav>
+</header>
+<div class="docs-grid">
+  <aside class="sidebar">
+    <details class="nav-details" open>
+      <summary>Menu</summary>
+      <nav aria-label="Documentation">
+        <p class="nav-group">Start here</p><ul><li><a href="/vm-manager/docs/">Overview</a></li><li><a href="/vm-manager/docs/getting-started/">Getting started</a></li></ul>
+<p class="nav-group">For Builders</p><ul><li><a href="/vm-manager/docs/builders/local-run/">Making it and running it locally</a></li><li><a href="/vm-manager/docs/builders/deploying/" aria-current="page">Deploying</a></li><li><a href="/vm-manager/docs/builders/sharing/">Sharing</a></li><li><a href="/vm-manager/docs/builders/commands/">The tool&#39;s commands</a></li><li><a href="/vm-manager/docs/builders/sdk/">The SDK&#39;s types</a></li></ul>
+<p class="nav-group">For Platform administrators</p><ul><li><a href="/vm-manager/docs/admin/install/">Installing with Compose</a></li><li><a href="/vm-manager/docs/admin/oidc/">Connecting OIDC</a></li><li><a href="/vm-manager/docs/admin/tls/">TLS</a></li><li><a href="/vm-manager/docs/admin/postgres/">Your own Postgres</a></li><li><a href="/vm-manager/docs/admin/updating/">Upgrading and stopping</a></li></ul>
+<p class="nav-group">Reference</p><ul><li><a href="/vm-manager/docs/releases/">Release notes</a></li><li><a href="/vm-manager/docs/glossary/">Glossary</a></li></ul>
+        <p class="nav-group">Elsewhere</p>
+        <ul><li><a href="/vm-manager/">The website</a></li><li><a href="https://github.com/Irvingouj/vm-manager/releases/tag/v0.1.3">The latest release</a></li><li><a href="https://github.com/Irvingouj/vm-manager">The repository</a></li></ul>
+      </nav>
+    </details>
+<script>
+  // The menu is open on wide screens and closed on narrow ones, decided before it is painted.
+  (function () { var d = document.querySelector(".nav-details"); if (d && window.matchMedia("(max-width: 59.99rem)").matches) d.open = false; })();
+</script>
+  </aside>
+  <main id="main" class="doc">
+    <p class="kicker">For Builders</p>
+    <h1>Deploying</h1>
+    
+    <article class="prose">
+<p>This is step 8 of <a href="/vm-manager/docs/getting-started/">Getting started</a>. <code>vibe versions</code>, <code>vibe go-back</code> and <code>vibe logs</code> show the Versions, serve an earlier one again, and show what the Application printed: see <a href="/vm-manager/docs/builders/commands/#deploying">Deploying</a> on The tool&#39;s commands.</p>
+<h2 id="8-deploy-it"><a class="anchor" href="#8-deploy-it" aria-hidden="true" tabindex="-1">#</a>8. Deploy it</h2>
+<p>A deploy sends the project&#39;s last commit, so the project must be a Git repository with everything committed:</p>
+<div class="code"><span class="lang">sh</span><pre tabindex="0"><code class="language-sh">git init
+git add --all
+git commit -m &quot;The first version&quot;
+vibe deploy</code></pre></div>
+<p>The Application now answers at <code>https://hello.vibe.example.com/</code>. Open it in your browser: you are its Contributor, so you can open it.</p>
+
+    </article>
+    <p class="source">From the repository: <a href="https://github.com/Irvingouj/vm-manager/blob/main/docs/getting-started.md"><code>docs/getting-started.md</code></a></p>
+    <nav class="pager" aria-label="Previous and next"><a class="prev" href="/vm-manager/docs/builders/local-run/"><span>Previous</span>Making it and running it locally</a><a class="next" href="/vm-manager/docs/builders/sharing/"><span>Next</span>Sharing</a></nav>
+  </main>
+</div>
+<footer class="foot">
+  <p>Vibe Manager is open source under the MIT licence. <a href="/vm-manager/">Home</a> · <a href="/vm-manager/docs/">Docs</a> · <a href="https://github.com/Irvingouj/vm-manager">GitHub</a></p>
+</footer>
+</body>
+</html>

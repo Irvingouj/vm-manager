@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Connecting OIDC · Vibe Manager docs</title>
+<meta name="description" content="Vibe Manager documentation: Connecting OIDC.">
+<link rel="icon" href="/vm-manager/assets/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/vm-manager/assets/style.css">
+<script src="/vm-manager/assets/search.js" defer></script>
+</head>
+<body class="docs" data-base="/vm-manager/">
+<a class="skip" href="#main">Skip to the content</a>
+<header class="topbar">
+  <a class="wordmark" href="/vm-manager/" title="Vibe Manager: the landing page"><span class="mark" aria-hidden="true"></span>Vibe&nbsp;Manager</a>
+  <a class="crumb" href="/vm-manager/docs/">Docs</a>
+  <div class="search" role="search">
+    <label class="visually-hidden" for="q">Search the documentation</label>
+    <input id="q" type="search" placeholder="Search the docs" autocomplete="off" spellcheck="false" aria-controls="results" aria-expanded="false">
+    <kbd aria-hidden="true">/</kbd>
+    <div id="results" class="results" hidden></div>
+  </div>
+  <nav class="toplinks" aria-label="Elsewhere">
+    <a href="https://github.com/Irvingouj/vm-manager/releases/tag/v0.1.3">v0.1.3</a>
+    <a href="https://github.com/Irvingouj/vm-manager">GitHub</a>
+  </nav>
+</header>
+<div class="docs-grid">
+  <aside class="sidebar">
+    <details class="nav-details" open>
+      <summary>Menu</summary>
+      <nav aria-label="Documentation">
+        <p class="nav-group">Start here</p><ul><li><a href="/vm-manager/docs/">Overview</a></li><li><a href="/vm-manager/docs/getting-started/">Getting started</a></li></ul>
+<p class="nav-group">For Builders</p><ul><li><a href="/vm-manager/docs/builders/local-run/">Making it and running it locally</a></li><li><a href="/vm-manager/docs/builders/deploying/">Deploying</a></li><li><a href="/vm-manager/docs/builders/sharing/">Sharing</a></li><li><a href="/vm-manager/docs/builders/commands/">The tool&#39;s commands</a></li><li><a href="/vm-manager/docs/builders/sdk/">The SDK&#39;s types</a></li></ul>
+<p class="nav-group">For Platform administrators</p><ul><li><a href="/vm-manager/docs/admin/install/">Installing with Compose</a></li><li><a href="/vm-manager/docs/admin/oidc/" aria-current="page">Connecting OIDC</a></li><li><a href="/vm-manager/docs/admin/tls/">TLS</a></li><li><a href="/vm-manager/docs/admin/postgres/">Your own Postgres</a></li><li><a href="/vm-manager/docs/admin/updating/">Upgrading and stopping</a></li></ul>
+<p class="nav-group">Reference</p><ul><li><a href="/vm-manager/docs/releases/">Release notes</a></li><li><a href="/vm-manager/docs/glossary/">Glossary</a></li></ul>
+        <p class="nav-group">Elsewhere</p>
+        <ul><li><a href="/vm-manager/">The website</a></li><li><a href="https://github.com/Irvingouj/vm-manager/releases/tag/v0.1.3">The latest release</a></li><li><a href="https://github.com/Irvingouj/vm-manager">The repository</a></li></ul>
+      </nav>
+    </details>
+<script>
+  // The menu is open on wide screens and closed on narrow ones, decided before it is painted.
+  (function () { var d = document.querySelector(".nav-details"); if (d && window.matchMedia("(max-width: 59.99rem)").matches) d.open = false; })();
+</script>
+  </aside>
+  <main id="main" class="doc">
+    <p class="kicker">For Platform administrators</p>
+    <h1>Connecting OIDC</h1>
+    <nav class="toc" aria-label="On this page"><p class="toc-title">On this page</p><ul><li class="d2"><a href="#6-register-the-platform-at-the-identity-provider">6. Register the platform at the identity provider</a></li><li class="d2"><a href="#7-connect-oidc">7. Connect OIDC</a></li><li class="d2"><a href="#8-sign-in">8. Sign in</a></li><li class="d3"><a href="#when-a-sign-in-fails">When a sign-in fails</a></li><li class="d2"><a href="#your-companys-own-certificate-authority">Your company&#39;s own certificate authority</a></li></ul></nav>
+    <article class="prose">
+<h2 id="6-register-the-platform-at-the-identity-provider"><a class="anchor" href="#6-register-the-platform-at-the-identity-provider" aria-hidden="true" tabindex="-1">#</a>6. Register the platform at the identity provider</h2>
+<p>At your identity provider, register a client for the platform (an OpenID Connect client with a client secret, the authorization code flow):</p>
+<ul>
+<li>the redirect address: <code>https://auth.vibe.example.com/callback</code>; with <code>VIBE_HTTPS_PORT</code> other than 443, the port is in it: <code>https://auth.vibe.example.com:8443/callback</code>;</li>
+<li>the scopes: <code>openid profile email offline_access</code> (another list can be given to <code>vibe admin connect-oidc</code> with <code>--scopes</code>);</li>
+<li>a refresh token for the platform: the provider must allow <code>offline_access</code> for this client and for every person who signs in, or the sign-in fails. In Keycloak, for example, a person needs its role <code>offline_access</code>: people made in its console have it by default, people made by a realm import may not, and for them the sign-in ended on the platform&#39;s page with &quot;The company&#39;s sign-in refused the code it gave&quot; and the log record <code>identity-provider-refused</code> with the error <code>not_allowed</code>;</li>
+<li>the person&#39;s Groups in the ID token, in the claim <code>groups</code> (another claim can be given with <code>--groups-claim</code>);</li>
+<li>the ID token signed with <code>RS256</code> or <code>ES256</code>.</li>
+</ul>
+<p>Note the issuer, the client id and the client secret, and choose the Group whose members are Platform administrators.</p>
+<h2 id="7-connect-oidc"><a class="anchor" href="#7-connect-oidc" aria-hidden="true" tabindex="-1">#</a>7. Connect OIDC</h2>
+<p>With the tool, from any computer that reaches the installation over HTTPS:</p>
+<div class="code"><span class="lang">sh</span><pre tabindex="0"><code class="language-sh">read -rs VIBE_SETUP_CREDENTIAL &amp;&amp; export VIBE_SETUP_CREDENTIAL
+read -rs VIBE_OIDC_CLIENT_SECRET &amp;&amp; export VIBE_OIDC_CLIENT_SECRET
+vibe admin connect-oidc --domain vibe.example.com \
+    --issuer https://idp.example.com \
+    --client-id vibe \
+    --administrators-group vibe-administrators</code></pre></div>
+<p>The two <code>read</code> lines ask for the setup credential and the client secret without showing them or keeping them in the shell&#39;s history. With <code>VIBE_HTTPS_PORT</code> other than 443, add <code>--port &lt;the port&gt;</code>; while the domain is not in DNS yet, <code>--resolve &lt;the machine&#39;s address&gt;</code> connects there in its place.</p>
+<p>The platform asks the identity provider for its configuration before it takes the connection; when it cannot use it, the command says why and nothing is changed. When it is taken, <code>curl https://api.vibe.example.com/v1/installation</code> says <code>&quot;sign_in&quot;:&quot;oidc&quot;</code>.</p>
+<h2 id="8-sign-in"><a class="anchor" href="#8-sign-in" aria-hidden="true" tabindex="-1">#</a>8. Sign in</h2>
+<p>In a browser, open <code>https://dashboard.vibe.example.com/</code>: it sends you to the identity provider and back, signed in. The tool signs in through the browser:</p>
+<div class="code"><span class="lang">sh</span><pre tabindex="0"><code class="language-sh">vibe sign-in --domain vibe.example.com
+vibe whoami</code></pre></div>
+<p>An Application can be shared with someone by their email address once that person has signed in here once; before that the platform refuses (<code>unknown-email</code>, and the Dashboard says nobody who signed in here has that email address).</p>
+<h3 id="when-a-sign-in-fails"><a class="anchor" href="#when-a-sign-in-fails" aria-hidden="true" tabindex="-1">#</a>When a sign-in fails</h3>
+<p>The platform&#39;s page says in one sentence what failed, and the program&#39;s log has the record of it (<code>docker compose logs vibe</code>):</p>
+<ul>
+<li><code>{&quot;event&quot;:&quot;identity-provider-refused&quot;,&quot;status&quot;,...,&quot;error&quot;,...}</code>: the identity provider refused the platform&#39;s call to its token endpoint; <code>error</code> is the provider&#39;s own error code (never its description), for example <code>not_allowed</code> when it does not allow <code>offline_access</code> (step 6);</li>
+<li><code>{&quot;event&quot;:&quot;identity-provider-unanswered&quot;,&quot;call&quot;,...,&quot;problem&quot;,...}</code>: a call to the provider brought no answer the platform could use; <code>call</code> is <code>configuration</code>, <code>keys</code> or <code>token</code>, <code>problem</code> says what was wrong (<code>unreachable</code>, <code>timed-out</code>, <code>too-large</code>, <code>status</code>, <code>not-json</code>, <code>no-id-token</code>, <code>another-issuer</code>, <code>lacks-endpoint</code>, <code>unreadable-keys</code>), with the answer&#39;s <code>status</code> when it had one.</li>
+</ul>
+<p>The person&#39;s browser and the tool&#39;s computer must trust the installation&#39;s certificate: one from a public authority, or the company&#39;s own authority installed on them (for the tool, <code>VIBE_CA_FILE</code>: see <a href="#your-companys-own-certificate-authority">Your company&#39;s own certificate authority</a>).</p>
+<h2 id="your-companys-own-certificate-authority"><a class="anchor" href="#your-companys-own-certificate-authority" aria-hidden="true" tabindex="-1">#</a>Your company&#39;s own certificate authority</h2>
+<p>When your identity provider&#39;s certificate is issued by your company&#39;s own certificate authority, the platform has to trust it. Put the authority&#39;s certificate (PEM, one or more certificates, at most 1 MiB) in <code>ca/</code> and name it as the container sees it:</p>
+<div class="code"><span class="lang">sh</span><pre tabindex="0"><code class="language-sh">cp /path/to/company-ca.pem ca/company-ca.pem
+chmod 644 ca/company-ca.pem
+echo &quot;VIBE_CA_FILE=/etc/vibe/ca/company-ca.pem&quot; &gt;&gt; .env
+docker compose up -d</code></pre></div>
+<p>It is trusted beside the public authorities built into the program, read when the program starts. The tool takes the same variable: when the installation&#39;s own certificate is issued by such an authority, set <code>VIBE_CA_FILE=/path/to/company-ca.pem</code> in the tool&#39;s environment on each computer that uses it.</p>
+
+    </article>
+    <p class="source">From the repository: <a href="https://github.com/Irvingouj/vm-manager/blob/main/deploy/README.md"><code>deploy/README.md</code></a></p>
+    <nav class="pager" aria-label="Previous and next"><a class="prev" href="/vm-manager/docs/admin/install/"><span>Previous</span>Installing with Compose</a><a class="next" href="/vm-manager/docs/admin/tls/"><span>Next</span>TLS</a></nav>
+  </main>
+</div>
+<footer class="foot">
+  <p>Vibe Manager is open source under the MIT licence. <a href="/vm-manager/">Home</a> · <a href="/vm-manager/docs/">Docs</a> · <a href="https://github.com/Irvingouj/vm-manager">GitHub</a></p>
+</footer>
+</body>
+</html>

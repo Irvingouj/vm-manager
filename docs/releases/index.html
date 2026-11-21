@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Release notes · Vibe Manager docs</title>
+<meta name="description" content="Vibe Manager documentation: Release notes.">
+<link rel="icon" href="/vm-manager/assets/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/vm-manager/assets/style.css">
+<script src="/vm-manager/assets/search.js" defer></script>
+</head>
+<body class="docs" data-base="/vm-manager/">
+<a class="skip" href="#main">Skip to the content</a>
+<header class="topbar">
+  <a class="wordmark" href="/vm-manager/" title="Vibe Manager: the landing page"><span class="mark" aria-hidden="true"></span>Vibe&nbsp;Manager</a>
+  <a class="crumb" href="/vm-manager/docs/">Docs</a>
+  <div class="search" role="search">
+    <label class="visually-hidden" for="q">Search the documentation</label>
+    <input id="q" type="search" placeholder="Search the docs" autocomplete="off" spellcheck="false" aria-controls="results" aria-expanded="false">
+    <kbd aria-hidden="true">/</kbd>
+    <div id="results" class="results" hidden></div>
+  </div>
+  <nav class="toplinks" aria-label="Elsewhere">
+    <a href="https://github.com/Irvingouj/vm-manager/releases/tag/v0.1.3">v0.1.3</a>
+    <a href="https://github.com/Irvingouj/vm-manager">GitHub</a>
+  </nav>
+</header>
+<div class="docs-grid">
+  <aside class="sidebar">
+    <details class="nav-details" open>
+      <summary>Menu</summary>
+      <nav aria-label="Documentation">
+        <p class="nav-group">Start here</p><ul><li><a href="/vm-manager/docs/">Overview</a></li><li><a href="/vm-manager/docs/getting-started/">Getting started</a></li></ul>
+<p class="nav-group">For Builders</p><ul><li><a href="/vm-manager/docs/builders/local-run/">Making it and running it locally</a></li><li><a href="/vm-manager/docs/builders/deploying/">Deploying</a></li><li><a href="/vm-manager/docs/builders/sharing/">Sharing</a></li><li><a href="/vm-manager/docs/builders/commands/">The tool&#39;s commands</a></li><li><a href="/vm-manager/docs/builders/sdk/">The SDK&#39;s types</a></li></ul>
+<p class="nav-group">For Platform administrators</p><ul><li><a href="/vm-manager/docs/admin/install/">Installing with Compose</a></li><li><a href="/vm-manager/docs/admin/oidc/">Connecting OIDC</a></li><li><a href="/vm-manager/docs/admin/tls/">TLS</a></li><li><a href="/vm-manager/docs/admin/postgres/">Your own Postgres</a></li><li><a href="/vm-manager/docs/admin/updating/">Upgrading and stopping</a></li></ul>
+<p class="nav-group">Reference</p><ul><li><a href="/vm-manager/docs/releases/" aria-current="page">Release notes</a></li><li><a href="/vm-manager/docs/glossary/">Glossary</a></li></ul>
+        <p class="nav-group">Elsewhere</p>
+        <ul><li><a href="/vm-manager/">The website</a></li><li><a href="https://github.com/Irvingouj/vm-manager/releases/tag/v0.1.3">The latest release</a></li><li><a href="https://github.com/Irvingouj/vm-manager">The repository</a></li></ul>
+      </nav>
+    </details>
+<script>
+  // The menu is open on wide screens and closed on narrow ones, decided before it is painted.
+  (function () { var d = document.querySelector(".nav-details"); if (d && window.matchMedia("(max-width: 59.99rem)").matches) d.open = false; })();
+</script>
+  </aside>
+  <main id="main" class="doc">
+    <p class="kicker">Reference</p>
+    <h1>Release notes</h1>
+    <nav class="toc" aria-label="On this page"><p class="toc-title">On this page</p><ul><li class="d2"><a href="#what-is-new-since-012">What is new since 0.1.2</a></li><li class="d2"><a href="#what-works">What works</a></li><li class="d2"><a href="#what-is-missing">What is missing</a></li><li class="d2"><a href="#systems">Systems</a></li><li class="d2"><a href="#the-files">The files</a></li></ul></nav>
+    <article class="prose">
+<p>The fourth release of the platform, still a minimal one, to try it for real. It holds the platform&#39;s image, the Compose files that install it, and the tool <code>vibe</code> for Linux and macOS. <a href="https://github.com/Irvingouj/vm-manager/blob/v0.1.3/docs/getting-started.md">Getting started</a> takes you from nothing to an Application open in your browser.</p>
+<p><strong>This release is not for untrusted Applications or real company data.</strong> Use it with Applications you wrote yourself and with data you can lose. It stays so until the work on three things is done: the credentials of shared databases (kept encrypted, revoked, replaced), the limits on what one request of an Application may use, and the hardening of the runtime that runs Applications.</p>
+<h2 id="what-is-new-since-012"><a class="anchor" href="#what-is-new-since-012" aria-hidden="true" tabindex="-1">#</a>What is new since 0.1.2</h2>
+<ul>
+<li><strong>The pages say each thing once.</strong> The Dashboard&#39;s list no longer repeats the Contributors and every Resource on each Application; a refusal, the sign-out page and the pages for an address that does not exist no longer say under their title what the title said. Buttons are short (&quot;Open&quot;, &quot;Share&quot;) and keep the Application&#39;s name for a screen reader.</li>
+<li><strong>Marks before words.</strong> A state is a mark with a colour and a shape: a lock for an Application that is not shared with you, a check, a cross, a warning. A person, a Group and everyone each have their mark where an Application&#39;s sharing is listed. A Resource&#39;s standing is a mark in a table of what the Application needs and what you hold. Every mark has a name a screen reader says.</li>
+<li><strong>The list first, the rest one step away.</strong> An Application in the Dashboard&#39;s list shows its name, its description, &quot;Open&quot; and at most one mark when a part of it will not work for you (&quot;Missing access&quot;, &quot;Not set up&quot;, &quot;Access unknown&quot;). Its Contributors, its Resources and whom to ask, its Version and its address are on its own page, which its name leads to.</li>
+<li><strong>Smaller things.</strong> A page of the sign-in address says which installation it is. The page of test Users of <code>vibe dev</code> names its Application. Rows of people no longer run under their button in a narrow window. The pages of 0.1.2 had one design; these are the same design, held to four rules: say it once; icon, colour, shape and layout before words; show more only when asked; watch hierarchy and padding.</li>
+</ul>
+<h2 id="what-works"><a class="anchor" href="#what-works" aria-hidden="true" tabindex="-1">#</a>What works</h2>
+<ul>
+<li><strong>Installing.</strong> One image and one Compose file start the platform beside a bundled Postgres 18 and a reverse proxy that terminates TLS with your wildcard certificate. You can use your own reverse proxy or your own Postgres 18 instead, or have the program serve TLS itself. Upgrading keeps every database, the OIDC connection and the sessions.</li>
+<li><strong>Signing in.</strong> People sign in with your company&#39;s identity provider (OIDC). Their Groups come from it. Platform administrators are the members of one Group you name. The tool signs in through the browser.</li>
+<li><strong>Making an Application.</strong> <code>vibe new</code> makes a project from the template. <code>vibe check</code> says whether it will deploy, with each problem and its fix. <code>vibe generate</code> writes the next migration of the Application&#39;s own database, and stops before a migration that destroys data.</li>
+<li><strong>Shared databases.</strong> A Builder lists the Resources (<code>vibe resources</code>) and pulls one&#39;s structure into the project as a typed definition (<code>vibe pull</code>). An Application reads and writes a Resource only as its Grants allow, as the person who uses it.</li>
+<li><strong>Running it on your computer.</strong> <code>vibe dev</code> serves the Application to your browser as a test User you choose, with test rows, beside a private Postgres. <code>vibe request</code> sends it one request.</li>
+<li><strong>Deploying.</strong> <code>vibe deploy</code> builds the Application on your computer and sends it as a new Version, which goes live at <code>https://&lt;name&gt;.&lt;domain&gt;/</code>. <code>vibe versions</code>, <code>vibe go-back</code> and <code>vibe logs</code> show the Versions, serve an earlier one again, and show what the Application printed.</li>
+<li><strong>Sharing.</strong> Contributors may change and deploy an Application. It opens for them alone until one of them shares it with people, Groups or everyone (<code>vibe share</code>).</li>
+<li><strong>The Dashboard</strong> lists the Applications you contribute to and those shared with you, says what of each will not work for you, and lets a Contributor share one.</li>
+<li><strong>Records.</strong> Every operation of an Application on a shared database is in the Operation log, and every row it changes in its own database is in the Change history, with who did it and through which Application.</li>
+</ul>
+<h2 id="what-is-missing"><a class="anchor" href="#what-is-missing" aria-hidden="true" tabindex="-1">#</a>What is missing</h2>
+<p>These are not in this release. Each is planned.</p>
+<ul>
+<li>Shared databases&#39; credentials are kept in the platform database without encryption. Registering a Resource is done through the platform&#39;s API only: the tool has no command for it, nor for listing, changing or revoking Grants.</li>
+<li>There are no limits per request yet: one Application can use as much CPU time, memory and time as it likes, and so slow down the others.</li>
+<li>The runtime that runs Applications is not yet closed against every way an Application could stop the whole program.</li>
+<li>An Application cannot call services outside the platform (<code>fetch</code> to the internet).</li>
+<li>An Application cannot serve static files: its pages are strings in its code.</li>
+<li>An Application cannot be deleted.</li>
+<li>An Application&#39;s source is not kept on the platform: it stays in your own Git repository.</li>
+<li>Platform administrators cannot yet see every Application, disable one, or read the Operation log with the tool.</li>
+<li>There is no report of Applications built against an older structure of a shared database that has changed.</li>
+<li>Coding agents use the tool&#39;s commands; there is no MCP interface yet.</li>
+<li>The tool is not on npm, and there is no Windows build. The SDK is not on npm either.</li>
+<li>After signing in to an Application, its address in the browser&#39;s address bar keeps the sign-in&#39;s <code>state</code> and <code>code</code> (issue #72).</li>
+<li>Reviews found smaller things still to be done in the identity and capture of operations, in the Application&#39;s own database, in the SDK&#39;s values, and in long histories.</li>
+</ul>
+<h2 id="systems"><a class="anchor" href="#systems" aria-hidden="true" tabindex="-1">#</a>Systems</h2>
+<ul>
+<li><strong>The image</strong> is for <code>linux/amd64</code> only. There is no image for <code>linux/arm64</code>.</li>
+<li><strong>The tool</strong> is built for two targets:<ul>
+<li><code>x86_64-unknown-linux-gnu</code>: Linux on x86-64 with glibc 2.35 or later (Ubuntu 22.04, Debian 12 and later). It was built on Ubuntu 22.04.</li>
+<li><code>aarch64-apple-darwin</code>: macOS on Apple silicon. It is not signed by a developer and not notarised by Apple: downloaded with a browser, macOS holds it back until you remove its quarantine mark (<code>xattr -d com.apple.quarantine vibe</code>).</li>
+</ul>
+</li>
+<li><strong>What was tried.</strong> The release workflow ran no test of the program for this release: since 2026-11-21 it checks the versions, builds the image and the tool, tries the packed tool as below, and publishes; the whole set of tests (the gate) and the install tests come back to it when the product is in use. Before the tag, on a Linux machine of 12 cores: the release check; the format and lint checks of every crate; the program&#39;s own tests; and, each alone, the test files of the pages and of the release&#39;s files (the Dashboard&#39;s, the sharing&#39;s, the sign-in&#39;s and the local run&#39;s pages in a real Firefox, the walk that measures the pages in light and in dark, <code>release_*</code>). The whole gate last ran on the tree of 0.1.2, before the pages were changed for this release. The pages were looked at in Firefox at 320, 768 and 1280 CSS pixels wide, in light and in dark; not in another browser, not on a phone, not with text enlarged to 200 %, and not with a screen reader. The install tests were not run. On macOS, nothing was run but what the release workflow runs there: the tool was built, unpacked, said its version, made a project, sent it one request on the machine, and passed <code>vibe check</code> against an installation on the same machine. Running it locally, deploying and signing in were not tried on a Mac by a person.</li>
+<li><strong>The Postgres a local run downloads.</strong> <code>vibe dev</code> and <code>vibe request</code> download Postgres 18 once, for the Application&#39;s own database on your computer. It is a third party&#39;s build (zonky&#39;s embedded Postgres binaries, from Maven Central), not the PostgreSQL project&#39;s own. The tool checks it against the checksum (SHA-256) it carries before it unpacks it.</li>
+</ul>
+<h2 id="the-files"><a class="anchor" href="#the-files" aria-hidden="true" tabindex="-1">#</a>The files</h2>
+<ul>
+<li><code>compose.yaml</code>, <code>compose.own-proxy.yaml</code>, <code>compose.own-postgres.yaml</code>, <code>compose.own-tls.yaml</code>, <code>env.example</code>: the Compose files and the list of values (<code>.env.example</code> in the repository).</li>
+<li><code>vibe-0.1.3-x86_64-unknown-linux-gnu.tar.gz</code>, <code>vibe-0.1.3-aarch64-apple-darwin.tar.gz</code>: the tool, with the licences of what it is built from.</li>
+<li><code>SHA256SUMS</code>: the SHA-256 of each file. Check your downloads with <code>sha256sum --check --ignore-missing SHA256SUMS</code> (Linux) or <code>shasum -a 256 --check --ignore-missing SHA256SUMS</code> (macOS).</li>
+<li>The image: <code>ghcr.io/irvingouj/vibe:0.1.3</code>.</li>
+</ul>
+
+    </article>
+    <p class="source">From the repository: <a href="https://github.com/Irvingouj/vm-manager/blob/main/docs/releases/v0.1.3.md"><code>docs/releases/v0.1.3.md</code></a></p>
+    <nav class="pager" aria-label="Previous and next"><a class="prev" href="/vm-manager/docs/admin/updating/"><span>Previous</span>Upgrading and stopping</a><a class="next" href="/vm-manager/docs/glossary/"><span>Next</span>Glossary</a></nav>
+  </main>
+</div>
+<footer class="foot">
+  <p>Vibe Manager is open source under the MIT licence. <a href="/vm-manager/">Home</a> · <a href="/vm-manager/docs/">Docs</a> · <a href="https://github.com/Irvingouj/vm-manager">GitHub</a></p>
+</footer>
+</body>
+</html>

@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Installing with Compose · Vibe Manager docs</title>
+<meta name="description" content="Vibe Manager documentation: Installing with Compose.">
+<link rel="icon" href="/vm-manager/assets/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/vm-manager/assets/style.css">
+<script src="/vm-manager/assets/search.js" defer></script>
+</head>
+<body class="docs" data-base="/vm-manager/">
+<a class="skip" href="#main">Skip to the content</a>
+<header class="topbar">
+  <a class="wordmark" href="/vm-manager/" title="Vibe Manager: the landing page"><span class="mark" aria-hidden="true"></span>Vibe&nbsp;Manager</a>
+  <a class="crumb" href="/vm-manager/docs/">Docs</a>
+  <div class="search" role="search">
+    <label class="visually-hidden" for="q">Search the documentation</label>
+    <input id="q" type="search" placeholder="Search the docs" autocomplete="off" spellcheck="false" aria-controls="results" aria-expanded="false">
+    <kbd aria-hidden="true">/</kbd>
+    <div id="results" class="results" hidden></div>
+  </div>
+  <nav class="toplinks" aria-label="Elsewhere">
+    <a href="https://github.com/Irvingouj/vm-manager/releases/tag/v0.1.3">v0.1.3</a>
+    <a href="https://github.com/Irvingouj/vm-manager">GitHub</a>
+  </nav>
+</header>
+<div class="docs-grid">
+  <aside class="sidebar">
+    <details class="nav-details" open>
+      <summary>Menu</summary>
+      <nav aria-label="Documentation">
+        <p class="nav-group">Start here</p><ul><li><a href="/vm-manager/docs/">Overview</a></li><li><a href="/vm-manager/docs/getting-started/">Getting started</a></li></ul>
+<p class="nav-group">For Builders</p><ul><li><a href="/vm-manager/docs/builders/local-run/">Making it and running it locally</a></li><li><a href="/vm-manager/docs/builders/deploying/">Deploying</a></li><li><a href="/vm-manager/docs/builders/sharing/">Sharing</a></li><li><a href="/vm-manager/docs/builders/commands/">The tool&#39;s commands</a></li><li><a href="/vm-manager/docs/builders/sdk/">The SDK&#39;s types</a></li></ul>
+<p class="nav-group">For Platform administrators</p><ul><li><a href="/vm-manager/docs/admin/install/" aria-current="page">Installing with Compose</a></li><li><a href="/vm-manager/docs/admin/oidc/">Connecting OIDC</a></li><li><a href="/vm-manager/docs/admin/tls/">TLS</a></li><li><a href="/vm-manager/docs/admin/postgres/">Your own Postgres</a></li><li><a href="/vm-manager/docs/admin/updating/">Upgrading and stopping</a></li></ul>
+<p class="nav-group">Reference</p><ul><li><a href="/vm-manager/docs/releases/">Release notes</a></li><li><a href="/vm-manager/docs/glossary/">Glossary</a></li></ul>
+        <p class="nav-group">Elsewhere</p>
+        <ul><li><a href="/vm-manager/">The website</a></li><li><a href="https://github.com/Irvingouj/vm-manager/releases/tag/v0.1.3">The latest release</a></li><li><a href="https://github.com/Irvingouj/vm-manager">The repository</a></li></ul>
+      </nav>
+    </details>
+<script>
+  // The menu is open on wide screens and closed on narrow ones, decided before it is painted.
+  (function () { var d = document.querySelector(".nav-details"); if (d && window.matchMedia("(max-width: 59.99rem)").matches) d.open = false; })();
+</script>
+  </aside>
+  <main id="main" class="doc">
+    <p class="kicker">For Platform administrators</p>
+    <h1>Installing with Compose</h1>
+    <nav class="toc" aria-label="On this page"><p class="toc-title">On this page</p><ul><li class="d2"><a href="#1-the-files">1. The files</a></li><li class="d2"><a href="#2-the-values">2. The values</a></li><li class="d2"><a href="#3-the-certificate">3. The certificate</a></li><li class="d2"><a href="#4-start-it">4. Start it</a></li><li class="d2"><a href="#5-the-setup-credential">5. The setup credential</a></li><li class="d2"><a href="#if-the-first-start-was-interrupted">If the first start was interrupted</a></li><li class="d2"><a href="#the-bundled-postgres">The bundled Postgres</a></li></ul></nav>
+    <article class="prose">
+<p>This takes you from a Linux machine with Docker to a person signed in. The platform is one container image, <code>vibe</code>, started by <code>compose.yaml</code> beside a Postgres 18 and a reverse proxy that terminates TLS.</p>
+<p>You need:</p>
+<ul>
+<li>a machine with Docker Engine 25.0 or later and its Compose plugin 2.24.1 or later: <code>docker version --format &#39;{{.Server.Version}}&#39;</code> prints the Engine&#39;s version, <code>docker compose version</code> the plugin&#39;s. That minimum is read from Docker&#39;s notes and was not run; the install tests ran with Engine 28.0.4 and Compose 2.38.2, and with Engine 29.2.1 and Compose 5.0.2 (see <a href="/vm-manager/docs/admin/updating/#why-these-versions-of-docker">Why these versions of Docker</a>, at the end);</li>
+<li>a domain for the installation, here <code>vibe.example.com</code>, whose names all reach the machine: Applications are at <code>&lt;name&gt;.vibe.example.com</code>, the platform&#39;s API at <code>api.vibe.example.com</code>, sign-in at <code>auth.vibe.example.com</code>, the Dashboard at <code>dashboard.vibe.example.com</code> (a DNS record for <code>*.vibe.example.com</code>);</li>
+<li>a certificate for <code>*.vibe.example.com</code> and its private key, in PEM;</li>
+<li>an OIDC identity provider at which you can register a client;</li>
+<li>the tool <code>vibe</code> on the computer you connect OIDC from.</li>
+</ul>
+<p>Replace <code>vibe.example.com</code> with your domain in every command below.</p>
+<h2 id="1-the-files"><a class="anchor" href="#1-the-files" aria-hidden="true" tabindex="-1">#</a>1. The files</h2>
+<p>Make a folder for the installation and put the files of this folder in it: <code>compose.yaml</code>, <code>compose.own-proxy.yaml</code>, <code>compose.own-tls.yaml</code>, <code>compose.own-postgres.yaml</code> and <code>.env.example</code>, and the two folders <code>ca/</code> and <code>certs/</code>.</p>
+<div class="code"><span class="lang">sh</span><pre tabindex="0"><code class="language-sh">mkdir -p /opt/vibe/ca /opt/vibe/certs
+cd /opt/vibe</code></pre></div>
+<p>Every command below is run in this folder.</p>
+<h2 id="2-the-values"><a class="anchor" href="#2-the-values" aria-hidden="true" tabindex="-1">#</a>2. The values</h2>
+<p><code>compose.yaml</code> reads its values from <code>.env</code> beside it. <code>.env.example</code> lists every value and what it is for. Three are required: the domain, the installation&#39;s key and the bundled Postgres&#39;s password.</p>
+<div class="code"><span class="lang">sh</span><pre tabindex="0"><code class="language-sh">cp .env.example .env
+chmod 600 .env
+sed -i &quot;s|^VIBE_DOMAIN=.*|VIBE_DOMAIN=vibe.example.com|&quot; .env
+sed -i &quot;s|^VIBE_SECRET_KEY=.*|VIBE_SECRET_KEY=$(openssl rand -base64 32)|&quot; .env
+sed -i &quot;s|^POSTGRES_PASSWORD=.*|POSTGRES_PASSWORD=$(openssl rand -hex 24)|&quot; .env</code></pre></div>
+<ul>
+<li><code>VIBE_SECRET_KEY</code> is the installation&#39;s key (<code>openssl rand -base64 32</code>). It seals the OIDC connection and the sessions in the platform database. Keep <code>.env</code> as long as you keep the data: with another key, OIDC has to be connected again.</li>
+<li><code>POSTGRES_PASSWORD</code> is the password of the role <code>vibe</code> in the bundled Postgres (<code>openssl rand -hex 24</code>).</li>
+<li>Without <code>VIBE_DOMAIN</code> or <code>VIBE_SECRET_KEY</code>, <code>docker compose</code> refuses to start and names the value.</li>
+<li>Without <code>POSTGRES_PASSWORD</code>, or with it empty, the bundled Postgres does not start: <code>docker compose up -d</code> ends with an error (<code>dependency failed to start: container ... is unhealthy</code>), <code>vibe</code> is not started, <code>docker compose ps</code> shows <code>postgres</code> restarting, and <code>docker compose logs postgres</code> names <code>POSTGRES_PASSWORD</code>. If the value is removed later, from a Postgres already made, the Postgres starts but is never healthy and <code>vibe</code> is not started again: its health check says <code>POSTGRES_PASSWORD is empty in .env</code> (<code>docker inspect --format &#39;{{json .State.Health.Log}}&#39; $(docker compose ps --quiet postgres)</code>). Either way, set it in <code>.env</code> and run <code>docker compose up -d</code> again.</li>
+</ul>
+<p>As downloaded, the installation is published on <code>127.0.0.1</code> only: it is reached from this machine alone. To let other machines in, set:</p>
+<div class="code"><span class="lang">sh</span><pre tabindex="0"><code class="language-sh">echo &quot;VIBE_BIND=0.0.0.0&quot; &gt;&gt; .env</code></pre></div>
+<p>It listens on port 443. For another port, set <code>VIBE_HTTPS_PORT</code> (for example <code>echo &quot;VIBE_HTTPS_PORT=8443&quot; &gt;&gt; .env</code>); every address the platform writes then carries that port.</p>
+<h2 id="3-the-certificate"><a class="anchor" href="#3-the-certificate" aria-hidden="true" tabindex="-1">#</a>3. The certificate</h2>
+<p>Put your certificate for <code>*.vibe.example.com</code>, followed by its intermediate certificates, in <code>certs/fullchain.pem</code>, and its private key in <code>certs/privkey.pem</code>. The proxy runs as the user <code>65532</code>, not as root; make the key readable by that user and nobody else:</p>
+<div class="code"><span class="lang">sh</span><pre tabindex="0"><code class="language-sh">cp /path/to/fullchain.pem certs/fullchain.pem
+cp /path/to/privkey.pem certs/privkey.pem
+chmod 644 certs/fullchain.pem
+sudo chown 65532 certs/privkey.pem
+sudo chmod 600 certs/privkey.pem</code></pre></div>
+<p>The proxy speaks TLS 1.2 and 1.3 with this certificate and passes every request on to the platform with its <code>Host</code> unchanged. It sets no limit of its own on a request&#39;s size or time: the platform&#39;s own apply (a request body of at most 16 MiB).</p>
+<p>When the proxy cannot read the key, it does not start: <code>docker compose ps</code> shows it restarting, and <code>docker compose logs proxy</code> says <code>open /etc/caddy/certs/privkey.pem: permission denied</code>. Give the key to the user <code>65532</code> as above and run <code>docker compose restart proxy</code>.</p>
+<p>With no proxy at all, the program can serve this certificate itself: see <a href="/vm-manager/docs/admin/tls/#the-program-serves-tls-itself">The program serves TLS itself</a>.</p>
+<h2 id="4-start-it"><a class="anchor" href="#4-start-it" aria-hidden="true" tabindex="-1">#</a>4. Start it</h2>
+<div class="code"><span class="lang">sh</span><pre tabindex="0"><code class="language-sh">docker compose up -d</code></pre></div>
+<p>This starts three containers: <code>postgres</code> (the bundled Postgres 18, its data in the volume <code>postgres-data</code>, published nowhere), <code>vibe</code> (the program, published nowhere) and <code>proxy</code> (published on <code>VIBE_BIND:VIBE_HTTPS_PORT</code>). The first start of Postgres makes the role <code>vibe</code> and the platform database <code>vibe</code>; <code>vibe</code> starts once that first start has finished and Postgres takes connections (<code>docker compose ps</code> shows <code>postgres</code> as <code>healthy</code>).</p>
+<p>Only HTTPS is served, on the published port alone. Nothing listens for plain <code>http://</code> (port 80 is not published) and nothing redirects it to <code>https://</code>; a plain HTTP request sent to the published port is refused with <code>400</code>. If you want <code>http://</code> addresses to be redirected, do it in a proxy of your own (see &quot;Your own reverse proxy&quot;).</p>
+<p>Check that it answers:</p>
+<div class="code"><span class="lang">sh</span><pre tabindex="0"><code class="language-sh">docker compose ps
+curl https://api.vibe.example.com/v1/installation</code></pre></div>
+<p>The answer is <code>{&quot;domain&quot;:&quot;vibe.example.com&quot;,&quot;sign_in&quot;:&quot;none&quot;,&quot;sign_in_address&quot;:null}</code>: no sign-in is connected yet. The program&#39;s log is the <code>vibe</code> container&#39;s: <code>docker compose logs vibe</code>.</p>
+<h2 id="5-the-setup-credential"><a class="anchor" href="#5-the-setup-credential" aria-hidden="true" tabindex="-1">#</a>5. The setup credential</h2>
+<div class="code"><span class="lang">sh</span><pre tabindex="0"><code class="language-sh">docker compose exec vibe vibe setup</code></pre></div>
+<p>This prints the setup credential (<code>vmsc_...</code>) once, on your terminal and in no log. It is good for 24 hours and for one thing: connecting OIDC, once. Running it again ends the earlier one.</p>
+<h2 id="if-the-first-start-was-interrupted"><a class="anchor" href="#if-the-first-start-was-interrupted" aria-hidden="true" tabindex="-1">#</a>If the first start was interrupted</h2>
+<p>The first start of the bundled Postgres makes its data folder, then the role <code>vibe</code>, the platform database and the rest, and leaves a mark when it has finished. If the container was stopped or killed in between (the machine went down, <code>docker compose down</code> during the first <code>up</code>), Postgres starts again on what was made so far and skips the rest. It is then never healthy: <code>docker compose ps</code> shows <code>postgres</code> as <code>health: starting</code> for two minutes and as <code>unhealthy</code> after that, <code>vibe</code> is not started, and <code>docker compose up -d</code> ends with <code>dependency failed to start: container ... is unhealthy</code>. The health check says why:</p>
+<div class="code"><span class="lang">sh</span><pre tabindex="0"><code class="language-sh">docker compose ps
+docker inspect --format &#39;{{json .State.Health.Log}}&#39; $(docker compose ps --quiet postgres)</code></pre></div>
+<p>Its output says <code>the first start of this Postgres did not finish</code>. Meanwhile you can look inside as the superuser: <code>docker compose exec postgres psql -U postgres</code>.</p>
+<p>Nothing is in it yet, since <code>vibe</code> never started on it: remove it and start again.</p>
+<div class="code"><span class="lang">sh</span><pre tabindex="0"><code class="language-sh">docker compose down --volumes
+docker compose up -d</code></pre></div>
+<h2 id="the-bundled-postgres"><a class="anchor" href="#the-bundled-postgres" aria-hidden="true" tabindex="-1">#</a>The bundled Postgres</h2>
+<p>The platform connects as the role <code>vibe</code>, never as a superuser. The superuser <code>postgres</code> cannot connect over the network at all, whatever password is given; you reach it inside the container:</p>
+<div class="code"><span class="lang">sh</span><pre tabindex="0"><code class="language-sh">docker compose exec postgres psql -U postgres</code></pre></div>
+<p><code>CONNECT</code> on the databases <code>postgres</code> and <code>template1</code> is taken from <code>PUBLIC</code> at its first start.</p>
+
+    </article>
+    <p class="source">From the repository: <a href="https://github.com/Irvingouj/vm-manager/blob/main/deploy/README.md"><code>deploy/README.md</code></a></p>
+    <nav class="pager" aria-label="Previous and next"><a class="prev" href="/vm-manager/docs/builders/sdk/"><span>Previous</span>The SDK&#39;s types</a><a class="next" href="/vm-manager/docs/admin/oidc/"><span>Next</span>Connecting OIDC</a></nav>
+  </main>
+</div>
+<footer class="foot">
+  <p>Vibe Manager is open source under the MIT licence. <a href="/vm-manager/">Home</a> · <a href="/vm-manager/docs/">Docs</a> · <a href="https://github.com/Irvingouj/vm-manager">GitHub</a></p>
+</footer>
+</body>
+</html>

@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>TLS · Vibe Manager docs</title>
+<meta name="description" content="Vibe Manager documentation: TLS.">
+<link rel="icon" href="/vm-manager/assets/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/vm-manager/assets/style.css">
+<script src="/vm-manager/assets/search.js" defer></script>
+</head>
+<body class="docs" data-base="/vm-manager/">
+<a class="skip" href="#main">Skip to the content</a>
+<header class="topbar">
+  <a class="wordmark" href="/vm-manager/" title="Vibe Manager: the landing page"><span class="mark" aria-hidden="true"></span>Vibe&nbsp;Manager</a>
+  <a class="crumb" href="/vm-manager/docs/">Docs</a>
+  <div class="search" role="search">
+    <label class="visually-hidden" for="q">Search the documentation</label>
+    <input id="q" type="search" placeholder="Search the docs" autocomplete="off" spellcheck="false" aria-controls="results" aria-expanded="false">
+    <kbd aria-hidden="true">/</kbd>
+    <div id="results" class="results" hidden></div>
+  </div>
+  <nav class="toplinks" aria-label="Elsewhere">
+    <a href="https://github.com/Irvingouj/vm-manager/releases/tag/v0.1.3">v0.1.3</a>
+    <a href="https://github.com/Irvingouj/vm-manager">GitHub</a>
+  </nav>
+</header>
+<div class="docs-grid">
+  <aside class="sidebar">
+    <details class="nav-details" open>
+      <summary>Menu</summary>
+      <nav aria-label="Documentation">
+        <p class="nav-group">Start here</p><ul><li><a href="/vm-manager/docs/">Overview</a></li><li><a href="/vm-manager/docs/getting-started/">Getting started</a></li></ul>
+<p class="nav-group">For Builders</p><ul><li><a href="/vm-manager/docs/builders/local-run/">Making it and running it locally</a></li><li><a href="/vm-manager/docs/builders/deploying/">Deploying</a></li><li><a href="/vm-manager/docs/builders/sharing/">Sharing</a></li><li><a href="/vm-manager/docs/builders/commands/">The tool&#39;s commands</a></li><li><a href="/vm-manager/docs/builders/sdk/">The SDK&#39;s types</a></li></ul>
+<p class="nav-group">For Platform administrators</p><ul><li><a href="/vm-manager/docs/admin/install/">Installing with Compose</a></li><li><a href="/vm-manager/docs/admin/oidc/">Connecting OIDC</a></li><li><a href="/vm-manager/docs/admin/tls/" aria-current="page">TLS</a></li><li><a href="/vm-manager/docs/admin/postgres/">Your own Postgres</a></li><li><a href="/vm-manager/docs/admin/updating/">Upgrading and stopping</a></li></ul>
+<p class="nav-group">Reference</p><ul><li><a href="/vm-manager/docs/releases/">Release notes</a></li><li><a href="/vm-manager/docs/glossary/">Glossary</a></li></ul>
+        <p class="nav-group">Elsewhere</p>
+        <ul><li><a href="/vm-manager/">The website</a></li><li><a href="https://github.com/Irvingouj/vm-manager/releases/tag/v0.1.3">The latest release</a></li><li><a href="https://github.com/Irvingouj/vm-manager">The repository</a></li></ul>
+      </nav>
+    </details>
+<script>
+  // The menu is open on wide screens and closed on narrow ones, decided before it is painted.
+  (function () { var d = document.querySelector(".nav-details"); if (d && window.matchMedia("(max-width: 59.99rem)").matches) d.open = false; })();
+</script>
+  </aside>
+  <main id="main" class="doc">
+    <p class="kicker">For Platform administrators</p>
+    <h1>TLS</h1>
+    <nav class="toc" aria-label="On this page"><p class="toc-title">On this page</p><ul><li class="d2"><a href="#your-own-reverse-proxy">Your own reverse proxy</a></li><li class="d2"><a href="#the-program-serves-tls-itself">The program serves TLS itself</a></li></ul></nav>
+    <article class="prose">
+<p>The platform is served over HTTPS only, with a certificate for <code>*.vibe.example.com</code>. There are three ways to end TLS:</p>
+<ul>
+<li><strong>The Compose file&#39;s reverse proxy</strong>, as <code>compose.yaml</code> starts it: put the certificate in <code>certs/</code> (<a href="/vm-manager/docs/admin/install/#3-the-certificate">3. The certificate</a>) and start with <code>docker compose up -d</code>.</li>
+<li><strong>Your own reverse proxy</strong>, with <code>compose.own-proxy.yaml</code>: below.</li>
+<li><strong>The program itself</strong>, with <code>compose.own-tls.yaml</code>: below.</li>
+</ul>
+<h2 id="your-own-reverse-proxy"><a class="anchor" href="#your-own-reverse-proxy" aria-hidden="true" tabindex="-1">#</a>Your own reverse proxy</h2>
+<p>Instead of the proxy of <code>compose.yaml</code>:</p>
+<div class="code"><span class="lang">sh</span><pre tabindex="0"><code class="language-sh">docker compose -f compose.yaml -f compose.own-proxy.yaml up -d</code></pre></div>
+<p>There is no <code>proxy</code> container then, and the program&#39;s own port is published, plain HTTP, at <code>VIBE_HTTP_BIND:VIBE_HTTP_PORT</code> (<code>127.0.0.1:8080</code> without them), for your proxy only. Your proxy terminates TLS for <code>*.vibe.example.com</code> and must pass <code>Host</code> on unchanged. Set <code>VIBE_HTTPS_PORT</code> to the port your proxy is reached at when it is not 443: the addresses the platform writes come from it, never from a header of the request.</p>
+<h2 id="the-program-serves-tls-itself"><a class="anchor" href="#the-program-serves-tls-itself" aria-hidden="true" tabindex="-1">#</a>The program serves TLS itself</h2>
+<p>Instead of the proxy of <code>compose.yaml</code>, for an installation that wants no proxy before the program: <code>vibe</code> itself ends TLS with the certificate and key of <code>certs/</code> (step 3) and is published at <code>VIBE_BIND:VIBE_HTTPS_PORT</code> (<code>127.0.0.1:443</code> without them).</p>
+<div class="code"><span class="lang">sh</span><pre tabindex="0"><code class="language-sh">docker compose -f compose.yaml -f compose.own-tls.yaml up -d</code></pre></div>
+<p>There is no <code>proxy</code> container then. <code>vibe</code> reads <code>certs/fullchain.pem</code> (your certificate for <code>*.vibe.example.com</code> first, its intermediate certificates after it, at most ten certificates) and <code>certs/privkey.pem</code> (its key, not encrypted: <code>PRIVATE KEY</code>, <code>RSA PRIVATE KEY</code> or <code>EC PRIVATE KEY</code>; an RSA key of 2048 to 4096 bits, an ECDSA key on P-256 or P-384, or an Ed25519 key, the kinds the program takes), mounted read-only at <code>/etc/vibe/certs</code>. It runs as the image&#39;s user <code>65532</code>, not as root, so the key must be readable by that user:</p>
+<div class="code"><span class="lang">sh</span><pre tabindex="0"><code class="language-sh">sudo chown 65532 certs/privkey.pem
+sudo chmod 600 certs/privkey.pem</code></pre></div>
+<p>It serves HTTPS only on that port (TLS 1.2 and 1.3, HTTP/1.1); a plain HTTP request to it gets no answer and its connection is closed. Everything the platform writes is the same as behind the proxy: the addresses come from <code>VIBE_HTTPS_PORT</code>.</p>
+<p>The program checks the two files when it starts, and does not start when they cannot be used: a key it cannot read, a key that is not the certificate&#39;s, a certificate that does not name <code>*.vibe.example.com</code> among its DNS names, an encrypted key (a passphrase is not supported). <code>docker compose ps</code> shows <code>vibe</code> restarting, and <code>docker compose logs vibe</code> names the variable (<code>VIBE_TLS_CERT_FILE</code> or <code>VIBE_TLS_KEY_FILE</code>), the file and why; it never shows anything of the key. A certificate that has expired is served all the same (a browser says so), and the log says <code>&quot;valid_now&quot;:false</code>.</p>
+<p>Replacing the certificate needs no restart. Copy the new files over the old ones, the key last (<code>cp new-fullchain.pem certs/fullchain.pem</code>, then <code>cp new-privkey.pem certs/privkey.pem</code>), or put both in place by renaming (<code>mv</code>), each from a file in <code>certs/</code>. The program looks at the two files every 5 seconds and gives the new certificate to new connections within 10 seconds of the change; connections already open keep the old one. <code>docker compose logs vibe</code> then shows <code>tls-certificate-loaded</code> with the new certificate&#39;s names, dates and fingerprint. A new pair that does not pass (a certificate whose key is not there yet, a certificate for another domain) changes nothing: the certificate in use goes on being served, and the log says why once, in a <code>tls-certificate-refused</code> record.</p>
+<p>Beside the proxy it lacks HTTP/2: the program speaks HTTP/1.1 only. Nothing listens on port 80 either, as with the proxy.</p>
+<p><code>compose.own-tls.yaml</code> cannot be given together with <code>compose.own-proxy.yaml</code>: each replaces the proxy of <code>compose.yaml</code> with something else, and only one of them can. With <code>compose.own-postgres.yaml</code> it can: <code>docker compose -f compose.yaml -f compose.own-tls.yaml -f compose.own-postgres.yaml up -d</code>.</p>
+
+    </article>
+    <p class="source">From the repository: <a href="https://github.com/Irvingouj/vm-manager/blob/main/deploy/README.md"><code>deploy/README.md</code></a></p>
+    <nav class="pager" aria-label="Previous and next"><a class="prev" href="/vm-manager/docs/admin/oidc/"><span>Previous</span>Connecting OIDC</a><a class="next" href="/vm-manager/docs/admin/postgres/"><span>Next</span>Your own Postgres</a></nav>
+  </main>
+</div>
+<footer class="foot">
+  <p>Vibe Manager is open source under the MIT licence. <a href="/vm-manager/">Home</a> · <a href="/vm-manager/docs/">Docs</a> · <a href="https://github.com/Irvingouj/vm-manager">GitHub</a></p>
+</footer>
+</body>
+</html>

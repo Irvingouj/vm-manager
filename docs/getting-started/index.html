@@ -1,0 +1,191 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Getting started · Vibe Manager docs</title>
+<meta name="description" content="Vibe Manager documentation: Getting started.">
+<link rel="icon" href="/vm-manager/assets/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/vm-manager/assets/style.css">
+<script src="/vm-manager/assets/search.js" defer></script>
+</head>
+<body class="docs" data-base="/vm-manager/">
+<a class="skip" href="#main">Skip to the content</a>
+<header class="topbar">
+  <a class="wordmark" href="/vm-manager/" title="Vibe Manager: the landing page"><span class="mark" aria-hidden="true"></span>Vibe&nbsp;Manager</a>
+  <a class="crumb" href="/vm-manager/docs/">Docs</a>
+  <div class="search" role="search">
+    <label class="visually-hidden" for="q">Search the documentation</label>
+    <input id="q" type="search" placeholder="Search the docs" autocomplete="off" spellcheck="false" aria-controls="results" aria-expanded="false">
+    <kbd aria-hidden="true">/</kbd>
+    <div id="results" class="results" hidden></div>
+  </div>
+  <nav class="toplinks" aria-label="Elsewhere">
+    <a href="https://github.com/Irvingouj/vm-manager/releases/tag/v0.1.3">v0.1.3</a>
+    <a href="https://github.com/Irvingouj/vm-manager">GitHub</a>
+  </nav>
+</header>
+<div class="docs-grid">
+  <aside class="sidebar">
+    <details class="nav-details" open>
+      <summary>Menu</summary>
+      <nav aria-label="Documentation">
+        <p class="nav-group">Start here</p><ul><li><a href="/vm-manager/docs/">Overview</a></li><li><a href="/vm-manager/docs/getting-started/" aria-current="page">Getting started</a></li></ul>
+<p class="nav-group">For Builders</p><ul><li><a href="/vm-manager/docs/builders/local-run/">Making it and running it locally</a></li><li><a href="/vm-manager/docs/builders/deploying/">Deploying</a></li><li><a href="/vm-manager/docs/builders/sharing/">Sharing</a></li><li><a href="/vm-manager/docs/builders/commands/">The tool&#39;s commands</a></li><li><a href="/vm-manager/docs/builders/sdk/">The SDK&#39;s types</a></li></ul>
+<p class="nav-group">For Platform administrators</p><ul><li><a href="/vm-manager/docs/admin/install/">Installing with Compose</a></li><li><a href="/vm-manager/docs/admin/oidc/">Connecting OIDC</a></li><li><a href="/vm-manager/docs/admin/tls/">TLS</a></li><li><a href="/vm-manager/docs/admin/postgres/">Your own Postgres</a></li><li><a href="/vm-manager/docs/admin/updating/">Upgrading and stopping</a></li></ul>
+<p class="nav-group">Reference</p><ul><li><a href="/vm-manager/docs/releases/">Release notes</a></li><li><a href="/vm-manager/docs/glossary/">Glossary</a></li></ul>
+        <p class="nav-group">Elsewhere</p>
+        <ul><li><a href="/vm-manager/">The website</a></li><li><a href="https://github.com/Irvingouj/vm-manager/releases/tag/v0.1.3">The latest release</a></li><li><a href="https://github.com/Irvingouj/vm-manager">The repository</a></li></ul>
+      </nav>
+    </details>
+<script>
+  // The menu is open on wide screens and closed on narrow ones, decided before it is painted.
+  (function () { var d = document.querySelector(".nav-details"); if (d && window.matchMedia("(max-width: 59.99rem)").matches) d.open = false; })();
+</script>
+  </aside>
+  <main id="main" class="doc">
+    <p class="kicker">Start here</p>
+    <h1>Getting started</h1>
+    <nav class="toc" aria-label="On this page"><p class="toc-title">On this page</p><ul><li class="d2"><a href="#what-you-need">What you need</a></li><li class="d2"><a href="#1-install-the-platform">1. Install the platform</a></li><li class="d2"><a href="#2-register-the-platform-at-your-identity-provider">2. Register the platform at your identity provider</a></li><li class="d2"><a href="#3-install-the-tool">3. Install the tool</a></li><li class="d2"><a href="#4-connect-oidc">4. Connect OIDC</a></li><li class="d2"><a href="#5-sign-in">5. Sign in</a></li><li class="d2"><a href="#6-make-a-project">6. Make a project</a></li><li class="d2"><a href="#7-run-it-on-your-computer">7. Run it on your computer</a></li><li class="d2"><a href="#8-deploy-it">8. Deploy it</a></li><li class="d2"><a href="#9-share-it">9. Share it</a></li><li class="d2"><a href="#what-next">What next</a></li></ul></nav>
+    <article class="prose">
+<p>This page takes you from nothing to an Application open in your browser. It uses the files of the release <code>v0.1.3</code> only. Read the <a href="/vm-manager/docs/releases/">release&#39;s notes</a> first: this release is not for untrusted Applications or real company data.</p>
+<p>There are two people in this page. They can be the same person.</p>
+<ul>
+<li>The <strong>administrator</strong> installs the platform on a server and connects it to the company&#39;s sign-in (OIDC).</li>
+<li>The <strong>Builder</strong> installs the tool <code>vibe</code> on their own computer, makes an Application, tries it there, deploys it and shares it.</li>
+</ul>
+<p>Every command below uses the domain <code>vibe.example.com</code>. Put your own domain in its place.</p>
+<h2 id="what-you-need"><a class="anchor" href="#what-you-need" aria-hidden="true" tabindex="-1">#</a>What you need</h2>
+<p>For the installation:</p>
+<ul>
+<li>a Linux server with Docker Engine 25.0 or later and its Compose plugin 2.24.1 or later, on <code>x86-64</code> (the image is for <code>linux/amd64</code> only). That minimum is read from Docker&#39;s notes and was not tried; <a href="/vm-manager/docs/admin/install/"><code>deploy/README.md</code></a> names the versions the install tests ran with;</li>
+<li>a domain whose names all reach the server: a DNS record for <code>*.vibe.example.com</code>. Applications are at <code>&lt;name&gt;.vibe.example.com</code>;</li>
+<li>a certificate for <code>*.vibe.example.com</code> and its private key, in PEM;</li>
+<li>an OIDC identity provider at which you can register a client.</li>
+</ul>
+<p>For the Builder&#39;s computer:</p>
+<ul>
+<li>Linux on <code>x86-64</code> with glibc 2.35 or later (Ubuntu 22.04, Debian 12 and later), or macOS on Apple silicon;</li>
+<li>Node.js 22 or later, with <code>npm</code>;</li>
+<li><code>git</code>.</li>
+</ul>
+<h2 id="1-install-the-platform"><a class="anchor" href="#1-install-the-platform" aria-hidden="true" tabindex="-1">#</a>1. Install the platform</h2>
+<p>On the server, make a folder and download the release&#39;s files into it:</p>
+<div class="code"><span class="lang">sh</span><pre tabindex="0"><code class="language-sh">mkdir -p /opt/vibe/certs /opt/vibe/ca
+cd /opt/vibe
+curl -fLO https://github.com/Irvingouj/vm-manager/releases/download/v0.1.3/compose.yaml
+curl -fLO https://github.com/Irvingouj/vm-manager/releases/download/v0.1.3/env.example
+curl -fLO https://github.com/Irvingouj/vm-manager/releases/download/v0.1.3/SHA256SUMS
+sha256sum --check --ignore-missing SHA256SUMS</code></pre></div>
+<p>The last command checks the files you downloaded. Each line must end with <code>OK</code>.</p>
+<p>Make the file of values, <code>.env</code>, from <code>env.example</code>. Three values are required: the domain, the installation&#39;s key and the password of the bundled Postgres.</p>
+<div class="code"><span class="lang">sh</span><pre tabindex="0"><code class="language-sh">cp env.example .env
+chmod 600 .env
+sed -i &quot;s|^VIBE_DOMAIN=.*|VIBE_DOMAIN=vibe.example.com|&quot; .env
+sed -i &quot;s|^VIBE_SECRET_KEY=.*|VIBE_SECRET_KEY=$(openssl rand -base64 32)|&quot; .env
+sed -i &quot;s|^POSTGRES_PASSWORD=.*|POSTGRES_PASSWORD=$(openssl rand -hex 24)|&quot; .env</code></pre></div>
+<p>Without the domain or the key, <code>docker compose</code> refuses to start and names the value. Without the password, the bundled Postgres does not start and <code>docker compose logs postgres</code> names <code>POSTGRES_PASSWORD</code>: set it and run <code>docker compose up -d</code> again. Keep <code>.env</code> as long as you keep the data. As downloaded, the installation answers on <code>127.0.0.1</code> only. To let other machines in, add <code>VIBE_BIND=0.0.0.0</code>:</p>
+<div class="code"><span class="lang">sh</span><pre tabindex="0"><code class="language-sh">echo &quot;VIBE_BIND=0.0.0.0&quot; &gt;&gt; .env</code></pre></div>
+<p>Put the certificate in <code>certs/</code>. The proxy runs as the user <code>65532</code>, so give the key to that user:</p>
+<div class="code"><span class="lang">sh</span><pre tabindex="0"><code class="language-sh">cp /path/to/fullchain.pem certs/fullchain.pem
+cp /path/to/privkey.pem certs/privkey.pem
+chmod 644 certs/fullchain.pem
+sudo chown 65532 certs/privkey.pem
+sudo chmod 600 certs/privkey.pem</code></pre></div>
+<p>The bundled proxy ends TLS with this certificate. The program can instead serve TLS itself, with no proxy, from the same two files: see &quot;The program serves TLS itself&quot; in <a href="/vm-manager/docs/admin/install/"><code>deploy/README.md</code></a> (it needs the release&#39;s <code>compose.own-tls.yaml</code> too).</p>
+<p>Start it, and check that it answers:</p>
+<div class="code"><span class="lang">sh</span><pre tabindex="0"><code class="language-sh">docker compose up -d
+docker compose ps
+curl https://api.vibe.example.com/v1/installation</code></pre></div>
+<p>The answer says <code>&quot;sign_in&quot;:&quot;none&quot;</code>: no sign-in is connected yet.</p>
+<p>The install document, <a href="/vm-manager/docs/admin/install/"><code>deploy/README.md</code></a>, says more about each step: another port, your own reverse proxy, your own Postgres, your company&#39;s own certificate authority, upgrading, and what to do when something fails.</p>
+<h2 id="2-register-the-platform-at-your-identity-provider"><a class="anchor" href="#2-register-the-platform-at-your-identity-provider" aria-hidden="true" tabindex="-1">#</a>2. Register the platform at your identity provider</h2>
+<p>At your identity provider, register an OpenID Connect client for the platform, with a client secret and the authorization code flow:</p>
+<ul>
+<li>the redirect address is <code>https://auth.vibe.example.com/callback</code>;</li>
+<li>the scopes are <code>openid profile email offline_access</code>. The provider must allow <code>offline_access</code> for this client and for every person who signs in;</li>
+<li>the ID token holds the person&#39;s Groups in the claim <code>groups</code>;</li>
+<li>the ID token is signed with <code>RS256</code> or <code>ES256</code>.</li>
+</ul>
+<p>Note the issuer, the client id and the client secret. Choose the Group whose members are Platform administrators.</p>
+<p>Then, on the server, print the setup credential. It is shown once, and it is good for 24 hours:</p>
+<div class="code"><span class="lang">sh</span><pre tabindex="0"><code class="language-sh">docker compose exec vibe vibe setup</code></pre></div>
+<h2 id="3-install-the-tool"><a class="anchor" href="#3-install-the-tool" aria-hidden="true" tabindex="-1">#</a>3. Install the tool</h2>
+<p>On each computer that uses the tool: the administrator&#39;s for the next step, and each Builder&#39;s.</p>
+<p>On Linux (<code>x86-64</code>):</p>
+<div class="code"><span class="lang">sh</span><pre tabindex="0"><code class="language-sh">curl -fLO https://github.com/Irvingouj/vm-manager/releases/download/v0.1.3/vibe-0.1.3-x86_64-unknown-linux-gnu.tar.gz
+curl -fLO https://github.com/Irvingouj/vm-manager/releases/download/v0.1.3/SHA256SUMS
+sha256sum --check --ignore-missing SHA256SUMS
+tar -xzf vibe-0.1.3-x86_64-unknown-linux-gnu.tar.gz
+mkdir -p ~/.local/bin
+cp vibe-0.1.3-x86_64-unknown-linux-gnu/vibe ~/.local/bin/vibe</code></pre></div>
+<p>On macOS (Apple silicon):</p>
+<div class="code"><span class="lang">sh</span><pre tabindex="0"><code class="language-sh">curl -fLO https://github.com/Irvingouj/vm-manager/releases/download/v0.1.3/vibe-0.1.3-aarch64-apple-darwin.tar.gz
+curl -fLO https://github.com/Irvingouj/vm-manager/releases/download/v0.1.3/SHA256SUMS
+shasum -a 256 --check --ignore-missing SHA256SUMS
+tar -xzf vibe-0.1.3-aarch64-apple-darwin.tar.gz
+mkdir -p ~/.local/bin
+cp vibe-0.1.3-aarch64-apple-darwin/vibe ~/.local/bin/vibe</code></pre></div>
+<p>The macOS program is not signed by a developer and not notarised by Apple. Downloaded with <code>curl</code>, as above, it runs. If you downloaded the archive with a browser, macOS holds the program back. Remove its quarantine mark:</p>
+<div class="code"><span class="lang">sh</span><pre tabindex="0"><code class="language-sh">xattr -d com.apple.quarantine ~/.local/bin/vibe</code></pre></div>
+<p><code>~/.local/bin</code> must be on your <code>PATH</code>. If it is not, add this line to your shell&#39;s start file (<code>~/.bashrc</code> or <code>~/.zshrc</code>) and open a new terminal:</p>
+<div class="code"><span class="lang">sh</span><pre tabindex="0"><code class="language-sh">export PATH=&quot;$HOME/.local/bin:$PATH&quot;</code></pre></div>
+<p>Check it:</p>
+<div class="code"><span class="lang">sh</span><pre tabindex="0"><code class="language-sh">vibe --version</code></pre></div>
+<p>The first line says <code>vibe 0.1.3</code>. Each archive also holds <code>THIRD-PARTY-LICENSES</code>: the licences of what the program is built from.</p>
+<h2 id="4-connect-oidc"><a class="anchor" href="#4-connect-oidc" aria-hidden="true" tabindex="-1">#</a>4. Connect OIDC</h2>
+<p>The administrator connects the identity provider with the tool, from any computer that reaches the installation over HTTPS. The two <code>read</code> lines ask for the setup credential and the client secret without showing them:</p>
+<div class="code"><span class="lang">sh</span><pre tabindex="0"><code class="language-sh">read -rs VIBE_SETUP_CREDENTIAL &amp;&amp; export VIBE_SETUP_CREDENTIAL
+read -rs VIBE_OIDC_CLIENT_SECRET &amp;&amp; export VIBE_OIDC_CLIENT_SECRET
+vibe admin connect-oidc --domain vibe.example.com \
+    --issuer https://idp.example.com \
+    --client-id vibe \
+    --administrators-group vibe-administrators</code></pre></div>
+<p>Now <code>curl https://api.vibe.example.com/v1/installation</code> says <code>&quot;sign_in&quot;:&quot;oidc&quot;</code>.</p>
+<h2 id="5-sign-in"><a class="anchor" href="#5-sign-in" aria-hidden="true" tabindex="-1">#</a>5. Sign in</h2>
+<p>The Builder signs the tool in. It opens the browser at the company&#39;s sign-in, and comes back signed in:</p>
+<div class="code"><span class="lang">sh</span><pre tabindex="0"><code class="language-sh">vibe sign-in --domain vibe.example.com
+vibe whoami</code></pre></div>
+<p>On a computer without a browser, add <code>--no-browser</code>: the tool shows an address to open on another device.</p>
+<h2 id="6-make-a-project"><a class="anchor" href="#6-make-a-project" aria-hidden="true" tabindex="-1">#</a>6. Make a project</h2>
+<p>Make a project from the template, install its packages, and check it:</p>
+<div class="code"><span class="lang">sh</span><pre tabindex="0"><code class="language-sh">vibe new hello
+cd hello
+npm install
+vibe check</code></pre></div>
+<p><code>hello</code> is the Application&#39;s name. It becomes its address: <code>https://hello.vibe.example.com/</code>. The project&#39;s <code>AGENTS.md</code> tells you and your coding agent how to work in it.</p>
+<h2 id="7-run-it-on-your-computer"><a class="anchor" href="#7-run-it-on-your-computer" aria-hidden="true" tabindex="-1">#</a>7. Run it on your computer</h2>
+<div class="code"><span class="lang">sh</span><pre tabindex="0"><code class="language-sh">vibe dev</code></pre></div>
+<p>Open <code>http://hello.localhost:7480/</code> in your browser. You choose there which test User you are; the test Users are in <code>vibe.dev.json</code>. The project is built again each time you change it. Stop it with <code>Ctrl+C</code>.</p>
+<p>The first run downloads Postgres 18 once, for the Application&#39;s own database on your computer. You can also send one request without a browser:</p>
+<div class="code"><span class="lang">sh</span><pre tabindex="0"><code class="language-sh">vibe request --as outsider /</code></pre></div>
+<h2 id="8-deploy-it"><a class="anchor" href="#8-deploy-it" aria-hidden="true" tabindex="-1">#</a>8. Deploy it</h2>
+<p>A deploy sends the project&#39;s last commit, so the project must be a Git repository with everything committed:</p>
+<div class="code"><span class="lang">sh</span><pre tabindex="0"><code class="language-sh">git init
+git add --all
+git commit -m &quot;The first version&quot;
+vibe deploy</code></pre></div>
+<p>The Application now answers at <code>https://hello.vibe.example.com/</code>. Open it in your browser: you are its Contributor, so you can open it.</p>
+<h2 id="9-share-it"><a class="anchor" href="#9-share-it" aria-hidden="true" tabindex="-1">#</a>9. Share it</h2>
+<p>Let others open it. Share it with a person by their email address (they must have signed in to the installation once), with a Group, or with everyone who can sign in:</p>
+<div class="code"><span class="lang">sh</span><pre tabindex="0"><code class="language-sh">vibe share hello --email colleague@example.com
+vibe share hello --group engineering
+vibe share hello --everyone</code></pre></div>
+<h2 id="what-next"><a class="anchor" href="#what-next" aria-hidden="true" tabindex="-1">#</a>What next</h2>
+<ul>
+<li><code>vibe --help</code> lists every command, and <code>vibe &lt;command&gt; --help</code> says what each one does.</li>
+<li>The Dashboard is at <code>https://dashboard.vibe.example.com/</code>.</li>
+<li>What this release does not have yet is in the <a href="/vm-manager/docs/releases/">release&#39;s notes</a>.</li>
+</ul>
+
+    </article>
+    <p class="source">From the repository: <a href="https://github.com/Irvingouj/vm-manager/blob/main/docs/getting-started.md"><code>docs/getting-started.md</code></a></p>
+    <nav class="pager" aria-label="Previous and next"><a class="prev" href="/vm-manager/docs/"><span>Previous</span>Overview</a><a class="next" href="/vm-manager/docs/builders/local-run/"><span>Next</span>Making it and running it locally</a></nav>
+  </main>
+</div>
+<footer class="foot">
+  <p>Vibe Manager is open source under the MIT licence. <a href="/vm-manager/">Home</a> · <a href="/vm-manager/docs/">Docs</a> · <a href="https://github.com/Irvingouj/vm-manager">GitHub</a></p>
+</footer>
+</body>
+</html>

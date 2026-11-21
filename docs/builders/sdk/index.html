@@ -1,0 +1,414 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>The SDK&#39;s types · Vibe Manager docs</title>
+<meta name="description" content="Vibe Manager documentation: The SDK&#39;s types.">
+<link rel="icon" href="/vm-manager/assets/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/vm-manager/assets/style.css">
+<script src="/vm-manager/assets/search.js" defer></script>
+</head>
+<body class="docs" data-base="/vm-manager/">
+<a class="skip" href="#main">Skip to the content</a>
+<header class="topbar">
+  <a class="wordmark" href="/vm-manager/" title="Vibe Manager: the landing page"><span class="mark" aria-hidden="true"></span>Vibe&nbsp;Manager</a>
+  <a class="crumb" href="/vm-manager/docs/">Docs</a>
+  <div class="search" role="search">
+    <label class="visually-hidden" for="q">Search the documentation</label>
+    <input id="q" type="search" placeholder="Search the docs" autocomplete="off" spellcheck="false" aria-controls="results" aria-expanded="false">
+    <kbd aria-hidden="true">/</kbd>
+    <div id="results" class="results" hidden></div>
+  </div>
+  <nav class="toplinks" aria-label="Elsewhere">
+    <a href="https://github.com/Irvingouj/vm-manager/releases/tag/v0.1.3">v0.1.3</a>
+    <a href="https://github.com/Irvingouj/vm-manager">GitHub</a>
+  </nav>
+</header>
+<div class="docs-grid">
+  <aside class="sidebar">
+    <details class="nav-details" open>
+      <summary>Menu</summary>
+      <nav aria-label="Documentation">
+        <p class="nav-group">Start here</p><ul><li><a href="/vm-manager/docs/">Overview</a></li><li><a href="/vm-manager/docs/getting-started/">Getting started</a></li></ul>
+<p class="nav-group">For Builders</p><ul><li><a href="/vm-manager/docs/builders/local-run/">Making it and running it locally</a></li><li><a href="/vm-manager/docs/builders/deploying/">Deploying</a></li><li><a href="/vm-manager/docs/builders/sharing/">Sharing</a></li><li><a href="/vm-manager/docs/builders/commands/">The tool&#39;s commands</a></li><li><a href="/vm-manager/docs/builders/sdk/" aria-current="page">The SDK&#39;s types</a></li></ul>
+<p class="nav-group">For Platform administrators</p><ul><li><a href="/vm-manager/docs/admin/install/">Installing with Compose</a></li><li><a href="/vm-manager/docs/admin/oidc/">Connecting OIDC</a></li><li><a href="/vm-manager/docs/admin/tls/">TLS</a></li><li><a href="/vm-manager/docs/admin/postgres/">Your own Postgres</a></li><li><a href="/vm-manager/docs/admin/updating/">Upgrading and stopping</a></li></ul>
+<p class="nav-group">Reference</p><ul><li><a href="/vm-manager/docs/releases/">Release notes</a></li><li><a href="/vm-manager/docs/glossary/">Glossary</a></li></ul>
+        <p class="nav-group">Elsewhere</p>
+        <ul><li><a href="/vm-manager/">The website</a></li><li><a href="https://github.com/Irvingouj/vm-manager/releases/tag/v0.1.3">The latest release</a></li><li><a href="https://github.com/Irvingouj/vm-manager">The repository</a></li></ul>
+      </nav>
+    </details>
+<script>
+  // The menu is open on wide screens and closed on narrow ones, decided before it is painted.
+  (function () { var d = document.querySelector(".nav-details"); if (d && window.matchMedia("(max-width: 59.99rem)").matches) d.open = false; })();
+</script>
+  </aside>
+  <main id="main" class="doc">
+    <p class="kicker">For Builders</p>
+    <h1>The SDK&#39;s types</h1>
+    <nav class="toc" aria-label="On this page"><p class="toc-title">On this page</p><ul><li class="d2"><a href="#at-a-glance">At a glance</a></li><li class="d2"><a href="#manifest">Manifest</a></li><li class="d2"><a href="#refusals-and-failures">Refusals and failures</a></li><li class="d2"><a href="#databases">Databases</a></li><li class="d2"><a href="#change-history">Change history</a></li><li class="d2"><a href="#context">Context</a></li></ul></nav>
+    <article class="prose">
+<p>An Application is written with the SDK, <code>@vm/sdk</code>. These are its types, <code>sdk/index.d.ts</code>, as they are in the repository, cut into their parts. A project made by <code>vibe new</code> has them already; its <code>AGENTS.md</code> tells you and your coding agent how to work in it.</p>
+<p>The words are those of the <a href="/vm-manager/docs/glossary/">Glossary</a>: a Manifest, a Resource and its Access level, the Trusted context, the Change history.</p>
+<h2 id="at-a-glance"><a class="anchor" href="#at-a-glance" aria-hidden="true" tabindex="-1">#</a>At a glance</h2>
+<div class="code"><span class="lang">ts</span><pre tabindex="0"><code class="language-ts">// @vm/sdk: what an Application is written with (blackbox/CONTRACT.md, &quot;The SDK&quot;).
+//
+//   manifest.ts:   export default defineManifest({ name, description, resources })
+//   src/index.ts:  export default defineApp(manifest, { fetch(request, ctx) { ... } })
+//
+//   ctx.user().db(&quot;devops&quot;)   a shared database declared in manifest.ts, as the User
+//   ctx.user().ownDb()        the Application&#39;s own database, as the User
+//   ctx.app().ownDb()         the Application&#39;s own database, as the Application
+//
+// A handle is a Drizzle database typed with that database&#39;s structure: a
+// shared one from resources/&lt;name&gt;/ (linked by its generated index.ts), the
+// own one from src/db/schema.ts (tsconfig &quot;paths&quot;: &quot;@vm/own-structure&quot;).
+// The types guide; the platform decides. Every operation is decided by the
+// host from the request in flight, and the database role is the boundary.
+
+import type { PgTable, PgTransactionConfig } from &quot;drizzle-orm/pg-core&quot;;
+import type { PgRemoteDatabase } from &quot;drizzle-orm/pg-proxy&quot;;
+import type * as OwnStructureModule from &quot;@vm/own-structure&quot;;
+
+declare const contextBrand: unique symbol;</code></pre></div>
+<h2 id="manifest"><a class="anchor" href="#manifest" aria-hidden="true" tabindex="-1">#</a>Manifest</h2>
+<div class="code"><span class="lang">ts</span><pre tabindex="0"><code class="language-ts">/** An Access level a Manifest declares. (`structure` is for building only.) */
+export type DeclaredAccess = &quot;read&quot; | &quot;write&quot;;
+
+/** A shared database the Application uses. */
+export interface ResourceDeclaration {
+  readonly kind: &quot;postgres&quot;;
+  readonly access: DeclaredAccess;
+}
+
+export interface Manifest {
+  /** The Application&#39;s name: a lower-case DNS label, as the platform&#39;s API takes it. */
+  readonly name: string;
+  /** One sentence saying what the Application does, and for whom. */
+  readonly description: string;
+  /** Every shared database the Application uses, by its Resource name. */
+  readonly resources: { readonly [name: string]: ResourceDeclaration };
+}
+
+/** Write the argument as a plain literal: the platform reads manifest.ts without running it. */
+export declare function defineManifest&lt;const M extends Manifest&gt;(manifest: M): M;</code></pre></div>
+<h2 id="refusals-and-failures"><a class="anchor" href="#refusals-and-failures" aria-hidden="true" tabindex="-1">#</a>Refusals and failures</h2>
+<div class="code"><span class="lang">ts</span><pre tabindex="0"><code class="language-ts">/** How much of a Resource a Grant opens; each level includes the one before. */
+export type AccessLevel = &quot;structure&quot; | &quot;read&quot; | &quot;write&quot;;
+
+/** Which condition refused the operation, and what else the host said about it. */
+export type Refusal =
+  | { readonly reason: &quot;no-request&quot; }
+  | { readonly reason: &quot;unknown-operation&quot; }
+  | { readonly reason: &quot;not-own-database&quot;; readonly resource: string }
+  | { readonly reason: &quot;not-declared&quot;; readonly resource: string }
+  | { readonly reason: &quot;not-registered&quot;; readonly resource: string }
+  | {
+      readonly reason: &quot;declared-lower&quot;;
+      readonly resource: string;
+      readonly declared: AccessLevel;
+      readonly needed: AccessLevel;
+    }
+  | {
+      readonly reason: &quot;no-grant&quot;;
+      readonly resource: string;
+      readonly user: string;
+      readonly needed: AccessLevel;
+      readonly held: AccessLevel | null;
+      readonly contact: string;
+    }
+  | { readonly reason: &quot;grants-unknown&quot;; readonly resource: string }
+  | { readonly reason: &quot;log-unavailable&quot;; readonly resource?: string };
+
+/**
+ * An operation the platform refused. Escaping `fetch`, it becomes the
+ * response 403 with `{ refusal, fix }`. Only the platform makes one.
+ */
+export declare class Refused extends Error {
+  private constructor();
+  readonly name: &quot;Refused&quot;;
+  /** Which condition failed, as the host gave it. */
+  readonly refusal: Refusal;
+  /** One sentence saying what to do. */
+  readonly fix: string;
+}
+
+/** The host&#39;s error for an operation that failed without being refused. */
+export interface OperationError {
+  /** `database`, `statement`, `limit`, `unavailable`, `malformed`, ... */
+  readonly kind: string;
+  readonly [detail: string]: unknown;
+}
+
+/**
+ * An operation that failed without being refused: Postgres refused or
+ * failed the statement, the statement check refused it, a limit ended it,
+ * or the database could not be reached. Escaping `fetch`, it is the
+ * platform&#39;s fixed 500. Only the platform makes one.
+ */
+export declare class OperationFailed extends Error {
+  private constructor();
+  readonly name: &quot;OperationFailed&quot;;
+  /** The host&#39;s `error.kind`. */
+  readonly kind: string;
+  /** The SQLSTATE, when `kind` is `database`. */
+  readonly code: string | undefined;
+  /** The host&#39;s whole error object. */
+  readonly detail: OperationError;
+}</code></pre></div>
+<h2 id="databases"><a class="anchor" href="#databases" aria-hidden="true" tabindex="-1">#</a>Databases</h2>
+<div class="code"><span class="lang">ts</span><pre tabindex="0"><code class="language-ts">/** Filled in by each pulled Resource&#39;s generated resources/&lt;name&gt;/index.ts. */
+export interface SharedStructures {}
+
+/** The own database&#39;s structure: src/db/schema.ts. */
+export type OwnStructure = typeof OwnStructureModule;
+
+type Structure = Record&lt;string, unknown&gt;;
+
+/** What no handle offers: raw SQL. `transaction` is the SDK&#39;s own, below. */
+type NotOffered = &quot;execute&quot; | &quot;transaction&quot;;
+
+/** Drizzle&#39;s `tx` on a database of structure `S`. */
+type DrizzleTransaction&lt;S extends Structure&gt; = Parameters&lt;Parameters&lt;PgRemoteDatabase&lt;S&gt;[&quot;transaction&quot;]&gt;[0]&gt;[0];
+
+/**
+ * The second argument of `transaction`, Drizzle&#39;s: `isolationLevel`
+ * (`read committed`, `repeatable read`, `serializable`) and `accessMode`
+ * (`read write`, `read only`).
+ */
+export type TransactionConfig = Pick&lt;PgTransactionConfig, &quot;isolationLevel&quot; | &quot;accessMode&quot;&gt;;
+
+/**
+ * The `tx` a transaction&#39;s callback is given: the same database, inside the
+ * transaction. Transactions cannot be nested, so it has no `transaction`;
+ * `tx.rollback()` rolls back and makes `transaction` reject with Drizzle&#39;s
+ * `TransactionRollbackError`. Its isolation level and access mode are the
+ * second argument of `transaction`: Drizzle&#39;s `setTransaction` sends a `SET`
+ * statement, which the platform refuses, so it is not offered either.
+ */
+export type Transaction&lt;S extends Structure&gt; = Omit&lt;DrizzleTransaction&lt;S&gt;, NotOffered | &quot;setTransaction&quot;&gt;;
+
+/**
+ * A Drizzle database on a database the Application may change.
+ * `transaction(callback, config?)` commits when the callback returns (and
+ * resolves to what it returned), and rolls everything back when it throws
+ * (and rejects with that same error).
+ */
+export type Database&lt;S extends Structure&gt; = Omit&lt;PgRemoteDatabase&lt;S&gt;, NotOffered&gt; &amp; {
+  transaction&lt;T&gt;(callback: (tx: Transaction&lt;S&gt;) =&gt; Promise&lt;T&gt;, config?: TransactionConfig): Promise&lt;T&gt;;
+};
+
+type Reading = &quot;select&quot; | &quot;selectDistinct&quot; | &quot;selectDistinctOn&quot; | &quot;$count&quot; | &quot;query&quot; | &quot;$with&quot;;
+
+type DeclaredAtRead&lt;N extends string&gt; =
+  `&#39;${N}&#39; is declared at &#39;read&#39; in manifest.ts. Declare it at &#39;write&#39; to change rows.`;
+
+/** What a database declared at `read` offers besides its reads: no change of rows. */
+type OnlyReads&lt;N extends string, S extends Structure&gt; = {
+  with(
+    ...queries: Parameters&lt;PgRemoteDatabase&lt;S&gt;[&quot;with&quot;]&gt;
+  ): Pick&lt;ReturnType&lt;PgRemoteDatabase&lt;S&gt;[&quot;with&quot;]&gt;, &quot;select&quot; | &quot;selectDistinct&quot; | &quot;selectDistinctOn&quot;&gt;;
+  insert(this: DeclaredAtRead&lt;N&gt;, ...args: unknown[]): never;
+  update(this: DeclaredAtRead&lt;N&gt;, ...args: unknown[]): never;
+  delete(this: DeclaredAtRead&lt;N&gt;, ...args: unknown[]): never;
+};
+
+/** The `tx` of a transaction through a handle declared at `read`: reads only, always read-only. */
+export type ReadOnlyTransaction&lt;N extends string, S extends Structure&gt; = Pick&lt;
+  DrizzleTransaction&lt;S&gt;,
+  Reading | &quot;rollback&quot;
+&gt; &amp;
+  OnlyReads&lt;N, S&gt;;
+
+/**
+ * A Drizzle database that only reads: the Resource is declared at `read`.
+ * Its transactions are read-only whatever `accessMode` says.
+ */
+export type ReadOnlyDatabase&lt;N extends string, S extends Structure&gt; = Pick&lt;PgRemoteDatabase&lt;S&gt;, Reading&gt; &amp;
+  OnlyReads&lt;N, S&gt; &amp; {
+    transaction&lt;T&gt;(
+      callback: (tx: ReadOnlyTransaction&lt;N, S&gt;) =&gt; Promise&lt;T&gt;,
+      config?: TransactionConfig,
+    ): Promise&lt;T&gt;;
+  };
+
+/** What `db(name)` is when the Resource has no generated link. */
+type NotPulled&lt;N extends string&gt; =
+  `The structure of &#39;${N}&#39; has not been pulled. Add resources/${N}/schema.ts and its generated index.ts.`;
+
+type Declarations = Manifest[&quot;resources&quot;];
+
+type SharedDatabase&lt;R extends Declarations, N extends keyof R &amp; string&gt; = N extends keyof SharedStructures
+  ? SharedStructures[N] extends infer S extends Structure
+    ? R[N][&quot;access&quot;] extends &quot;write&quot;
+      ? Database&lt;S&gt;
+      : ReadOnlyDatabase&lt;N, S&gt;
+    : never
+  : NotPulled&lt;N&gt;;</code></pre></div>
+<h2 id="change-history"><a class="anchor" href="#change-history" aria-hidden="true" tabindex="-1">#</a>Change history</h2>
+<div class="code"><span class="lang">ts</span><pre tabindex="0"><code class="language-ts">/**
+ * What a change of structure that changed data was (blackbox/CONTRACT.md,
+ * &quot;Changes of structure that change data&quot;): one member per `change`. Names
+ * of columns are the database&#39;s; types as Postgres&#39;s `format_type` prints
+ * them, a type that is not Postgres&#39;s own with its schema.
+ */
+export type StructureChange =
+  /** A column&#39;s type was changed (with or without `USING`). */
+  | { change: &quot;column-type&quot;; column: string; from: string; to: string }
+  /** A column was dropped. */
+  | { change: &quot;column-dropped&quot;; column: string }
+  /** The table was dropped, and none is there under its name. */
+  | { change: &quot;table-dropped&quot; }
+  /** Another table is there under the name. */
+  | { change: &quot;table-replaced&quot; }
+  /** Postgres wrote the table&#39;s rows anew, and no `column-type` entry shows why. */
+  | { change: &quot;table-rewritten&quot; }
+  /** A value of the enum `type` was renamed; `columns` of this table have that type. */
+  | { change: &quot;enum-value-renamed&quot;; type: string; from: string; to: string; columns: string[] }
+  /** A partition (`schema.table`) was attached to the table. */
+  | { change: &quot;partition-attached&quot;; partition: string }
+  /** A partition (`schema.table`) was detached from the table. */
+  | { change: &quot;partition-detached&quot;; partition: string };
+
+/** What every change has, of a row or of the structure. */
+interface ChangeCommon {
+  /**
+   * The change&#39;s place in the history, as decimal digits; later changes
+   * have greater ids. Pass it as `before` to page back.
+   */
+  readonly id: string;
+  /** When the change was made. */
+  readonly at: Date;
+  /** The User in flight when the change was made; for a migration, the Contributor who sent the Version. */
+  readonly userId: string;
+  readonly application: string;
+  readonly actor: &quot;user&quot; | &quot;application&quot; | &quot;migration&quot;;
+  /** The request&#39;s id, as in the Operation log; null for a migration. */
+  readonly request: string | null;
+  /** The migration&#39;s name, for a migration; null otherwise. */
+  readonly migration: string | null;
+}
+
+/**
+ * One change of a row, as the Change history recorded it. `old` and `new`
+ * are rows of the table as `select()` gives them, read in the table&#39;s
+ * present shape: a column dropped since is not there, a column added or
+ * renamed since is null in rows from before that.
+ */
+export interface RowChange&lt;T extends PgTable&gt; extends ChangeCommon {
+  readonly kind: &quot;insert&quot; | &quot;update&quot; | &quot;delete&quot;;
+  /** The whole row before; null for an insert. */
+  readonly old: T[&quot;$inferSelect&quot;] | null;
+  /** The whole row after; null for a delete. */
+  readonly new: T[&quot;$inferSelect&quot;] | null;
+  /**
+   * For an update, the properties whose value differs, in the order the
+   * Drizzle table declares them; then any column it does not declare (one
+   * the table no longer has, say) by its database name. Null for an insert
+   * and a delete.
+   */
+  readonly changed: string[] | null;
+  readonly structure: null;
+}
+
+/** A change of the table&#39;s structure that changed data, made by a migration. */
+export interface StructureEntry extends ChangeCommon {
+  readonly kind: &quot;structure&quot;;
+  readonly old: null;
+  readonly new: null;
+  readonly changed: null;
+  /** What changed. */
+  readonly structure: StructureChange;
+}
+
+/** One change of the table&#39;s history, narrowed by `kind`. */
+export type Change&lt;T extends PgTable&gt; = RowChange&lt;T&gt; | StructureEntry;
+
+type ColumnsOf&lt;T extends PgTable&gt; = T[&quot;_&quot;][&quot;columns&quot;];
+
+/** The properties of the columns declared with `.primaryKey()`, with their values&#39; types. */
+type DeclaredKey&lt;T extends PgTable&gt; = {
+  [K in keyof ColumnsOf&lt;T&gt; as ColumnsOf&lt;T&gt;[K][&quot;_&quot;][&quot;isPrimaryKey&quot;] extends true
+    ? K
+    : never]: ColumnsOf&lt;T&gt;[K][&quot;_&quot;][&quot;data&quot;];
+};
+
+/**
+ * The key of one row: its primary key&#39;s properties. Checked here for a
+ * primary key declared on its column with `.primaryKey()`; for one declared
+ * on the table, at run time.
+ */
+export type HistoryKey&lt;T extends PgTable&gt; = keyof DeclaredKey&lt;T&gt; extends never
+  ? { readonly [property: string]: unknown }
+  : { readonly [K in keyof DeclaredKey&lt;T&gt;]: DeclaredKey&lt;T&gt;[K] };
+
+export interface HistoryOptions {
+  /** How many changes at most: an integer from 1 to 1000; 100 when left out. */
+  readonly limit?: number;
+  /** A change&#39;s `id`: only changes older than it are answered. */
+  readonly before?: string;
+}
+
+/** What the own database&#39;s handles have besides Drizzle&#39;s. */
+interface ReadsHistory {
+  /**
+   * The Change history of `table`, newest first: of the row whose primary
+   * key is `key`, or, without `key`, of every row. The history is kept
+   * under the key a row had before each change; a change of the table&#39;s
+   * structure is in every row&#39;s history. One host operation `history`, as
+   * this handle&#39;s actor.
+   */
+  history&lt;T extends PgTable&gt;(table: T, key?: HistoryKey&lt;T&gt;, options?: HistoryOptions): Promise&lt;Change&lt;T&gt;[]&gt;;
+}
+
+/** A handle of the own database: a Drizzle database, and its Change history. */
+export type OwnDatabase = Database&lt;OwnStructure&gt; &amp; ReadsHistory;</code></pre></div>
+<h2 id="context"><a class="anchor" href="#context" aria-hidden="true" tabindex="-1">#</a>Context</h2>
+<div class="code"><span class="lang">ts</span><pre tabindex="0"><code class="language-ts">/** Acting as the User of the request: the shared databases declared in manifest.ts, and the own database. */
+export interface ActingAsUser&lt;R extends Declarations&gt; {
+  readonly id: string;
+  readonly groups: readonly string[];
+  /** A shared database declared in manifest.ts, with this User&#39;s Access. */
+  db&lt;N extends keyof R &amp; string&gt;(name: N): SharedDatabase&lt;R, N&gt;;
+  /** The Application&#39;s own database, as this User. */
+  ownDb(): OwnDatabase;
+}
+
+/** Acting as the Application itself: its own database only. */
+export interface ActingAsApplication {
+  /** The Application&#39;s own database, as the Application. */
+  ownDb(): OwnDatabase;
+}
+
+/** Made by the platform for each request; Application code cannot make one. */
+export interface TrustedContext&lt;M extends Manifest&gt; {
+  readonly [contextBrand]: &quot;TrustedContext&quot;;
+  /** The User of the request in flight. */
+  user(): ActingAsUser&lt;M[&quot;resources&quot;]&gt;;
+  /** The Application acting as itself. */
+  app(): ActingAsApplication;
+}
+
+export interface Handlers&lt;M extends Manifest&gt; {
+  fetch(request: Request, ctx: TrustedContext&lt;M&gt;): Response | Promise&lt;Response&gt;;
+}
+
+/** The Application, as src/index.ts exports it by default. */
+export interface App&lt;M extends Manifest&gt; {
+  readonly manifest: M;
+  fetch(request: Request, ctx: TrustedContext&lt;M&gt;): Response | Promise&lt;Response&gt;;
+}
+
+export declare function defineApp&lt;const M extends Manifest&gt;(manifest: M, handlers: Handlers&lt;M&gt;): App&lt;M&gt;;</code></pre></div>
+
+    </article>
+    <p class="source">From the repository: <a href="https://github.com/Irvingouj/vm-manager/blob/main/sdk/index.d.ts"><code>sdk/index.d.ts</code></a></p>
+    <nav class="pager" aria-label="Previous and next"><a class="prev" href="/vm-manager/docs/builders/commands/"><span>Previous</span>The tool&#39;s commands</a><a class="next" href="/vm-manager/docs/admin/install/"><span>Next</span>Installing with Compose</a></nav>
+  </main>
+</div>
+<footer class="foot">
+  <p>Vibe Manager is open source under the MIT licence. <a href="/vm-manager/">Home</a> · <a href="/vm-manager/docs/">Docs</a> · <a href="https://github.com/Irvingouj/vm-manager">GitHub</a></p>
+</footer>
+</body>
+</html>

@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Glossary · Vibe Manager docs</title>
+<meta name="description" content="Vibe Manager documentation: Glossary.">
+<link rel="icon" href="/vm-manager/assets/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/vm-manager/assets/style.css">
+<script src="/vm-manager/assets/search.js" defer></script>
+</head>
+<body class="docs" data-base="/vm-manager/">
+<a class="skip" href="#main">Skip to the content</a>
+<header class="topbar">
+  <a class="wordmark" href="/vm-manager/" title="Vibe Manager: the landing page"><span class="mark" aria-hidden="true"></span>Vibe&nbsp;Manager</a>
+  <a class="crumb" href="/vm-manager/docs/">Docs</a>
+  <div class="search" role="search">
+    <label class="visually-hidden" for="q">Search the documentation</label>
+    <input id="q" type="search" placeholder="Search the docs" autocomplete="off" spellcheck="false" aria-controls="results" aria-expanded="false">
+    <kbd aria-hidden="true">/</kbd>
+    <div id="results" class="results" hidden></div>
+  </div>
+  <nav class="toplinks" aria-label="Elsewhere">
+    <a href="https://github.com/Irvingouj/vm-manager/releases/tag/v0.1.3">v0.1.3</a>
+    <a href="https://github.com/Irvingouj/vm-manager">GitHub</a>
+  </nav>
+</header>
+<div class="docs-grid">
+  <aside class="sidebar">
+    <details class="nav-details" open>
+      <summary>Menu</summary>
+      <nav aria-label="Documentation">
+        <p class="nav-group">Start here</p><ul><li><a href="/vm-manager/docs/">Overview</a></li><li><a href="/vm-manager/docs/getting-started/">Getting started</a></li></ul>
+<p class="nav-group">For Builders</p><ul><li><a href="/vm-manager/docs/builders/local-run/">Making it and running it locally</a></li><li><a href="/vm-manager/docs/builders/deploying/">Deploying</a></li><li><a href="/vm-manager/docs/builders/sharing/">Sharing</a></li><li><a href="/vm-manager/docs/builders/commands/">The tool&#39;s commands</a></li><li><a href="/vm-manager/docs/builders/sdk/">The SDK&#39;s types</a></li></ul>
+<p class="nav-group">For Platform administrators</p><ul><li><a href="/vm-manager/docs/admin/install/">Installing with Compose</a></li><li><a href="/vm-manager/docs/admin/oidc/">Connecting OIDC</a></li><li><a href="/vm-manager/docs/admin/tls/">TLS</a></li><li><a href="/vm-manager/docs/admin/postgres/">Your own Postgres</a></li><li><a href="/vm-manager/docs/admin/updating/">Upgrading and stopping</a></li></ul>
+<p class="nav-group">Reference</p><ul><li><a href="/vm-manager/docs/releases/">Release notes</a></li><li><a href="/vm-manager/docs/glossary/" aria-current="page">Glossary</a></li></ul>
+        <p class="nav-group">Elsewhere</p>
+        <ul><li><a href="/vm-manager/">The website</a></li><li><a href="https://github.com/Irvingouj/vm-manager/releases/tag/v0.1.3">The latest release</a></li><li><a href="https://github.com/Irvingouj/vm-manager">The repository</a></li></ul>
+      </nav>
+    </details>
+<script>
+  // The menu is open on wide screens and closed on narrow ones, decided before it is painted.
+  (function () { var d = document.querySelector(".nav-details"); if (d && window.matchMedia("(max-width: 59.99rem)").matches) d.open = false; })();
+</script>
+  </aside>
+  <main id="main" class="doc">
+    <p class="kicker">Reference</p>
+    <h1>Glossary</h1>
+    <nav class="toc" aria-label="On this page"><p class="toc-title">On this page</p><ul><li class="d2"><a href="#language">Language</a></li><li class="d3"><a href="#building-blocks">Building blocks</a></li><li class="d3"><a href="#authorization">Authorization</a></li><li class="d3"><a href="#audit">Audit</a></li><li class="d3"><a href="#people">People</a></li></ul></nav>
+    <article class="prose">
+<p>An open-source, self-hosted platform on which an enterprise&#39;s employees and their AI coding agents build, deploy and run internal applications against shared, IT-governed infrastructure.</p>
+<h2 id="language"><a class="anchor" href="#language" aria-hidden="true" tabindex="-1">#</a>Language</h2>
+<h3 id="building-blocks"><a class="anchor" href="#building-blocks" aria-hidden="true" tabindex="-1">#</a>Building blocks</h3>
+<p><strong>Application</strong>:
+A stateless program, deployed by a Builder, that answers web requests and reaches enterprise infrastructure only through the SDK. It follows the Cloudflare Workers execution model without being Cloudflare-compatible.
+<em>Avoid</em>: Worker (reserved for future background compute), service, project</p>
+<p><strong>Manifest</strong>:
+The TypeScript value in an Application&#39;s project that names the Application and lists the Resources it uses. Deploy turns it into the Application&#39;s Declared access.
+<em>Avoid</em>: Config, bindings file, wrangler file</p>
+<p><strong>Version</strong>:
+One deploy of an Application, kept unchanged: its bundled code, its Declared access and the Git commit it was built from. An Application serves exactly one Version at a time, and going back means serving the previous one.
+<em>Avoid</em>: Release, build, revision, deployment (for the thing; deploy is the act)</p>
+<p><strong>Dashboard</strong>:
+The page every employee signs in to, listing the Applications they can contribute to and the Applications shared with them. The same list is available to their agent.
+<em>Avoid</em>: Portal, console (IT&#39;s admin surface), app store</p>
+<p><strong>Integration</strong>:
+Separately trusted code that exposes a few narrow business functions and reaches Resources as itself. Applications call it instead of holding privileged access. Anyone may write one; each function takes effect only once the Resource owner releases it.
+<em>Avoid</em>: Plugin, connector, external API (an outbound HTTP endpoint is a different thing)</p>
+<p><strong>Resource</strong>:
+A named piece of enterprise infrastructure that IT registers and governs, and that an Application reaches through the SDK by its logical name alone. Every signed-in employee can see that a Resource exists (its name, a description and whom to ask for access); anything more needs a Grant.
+<em>Avoid</em>: Binding (the Cloudflare and OpenWorkers term), service, backend</p>
+<p><strong>Resource owner</strong>:
+The person or Group answerable for a Resource. They, or a Platform administrator, release the Integration functions that reach it. In Milestone 1 the owner is recorded only; Grants are written by Platform administrators.
+<em>Avoid</em>: Data owner, steward, admin</p>
+<p><strong>Schema owner</strong>:
+The one party allowed to change a database&#39;s structure: the Application itself for its own database, and someone outside the Application for a shared one.
+<em>Avoid</em>: DBA, admin, maintainer</p>
+<p><strong>Trusted context</strong>:
+The platform-created value that says which User, Application and request an operation belongs to. Application code receives it and cannot construct one.
+<em>Avoid</em>: Session, token, credentials</p>
+<h3 id="authorization"><a class="anchor" href="#authorization" aria-hidden="true" tabindex="-1">#</a>Authorization</h3>
+<p><strong>Grant</strong>:
+A Platform administrator&#39;s statement that a Group may reach a Resource at a given access level. It names a Group, never a single User, and covers the whole Resource. It holds in every Application, and it also decides who may build against the Resource.
+<em>Avoid</em>: Permission, ACL, role</p>
+<p><strong>Access level</strong>:
+How much of a Resource a Grant opens. For a database there are three, each including the one before: structure (pull its table structure, no rows), read, and write.
+<em>Avoid</em>: Role, permission set, scope</p>
+<p><strong>Group</strong>:
+A set of Users defined in the enterprise directory and reported by the identity provider. The platform does not define its own. Grants are given to Groups.
+<em>Avoid</em>: Role, team, access list</p>
+<p><strong>Declared access</strong>:
+The list, taken from an Application&#39;s Manifest at deploy and fixed for that Version, of the Resources it uses and at what access level. Nothing outside it is reachable.
+<em>Avoid</em>: Binding, scope, app permission</p>
+<p><strong>Autonomous grant</strong>:
+A Grant that lets code reach a Resource as itself, whatever the User it is serving may access. Only an Integration can hold one on a shared Resource; an Application acts as itself only in its own database.
+<em>Avoid</em>: Service account, elevated access, bypass</p>
+<h3 id="audit"><a class="anchor" href="#audit" aria-hidden="true" tabindex="-1">#</a>Audit</h3>
+<p><strong>Operation log</strong>:
+The platform&#39;s record of every operation on a Resource: who, through which Application, what statement, how many rows, and whether it succeeded. It contains none of the Resource&#39;s data.
+<em>Avoid</em>: Audit trail (ambiguous between the two layers), access log</p>
+<p><strong>Change history</strong>:
+The record of each row that was changed in an Application&#39;s own database: old value, new value, who and through which Application. The platform keeps it in the platform database, out of reach of the database a Contributor&#39;s migrations run in (ADR 0017). Readable, through the Application, by whoever may use the Application.
+<em>Avoid</em>: Audit log, versioning, revision table</p>
+<h3 id="people"><a class="anchor" href="#people" aria-hidden="true" tabindex="-1">#</a>People</h3>
+<p><strong>Platform administrator</strong>:
+A member of the one directory Group named when the platform is installed. They register Resources, write Grants, see every Application and can disable any of them. The platform keeps no administrator accounts of its own.
+<em>Avoid</em>: Superuser, root, IT (when this specific role is meant)</p>
+<p><strong>Builder</strong>:
+An employee who creates and deploys an Application, normally by directing a Coding agent. Any signed-in employee may create one.
+<em>Avoid</em>: Developer, author, employee (when the building role is meant)</p>
+<p><strong>Contributor</strong>:
+A person or Group allowed to change and deploy a given Application. An Application has no owner: it belongs to the company, and what is controlled is who may contribute to it.
+<em>Avoid</em>: Owner, maintainer, author</p>
+<p><strong>User</strong>:
+An employee who signs in to a deployed Application and uses it.
+<em>Avoid</em>: End user, customer, employee (when the using role is meant)</p>
+<p><strong>Coding agent</strong>:
+An AI tool that writes Application code at a Builder&#39;s direction.
+<em>Avoid</em>: AI, bot, agent (unqualified)</p>
+
+    </article>
+    <p class="source">From the repository: <a href="https://github.com/Irvingouj/vm-manager/blob/main/CONTEXT.md"><code>CONTEXT.md</code></a></p>
+    <nav class="pager" aria-label="Previous and next"><a class="prev" href="/vm-manager/docs/releases/"><span>Previous</span>Release notes</a><span></span></nav>
+  </main>
+</div>
+<footer class="foot">
+  <p>Vibe Manager is open source under the MIT licence. <a href="/vm-manager/">Home</a> · <a href="/vm-manager/docs/">Docs</a> · <a href="https://github.com/Irvingouj/vm-manager">GitHub</a></p>
+</footer>
+</body>
+</html>

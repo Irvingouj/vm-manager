@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Upgrading and stopping · Vibe Manager docs</title>
+<meta name="description" content="Vibe Manager documentation: Upgrading and stopping.">
+<link rel="icon" href="/vm-manager/assets/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/vm-manager/assets/style.css">
+<script src="/vm-manager/assets/search.js" defer></script>
+</head>
+<body class="docs" data-base="/vm-manager/">
+<a class="skip" href="#main">Skip to the content</a>
+<header class="topbar">
+  <a class="wordmark" href="/vm-manager/" title="Vibe Manager: the landing page"><span class="mark" aria-hidden="true"></span>Vibe&nbsp;Manager</a>
+  <a class="crumb" href="/vm-manager/docs/">Docs</a>
+  <div class="search" role="search">
+    <label class="visually-hidden" for="q">Search the documentation</label>
+    <input id="q" type="search" placeholder="Search the docs" autocomplete="off" spellcheck="false" aria-controls="results" aria-expanded="false">
+    <kbd aria-hidden="true">/</kbd>
+    <div id="results" class="results" hidden></div>
+  </div>
+  <nav class="toplinks" aria-label="Elsewhere">
+    <a href="https://github.com/Irvingouj/vm-manager/releases/tag/v0.1.3">v0.1.3</a>
+    <a href="https://github.com/Irvingouj/vm-manager">GitHub</a>
+  </nav>
+</header>
+<div class="docs-grid">
+  <aside class="sidebar">
+    <details class="nav-details" open>
+      <summary>Menu</summary>
+      <nav aria-label="Documentation">
+        <p class="nav-group">Start here</p><ul><li><a href="/vm-manager/docs/">Overview</a></li><li><a href="/vm-manager/docs/getting-started/">Getting started</a></li></ul>
+<p class="nav-group">For Builders</p><ul><li><a href="/vm-manager/docs/builders/local-run/">Making it and running it locally</a></li><li><a href="/vm-manager/docs/builders/deploying/">Deploying</a></li><li><a href="/vm-manager/docs/builders/sharing/">Sharing</a></li><li><a href="/vm-manager/docs/builders/commands/">The tool&#39;s commands</a></li><li><a href="/vm-manager/docs/builders/sdk/">The SDK&#39;s types</a></li></ul>
+<p class="nav-group">For Platform administrators</p><ul><li><a href="/vm-manager/docs/admin/install/">Installing with Compose</a></li><li><a href="/vm-manager/docs/admin/oidc/">Connecting OIDC</a></li><li><a href="/vm-manager/docs/admin/tls/">TLS</a></li><li><a href="/vm-manager/docs/admin/postgres/">Your own Postgres</a></li><li><a href="/vm-manager/docs/admin/updating/" aria-current="page">Upgrading and stopping</a></li></ul>
+<p class="nav-group">Reference</p><ul><li><a href="/vm-manager/docs/releases/">Release notes</a></li><li><a href="/vm-manager/docs/glossary/">Glossary</a></li></ul>
+        <p class="nav-group">Elsewhere</p>
+        <ul><li><a href="/vm-manager/">The website</a></li><li><a href="https://github.com/Irvingouj/vm-manager/releases/tag/v0.1.3">The latest release</a></li><li><a href="https://github.com/Irvingouj/vm-manager">The repository</a></li></ul>
+      </nav>
+    </details>
+<script>
+  // The menu is open on wide screens and closed on narrow ones, decided before it is painted.
+  (function () { var d = document.querySelector(".nav-details"); if (d && window.matchMedia("(max-width: 59.99rem)").matches) d.open = false; })();
+</script>
+  </aside>
+  <main id="main" class="doc">
+    <p class="kicker">For Platform administrators</p>
+    <h1>Upgrading and stopping</h1>
+    <nav class="toc" aria-label="On this page"><p class="toc-title">On this page</p><ul><li class="d2"><a href="#upgrading">Upgrading</a></li><li class="d2"><a href="#stopping">Stopping</a></li><li class="d2"><a href="#how-it-is-hardened">How it is hardened</a></li><li class="d2"><a href="#why-these-versions-of-docker">Why these versions of Docker</a></li></ul></nav>
+    <article class="prose">
+<h2 id="upgrading"><a class="anchor" href="#upgrading" aria-hidden="true" tabindex="-1">#</a>Upgrading</h2>
+<p>Set the newer image in <code>.env</code> and start again:</p>
+<div class="code"><span class="lang">sh</span><pre tabindex="0"><code class="language-sh">sed -i &quot;s|^#\?VIBE_IMAGE=.*|VIBE_IMAGE=ghcr.io/irvingouj/vibe:&lt;the newer version&gt;|&quot; .env
+docker compose pull &amp;&amp; docker compose up -d</code></pre></div>
+<p>The platform database, every Application&#39;s own database, the OIDC connection and the sessions are kept: the data is the volume&#39;s, the key is the <code>.env</code>&#39;s.</p>
+<h2 id="stopping"><a class="anchor" href="#stopping" aria-hidden="true" tabindex="-1">#</a>Stopping</h2>
+<div class="code"><span class="lang">sh</span><pre tabindex="0"><code class="language-sh">docker compose down</code></pre></div>
+<p>stops and removes the containers and keeps the data; <code>docker compose up -d</code> brings it back as it was. Only</p>
+<div class="code"><span class="lang">sh</span><pre tabindex="0"><code class="language-sh">docker compose down --volumes</code></pre></div>
+<p>removes the bundled Postgres&#39;s data, every Application&#39;s included, for good.</p>
+<h2 id="how-it-is-hardened"><a class="anchor" href="#how-it-is-hardened" aria-hidden="true" tabindex="-1">#</a>How it is hardened</h2>
+<ul>
+<li><code>vibe</code> runs with a read-only root filesystem, every capability dropped, <code>no-new-privileges</code>, as the image&#39;s user <code>65532</code> (not root), with no writable volume and no tmpfs; its one mount is <code>ca/</code>, read-only, at <code>/etc/vibe/ca</code> (with <code>compose.own-tls.yaml</code>, <code>certs/</code> too, read-only, at <code>/etc/vibe/certs</code>). The installation&#39;s key and the database&#39;s address are in its environment, in no command line.</li>
+<li><code>vibe</code> may open 65,536 files (<code>ulimits: nofile</code>, soft and hard), whatever the Docker daemon&#39;s default, so that it never runs out of files before its own bound of 1,024 connections at once; started elsewhere, the program raises its own soft limit towards the hard one and logs <code>open-files-limit-low</code> when even the hard limit is below 4,096.</li>
+<li><code>postgres</code> runs as its image&#39;s user <code>999</code> and <code>proxy</code> as <code>65532</code>, neither as root, each with every capability dropped and <code>no-new-privileges</code>.</li>
+<li>Not possible: a read-only root filesystem for <code>postgres</code> and <code>proxy</code>. Each takes a file of <code>compose.yaml</code>&#39;s <code>configs</code> (Postgres&#39;s first-start script, the proxy&#39;s configuration), and Compose cannot place such a file into a read-only container.</li>
+</ul>
+<h2 id="why-these-versions-of-docker"><a class="anchor" href="#why-these-versions-of-docker" aria-hidden="true" tabindex="-1">#</a>Why these versions of Docker</h2>
+<p>The install tests ran with two pairs of versions: Docker Engine 28.0.4 with Compose 2.38.2 (GitHub&#39;s hosted runner, in the release workflow), and Docker Engine 29.2.1 with Compose 5.0.2 (the machine of the install gate). The minimum this document gives, Engine 25.0 and Compose 2.24.1, was not run: it is read from Docker&#39;s notes. The Compose files use three things that older versions do not have, each according to Docker&#39;s own notes:</p>
+<ul>
+<li>a config written in the file itself (<code>configs: ... content:</code>), for the Postgres first-start script and the proxy&#39;s configuration: Compose 2.23.1 (<a href="https://docs.docker.com/reference/compose-file/configs/">Compose file reference, configs</a>: &quot;<code>content</code>: The content is created with the inlined value. Introduced in Docker Compose version 2.23.1&quot;);</li>
+<li>the health check&#39;s <code>start_interval</code>, so that a fresh install is seen healthy within seconds: Docker Engine 25.0.0 (<a href="https://docs.docker.com/engine/release-notes/25.0/">Engine 25.0 release notes</a>, &quot;Add an additional interval to be used by healthchecks during the container start period&quot;) and Compose 2.24.0, whose <a href="https://github.com/docker/compose/releases/tag/v2.24.0">release notes</a> list &quot;Add support for start_interval&quot;, with the check of the Engine&#39;s version it needs fixed in <a href="https://github.com/docker/compose/releases/tag/v2.24.1">2.24.1</a> (&quot;fix engine version require to use healthcheck.start_interval&quot;);</li>
+<li><code>!reset</code>, by which <code>compose.own-proxy.yaml</code>, <code>compose.own-tls.yaml</code> and <code>compose.own-postgres.yaml</code> remove the bundled proxy or Postgres: compose-go <a href="https://github.com/compose-spec/compose-go/releases/tag/v1.13.5">v1.13.5</a> (&quot;allow override compose.yaml to REMOVE elements&quot;), first in Compose 2.18.0 (its <code>go.mod</code> names compose-go v1.13.5), well below the others.</li>
+</ul>
+
+    </article>
+    <p class="source">From the repository: <a href="https://github.com/Irvingouj/vm-manager/blob/main/deploy/README.md"><code>deploy/README.md</code></a></p>
+    <nav class="pager" aria-label="Previous and next"><a class="prev" href="/vm-manager/docs/admin/postgres/"><span>Previous</span>Your own Postgres</a><a class="next" href="/vm-manager/docs/releases/"><span>Next</span>Release notes</a></nav>
+  </main>
+</div>
+<footer class="foot">
+  <p>Vibe Manager is open source under the MIT licence. <a href="/vm-manager/">Home</a> · <a href="/vm-manager/docs/">Docs</a> · <a href="https://github.com/Irvingouj/vm-manager">GitHub</a></p>
+</footer>
+</body>
+</html>

@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Documentation · Vibe Manager docs</title>
+<meta name="description" content="Vibe Manager documentation: Documentation.">
+<link rel="icon" href="/vm-manager/assets/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/vm-manager/assets/style.css">
+<script src="/vm-manager/assets/search.js" defer></script>
+</head>
+<body class="docs" data-base="/vm-manager/">
+<a class="skip" href="#main">Skip to the content</a>
+<header class="topbar">
+  <a class="wordmark" href="/vm-manager/" title="Vibe Manager: the landing page"><span class="mark" aria-hidden="true"></span>Vibe&nbsp;Manager</a>
+  <a class="crumb" href="/vm-manager/docs/">Docs</a>
+  <div class="search" role="search">
+    <label class="visually-hidden" for="q">Search the documentation</label>
+    <input id="q" type="search" placeholder="Search the docs" autocomplete="off" spellcheck="false" aria-controls="results" aria-expanded="false">
+    <kbd aria-hidden="true">/</kbd>
+    <div id="results" class="results" hidden></div>
+  </div>
+  <nav class="toplinks" aria-label="Elsewhere">
+    <a href="https://github.com/Irvingouj/vm-manager/releases/tag/v0.1.3">v0.1.3</a>
+    <a href="https://github.com/Irvingouj/vm-manager">GitHub</a>
+  </nav>
+</header>
+<div class="docs-grid">
+  <aside class="sidebar">
+    <details class="nav-details" open>
+      <summary>Menu</summary>
+      <nav aria-label="Documentation">
+        <p class="nav-group">Start here</p><ul><li><a href="/vm-manager/docs/" aria-current="page">Overview</a></li><li><a href="/vm-manager/docs/getting-started/">Getting started</a></li></ul>
+<p class="nav-group">For Builders</p><ul><li><a href="/vm-manager/docs/builders/local-run/">Making it and running it locally</a></li><li><a href="/vm-manager/docs/builders/deploying/">Deploying</a></li><li><a href="/vm-manager/docs/builders/sharing/">Sharing</a></li><li><a href="/vm-manager/docs/builders/commands/">The tool&#39;s commands</a></li><li><a href="/vm-manager/docs/builders/sdk/">The SDK&#39;s types</a></li></ul>
+<p class="nav-group">For Platform administrators</p><ul><li><a href="/vm-manager/docs/admin/install/">Installing with Compose</a></li><li><a href="/vm-manager/docs/admin/oidc/">Connecting OIDC</a></li><li><a href="/vm-manager/docs/admin/tls/">TLS</a></li><li><a href="/vm-manager/docs/admin/postgres/">Your own Postgres</a></li><li><a href="/vm-manager/docs/admin/updating/">Upgrading and stopping</a></li></ul>
+<p class="nav-group">Reference</p><ul><li><a href="/vm-manager/docs/releases/">Release notes</a></li><li><a href="/vm-manager/docs/glossary/">Glossary</a></li></ul>
+        <p class="nav-group">Elsewhere</p>
+        <ul><li><a href="/vm-manager/">The website</a></li><li><a href="https://github.com/Irvingouj/vm-manager/releases/tag/v0.1.3">The latest release</a></li><li><a href="https://github.com/Irvingouj/vm-manager">The repository</a></li></ul>
+      </nav>
+    </details>
+<script>
+  // The menu is open on wide screens and closed on narrow ones, decided before it is painted.
+  (function () { var d = document.querySelector(".nav-details"); if (d && window.matchMedia("(max-width: 59.99rem)").matches) d.open = false; })();
+</script>
+  </aside>
+  <main id="main" class="doc">
+    <p class="kicker">Start here</p>
+    <h1>Overview</h1>
+    <nav class="toc" aria-label="On this page"><p class="toc-title">On this page</p><ul><li class="d2"><a href="#two-people">Two people</a></li><li class="d2"><a href="#for-platform-administrators">For Platform administrators</a></li><li class="d2"><a href="#for-builders">For Builders</a></li></ul></nav>
+    <article class="prose">
+<p>Vibe Manager is an open-source, self-hosted platform on which an enterprise&#39;s employees and their AI coding agents build, deploy and run internal applications against shared, IT-governed infrastructure.</p>
+<p>The latest release, <code>v0.1.3</code>, is still a minimal one, to try it. <strong>It is not for untrusted Applications or real company data</strong>: its <a href="/vm-manager/docs/releases/">release notes</a> say what works and what is missing.</p>
+<h2 id="two-people"><a class="anchor" href="#two-people" aria-hidden="true" tabindex="-1">#</a>Two people</h2>
+<p>There are two people in these documents. They can be the same person.</p>
+<ul>
+<li>The <strong>Platform administrator</strong> installs the platform on a server and connects it to the company&#39;s sign-in (OIDC).</li>
+<li>The <strong>Builder</strong> installs the tool <code>vibe</code> on their own computer, makes an Application, tries it there, deploys it and shares it.</li>
+</ul>
+<p><a href="/vm-manager/docs/getting-started/">Getting started</a> takes both from nothing to an Application open in a browser, in one page.</p>
+<h2 id="for-platform-administrators"><a class="anchor" href="#for-platform-administrators" aria-hidden="true" tabindex="-1">#</a>For Platform administrators</h2>
+<ul>
+<li><a href="/vm-manager/docs/admin/install/">Installing with Compose</a>: the files, the values, the certificate, the first start and the setup credential.</li>
+<li><a href="/vm-manager/docs/admin/oidc/">Connecting OIDC</a>: registering the platform at the identity provider, <code>vibe admin connect-oidc</code>, signing in, and when a sign-in fails.</li>
+<li><a href="/vm-manager/docs/admin/tls/">TLS</a>: the Compose file&#39;s reverse proxy, your own reverse proxy, or the program serving TLS itself.</li>
+<li><a href="/vm-manager/docs/admin/postgres/">Your own Postgres</a>: a Postgres 18 of your own instead of the bundled one.</li>
+<li><a href="/vm-manager/docs/admin/updating/">Upgrading and stopping</a>, and how the containers are hardened.</li>
+</ul>
+<h2 id="for-builders"><a class="anchor" href="#for-builders" aria-hidden="true" tabindex="-1">#</a>For Builders</h2>
+<ul>
+<li><a href="/vm-manager/docs/builders/local-run/">Making it and running it locally</a>: <code>vibe new</code>, <code>vibe check</code>, <code>vibe dev</code>, <code>vibe request</code>.</li>
+<li><a href="/vm-manager/docs/builders/deploying/">Deploying</a>: <code>vibe deploy</code>, and the Versions it makes.</li>
+<li><a href="/vm-manager/docs/builders/sharing/">Sharing</a>: <code>vibe share</code>, and the Dashboard.</li>
+<li><a href="/vm-manager/docs/builders/commands/">The tool&#39;s commands</a>: every command, as its <code>--help</code> prints it.</li>
+<li><a href="/vm-manager/docs/builders/sdk/">The SDK&#39;s types</a>: what an Application is written with.</li>
+</ul>
+<p>The words these pages use (Application, Resource, Grant, Version, Contributor, ...) are defined in the <a href="/vm-manager/docs/glossary/">Glossary</a>.</p>
+
+    </article>
+    
+    <nav class="pager" aria-label="Previous and next"><span></span><a class="next" href="/vm-manager/docs/getting-started/"><span>Next</span>Getting started</a></nav>
+  </main>
+</div>
+<footer class="foot">
+  <p>Vibe Manager is open source under the MIT licence. <a href="/vm-manager/">Home</a> · <a href="/vm-manager/docs/">Docs</a> · <a href="https://github.com/Irvingouj/vm-manager">GitHub</a></p>
+</footer>
+</body>
+</html>
