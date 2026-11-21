@@ -211,7 +211,7 @@ details>summary{cursor:pointer;color:var(--accent);min-height:1.5rem}
 details[open]>summary{margin-bottom:.5rem}
 .admin-link .i{width:1.25rem;height:1.25rem}
 .sections{margin:-1rem 0 2rem;border-bottom:1px solid var(--line)}
-.sections ul{list-style:none;padding:0;display:flex;flex-wrap:wrap;column-gap:.25rem}
+.sections ul{list-style:none;padding:0;display:flex;flex-wrap:wrap;column-gap:.5rem}
 .sections a{display:inline-flex;align-items:center;gap:.5rem;min-height:2.75rem;padding:.5rem .75rem;margin-bottom:-1px;border-bottom:2px solid transparent;color:var(--ink-2);font-weight:600;text-decoration:none}
 .sections a:hover{color:var(--ink)}
 .sections a .i{color:var(--ink-3)}
@@ -242,9 +242,10 @@ details[open]>summary{margin-bottom:.5rem}
 .notice code.id{color:inherit}
 .lone .lead+.usage-line{margin-top:.75rem}
 .filters{padding:1rem 1.25rem}
-.filter-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(14rem,1fr));gap:1rem 1.25rem}
+.filter-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(18rem,100%),1fr));gap:1rem 1.25rem}
 .filter-grid .field+.field{margin-top:0}
 .filter-grid .control{max-width:none}
+.filter-grid input[type=datetime-local]{padding-inline:.25rem;letter-spacing:-.03em}
 .field-error{display:flex;align-items:flex-start;gap:.375rem;margin-top:.5rem;font-size:.875rem;line-height:1.25rem;color:var(--danger)}
 .field-error .i{width:1rem;height:1rem;margin-top:.125rem}
 .filters .form-actions{display:flex;flex-wrap:wrap;align-items:center;gap:.5rem .75rem;margin-top:1.25rem}
@@ -299,7 +300,11 @@ code.cmd{white-space:nowrap}
 .res td.lv{color:var(--ink)}
 .res td.lv::before{content:attr(data-label) " ";color:var(--ink-2)}
 .rows .who-is{flex-basis:auto}
-.admin-link .word{position:absolute;width:1px;height:1px;margin:-1px;padding:0;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;border:0}
+.admin-link .word,.sections a:not([aria-current=page]) .word{position:absolute;width:1px;height:1px;margin:-1px;padding:0;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;border:0}
+.sections ul{flex-wrap:nowrap}
+.sections a{padding-inline:.25rem;white-space:nowrap}
+.sections a[aria-current=page]{padding-inline:.5rem}
+.filters{padding:0;background:none;border:0;box-shadow:none}
 .admin-link{padding-inline:.5rem}
 dl.facts.big{grid-template-columns:1fr;gap:0}
 dl.facts.big dd+dt{margin-top:.75rem}

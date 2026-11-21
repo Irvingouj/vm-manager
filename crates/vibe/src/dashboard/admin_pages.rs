@@ -84,7 +84,7 @@ fn sections(current: Section) -> String {
         };
         write!(
             out,
-            "<li><a data-vm-section=\"{value}\" href=\"{path}\"{current}>{}{words}</a></li>",
+            "<li><a data-vm-section=\"{value}\" href=\"{path}\"{current}>{}<span class=\"word\">{words}</span></a></li>",
             icon.svg()
         )
         .ok();
