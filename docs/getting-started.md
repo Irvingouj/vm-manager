@@ -1,6 +1,6 @@
 # Getting started
 
-This page takes you from nothing to an Application open in your browser. It uses the files of the release `v0.1.1` only. Read the [release's notes](releases/v0.1.1.md) first: this release is not for untrusted Applications or real company data.
+This page takes you from nothing to an Application open in your browser. It uses the files of the release `v0.1.2` only. Read the [release's notes](releases/v0.1.2.md) first: this release is not for untrusted Applications or real company data.
 
 There are two people in this page. They can be the same person.
 
@@ -31,9 +31,9 @@ On the server, make a folder and download the release's files into it:
 ```sh
 mkdir -p /opt/vibe/certs /opt/vibe/ca
 cd /opt/vibe
-curl -fLO https://github.com/Irvingouj/vm-manager/releases/download/v0.1.1/compose.yaml
-curl -fLO https://github.com/Irvingouj/vm-manager/releases/download/v0.1.1/env.example
-curl -fLO https://github.com/Irvingouj/vm-manager/releases/download/v0.1.1/SHA256SUMS
+curl -fLO https://github.com/Irvingouj/vm-manager/releases/download/v0.1.2/compose.yaml
+curl -fLO https://github.com/Irvingouj/vm-manager/releases/download/v0.1.2/env.example
+curl -fLO https://github.com/Irvingouj/vm-manager/releases/download/v0.1.2/SHA256SUMS
 sha256sum --check --ignore-missing SHA256SUMS
 ```
 
@@ -103,23 +103,23 @@ On each computer that uses the tool: the administrator's for the next step, and 
 On Linux (`x86-64`):
 
 ```sh
-curl -fLO https://github.com/Irvingouj/vm-manager/releases/download/v0.1.1/vibe-0.1.1-x86_64-unknown-linux-gnu.tar.gz
-curl -fLO https://github.com/Irvingouj/vm-manager/releases/download/v0.1.1/SHA256SUMS
+curl -fLO https://github.com/Irvingouj/vm-manager/releases/download/v0.1.2/vibe-0.1.2-x86_64-unknown-linux-gnu.tar.gz
+curl -fLO https://github.com/Irvingouj/vm-manager/releases/download/v0.1.2/SHA256SUMS
 sha256sum --check --ignore-missing SHA256SUMS
-tar -xzf vibe-0.1.1-x86_64-unknown-linux-gnu.tar.gz
+tar -xzf vibe-0.1.2-x86_64-unknown-linux-gnu.tar.gz
 mkdir -p ~/.local/bin
-cp vibe-0.1.1-x86_64-unknown-linux-gnu/vibe ~/.local/bin/vibe
+cp vibe-0.1.2-x86_64-unknown-linux-gnu/vibe ~/.local/bin/vibe
 ```
 
 On macOS (Apple silicon):
 
 ```sh
-curl -fLO https://github.com/Irvingouj/vm-manager/releases/download/v0.1.1/vibe-0.1.1-aarch64-apple-darwin.tar.gz
-curl -fLO https://github.com/Irvingouj/vm-manager/releases/download/v0.1.1/SHA256SUMS
+curl -fLO https://github.com/Irvingouj/vm-manager/releases/download/v0.1.2/vibe-0.1.2-aarch64-apple-darwin.tar.gz
+curl -fLO https://github.com/Irvingouj/vm-manager/releases/download/v0.1.2/SHA256SUMS
 shasum -a 256 --check --ignore-missing SHA256SUMS
-tar -xzf vibe-0.1.1-aarch64-apple-darwin.tar.gz
+tar -xzf vibe-0.1.2-aarch64-apple-darwin.tar.gz
 mkdir -p ~/.local/bin
-cp vibe-0.1.1-aarch64-apple-darwin/vibe ~/.local/bin/vibe
+cp vibe-0.1.2-aarch64-apple-darwin/vibe ~/.local/bin/vibe
 ```
 
 The macOS program is not signed by a developer and not notarised by Apple. Downloaded with `curl`, as above, it runs. If you downloaded the archive with a browser, macOS holds the program back. Remove its quarantine mark:
@@ -140,7 +140,7 @@ Check it:
 vibe --version
 ```
 
-The first line says `vibe 0.1.1`. Each archive also holds `THIRD-PARTY-LICENSES`: the licences of what the program is built from.
+The first line says `vibe 0.1.2`. Each archive also holds `THIRD-PARTY-LICENSES`: the licences of what the program is built from.
 
 ## 4. Connect OIDC
 
@@ -222,4 +222,4 @@ vibe share hello --everyone
 
 - `vibe --help` lists every command, and `vibe <command> --help` says what each one does.
 - The Dashboard is at `https://dashboard.vibe.example.com/`.
-- What this release does not have yet is in the [release's notes](releases/v0.1.1.md).
+- What this release does not have yet is in the [release's notes](releases/v0.1.2.md).

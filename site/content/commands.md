@@ -1,6 +1,6 @@
 # The tool's commands
 
-Every command of the tool `vibe` 0.1.1, as `vibe <command> --help` prints it. `vibe --help` lists them all; that list and the exit codes are at the end of this page.
+Every command of the tool `vibe` 0.1.2, as `vibe <command> --help` prints it. `vibe --help` lists them all; that list and the exit codes are at the end of this page.
 
 ## Signing in
 
