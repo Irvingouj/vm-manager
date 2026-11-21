@@ -2059,31 +2059,33 @@ Pages are read by people; the attributes named `data-vm-...` below are what a te
 ### The list (`GET /`)
 
 - **Exactly the Applications `GET /v1/applications` answers that User**: those they are a Contributor of, then those they can open besides, each group by name (byte order, as the API's). So the Dashboard and `vibe applications` show the same Applications to the same person, and say the same of each which of the two it is. An Application with no serving Version is listed like any other.
-- 100 Applications to a page. `?page=<n>` is the n-th page of that order (from 1; without it, the first). When there are more, the page has a link `a[data-vm-next]` to the next one, and from the second on a link `a[data-vm-previous]`. A page past the last is `200` with no Application. A page with no Application says so in words: on the first, that nothing is shared with the person yet and that an Application is made with the `vm` tool.
-- Each Application is one element with `data-vm-application="<name>"`, `data-vm-relation="contributor"` or `"shared"`, and `data-vm-serving="<the serving Version's number>"` or `"none"`. Inside it:
-  - its name, and its description when it has one, in an element with `data-vm-description`;
-  - when a Version serves: a link `a[data-vm-open]` whose `href` is the Application's address in full, with the path `/` (`<scheme>://<name>.<domain>[:<port>]/`). When none serves: no such link, and words saying that nothing is deployed yet;
-  - a link `a[data-vm-details]` to `/applications/<name>`;
-  - its Contributors, in the order of the list, the first 20: each an element with `data-vm-contributor="user"` or `"group"` and `data-vm-id="<user id or Group>"`, whose text is the person's name when the platform knows it (and their id), or the Group. When there are more than 20: an element with `data-vm-more-contributors="<how many more>"`;
-  - **the Resources its serving Version declares**, by name: each an element with `data-vm-resource="<name>"`, `data-vm-declared="<the declared level>"`, `data-vm-yours="structure" | "read" | "write" | "none" | "unknown"` (what `your_access` of `GET /v1/resources/<name>` says for that User; `none` for no Grant and for a Resource that is not registered; `unknown` while the program cannot tell, "A write whose answer is lost": the page reads as `GET /v1/resources/<name>` does there, within the same bound, and is answered `200` all the same, never held until the write is settled), and `data-vm-standing`:
-
-    | `data-vm-standing` | When | What the words say |
-    |---|---|---|
-    | `enough` | The User holds at least the declared level | nothing more |
-    | `lower` | The User holds a Grant below the declared level | what they hold, that what needs more will be refused for them, and whom to ask |
-    | `none` | The User holds no Grant on it | that this part of the Application will be refused for them, and whom to ask |
-    | `not-registered` | No Resource of that name is registered | that no such Resource is registered, so this part works for nobody yet |
-    | `unknown` | The program cannot tell just now | that it cannot be told just now |
-
-    For `lower` and `none` the element has `data-vm-ask="<the Resource's contact>"` and its text shows that contact: **whom to ask**. The mark is in words, not in colour alone. An Application that declares no Resource, or that no Version serves, has no such element.
+- 100 Applications to a page. `?page=<n>` is the n-th page of that order (from 1; without it, the first). When there are more, the page has a link `a[data-vm-next]` to the next one, and from the second on a link `a[data-vm-previous]`. A page past the last is `200` with no Application. A page with no Application says so in words: on the first, that nothing is shared with the person yet and that an Application is made with the `vibe` tool.
+- **The list shows what is needed to find an Application and open it, and no more** (ticket: The pages follow the product owner's four UI/UX rules; until then each element of the list also held the Contributors and every Resource with its standing). Each Application is one element with `data-vm-application="<name>"`, `data-vm-relation="contributor"` or `"shared"`, `data-vm-serving="<the serving Version's number>"` or `"none"`, and `data-vm-attention` (below). Inside it:
+  - its name, which is the link `a[data-vm-details]` to `/applications/<name>`, its own page;
+  - its description when it has one, in an element with `data-vm-description`;
+  - when a Version serves: a link `a[data-vm-open]` whose `href` is the Application's address in full, with the path `/` (`<scheme>://<name>.<domain>[:<port>]/`); the link's name, as a screen reader says it, holds the Application's name. When none serves: no such link, and a mark with the words "Not deployed";
+  - **one mark, at most, for what of it will not work for the person**: `data-vm-attention` says the worst standing among the Resources its serving Version declares ("One Application", below): `"missing-access"` when one is `lower` or `none`, else `"not-registered"` when one is `not-registered`, else `"unknown"` when one is `unknown`, else `"none"` (also when it declares no Resource or no Version serves). For the first three the element holds a mark of that kind with a few words ("Missing access", "Not set up", "Access unknown"); for `"none"` it holds no such mark. Which Resource, what the person holds and whom to ask are on the Application's page.
+  - No Contributor, no Resource, no Version's number as text and no address as text is in the list: they are on the Application's page.
 - Nothing of an Application the person cannot open is on any page of theirs.
 
 ### One Application (`GET /applications/<name>`)
 
 - By whoever can open it, and by a Platform administrator, as `GET /v1/applications/<name>`. Anyone else: `403`, a page saying that the Application of that name is not shared with them and to ask one of its Contributors, naming none (as its own address answers them). A name no Application has, or that none could have: `404`.
-- The Application as in the list, in an element with the same attributes, with **every** Contributor (no `data-vm-more-contributors`), its address, and the same Resources.
+- The Application in an element with the list's attributes (`data-vm-application`, `data-vm-relation`, `data-vm-serving`, `data-vm-attention`), with its name, its description (`data-vm-description`), the serving Version's number, its address as text, and `a[data-vm-open]` when a Version serves (words saying that nothing is deployed yet when none does).
+- **Its Contributors**, every one, in the order of the list: each an element with `data-vm-contributor="user"` or `"group"` and `data-vm-id="<user id or Group>"`, whose text is the person's name when the platform knows it (and their id), or the Group. Words there say that Contributors are changed with the tool.
+- **The Resources its serving Version declares**, by name: each an element with `data-vm-resource="<name>"`, `data-vm-declared="<the declared level>"`, `data-vm-yours="structure" | "read" | "write" | "none" | "unknown"` (what `your_access` of `GET /v1/resources/<name>` says for that User; `none` for no Grant and for a Resource that is not registered; `unknown` while the program cannot tell, "A write whose answer is lost": the page reads as `GET /v1/resources/<name>` does there, within the same bound, and is answered `200` all the same, never held until the write is settled), and `data-vm-standing`:
+
+    | `data-vm-standing` | When | What the element says |
+    |---|---|---|
+    | `enough` | The User holds at least the declared level | the level declared and the level held |
+    | `lower` | The User holds a Grant below the declared level | the two levels, and whom to ask |
+    | `none` | The User holds no Grant on it | the level declared, that they hold nothing, and whom to ask |
+    | `not-registered` | No Resource of that name is registered | the level declared, and that it is not registered |
+    | `unknown` | The program cannot tell just now | the level declared, and that it cannot be told just now |
+
+    Each standing has a mark of its own kind (not colour alone), whose name, as a screen reader says it, says the standing in words and, for `lower` and `none`, that what needs more is refused for them. For `lower` and `none` the element has `data-vm-ask="<the Resource's contact>"` and its text shows that contact: **whom to ask**. An Application that declares no Resource, or that no Version serves, has no such element. The list's own Dashboard page holds none of these elements.
 - **A Platform administrator who cannot open it** reads the page all the same, and it does not offer what would be refused: the element has `data-vm-relation="none"` and no `a[data-vm-open]` (the address is still there, as text), and words saying that they read it as a Platform administrator and that it is not shared with them. The Resources are marked for them as for anyone.
-- **A person the platform has never seen** (it knows neither a name nor an email of them: nobody of that id signed in here, so a mistyped id shows): with OIDC their element, among the Contributors or among whom it is shared with, here and in the list, has the attribute `data-vm-unseen` and words saying that they were not seen signing in here yet and to check the id, as the tool says it. Someone the platform knows a name or an email of has neither. The stand-in keeps no record of people: there nobody has the attribute or the words.
+- **A person the platform has never seen** (it knows neither a name nor an email of them: nobody of that id signed in here, so a mistyped id shows): with OIDC their element, among the Contributors or among whom it is shared with, has the attribute `data-vm-unseen` and words saying that they were not seen signing in here yet and to check the id, as the tool says it. Someone the platform knows a name or an email of has neither. The stand-in keeps no record of people: there nobody has the attribute or the words.
 - **To a Contributor and to a Platform administrator: whom it is shared with**, in the order of the list: each an element with `data-vm-shared="user" | "group" | "everyone"` and, for the first two, `data-vm-id`; a person with their name and email when known. When it is shared with nobody, words saying that only its Contributors can open it. To anyone else no such element, and words saying that only its Contributors see whom it is shared with.
 - **To a Contributor: the forms.** One `form[data-vm-form="share"]` and, beside each entry of whom it is shared with, one `form[data-vm-form="unshare"]`; each `method="post"` with `action="/applications/<name>/sharing"`. Someone who is not a Contributor gets no form. With `?changed=shared`, `?changed=unshared` or `?changed=nothing` the page has an element with `data-vm-notice` of that value saying so (what a change redirects to); any other `changed` is ignored.
 
@@ -2427,6 +2429,16 @@ Until this ticket each family of pages carried a few lines of style of its own, 
 ### Narrow
 
 - As "A real browser in the gate: What it walks" says of 320 CSS pixels: still true of each page, in light and in dark.
+
+### Said once, and without words where that can be done (ticket: The pages follow the product owner's four UI/UX rules)
+
+The product owner's rules for every page: a piece of information is conveyed once; it is conveyed by an icon, by colour, by shape or by layout before it is conveyed by language; information is exposed progressively; hierarchy and padding are watched. Most of this is judged by looking (the project's UI/UX skill). What can be pinned is pinned here and where each page is described above:
+
+- **The Dashboard's list** holds no Contributor and no Resource ("The Dashboard: The list"): no element with `data-vm-contributor`, `data-vm-more-contributors`, `data-vm-resource` or `data-vm-shared` is on it, and the signed-in person's id is on it once, in the header (`data-vm-user`), unless it is part of an Application's name or description.
+- **A mark that carries meaning has a name.** Every `<svg>` of a page is either hidden from a screen reader (`aria-hidden="true"`) beside text that says the same (text that may itself be hidden from sight), or has `role="img"` and an `aria-label` that is not empty. No page conveys a state by an `<svg>` with neither.
+- **A page of the sign-in address says which installation it is**: its header holds the installation's domain (`<domain>`, as `--domain` gave it), escaped.
+- **The local run's test-User page says which Application it is for**: the Application's name is in its text, outside the `<title>`.
+- **A disclosure is a `<details>`**: what a page holds back is in a `<details>` with a `<summary>` (no script exists), or on another page a link of the page leads to.
 
 ### How it is tested
 
