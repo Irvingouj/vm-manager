@@ -2399,3 +2399,40 @@ Everything the platform derives from how it is reached is as with `--public-sche
 - HTTP/2 and HTTP/3 from the program itself; a listener on port 80 that redirects to HTTPS; `Strict-Transport-Security`.
 - Certificates got by the program itself (ACME); a certificate per Application; client certificates.
 - TLS older than 1.2 is not offered (the library built in has none); no test of the gate shows a TLS 1.1 client being refused, since the harness's own client cannot speak it.
+
+## How the pages look (ticket: One theme for every page of the platform's own)
+
+Until this ticket each family of pages carried a few lines of style of its own, and the page the tool serves while it signs in had none. From here on every page of the platform's own is dressed by one theme, the same identity as the website. What a page says, its `data-vm-...` marks and its forms are as the sections above say: this section adds what can be seen and measured, and takes nothing away.
+
+**The pages** it speaks of: the Dashboard's pages (the list, one Application's page, their refusals), the sign-in address's pages (the tool's sign-in page, the sign-out page, the pages of refusal and of failure), the page an Application's address answers in the platform's name, the local run's own pages (the test-User page, the page of a wrong `Host`), and the page the tool itself serves on the loopback address while it signs in.
+
+### One theme, nothing loaded
+
+- Each page has exactly one `<style>` element, in its `<head>`, and `<meta name="color-scheme" content="light dark">`. The style names no address: no `url(`, no `@import`, no `@font-face`. The fonts are the reader's own.
+- The `content-security-policy` is as each section above says, with `style-src 'unsafe-inline'` as the one thing added to `default-src 'none'`: no script, no image, no font and no style sheet is fetched. **The tool's own page** on the loopback address has it too from this ticket on: `default-src 'none'; style-src 'unsafe-inline'`; its other headers stay as they were.
+- Each page has `<html lang="en">` and exactly one `<h1>`.
+
+### Light and dark
+
+- A page follows the browser's `prefers-color-scheme`. In a browser set to light the page's background is lighter than its text; in one set to dark it is darker than its text. Neither is pure black on pure white or the reverse.
+- **Contrast.** In both, every piece of text a page shows has a contrast of at least 4.5:1 against the colour behind it (WCAG 2's ratio of relative luminances, from the colours the browser computes: the text's `color` against the nearest `background-color` behind it that is not transparent); 3:1 is enough for text of 24 CSS pixels or more, or of 18.66 or more when bold. The theme puts no picture or gradient behind text. The edge of a field (its border against the colour around it) has at least 3:1.
+- No text is smaller than 12 CSS pixels, and what a person reads to act (a form's labels, its fields, its buttons, a refusal's words) is 16 or more.
+
+### What can be pressed
+
+- Every button and every field (`<button>`, `<input>` that is not hidden, `<select>`, `<textarea>`) is at least 24 by 24 CSS pixels, and so is every link that is not inside a sentence. A form's submit button and its text fields are at least 44 CSS pixels high.
+- **Focus can be seen.** Each link, button and field, when the keyboard brings the focus to it, has an outline at least 2 CSS pixels wide (the computed `outline-style` is not `none`), whose colour has at least 3:1 against the colour of the page behind it. This holds in light and in dark.
+- Nothing moves for a reader whose browser says `prefers-reduced-motion: reduce`: no transition and no animation has a duration then.
+
+### Narrow
+
+- As "A real browser in the gate: What it walks" says of 320 CSS pixels: still true of each page, in light and in dark.
+
+### How it is tested
+
+A walk of the gate (`blackbox/tests/browser_look.rs`) opens, in a browser set to light and again in one set to dark: the Dashboard's list with Applications in it, one Application's page as a Contributor sees it (its sharing form on it), the sign-out page, the tool's sign-in page, a page of refusal, and the local run's test-User page; on each it measures what this section says (the one `<style>`, the `color-scheme`, the one `<h1>`, the background against the text, every text's contrast, the sizes, the focus outline of each thing the keyboard reaches, the width at 320). The tool's own page is read as the tool serves it during a sign-in: its policy, its one `<style>`, its `color-scheme`.
+
+### What this does not close
+
+- Whether a page is pleasant is not a test's to say: the pages are looked at in a real browser, at 320, 768 and 1280 CSS pixels, light and dark, whenever they change, by the method of the project's UI/UX skill (`.claude/skills/ui-ux/`).
+- A switch on the page between light and dark (it follows the browser); a language other than English; print.
