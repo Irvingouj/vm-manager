@@ -63,7 +63,9 @@ fn what_its_code_was_given_counts_for_its_user_and_nothing_refused_before_the_co
     anonymous.expect_status(401);
     let not_shared = vm.get_as(&bob(), "secret", "/hello");
     not_shared.expect_status(403);
-    let no_version = vm.get_as(&bob(), "empty", "/hello");
+    // By alice, its Contributor: to bob, with whom it is not shared, it
+    // would be the `403` before.
+    let no_version = vm.get_as(&alice(), "empty", "/hello");
     no_version.expect_status(404);
     let disabled = vm.get_as(&bob(), "stopped", "/hello");
     disabled.expect_status(503);

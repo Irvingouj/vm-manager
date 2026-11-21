@@ -312,8 +312,9 @@ fn malformed_parameters_are_refused_and_other_methods_are_not_allowed() {
     ] {
         assert_api_error(&list(&vm, &administrator(), &query), 400, "malformed");
     }
-    // A 63-character name is one an Application could have.
-    let longest = "a".repeat(63);
+    // A 63-character name is one an Application could have; nothing here
+    // comes after this one.
+    let longest = "z".repeat(63);
     assert_eq!(
         list_page(&vm, &format!("?after={longest}"))["applications"],
         json!([])

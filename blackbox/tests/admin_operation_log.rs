@@ -147,7 +147,7 @@ fn each_filter_alone_answers_exactly_the_entries_that_match_it() {
             &matching(&all, |e| e["application"] == application),
         );
     }
-    for resource in [RESOURCE, RO, GHOST, "never-registered"] {
+    for resource in [RESOURCE, RO, GHOST, "never_registered"] {
         assert_filtered(
             &t,
             &format!("resource={resource}"),
@@ -411,7 +411,7 @@ fn a_malformed_parameter_is_refused_naming_it() {
     // Other parameters are ignored.
     let page = log_page(t.vm(), "?sort=desc&page=2&limit=1");
     assert_eq!(page["entries"].as_array().unwrap().len(), 1);
-    // `+` is a plus: a time written with a raw `+` is a space, not taken.
+    // A raw `+` is read as a space: a time written with one is not taken.
     let raw_plus = operation_log(t.vm(), &administrator(), "?since=2026-11-21T10:00:00+01:00");
     assert_api_error(&raw_plus, 400, "malformed");
     for method in ["POST", "PUT", "DELETE"] {

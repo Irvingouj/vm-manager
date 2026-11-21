@@ -88,6 +88,7 @@ fn a_new_project_deploys_as_it_stands_and_a_signed_in_user_gets_its_page() {
             "structures": {},
             "pulled": [],
             "visible_to": null,
+            "disabled": null,
             "warnings": [],
             "notes": [],
         }),
