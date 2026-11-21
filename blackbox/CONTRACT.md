@@ -2882,7 +2882,7 @@ vibe serve ... [--storage-root <directory>]
 ```
 
 - `--storage-root` names the one directory beneath which every Storage Resource's directory must be. It is an absolute path; one that is not is a start-up failure ("Starting and stopping": non-zero within 15 seconds, a message naming `--storage-root`).
-- Without it, nothing else changes, and every Storage registration is refused `storage-not-configured`.
+- Without it, nothing else changes, every Storage registration is refused `storage-not-configured`, and a Storage Resource registered before cannot be used (`outside-storage-root`, "When the directory cannot be used").
 - With it, when it is not there or is not a directory, `vibe serve` **starts all the same** and writes before `listening` one record `{"event":"storage-root-unusable","problem":"missing" | "not-a-directory"}`; every registration is then refused `directory-missing` or `not-a-directory` (below), and Storage Resources already registered are as "When the directory cannot be used" says. The root itself need not be writable by the program: it writes only inside a Resource's directory, and that is what a registration checks.
 
 ### Registering a Storage Resource
@@ -2920,7 +2920,22 @@ vibe serve ... [--storage-root <directory>]
 
 ### When the directory cannot be used
 
-The program keeps each Storage Resource's directory open from when it loads the Resource (at start, at registration); its `.vibe-resource` is looked at then and each time the directory is opened again, not at each operation. When it cannot open it, or the directory's `.vibe-resource` is not there or names another Resource (a mount forgotten, another disk), the program's log has `{"event":"storage-unavailable","resource":"<name>","problem":"missing" | "not-a-directory" | "not-marked" | "marked-for-another"}` at most once a minute while it lasts, and every allowed operation on the Resource fails `{ error: { kind: "unavailable" } }`, its Operation log entry `failed` with `error` `unavailable`. Nothing is written anywhere then. It tries again at most every 10 seconds, at an operation; once the directory can be used, operations work, with no restart.
+The program keeps each Storage Resource's directory open from when it loads the Resource (at start, at registration); its `.vibe-resource` is looked at then and each time the directory is opened again, not at each operation. **Each time it opens the directory, at start too, it reaches it as a registration does**: from the storage root it was started with, one component at a time, following no link.
+
+When it cannot open it so, or the directory's `.vibe-resource` is not there or names another Resource (a mount forgotten, another disk), the program's log has `{"event":"storage-unavailable","resource":"<name>","problem":"<problem>"}` at most once a minute while it lasts (and at once when the problem becomes another), and every allowed operation on the Resource fails `{ error: { kind: "unavailable" } }`, its Operation log entry `failed` with `error` `unavailable`. Nothing is written anywhere then. It tries again at most every 10 seconds, at an operation; once the directory can be used, operations work, with no restart, and the log has `{"event":"storage-available","resource":"<name>"}`.
+
+| `problem` | When |
+|---|---|
+| `outside-storage-root` | The program was started without `--storage-root`, or with one the directory is not beneath |
+| `link` | A component of the directory beneath the storage root, or the directory itself, is now a symbolic link |
+| `missing` | It is not there |
+| `not-a-directory` | It is there and is not a directory |
+| `not-marked` | It holds no `.vibe-resource` the program wrote |
+| `marked-for-another` | Its `.vibe-resource` names another Resource |
+| `no-answer` | Its file system did not answer in time (below) |
+
+- **While the program runs** it also looks, at an operation and at most every 10 seconds, whether the directory's path still names the directory it holds open. When it does not (the directory was moved away or removed, another disk was mounted at its place), it lets go of the one it held and opens the path again as above. So within about 10 seconds nothing more is written into a directory that is no longer at its place, the Resource is `storage-unavailable` when what is at its place cannot be used, and it is in use again, with no restart, once the directory is back.
+- **At start** the directories are opened together, and the program waits for them at most 3 seconds in all. One whose file system has not answered by then (a network mount whose server is away) is `storage-unavailable` with `no-answer`: it does not keep the program from starting, holds one of the file threads ("Bounds") until its file system answers, and is in use as soon as it does. (No black-box test can make a file system hang; this is read in the code at review.)
 
 ### The Manifest, Declared access and a Version
 
@@ -2996,6 +3011,7 @@ export interface Storage<Name extends string = string> extends ReadOnlyStorage<N
 
 - `ctx.user().storage(name)`: a Storage Resource the Manifest declares, as the User: a `Storage<"<name>">` when declared at `write`, a `ReadOnlyStorage<"<name>">` when declared at `read` (each assignable to `Storage` and `ReadOnlyStorage` written without a name). A handle holds no identity; every call is one host operation decided from the request in flight, as for databases.
 - `ctx.user().db(name)` takes only names declared `postgres`, and `storage(name)` only names declared `storage`.
+- Besides the members above, `ReadOnlyStorage<Name>` carries `put` and `delete` typed so that no call of them compiles (their `this` is the message of "Compile errors" below, which is how the compiler comes to say it); `Storage<Name>` declares them as above.
 - Each call is exactly one host operation (below), and so one Operation log entry. `files`, `folders` and `cursor` are the host's answer; `lastModified` is a `Date` of the host's time.
 - A refusal rejects with `Refused`, a failure with `OperationFailed` (`kind` the host's `error.kind`, `detail` its whole error), as for databases ("The SDK: Refusals and failures"). A `Refused` that escapes `fetch` is the `403` with `{ refusal, fix }`; an `OperationFailed` the fixed `500`.
 - A `body` that is none of the three, a `key` that is not a string, `options` of the wrong shape (not an object, or a member of the wrong type, such as `prefix: 5`): a `TypeError`, and nothing is sent to the host. Everything else (the key's rules, the bounds) is the host's to decide, so that it is logged.
@@ -3027,10 +3043,10 @@ A key is taken when every one of these holds; otherwise the operation fails `{ e
 | `dot-segment` | have no segment that is `.` or `..` |
 | `character` | hold no control character (U+0000 to U+001F, U+007F to U+009F), no `\`, and none of U+061C, U+200E, U+200F, U+202A to U+202E, U+2066 to U+2069 |
 | `not-nfc` | be in Unicode normalisation form C (`café` is refused; `café` is taken) |
-| `reserved` | have no segment that begins with `.vibe-` |
+| `reserved` | have no segment that begins with `.vibe-`, in any letter case (`.VIBE-resource` and `a/.Vibe-x` are refused: on a disk that does not tell letter case apart they would be the platform's own names) |
 
 - When several rules are broken, the first in the table is named.
-- Letter case matters: `Report.pdf` and `report.pdf` are two files.
+- Letter case matters (but for `reserved`): `Report.pdf` and `report.pdf` are two files.
 - Everything else is taken: spaces, `#`, `%`, `&`, `[`, `'`, a segment `.hidden`, non-Latin letters (`报告/第三季度.pdf`).
 - **A file and a folder of the same name cannot both exist.** A `put` of `a/b` while `a` is a file, or of `a` while a file's key begins with `a/`, fails `{ error: { kind: "key-conflict", message } }` and writes nothing.
 - A **prefix** (of `list`) is `""`, or a string `p` such that `p + "x"` is a key that is taken, so of at most 1,023 bytes (`reports/`, `rep`, `报告/`, and also `.`, `..` and `a/` are prefixes; `../`, `/x` and `a//` are not: `invalid-key` with the rule `p + "x"` breaks).
@@ -3110,7 +3126,7 @@ Every Storage operation, allowed, refused or failed, has one entry, written befo
 | `statement` | the operation's word and its key, the key written as a JSON string: `get "reports/q3.pdf"`, `put "reports/q4.pdf"`, `head "..."`, `delete "..."`; for a list `list "<prefix>"`, and `list "<prefix>" delimiter "/"` with the delimiter. In that JSON string every character the rule `character` names (the controls U+0000 to U+001F and U+007F to U+009F, and the bidirectional marks; not `\`, which JSON writes `\\`) is written `\uXXXX` (four hex digits, lower case), so that an entry is safe to print. A key that breaks a rule is written the same, and one longer than 1,024 bytes is cut after its first 1,024 bytes (at a character's end) and `...` follows the closing quote: `put "<the first 1,024 bytes>"...`. |
 | `rows` | head and get: `1` when a file was answered, `0` for `null`; put: `1`; delete: null; list: the number of files and folders answered; null unless it ended |
 | `outcome`, `reason`, `error` | as for any operation; `error` as the table of failures says |
-| `duration_ms` | from when the directory was first touched; null when it was not |
+| `duration_ms` | from when the operation was handed to the directory (its entry written), to its end, the wait for a file thread included; null when it ended before that (a refusal, `invalid-key`, a put's `limit` `bytes`) |
 
 - **No field holds a file's contents**, its content type or its size: only its key. The cursor is not recorded.
 - The program's `host-call` record names the operation (`storage.get`, ...) as for any call.
@@ -3122,9 +3138,10 @@ For a Resource whose directory is `<dir>`:
 
 - After a put of `key`, the file `<dir>/<key>` (its segments as folders) holds exactly the bytes put, as a regular file with a link count of 1, owned by the program's user, mode `0640`; each folder it needed was made with mode `0750`. Its extended attribute `user.vibe.content-type` holds the content type given (none when none was given). Its time of modification is the time of last change, to the second.
 - After a delete, `<dir>/<key>` is gone, and so is every folder of it left empty.
+- A put that fails leaves nothing behind: its file in `.vibe-staging/` is removed, and so are the folders it made for its key (those still empty). (No black-box test can make a put fail after it has made a folder; this is read in the code at review.) Only a program killed in the instant between making a put's folders and landing its file can leave an empty folder: it is never listed, the next delete beneath it or `rmdir` on the host removes it, and until then it is as an empty folder made by hand ("Nothing reaches outside": a put of its own name as a key is `key-conflict`).
 - A file placed in `<dir>` by hand (by someone on the host) whose path is a key that is taken is a file of the Resource like any other: listed, read, replaced, deleted, with the content type of the table when it has no attribute.
 - Besides the files, `<dir>` holds `.vibe-resource` and `.vibe-staging/`, which are never listed or reachable (their names are `reserved`). `.vibe-staging/` is empty when no put is under way; what a crash left there is removed when the Resource is next loaded.
-- Names on the disk that are not keys that are taken (a control character, `\`, a name beginning with `.vibe-`, a name not in NFC) are never listed and cannot be reached.
+- Names on the disk that are not keys that are taken (a control character, `\`, a name beginning with `.vibe-` in any letter case, a name not in NFC) are never listed and cannot be reached.
 
 ### Nothing reaches outside
 
@@ -3189,4 +3206,5 @@ From this ticket on the template's `AGENTS.md` names `ctx.user().storage(name)` 
 - Showing a Storage Resource's location to a Platform administrator, changing it, or removing a Resource: the ticket "Resources and Grants in full".
 - Someone with write access to the host's folder can change or remove files the Applications then read; the platform guarantees only that it reads and writes nothing outside the folder, and that what it writes is whole.
 - Hard links planted on the host are read as files (ADR 0019).
+- A file someone on the host writes in place while an Application reads it may be answered in part. Files are placed whole by renaming them into the directory, as the platform itself does.
 - The local loop on Windows (keys with `:`, `*`, `?`, `"`, `<`, `>`, `|`, or ending with `.` or a space, which Windows cannot name): the ticket on the three systems.
