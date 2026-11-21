@@ -31,8 +31,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use blackbox::firefox::{
-    self, ENV, Firefox, MIN_VERSION, NO_BROWSER, NOT_ABSOLUTE, Options, Process, WHAT_TO_DO,
-    no_wider_than, processes_naming,
+    self, ENV, Firefox, MIN_VERSION, NO_BROWSER, NOT_ABSOLUTE, Options, Process, Scheme,
+    WHAT_TO_DO, no_wider_than, processes_naming,
 };
 use blackbox::program::{run_to_exit, write_program};
 use blackbox::release::Folder;
@@ -414,6 +414,95 @@ fn the_width_check_holds_the_window_to_320_css_pixels_and_fails_for_a_page_wider
         too_wide.as_ref().is_err_and(|e| e.contains("wider")),
         "expected the check to fail for a page wider than its window, got {too_wide:?}"
     );
+}
+
+/// A page that says what the browser tells it: the scheme it prefers, the
+/// motion, and the colour of its canvas (the `Canvas` colour, as the page's
+/// `color-scheme` meta lets the browser choose it).
+const SCHEME_PAGE: &str = "data:text/html,<meta name=color-scheme content='light dark'><p>x</p>";
+
+/// What [`SCHEME_PAGE`] says: `[dark matches, light matches, reduced
+/// motion matches, the canvas's background colour]`.
+fn told(browser: &mut Firefox) -> serde_json::Value {
+    browser.navigate(SCHEME_PAGE);
+    browser.script(
+        "const p = document.createElement('div'); p.style.backgroundColor = 'Canvas'; document.body.appendChild(p); const canvas = getComputedStyle(p).backgroundColor; p.remove(); return [matchMedia('(prefers-color-scheme: dark)').matches, matchMedia('(prefers-color-scheme: light)').matches, matchMedia('(prefers-reduced-motion: reduce)').matches, canvas];",
+        &[],
+    )
+}
+
+#[test]
+fn a_browser_set_to_dark_or_to_light_tells_pages_so_and_their_canvas_follows() {
+    // (CONTRACT.md, "How the pages look: How it is tested": a walk "in a
+    // browser set to light and again in one set to dark"; a walk that
+    // measured light twice would be worthless.)
+    let mut dark = Firefox::start_with(&Options::default().in_scheme(Scheme::Dark));
+    let said = told(&mut dark);
+    eprintln!("a browser set to dark: {said}");
+    assert_eq!(said[0], true, "dark: prefers-color-scheme: dark matches");
+    assert_eq!(said[1], false, "dark: prefers-color-scheme: light does not");
+    assert_ne!(
+        said[3], "rgb(255, 255, 255)",
+        "dark: a page of `color-scheme: light dark` has a dark canvas, not white"
+    );
+    drop(dark);
+    let mut light = Firefox::start_with(&Options::default().in_scheme(Scheme::Light));
+    let said = told(&mut light);
+    eprintln!("a browser set to light: {said}");
+    assert_eq!(
+        said[0], false,
+        "light: prefers-color-scheme: dark does not match"
+    );
+    assert_eq!(said[1], true, "light: prefers-color-scheme: light matches");
+    assert_eq!(said[3], "rgb(255, 255, 255)", "light: the canvas is white");
+}
+
+#[test]
+fn a_browser_set_to_reduce_motion_tells_pages_so_and_a_tab_brings_a_focus_that_is_visible() {
+    let mut browser = Firefox::start_with(&Options::default().reducing_motion());
+    let said = told(&mut browser);
+    assert_eq!(
+        said[2], true,
+        "prefers-reduced-motion: reduce matches: {said}"
+    );
+    drop(browser);
+    let mut browser = Firefox::start_with(&Options::default());
+    let said = told(&mut browser);
+    assert_eq!(
+        said[2], false,
+        "without it, prefers-reduced-motion: reduce does not match: {said}"
+    );
+    browser.navigate(
+        "data:text/html,<p>x <a href='about:blank'>a link</a></p><button id=b>b</button>",
+    );
+    let focused = |browser: &mut Firefox| {
+        browser.script(
+            "const a = document.activeElement; return [a ? a.localName : null, a ? a.matches(':focus-visible') : null];",
+            &[],
+        )
+    };
+    browser.press_key(firefox::TAB);
+    let first = focused(&mut browser);
+    browser.press_key(firefox::TAB);
+    let second = focused(&mut browser);
+    eprintln!("the Tab key focused {first} then {second}");
+    assert_eq!(
+        first,
+        serde_json::json!(["a", true]),
+        "the first Tab focuses the link, visibly"
+    );
+    assert_eq!(
+        second,
+        serde_json::json!(["button", true]),
+        "the second Tab focuses the button, visibly"
+    );
+    // A focus given by a script alone is not what the keyboard gives: the
+    // walk of the pages uses the keyboard.
+    let scripted = browser.script(
+        "document.activeElement.blur(); const a = document.querySelector('a'); a.focus(); return a.matches(':focus-visible');",
+        &[],
+    );
+    eprintln!("a link focused by a script alone matches :focus-visible: {scripted}");
 }
 
 #[test]

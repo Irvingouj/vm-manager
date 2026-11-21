@@ -115,6 +115,9 @@ pub const MAX_MESSAGE: usize = 32 * 1024 * 1024;
 /// How many ports a start tries for Marionette.
 const PORT_TRIES: usize = 3;
 
+/// The Tab key, as WebDriver's key actions name it.
+pub const TAB: char = '\u{E004}';
+
 /// The key of an element's reference in Marionette's answers.
 const ELEMENT_KEY: &str = "element-6066-11e4-a52e-4f735466cecf";
 
@@ -273,6 +276,35 @@ pub struct Options {
     /// trusted beyond the browser's own, and a certificate it cannot check
     /// is refused (`acceptInsecureCerts` false).
     pub authorities: Vec<Vec<u8>>,
+    /// The colour scheme the browser tells pages it prefers
+    /// (`prefers-color-scheme`); `None` leaves the browser's own.
+    pub scheme: Option<Scheme>,
+    /// Whether the browser tells pages its reader prefers less motion
+    /// (`prefers-reduced-motion: reduce`).
+    pub reduced_motion: bool,
+}
+
+/// A colour scheme a browser may be set to prefer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scheme {
+    Light,
+    Dark,
+}
+
+impl Scheme {
+    /// `light` or `dark`, as `prefers-color-scheme` names it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Light => "light",
+            Self::Dark => "dark",
+        }
+    }
+}
+
+impl fmt::Display for Scheme {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
 }
 
 impl Options {
@@ -280,8 +312,22 @@ impl Options {
     pub fn reaching(names: &[String]) -> Self {
         Self {
             names: names.to_vec(),
-            authorities: Vec::new(),
+            ..Self::default()
         }
+    }
+
+    /// As it is, telling pages it prefers this colour scheme.
+    #[must_use]
+    pub fn in_scheme(mut self, scheme: Scheme) -> Self {
+        self.scheme = Some(scheme);
+        self
+    }
+
+    /// As it is, telling pages its reader prefers less motion.
+    #[must_use]
+    pub fn reducing_motion(mut self) -> Self {
+        self.reduced_motion = true;
+        self
     }
 
     /// As it is, also trusting this authority (its certificate in DER).
@@ -295,7 +341,7 @@ impl Options {
 /// The preferences a browser of the harness's is started with, one
 /// `user_pref(...)` a line, each with its reason.
 pub fn preferences(marionette_port: u16, options: &Options) -> String {
-    let prefs: Vec<(&str, Value)> = vec![
+    let mut prefs: Vec<(&str, Value)> = vec![
         // Marionette on the port the harness chose.
         ("marionette.port", json!(marionette_port)),
         // The installation's names reach the program on this machine.
@@ -393,7 +439,26 @@ pub fn preferences(marionette_port: u16, options: &Options) -> String {
             "toolkit.legacyUserProfileCustomizations.stylesheets",
             json!(true),
         ),
+        // The Tab key brings the focus to every link, button and field, as
+        // on a desktop of Linux (written down: a build whose default
+        // differs, as macOS's skips links, walks the same way).
+        ("accessibility.tabfocus", json!(7)),
     ];
+    if let Some(scheme) = options.scheme {
+        let dark = scheme == Scheme::Dark;
+        // What pages are told of `prefers-color-scheme` (0 dark, 1 light),
+        // and the system's own theme to match, so that nothing of the
+        // browser's says the other.
+        prefs.push((
+            "layout.css.prefers-color-scheme.content-override",
+            json!(if dark { 0 } else { 1 }),
+        ));
+        prefs.push(("ui.systemUsesDarkTheme", json!(i32::from(dark))));
+    }
+    if options.reduced_motion {
+        // `prefers-reduced-motion: reduce`.
+        prefs.push(("ui.prefersReducedMotion", json!(1)));
+    }
     let mut text = String::new();
     for (name, value) in prefs {
         text.push_str(&format!("user_pref({}, {value});\n", json!(name)));
@@ -1218,6 +1283,52 @@ impl Firefox {
             "WebDriver:ElementSendKeys",
             &json!({ "id": element.0, "text": text }),
         );
+    }
+
+    /// Gives the page shown the focus, as a person's click into the window
+    /// does without clicking anything of it (`document.hasFocus()`): after
+    /// a form's submission a new page of a window without a window may not
+    /// have it, and then the keyboard's focus does not match
+    /// `:focus-visible`. Whether the page has the focus afterwards.
+    pub fn focus_page(&mut self) -> bool {
+        let has = |f: &mut Self| {
+            f.script("return document.hasFocus();", &[])
+                .as_bool()
+                .unwrap_or(false)
+        };
+        if has(self) {
+            return true;
+        }
+        let handle = self.must("WebDriver:GetWindowHandle", &json!({}))["value"].clone();
+        drop(self.command(
+            "WebDriver:SwitchToWindow",
+            &json!({ "handle": handle, "focus": true }),
+        ));
+        if has(self) {
+            return true;
+        }
+        self.script("window.focus(); return null;", &[]);
+        has(self)
+    }
+
+    /// Presses a key and lets it go, as a person does on the keyboard
+    /// (Marionette's key actions: the page sees a keyboard, so the focus a
+    /// Tab brings matches `:focus-visible`). `key` is a character or one
+    /// of WebDriver's codes, as [`TAB`].
+    pub fn press_key(&mut self, key: char) {
+        let key = key.to_string();
+        self.must(
+            "WebDriver:PerformActions",
+            &json!({ "actions": [{
+                "type": "key",
+                "id": "harness-keyboard",
+                "actions": [
+                    { "type": "keyDown", "value": key },
+                    { "type": "keyUp", "value": key }
+                ]
+            }] }),
+        );
+        self.must("WebDriver:ReleaseActions", &json!({}));
     }
 
     /// Sets the window's size, in the browser's own pixels.

@@ -70,7 +70,8 @@
 //!   a fresh profile of the test's own, driven over Marionette, and ended
 //!   with every process it started and its profile whatever happens to the
 //!   test; [`walks`] is what the tests that walk the platform's pages in it
-//!   share;
+//!   share, and [`look`] measures how a page looks in it (colours and
+//!   their contrast, sizes, the keyboard's focus, motion);
 //! - [`connection`] connects OIDC as an administrator would (the
 //!   installation's key, `vibe setup`, `vibe admin connect-oidc`, `PUT
 //!   /v1/oidc`), and [`tool_sign_ins`] is what the tests of the tool's
@@ -146,6 +147,7 @@ pub mod left_behind;
 pub mod local;
 pub mod log;
 pub mod logs;
+pub mod look;
 pub mod lost_answer;
 pub mod oidc;
 pub mod out_of_reach;
