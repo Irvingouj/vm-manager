@@ -14,10 +14,15 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ring::hmac;
 
 use super::Position;
-use super::key::KEY_BYTES;
+use super::key::{KEY_BYTES, SEGMENT_BYTES};
 
-/// The most bytes of a cursor: a position of 1,025 bytes is 1,367
-/// characters, its seal 43, and the dot.
+/// The longest position: the last name a list passed, which may be a name
+/// on the disk that is no key (a folder too long to hold one is passed
+/// whole): a folder's keys (less than [`KEY_BYTES`]), a name and a `/`.
+const POSITION_BYTES: usize = KEY_BYTES + SEGMENT_BYTES + 1;
+
+/// The most bytes of a cursor: a position of [`POSITION_BYTES`] and its
+/// flag (1,281 bytes) is 1,708 characters, its seal 43, and the dot.
 pub const CURSOR_BYTES: usize = 2048;
 
 /// The bytes of the key cursors are sealed with.
@@ -80,7 +85,7 @@ impl Sealer {
         )
         .ok()?;
         let (flag, last) = payload.split_first()?;
-        if last.len() > KEY_BYTES {
+        if last.len() > POSITION_BYTES {
             return None;
         }
         let last = String::from_utf8(last.to_vec()).ok()?;

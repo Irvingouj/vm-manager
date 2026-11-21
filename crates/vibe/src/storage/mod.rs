@@ -61,8 +61,12 @@ pub const ROOM_WAIT: Duration = Duration::from_secs(5);
 /// The time an operation has from the moment it is decided.
 pub const OPERATION_TIME: Duration = Duration::from_secs(10);
 
+/// How long a list looks before it answers what it has, with the cursor
+/// of where it got to: a page may hold fewer than `limit`, even nothing.
+pub const LOOK_TIME: Duration = Duration::from_secs(5);
+
 /// The most files and folders one list answers, and how many without
-/// `limit`.
+/// `limit`; also how many names one pass over a folder keeps.
 pub const PAGE: usize = 1000;
 pub const DEFAULT_PAGE: usize = 100;
 
@@ -127,7 +131,8 @@ pub struct ListQuery {
 pub struct Page {
     pub files: Vec<Metadata>,
     pub folders: Vec<String>,
-    /// Where the next page starts; `None` when nothing follows.
+    /// Where the next page starts (the last name passed, answered or
+    /// not); `None` only when nothing follows.
     pub next: Option<Position>,
 }
 
@@ -167,7 +172,10 @@ pub enum Failure {
     /// The place of files cannot be used now, any other error of it, or no
     /// room for the operation now.
     Unavailable,
-    /// Given up by the host (a disable) before it landed: nothing was done.
+    /// Given up by the host (a disable). Looked at before anything is
+    /// changed and once more before a put lands; a put given up while its
+    /// last system calls run (the rename, the `fsync`s) may have landed,
+    /// whole, as one past its time may.
     Stopped,
 }
 
@@ -258,11 +266,14 @@ pub fn encoded_len(bytes: usize) -> usize {
 }
 
 /// A put's body as the raw interface carries it: base64 text, looked at
-/// but not decoded.
+/// but not decoded; and, once the put is allowed, its room among
+/// [`BODIES_AT_ONCE`], which goes wherever the body goes (into the file
+/// job) and is given back only when the body and its bytes are gone.
 #[derive(Debug)]
 pub struct Body {
     text: String,
     bytes: usize,
+    room: Option<Room>,
 }
 
 /// What a put's `body` text is.
@@ -272,6 +283,13 @@ pub enum BodyText {
     Within(Body),
     /// Longer than [`BODY_TEXT`]: past the bound whatever it holds.
     Past,
+    /// Within the bound, but there was no room for it among
+    /// [`BODIES_AT_ONCE`] when the put was decided: its text was dropped
+    /// then, and the put fails `unavailable` in its place in the order.
+    NoRoom,
+    /// The put was refused: its text was dropped at the decision, and is
+    /// never looked at.
+    Dropped,
 }
 
 impl Body {
@@ -301,7 +319,11 @@ impl Body {
             (3, 0 | 1) if last & 0x03 == 0 => data.len() / 4 * 3 + 2,
             _ => return Err(NOT_BASE64),
         };
-        Ok(BodyText::Within(Self { text, bytes }))
+        Ok(BodyText::Within(Self {
+            text,
+            bytes,
+            room: None,
+        }))
     }
 
     /// The number of bytes it decodes to.
@@ -318,12 +340,23 @@ impl Body {
         self.text.len()
     }
 
-    /// The bytes. `None` only if [`Body::read`] and the decoder disagree,
-    /// which they do not.
-    pub fn decode(self) -> Option<Vec<u8>> {
-        let mut bytes = Vec::with_capacity(self.bytes);
-        ENGINE.decode_vec(self.text.as_bytes(), &mut bytes).ok()?;
-        (bytes.len() == self.bytes).then_some(bytes)
+    /// The body holding `room`, taken for it.
+    pub fn with_room(self, room: Room) -> Self {
+        Self {
+            room: Some(room),
+            ..self
+        }
+    }
+
+    /// The bytes, the text dropped; and the room the body held, for the
+    /// caller to keep until the bytes are gone. `None` only if
+    /// [`Body::read`] and the decoder disagree, which they do not.
+    pub fn decode(self) -> Option<(Vec<u8>, Option<Room>)> {
+        let Self { text, bytes, room } = self;
+        let mut decoded = Vec::with_capacity(bytes);
+        ENGINE.decode_vec(text.as_bytes(), &mut decoded).ok()?;
+        drop(text);
+        (decoded.len() == bytes).then_some((decoded, room))
     }
 }
 
@@ -340,8 +373,10 @@ fn sextet(b: u8) -> Option<u8> {
 }
 
 /// The program's one budget of bodies held at once ([`BODIES_AT_ONCE`]):
-/// a put takes room for its bytes and its text before it decodes, a get
-/// for its file and its text before it reads.
+/// a put takes room for its bytes and its text when it is decided, without
+/// waiting ([`Bodies::try_take`]); a get for its file and its text before
+/// it reads, waiting up to [`ROOM_WAIT`] with nothing held
+/// ([`Bodies::take`]).
 pub struct Bodies {
     room: Arc<Semaphore>,
 }
@@ -359,14 +394,34 @@ impl Default for Bodies {
 }
 
 impl Bodies {
+    /// The permits a body of `bytes` bytes and its base64 text takes;
+    /// `None` for none.
+    fn wanted(bytes: usize) -> Option<u32> {
+        let wanted = bytes.saturating_add(encoded_len(bytes));
+        if wanted == 0 {
+            return None;
+        }
+        u32::try_from(wanted.min(BODIES_AT_ONCE)).ok()
+    }
+
+    /// Room for a body of `bytes` bytes and its base64 text, now, without
+    /// waiting; `None` when there is none.
+    pub fn try_take(&self, bytes: usize) -> Option<Room> {
+        let Some(wanted) = Self::wanted(bytes) else {
+            return Some(Room(None));
+        };
+        Arc::clone(&self.room)
+            .try_acquire_many_owned(wanted)
+            .ok()
+            .map(|permit| Room(Some(permit)))
+    }
+
     /// Room for a body of `bytes` bytes and its base64 text, waiting up to
     /// [`ROOM_WAIT`]; `None` when there was none.
     pub async fn take(&self, bytes: usize) -> Option<Room> {
-        let wanted = bytes.saturating_add(encoded_len(bytes));
-        if wanted == 0 {
+        let Some(wanted) = Self::wanted(bytes) else {
             return Some(Room(None));
-        }
-        let wanted = u32::try_from(wanted.min(BODIES_AT_ONCE)).ok()?;
+        };
         let room = Arc::clone(&self.room);
         match tokio::time::timeout(ROOM_WAIT, room.acquire_many_owned(wanted)).await {
             Ok(Ok(permit)) => Some(Room(Some(permit))),

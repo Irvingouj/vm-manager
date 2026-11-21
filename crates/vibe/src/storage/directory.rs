@@ -771,16 +771,33 @@ impl Backend for Directory {
             let size = usize::try_from(metadata.size).unwrap_or(BODY_BYTES);
             let room = bodies.take(size).await.ok_or(Failure::Unavailable)?;
             self.on_files(until.clone(), move |_| {
-                // At most the size `fstat` gave and one byte: a file that
-                // grew past the bound meanwhile fails, it is not read on.
-                let mut bytes = Vec::with_capacity(size);
-                std::fs::File::from(fd)
-                    .take(u64::try_from(size).unwrap_or(0).saturating_add(1))
-                    .read_to_end(&mut bytes)
-                    .map_err(|e| io_failure(&e))?;
-                if bytes.len() > BODY_BYTES {
-                    return Err(Failure::Bytes);
+                // Into a buffer of the size `fstat` gave and one byte, which
+                // never grows (so never past the room taken): one byte more
+                // than that size means the file grew while it was read; it
+                // is not answered as if whole. `limit` `bytes` when that is
+                // past the bound, else `unavailable`.
+                let mut bytes = vec![0_u8; size.saturating_add(1)];
+                let mut file = std::fs::File::from(fd);
+                let mut filled = 0;
+                while let Some(rest) = bytes.get_mut(filled..)
+                    && !rest.is_empty()
+                {
+                    match file.read(rest) {
+                        Ok(0) => break,
+                        Ok(n) => filled += n,
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                        Err(e) => return Err(io_failure(&e)),
+                    }
                 }
+                drop(file);
+                if filled > size {
+                    return Err(if filled > BODY_BYTES {
+                        Failure::Bytes
+                    } else {
+                        Failure::Unavailable
+                    });
+                }
+                bytes.truncate(filled);
                 metadata.size = u64::try_from(bytes.len()).unwrap_or(0);
                 let body = encode(&bytes);
                 Ok(Some(Got {
@@ -850,7 +867,9 @@ fn put(
     content_type: Option<String>,
     until: &Until,
 ) -> Result<Metadata, Failure> {
-    let bytes = body.decode().ok_or(Failure::Unavailable)?;
+    // The text is dropped as it is decoded; the room is kept until the
+    // bytes are gone too.
+    let (bytes, room) = body.decode().ok_or(Failure::Unavailable)?;
     let staging = staging(opened)?;
     let name = format!("{}{}", this_run(), uuid::Uuid::new_v4().simple());
     let fd = rustix::fs::openat(
@@ -870,6 +889,7 @@ fn put(
     rustix::fs::fchmod(&staged.file, Mode::from_raw_mode(FILE_MODE)).map_err(failure)?;
     staged.file.write_all(&bytes).map_err(|e| io_failure(&e))?;
     drop(bytes);
+    drop(room);
     if let Some(content_type) = &content_type {
         rustix::fs::fsetxattr(
             &staged.file,
@@ -1133,8 +1153,12 @@ struct Lister<'q> {
     until: &'q Until,
     dev: u64,
     page: Page,
-    /// The last item answered.
-    last: Option<Position>,
+    /// The last name passed, answered or not (a folder passed whole is
+    /// `folder: true`): where the next page starts.
+    passed: Option<Position>,
+    /// When the list stops looking and answers what it has
+    /// ([`super::LOOK_TIME`] from its start).
+    looking: Instant,
     /// Something follows the page.
     more: bool,
 }
@@ -1239,7 +1263,8 @@ fn list(opened: &Opened, query: &ListQuery, until: &Until) -> Result<Page, Failu
         until,
         dev: opened.dev,
         page: Page::default(),
-        last: None,
+        passed: None,
+        looking: Instant::now() + super::LOOK_TIME,
         more: false,
     };
     let (folders, begins) = query.prefix.rsplit_once('/').unwrap_or(("", &query.prefix));
@@ -1260,7 +1285,11 @@ fn list(opened: &Opened, query: &ListQuery, until: &Until) -> Result<Page, Failu
     let dir = chain.last().map_or(opened.fd.as_fd(), AsFd::as_fd);
     lister.visit(dir, &base, begins)?;
     let mut page = lister.page;
-    page.next = if lister.more { lister.last } else { None };
+    page.next = if lister.more {
+        lister.passed.or_else(|| query.after.clone())
+    } else {
+        None
+    };
     Ok(page)
 }
 
@@ -1269,16 +1298,29 @@ impl Lister<'_> {
         self.page.files.len() + self.page.folders.len() >= self.query.limit
     }
 
+    /// `last` (a key, or a folder with `/` when `folder`) was passed.
+    fn pass(&mut self, last: String, folder: bool) {
+        self.passed = Some(Position { last, folder });
+    }
+
     /// Lists the folder `dir`, whose keys begin with `base`, its names
-    /// beginning with `begins`. Answers whether the page is done.
+    /// beginning with `begins`. Answers whether the page is done. Each
+    /// pass over the folder keeps the [`PAGE`]+1 smallest names left,
+    /// whatever the page's `limit`, so names passed over cost no more
+    /// than names answered.
     fn visit(&mut self, dir: BorrowedFd<'_>, base: &str, begins: &str) -> Result<bool, Failure> {
         let mut from = from_of(self.query.after.as_ref(), base);
         loop {
-            let want = self.query.limit.saturating_add(1).min(PAGE + 1);
-            let (entries, left) = smallest(dir, begins, from.as_ref(), want, self.until)?;
+            let (entries, left) = smallest(dir, begins, from.as_ref(), PAGE + 1, self.until)?;
             for entry in &entries {
                 if self.until.over() {
                     return Err(over(self.until));
+                }
+                // Looked long enough: what it has, with where it got to
+                // (once it got somewhere).
+                if self.passed.is_some() && Instant::now() >= self.looking {
+                    self.more = true;
+                    return Ok(true);
                 }
                 if self.item(dir, base, entry)? {
                     return Ok(true);
@@ -1300,10 +1342,6 @@ impl Lister<'_> {
     fn item(&mut self, dir: BorrowedFd<'_>, base: &str, entry: &Entry) -> Result<bool, Failure> {
         if entry.folder {
             let folder = format!("{base}{}/", entry.name);
-            // No key can be inside: past the bounds of a key.
-            if folder.len() >= KEY_BYTES || folder.matches('/').count() >= SEGMENTS {
-                return Ok(false);
-            }
             if self
                 .query
                 .after
@@ -1312,13 +1350,22 @@ impl Lister<'_> {
             {
                 return Ok(false);
             }
+            // No key can be inside: past the bounds of a key.
+            if folder.len() >= KEY_BYTES || folder.matches('/').count() >= SEGMENTS {
+                self.pass(folder, true);
+                return Ok(false);
+            }
             let fd = match open_folder(dir, &entry.name, self.dev) {
                 Ok(Step::Folder(fd)) => fd,
-                Ok(_) | Err(Failure::NotReachable(_) | Failure::Unavailable) => return Ok(false),
+                Ok(_) | Err(Failure::NotReachable(_) | Failure::Unavailable) => {
+                    self.pass(folder, true);
+                    return Ok(false);
+                }
                 Err(failure) => return Err(failure),
             };
             if self.query.delimiter {
                 if !holds_a_file(fd.as_fd(), &folder, self.dev, self.until, 0)? {
+                    self.pass(folder, true);
                     return Ok(false);
                 }
                 if self.full() {
@@ -1326,19 +1373,21 @@ impl Lister<'_> {
                     return Ok(true);
                 }
                 self.page.folders.push(folder.clone());
-                self.last = Some(Position {
-                    last: folder,
-                    folder: true,
-                });
+                self.pass(folder, true);
                 return Ok(false);
             }
-            return self.visit(fd.as_fd(), &folder, "");
-        }
-        let key = format!("{base}{}", entry.name);
-        if key::check(&key).is_err() {
+            if self.visit(fd.as_fd(), &folder, "")? {
+                return Ok(true);
+            }
+            self.pass(folder, true);
             return Ok(false);
         }
+        let key = format!("{base}{}", entry.name);
         if self.query.after.as_ref().is_some_and(|p| !p.before(&key)) {
+            return Ok(false);
+        }
+        if key::check(&key).is_err() {
+            self.pass(key, false);
             return Ok(false);
         }
         if self.full() {
@@ -1350,15 +1399,12 @@ impl Lister<'_> {
                 self.page
                     .files
                     .push(metadata(key.clone(), fd.as_fd(), &stat));
-                self.last = Some(Position {
-                    last: key,
-                    folder: false,
-                });
             }
             // Gone, or no longer a file: passed over.
             Ok(None) | Err(Failure::NotReachable(_) | Failure::Unavailable) => {}
             Err(failure) => return Err(failure),
         }
+        self.pass(key, false);
         Ok(false)
     }
 }
@@ -1503,6 +1549,12 @@ pub struct Root {
 /// checks.
 const CLAIM_WAIT: Duration = Duration::from_secs(5);
 
+/// The most registrations claimed at once: those under way, and those
+/// whose insert may still land and could not be read back (kept until the
+/// program stops). When it is full a registration is refused `503`
+/// `unavailable` ([`Refused::Busy`]), and nothing is made.
+pub const CLAIMS: usize = 64;
+
 /// The longest the checks of a registration may take.
 const CHECK_TIME: Duration = Duration::from_secs(10);
 
@@ -1621,25 +1673,51 @@ impl Root {
 
     /// Checks `directory` for the Resource `name` in the table's order and,
     /// when it passes, writes its marker and `.vibe-staging/`: on a file
-    /// thread. `taken` are the directories of the Resources registered. The
-    /// directory is claimed until [`Root::release`].
+    /// thread. `taken` reads the directories of the Resources registered;
+    /// it is called under the claims' lock, inside the checks, so that a
+    /// registration checked second sees the first, registered (in memory)
+    /// or still claimed. The directory is claimed until [`Root::release`]
+    /// or [`Root::undo`]. A registration nobody waits for any more (its
+    /// checks took more than [`CHECK_TIME`]) writes nothing, or undoes what
+    /// it wrote and gives its claim back.
     pub async fn prepare(
         self: &Arc<Self>,
         files: &Files,
         name: &str,
         directory: &str,
-        taken: Vec<Taken>,
+        taken: impl Fn() -> Vec<Taken> + Send + 'static,
     ) -> Result<Prepared, Refused> {
         let root = Arc::clone(self);
+        let undoing = Arc::clone(self);
         let name = name.to_owned();
         let directory = directory.to_owned();
-        let answer = files
-            .run(move || root.check_and_mark(&name, &directory, &taken))
+        let deadline = Instant::now() + CHECK_TIME;
+        let until = Until::new(deadline);
+        let mut answer = files
+            .run_or_undo(
+                move || root.check_and_mark(&name, &directory, &taken, &until),
+                move |answer| {
+                    if let Ok(prepared) = answer {
+                        undoing.undo_now(prepared);
+                    }
+                },
+            )
             .await
             .ok_or(Refused::Busy)?;
-        match tokio::time::timeout(CHECK_TIME, answer).await {
+        let waited =
+            tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), &mut answer).await;
+        match waited {
             Ok(Ok(prepared)) => prepared,
-            Ok(Err(_)) | Err(_) => Err(Refused::Busy),
+            Ok(Err(_)) => Err(Refused::Busy),
+            Err(_) => {
+                // Not waited for any more: an answer sent meanwhile is
+                // undone here; one sent after this is undone by the job.
+                answer.close();
+                if let Ok(Ok(prepared)) = answer.try_recv() {
+                    self.undo(files, prepared).await;
+                }
+                Err(Refused::Busy)
+            }
         }
     }
 
@@ -1649,24 +1727,32 @@ impl Root {
     pub async fn undo(self: &Arc<Self>, files: &Files, prepared: Prepared) {
         let root = Arc::clone(self);
         let claim = prepared.claim;
-        let undone = files
-            .run(move || {
-                if prepared.made_marker {
-                    rustix::fs::unlinkat(&prepared.opened.fd, MARKER, AtFlags::empty()).ok();
-                }
-                if prepared.made_staging {
-                    rustix::fs::unlinkat(&prepared.opened.fd, STAGING, AtFlags::REMOVEDIR).ok();
-                }
-                rustix::fs::fsync(&prepared.opened.fd).ok();
-                root.release(claim);
-            })
-            .await;
+        let undone = files.run(move || root.undo_now(prepared)).await;
         match undone {
             Some(answer) => {
                 tokio::time::timeout(CHECK_TIME, answer).await.ok();
             }
             None => self.release(claim),
         }
+    }
+
+    /// [`Root::undo`], on a file thread.
+    fn undo_now(&self, prepared: Prepared) {
+        let Prepared {
+            opened,
+            made_marker,
+            made_staging,
+            claim,
+            ..
+        } = prepared;
+        if made_marker {
+            rustix::fs::unlinkat(&opened.fd, MARKER, AtFlags::empty()).ok();
+        }
+        if made_staging {
+            rustix::fs::unlinkat(&opened.fd, STAGING, AtFlags::REMOVEDIR).ok();
+        }
+        rustix::fs::fsync(&opened.fd).ok();
+        self.release(claim);
     }
 
     /// The registration `claim` is over (registered, or undone).
@@ -1681,7 +1767,8 @@ impl Root {
         &self,
         name: &str,
         directory: &str,
-        taken: &[Taken],
+        taken: &dyn Fn() -> Vec<Taken>,
+        until: &Until,
     ) -> Result<Prepared, Refused> {
         let segments = segments_of(directory).ok_or(Refused::Outside)?;
         let beneath = self.beneath(&segments).ok_or(Refused::Outside)?;
@@ -1698,12 +1785,18 @@ impl Root {
         })?;
         probe(&opened)?;
         let mut claims = self.claims_within(CLAIM_WAIT)?;
+        if claims.len() >= CLAIMS {
+            return Err(Refused::Busy);
+        }
+        // Read now, under the claims' lock: a registration whose claim was
+        // given back is in memory by then.
+        let taken = taken();
         // In use: another Resource's directory, inside one, or holding one;
         // by path, by identity, and by marker.
         let identity = (opened.dev, opened.ino);
         let in_use_by_path =
             |other: &[String]| other.starts_with(&segments) || segments.starts_with(other);
-        for other in taken {
+        for other in &taken {
             let other_segments = other
                 .path
                 .to_str()
@@ -1736,6 +1829,10 @@ impl Root {
         if marked_above {
             return Err(Refused::InUse);
         }
+        // Nobody waits for it any more: nothing is written.
+        if until.over() {
+            return Err(Refused::Busy);
+        }
         let made_marker = match read_marker(opened.fd.as_fd()) {
             Marker::Names(marked) if marked == name => false,
             Marker::Names(_) => return Err(Refused::InUse),
@@ -1757,6 +1854,15 @@ impl Root {
                 return Err(refused);
             }
         };
+        if until.over() {
+            if made_marker {
+                rustix::fs::unlinkat(&opened.fd, MARKER, AtFlags::empty()).ok();
+            }
+            if made_staging {
+                rustix::fs::unlinkat(&opened.fd, STAGING, AtFlags::REMOVEDIR).ok();
+            }
+            return Err(Refused::Busy);
+        }
         rustix::fs::fsync(&opened.fd).ok();
         let claim = self
             .next_claim

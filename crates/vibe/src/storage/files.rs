@@ -99,6 +99,17 @@ impl Files {
         &self,
         job: impl FnOnce() -> T + Send + 'static,
     ) -> Option<oneshot::Receiver<T>> {
+        self.run_or_undo(job, drop).await
+    }
+
+    /// As [`Files::run`], but when the job's answer cannot be delivered
+    /// (nobody waits for it any more), `undelivered` is given it, on the
+    /// file thread: to undo what the job made.
+    pub async fn run_or_undo<T: Send + 'static>(
+        &self,
+        job: impl FnOnce() -> T + Send + 'static,
+        undelivered: impl FnOnce(T) + Send + 'static,
+    ) -> Option<oneshot::Receiver<T>> {
         let places = Arc::clone(&self.places);
         let place = match tokio::time::timeout(PLACE_WAIT, places.acquire_owned()).await {
             Ok(Ok(place)) => place,
@@ -114,7 +125,9 @@ impl Files {
         let handed = Handed {
             job: Box::new(move || {
                 // The operation may have stopped waiting.
-                reply.send(job()).ok();
+                if let Err(answer) = reply.send(job()) {
+                    undelivered(answer);
+                }
             }),
             place,
         };

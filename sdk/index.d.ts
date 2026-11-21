@@ -369,7 +369,10 @@ export interface ListOptions {
   readonly prefix?: string;
   /** Roll up every key holding a `/` after the prefix into its folder. */
   readonly delimiter?: "/";
-  /** 1 to 1000; 100 without it. */
+  /**
+   * The most files and folders a page holds: 1 to 1000; 100 without it. A
+   * page may hold fewer, even none, and still have a cursor.
+   */
   readonly limit?: number;
   /** A cursor a list of the same prefix and delimiter answered: the next page. */
   readonly cursor?: string;
@@ -379,7 +382,10 @@ export interface FileList {
   readonly files: readonly FileInfo[];
   /** With delimiter "/" only; each ends with "/". */
   readonly folders: readonly string[];
-  /** null when nothing follows. */
+  /**
+   * null only when nothing follows. A page may be short (fewer than `limit`,
+   * even empty) and still have a cursor: go on with it until it is null.
+   */
   readonly cursor: string | null;
 }
 

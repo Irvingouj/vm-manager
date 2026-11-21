@@ -1708,9 +1708,13 @@ impl Api {
         let Some(root) = &self.storage.root else {
             return Ok(storage_refused(storage::directory::Refused::NotConfigured));
         };
-        let taken = self.resources.storage_taken();
+        // Read inside the checks, under the claims' lock: not a copy made
+        // now, before another registration is in memory.
+        let resources = Arc::clone(&self.resources);
         let prepared = match root
-            .prepare(&self.storage.files, &name, directory, taken)
+            .prepare(&self.storage.files, &name, directory, move || {
+                resources.storage_taken()
+            })
             .await
         {
             Ok(prepared) => prepared,
@@ -1723,6 +1727,9 @@ impl Api {
             Some(Arc::clone(root)),
             &self.storage.files,
         );
+        // Copied: the name moves into the new Resource, and the error path
+        // reads the Resource back by it. A few bytes, once a registration.
+        let kept_name = name.clone();
         let new = NewResource {
             name,
             description,
@@ -1748,10 +1755,22 @@ impl Api {
                 Ok(name_taken())
             }
             Err(error) => {
-                // The insert may still land: the marker is kept, so that
-                // the Resource is usable if it does (and a registration
-                // asked again takes it).
-                root.release(prepared.claim());
+                // The insert may still land. Read it back: the claim is
+                // given back once the Resource is in memory, what was made
+                // is undone once it is known not to be registered, and the
+                // claim is kept (with the marker) when even that cannot be
+                // known, so that no other registration takes the directory.
+                match self.resources.find(&kept_name).await {
+                    Ok(Some(found))
+                        if found
+                            .storage()
+                            .is_some_and(|d| d.path() == prepared.directory.as_path()) =>
+                    {
+                        root.release(prepared.claim());
+                    }
+                    Ok(_) => root.undo(&self.storage.files, prepared).await,
+                    Err(_) => {}
+                }
                 Err(error)
             }
         }

@@ -10,11 +10,20 @@
 //!    ([`PlatformGateway::decide_kind`]);
 //! 3. in a task of its own (as every operation): a refusal's entry; then
 //!    the key's rules (`invalid-key`, a whole `failed` entry, nothing
-//!    touched), a put's body past the bound (`limit` `bytes`, the same);
-//!    then the entry written `unfinished` (`log-unavailable` if it cannot
-//!    be); then, for a put, room among the bodies held at once; then the
-//!    backend's operation, within 10 seconds of the decision, given up if
-//!    the Application is disabled meanwhile; and the entry completed.
+//!    touched), a put's body past the bound (`limit` `bytes`, the same), a
+//!    put that found no room for its body (`unavailable`, the same); then
+//!    the entry written `unfinished` (`log-unavailable` if it cannot be);
+//!    then the backend's operation, within 10 seconds of the decision,
+//!    given up if the Application is disabled meanwhile; and the entry
+//!    completed.
+//!
+//! A put's body takes its room among the bodies held at once at the
+//! decision ([`PlatformGateway::hold`]), without waiting: a refused put
+//! keeps none of its body, and one that finds no room drops its text at
+//! once. The room goes with the body into the file job and is given back
+//! when the body's text and bytes are gone, not when the host stops
+//! waiting. A get takes its room before it reads (crate::storage::Backend)
+//! and holds it until its answer is handed on.
 //!
 //! The statement written in the entry is the operation's word and its key
 //! (crate::storage::key::quoted); no entry holds a file's contents, content
@@ -38,7 +47,7 @@ use crate::runner::InFlight;
 use crate::storage::cursor::Sealer;
 use crate::storage::{
     BODY_BYTES, Backend, Body, BodyText, DEFAULT_PAGE, Failure, Got, Key, ListQuery, Metadata,
-    OPERATION_TIME, PAGE, Page, Position, Storage, Until, is_content_type, key as keys,
+    OPERATION_TIME, PAGE, Page, Position, Room, Storage, Until, is_content_type, key as keys,
 };
 
 /// One of the five operations.
@@ -247,7 +256,7 @@ impl PlatformGateway {
         active: bool,
         args: Value,
     ) -> Decision {
-        let read = match read(op, args, &self.storage.cursors) {
+        let mut read = match read(op, args, &self.storage.cursors) {
             Ok(read) => read,
             // With no request in flight nothing is answered but that.
             Err(_) if !active => return Decision::refused(&Refusal::no_request()),
@@ -262,6 +271,12 @@ impl PlatformGateway {
             in_flight,
             active,
         );
+        if let Asked::Put { body, .. } = &mut read.asked {
+            *body = self.hold(
+                std::mem::replace(body, BodyText::Dropped),
+                refusal.is_some(),
+            );
+        }
         let work = StorageWork {
             op,
             in_flight: Arc::clone(in_flight),
@@ -280,6 +295,32 @@ impl PlatformGateway {
         }
         let refused = work.refusal.as_ref().map(|r| r.reason);
         self.dispatch(work, refused, StorageWork::run)
+    }
+
+    /// A put's body at its decision: dropped when the put is refused; else
+    /// given room among the bodies held at once now, without waiting, or
+    /// dropped at once when there is none (the put then fails
+    /// `unavailable` in its place in the order). So no put waits holding
+    /// its body.
+    fn hold(&self, body: BodyText, refused: bool) -> BodyText {
+        match body {
+            _ if refused => BodyText::Dropped,
+            BodyText::Within(body) if body.len() <= BODY_BYTES => {
+                match self.storage.bodies.try_take(body.len()) {
+                    Some(room) => BodyText::Within(body.with_room(room)),
+                    None => {
+                        log::record(
+                            "storage-busy",
+                            json!({ "problem": "no room for the body among those held at once" }),
+                        );
+                        BodyText::NoRoom
+                    }
+                }
+            }
+            // Past the bound: `limit` `bytes`, its text not kept.
+            BodyText::Within(_) | BodyText::Past => BodyText::Past,
+            other @ (BodyText::NoRoom | BodyText::Dropped) => other,
+        }
     }
 }
 
@@ -458,23 +499,6 @@ impl StorageWork {
         // for room and for a file thread included.
         let started = tokio::time::Instant::now();
         let elapsed = || Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
-        // Room for a put's body among the bodies held at once (a get takes
-        // its own once it knows the file's size).
-        let _room = match &checked {
-            Checked::Put { body, .. } => match self.storage.bodies.take(body.len()).await {
-                Some(room) => Some(room),
-                None => {
-                    log::record(
-                        "storage-busy",
-                        json!({ "problem": "no room for the body among those held at once" }),
-                    );
-                    let ending = failed_ending("unavailable", elapsed());
-                    self.finish(id, &ending).await;
-                    return unavailable();
-                }
-            },
-            _ => None,
-        };
         let deadline = tokio::time::Instant::from_std(self.until.deadline());
         let stop = Arc::clone(&self.in_flight.stop);
         let active = self.active;
@@ -494,7 +518,8 @@ impl StorageWork {
         };
         let duration_ms = elapsed();
         let Some(done) = ran else {
-            // Disabled meanwhile: given up before it lands.
+            // Disabled meanwhile: given up. A put whose last system calls
+            // are under way may still land, whole, as one past its time.
             self.until.give_up();
             self.finish(id, &failed_ending(APPLICATION_DISABLED, duration_ms))
                 .await;
@@ -502,7 +527,8 @@ impl StorageWork {
         };
         match done {
             Ok(done) => {
-                let (rows, answer) = Self::answer(done);
+                // A get's room is held until its answer is handed on.
+                let (rows, answer, _room) = Self::answer(done);
                 let ending = Ending {
                     outcome: "allowed",
                     error: None,
@@ -559,6 +585,9 @@ impl StorageWork {
                         content_type,
                     }),
                     BodyText::Within(_) | BodyText::Past => Err(("bytes", limit("bytes"))),
+                    // No room at the decision, or (not reached: a refusal
+                    // is answered first) refused.
+                    BodyText::NoRoom | BodyText::Dropped => Err(("unavailable", unavailable())),
                 },
             },
             (
@@ -618,21 +647,33 @@ impl StorageWork {
     }
 
     /// The answer and the entry's `rows`.
-    fn answer(done: Done) -> (Option<u64>, Value) {
+    /// The answer, the entry's `rows`, and a get's room (held by the
+    /// caller until the answer is handed on).
+    fn answer(done: Done) -> (Option<u64>, Value, Option<Room>) {
         match done {
-            Done::Head(None) | Done::Get(None) => (Some(0), ok_to_wire(Value::Null)),
-            Done::Head(Some(metadata)) => {
-                (Some(1), ok_to_wire(Value::Object(metadata_json(&metadata))))
-            }
+            Done::Head(None) | Done::Get(None) => (Some(0), ok_to_wire(Value::Null), None),
+            Done::Head(Some(metadata)) => (
+                Some(1),
+                ok_to_wire(Value::Object(metadata_json(&metadata))),
+                None,
+            ),
             Done::Get(Some(got)) => {
-                let Got { metadata, body, .. } = got;
+                let Got {
+                    metadata,
+                    body,
+                    room,
+                } = got;
                 let mut object = metadata_json(&metadata);
                 // Moved in: the body's text is not copied.
                 object.insert("body".into(), Value::String(body));
-                (Some(1), ok_to_wire(Value::Object(object)))
+                (Some(1), ok_to_wire(Value::Object(object)), Some(room))
             }
-            Done::Put(metadata) => (Some(1), ok_to_wire(Value::Object(metadata_json(&metadata)))),
-            Done::Delete => (None, ok_to_wire(json!({}))),
+            Done::Put(metadata) => (
+                Some(1),
+                ok_to_wire(Value::Object(metadata_json(&metadata))),
+                None,
+            ),
+            Done::Delete => (None, ok_to_wire(json!({})), None),
             Done::List(page, cursor) => {
                 let count = page.files.len() + page.folders.len();
                 let files: Vec<Value> = page
@@ -647,6 +688,7 @@ impl StorageWork {
                         "folders": page.folders,
                         "cursor": cursor,
                     })),
+                    None,
                 )
             }
         }
