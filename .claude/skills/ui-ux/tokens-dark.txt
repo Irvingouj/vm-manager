@@ -27,3 +27,5 @@ warn-mark-on-surface #fef08a #1c1a16 3
 warn-mark-on-bg      #fef08a #12110e 3
 danger-mark-on-bg    #fca5a5 #12110e 3
 ink3-mark-on-surface #9a9282 #1c1a16 3
+on-danger-fill       #16140f #fca5a5 4.5
+on-danger-hover      #16140f #fecaca 4.5

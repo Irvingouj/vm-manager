@@ -50,6 +50,9 @@ pub(crate) struct Viewer<'a> {
     pub user: &'a User,
     pub name: Option<String>,
     pub sign_out: Option<String>,
+    /// Whether the person is a Platform administrator, as decided at this
+    /// request: their header holds the way in to the pages under `/admin`.
+    pub admin: bool,
 }
 
 impl Viewer<'_> {
@@ -91,12 +94,12 @@ impl<'a> Person<'a> {
 
     /// The attributes of a person's element beyond its kind and id:
     /// `data-vm-unseen` for one never seen.
-    fn marks(&self) -> &'static str {
+    pub(super) fn marks(&self) -> &'static str {
         if self.unseen { " data-vm-unseen" } else { "" }
     }
 
     /// `user`, `group` or `everyone`, and the id or the Group.
-    fn kind(&self) -> (&'static str, Option<&'a str>) {
+    pub(super) fn kind(&self) -> (&'static str, Option<&'a str>) {
         match self.named {
             Named::User(id) => ("user", Some(id)),
             Named::Group(group) => ("group", Some(group)),
@@ -109,7 +112,7 @@ impl<'a> Person<'a> {
     /// loudest, the email and the id small beneath it; for one the
     /// platform has never seen, a mark and words saying so and to check
     /// the id, as the tool says it (crate::tool::sharing's `entry_words`).
-    fn row(&self) -> String {
+    pub(super) fn row(&self) -> String {
         match self.named {
             Named::User(id) => {
                 let mut lines = String::new();
@@ -187,8 +190,23 @@ pub(crate) struct Block<'a> {
     pub declared: Option<&'a Declared>,
     pub seen: &'a BTreeMap<&'a str, Seen>,
     /// Since when a Platform administrator has disabled it (RFC 3339);
-    /// `None` when it is not disabled. Who did is not shown.
+    /// `None` when it is not disabled. Who did is shown to a Platform
+    /// administrator only ([`Block::admin`]).
     pub disabled: Option<&'a str>,
+    /// What its own page shows a Platform administrator besides; `None`
+    /// for anyone else, and on the list.
+    pub admin: Option<AdminSees<'a>>,
+}
+
+/// What an Application's own page shows a Platform administrator besides
+/// what it shows anyone (blackbox/CONTRACT.md, "The Dashboard for Platform
+/// administrators: One Application, as a Platform administrator sees it").
+pub(crate) struct AdminSees<'a> {
+    /// `usage.requests` and `usage.users` of `GET /v1/admin/applications`.
+    pub requests: i64,
+    pub users: i64,
+    /// Who disabled it, when it is disabled.
+    pub disabled_by: Option<&'a str>,
 }
 
 /// What a change led to.
@@ -197,6 +215,10 @@ pub(crate) enum Notice {
     Shared,
     Unshared,
     Nothing,
+    /// A Platform administrator's disable, made (to them only).
+    Disabled,
+    /// A Platform administrator's enable, made (to them only).
+    Enabled,
 }
 
 /// Why a change of sharing was refused.
@@ -214,7 +236,7 @@ pub(crate) enum Refusal {
 
 /// A page: `title` (escaped already) and `main`, the platform's own HTML
 /// with anything else in it escaped already.
-fn page(
+pub(super) fn page(
     status: StatusCode,
     viewer: &Viewer<'_>,
     title: &str,
@@ -235,8 +257,19 @@ fn page(
             escape(at)
         )
     });
+    // The way in to the pages of Platform administrators: a shield, the
+    // word beside it from 40rem up (hidden from sight, not from a reader
+    // who hears it, below that).
+    let admin = if viewer.admin {
+        format!(
+            "<a class=\"btn quiet compact admin-link\" data-vm-admin href=\"/admin/applications\">{}<span class=\"word\">Administration</span></a>",
+            Icon::Shield.svg()
+        )
+    } else {
+        String::new()
+    };
     let who = format!(
-        "<div class=\"who\"><p class=\"person\" data-vm-user=\"{id}\"><span class=\"vh\">Signed in as </span>{person}</p>{sign_out}</div>"
+        "<div class=\"who\">{admin}<p class=\"person\" data-vm-user=\"{id}\"><span class=\"vh\">Signed in as </span>{person}</p>{sign_out}</div>"
     );
     let html = theme::page(
         &format!("{title} \u{2014} Dashboard"),
@@ -339,6 +372,9 @@ fn application_attributes(block: &Block<'_>, name: &str, since: bool) -> String 
     if let Some(disabled) = block.disabled {
         if since {
             attributes.push_str(&format!(" data-vm-disabled=\"{}\"", escape(disabled)));
+            if let Some(by) = block.admin.as_ref().and_then(|a| a.disabled_by) {
+                attributes.push_str(&format!(" data-vm-disabled-by=\"{}\"", escape(by)));
+            }
         } else {
             attributes.push_str(" data-vm-disabled");
         }
@@ -348,7 +384,7 @@ fn application_attributes(block: &Block<'_>, name: &str, since: bool) -> String 
 
 /// An RFC 3339 time as a person reads it: `2026-11-21 16:25 UTC`; the
 /// time as it is when it is not of that form.
-fn when(rfc3339: &str) -> String {
+pub(super) fn when(rfc3339: &str) -> String {
     match (rfc3339.get(..10), rfc3339.get(11..16)) {
         (Some(day), Some(minute)) if rfc3339.ends_with('Z') => format!("{day} {minute} UTC"),
         _ => rfc3339.to_owned(),
@@ -357,7 +393,7 @@ fn when(rfc3339: &str) -> String {
 
 /// The mark of an Application a Platform administrator has disabled: a
 /// lock and the word.
-fn disabled_mark() -> String {
+pub(super) fn disabled_mark() -> String {
     format!(
         "<span class=\"pill err\" data-vm-disabled-mark>{}Disabled</span>",
         Icon::Lock.svg()
@@ -366,7 +402,7 @@ fn disabled_mark() -> String {
 
 /// The mark of an Application no Version serves: a dashed circle and the
 /// words.
-fn not_deployed() -> String {
+pub(super) fn not_deployed() -> String {
     format!(
         "<span class=\"pill\">{}Not deployed</span>",
         Icon::Empty.svg()
@@ -490,7 +526,7 @@ fn standing(declared: AccessLevel, seen: &Seen) -> (&'static str, &'static str) 
 /// One Application on its own page: its name and Version, its
 /// description, the way to open it beside its address, who can open it,
 /// and the Resources it uses.
-fn whole(out: &mut String, block: &Block<'_>, people: &str) {
+fn whole(out: &mut String, block: &Block<'_>, people: &str, notice: Option<Notice>) {
     let name = escape(block.name);
     out.push_str(&format!(
         "<article class=\"app whole\" {}><div class=\"app-head\"><h1>{name}</h1>",
@@ -510,15 +546,39 @@ fn whole(out: &mut String, block: &Block<'_>, people: &str) {
         ));
     }
     if let Some(since) = block.disabled {
-        out.push_str(&theme::notice(
-            Mark::Warn,
-            "data-vm-disabled-notice",
-            &format!(
-                "A Platform administrator disabled this Application on <time datetime=\"{}\">{}</time>. Only a Platform administrator enables it again: ask your company's IT.",
-                escape(since),
-                escape(&when(since))
-            ),
-        ));
+        let at = format!(
+            "<time datetime=\"{}\">{}</time>",
+            escape(since),
+            escape(&when(since))
+        );
+        let by = block.admin.as_ref().and_then(|a| a.disabled_by);
+        match (by, notice) {
+            // A Platform administrator who has just disabled it: the
+            // notice of the change says when and by whom, once.
+            (Some(by), Some(Notice::Disabled)) => out.push_str(&theme::notice(
+                Mark::Ok,
+                "role=\"status\" data-vm-notice=\"disabled\"",
+                &format!(
+                    "Disabled on {at} by <code class=\"id\">{}</code>: its address answers every request that it is disabled.",
+                    escape(by)
+                ),
+            )),
+            (Some(by), _) => out.push_str(&theme::notice(
+                Mark::Warn,
+                "data-vm-disabled-notice",
+                &format!(
+                    "Disabled on {at} by <code class=\"id\">{}</code>: its address answers every request that it is disabled.",
+                    escape(by)
+                ),
+            )),
+            (None, _) => out.push_str(&theme::notice(
+                Mark::Warn,
+                "data-vm-disabled-notice",
+                &format!(
+                    "A Platform administrator disabled this Application on {at}. Only a Platform administrator enables it again: ask your company's IT."
+                ),
+            )),
+        }
     }
     out.push_str("<div class=\"actions\">");
     if let (Some(open), Some(_), None) = (&block.open, block.serving, block.disabled) {
@@ -537,6 +597,9 @@ fn whole(out: &mut String, block: &Block<'_>, people: &str) {
         ));
     }
     out.push_str("</div>");
+    if let Some(admin) = &block.admin {
+        admin_strip(out, block, admin, &name);
+    }
     if block.serving.is_some()
         && let Some(declared) = block.declared
         && !declared.is_empty()
@@ -554,6 +617,39 @@ fn whole(out: &mut String, block: &Block<'_>, people: &str) {
     }
     out.push_str(people);
     out.push_str("</article>");
+}
+
+/// What a Platform administrator has on an Application's own page: its
+/// usage, the way to its Operation log, and the way to disable it (a link
+/// to the page that confirms it) or the button that enables it. `name` is
+/// escaped already.
+fn admin_strip(out: &mut String, block: &Block<'_>, admin: &AdminSees<'_>, name: &str) {
+    out.push_str(&format!(
+        "<div class=\"admin-strip\"><p class=\"usage-line\" data-vm-usage data-vm-requests=\"{r}\" data-vm-users=\"{u}\">\
+         {}<span class=\"num\">{rs}</span> {} by {}<span class=\"num\">{us}</span> {} in the last 30 days</p><div class=\"actions\">\
+         <a class=\"btn quiet compact\" data-vm-operation-log href=\"/admin/operation-log?application={name}\">{}Operation log</a>",
+        Icon::Activity.svg(),
+        if admin.requests == 1 { "request" } else { "requests" },
+        Icon::Person.svg(),
+        if admin.users == 1 { "User" } else { "Users" },
+        Icon::Log.svg(),
+        r = admin.requests,
+        u = admin.users,
+        rs = thousands(admin.requests),
+        us = thousands(admin.users),
+    ));
+    if block.disabled.is_some() {
+        out.push_str(&format!(
+            "<form data-vm-form=\"enable\" method=\"post\" action=\"/admin/applications/{name}/enable\"><button type=\"submit\" class=\"primary\">{}Enable {name}</button></form>",
+            Icon::Play.svg()
+        ));
+    } else {
+        out.push_str(&format!(
+            "<a class=\"btn quiet danger\" data-vm-disable href=\"/admin/applications/{name}/disable\">{}Disable<span class=\"vh\"> {name}</span></a>",
+            Icon::Stop.svg()
+        ));
+    }
+    out.push_str("</div></div>");
 }
 
 /// One declared Resource and the User's standing with it: a mark in the
@@ -621,7 +717,16 @@ pub(crate) fn application(
         "<nav class=\"crumbs\" aria-label=\"Back\"><a class=\"btn quiet compact back\" href=\"/\">{}Your Applications</a></nav>",
         Icon::Back.svg()
     );
-    if let Some(notice) = notice {
+    // The notice of a disable is said where the disable is, in the
+    // Application, when it is disabled and its Platform administrator sees
+    // by whom ([`whole`]).
+    let said_inside = matches!(notice, Some(Notice::Disabled))
+        && block.disabled.is_some()
+        && block
+            .admin
+            .as_ref()
+            .is_some_and(|a| a.disabled_by.is_some());
+    if let Some(notice) = notice.filter(|_| !said_inside) {
         let (value, mark, words) = match notice {
             Notice::Shared => ("shared", Mark::Ok, "Shared: they can open it now."),
             Notice::Unshared => (
@@ -630,6 +735,16 @@ pub(crate) fn application(
                 "Unshared: whoever it was shared with that way can no longer open it.",
             ),
             Notice::Nothing => ("nothing", Mark::Info, "Nothing changed: it was so already."),
+            Notice::Disabled => (
+                "disabled",
+                Mark::Ok,
+                "Disabled: its address answers every request that it is disabled.",
+            ),
+            Notice::Enabled => (
+                "enabled",
+                Mark::Ok,
+                "Enabled: its address serves every request again.",
+            ),
         };
         main.push_str(&theme::notice(
             mark,
@@ -715,7 +830,7 @@ pub(crate) fn application(
         ));
     }
     people.push_str("</section>");
-    whole(&mut main, block, &people);
+    whole(&mut main, block, &people, notice);
     page(StatusCode::OK, viewer, &name, Layout::Column, &main)
 }
 
@@ -816,7 +931,7 @@ fn back() -> String {
 }
 
 /// `1,000`.
-fn thousands(n: i64) -> String {
+pub(super) fn thousands(n: i64) -> String {
     let digits = n.to_string();
     let mut out = String::with_capacity(digits.len() + digits.len() / 3);
     for (at, c) in digits.chars().enumerate() {

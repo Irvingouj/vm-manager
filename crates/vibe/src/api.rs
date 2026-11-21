@@ -834,7 +834,7 @@ const MAX_LOG_ANSWER_BYTES: usize = 4 * 1024 * 1024;
 const MAX_DECLARED_LISTED: usize = 200;
 
 /// The most Applications to a page of the list of every Application.
-const MAX_ADMIN_PAGE: u8 = 100;
+pub(crate) const MAX_ADMIN_PAGE: u8 = 100;
 
 impl Api {
     pub fn new(
@@ -1022,7 +1022,7 @@ impl Api {
     /// `GET` and `PUT /v1/oidc`, by a Platform administrator.
     async fn oidc(&self, user: &User, method: &Method, body: &[u8]) -> Result<Answer, DbError> {
         if method == Method::GET {
-            return Ok(match oidc_connection::read(&self.signing.database).await? {
+            return Ok(match self.oidc_connection().await? {
                 Some(stored) => Answer::json(StatusCode::OK, &stored.view()),
                 None => Answer::not_found(
                     "OIDC is not connected: a Platform administrator connects it with `vibe admin connect-oidc`",
@@ -1046,22 +1046,10 @@ impl Api {
         if method != Method::GET {
             return Answer::method_not_allowed(method, "GET");
         }
-        let connected = self.signing.oidc.as_ref().and_then(|o| o.connected());
-        let (sign_in, address) = match connected {
-            Some(_) => (
-                "oidc",
-                Some(
-                    self.signing
-                        .public
-                        .origin(&format!("{}.{}", crate::oidc::AUTH_NAME, self.domain), None),
-                ),
-            ),
-            None if self.signing.stand_in => ("stand-in", None),
-            None => ("none", None),
-        };
+        let (domain, sign_in, address) = self.installation_facts();
         Answer::json(
             StatusCode::OK,
-            &json!({ "domain": &*self.domain, "sign_in": sign_in, "sign_in_address": address }),
+            &json!({ "domain": domain, "sign_in": sign_in, "sign_in_address": address }),
         )
     }
 
@@ -1582,15 +1570,15 @@ impl Api {
         body: &[u8],
     ) -> Result<Answer, DbError> {
         if method == Method::GET {
-            let all = self.resources.list();
             // Grants memory does not know now are read back, without
             // waiting; the User's access to a Resource is never guessed.
+            let all = match self.known_resources().await {
+                Ok(all) => all,
+                Err(name) => return Ok(grants_unknown(&name)),
+            };
             let groups = groups_of(user);
             let mut resources = Vec::with_capacity(all.len());
-            // One limit for all of this request's readings.
-            let deadline = tokio::time::Instant::now() + resources::READ_BACK_WAIT;
             for resource in &all {
-                self.resources.read_back(resource, deadline).await;
                 match ResourceRead::of(resource, &groups) {
                     Some(read) => resources.push(read),
                     None => return Ok(grants_unknown(&resource.name)),
@@ -1939,11 +1927,34 @@ impl Api {
         let asked = match LogQuery::read(query) {
             Ok(asked) => asked,
             Err(problem) => {
-                return Answer::error(StatusCode::BAD_REQUEST, "malformed", &problem);
+                return Answer::error(StatusCode::BAD_REQUEST, "malformed", &problem.message());
             }
         };
+        match self.read_operation_log(&asked).await {
+            Ok((entries, earlier)) => {
+                Answer::json(StatusCode::OK, &EntriesView { entries, earlier })
+            }
+            Err(AdminRead::Busy) => readings_busy(),
+            Err(AdminRead::TooLong(_)) => Answer::error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "unavailable",
+                "the reading took too long (more than 10 seconds in the platform database) and was ended: narrow it, with since and until or another filter, and read again",
+            ),
+            Err(AdminRead::Failed(error)) => Answer::unavailable(&error),
+        }
+    }
+
+    /// One reading of the Operation log for Platform administrators, as
+    /// `GET /v1/operation-log` answers it and the Dashboard's page shows
+    /// it: one of the [`ADMIN_READINGS`] at once, within
+    /// [`ADMIN_READ_TIME`], at most 4 MiB written as the API writes it.
+    /// The entries (oldest first) and `earlier`.
+    pub(crate) async fn read_operation_log(
+        &self,
+        asked: &LogQuery,
+    ) -> Result<(Vec<Value>, Option<i64>), AdminRead> {
         let Some(_permit) = self.reading() else {
-            return readings_busy();
+            return Err(AdminRead::Busy);
         };
         let filter = asked.filter();
         // What the answer holds besides its entries: `{"entries":[],
@@ -1960,20 +1971,19 @@ impl Api {
                 } else {
                     None
                 };
-                Answer::json(StatusCode::OK, &EntriesView { entries, earlier })
+                Ok((entries, earlier))
             }
-            Err(error) if took_too_long(&error) => {
+            Err(error) => {
                 log::record(
                     "platform-database-failed",
                     json!({ "error": error.to_string() }),
                 );
-                Answer::error(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "unavailable",
-                    "the reading took too long (more than 10 seconds in the platform database) and was ended: narrow it, with since and until or another filter, and read again",
-                )
+                if took_too_long(&error) {
+                    Err(AdminRead::TooLong(error))
+                } else {
+                    Err(AdminRead::Failed(error))
+                }
             }
-            Err(error) => Answer::unavailable(&error),
         }
     }
 
@@ -1995,17 +2005,68 @@ impl Api {
                 return Answer::error(StatusCode::BAD_REQUEST, "malformed", &problem);
             }
         };
+        let read = match self
+            .read_every_application(Which::After(after.as_deref()), limit)
+            .await
+        {
+            Ok(read) => read,
+            Err(AdminRead::Busy) => return readings_busy(),
+            Err(AdminRead::TooLong(error) | AdminRead::Failed(error)) => {
+                return Answer::unavailable(&error);
+            }
+        };
+        let applications = read
+            .rows
+            .iter()
+            .zip(read.declared.iter())
+            .map(|(application, (declared_access, declared_more))| {
+                self.admin_view(application, declared_access.as_ref(), *declared_more)
+            })
+            .collect();
+        Answer::json(
+            StatusCode::OK,
+            &AdminApplicationsView {
+                applications,
+                next: read.next(),
+            },
+        )
+    }
+
+    /// One reading of every Application for Platform administrators, as
+    /// `GET /v1/admin/applications` answers it and the Dashboard's pages
+    /// show it (`which`: a page after a name, or the one Application of a
+    /// name): one of the [`ADMIN_READINGS`] at once, within
+    /// [`ADMIN_READ_TIME`], each Declared access cut ([`cut_declared`]).
+    pub(crate) async fn read_every_application(
+        &self,
+        which: Which<'_>,
+        limit: u8,
+    ) -> Result<EveryApplication, AdminRead> {
         let Some(_permit) = self.reading() else {
-            return readings_busy();
+            return Err(AdminRead::Busy);
         };
         let fetched = i64::from(limit).saturating_add(1);
+        let (after, only) = match which {
+            Which::After(after) => (after, None),
+            Which::Named(name) => (None, Some(name)),
+        };
         let mut rows = match self
             .registry
-            .every_application(after.as_deref(), fetched, ADMIN_READ_TIME)
+            .every_application(after, only, fetched, ADMIN_READ_TIME)
             .await
         {
             Ok(rows) => rows,
-            Err(error) => return Answer::unavailable(&error),
+            Err(error) => {
+                log::record(
+                    "platform-database-failed",
+                    json!({ "error": error.to_string() }),
+                );
+                return Err(if took_too_long(&error) {
+                    AdminRead::TooLong(error)
+                } else {
+                    AdminRead::Failed(error)
+                });
+            }
         };
         let limit = usize::from(limit);
         let more = rows.len() > limit;
@@ -2015,22 +2076,11 @@ impl Api {
             .iter_mut()
             .map(|application| cut_declared(application.declared_access.take()))
             .collect();
-        let next = if more {
-            rows.last().map(|a| a.name.as_str())
-        } else {
-            None
-        };
-        let applications = rows
-            .iter()
-            .zip(declared)
-            .map(|(application, (declared_access, declared_more))| {
-                self.admin_view(application, declared_access, declared_more)
-            })
-            .collect();
-        Answer::json(
-            StatusCode::OK,
-            &AdminApplicationsView { applications, next },
-        )
+        Ok(EveryApplication {
+            rows,
+            declared,
+            more,
+        })
     }
 
     /// An Application of the list of every Application, its Declared
@@ -2038,7 +2088,7 @@ impl Api {
     fn admin_view<'a>(
         &self,
         application: &'a AdminApplication,
-        declared_access: Option<Value>,
+        declared_access: Option<&'a Value>,
         declared_more: usize,
     ) -> AdminApplicationView<'a> {
         AdminApplicationView {
@@ -2104,11 +2154,7 @@ impl Api {
         {
             return Answer::malformed(&problem, "nothing, or {}");
         }
-        let switched = self
-            .registry
-            .set_disabled(name, disable, &user.id, ADMIN_READ_TIME)
-            .await;
-        match switched {
+        match self.switch(user, name, disable).await {
             Ok(Some((application, changed))) => Answer::json(
                 StatusCode::OK,
                 &SwitchedView {
@@ -2120,6 +2166,67 @@ impl Api {
             Ok(None) => no_application(),
             Err(error) => Answer::unavailable(&error),
         }
+    }
+
+    /// Disables (`disable`) or enables the Application `name` by `user`,
+    /// a Platform administrator, as `POST /v1/applications/<name>/disable`
+    /// and `/enable` do and the Dashboard's forms do: within
+    /// [`ADMIN_READ_TIME`]; `None` for no such Application (also, without
+    /// asking the database, for a name none could have); else the
+    /// Application as it is after and whether this changed it.
+    pub(crate) async fn switch(
+        &self,
+        user: &User,
+        name: &str,
+        disable: bool,
+    ) -> Result<Option<(ApplicationRecord, bool)>, DbError> {
+        if check_name(name).is_err() {
+            return Ok(None);
+        }
+        self.registry
+            .set_disabled(name, disable, &user.id, ADMIN_READ_TIME)
+            .await
+    }
+
+    /// What `GET /v1/installation` answers: the domain, how people sign in
+    /// (`oidc`, `stand-in` or `none`), and with OIDC the sign-in address.
+    pub(crate) fn installation_facts(&self) -> (&str, &'static str, Option<String>) {
+        let connected = self.signing.oidc.as_ref().and_then(|o| o.connected());
+        let (sign_in, address) = match connected {
+            Some(_) => (
+                "oidc",
+                Some(
+                    self.signing
+                        .public
+                        .origin(&format!("{}.{}", crate::oidc::AUTH_NAME, self.domain), None),
+                ),
+            ),
+            None if self.signing.stand_in => ("stand-in", None),
+            None => ("none", None),
+        };
+        (&self.domain, sign_in, address)
+    }
+
+    /// The OIDC connection as `GET /v1/oidc` reads it; `None` when OIDC is
+    /// not connected.
+    pub(crate) async fn oidc_connection(&self) -> Result<Option<oidc_connection::Stored>, DbError> {
+        oidc_connection::read(&self.signing.database).await
+    }
+
+    /// Every Resource, by name, as `GET /v1/resources` reads them: the
+    /// Grants memory does not know now read back first, all within one
+    /// limit; `Err` with the name of the first Resource whose Grants still
+    /// cannot be told (nothing is said of them on a guess).
+    pub(crate) async fn known_resources(&self) -> Result<Vec<Arc<resources::Resource>>, String> {
+        let all = self.resources.list();
+        let deadline = tokio::time::Instant::now() + resources::READ_BACK_WAIT;
+        for resource in &all {
+            self.resources.read_back(resource, deadline).await;
+            if !resource.grants_known() {
+                return Err(resource.name.clone());
+            }
+        }
+        Ok(all)
     }
 
     /// The Application `name`; `None` also for a name no Application can
@@ -2486,7 +2593,7 @@ struct AdminApplicationView<'a> {
     serving_version: Option<u64>,
     latest_version: Option<u64>,
     /// At most [`MAX_DECLARED_LISTED`] Resources, by name.
-    declared_access: Option<Value>,
+    declared_access: Option<&'a Value>,
     declared_more: usize,
     contributors: Vec<EntryView<'a>>,
     shared_with: SharedCountsView,
@@ -2536,6 +2643,48 @@ fn cut_declared(stored: Option<Value>) -> (Option<Value>, usize) {
     (cut, more)
 }
 
+/// Why a reading for Platform administrators answered nothing.
+pub(crate) enum AdminRead {
+    /// [`ADMIN_READINGS`] readings run already: answered at once.
+    Busy,
+    /// It passed its [`ADMIN_READ_TIME`] in the platform database and was
+    /// ended.
+    TooLong(DbError),
+    /// The platform database could not be read.
+    Failed(DbError),
+}
+
+/// Which Applications a reading of every Application reads.
+#[derive(Clone, Copy)]
+pub(crate) enum Which<'a> {
+    /// A page: those whose name comes after this one (from the first
+    /// without it).
+    After(Option<&'a str>),
+    /// The one Application of this name.
+    Named(&'a str),
+}
+
+/// A page of every Application, as read: its Applications by name, each
+/// one's Declared access cut and how many more it declares, and whether
+/// more Applications come after them.
+pub(crate) struct EveryApplication {
+    pub rows: Vec<AdminApplication>,
+    pub declared: Vec<(Option<Value>, usize)>,
+    pub more: bool,
+}
+
+impl EveryApplication {
+    /// The API's `next`: the last Application's name when more come after
+    /// it.
+    pub fn next(&self) -> Option<&str> {
+        if self.more {
+            self.rows.last().map(|a| a.name.as_str())
+        } else {
+            None
+        }
+    }
+}
+
 /// `503`: [`ADMIN_READINGS`] readings for Platform administrators run.
 fn readings_busy() -> Answer {
     Answer::error(
@@ -2559,7 +2708,7 @@ fn took_too_long(error: &DbError) -> bool {
 /// as a form writes one), only those named in `known`; `Err` with the name
 /// of one given twice or whose value cannot be decoded. A parameter written
 /// without `=` has the empty value.
-fn query_parameters<'k>(
+pub(crate) fn query_parameters<'k>(
     query: Option<&str>,
     known: &[&'k str],
 ) -> Result<BTreeMap<&'k str, String>, &'k str> {
@@ -2581,7 +2730,7 @@ fn query_parameters<'k>(
 }
 
 /// `?after` and `?limit` of `GET /v1/admin/applications`.
-fn admin_list_query(query: Option<&str>) -> Result<(Option<String>, u8), String> {
+pub(crate) fn admin_list_query(query: Option<&str>) -> Result<(Option<String>, u8), String> {
     let mut found = query_parameters(query, &["after", "limit"])
         .map_err(|name| format!("?{name} is given twice or is not percent-encoded"))?;
     let limit = match found.get("limit") {
@@ -2604,7 +2753,7 @@ fn admin_list_query(query: Option<&str>) -> Result<(Option<String>, u8), String>
 
 /// A whole number written plainly: digits, no sign, no leading zero, above
 /// 0, at most 18 digits.
-fn plain_number(text: &str) -> Option<i64> {
+pub(crate) fn plain_number(text: &str) -> Option<i64> {
     let canonical = !text.is_empty()
         && !text.starts_with('0')
         && text.len() <= 18
@@ -2698,32 +2847,81 @@ pub(crate) fn rfc3339_micros(text: &str) -> Option<i64> {
 
 /// The filters of `GET /v1/operation-log`, read and checked.
 #[derive(Debug, Default)]
-struct LogQuery {
-    user: Option<String>,
-    application: Option<String>,
-    resource: Option<String>,
-    outcome: Option<String>,
-    since: Option<String>,
-    until: Option<String>,
-    before: Option<i64>,
-    limit: i64,
+pub(crate) struct LogQuery {
+    pub user: Option<String>,
+    pub application: Option<String>,
+    pub resource: Option<String>,
+    pub outcome: Option<String>,
+    pub since: Option<String>,
+    pub until: Option<String>,
+    pub before: Option<i64>,
+    pub limit: i64,
+}
+
+/// The filters of `GET /v1/operation-log`, as named in a query.
+pub(crate) const LOG_FILTERS: [&str; 7] = [
+    "user",
+    "application",
+    "resource",
+    "outcome",
+    "since",
+    "until",
+    "before",
+];
+
+/// What is wrong with the filters of a reading of the Operation log.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum LogProblem {
+    /// A parameter given twice, or whose value is not percent-encoded.
+    Repeated(&'static str),
+    /// A value not taken as the contract's table says (empty included).
+    Value(&'static str),
+    /// `since` not before `until`.
+    Order,
+}
+
+impl LogProblem {
+    /// The API's message, naming the parameter.
+    pub fn message(&self) -> String {
+        match self {
+            Self::Repeated(name) => format!("?{name} is given twice or is not percent-encoded"),
+            Self::Order => "?since must be before ?until".into(),
+            Self::Value("user") => {
+                "?user must be a user id of 1 to 256 bytes without control characters".into()
+            }
+            Self::Value("application") => "?application must be a name an Application could have: 1 to 63 lower-case letters, digits and hyphens".into(),
+            Self::Value("resource") => "?resource must be a name a Resource could have".into(),
+            Self::Value("outcome") => "?outcome must be allowed, refused, failed or unfinished".into(),
+            Self::Value(time @ ("since" | "until")) => format!(
+                "?{time} must be RFC 3339 with a date, a time and an offset (Z or ±hh:mm, + written %2B), up to microseconds"
+            ),
+            Self::Value("before") => "?before must be a positive whole number, written plainly".into(),
+            Self::Value(_) => "?limit must be a whole number from 1 to 1000, written plainly".into(),
+        }
+    }
 }
 
 impl LogQuery {
     /// Every parameter's problem is told naming it.
-    fn read(query: Option<&str>) -> Result<Self, String> {
-        const NAMES: [&str; 8] = [
-            "user",
-            "application",
-            "resource",
-            "outcome",
-            "since",
-            "until",
-            "before",
-            "limit",
-        ];
-        let mut found = query_parameters(query, &NAMES)
-            .map_err(|name| format!("?{name} is given twice or is not percent-encoded"))?;
+    fn read(query: Option<&str>) -> Result<Self, LogProblem> {
+        let mut names = LOG_FILTERS.to_vec();
+        names.push("limit");
+        let mut found = query_parameters(query, &names).map_err(LogProblem::Repeated)?;
+        let limit = found.remove("limit");
+        let mut asked = Self::of_filters(found)?;
+        if let Some(limit) = limit {
+            asked.limit = plain_number(&limit)
+                .filter(|n| (1..=i64::from(oplog::MAX_READ)).contains(n))
+                .ok_or(LogProblem::Value("limit"))?;
+        }
+        Ok(asked)
+    }
+
+    /// The filters of [`LOG_FILTERS`] given, each decoded once, checked as
+    /// the API checks them, with the API's `limit` of 100. Shared by the
+    /// API and the Dashboard's page of the Operation log, which gives what
+    /// its form sent here.
+    pub(crate) fn of_filters(mut found: BTreeMap<&str, String>) -> Result<Self, LogProblem> {
         let mut asked = Self {
             limit: 100,
             ..Self::default()
@@ -2731,21 +2929,19 @@ impl LogQuery {
         if let Some(user) = found.remove("user") {
             if user.is_empty() || user.len() > MAX_ENTRY_BYTES || user.chars().any(char::is_control)
             {
-                return Err(
-                    "?user must be a user id of 1 to 256 bytes without control characters".into(),
-                );
+                return Err(LogProblem::Value("user"));
             }
             asked.user = Some(user);
         }
         if let Some(application) = found.remove("application") {
             if matches!(check_name(&application), Err(NameProblem::Invalid)) {
-                return Err("?application must be a name an Application could have: 1 to 63 lower-case letters, digits and hyphens".into());
+                return Err(LogProblem::Value("application"));
             }
             asked.application = Some(application);
         }
         if let Some(resource) = found.remove("resource") {
             if !is_resource_name(&resource) {
-                return Err("?resource must be a name a Resource could have".into());
+                return Err(LogProblem::Value("resource"));
             }
             asked.resource = Some(resource);
         }
@@ -2754,17 +2950,15 @@ impl LogQuery {
                 outcome.as_str(),
                 "allowed" | "refused" | "failed" | "unfinished"
             ) {
-                return Err("?outcome must be allowed, refused, failed or unfinished".into());
+                return Err(LogProblem::Value("outcome"));
             }
             asked.outcome = Some(outcome);
         }
         let mut times = [None, None];
-        for (at, name) in ["since", "until"].into_iter().enumerate() {
+        for (at, name) in [(0, "since"), (1, "until")] {
             if let Some(time) = found.remove(name) {
                 let Some(micros) = rfc3339_micros(&time) else {
-                    return Err(format!(
-                        "?{name} must be RFC 3339 with a date, a time and an offset (Z or ±hh:mm, + written %2B), up to microseconds"
-                    ));
+                    return Err(LogProblem::Value(name));
                 };
                 if let Some(slot) = times.get_mut(at) {
                     *slot = Some(micros);
@@ -2779,20 +2973,13 @@ impl LogQuery {
         if let [Some(since), Some(until)] = times
             && since >= until
         {
-            return Err("?since must be before ?until".into());
+            return Err(LogProblem::Order);
         }
         if let Some(before) = found.remove("before") {
             let Some(before) = plain_number(&before) else {
-                return Err("?before must be a positive whole number, written plainly".into());
+                return Err(LogProblem::Value("before"));
             };
             asked.before = Some(before);
-        }
-        if let Some(limit) = found.remove("limit") {
-            asked.limit = plain_number(&limit)
-                .filter(|n| (1..=i64::from(oplog::MAX_READ)).contains(n))
-                .ok_or_else(|| {
-                    "?limit must be a whole number from 1 to 1000, written plainly".to_owned()
-                })?;
         }
         Ok(asked)
     }

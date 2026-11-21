@@ -1209,6 +1209,23 @@ impl Registry {
     }
 
     /// The name the platform last read of the person `id` at a sign-in.
+    /// Whether the platform database answers now: one statement that reads
+    /// no table, for a page that shows only what memory holds and is
+    /// answered `503` while the platform database cannot be reached
+    /// (blackbox/CONTRACT.md, "The Dashboard: What it answers").
+    pub async fn probe(&self) -> Result<(), DbError> {
+        self.database
+            .pool()
+            .run(async |client: &mut Client| {
+                client
+                    .simple_query("SELECT 1")
+                    .await
+                    .map(|_| ())
+                    .map_err(DbError::from)
+            })
+            .await
+    }
+
     pub async fn person_name(&self, id: &str) -> Result<Option<String>, DbError> {
         let row = self
             .database
@@ -2104,7 +2121,7 @@ impl Registry {
     /// One page of every Application of the installation, for Platform
     /// administrators (blackbox/CONTRACT.md, "Every Application, on the
     /// platform's API"): those whose name comes after `after` (byte order),
-    /// `limit` of them at most, by name, each with its serving Version's
+    /// only the one named `only` when it is given, `limit` of them at most, by name, each with its serving Version's
     /// Declared access, its Contributors (at most [`MAX_CONTRIBUTORS`]), how
     /// many entries of each kind it is shared with, its disable, and its
     /// usage over the last 30 UTC days. One query, in a read-only
@@ -2112,6 +2129,7 @@ impl Registry {
     pub async fn every_application(
         &self,
         after: Option<&str>,
+        only: Option<&str>,
         limit: i64,
         limit_time: std::time::Duration,
     ) -> Result<Vec<AdminApplication>, DbError> {
@@ -2171,11 +2189,12 @@ impl Registry {
                             FROM application_usage g
                             WHERE g.application = a.name AND g.day >= p.from_day
                          ) u
-                         WHERE $1::text IS NULL OR a.name COLLATE \"C\" > $1::text COLLATE \"C\"
+                         WHERE ($1::text IS NULL OR a.name COLLATE \"C\" > $1::text COLLATE \"C\")
+                           AND ($4::text IS NULL OR a.name = $4::text)
                          ORDER BY a.name COLLATE \"C\"
                          LIMIT $2"
                     ),
-                    &[&after, &limit, &MAX_CONTRIBUTORS],
+                    &[&after, &limit, &MAX_CONTRIBUTORS, &only],
                 )
                 .await
                 .map_err(DbError::from)?;

@@ -27,3 +27,5 @@ warn-mark-on-surface #854d0e #fffdf9 3
 warn-mark-on-bg      #854d0e #f6f3ec 3
 danger-mark-on-bg    #b91c1c #f6f3ec 3
 ink3-mark-on-surface #6b655c #fffdf9 3
+on-danger-fill       #ffffff #b91c1c 4.5
+on-danger-hover      #ffffff #991b1b 4.5

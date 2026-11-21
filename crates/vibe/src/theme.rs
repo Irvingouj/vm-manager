@@ -23,7 +23,7 @@
 pub const STYLE: &str = r#":root{color-scheme:light dark;
 --bg:#f6f3ec;--surface:#fffdf9;--surface-2:#efeadf;--ink:#16140f;--ink-2:#57534e;--ink-3:#6b655c;--line:#d6cfbf;--edge:#8a8377;
 --accent:#c2410c;--accent-strong:#9a3412;--on-accent:#fff;--accent-soft:#ffedd5;--accent-soft-ink:#9a3412;
---danger:#b91c1c;--danger-soft:#fee2e2;--danger-soft-ink:#991b1b;--ok-soft:#dcfce7;--ok-soft-ink:#166534;--warn-soft:#fef9c3;--warn-soft-ink:#854d0e;
+--danger:#b91c1c;--on-danger:#fff;--danger-soft:#fee2e2;--danger-soft-ink:#991b1b;--ok-soft:#dcfce7;--ok-soft-ink:#166534;--warn-soft:#fef9c3;--warn-soft-ink:#854d0e;
 --shadow-1:0 1px 2px rgb(22 20 15/.06),0 1px 1px rgb(22 20 15/.04);--shadow-2:0 8px 24px -6px rgb(22 20 15/.14),0 2px 6px -2px rgb(22 20 15/.08);--card-edge:transparent;
 --sans:system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
 --serif:"Iowan Old Style","Palatino Linotype",Palatino,"Book Antiqua",Georgia,serif;
@@ -31,7 +31,7 @@ pub const STYLE: &str = r#":root{color-scheme:light dark;
 @media (prefers-color-scheme:dark){:root{
 --bg:#12110e;--surface:#1c1a16;--surface-2:#27251f;--ink:#ece7dc;--ink-2:#b5ad9c;--ink-3:#9a9282;--line:#34312a;--edge:#7d766a;
 --accent:#ff7a3d;--accent-strong:#ff9a66;--on-accent:#16140f;--accent-soft:#3a1d0e;--accent-soft-ink:#ffb38a;
---danger:#fca5a5;--danger-soft:#3b1212;--danger-soft-ink:#fecaca;--ok-soft:#0f2a1a;--ok-soft-ink:#bbf7d0;--warn-soft:#2e2607;--warn-soft-ink:#fef08a;
+--danger:#fca5a5;--on-danger:#16140f;--danger-soft:#3b1212;--danger-soft-ink:#fecaca;--ok-soft:#0f2a1a;--ok-soft-ink:#bbf7d0;--warn-soft:#2e2607;--warn-soft-ink:#fef08a;
 --shadow-1:none;--shadow-2:none;--card-edge:var(--line)}}
 *,*::before,*::after{box-sizing:border-box}
 html{-webkit-text-size-adjust:100%;text-size-adjust:100%}
@@ -95,12 +95,14 @@ code.id.as-name{font-size:1em;line-height:inherit;font-weight:600;color:var(--in
 .quiet:hover,button.quiet:hover{background:var(--surface-2);border-color:transparent;color:var(--accent-strong);text-decoration:underline}
 .quiet.danger,button.quiet.danger{color:var(--danger)}
 .quiet.danger:hover,button.quiet.danger:hover{color:var(--danger)}
+.danger-fill,button.danger-fill{background:var(--danger);border-color:var(--danger);color:var(--on-danger)}
+.danger-fill:hover,button.danger-fill:hover{background:var(--danger-soft-ink);border-color:var(--danger-soft-ink);color:var(--on-danger)}
 .compact{min-height:2.25rem;padding-block:.375rem}
 .field+.field{margin-top:1.25rem}
 label{display:block;font-weight:600;font-size:1rem;line-height:1.5rem}
 .help{margin-top:.25rem;font-size:.875rem;line-height:1.25rem;color:var(--ink-2);max-width:65ch}
 .control{position:relative;margin-top:.5rem;width:100%;max-width:24rem}
-input[type=text],select{display:block;width:100%;min-height:2.75rem;padding:.5rem .75rem;border:1px solid var(--edge);border-radius:.375rem;background:var(--surface);color:var(--ink);font:400 1rem/1.5rem var(--sans)}
+input[type=text],input[type=datetime-local],select{display:block;width:100%;min-height:2.75rem;padding:.5rem .75rem;border:1px solid var(--edge);border-radius:.375rem;background:var(--surface);color:var(--ink);font:400 1rem/1.5rem var(--sans)}
 select{-webkit-appearance:none;appearance:none;padding-right:2.5rem;cursor:pointer}
 .control .chevron{position:absolute;right:.75rem;top:50%;width:1rem;height:1rem;margin-top:-.5rem;color:var(--ink-2);pointer-events:none}
 input.code{font-family:var(--mono);letter-spacing:.08em;text-transform:uppercase}
@@ -207,6 +209,88 @@ table.res{width:100%;border-collapse:collapse;font-size:.875rem;line-height:1.25
 pre.message{white-space:pre-wrap;padding:.75rem 1rem;border-radius:.375rem;background:var(--surface-2);color:var(--ink);font-size:.875rem;line-height:1.25rem}
 details>summary{cursor:pointer;color:var(--accent);min-height:1.5rem}
 details[open]>summary{margin-bottom:.5rem}
+.admin-link .i{width:1.25rem;height:1.25rem}
+.sections{margin:-1rem 0 2rem;border-bottom:1px solid var(--line)}
+.sections ul{list-style:none;padding:0;display:flex;flex-wrap:wrap;column-gap:.25rem}
+.sections a{display:inline-flex;align-items:center;gap:.5rem;min-height:2.75rem;padding:.5rem .75rem;margin-bottom:-1px;border-bottom:2px solid transparent;color:var(--ink-2);font-weight:600;text-decoration:none}
+.sections a:hover{color:var(--ink)}
+.sections a .i{color:var(--ink-3)}
+.sections a[aria-current=page]{color:var(--ink);border-bottom-color:var(--accent)}
+.sections a[aria-current=page] .i{color:var(--accent)}
+.legend{display:flex;flex-wrap:wrap;align-items:center;gap:.25rem 1rem;margin-bottom:1rem;font-size:.875rem;line-height:1.25rem;color:var(--ink-2)}
+.legend>span{display:inline-flex;align-items:center;gap:.375rem}
+.legend .i,.usage .i{width:1rem;height:1rem;color:var(--ink-3)}
+.usage{display:flex;align-items:center;gap:1rem;flex:none;font-size:.875rem;line-height:1.25rem;color:var(--ink-2)}
+.usage>span{display:inline-flex;align-items:center;gap:.375rem}
+.num{font-variant-numeric:tabular-nums;font-weight:600;color:var(--ink)}
+.app.card>details{flex:1 0 100%;margin-top:-.25rem}
+.app-head h2{font-size:1.125rem;line-height:1.75rem}
+.more>summary{display:list-item;min-height:1.5rem;font-size:.875rem;line-height:1.25rem;font-weight:600}
+.more[open]>summary{margin-bottom:.75rem}
+.more>*+*:not(summary){margin-top:1rem}
+.more .rows{margin-top:.5rem}
+.more h3.over{margin-top:1.25rem}
+.more .facts{max-width:40rem}
+.lv-pill{white-space:nowrap;flex:none}
+.tags code.lv,.lv-pill{font-family:var(--sans);font-size:.75rem;line-height:1.25rem;font-weight:600;padding:0 .5rem;border-radius:999px;background:var(--surface-2);color:var(--ink-2)}
+.usage-line{color:var(--ink-2)}
+.usage-line .i{color:var(--ink-3);vertical-align:-.25rem;margin-right:.25rem}
+.usage-line .i:not(:first-child){margin-left:.125rem}
+.admin-strip{margin-top:1.5rem;padding-top:1rem;border-top:1px solid var(--line);display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:.75rem 1.5rem}
+.admin-strip .actions{margin-left:auto}
+.admin-strip form{display:inline-flex}
+.notice code.id{color:inherit}
+.lone .lead+.usage-line{margin-top:.75rem}
+.filters{padding:1rem 1.25rem}
+.filter-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(14rem,1fr));gap:1rem 1.25rem}
+.filter-grid .field+.field{margin-top:0}
+.filter-grid .control{max-width:none}
+.field-error{display:flex;align-items:flex-start;gap:.375rem;margin-top:.5rem;font-size:.875rem;line-height:1.25rem;color:var(--danger)}
+.field-error .i{width:1rem;height:1rem;margin-top:.125rem}
+.filters .form-actions{display:flex;flex-wrap:wrap;align-items:center;gap:.5rem .75rem;margin-top:1.25rem}
+.log{margin-top:2rem}
+.log>.over{margin-bottom:.5rem}
+.log>.notice{margin-bottom:1rem;max-width:none}
+.entries{list-style:none;padding:0;border-top:1px solid var(--line)}
+.entry{padding:.75rem 0;border-bottom:1px solid var(--line)}
+.entry-line{display:flex;flex-wrap:wrap;align-items:center;gap:.25rem 1rem;font-size:.875rem;line-height:1.25rem}
+.entry-line>span{display:inline-flex;align-items:center;gap:.375rem;min-width:0}
+.entry-line .i{width:1rem;height:1rem;color:var(--ink-3)}
+.entry-line .mark{width:1.25rem;height:1.25rem}
+.mark.allowed{color:var(--ok-soft-ink)}
+.mark.refused{color:var(--danger)}
+.mark.failed{color:var(--warn-soft-ink)}
+.mark.unfinished{color:var(--ink-3)}
+.entry-line time{font-variant-numeric:tabular-nums;color:var(--ink-2);white-space:nowrap}
+.entry-line a{display:inline-flex;align-items:center;min-height:1.5rem;font-weight:600}
+.entry-line .soft{color:var(--ink-3)}
+.entry-line code{background:none;padding:0;font-size:1em}
+.entry-line .reason{color:var(--danger)}
+.entry-line .reason.failed{color:var(--warn-soft-ink)}
+.entry details{margin-top:.25rem;margin-left:1.625rem}
+.entry details>summary{font-size:.875rem;line-height:1.25rem;font-weight:600}
+pre.statement{white-space:pre-wrap;overflow-wrap:anywhere;padding:.75rem 1rem;border-radius:.375rem;background:var(--surface-2);color:var(--ink);font-size:.875rem;line-height:1.25rem}
+.entry .facts{margin-top:.75rem}
+.grants{list-style:none;padding:0;display:flex;flex-wrap:wrap;gap:.5rem 1.25rem}
+.grants>li{display:inline-flex;align-items:center;gap:.375rem;min-width:0}
+.grants .i{color:var(--ink-3)}
+.grants .g{font-weight:600}
+.res-card>*+*{margin-top:.75rem}
+.res-card h2{display:flex;align-items:center;gap:.5rem;font-size:1.125rem;line-height:1.75rem}
+.res-card h2 .i{color:var(--ink-3)}
+.res-card h2 code{background:none;padding:0;font-size:1em;font-weight:600}
+.res-card .desc{color:var(--ink-2)}
+.res-card .more>a{display:inline-flex;align-items:center;gap:.375rem;min-height:1.5rem}
+.res-card .more>a .i{width:1rem;height:1rem}
+dl.facts.big{font-size:1rem;line-height:1.5rem;gap:.5rem 1.5rem}
+dl.facts.big code{overflow-wrap:anywhere}
+dl.facts dd .i{width:1rem;height:1rem;vertical-align:-.1875rem;color:var(--ink-3);margin-right:.25rem}
+.column>dl.facts+details,.column>details+.lockline{margin-top:1.5rem}
+.column>details>summary{font-weight:600}
+.lone .confirm>*+*{margin-top:1rem}
+code.cmd{white-space:nowrap}
+.lone .confirm .actions{margin-top:1.5rem;display:flex;flex-wrap:wrap;align-items:center;gap:.75rem 1rem}
+.lone .confirm .actions form{margin:0}
 @media (max-width:39.99rem){
 .res thead{position:absolute;width:1px;height:1px;margin:-1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
 .res tr{display:flex;flex-wrap:wrap;column-gap:1rem;border-top:1px solid var(--line);padding:.625rem 0 .625rem 1.75rem}
@@ -215,6 +299,10 @@ details[open]>summary{margin-bottom:.5rem}
 .res td.lv{color:var(--ink)}
 .res td.lv::before{content:attr(data-label) " ";color:var(--ink-2)}
 .rows .who-is{flex-basis:auto}
+.admin-link .word{position:absolute;width:1px;height:1px;margin:-1px;padding:0;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;border:0}
+.admin-link{padding-inline:.5rem}
+dl.facts.big{grid-template-columns:1fr;gap:0}
+dl.facts.big dd+dt{margin-top:.75rem}
 }
 @media (min-width:40rem){
 h1{font-size:1.875rem;line-height:2.25rem}
@@ -314,6 +402,20 @@ pub enum Icon {
     Window,
     /// A door with an arrow leaving it: sign out.
     Leave,
+    /// A shield: the pages of Platform administrators.
+    Shield,
+    /// A pulse: requests.
+    Activity,
+    /// Lines of a list: the Operation log.
+    Log,
+    /// A cylinder: a database, a Resource.
+    Database,
+    /// A stack of two boxes: the installation.
+    Server,
+    /// A circle with a bar across it: stop serving (disable).
+    Stop,
+    /// A triangle pointing right: serve again (enable).
+    Play,
 }
 
 impl Icon {
@@ -371,6 +473,27 @@ impl Icon {
             Self::Leave => {
                 "<svg class=\"i\" viewBox=\"0 0 20 20\" aria-hidden=\"true\" focusable=\"false\"><path d=\"M8 3.5H4.5a1 1 0 0 0-1 1v11a1 1 0 0 0 1 1H8M12.5 6.5L16 10l-3.5 3.5M16 10H7.5\"/></svg>"
             }
+            Self::Shield => {
+                "<svg class=\"i\" viewBox=\"0 0 20 20\" aria-hidden=\"true\" focusable=\"false\"><path d=\"M10 2.5l6 2.25v4.5c0 3.9-2.55 6.9-6 8.25-3.45-1.35-6-4.35-6-8.25v-4.5z\"/><path d=\"M7.5 10l1.75 1.75 3.25-3.5\"/></svg>"
+            }
+            Self::Activity => {
+                "<svg class=\"i\" viewBox=\"0 0 20 20\" aria-hidden=\"true\" focusable=\"false\"><path d=\"M2.5 10.5h3l2-5 3.5 9 2-4h4.5\"/></svg>"
+            }
+            Self::Log => {
+                "<svg class=\"i\" viewBox=\"0 0 20 20\" aria-hidden=\"true\" focusable=\"false\"><path d=\"M7.5 5.5h9M7.5 10h9M7.5 14.5h9\"/><circle cx=\"4\" cy=\"5.5\" r=\".6\"/><circle cx=\"4\" cy=\"10\" r=\".6\"/><circle cx=\"4\" cy=\"14.5\" r=\".6\"/></svg>"
+            }
+            Self::Database => {
+                "<svg class=\"i\" viewBox=\"0 0 20 20\" aria-hidden=\"true\" focusable=\"false\"><ellipse cx=\"10\" cy=\"5\" rx=\"6\" ry=\"2.25\"/><path d=\"M4 5v10c0 1.25 2.7 2.25 6 2.25s6-1 6-2.25V5M4 10c0 1.25 2.7 2.25 6 2.25s6-1 6-2.25\"/></svg>"
+            }
+            Self::Server => {
+                "<svg class=\"i\" viewBox=\"0 0 20 20\" aria-hidden=\"true\" focusable=\"false\"><rect x=\"3\" y=\"3.5\" width=\"14\" height=\"5.5\" rx=\"1.25\"/><rect x=\"3\" y=\"11\" width=\"14\" height=\"5.5\" rx=\"1.25\"/><path d=\"M6 6.25h.01M6 13.75h.01\"/></svg>"
+            }
+            Self::Stop => {
+                "<svg class=\"i\" viewBox=\"0 0 20 20\" aria-hidden=\"true\" focusable=\"false\"><circle cx=\"10\" cy=\"10\" r=\"7.25\"/><path d=\"M4.9 15.1L15.1 4.9\"/></svg>"
+            }
+            Self::Play => {
+                "<svg class=\"i\" viewBox=\"0 0 20 20\" aria-hidden=\"true\" focusable=\"false\"><path d=\"M6.5 4.5v11l9-5.5z\"/></svg>"
+            }
         }
     }
 }
@@ -384,6 +507,19 @@ pub fn icon(icon: Icon, words: &str) -> String {
     } else {
         format!("{}<span class=\"vh\">{words}</span>", icon.svg())
     }
+}
+
+/// `icon` as a mark that carries meaning by itself: an image with a name
+/// (`role="img"`, `aria-label` of `name`, the platform's own words), with
+/// `class` beside `i` for its colour.
+pub fn named(icon: Icon, name: &str, class: &str) -> String {
+    icon.svg()
+        .replacen("class=\"i\"", &format!("class=\"i {class}\""), 1)
+        .replacen(
+            "aria-hidden=\"true\" focusable=\"false\"",
+            &format!("role=\"img\" aria-label=\"{name}\" focusable=\"false\""),
+            1,
+        )
 }
 
 /// A page's one `<h1>` with the mark of its state before it (`mark`'s
@@ -511,6 +647,14 @@ mod tests {
             "a page of the sign-in address links nowhere by itself"
         );
         assert!(html.contains("vm.test"), "it says which installation it is");
+    }
+
+    #[test]
+    fn a_named_mark_is_an_image_with_a_name_and_not_hidden() {
+        let mark = named(Icon::Check, "Allowed", "mark allowed");
+        assert!(mark.starts_with("<svg class=\"i mark allowed\""));
+        assert!(mark.contains("role=\"img\" aria-label=\"Allowed\""));
+        assert!(!mark.contains("aria-hidden"));
     }
 
     #[test]

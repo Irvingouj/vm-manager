@@ -34,6 +34,8 @@
 //! on it. For one Application: the registry's read of it (two), and the
 //! query of what it shows (one).
 
+mod admin;
+mod admin_pages;
 mod pages;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -48,7 +50,7 @@ use hyper::http::request::Parts;
 use hyper::{Method, Response};
 use url::form_urlencoded;
 
-use crate::api::{ListChanged, MAX_ENTRY_BYTES, entry_text};
+use crate::api::{AdminRead, ListChanged, MAX_ENTRY_BYTES, Which, entry_text};
 use crate::ingress::{BODY_READ_TIMEOUT, Ingress};
 use crate::oidc::AUTH_NAME;
 use crate::registry::{Asked, Change, Changed, List, Listing, Named, check_name};
@@ -125,20 +127,17 @@ impl Ingress {
     {
         let viewer = self.viewer(user, port).await;
         let read = parts.method == Method::GET || parts.method == Method::HEAD;
-        let mut answer = match (Route::of(parts.uri.path()), read) {
-            (None, _) => pages::not_found(&viewer),
-            (Some(Route::List), true) => self.list(&viewer, parts.uri.query(), port).await,
-            (Some(Route::Application(name)), true) => {
-                self.application(&viewer, name, parts.uri.query(), port)
-                    .await
+        let mut answer = if admin::is_admin_path(parts.uri.path()) {
+            // Before anything else of the path, its parameters or its
+            // body: nobody but a Platform administrator learns what is
+            // there.
+            if viewer.admin {
+                self.admin(&viewer, parts, body).await
+            } else {
+                admin_pages::not_an_administrator(&viewer)
             }
-            (Some(Route::Sharing(name)), false) if parts.method == Method::POST => {
-                self.sharing(&viewer, parts, name, body).await
-            }
-            (Some(Route::List | Route::Application(_)), false) => {
-                pages::method_not_allowed(&viewer, "GET, HEAD")
-            }
-            (Some(Route::Sharing(_)), _) => pages::method_not_allowed(&viewer, "POST"),
+        } else {
+            self.dashboard_page(&viewer, parts, body, read, port).await
         };
         if parts.method == Method::HEAD {
             *answer.body_mut() = Full::new(Bytes::new());
@@ -146,11 +145,42 @@ impl Ingress {
         answer
     }
 
+    /// A request to a path of the Dashboard outside `/admin`.
+    async fn dashboard_page<B>(
+        &self,
+        viewer: &Viewer<'_>,
+        parts: &Parts,
+        body: B,
+        read: bool,
+        port: Option<u16>,
+    ) -> Answer
+    where
+        B: Body<Data = Bytes> + Send,
+        B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
+        match (Route::of(parts.uri.path()), read) {
+            (None, _) => pages::not_found(viewer),
+            (Some(Route::List), true) => self.list(viewer, parts.uri.query(), port).await,
+            (Some(Route::Application(name)), true) => {
+                self.application(viewer, name, parts.uri.query(), port)
+                    .await
+            }
+            (Some(Route::Sharing(name)), false) if parts.method == Method::POST => {
+                self.sharing(viewer, parts, name, body).await
+            }
+            (Some(Route::List | Route::Application(_)), false) => {
+                pages::method_not_allowed(viewer, "GET, HEAD")
+            }
+            (Some(Route::Sharing(_)), _) => pages::method_not_allowed(viewer, "POST"),
+        }
+    }
+
     /// Whom a page says the person is signed in as: with OIDC their name,
     /// read for it (when that fails, the page shows the id alone), and the
     /// sign-in address's sign-out; the stand-in keeps no record of people
     /// and has no sign-out.
     async fn viewer<'a>(&self, user: &'a User, port: Option<u16>) -> Viewer<'a> {
+        let admin = self.api.is_administrator(user);
         if self.oidc.as_ref().is_some_and(|o| o.connected().is_some()) {
             let name = self.registry.person_name(&user.id).await.ok().flatten();
             let sign_out = format!(
@@ -162,12 +192,14 @@ impl Ingress {
                 user,
                 name,
                 sign_out: Some(sign_out),
+                admin,
             }
         } else {
             Viewer {
                 user,
                 name: None,
                 sign_out: None,
+                admin,
             }
         }
     }
@@ -232,6 +264,7 @@ impl Ingress {
                     declared: shown.map(|s| &s.declared),
                     seen: &seen,
                     disabled: listed.disabled_since.as_deref(),
+                    admin: None,
                 }
             })
             .collect();
@@ -265,6 +298,22 @@ impl Ingress {
         let shown = match self.registry.shown(&[name], 0).await {
             Ok(shown) => shown,
             Err(error) => return self.unavailable(viewer, &error),
+        };
+        // A Platform administrator sees its usage: one reading of every
+        // Application, as `GET /v1/admin/applications` answers it.
+        let usage = if administrator {
+            match self.api.read_every_application(Which::Named(name), 1).await {
+                Ok(read) => match read.rows.first() {
+                    Some(row) => Some((row.requests, row.users)),
+                    None => return pages::no_application(viewer, name),
+                },
+                Err(AdminRead::Busy) => return admin_pages::busy_card(viewer),
+                Err(AdminRead::TooLong(error) | AdminRead::Failed(error)) => {
+                    return self.unavailable(viewer, &error);
+                }
+            }
+        } else {
+            None
         };
         let declared = shown.get(name).map(|s| &s.declared);
         let records = viewer.records_people();
@@ -309,6 +358,11 @@ impl Ingress {
             declared,
             seen: &seen,
             disabled: record.disabled.as_ref().map(|d| d.since.as_str()),
+            admin: usage.map(|(requests, users)| pages::AdminSees {
+                requests,
+                users,
+                disabled_by: record.disabled.as_ref().map(|d| d.by.as_str()),
+            }),
         };
         let shared: Option<Vec<pages::Person<'_>>> = (contributor || administrator).then(|| {
             record
@@ -324,7 +378,7 @@ impl Ingress {
             &block,
             shared.as_deref(),
             contributor,
-            notice_of(query),
+            notice_of(query, administrator),
         )
     }
 
@@ -467,7 +521,8 @@ fn page_of(query: Option<&str>) -> Option<i64> {
 }
 
 /// `?changed=`: the notice a change leads to; any other value is ignored.
-fn notice_of(query: Option<&str>) -> Option<Notice> {
+/// `disabled` and `enabled` are a Platform administrator's (`admin`) only.
+fn notice_of(query: Option<&str>, admin: bool) -> Option<Notice> {
     let given = form_urlencoded::parse(query?.as_bytes())
         .find(|(name, _)| name == "changed")
         .map(|(_, value)| value)?;
@@ -475,6 +530,8 @@ fn notice_of(query: Option<&str>) -> Option<Notice> {
         "shared" => Some(Notice::Shared),
         "unshared" => Some(Notice::Unshared),
         "nothing" => Some(Notice::Nothing),
+        "disabled" if admin => Some(Notice::Disabled),
+        "enabled" if admin => Some(Notice::Enabled),
         _ => None,
     }
 }
