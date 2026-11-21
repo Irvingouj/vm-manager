@@ -1,10 +1,11 @@
 //! The Dashboard's list (CONTRACT.md, "The Dashboard: The list"), with the
 //! stand-in sign-in: exactly the Applications a person contributes to, then
 //! those shared with them (by their id, by a Group, with everyone), each
-//! group by name, and nothing else; `data-vm-relation`, `data-vm-serving`
-//! and the link that opens an Application; its description and its
-//! Contributors (the first 20, and how many more); pages of 100; and the
-//! same Applications as `GET /v1/applications` and `vibe applications`.
+//! group by name, and nothing else; `data-vm-relation`, `data-vm-serving`,
+//! the name that leads to its page and the link that opens it, its
+//! description, and "Not deployed"; its Contributors, every one, on its own
+//! page and none on the list; pages of 100; and the same Applications as
+//! `GET /v1/applications` and `vibe applications`.
 //!
 //! Acceptance criteria: "A signed-in person sees the Applications they
 //! contribute to and those shared with them, and no others"; "Each
@@ -22,8 +23,8 @@
 use std::collections::BTreeMap;
 
 use blackbox::dashboard::{
-    CONTRIBUTORS_LISTED, Dashboard, Listed, PAGE_SIZE, administrator, create, deploy,
-    stand_in_options, start,
+    Dashboard, Listed, PAGE_SIZE, administrator,
+    assert_list_holds_nothing_of_an_applications_own_page, create, deploy, stand_in_options, start,
 };
 use blackbox::sharing::{add, assert_opens, contributors_ok, everyone, group, share_ok, user};
 use blackbox::tool::Machine;
@@ -199,6 +200,29 @@ fn each_application_shows_its_serving_version_and_a_link_that_opens_it_only_when
         "expected the element to show the Application's name, got {:?}",
         board.text
     );
+    assert!(
+        board.open_names.iter().all(|n| n.contains("board")),
+        "expected the name of `a[data-vm-open]`, as a screen reader says it, to hold the Application's name, got {:?}\n{}",
+        board.open_names,
+        page.describe()
+    );
+    let words: Vec<String> = board
+        .text
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(str::to_owned)
+        .collect();
+    assert!(
+        !words.iter().any(|w| w == "2" || w == "v2"),
+        "expected no Version's number as text in the list (it is `data-vm-serving` here, and on the Application's page), got {:?}",
+        board.text
+    );
+    assert!(
+        !board.text.contains("board.vm.test"),
+        "expected no address as text in the list (it is the link's `href` here, and on the Application's page), got {:?}",
+        board.text
+    );
 
     let draft = page.listed("draft");
     assert_eq!(
@@ -213,9 +237,9 @@ fn each_application_shows_its_serving_version_and_a_link_that_opens_it_only_when
         "expected no `a[data-vm-open]` when no Version serves"
     );
     assert!(
-        draft.text.to_lowercase().contains("deployed"),
-        "expected words saying that nothing is deployed yet, got {:?}",
-        draft.text
+        draft.spoken.to_lowercase().contains("not deployed"),
+        "expected a mark with the words \"Not deployed\", got {:?}",
+        draft.spoken
     );
     assert_eq!(
         draft.description(),
@@ -233,6 +257,11 @@ fn each_application_shows_its_serving_version_and_a_link_that_opens_it_only_when
             at.host_str() == Some("dashboard.vm.test")
                 && at.path() == format!("/applications/{name}"),
             "expected `a[data-vm-details]` to lead to /applications/{name} on the Dashboard, got {details:?}"
+        );
+        assert!(
+            listed.details_texts.iter().all(|t| t.contains(name)),
+            "expected the Application's name to be the link `a[data-vm-details]`, its text is {:?}",
+            listed.details_texts
         );
     }
     // The link opens it.
@@ -266,7 +295,7 @@ fn the_link_to_open_is_the_applications_address_as_a_browser_reaches_it() {
 }
 
 #[test]
-fn contributors_are_shown_in_the_order_of_the_list_the_first_twenty_and_how_many_more() {
+fn every_contributor_is_on_the_applications_page_in_the_order_of_the_list_and_none_on_the_list() {
     let vm = start();
     create(&vm, &alice(), "crowded", None);
     let mut entries = vec![group("ops-team")];
@@ -286,54 +315,41 @@ fn contributors_are_shown_in_the_order_of_the_list_the_first_twenty_and_how_many
     assert_eq!(all.len(), 25, "the harness's own count");
 
     let dashboard = Dashboard::new(&vm, &alice());
-    let page = dashboard.list();
-    let crowded = page.listed("crowded");
+    let list = dashboard.list();
+    assert_list_holds_nothing_of_an_applications_own_page(&list, "alice's list");
+    for absent in ["ops-team", "night-shift", "u01", "u23"] {
+        assert!(
+            !list.body_text().contains(absent),
+            "expected no Contributor on the list, but it names {absent:?}\n{}",
+            list.describe()
+        );
+    }
+
+    let details = dashboard.details("crowded");
     assert_eq!(
-        crowded.contributor_keys(),
-        all[..CONTRIBUTORS_LISTED].to_vec(),
-        "expected the first 20 Contributors in the order of the list, each `data-vm-contributor` with `data-vm-id`\n{}",
-        page.describe()
+        details.contributor_keys(),
+        all,
+        "expected every Contributor on the Application's own page, in the order of the list, each `data-vm-contributor` with `data-vm-id`\n{}",
+        details.describe()
     );
     assert_eq!(
-        crowded.more_contributors,
-        vec!["5".to_owned()],
-        "expected one element `data-vm-more-contributors=\"5\"`\n{}",
-        page.describe()
+        details.count("data-vm-more-contributors"),
+        0,
+        "expected no `data-vm-more-contributors` on the Application's own page"
     );
-    for shown in &crowded.contributors {
+    for shown in &details.contributors() {
         let id = shown.id.clone().unwrap_or_default();
         assert!(
             shown.text.contains(&id),
             "expected each Contributor's text to show their id or the Group, got {shown:?}"
         );
     }
-    let pair = page.listed("pair");
+    let pair = dashboard.details("pair");
     assert_eq!(
         pair.contributor_keys(),
         vec!["user:alice".to_owned(), "group:night-shift".to_owned()],
         "{}",
-        page.describe()
-    );
-    assert!(
-        pair.more_contributors.is_empty(),
-        "expected no `data-vm-more-contributors` for 2 Contributors"
-    );
-
-    let details = dashboard.details("crowded");
-    let shown = details.listed("crowded");
-    assert_eq!(
-        shown.contributor_keys(),
-        all,
-        "expected every Contributor on the Application's own page\n{}",
-        details.describe()
-    );
-    assert!(
-        shown.more_contributors.is_empty()
-            && details
-                .root()
-                .with_attr("data-vm-more-contributors")
-                .is_empty(),
-        "expected no `data-vm-more-contributors` on the Application's own page"
+        pair.describe()
     );
 }
 

@@ -15,7 +15,8 @@
 use std::time::Duration;
 
 use blackbox::dashboard::{
-    Dashboard, Page, assert_refused, create, deploy, form_body, stand_in_options, start,
+    Dashboard, Page, assert_list_holds_nothing_of_an_applications_own_page, assert_refused, create,
+    deploy, form_body, stand_in_options, start,
 };
 use blackbox::postgres::{Platform, PrivatePostgres};
 use blackbox::sharing::{add, assert_own_page_headers, contributors_ok, group, share_ok};
@@ -232,54 +233,68 @@ fn everything_shown_is_escaped_as_html() {
         &add(&[group(hostile_group)]),
     );
     let dashboard = Dashboard::new(&vm, &hostile_user);
-    for page in [dashboard.list(), dashboard.details(APP)] {
+    let list = dashboard.list();
+    let details = dashboard.details(APP);
+    for (where_, page) in [("the list", &list), ("its page", &details)] {
         let (id, text) = page.user();
         assert_eq!(
             id,
             hostile_user.id,
-            "expected `data-vm-user` to hold the id exactly\n{}",
+            "{where_}: expected `data-vm-user` to hold the id exactly\n{}",
             page.describe()
         );
         assert!(
             text.contains(&hostile_user.id),
-            "expected the id shown as those characters, got {text:?}"
+            "{where_}: expected the id shown as those characters, got {text:?}"
         );
         let board = page.listed(APP);
         assert_eq!(
             board.description(),
             Some(description),
-            "expected the description shown as those characters\n{}",
+            "{where_}: expected the description shown as those characters\n{}",
             page.describe()
         );
-        assert_eq!(
-            board.contributor_keys(),
-            vec![
-                format!("user:{}", hostile_user.id),
-                format!("group:{hostile_group}")
-            ],
-            "expected each Contributor's `data-vm-id` to hold it exactly\n{}",
-            page.describe()
-        );
-        for shown in &board.contributors {
-            let id = shown.id.clone().unwrap_or_default();
-            assert!(
-                shown.text.contains(&id),
-                "expected {id:?} shown as those characters, got {:?}",
-                shown.text
-            );
-        }
         let html = page.response.text();
         for raw in ["<script>alert", "<i>o'neil", "<b>\"g\"", "\"co\"</i>"] {
             assert!(
                 !html.contains(raw),
-                "expected everything that is not the platform's own text escaped as HTML, but the page holds {raw:?}\n{html}"
+                "{where_}: expected everything that is not the platform's own text escaped as HTML, but the page holds {raw:?}\n{html}"
             );
         }
     }
-    let details = dashboard.details(APP);
+    // The Contributors and whom it is shared with are on its page only.
+    assert_eq!(
+        details.contributor_keys(),
+        vec![
+            format!("user:{}", hostile_user.id),
+            format!("group:{hostile_group}")
+        ],
+        "expected each Contributor's `data-vm-id` to hold it exactly\n{}",
+        details.describe()
+    );
+    for shown in &details.contributors() {
+        let id = shown.id.clone().unwrap_or_default();
+        assert!(
+            shown.text.contains(&id),
+            "expected {id:?} shown as those characters, got {:?}",
+            shown.text
+        );
+    }
     assert_eq!(
         details.shared_keys(),
         vec![format!("group:{hostile_group}")]
+    );
+    assert_list_holds_nothing_of_an_applications_own_page(&list, "the list");
+    assert!(
+        !list.text().contains(hostile_group),
+        "expected the Group, a Contributor and whom it is shared with, nowhere on the list\n{}",
+        list.describe()
+    );
+    assert_eq!(
+        list.body_text().matches(&hostile_user.id).count(),
+        1,
+        "expected the person's id on the list once, in the header, not again as a Contributor\n{}",
+        list.describe()
     );
 }
 

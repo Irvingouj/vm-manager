@@ -21,8 +21,8 @@
 use blackbox::api::version_body;
 use blackbox::browser::{Browser, Step, describe_steps, query_param};
 use blackbox::dashboard::{
-    Page, assert_changed, assert_refusal_words, assert_refused, oidc_page, oidc_post, oidc_sign_in,
-    oidc_url,
+    Page, assert_changed, assert_list_holds_nothing_of_an_applications_own_page,
+    assert_refusal_words, assert_refused, oidc_page, oidc_post, oidc_sign_in, oidc_url,
 };
 use blackbox::oidc::{Person, Provider};
 use blackbox::postgres::{Platform, PrivatePostgres};
@@ -436,43 +436,47 @@ fn people_are_shown_with_their_names_and_emails() {
         200,
         "Ada at board",
     );
-    for (where_, listed) in [
-        ("the list", page.listed(APP)),
-        ("its page", details.listed(APP)),
-    ] {
-        let mut contributors = listed.contributor_keys();
-        contributors.sort();
-        let mut wanted = vec![
-            format!("user:{ADA}"),
-            format!("user:{GRACE}"),
-            format!("user:{MISTYPED}"),
-        ];
-        wanted.sort();
-        assert_eq!(contributors, wanted, "{where_}\n{}", page.describe());
-        for shown in &listed.contributors {
-            let id = shown.id.as_deref().unwrap_or_default();
-            let name = match id {
-                ADA => Some("Ada Lovelace"),
-                GRACE => Some("Grace Hopper"),
-                _ => None,
-            };
-            if let Some(name) = name {
-                assert!(
-                    shown.text.contains(name),
-                    "{where_}: expected a Contributor shown by their name {name:?}, got {shown:?}"
-                );
-            } else {
-                assert!(
-                    shown.text.contains(MISTYPED),
-                    "{where_}: expected someone who never signed in here shown by their id, got {shown:?}"
-                );
-            }
-            assert_unseen(
-                shown,
-                name.is_none(),
-                &format!("{where_}, Contributor {id}"),
+    assert_list_holds_nothing_of_an_applications_own_page(&page, "Ada's list");
+    for absent in ["Grace Hopper", MISTYPED, "Twin A", HEDY] {
+        assert!(
+            !page.body_text().contains(absent),
+            "expected no Contributor and no one it is shared with on the list, but it names {absent:?}\n{}",
+            page.describe()
+        );
+    }
+    let where_ = "its page";
+    let mut contributors = details.contributor_keys();
+    contributors.sort();
+    let mut wanted = vec![
+        format!("user:{ADA}"),
+        format!("user:{GRACE}"),
+        format!("user:{MISTYPED}"),
+    ];
+    wanted.sort();
+    assert_eq!(contributors, wanted, "{where_}\n{}", details.describe());
+    for shown in &details.contributors() {
+        let id = shown.id.as_deref().unwrap_or_default();
+        let name = match id {
+            ADA => Some("Ada Lovelace"),
+            GRACE => Some("Grace Hopper"),
+            _ => None,
+        };
+        if let Some(name) = name {
+            assert!(
+                shown.text.contains(name),
+                "{where_}: expected a Contributor shown by their name {name:?}, got {shown:?}"
+            );
+        } else {
+            assert!(
+                shown.text.contains(MISTYPED),
+                "{where_}: expected someone who never signed in here shown by their id, got {shown:?}"
             );
         }
+        assert_unseen(
+            shown,
+            name.is_none(),
+            &format!("{where_}, Contributor {id}"),
+        );
     }
     let shared = details.shared();
     assert_eq!(

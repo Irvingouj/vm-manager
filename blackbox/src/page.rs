@@ -425,6 +425,56 @@ impl<'a> Element<'a> {
         }
         text.split_whitespace().collect::<Vec<_>>().join(" ")
     }
+
+    /// The text inside this element as a screen reader says it, near
+    /// enough for a test: what is inside an element with
+    /// `aria-hidden="true"` is left out; an element with an `aria-label`
+    /// that is not empty says its label instead of what is inside it; an
+    /// `<img>` says its `alt`. The raw text of a `<script>`, `<style>` or
+    /// `<title>` is left out. White space squashed and trimmed.
+    pub fn spoken(&self) -> String {
+        let mut text = String::new();
+        let mut stack: Vec<usize> = self.child_nodes().iter().rev().copied().collect();
+        while let Some(at) = stack.pop() {
+            match &self.document.nodes[at] {
+                Node::Text(t) => text.push_str(t),
+                Node::Element { .. } => {
+                    let element = Element {
+                        document: self.document,
+                        at,
+                    };
+                    if matches!(element.name(), "script" | "style" | "title")
+                        || element
+                            .attr("aria-hidden")
+                            .is_some_and(|h| h.trim().eq_ignore_ascii_case("true"))
+                    {
+                        continue;
+                    }
+                    text.push(' ');
+                    if let Some(label) = element.attr("aria-label").filter(|l| !l.trim().is_empty())
+                    {
+                        text.push_str(label);
+                    } else if element.name() == "img" {
+                        text.push_str(element.attr("alt").unwrap_or_default());
+                    } else {
+                        stack.extend(element.child_nodes().iter().rev());
+                    }
+                    text.push(' ');
+                }
+            }
+        }
+        text.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    /// The element's name as a screen reader says it, near enough for a
+    /// test: its `aria-label` when that is not empty, else what is inside
+    /// it as [`Element::spoken`] reads it.
+    pub fn accessible_name(&self) -> String {
+        match self.attr("aria-label").filter(|l| !l.trim().is_empty()) {
+            Some(label) => label.split_whitespace().collect::<Vec<_>>().join(" "),
+            None => self.spoken(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -482,6 +532,18 @@ mod tests {
         assert_eq!(root.with_attr("x")[0].text(), "a b");
         assert_eq!(root.with_attr("y")[0].text(), "c");
         assert!(root.with_attr("x")[0].with_attr("y").is_empty());
+    }
+
+    #[test]
+    fn what_a_screen_reader_says_leaves_out_the_hidden_and_says_labels() {
+        let doc = Document::parse(
+            r#"<a x href="/"><svg aria-hidden="true"><path d="M0"/></svg><span>Open</span> <span class="sr">board</span></a><p y><svg role="img" aria-label="Missing access"><path/></svg> Fix <span aria-hidden=true>!</span><img alt="pic"></p><a z aria-label="Open  board">Go</a>"#,
+        );
+        let root = doc.root();
+        assert_eq!(root.with_attr("x")[0].spoken(), "Open board");
+        assert_eq!(root.with_attr("y")[0].spoken(), "Missing access Fix pic");
+        assert_eq!(root.with_attr("z")[0].accessible_name(), "Open board");
+        assert_eq!(root.with_attr("x")[0].accessible_name(), "Open board");
     }
 
     #[test]

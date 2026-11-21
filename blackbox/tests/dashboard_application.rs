@@ -134,7 +134,7 @@ fn a_contributor_sees_every_contributor_its_address_and_whom_it_is_shared_with_i
         assert_eq!(board.serving.as_deref(), Some("1"), "{}", page.describe());
         assert_eq!(board.description(), Some(DESCRIPTION));
         assert_eq!(
-            board.contributor_keys(),
+            page.contributor_keys(),
             keys(&["user:alice", "group:staff"]),
             "{}: expected every Contributor, in order\n{}",
             person.id,
@@ -223,7 +223,7 @@ fn someone_it_is_shared_with_sees_who_maintains_it_and_not_whom_else_it_is_share
         page.describe()
     );
     assert_eq!(
-        board.contributor_keys(),
+        page.contributor_keys(),
         keys(&["user:alice", "group:staff"]),
         "expected who maintains it\n{}",
         page.describe()
@@ -287,7 +287,7 @@ fn assert_administrator_cannot_open(page: &Page, context: &str) {
         page.describe()
     );
     assert_eq!(
-        board.contributor_keys(),
+        page.contributor_keys(),
         keys(&["user:alice", "group:staff"]),
         "{context}"
     );
@@ -358,7 +358,7 @@ fn a_platform_administrator_gets_the_page_and_whom_it_is_shared_with_and_no_form
         page.describe()
     );
     assert_eq!(
-        board.contributor_keys(),
+        page.contributor_keys(),
         keys(&["user:alice", "group:staff"])
     );
 }
@@ -417,8 +417,8 @@ fn with_the_stand_in_nobody_is_marked_as_never_seen() {
             "expected no element `data-vm-unseen` with the stand-in\n{}",
             page.describe()
         );
-        let board = page.listed(APP);
-        for shown in board.contributors.iter().chain(page.shared().iter()) {
+        page.listed(APP);
+        for shown in page.contributors().iter().chain(page.shared().iter()) {
             let text = shown.text.to_lowercase();
             assert!(
                 !(text.contains("seen") || text.contains("check")),

@@ -25,9 +25,6 @@ pub const NAME: &str = "dashboard";
 /// How many Applications a page of the list holds.
 pub const PAGE_SIZE: usize = 100;
 
-/// How many Contributors an Application shows in the list.
-pub const CONTRIBUTORS_LISTED: usize = 20;
-
 /// The largest body of a change of sharing.
 pub const MAX_FORM_BODY: usize = 4096;
 
@@ -300,25 +297,33 @@ pub fn oidc_post(browser: &mut Browser, page: &Page, action: &Url, body: &str) -
 }
 
 /// The fields `data-vm-...` say of one element of the list (or of an
-/// Application's own page).
+/// Application's own page). What only an Application's own page holds (its
+/// Contributors, its Resources) is read from the whole page:
+/// [`Page::contributors`], [`Page::resources`].
 #[derive(Clone, Debug)]
 pub struct Listed {
     pub name: String,
     pub relation: Option<String>,
     pub serving: Option<String>,
+    /// `data-vm-attention`: the worst standing among the Resources its
+    /// serving Version declares, as one mark.
+    pub attention: Option<String>,
     /// The text of the element `data-vm-description`, if there is one;
     /// `Some` of each when there are more (a test says that is wrong).
     pub descriptions: Vec<String>,
     /// The elements `data-vm-open`: (element name, `href`).
     pub open: Vec<(String, Option<String>)>,
+    /// The name of each element `data-vm-open` as a screen reader says it.
+    pub open_names: Vec<String>,
     /// The elements `data-vm-details`: (element name, `href`).
     pub details: Vec<(String, Option<String>)>,
-    pub contributors: Vec<Shown>,
-    /// The values of the elements `data-vm-more-contributors`.
-    pub more_contributors: Vec<String>,
-    pub resources: Vec<Declared>,
+    /// The text of each element `data-vm-details`.
+    pub details_texts: Vec<String>,
     /// The whole element's text.
     pub text: String,
+    /// The whole element's text as a screen reader says it
+    /// ([`Element::spoken`]).
+    pub spoken: String,
 }
 
 /// A person, a Group or everyone as a page shows them: the kind
@@ -345,7 +350,7 @@ impl Shown {
     }
 }
 
-/// A declared Resource as the list shows it.
+/// A declared Resource as an Application's own page shows it.
 #[derive(Clone, Debug)]
 pub struct Declared {
     pub name: String,
@@ -354,6 +359,45 @@ pub struct Declared {
     pub standing: Option<String>,
     pub ask: Option<String>,
     pub text: String,
+    /// The element's text as a screen reader says it ([`Element::spoken`]):
+    /// a mark's name included, what is hidden from it left out.
+    pub spoken: String,
+    /// Each `<svg>` inside it: (`aria-hidden`, `role`, `aria-label`).
+    pub marks: Vec<(Option<String>, Option<String>, Option<String>)>,
+}
+
+impl Declared {
+    fn read(e: &Element<'_>) -> Self {
+        Self {
+            name: e.attr("data-vm-resource").unwrap_or_default().to_owned(),
+            declared: e.attr("data-vm-declared").map(str::to_owned),
+            yours: e.attr("data-vm-yours").map(str::to_owned),
+            standing: e.attr("data-vm-standing").map(str::to_owned),
+            ask: e.attr("data-vm-ask").map(str::to_owned),
+            text: e.text(),
+            spoken: e.spoken(),
+            marks: e
+                .named("svg")
+                .iter()
+                .map(|svg| {
+                    (
+                        svg.attr("aria-hidden").map(str::to_owned),
+                        svg.attr("role").map(str::to_owned),
+                        svg.attr("aria-label").map(str::to_owned),
+                    )
+                })
+                .collect(),
+        }
+    }
+}
+
+fn shown_contributor(e: &Element<'_>) -> Shown {
+    Shown {
+        kind: e.attr("data-vm-contributor").unwrap_or_default().to_owned(),
+        id: e.attr("data-vm-id").map(str::to_owned),
+        text: e.text(),
+        unseen: e.has("data-vm-unseen"),
+    }
 }
 
 impl Listed {
@@ -366,49 +410,30 @@ impl Listed {
                 .to_owned(),
             relation: element.attr("data-vm-relation").map(str::to_owned),
             serving: element.attr("data-vm-serving").map(str::to_owned),
+            attention: element.attr("data-vm-attention").map(str::to_owned),
             descriptions: element
                 .with_attr("data-vm-description")
                 .iter()
                 .map(Element::text)
                 .collect(),
             open: element.with_attr("data-vm-open").iter().map(link).collect(),
+            open_names: element
+                .with_attr("data-vm-open")
+                .iter()
+                .map(Element::accessible_name)
+                .collect(),
             details: element
                 .with_attr("data-vm-details")
                 .iter()
                 .map(link)
                 .collect(),
-            contributors: element
-                .with_attr("data-vm-contributor")
+            details_texts: element
+                .with_attr("data-vm-details")
                 .iter()
-                .map(|e| Shown {
-                    kind: e.attr("data-vm-contributor").unwrap_or_default().to_owned(),
-                    id: e.attr("data-vm-id").map(str::to_owned),
-                    text: e.text(),
-                    unseen: e.has("data-vm-unseen"),
-                })
-                .collect(),
-            more_contributors: element
-                .with_attr("data-vm-more-contributors")
-                .iter()
-                .map(|e| {
-                    e.attr("data-vm-more-contributors")
-                        .unwrap_or_default()
-                        .to_owned()
-                })
-                .collect(),
-            resources: element
-                .with_attr("data-vm-resource")
-                .iter()
-                .map(|e| Declared {
-                    name: e.attr("data-vm-resource").unwrap_or_default().to_owned(),
-                    declared: e.attr("data-vm-declared").map(str::to_owned),
-                    yours: e.attr("data-vm-yours").map(str::to_owned),
-                    standing: e.attr("data-vm-standing").map(str::to_owned),
-                    ask: e.attr("data-vm-ask").map(str::to_owned),
-                    text: e.text(),
-                })
+                .map(Element::text)
                 .collect(),
             text: element.text(),
+            spoken: element.spoken(),
         }
     }
 
@@ -435,23 +460,66 @@ impl Listed {
     pub fn details_href(&self) -> Option<String> {
         one_link(&self.details, "data-vm-details", &self.name)
     }
+}
 
-    /// What each Contributor shown names (see [`Shown::key`]), in order.
-    pub fn contributor_keys(&self) -> Vec<String> {
-        self.contributors.iter().map(Shown::key).collect()
+/// The few words of the list's mark for each `data-vm-attention` but
+/// `none` (CONTRACT.md, "The Dashboard: The list").
+pub const ATTENTION_WORDS: [(&str, &str); 3] = [
+    ("missing-access", "Missing access"),
+    ("not-registered", "Not set up"),
+    ("unknown", "Access unknown"),
+];
+
+/// Fails unless the Application's element (on its own page, where the
+/// element holds the whole of it and the words of the list's mark are not
+/// promised) has `data-vm-attention` of `wanted`.
+pub fn assert_attention_attribute(listed: &Listed, wanted: &str, context: &str) {
+    assert_eq!(
+        listed.attention.as_deref(),
+        Some(wanted),
+        "{context}: expected `data-vm-attention={wanted:?}` on {:?}, got {:?}",
+        listed.name,
+        listed.attention
+    );
+}
+
+/// Fails unless the Application's element of the list has
+/// `data-vm-attention` of `wanted` and holds the words of that mark (as a screen reader says the
+/// element, in any letter case) and no other mark's; for `none`, no mark's
+/// words at all.
+pub fn assert_attention(listed: &Listed, wanted: &str, context: &str) {
+    assert_attention_attribute(listed, wanted, context);
+    let spoken = listed.spoken.to_lowercase();
+    for (attention, words) in ATTENTION_WORDS {
+        let held = spoken.contains(&words.to_lowercase());
+        assert!(
+            held == (attention == wanted),
+            "{context}: expected {:?} to hold {} the words {words:?} (the mark of `{attention}`) with `data-vm-attention={wanted:?}`; it says {:?}",
+            listed.name,
+            if attention == wanted { "" } else { "not" },
+            listed.spoken
+        );
     }
+}
 
-    /// The declared Resource of this name, failing unless there is exactly
-    /// one.
-    pub fn resource(&self, name: &str) -> &Declared {
-        let found: Vec<&Declared> = self.resources.iter().filter(|r| r.name == name).collect();
-        match found.as_slice() {
-            [one] => one,
-            _ => panic!(
-                "expected exactly one element `data-vm-resource={name:?}` in {:?}, got {:?}",
-                self.name, self.resources
-            ),
-        }
+/// Fails unless the page of the list holds what finds and opens an
+/// Application and none of what is on an Application's own page: no
+/// element `data-vm-contributor`, `data-vm-more-contributors`,
+/// `data-vm-resource` or `data-vm-shared` (CONTRACT.md, "How the pages
+/// look: Said once").
+pub fn assert_list_holds_nothing_of_an_applications_own_page(page: &Page, context: &str) {
+    for attribute in [
+        "data-vm-contributor",
+        "data-vm-more-contributors",
+        "data-vm-resource",
+        "data-vm-shared",
+    ] {
+        assert_eq!(
+            page.count(attribute),
+            0,
+            "{context}: expected no element `{attribute}` on the Dashboard's list, it is on the Application's own page\n{}",
+            page.describe()
+        );
     }
 }
 
@@ -761,6 +829,61 @@ impl Page {
     /// What each element `data-vm-shared` names, in order.
     pub fn shared_keys(&self) -> Vec<String> {
         self.shared().iter().map(Shown::key).collect()
+    }
+
+    /// Every element `data-vm-contributor` of the page, in order.
+    pub fn contributors(&self) -> Vec<Shown> {
+        self.root()
+            .with_attr("data-vm-contributor")
+            .iter()
+            .map(shown_contributor)
+            .collect()
+    }
+
+    /// What each Contributor of the page names (see [`Shown::key`]), in
+    /// order.
+    pub fn contributor_keys(&self) -> Vec<String> {
+        self.contributors().iter().map(Shown::key).collect()
+    }
+
+    /// Every element `data-vm-resource` of the page, in order.
+    pub fn resources(&self) -> Vec<Declared> {
+        self.root()
+            .with_attr("data-vm-resource")
+            .iter()
+            .map(Declared::read)
+            .collect()
+    }
+
+    /// The declared Resource of this name, failing unless the page has
+    /// exactly one element of it.
+    pub fn resource(&self, name: &str) -> Declared {
+        let found: Vec<Declared> = self
+            .resources()
+            .into_iter()
+            .filter(|r| r.name == name)
+            .collect();
+        match found.as_slice() {
+            [one] => one.clone(),
+            _ => panic!(
+                "expected exactly one element `data-vm-resource={name:?}` on the page at {}, found {}\n{}",
+                self.url,
+                found.len(),
+                self.describe()
+            ),
+        }
+    }
+
+    /// How many elements of the page carry this attribute.
+    pub fn count(&self, attribute: &str) -> usize {
+        self.root().with_attr(attribute).len()
+    }
+
+    /// The text a person reads on the page: that of its `<body>`, without
+    /// the `<title>` (the whole page's when there is no `<body>`).
+    pub fn body_text(&self) -> String {
+        let bodies = self.root().named("body");
+        bodies.first().map_or_else(|| self.text(), Element::text)
     }
 
     /// Every form of the page.

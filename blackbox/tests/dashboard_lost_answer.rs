@@ -1,5 +1,6 @@
 //! The Dashboard while the program cannot tell what became of a write
-//! (CONTRACT.md, "The Dashboard: The list" on `unknown`, "Sharing from it"
+//! (CONTRACT.md, "The Dashboard: The list" on `data-vm-attention`, "One
+//! Application" on `unknown`, "Sharing from it"
 //! on `503` `unavailable`, and "A write whose answer is lost"), with the
 //! stand-in sign-in, on a platform database on a Postgres of each test's
 //! own whose commits the harness can hold (`blackbox::lost_answer`).
@@ -15,7 +16,10 @@
 
 use std::thread;
 
-use blackbox::dashboard::{Dashboard, Page, assert_refused, create, deploy, stand_in_options};
+use blackbox::dashboard::{
+    Dashboard, Page, assert_attention, assert_attention_attribute, assert_refused, create, deploy,
+    stand_in_options,
+};
 use blackbox::lost_answer::{HeldPostgres, LOST_WRITE_TIMEOUT, quickly};
 use blackbox::scenario::{CONTACT, Scenario, administrator};
 use blackbox::{User, Vm, assert_api_error};
@@ -23,14 +27,18 @@ use serde_json::json;
 
 const APP: &str = "board";
 
+/// Declares `crewdb` beside a Resource that is not registered.
+const MIXED: &str = "mixed";
+
 fn alice() -> User {
     User::new("alice").in_groups(&["crew"])
 }
 
-/// (yours, standing, ask) of a Resource of `board` on alice's Dashboard.
+/// (yours, standing, ask) of a Resource of `board` on its page on alice's
+/// Dashboard.
 fn standing(vm: &Vm, resource: &str) -> (String, String, Option<String>) {
-    let page = Dashboard::new(vm, &alice()).list();
-    let shown = page.listed(APP).resource(resource).clone();
+    let page = Dashboard::new(vm, &alice()).details(APP);
+    let shown = page.resource(resource);
     (
         shown.yours.unwrap_or_default(),
         shown.standing.unwrap_or_default(),
@@ -50,11 +58,21 @@ fn while_a_grant_cannot_be_told_its_standing_is_unknown_and_then_what_the_databa
     let vm = &s.vm;
     create(vm, &alice(), APP, None);
     deploy(vm, &alice(), APP, &[("crewdb", "read"), ("steady", "read")]);
+    create(vm, &alice(), MIXED, None);
+    deploy(
+        vm,
+        &alice(),
+        MIXED,
+        &[("crewdb", "read"), ("nowhere", "read")],
+    );
     assert_eq!(
         standing(vm, "crewdb").1,
         "enough",
         "the harness's own check: crew holds read on crewdb"
     );
+    let list = Dashboard::new(vm, &alice()).list();
+    assert_attention(&list.listed(APP), "none", "before: board");
+    assert_attention(&list.listed(MIXED), "not-registered", "before: mixed");
 
     postgres.hold();
     let lower = vm
@@ -74,8 +92,50 @@ fn while_a_grant_cannot_be_told_its_standing_is_unknown_and_then_what_the_databa
     postgres.assert_waiting(1, "after the Grant's `503`");
 
     // Answered `200` within the bound of the API's reading, never held
-    // until the write is settled.
+    // until the write is settled: the Application's page, and the list.
     let dashboard = Dashboard::new(vm, &alice());
+    let target = format!("/applications/{APP}");
+    let answer = quickly(
+        vm,
+        &dashboard.navigation("GET", &target),
+        "the Application's page while the Grants on crewdb cannot be told",
+    );
+    assert_eq!(
+        answer.status,
+        200,
+        "expected the Application's page answered `200` all the same while the Grants on crewdb cannot be told\n{}",
+        answer.describe()
+    );
+    let page = Page::read(
+        answer,
+        dashboard.url(&target),
+        "the Application's page meanwhile",
+    );
+    let crewdb = page.resource("crewdb");
+    assert_eq!(
+        (crewdb.yours.as_deref(), crewdb.standing.as_deref()),
+        (Some("unknown"), Some("unknown")),
+        "expected `data-vm-yours` and `data-vm-standing` `unknown` while the program cannot tell the Grants on crewdb\n{}",
+        page.describe()
+    );
+    assert!(
+        crewdb.spoken.to_lowercase().contains("now") && crewdb.spoken.contains("read"),
+        "expected words saying the level declared and that it cannot be told just now, got {:?}",
+        crewdb.spoken
+    );
+    let steady = page.resource("steady");
+    assert_eq!(
+        (steady.yours.as_deref(), steady.standing.as_deref()),
+        (Some("read"), Some("enough")),
+        "expected another Resource shown as ever meanwhile\n{}",
+        page.describe()
+    );
+    assert_attention_attribute(
+        &page.listed(APP),
+        "unknown",
+        "the Application's page meanwhile",
+    );
+
     let answer = quickly(
         vm,
         &dashboard.navigation("GET", "/"),
@@ -87,26 +147,12 @@ fn while_a_grant_cannot_be_told_its_standing_is_unknown_and_then_what_the_databa
         "expected the list answered `200` all the same while the Grants on crewdb cannot be told\n{}",
         answer.describe()
     );
-    let page = Page::read(answer, dashboard.url("/"), "the list meanwhile");
-    let board = page.listed(APP);
-    let crewdb = board.resource("crewdb");
-    assert_eq!(
-        (crewdb.yours.as_deref(), crewdb.standing.as_deref()),
-        (Some("unknown"), Some("unknown")),
-        "expected `data-vm-yours` and `data-vm-standing` `unknown` while the program cannot tell the Grants on crewdb\n{}",
-        page.describe()
-    );
-    assert!(
-        crewdb.text.to_lowercase().contains("now"),
-        "expected words saying that it cannot be told just now, got {:?}",
-        crewdb.text
-    );
-    let steady = board.resource("steady");
-    assert_eq!(
-        (steady.yours.as_deref(), steady.standing.as_deref()),
-        (Some("read"), Some("enough")),
-        "expected another Resource shown as ever meanwhile\n{}",
-        page.describe()
+    let list = Page::read(answer, dashboard.url("/"), "the list meanwhile");
+    assert_attention(&list.listed(APP), "unknown", "the list meanwhile: board");
+    assert_attention(
+        &list.listed(MIXED),
+        "not-registered",
+        "the list meanwhile: mixed, where not registered comes before unknown",
     );
 
     postgres.let_through();
@@ -119,6 +165,13 @@ fn while_a_grant_cannot_be_told_its_standing_is_unknown_and_then_what_the_databa
             Some(CONTACT.to_owned())
         ),
         "expected the Grant the database has once the write is settled, at the next request"
+    );
+    let list = Dashboard::new(vm, &alice()).list();
+    assert_attention(&list.listed(APP), "missing-access", "after: board");
+    assert_attention(
+        &list.listed(MIXED),
+        "missing-access",
+        "after: mixed, where missing access comes before not registered",
     );
 }
 

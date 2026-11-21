@@ -98,6 +98,8 @@ struct Look {
     measured: Value,
     focus: FocusWalk,
     narrow: Result<(), String>,
+    /// The page's markup as the browser holds it.
+    html: String,
 }
 
 impl Look {
@@ -302,6 +304,7 @@ fn look(browser: &mut Firefox, scheme: Scheme, page: &'static str) -> Look {
         &[],
     );
     let measured = measure(browser);
+    let html = browser.source();
     let narrow = narrowed(browser, NARROW);
     browser.set_window(WIDE.0, WIDE.1);
     eprintln!(
@@ -321,6 +324,7 @@ fn look(browser: &mut Firefox, scheme: Scheme, page: &'static str) -> Look {
         measured,
         focus,
         narrow,
+        html,
     }
 }
 
@@ -1012,6 +1016,58 @@ fn the_tool_s_own_page_has_the_policy_one_style_in_its_head_the_color_scheme_lan
         }
     }
     verdict("the tool's own page on the loopback address", &failures);
+}
+
+/// What is wrong with each `<svg>` of `html` that is neither hidden from a
+/// screen reader (`aria-hidden="true"`) nor an image with a name
+/// (`role="img"` and an `aria-label` that is not empty).
+fn unnamed_marks(html: &str) -> Vec<String> {
+    Document::parse(html)
+        .root()
+        .named("svg")
+        .iter()
+        .filter(|svg| {
+            let hidden = svg
+                .attr("aria-hidden")
+                .is_some_and(|h| h.trim().eq_ignore_ascii_case("true"));
+            let named = svg
+                .attr("role")
+                .is_some_and(|r| r.trim().eq_ignore_ascii_case("img"))
+                && svg.attr("aria-label").is_some_and(|l| !l.trim().is_empty());
+            !hidden && !named
+        })
+        .map(|svg| format!("an <svg> with {:?}", svg.attributes()))
+        .collect()
+}
+
+#[test]
+fn every_svg_is_hidden_from_a_screen_reader_or_is_an_image_with_a_name() {
+    let mut failures = Vec::new();
+    for l in looks(&mut failures) {
+        if l.html.is_empty() {
+            failures.push(format!("{}: its markup was not read", l.at()));
+        }
+        for problem in unnamed_marks(&l.html) {
+            failures.push(format!(
+                "{}: {problem}, neither `aria-hidden=\"true\"` nor `role=\"img\"` with an `aria-label`",
+                l.at()
+            ));
+        }
+    }
+    match &walk().tool_page {
+        Ok((_, html)) => {
+            for problem in unnamed_marks(html) {
+                failures.push(format!(
+                    "the tool's own page: {problem}, neither `aria-hidden=\"true\"` nor `role=\"img\"` with an `aria-label`"
+                ));
+            }
+        }
+        Err(e) => failures.push(format!("the tool's own page was not read: {e}")),
+    }
+    verdict(
+        "every <svg> hidden beside its words, or an image with a name",
+        &failures,
+    );
 }
 
 #[test]
