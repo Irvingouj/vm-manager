@@ -866,6 +866,17 @@ impl Stopped {
     pub fn start(&self) -> Vm {
         Vm::start(&self.options)
     }
+
+    /// Starts the program again with the same options and platform
+    /// database, but `--storage-root <root>` in place of the one it had,
+    /// or no `--storage-root` when `root` is `None`.
+    pub fn start_with_root(&self, root: Option<&Path>) -> Vm {
+        let mut options = self.options.clone().without_arg_extra("--storage-root");
+        if let Some(root) = root {
+            options = options.args_extra(&["--storage-root", &root.to_string_lossy()]);
+        }
+        Vm::start(&options)
+    }
 }
 
 /// Stops the program with `SIGTERM` and waits up to 15 seconds for it to

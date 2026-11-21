@@ -202,6 +202,16 @@ impl VmOptions {
         self
     }
 
+    /// Drops this argument and the value after it from the extra ones.
+    #[must_use]
+    pub fn without_arg_extra(mut self, name: &str) -> Self {
+        if let Some(at) = self.extra_args.iter().position(|a| a == name) {
+            let end = (at + 2).min(self.extra_args.len());
+            self.extra_args.drain(at..end);
+        }
+        self
+    }
+
     /// The value after this argument among the extra ones, if given.
     pub fn extra_arg_value(&self, name: &str) -> Option<&str> {
         self.extra_args

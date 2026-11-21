@@ -30,7 +30,7 @@ use serde_json::{Value, json};
 /// The rule each hostile key of the fixture breaks, and the rule of the
 /// key `<it>x` (what a list with it as its prefix is checked by), `None`
 /// when that is a key that is taken.
-const RULES: [(&str, &str, Option<&str>); 19] = [
+const RULES: [(&str, &str, Option<&str>); 22] = [
     ("dotdot-secret", "dot-segment", Some("dot-segment")),
     ("climb", "dot-segment", Some("dot-segment")),
     ("absolute", "empty-segment", Some("empty-segment")),
@@ -46,6 +46,10 @@ const RULES: [(&str, &str, Option<&str>); 19] = [
     ("backslash", "character", Some("character")),
     ("marker", "reserved", Some("reserved")),
     ("staging", "reserved", Some("reserved")),
+    // `reserved` in any letter case.
+    ("marker-upper", "reserved", Some("reserved")),
+    ("staging-mixed", "reserved", Some("reserved")),
+    ("inner-mixed", "reserved", Some("reserved")),
     ("long", "too-long", Some("too-long")),
     ("long-segment", "segment-too-long", Some("segment-too-long")),
     ("deep", "too-deep", Some("too-deep")),

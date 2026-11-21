@@ -167,12 +167,15 @@ fn names_on_the_disk_that_are_not_keys_are_never_listed_and_cannot_be_reached() 
         ".vibe-mine",
         "cafe\u{301}.txt",
         "bidi\u{202e}.txt",
+        // `.vibe-` in another letter case.
+        ".VIBE-notes.txt",
     ];
     for name in odd {
         place(&dir.join(name), b"not a key");
     }
     place(&dir.join("folder\u{1}/inner.txt"), b"not a key");
     place(&dir.join(".vibe-staging-not/x.txt"), b"not a key");
+    place(&dir.join(".Vibe-old/kept.txt"), b"not a key");
     for args in [json!({}), json!({ "delimiter": "/" })] {
         let listed = s.as_writer(&list(MARKETING, &args));
         let (files, folders) = listed_names(&listed["ok"]);
@@ -200,6 +203,24 @@ fn names_on_the_disk_that_are_not_keys_are_never_listed_and_cannot_be_reached() 
         "reserved",
         "the staging folder",
     );
+    for (call, what) in [
+        (
+            get(MARKETING, ".VIBE-notes.txt"),
+            "a file `.VIBE-notes.txt` placed by hand",
+        ),
+        (
+            get(MARKETING, ".Vibe-old/kept.txt"),
+            "a file in a folder `.Vibe-old/` placed by hand",
+        ),
+        (
+            head(MARKETING, ".Vibe-old"),
+            "a folder `.Vibe-old/` placed by hand",
+        ),
+    ] {
+        assert_invalid_key(&s.as_writer(&call), "reserved", what);
+    }
+    let listed = s.as_writer(&list(MARKETING, &json!({ "prefix": ".Vibe-old/" })));
+    assert_invalid_key(&listed, "reserved", "a list on the prefix `.Vibe-old/`");
 }
 
 #[test]

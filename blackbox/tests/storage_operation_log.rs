@@ -202,7 +202,7 @@ fn a_failure_after_the_directory_was_touched_has_a_duration_and_one_before_has_n
         );
         assert!(
             entry["duration_ms"].is_u64(),
-            "{error}: expected `duration_ms` from when the directory was first touched, got {entry}"
+            "{error}: expected `duration_ms`, from when the operation was handed to the directory, got {entry}"
         );
         assert!(
             entry["rows"].is_null(),
@@ -379,4 +379,84 @@ fn the_entries_are_found_by_resource_on_the_api_and_with_the_tool() {
         printed, page,
         "expected `vibe admin operation-log --resource {MARKETING} --json` to print the API's page"
     );
+}
+
+/// `duration_ms` of `entry`: a number when `handed` (the operation was
+/// handed to the directory), else null.
+fn assert_duration(entry: &Value, handed: bool, what: &str) {
+    if handed {
+        assert!(
+            entry["duration_ms"].is_u64(),
+            "{what}: expected `duration_ms` a number, from when the operation was handed to the directory, got {entry}"
+        );
+    } else {
+        assert!(
+            entry.get("duration_ms").is_some_and(Value::is_null),
+            "{what}: expected `duration_ms` null, the operation ended before it was handed to the directory, got {entry}"
+        );
+    }
+}
+
+#[test]
+fn duration_ms_is_a_number_once_the_operation_is_handed_to_the_directory_and_null_before() {
+    let s = Storage::ready();
+    s.install(
+        "bodies",
+        "storage-bodies.js",
+        &[(MARKETING, "storage", "write")],
+    );
+    symlink(s.place.outside(), s.dir(MARKETING).join("etc")).unwrap();
+    s.put_ok("a", b"x", None);
+    // Handed to the directory: allowed, key-conflict, not-reachable.
+    for (call, what) in [
+        (put(MARKETING, "b.txt", b"x", None), "an allowed put"),
+        (get(MARKETING, "b.txt"), "an allowed get"),
+        (head(MARKETING, "none"), "a head answered null"),
+        (list(MARKETING, &json!({})), "an allowed list"),
+        (delete(MARKETING, "b.txt"), "an allowed delete"),
+        (
+            put(MARKETING, "a/b", b"x", None),
+            "a put failed `key-conflict`",
+        ),
+        (get(MARKETING, "etc/passwd"), "a get failed `not-reachable`"),
+    ] {
+        let (_, _, entry) = logged(&s, &call);
+        assert_duration(&entry, true, what);
+    }
+    // Ended before: a refusal, invalid-key, a put's `limit` `bytes`.
+    let (response, answer) = s.one(&blackbox::storage::nobody(), FILES, &head(MARKETING, "a"));
+    assert!(
+        answer["refused"].is_object(),
+        "expected a refusal, got {answer}"
+    );
+    assert_duration(&s.entry_of(&response), false, "a refusal");
+    let (_, _, entry) = logged(&s, &get(MARKETING, "../secret"));
+    assert_duration(&entry, false, "`invalid-key`");
+    let (response, body) = s.post(
+        &wanda(),
+        "bodies",
+        "/put-made",
+        &json!({ "resource": MARKETING, "key": "big.bin", "size": blackbox::storage::BODY_BOUND + 1, "byte": 65 }),
+    );
+    assert_eq!(
+        body["answer"]["error"]["limit"], "bytes",
+        "expected a put of 8 MiB and one byte `limit` `bytes`, got {}",
+        body["answer"]["error"]
+    );
+    assert_duration(&s.entry_of(&response), false, "a put's `limit` `bytes`");
+    // unavailable: handed to a directory that cannot be used.
+    let dir = s.dir(MARKETING);
+    let blackbox::storage::Storage { vm, place } = s;
+    let stopped = blackbox::storage::terminate(vm);
+    std::fs::rename(&dir, dir.with_file_name("marketing-aside")).unwrap();
+    let s = Storage {
+        vm: stopped.start(),
+        place,
+    };
+    let (_, answer, entry) = logged(&s, &head(MARKETING, "a"));
+    assert_eq!(
+        answer["error"]["kind"], "unavailable",
+        "expected `unavailable` with the directory moved away, got {answer}"
+    );
+    assert_duration(&entry, true, "a head failed `unavailable`");
 }

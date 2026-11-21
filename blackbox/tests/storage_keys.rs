@@ -40,6 +40,11 @@ fn broken() -> Vec<(String, &'static str)> {
         (".vibe-resource".to_owned(), "reserved"),
         (".vibe-staging/x".to_owned(), "reserved"),
         ("a/.vibe-anything".to_owned(), "reserved"),
+        // `reserved` in any letter case.
+        (".VIBE-resource".to_owned(), "reserved"),
+        (".Vibe-staging/x".to_owned(), "reserved"),
+        ("a/.vIbE-x".to_owned(), "reserved"),
+        (".VIBE-anything at all".to_owned(), "reserved"),
     ];
     for c in [
         '\u{0}', '\u{1}', '\u{1f}', '\u{7f}', '\u{80}', '\u{9f}', '\u{61c}', '\u{200e}',
@@ -319,5 +324,66 @@ fn a_prefix_is_one_that_with_a_character_after_it_is_a_key_that_is_taken() {
     assert_ok_null(
         &s.as_writer(&head(MARKETING, "rep")),
         "a prefix is not a file",
+    );
+}
+
+#[test]
+fn reserved_names_are_reserved_in_any_letter_case_and_the_marker_is_untouched() {
+    let s = Storage::ready();
+    let marker = s.dir(MARKETING).join(".vibe-resource");
+    let marker_before = std::fs::read(&marker).unwrap();
+    let before = tree(&s.place.base);
+    for key in [
+        ".VIBE-resource",
+        ".Vibe-staging/x",
+        "a/.vIbE-x",
+        ".VIBE-",
+        ".VIBE-notes.txt",
+    ] {
+        for call in [
+            head(MARKETING, key),
+            get(MARKETING, key),
+            put(MARKETING, key, b"over the marker", None),
+            delete(MARKETING, key),
+        ] {
+            let (response, answer) = s.one(&wanda(), FILES, &call);
+            let what = format!("{} of {key:?}", call["operation"]);
+            assert_invalid_key(&answer, "reserved", &what);
+            let entry = s.entry_of(&response);
+            assert_eq!(
+                (entry["outcome"].as_str(), entry["error"].as_str()),
+                (Some("failed"), Some("invalid-key")),
+                "{what}: {entry}"
+            );
+        }
+    }
+    for prefix in [".VIBE-", "a/.Vibe-st", ".vIbE-"] {
+        list_prefix(&s, prefix, Some("reserved"));
+    }
+    assert_eq!(
+        tree(&s.place.base),
+        before,
+        "expected nothing written by a reserved name in another letter case"
+    );
+    assert_eq!(
+        std::fs::read(&marker).unwrap(),
+        marker_before,
+        "expected `.vibe-resource` to hold what it held"
+    );
+    // Without the hyphen they are keys like any other.
+    for key in [".vibe", ".VIBEX", "a/.Vibe"] {
+        s.put_ok(key, b"taken", None);
+        assert_got(
+            &s.as_writer(&get(MARKETING, key)),
+            key,
+            b"taken",
+            "application/octet-stream",
+            "a name that begins `.vibe` with no hyphen",
+        );
+    }
+    assert_eq!(
+        std::fs::read(&marker).unwrap(),
+        marker_before,
+        "expected `.vibe-resource` to hold what it held"
     );
 }
