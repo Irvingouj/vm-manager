@@ -17,7 +17,7 @@
 # The version of crates/vibe, as the first line of `vibe --version` says it
 # (`vibe <version>`). The build fails when the two differ, so that the
 # image's version label cannot drift from the program.
-ARG VIBE_VERSION=0.1.2
+ARG VIBE_VERSION=0.1.3
 
 FROM rust:1.99.1-trixie AS build
 ARG VIBE_VERSION

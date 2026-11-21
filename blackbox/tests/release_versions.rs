@@ -1,6 +1,6 @@
 //! One version (CONTRACT.md, "The first release: One version"; ticket "A
 //! first, minimal release"): the program's version is the package `vibe`'s,
-//! `vibe --version` says it on its first line, it is `0.1.2` now (it was
+//! `vibe --version` says it on its first line, it is `0.1.3` now (it was
 //! `0.1.0` for that ticket), and every file of the release that names a version names that
 //! one: the `Dockerfile`'s default, the image the Compose file takes, the
 //! image `.env.example` and `deploy/README.md` show, the addresses and

@@ -24,7 +24,7 @@ use crate::shared_database::token;
 pub use crate::sdk::repository_root;
 
 /// The version CONTRACT.md gives the release ("One version").
-pub const VERSION: &str = "0.1.2";
+pub const VERSION: &str = "0.1.3";
 
 /// The two targets a release's tool is built for.
 pub const TARGETS: [&str; 2] = ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin"];
