@@ -2540,7 +2540,7 @@ In "Responses the program itself gives", after the `403` of "Contributors and sh
 
 A request is in flight from the moment its Application's code may be given it until its response is sent.
 
-- **Within 1 second of the `200` of a disable, every request in flight to that Application is answered** as a disabled Application answers ("What a disabled Application answers"), whatever its code was doing or had already returned, unless its response had already begun to be sent (then nothing more is promised of it). Its code is stopped. Requests waiting to be given to the code are answered the same and are never given to it.
+- **Within 1 second of the `200` of a disable, every request in flight to that Application is answered** as a disabled Application answers ("What a disabled Application answers"), whatever its code was doing or had already returned, unless its response had already begun to be sent (then nothing more is promised of it). Its code is stopped. Requests waiting to be given to the code are answered the same and are never given to it. This holds whatever the program then knew of the Application: also when a write of its lists or of its serving Version had lost its answer just before ("A write whose answer is lost") and the program was finding it out.
 - **Every transaction it left open is rolled back**, as when a request ends ("Transactions: What the host does on its own"), with a `rollback` entry whose `error` is `application-disabled`. A statement still running is cancelled; its Operation log entry is `failed` with `error` `application-disabled`. So nothing such a request had not committed when the `200` was answered is kept.
 - **No operation of the Application is allowed after that `200`**: an operation its code still calls (from a request in flight, at any moment after) is refused with the reason `application-disabled`, before every other check but `no-request`, nothing is sent to any database, and it has its Operation log entry like every refusal. `application-disabled` joins "Refusal reasons"; its `fix` says that a Platform administrator has disabled the Application and that nothing in the code is wrong. It is the host's, not the Authorization decision's: the `authz` crate is unchanged. The SDK's `Refusal` type has it: `{ readonly reason: "application-disabled" }`.
 - The entry of such a request in "Logs" is made as for any request its code was given: with `status` `503` and what its code printed until it was stopped. It is counted in `usage` (its code was given it).
@@ -2566,7 +2566,7 @@ Disabling stops the Application from serving. It changes nothing else of it, and
 
 ### Reading the Operation log
 
-`GET /v1/operation-log`, by a Platform administrator, as "The Operation log" gives it, takes from this ticket on these parameters, each optional and at most once, each percent-decoded (`+` is a plus); they are combined: an entry is answered when it matches every one given.
+`GET /v1/operation-log`, by a Platform administrator, as "The Operation log" gives it, takes from this ticket on these parameters, each optional and at most once, each percent-decoded (a `+` is read as a space, as a form writes one; a plus is written `%2B`); they are combined: an entry is answered when it matches every one given.
 
 | Parameter | Matches an entry whose | Taken |
 |---|---|---|
@@ -2574,7 +2574,7 @@ Disabling stops the Application from serving. It changes nothing else of it, and
 | `application=<name>` | `application` is exactly this | a name an Application could have; it need not have one now |
 | `resource=<name>` | `resource` is exactly this (so never an entry of an own database, whose `resource` is null) | a name a Resource could have ("Resources and Grants") |
 | `outcome=<outcome>` | `outcome` is this | `allowed`, `refused`, `failed` or `unfinished` |
-| `since=<time>` | `time` is at or after this | RFC 3339 with a date, a time and an offset (`Z` or `±hh:mm`; `+` written `%2B`), up to microseconds |
+| `since=<time>` | `time` is at or after this | RFC 3339 with a date, a time and an offset (`Z` or `±hh:mm`; `+` written `%2B`), up to microseconds; the letters `T` and `Z` may be lower case |
 | `until=<time>` | `time` is before this | as `since`; when both are given, `since` is before `until` |
 | `before=<id>` | `id` is below this | a positive whole number, written plainly |
 | `limit=<n>` | (how many) | 1 to 1000, written plainly; 100 without it |
@@ -2606,7 +2606,7 @@ All four need a sign-in (`4`), are made at the installation the tool is signed i
 
 **What the tool checks before it asks** (each is exit code `2`, the usual usage text on standard error, nothing asked): an `<application>`, `--application` or `--after` that no Application could be named; a `--resource` that no Resource could be named; a `--user` that is empty, longer than 256 bytes or has a control character; an `--outcome` other than the four; a `--since` or `--until` that is not RFC 3339 with an offset, or a `--since` not before `--until`; a `--before` that is not a positive whole number; a `--limit` outside 1 to 100 (`applications`) or 1 to 1000 (`operation-log`); an option given twice.
 
-**`vibe admin applications`** prints one page of `GET /v1/admin/applications`, exit code `0`. With `--json`, the API's answer as it is. In words, one block per Application: its name and address; `disabled since <time> by <user id>` when it is; the serving Version, or that none serves; its Declared access, each Resource with its level (and how many more when `declared_more` is not 0), or that it declares none; its Contributors, a person by name and email when known and by id, a Group as a Group; whom it is shared with as the counts say (everyone, or how many Groups and people, or nobody); and `<requests> requests by <users> Users in the last 30 days`. When `next` is not null, a last line says that more Applications follow and gives the whole command with `--after <next>`. With none: `{ "applications": [], "next": null }`, and in words that the installation has no Application yet.
+**`vibe admin applications`** prints one page of `GET /v1/admin/applications`, exit code `0`. With `--json`, the API's answer as it is. In words, one block per Application: its name and address; `disabled since <time> by <user id>` when it is; the serving Version, or that none serves; its Declared access, each Resource with its level (and how many more when `declared_more` is not 0), or that it declares none; its Contributors, a person by name and email when known and by id, a Group as a Group; whom it is shared with as the counts say (everyone, or how many Groups and people, or nobody); and `<requests> requests by <users> Users in the last 30 days`. When `next` is not null, a last line says that more Applications follow and gives the whole command with `--after <next>`. With none: `{ "applications": [], "next": null }`, and in words that the installation has no Application yet; with `--after <name>` and none after it, that no Application comes after `<name>`.
 
 **`vibe admin disable`** prints, exit code `0`:
 
