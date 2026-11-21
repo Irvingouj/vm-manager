@@ -65,11 +65,7 @@ fn a_key_that_breaks_a_rule_fails_invalid_key_naming_it_and_has_its_failed_entry
             let what = format!("{operation} of {key:?}");
             assert_invalid_key(&answer, rule, &what);
             let entry = s.entry_of(&response);
-            // The statement holds the key as a JSON string; the C1
-            // controls (U+007F to U+009F) are left out of the exact check:
-            // CONTRACT.md does not say how they are escaped.
-            let c1 = key.chars().any(|c| ('\u{7f}'..='\u{9f}').contains(&c));
-            if key.len() <= 1024 && !c1 {
+            if key.len() <= 1024 {
                 let id = response.request_id();
                 let statement = statement_of(word, &key);
                 assert_storage_entry(
@@ -302,6 +298,8 @@ fn a_prefix_is_one_that_with_a_character_after_it_is_a_key_that_is_taken() {
     );
     assert_eq!(longest_prefix.len(), 1023, "the harness's own check");
     list_prefix(&s, &longest_prefix, None);
+    // 1,024 bytes: past the bound of 1,023.
+    list_prefix(&s, &format!("{longest_prefix}e"), Some("too-long"));
     for (prefix, rule) in [
         ("../", "dot-segment"),
         ("/x", "empty-segment"),

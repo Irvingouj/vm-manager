@@ -147,18 +147,46 @@ fn a_put_of_exactly_8_mib_is_taken_and_one_byte_more_is_limit_bytes() {
         "application/octet-stream",
         "8 MiB, unpadded",
     );
-    // A body too large that is not base64 is malformed: the first in order.
-    let (_, spoiled) = put_made(
+    // A text longer than 8 MiB encodes to (11,184,812 characters) is past
+    // the bound whatever it holds: it is not looked at, and the put has its
+    // entry. 8 MiB and 3 bytes encode to 11,184,816.
+    let (id, spoiled) = put_made(
         &s,
         "big/spoiled.bin",
+        BODY_BOUND + 3,
+        0x41,
+        &json!({ "spoil": true }),
+    );
+    assert_limit_bytes(&spoiled, "a text past the bound that is not base64");
+    let entry = s
+        .log()
+        .into_iter()
+        .find(|e| e["request"] == id.as_str())
+        .unwrap_or_else(|| panic!("expected an entry for a put of a text past the bound"));
+    assert_eq!(
+        (entry["outcome"].as_str(), entry["error"].as_str()),
+        (Some("failed"), Some("bytes")),
+        "the entry of a put of a text past the bound: {entry}"
+    );
+    // No longer and not base64: malformed, with no entry. 8 MiB and one
+    // byte encode to 11,184,812 characters, as 8 MiB do.
+    let (id, short) = put_made(
+        &s,
+        "big/short-spoiled.bin",
         BODY_BOUND + 1,
         0x41,
         &json!({ "spoil": true }),
     );
     assert_eq!(
-        spoiled["error"]["kind"], "malformed",
-        "expected a body that is not base64 malformed before its size, got {spoiled}"
+        short["error"]["kind"], "malformed",
+        "expected a text within the bound that is not base64 malformed, got {short}"
     );
+    assert!(
+        !s.log().iter().any(|e| e["request"] == id.as_str()),
+        "expected no entry for a malformed put"
+    );
+    assert!(!s.dir(MARKETING).join("big/spoiled.bin").exists());
+    assert!(!s.dir(MARKETING).join("big/short-spoiled.bin").exists());
 }
 
 #[test]
@@ -247,7 +275,7 @@ fn a_list_page_holds_up_to_1000_and_its_cursor_is_at_most_2048_bytes() {
         "a cursor after a key of 1,024 bytes: {} bytes",
         cursor.len()
     );
-    assert_eq!(listed_names(&page["ok"]).0, [longest.clone()]);
+    assert_eq!(listed_names(&page["ok"]).0, std::slice::from_ref(&longest));
 }
 
 #[test]

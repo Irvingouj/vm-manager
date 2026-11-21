@@ -221,33 +221,48 @@ fn a_key_is_written_as_a_json_string_and_cut_after_1024_bytes() {
         "back\\slash",
         "报告/第三季度.pdf",
         "a\u{202e}b",
+        "del\u{7f}",
+        "c1\u{85}\u{9f}",
+        "lrm\u{200e}\u{61c}\u{2066}",
     ] {
         let (_, _, entry) = logged(&s, &head(MARKETING, key));
         assert_eq!(
             entry["statement"],
             json!(statement_of("head", key)),
-            "expected the key written as a JSON string, its control characters as JSON escapes: {entry}"
+            "expected the key written as a JSON string, every character the rule `character` names as `\\uXXXX`: {entry}"
         );
     }
+    // The escapes, written out.
     assert_eq!(statement_of("head", "a\u{0}b"), "head \"a\\u0000b\"");
+    assert_eq!(statement_of("head", "del\u{7f}"), "head \"del\\u007f\"");
+    assert_eq!(
+        statement_of("head", "c1\u{85}\u{9f}"),
+        "head \"c1\\u0085\\u009f\""
+    );
+    assert_eq!(statement_of("head", "a\u{202e}b"), "head \"a\\u202eb\"");
+    assert_eq!(
+        statement_of("head", "quote\"d\\"),
+        "head \"quote\\\"d\\\\\""
+    );
+    assert_eq!(
+        statement_of("head", "报告/第三季度.pdf"),
+        "head \"报告/第三季度.pdf\""
+    );
+    // The cut: `put "<the first 1,024 bytes>"...`.
     let long = "a".repeat(1025);
     let (_, _, entry) = logged(&s, &put(MARKETING, &long, b"x", None));
-    let statement = entry["statement"].as_str().unwrap();
-    assert!(
-        statement.starts_with(&format!("put \"{}", "a".repeat(1024)))
-            && !statement.contains(&"a".repeat(1025))
-            && statement.trim_end_matches('"').ends_with("..."),
-        "expected the key cut after its first 1,024 bytes with `...` after it, got {statement:?}"
+    assert_eq!(
+        entry["statement"].as_str(),
+        Some(format!("put \"{}\"...", "a".repeat(1024)).as_str()),
+        "expected the key cut after its first 1,024 bytes, `...` after the closing quote"
     );
     // Cut at a character's end: 1,023 bytes and then a character of two.
     let wide = format!("{}éb", "a".repeat(1023));
     let (_, _, entry) = logged(&s, &put(MARKETING, &wide, b"x", None));
-    let statement = entry["statement"].as_str().unwrap();
-    assert!(
-        statement.contains(&"a".repeat(1023))
-            && !statement.contains('é')
-            && statement.trim_end_matches('"').ends_with("..."),
-        "expected the key cut at the end of a character, before `é`, got {statement:?}"
+    assert_eq!(
+        entry["statement"].as_str(),
+        Some(format!("put \"{}\"...", "a".repeat(1023)).as_str()),
+        "expected the key cut at the end of a character, before `é`"
     );
 }
 

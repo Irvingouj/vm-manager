@@ -325,7 +325,7 @@ fn a_directory_outside_the_storage_root_is_refused_in_every_form() {
         (format!("{r}//marketing"), "an empty segment"),
         (format!("{r}/marketing/."), "a `.` at its end"),
         (format!("{r}/marketing/.."), "a `..` at its end"),
-        (format!("{r}/marketing/"), "a slash at its end"),
+        (format!("{r}/marketing//"), "two slashes at its end"),
     ];
     for (directory, what) in &cases {
         assert_refused(
@@ -566,4 +566,20 @@ fn a_vibe_resource_naming_the_same_resource_is_taken() {
         marker,
         "expected the marker of the same Resource kept as it was"
     );
+}
+
+#[test]
+fn one_slash_at_the_end_of_the_directory_is_dropped() {
+    let s = Storage::start();
+    let dir = s.dir(MARKETING);
+    std::fs::create_dir_all(&dir).unwrap();
+    let answer = s.try_register(MARKETING, &format!("{}/", dir.to_string_lossy()));
+    assert!(
+        answer.status == 201,
+        "expected `<root>/marketing/` taken as `<root>/marketing`, got\n{}",
+        answer.describe()
+    );
+    assert_marked(&dir, "after a registration with one slash at the end");
+    let again = s.try_register("other", &dir.to_string_lossy());
+    assert_api_error(&again, 409, "directory-in-use");
 }

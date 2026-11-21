@@ -45,7 +45,7 @@ fn a_storage_root_that_is_not_an_absolute_path_is_a_start_up_failure_naming_the_
                 "--storage-root",
                 root,
             ],
-            Some(&platform.url()),
+            Some(platform.url()),
         );
         let took = began.elapsed();
         assert!(
@@ -179,24 +179,33 @@ fn a_storage_root_that_is_a_file_starts_all_the_same_and_says_not_a_directory() 
 }
 
 #[test]
-fn a_storage_root_the_program_cannot_write_in_starts_all_the_same_and_says_not_writable() {
+fn a_storage_root_the_program_cannot_write_in_is_no_problem_when_the_resources_directory_can_be() {
     let place = Place::new("root-readonly");
     let root = place.root();
+    std::fs::create_dir(root.join(MARKETING)).unwrap();
     set_mode(&root, 0o555);
     let s = Storage::start_on(place, Some(&root), &VmOptions::new());
-    assert_one_unusable(&s, "not-writable");
-    let answer = s.try_register(MARKETING, &root.join(MARKETING).to_string_lossy());
     assert!(
-        answer.status == 422,
-        "expected a registration beneath a storage root that cannot be written refused `422`, got\n{}",
-        answer.describe()
+        unusable_records(&s).is_empty()
+            && !s
+                .vm
+                .records()
+                .iter()
+                .any(|r| event(r) == "storage-root-unusable"),
+        "expected no `storage-root-unusable` record for a root the program cannot write in"
     );
-    s.admin().get_resource(MARKETING).expect_status(404);
-    set_mode(&s.root(), 0o755);
-    assert!(
-        std::fs::read_dir(s.root()).unwrap().next().is_none(),
-        "expected nothing written in the storage root"
+    s.register_on(MARKETING, &root.join(MARKETING));
+    let mut in_root: Vec<String> = std::fs::read_dir(&root)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    in_root.sort();
+    assert_eq!(
+        in_root,
+        [MARKETING],
+        "expected nothing written in the root itself"
     );
+    set_mode(&root, 0o755);
 }
 
 #[test]

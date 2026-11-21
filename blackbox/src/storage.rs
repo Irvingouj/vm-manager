@@ -510,6 +510,10 @@ impl Storage {
 /// What a Storage operation's entry must say, from [`Expected`] with the
 /// operation and statement set: the entry also has `own_database` false,
 /// `actor` `user` and `transaction` null.
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "callers write `Expected { .. }` in place; taking it by value reads as the struct update it is"
+)]
 pub fn storage_expected<'a>(
     base: Expected<'a>,
     operation: &'a str,
@@ -536,7 +540,40 @@ pub fn assert_storage_entry(entry: &Value, want: &Expected<'_>, context: &str) {
 
 /// The statement of an operation on a key: `<word> "<key as JSON>"`.
 pub fn statement_of(word: &str, key: &str) -> String {
-    format!("{word} {}", serde_json::to_string(key).unwrap_or_default())
+    format!("{word} {}", json_key(key))
+}
+
+/// Whether `c` is a character the key rule `character` names (other than
+/// `\`): a control, U+0000 to U+001F or U+007F to U+009F, or a
+/// bidirectional mark.
+pub fn is_named_character(c: char) -> bool {
+    matches!(
+        c,
+        '\u{0}'..='\u{1f}'
+            | '\u{7f}'..='\u{9f}'
+            | '\u{61c}'
+            | '\u{200e}'
+            | '\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2066}'..='\u{2069}'
+    )
+}
+
+/// `key` as the Operation log writes it: a JSON string in which every
+/// character the rule `character` names is `\uXXXX` (lower-case hex, as
+/// JSON writes the controls it must escape), `"` is `\"` and `\` is `\\`.
+pub fn json_key(key: &str) -> String {
+    let mut out = String::from("\"");
+    for c in key.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if is_named_character(c) => out.push_str(&format!("\\u{:04x}", u32::from(c))),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// Whether `text` is RFC 3339 in UTC with whole seconds:
