@@ -30,6 +30,14 @@ _Avoid_: Plugin, connector, external API (an outbound HTTP endpoint is a differe
 A named piece of enterprise infrastructure that IT registers and governs, and that an Application reaches through the SDK by its logical name alone. Every signed-in employee can see that a Resource exists (its name, a description and whom to ask for access); anything more needs a Grant.
 _Avoid_: Binding (the Cloudflare and OpenWorkers term), service, backend
 
+**Storage**:
+A kind of Resource: a named place of files, registered on a directory beneath the installation's storage root (an S3 bucket later), reached through the SDK as the User, with Grants at `read` or `write`. A file in it is named by a key.
+_Avoid_: File system, bucket, drive, volume (the mount is the installation's, not the Resource)
+
+**Key**:
+The name of one file of a Storage Resource: segments separated by `/`. There are no directories; a folder is the keys that begin with `<folder>/` and exists only while one of them does.
+_Avoid_: Path, file name
+
 **Resource owner**:
 The person or Group answerable for a Resource. They, or a Platform administrator, release the Integration functions that reach it. In Milestone 1 the owner is recorded only; Grants are written by Platform administrators.
 _Avoid_: Data owner, steward, admin
