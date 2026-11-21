@@ -1317,7 +1317,14 @@ impl std::fmt::Debug for Prepared {
 /// one is not inside it or holding it.
 pub struct Taken {
     pub path: PathBuf,
-    pub identity: Option<(u64, u64)>,
+    /// Its directory, while it is open.
+    pub opened: Option<Arc<Opened>>,
+}
+
+impl Taken {
+    fn identity(&self) -> Option<(u64, u64)> {
+        self.opened.as_ref().map(|o| (o.dev, o.ino))
+    }
 }
 
 impl Directory {
@@ -1325,7 +1332,7 @@ impl Directory {
     pub fn taken(&self) -> Taken {
         Taken {
             path: self.inner.path.clone(),
-            identity: self.identity().map(|o| (o.dev, o.ino)),
+            opened: self.identity(),
         }
     }
 }
@@ -1511,16 +1518,17 @@ impl Root {
                 .unwrap_or_default();
             if in_use_by_path(&other_segments)
                 || other
-                    .identity
+                    .identity()
                     .is_some_and(|id| id == identity || ancestors.contains(&id))
             {
                 return Err(Refused::InUse);
             }
         }
+        let root_identity = ancestors.first().copied().unwrap_or((0, 0));
         if taken
             .iter()
-            .filter_map(|t| t.identity)
-            .any(|other| holds(&opened, other, &ancestors))
+            .filter_map(|t| t.opened.as_deref())
+            .any(|other| holds(&opened, other, root_identity))
         {
             return Err(Refused::InUse);
         }
@@ -1597,59 +1605,46 @@ impl Root {
     }
 }
 
-/// Whether the directory `opened` holds the directory `other` (by
-/// identity): walking up from `other` through `..`, at most [`SEGMENTS`]
-/// levels, stopping at the root (the first of `ancestors`).
-fn holds(opened: &Opened, other: (u64, u64), ancestors: &[(u64, u64)]) -> bool {
+/// Whether the directory `opened` holds the directory `other` (another
+/// Resource's, held open): walking up from `other` through `..`, at most
+/// [`SEGMENTS`] levels beneath the storage root, stopping at the root
+/// (`root`) or at `/`.
+fn holds(opened: &Opened, other: &Opened, root: (u64, u64)) -> bool {
     let target = (opened.dev, opened.ino);
-    let root = ancestors.first().copied();
-    // The other directory is reached through its own Resource's
-    // descriptor, which this function does not hold: walked from the
-    // root's side instead, by searching `opened` for it.
-    let _ = root;
-    contains_identity(opened.fd.as_fd(), target, other, 0)
-}
-
-/// Whether the folder `dir` holds a folder of identity `wanted` (not
-/// following links), at most [`SEGMENTS`] deep.
-fn contains_identity(
-    dir: BorrowedFd<'_>,
-    me: (u64, u64),
-    wanted: (u64, u64),
-    depth: usize,
-) -> bool {
-    if me == wanted {
-        return true;
-    }
-    if depth >= SEGMENTS {
-        return false;
-    }
-    let Ok(reader) = Dir::read_from(dir) else {
+    let Ok(mut current) = rustix::fs::openat(
+        &other.fd,
+        ".",
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) else {
         return false;
     };
-    for entry in reader.flatten() {
-        let name = entry.file_name();
-        let bytes = name.to_bytes();
-        if bytes == b"." || bytes == b".." {
-            continue;
-        }
-        if entry.file_type() != FileType::Directory && entry.file_type() != FileType::Unknown {
-            continue;
-        }
-        let Ok(fd) = rustix::fs::openat(
-            dir,
-            name,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        ) else {
-            continue;
-        };
-        let Ok(stat) = rustix::fs::fstat(&fd) else {
-            continue;
-        };
-        if contains_identity(fd.as_fd(), (stat.st_dev, stat.st_ino), wanted, depth + 1) {
+    let mut here = (other.dev, other.ino);
+    for _ in 0..=SEGMENTS {
+        if here == target {
             return true;
         }
+        if here == root {
+            return false;
+        }
+        let Ok(up) = rustix::fs::openat(
+            &current,
+            "..",
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) else {
+            return false;
+        };
+        let Ok(stat) = rustix::fs::fstat(&up) else {
+            return false;
+        };
+        let above = (stat.st_dev, stat.st_ino);
+        // `/`, whose `..` is itself.
+        if above == here {
+            return false;
+        }
+        here = above;
+        current = up;
     }
     false
 }

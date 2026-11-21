@@ -152,7 +152,7 @@ fn read(op: Op, args: Value, cursors: &Sealer) -> Result<Read, &'static str> {
                 }
             };
             let content_type = match args.remove("content_type") {
-                None | Some(Value::Null) => None,
+                None => None,
                 Some(Value::String(given)) if is_content_type(&given) => Some(given),
                 Some(_) => {
                     return Err(
@@ -168,17 +168,17 @@ fn read(op: Op, args: Value, cursors: &Sealer) -> Result<Read, &'static str> {
         }
         Op::List => {
             let prefix = match args.remove("prefix") {
-                None | Some(Value::Null) => String::new(),
+                None => String::new(),
                 Some(Value::String(prefix)) => prefix,
                 Some(_) => return Err("`prefix` must be a string, or not given"),
             };
             let delimiter = match args.get("delimiter") {
-                None | Some(Value::Null) => false,
+                None => false,
                 Some(Value::String(d)) if d == "/" => true,
                 Some(_) => return Err("`delimiter` must be \"/\", or not given"),
             };
             let limit = match args.get("limit") {
-                None | Some(Value::Null) => DEFAULT_PAGE,
+                None => DEFAULT_PAGE,
                 Some(Value::Number(n)) => match n.as_u64().and_then(|n| usize::try_from(n).ok()) {
                     Some(limit) if (1..=PAGE).contains(&limit) => limit,
                     _ => return Err(LIMIT),
@@ -186,7 +186,7 @@ fn read(op: Op, args: Value, cursors: &Sealer) -> Result<Read, &'static str> {
                 Some(_) => return Err(LIMIT),
             };
             let after = match args.get("cursor") {
-                None | Some(Value::Null) => None,
+                None => None,
                 Some(Value::String(cursor)) => Some(
                     cursors
                         .open(&resource, &prefix, delimiter, cursor)

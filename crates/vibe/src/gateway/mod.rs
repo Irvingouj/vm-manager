@@ -189,7 +189,7 @@ impl Refusal {
         kinds: Kinds,
     ) -> Self {
         let mut refusal = match reason {
-            authz::Reason::NotDeclared if kinds.told() => {
+            authz::Reason::NotDeclared if kinds.told(kinds.declared) => {
                 let fix = match (kinds.asked, kinds.declared) {
                     (ResourceKind::Storage, Some(_)) => format!(
                         "the serving Version declares {name:?} with kind \"postgres\", a database, and this is an operation on Storage: declare it with kind \"storage\" (access {:?} or higher), or use it as a database with db(...)",
@@ -204,10 +204,10 @@ impl Refusal {
                     ),
                 };
                 let mut refusal = Self::new("not-declared", fix);
-                kinds.detail(&mut refusal.details);
+                kinds.detail(&mut refusal.details, "declared_kind", kinds.declared);
                 refusal
             }
-            authz::Reason::NotRegistered if kinds.told() => {
+            authz::Reason::NotRegistered if kinds.told(kinds.registered) => {
                 let fix = match (kinds.asked, kinds.registered) {
                     (ResourceKind::Storage, Some(_)) => format!(
                         "the Resource {name:?} is registered as a database, not as Storage: declare it with kind \"postgres\" and use it as a database, or ask a Platform administrator for the Storage Resource you need"
@@ -220,7 +220,7 @@ impl Refusal {
                     ),
                 };
                 let mut refusal = Self::new("not-registered", fix);
-                kinds.detail(&mut refusal.details);
+                kinds.detail(&mut refusal.details, "registered_kind", kinds.registered);
                 refusal
             }
             authz::Reason::NoRequest => return Self::no_request(),
@@ -308,20 +308,20 @@ struct Kinds {
 }
 
 impl Kinds {
-    /// Whether a `not-declared` or `not-registered` says the kinds: always
-    /// for Storage; for a database only when the name is Storage's, so that
-    /// nothing else of a database's refusals changes.
-    fn told(self) -> bool {
-        self.asked == ResourceKind::Storage || self.declared.is_some() || self.registered.is_some()
+    /// Whether a `not-declared` (with `other` the kind it is declared as)
+    /// or a `not-registered` (`other` the kind registered) says the kinds:
+    /// always for Storage; for a database only when the name is Storage's
+    /// there, so that nothing else of a database's refusals changes.
+    fn told(self, other: Option<ResourceKind>) -> bool {
+        self.asked == ResourceKind::Storage || other.is_some()
     }
 
-    fn detail(self, details: &mut Map<String, Value>) {
+    /// `kind`, and `field` (`declared_kind` or `registered_kind`) when the
+    /// name is of the `other` kind.
+    fn detail(self, details: &mut Map<String, Value>, field: &str, other: Option<ResourceKind>) {
         details.insert("kind".into(), self.asked.name().into());
-        if let Some(declared) = self.declared {
-            details.insert("declared_kind".into(), declared.name().into());
-        }
-        if let Some(registered) = self.registered {
-            details.insert("registered_kind".into(), registered.name().into());
+        if let Some(other) = other {
+            details.insert(field.into(), other.name().into());
         }
     }
 }
