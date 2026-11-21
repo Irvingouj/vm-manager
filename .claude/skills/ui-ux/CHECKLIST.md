@@ -2,6 +2,13 @@
 
 Ask these of every page, in this order, at 320, 768 and 1280 px, light and dark, looking at a screenshot. Write down each "no" with the page and the rule's number. The reasons, with sources, are in `docs/research/refactoring-ui-and-tailwind-defaults.md` (RU) and `docs/research/hci-principles-for-the-platforms-pages.md` (HCI).
 
+## First: the product owner's four rules
+
+- **Once.** Is every piece of information on the page said exactly once? Name each thing said twice (header and body, heading and sentence, pill and words) and which of the two goes.
+- **Without words first.** For each sentence and label: could an icon, a colour, a shape or the layout carry it instead, in that order of preference? Words stay only for what those cannot carry, and every meaningful icon has an accessible name.
+- **Progressively.** Does this view show only what is needed to decide the next step, with the rest one step away? Name what could move to the detail, a `<details>` or the next page.
+- **Hierarchy and padding.** What does the eye land on first, second, third: is that the right order? Is every box's padding from the scale, roomy, and even where it should be even; is the gap between groups larger than inside them?
+
 ## A. Orientation: where am I, what can I do, what just happened
 
 1. Does the page say what it is in its title and its one `h1`, in words the person would use, the page's own part first in the `<title>`? (Nielsen: match with the real world; WCAG 2.4.2)

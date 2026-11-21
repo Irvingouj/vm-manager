@@ -17,6 +17,15 @@ A page is done when a person can tell where they are, what they can do and what 
 6. **Verify by looking and measuring.** New screenshots at the three widths, light and dark, read and compared with the "before"; every text and control pair through `scripts/contrast.py`; a keyboard-only walk (visible focus everywhere, order follows the page); 320 px with no sideways scroll; text at 200 %; `prefers-reduced-motion`. Then the tests that hold the pages.
 7. **Report** what changed, with the before and after pictures' paths, the contrast table, and what was not checked.
 
+## The product owner's four rules (they come first)
+
+When another rule below pulls a different way, these win; the measurable floor (contrast, target sizes, focus, an accessible name for every mark) still holds under them.
+
+1. **A piece of information is conveyed once.** Nothing is said twice on a page: not in the header and again in the body, not in a heading and again in the sentence under it, not by a pill and again by the words beside it. Before adding anything, look for where the page already says it, and remove the weaker of the two.
+2. **Say it without words where that can be done.** Prefer, in this order: (1) an icon, (2) colour, (3) shape, (4) layout (position, grouping, order, size), and only last (5) language. A status is a mark and a colour before it is a sentence; a relation is nearness and alignment before it is a label; a primary action is its fill and its place before it is an explanation. Words are for what the other four cannot carry (a name, a reason, a next step), and then as few as do it. An icon that carries meaning has an accessible name (`aria-label`, or text hidden from sight), so nothing is lost to a screen reader, and a colour that carries meaning rides with an icon or a shape, so nothing is lost to someone who cannot tell the colours apart.
+3. **Expose information progressively.** A view shows what the person needs to decide the next step and no more; the rest is one step away (the item's own page, a `<details>`, the next page of a list). The list shows names and state; identifiers, addresses, who else, and the reasons live on the detail. Nothing is hidden that the person needs in order to act now.
+4. **Watch hierarchy and padding.** Every view has one thing the eye lands on first, then a second, then the rest, set by weight, colour and space. Padding is deliberate and from the scale: the inside of a box is roomy enough that nothing touches its edge, equal on the sides that should read as equal, and the gap between groups is clearly larger than the gap inside one. Check both by looking at the picture, not by reading the CSS.
+
 ## Rules that do not bend
 
 - **One primary action per view**, styled as such; everything else is secondary or quiet. A destructive action is not automatically loud: it is loud only where it is the primary action.
@@ -26,9 +35,9 @@ A page is done when a person can tell where they are, what they can do and what 
 - **Contrast** (WCAG 2.2 AA): text 4.5:1, large text and the edges of controls and focus rings 3:1, in both schemes. Measured, not guessed.
 - **Targets** at least 24 by 24 CSS px, 44 px tall for the main buttons and fields; never two closer than 8 px.
 - **Focus is always visible**: an `outline` (it survives forced colours), offset from the control, 3:1 against what is around it. Never `outline: none` without a replacement.
-- **Never colour alone**: a status has words, and an icon or a shape, as well as its colour. Links inside text are underlined.
+- **Never colour alone**: a status has an icon or a shape as well as its colour (rule 2 above: words only when those cannot say it, and always an accessible name). Links inside text are underlined.
 - **Forms**: a visible label above each field (a placeholder is not a label), help text under the label, the error next to its field in words that say what happened and what to do, the button named by its verb and object ("Share hello"), nothing disabled without saying why.
-- **Messages** say what happened, why, and what the person can do next, in the vocabulary of `CONTEXT.md` (User, Application, Contributor, Group, Dashboard, Version, Platform administrator). No blame, no jargon, no bare codes.
+- **Messages**, where words are needed (rule 2 above), say what happened, why, and what the person can do next, once (rule 1), in the vocabulary of `CONTEXT.md` (User, Application, Contributor, Group, Dashboard, Version, Platform administrator). No blame, no jargon, no bare codes.
 - **Empty states** say what would be here and how to get the first one.
 - **Motion** is optional decoration: under 200 ms, none under `prefers-reduced-motion`, and nothing moves on its own.
 

@@ -35,7 +35,7 @@ The driving session orchestrates; one agent works at a time.
 3. **Implementation.** A different agent makes them pass. It does not edit the tests or the contract; if it believes one is wrong, it says so and the driving session decides.
 4. **Review.** The driving session reads the diff against the Rust rules below and the ticket.
 5. **Fix what the review found.** Everything: a defect, a gap in what the ticket promises, a way round a security claim, a path with no test, a cost nobody measured. Each goes back through the loop (the contract if the outside changes, a red test, the implementation). A ticket is never closed over a list of things left open.
-6. **Green.** The driving session runs the gate itself. If it fails, back to the implementation agent until it is green.
+6. **Green.** The driving session runs the checks itself: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, and the test files that touch what the ticket changed (its red tests and their neighbours). If one fails, back to the implementation agent until it is green. **The whole gate is not run for a ticket or before a push** until the product owner asks for it (the product owner's decision of 2026-11-21: nobody uses the product yet, the tests pin today's behaviour, and a full run before every push only slows the work).
 
 Then the ticket's commits are pushed and the issue is closed with what was run. A finding that cannot be fixed inside the ticket, because only the product owner can decide it, is put to the product owner at once and the ticket stays open until it is answered.
 
@@ -46,9 +46,11 @@ Then the ticket's commits are pushed and the issue is closed with what was run. 
 
 Work on `main` and push to `main`. No pull requests. No branch unless something truly needs one, and then it is deleted when merged. The gate is run locally, and nothing of the loop ever waits on a remote check: no workflow runs per push or per pull request. The one workflow there may be is the release pipeline, started by a version tag or by hand, which builds, tests and publishes a release (the product owner's decision of 2026-11-18).
 
-That pipeline is `.github/workflows/release.yml`. A release is made from a commit of `main` like this: change the version in every place `scripts/release-check.sh` names (the package `vibe`, `Cargo.lock`, the `Dockerfile`, `deploy/`, `docs/getting-started.md`) and write the notes `docs/releases/v<version>.md`; run `scripts/release-check.sh` until it passes; run the gate and `scripts/install-gate.sh`, both green; commit and push to `main`; then push the tag `v<version>` on that commit. The workflow checks, builds and tests everything again and publishes only if all of it passes. A run started by hand on a branch is a rehearsal and publishes nothing. The details, and what to do when a run fails, are in `docs/releasing.md`.
+That pipeline is `.github/workflows/release.yml`. A release is made from a commit of `main` like this: change the version in every place `scripts/release-check.sh` names (the package `vibe`, `Cargo.lock`, the `Dockerfile`, `deploy/`, `docs/getting-started.md`) and write the notes `docs/releases/v<version>.md`; run `scripts/release-check.sh` until it passes; run the checks of step 6 on what the release changes (the whole gate and `scripts/install-gate.sh` only when the product owner asks, as above); commit and push to `main`; then push the tag `v<version>` on that commit. The workflow checks, builds and tests everything again and publishes only if all of it passes. A run started by hand on a branch is a rehearsal and publishes nothing. The details, and what to do when a run fails, are in `docs/releasing.md`.
 
 ### The gate
+
+Since 2026-11-21 the gate is run when the product owner asks for it, not for every ticket ("The loop for every ticket", step 6). This section says what it is when it is run.
 
 `scripts/gate.sh` first looks for the browser the browser tests drive: Firefox 128 or later, the program `VIBE_TEST_BROWSER` names (an absolute path, or a name on the `PATH`), else `firefox` on the `PATH`. Without one it stops at once, before anything is built, in the same words as the browser tests' own failure; with one it says in one line which it found and its version. It then checks that `blackbox` depends on no product crate, and runs:
 
