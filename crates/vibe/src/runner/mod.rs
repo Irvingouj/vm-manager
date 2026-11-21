@@ -24,7 +24,7 @@ mod host;
 
 use std::num::NonZeroUsize;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -39,7 +39,7 @@ use tokio::task::JoinSet;
 
 use crate::app_logs::Collected;
 use crate::gateway::{Gateway, Transactions};
-use crate::registry::{Declared, Serving};
+use crate::registry::{Declared, Serving, Stop};
 use crate::user::User;
 use host::{APPLICATION_BINDING, HostOps};
 
@@ -61,6 +61,11 @@ pub struct InFlight {
     /// What its context printed and did not catch, for its log entry
     /// (crate::app_logs).
     pub collected: Collected,
+    /// Fired when a Platform administrator disables the Application
+    /// (blackbox/CONTRACT.md, "What Platform administrators see and stop:
+    /// Requests in flight"): the request is answered so at once, its code
+    /// stopped, and its operations refused.
+    pub stop: Arc<Stop>,
 }
 
 /// What the Application answered.
@@ -81,7 +86,17 @@ pub enum Outcome {
     Failed,
     /// Every engine thread's queue is full. Nothing of the Application ran.
     Busy,
+    /// The Application was disabled while the request was in flight: its
+    /// code was stopped, or (`given` false) never given it.
+    Stopped {
+        given: bool,
+    },
 }
+
+/// How long a request stopped while its code runs waits for the engine to
+/// say it has stopped it, before it is answered anyway (code that holds its
+/// thread is ended by its CPU limit).
+const STOPPED_WAIT: Duration = Duration::from_millis(500);
 
 /// The limits of the runner. Each is a bound on memory or time.
 #[derive(Clone, Debug)]
@@ -128,6 +143,9 @@ struct Job {
     serving: Arc<Serving>,
     request: HttpRequest,
     reply: oneshot::Sender<Outcome>,
+    /// Set by whichever comes first: the engine taking the job, or the
+    /// request being stopped while it waits (then the engine drops it).
+    taken: Arc<AtomicBool>,
 }
 
 pub struct RequestRunner {
@@ -197,12 +215,16 @@ impl RequestRunner {
         serving: Arc<Serving>,
         request: HttpRequest,
     ) -> Outcome {
-        let (reply, answer) = oneshot::channel();
+        let (reply, mut answer) = oneshot::channel();
+        let taken = Arc::new(AtomicBool::new(false));
+        let stop = Arc::clone(&in_flight.stop);
+        let stop_transactions = Arc::clone(&in_flight);
         let mut job = Job {
             in_flight,
             serving,
             request,
             reply,
+            taken: Arc::clone(&taken),
         };
         let first = self.next.fetch_add(1, Ordering::Relaxed);
         let mut queued = false;
@@ -228,9 +250,24 @@ impl RequestRunner {
         }
         // The engine enforces the deadline itself; this wait is the
         // backstop, with time for the engine to report.
-        match tokio::time::timeout(self.deadline + Duration::from_secs(1), answer).await {
-            Ok(Ok(outcome)) => outcome,
-            Ok(Err(_)) | Err(_) => Outcome::Failed,
+        let backstop = tokio::time::sleep(self.deadline + Duration::from_secs(1));
+        tokio::select! {
+            biased;
+            outcome = &mut answer => return outcome.unwrap_or(Outcome::Failed),
+            () = backstop => return Outcome::Failed,
+            () = stop.stopped() => {}
+        }
+        // Disabled while it waited or ran.
+        if !taken.swap(true, Ordering::AcqRel) {
+            // Never given to an engine: it never will be.
+            return Outcome::Stopped { given: false };
+        }
+        // Its transactions are rolled back now, whatever its code is doing
+        // (the engine ends them too once it has stopped the code).
+        stop_transactions.transactions.end();
+        match tokio::time::timeout(STOPPED_WAIT, answer).await {
+            Ok(Ok(outcome @ Outcome::Stopped { .. })) => outcome,
+            _ => Outcome::Stopped { given: true },
         }
     }
 }
@@ -272,6 +309,10 @@ impl Engine {
                     job = jobs.recv() => {
                         let Some(job) = job else { break };
                         let Ok(permit) = Arc::clone(&permits).acquire_owned().await else { break };
+                        // Stopped while it waited: never given to the code.
+                        if job.taken.swap(true, Ordering::AcqRel) {
+                            continue;
+                        }
                         let engine = Arc::clone(&engine);
                         running.spawn_local(async move {
                             let outcome = engine.serve(job.in_flight, &job.serving, job.request).await;
@@ -292,12 +333,26 @@ impl Engine {
         serving: &Serving,
         request: HttpRequest,
     ) -> Outcome {
+        if in_flight.stop.is_stopped() {
+            return Outcome::Stopped { given: false };
+        }
+        let stop = Arc::clone(&in_flight.stop);
         let host = Arc::new(HostOps::new(
             Arc::clone(&in_flight),
             Arc::clone(&self.gateway),
         ));
         let deadline = self.limits.deadline;
-        match tokio::time::timeout(deadline, self.serve_in(&host, serving, request)).await {
+        let served = tokio::select! {
+            biased;
+            // Disabled: the context, and all it holds, goes with the
+            // future; its transactions are rolled back.
+            () = stop.stopped() => {
+                host.end();
+                return Outcome::Stopped { given: true };
+            }
+            served = tokio::time::timeout(deadline, self.serve_in(&host, serving, request)) => served,
+        };
+        match served {
             Ok(outcome) => {
                 host.end();
                 outcome

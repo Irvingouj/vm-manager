@@ -198,6 +198,51 @@ pub fn not_shared(
     )
 }
 
+/// `503`: a Platform administrator has disabled the Application
+/// (blackbox/CONTRACT.md, "What Platform administrators see and stop: What
+/// a disabled Application answers"). It names the Application and whom the
+/// person is signed in as, as [`not_shared`] does (with OIDC one link, to
+/// sign out), all escaped; nothing of the disable (no administrator, no
+/// time). Unlike every other `503` of the program it has no `retry-after`:
+/// trying again shortly changes nothing.
+pub fn disabled(
+    at: &str,
+    application: &str,
+    id: &str,
+    name: Option<&str>,
+    sign_out: Option<&str>,
+) -> Response<Full<Bytes>> {
+    let who = match name {
+        Some(name) => format!(
+            "<strong>{}</strong> <code class=\"id\">{}</code>",
+            escape(name),
+            escape(id)
+        ),
+        None => format!("<code class=\"id as-name\">{}</code>", escape(id)),
+    };
+    let application = escape(application);
+    let mut response = page(
+        Some(at),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Disabled",
+        &theme::state_title(Mark::Warn, Icon::Lock, "This Application is disabled"),
+        &format!(
+            "<div data-vm-disabled=\"{application}\">\
+             <p>A Platform administrator has stopped <code>{application}</code>.</p>\
+             <p class=\"soft\">Nothing you did caused this, and you cannot undo it: ask your company's IT (its Platform administrators).</p>\
+             </div>\
+             <div class=\"aside signed\"><p class=\"small soft\">{}<span class=\"vh\">You are signed in as </span>{who}</p>{}</div>",
+            Icon::Person.svg(),
+            sign_out.map_or_else(String::new, |address| format!(
+                "<a class=\"btn quiet compact\" href=\"{}\">Sign out</a>",
+                escape(address)
+            )),
+        ),
+    );
+    response.headers_mut().remove(RETRY_AFTER);
+    response
+}
+
 /// `404` of every other path of the sign-in address.
 pub fn not_found(at: &str) -> Response<Full<Bytes>> {
     page(

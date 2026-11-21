@@ -101,6 +101,11 @@ pub const UNKNOWN_OPERATION: &str = "unknown-operation";
 pub const GRANTS_UNKNOWN: &str = "grants-unknown";
 /// The Operation log entry could not be written.
 pub const LOG_UNAVAILABLE: &str = "log-unavailable";
+/// A Platform administrator disabled the Application (blackbox/CONTRACT.md,
+/// "What Platform administrators see and stop: Requests in flight"): the
+/// host's, before every other check but `no-request`; not the
+/// Authorization decision's.
+pub const APPLICATION_DISABLED: &str = "application-disabled";
 /// The `host-call` record's reason for arguments that cannot be read. Not
 /// a refusal Application code receives: it gets `{ error: { kind:
 /// "malformed" } }`.
@@ -126,6 +131,14 @@ impl Refusal {
         Self::new(
             UNKNOWN_OPERATION,
             format!("the platform has no operation {operation:?} on env.VM"),
+        )
+    }
+
+    /// The Application was disabled by a Platform administrator.
+    pub fn application_disabled() -> Self {
+        Self::new(
+            APPLICATION_DISABLED,
+            "a Platform administrator has disabled this Application, so the platform runs none of its operations: nothing in the code is wrong; tell the Builder, who asks their IT".into(),
         )
     }
 
@@ -463,6 +476,10 @@ impl PlatformGateway {
             return Decision::refused(&Refusal::no_request());
         }
         let Some(found) = in_flight.transactions.find(id) else {
+            // Its transactions were ended by the disable.
+            if in_flight.stop.is_stopped() {
+                return Decision::refused(&Refusal::application_disabled());
+            }
             return no_transaction();
         };
         let target = match &found.resource {
@@ -575,6 +592,9 @@ impl PlatformGateway {
         if !active {
             return Decision::refused(&Refusal::no_request());
         }
+        if in_flight.stop.is_stopped() {
+            return Decision::refused(&Refusal::application_disabled());
+        }
         let Some(found) = in_flight.transactions.find(id) else {
             return no_transaction();
         };
@@ -622,6 +642,23 @@ impl PlatformGateway {
     /// `target`, acting as `actor`, for the request in flight: what it is
     /// on, and the refusal if refused.
     fn decide(
+        &self,
+        needed: AccessLevel,
+        actor: authz::Actor,
+        target: Target<'_>,
+        in_flight: &InFlight,
+        active: bool,
+    ) -> (On, Option<Refusal>) {
+        let (on, refusal) = self.decide_access(needed, actor, target, in_flight, active);
+        // Disabled: refused before every other check but `no-request`.
+        if active && in_flight.stop.is_stopped() {
+            return (on, Some(Refusal::application_disabled()));
+        }
+        (on, refusal)
+    }
+
+    /// The Authorization decision of [`PlatformGateway::decide`].
+    fn decide_access(
         &self,
         needed: AccessLevel,
         actor: authz::Actor,
@@ -850,6 +887,7 @@ impl Gateway for PlatformGateway {
             "tx.commit" => self.end(in_flight, active, args, true),
             "tx.rollback" => self.end(in_flight, active, args, false),
             _ if !active => Decision::refused(&Refusal::no_request()),
+            _ if in_flight.stop.is_stopped() => Decision::refused(&Refusal::application_disabled()),
             // Nothing the Application passes is read: who is asking is the
             // request in flight.
             "whoami" => Decision::allowed(ok_to_wire(json!({
@@ -1293,9 +1331,33 @@ impl Work {
             Kind::Query | Kind::Begin(_) | Kind::History => Level::Read,
             Kind::Execute => Level::Write,
         };
-        let outcome = pool
-            .run(level, &self.sql, &self.params, self.values, label)
+        // Given up when the Application is disabled meanwhile: what runs is
+        // cancelled and the entry says why.
+        let stop = Arc::clone(&self.in_flight.stop);
+        let active = self.active;
+        let stopped = async move {
+            if active {
+                stop.stopped().await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        };
+        let ran = pool
+            .run_until(level, &self.sql, &self.params, self.values, label, stopped)
             .await;
+        let Some(outcome) = ran else {
+            let ending = Ending {
+                outcome: "failed",
+                error: Some(APPLICATION_DISABLED),
+                rows: None,
+                duration_ms: None,
+                began_nothing: false,
+            };
+            if let Err(error) = self.log.finish(id, &ending).await {
+                self.unlogged(&error);
+            }
+            return Refusal::application_disabled().to_wire();
+        };
         // What a write committed on the own database is shipped to the
         // Change history once it is answered: asked for now, not waited for
         // (blackbox/CONTRACT.md, "Shipping: When").
@@ -1395,7 +1457,7 @@ impl Work {
         };
         let request_ended = Ending {
             outcome: "failed",
-            error: Some(transaction::REQUEST_ENDED),
+            error: Some(transaction::ended_why(&self.in_flight)),
             rows: None,
             duration_ms: None,
             began_nothing: false,
@@ -1406,7 +1468,7 @@ impl Work {
             if let Err(error) = self.log.finish(id, &request_ended).await {
                 self.unlogged(&error);
             }
-            let after = transaction::After::Ended(transaction::REQUEST_ENDED);
+            let after = transaction::After::Ended(transaction::ended_why(&self.in_flight));
             return (transaction::no_transaction_wire(), after);
         }
         let ran = tokio::select! {

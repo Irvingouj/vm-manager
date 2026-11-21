@@ -378,20 +378,51 @@ impl Pool {
         values: Values,
         label: Label<'_>,
     ) -> Outcome {
+        let never = std::future::pending::<()>();
+        match self
+            .run_until(level, sql, params, values, label, never)
+            .await
+        {
+            Some(outcome) => outcome,
+            None => unavailable(),
+        }
+    }
+
+    /// [`Pool::run`], given up when `stop` ends first (the Application was
+    /// disabled, blackbox/CONTRACT.md, "What Platform administrators see
+    /// and stop: Requests in flight"): what runs is cancelled, the
+    /// connection closed (its backend ended from another connection if it
+    /// does not come back within the grace period), nothing committed, and
+    /// `None` answered.
+    pub async fn run_until(
+        &self,
+        level: Level,
+        sql: &str,
+        params: &[Param],
+        values: Values,
+        label: Label<'_>,
+        stop: impl Future<Output = ()>,
+    ) -> Option<Outcome> {
         if !self.levels.permit(level) {
             self.report("an operation of a level this login is not for");
-            return unavailable();
+            return Some(unavailable());
         }
+        let mut stop = std::pin::pin!(stop);
         let checkout = self.limits.checkout;
-        let Ok(Ok(_permit)) = tokio::time::timeout(checkout, self.permits.acquire()).await else {
+        let acquired = tokio::select! {
+            biased;
+            () = &mut stop => return None,
+            acquired = tokio::time::timeout(checkout, self.permits.acquire()) => acquired,
+        };
+        let Ok(Ok(_permit)) = acquired else {
             self.report("no connection was free in time");
-            return unavailable();
+            return Some(unavailable());
         };
         let (mut connection, reused) = match self.take_idle() {
             Some(connection) => (connection, true),
             None => match self.open().await {
                 Ok(connection) => (connection, false),
-                Err(()) => return unavailable(),
+                Err(()) => return Some(unavailable()),
             },
         };
         let operation = wire::Operation {
@@ -402,7 +433,15 @@ impl Pool {
             label,
             key: self.key.as_deref(),
         };
-        let mut run = connection.operate(&operation, &self.limits).await;
+        let ran = tokio::select! {
+            biased;
+            () = &mut stop => None,
+            run = connection.operate(&operation, &self.limits) => Some(run),
+        };
+        let Some(mut run) = ran else {
+            self.halt(connection).await;
+            return None;
+        };
         if run.stale && reused {
             // An idle connection the server had closed: the statement did
             // not reach it (and nothing is committed without the host's own
@@ -410,9 +449,18 @@ impl Pool {
             drop(connection);
             connection = match self.open().await {
                 Ok(connection) => connection,
-                Err(()) => return unavailable(),
+                Err(()) => return Some(unavailable()),
             };
-            run = connection.operate(&operation, &self.limits).await;
+            let ran = tokio::select! {
+                biased;
+                () = &mut stop => None,
+                run = connection.operate(&operation, &self.limits) => Some(run),
+            };
+            let Some(again) = ran else {
+                self.halt(connection).await;
+                return None;
+            };
+            run = again;
         }
         if matches!(run.result, Err(Failure::Unavailable)) {
             self.report("the connection failed during the statement");
@@ -423,11 +471,23 @@ impl Pool {
         } else if run.reusable {
             self.give_back(connection);
         }
-        Outcome {
+        Some(Outcome {
             duration: run
                 .sent
                 .map(|sent| run.ended.saturating_duration_since(sent)),
             result: run.result,
+        })
+    }
+
+    /// A connection given up in the middle of an operation: what runs is
+    /// cancelled, it is closed (which rolls back), and its backend ended
+    /// from another connection if it does not come back within the grace
+    /// period.
+    async fn halt(&self, mut connection: Connection) {
+        let stuck = connection.halt(self.limits.grace).await;
+        drop(connection);
+        if let Some(process_id) = stuck {
+            self.terminate(process_id).await;
         }
     }
 

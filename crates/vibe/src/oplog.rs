@@ -318,6 +318,130 @@ impl OperationLog {
         rows.iter().map(entry_of).collect()
     }
 
+    /// One page of the entries that match `filter` (blackbox/CONTRACT.md,
+    /// "What Platform administrators see and stop: Reading the Operation
+    /// log"): the newest `filter.limit` of them, oldest first, as the API
+    /// answers them, stopped before what they take written as JSON (each
+    /// with a comma) would pass `max_bytes`, always at least one. Answers
+    /// them and whether an older entry matches.
+    ///
+    /// One statement, built of the filters given (each a bound parameter),
+    /// each of which an index serves with `id` (crate::platform_db::steps,
+    /// step 16), in a read-only transaction whose statements Postgres ends
+    /// after `limit_time`. It reads at most `limit` + 1 rows, and of them
+    /// only as many as their statements' bytes let fit.
+    pub async fn filtered(
+        &self,
+        filter: &Filter<'_>,
+        max_bytes: usize,
+        limit_time: Duration,
+    ) -> Result<(Vec<Value>, bool), DbError> {
+        let mut conditions: Vec<String> = Vec::new();
+        let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = Vec::new();
+        for (column, value) in [
+            ("user_id", &filter.user),
+            ("application", &filter.application),
+            ("resource", &filter.resource),
+            ("outcome", &filter.outcome),
+        ] {
+            if let Some(value) = value {
+                params.push(value);
+                conditions.push(format!("{column} = ${}", params.len()));
+            }
+        }
+        if let Some(since) = &filter.since {
+            params.push(since);
+            conditions.push(format!("time >= ${}::text::timestamptz", params.len()));
+        }
+        if let Some(until) = &filter.until {
+            params.push(until);
+            conditions.push(format!("time < ${}::text::timestamptz", params.len()));
+        }
+        if let Some(before) = &filter.before {
+            params.push(before);
+            conditions.push(format!("id < ${}", params.len()));
+        }
+        let fetched = filter.limit.saturating_add(1);
+        params.push(&fetched);
+        let limit_at = params.len();
+        let budget = i64::try_from(max_bytes).unwrap_or(i64::MAX);
+        params.push(&budget);
+        let budget_at = params.len();
+        let matching = if conditions.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", conditions.join(" AND "))
+        };
+        // The rows past what their statements alone would take beyond the
+        // budget are not read (the first always is); `n` says how many
+        // matched up to `limit` + 1.
+        let sql = format!(
+            concat!(
+                "SELECT ",
+                ENTRY_COLUMNS!(),
+                ", n FROM (
+                    SELECT o.*, row_number() OVER w AS rn,
+                           sum(coalesce(octet_length(o.statement), 0)) OVER w AS upto,
+                           count(*) OVER () AS n
+                    FROM (SELECT * FROM operation_log {matching} ORDER BY id DESC LIMIT ${limit_at}) o
+                    WINDOW w AS (ORDER BY o.id DESC ROWS UNBOUNDED PRECEDING)
+                 ) t
+                 WHERE rn = 1 OR upto <= ${budget_at}
+                 ORDER BY id DESC"
+            ),
+            matching = matching,
+            limit_at = limit_at,
+            budget_at = budget_at,
+        );
+        let timeout = crate::registry::statement_timeout(limit_time);
+        let read = self.database.pool().run(async |client: &mut Client| {
+            let transaction = client
+                .build_transaction()
+                .read_only(true)
+                .start()
+                .await
+                .map_err(DbError::from)?;
+            transaction
+                .batch_execute(&timeout)
+                .await
+                .map_err(DbError::from)?;
+            let rows = transaction
+                .query(&sql, &params)
+                .await
+                .map_err(DbError::from)?;
+            transaction.commit().await.map_err(DbError::from)?;
+            Ok(rows)
+        });
+        // Postgres ends the statement first; this is the backstop.
+        let backstop = limit_time.saturating_add(Duration::from_secs(1));
+        let rows = match tokio::time::timeout(backstop, read).await {
+            Ok(rows) => rows?,
+            Err(_) => return Err(DbError::timed_out("reading the Operation log", limit_time)),
+        };
+        let matched = match rows.first() {
+            Some(row) => get::<i64>(row, 17)?,
+            None => 0,
+        };
+        let limit = usize::try_from(filter.limit).unwrap_or(usize::MAX);
+        let mut entries = Vec::with_capacity(rows.len().min(limit));
+        let mut taken = 0_usize;
+        for row in &rows {
+            if entries.len() >= limit {
+                break;
+            }
+            let entry = entry_of(row)?;
+            let size = serde_json::to_vec(&entry).map_or(usize::MAX, |b| b.len().saturating_add(1));
+            if !entries.is_empty() && taken.saturating_add(size) > max_bytes {
+                break;
+            }
+            taken = taken.saturating_add(size);
+            entries.push(entry);
+        }
+        let more = i64::try_from(entries.len()).map_or(true, |kept| kept < matched);
+        entries.reverse();
+        Ok((entries, more))
+    }
+
     /// The entries of the request `request`, oldest first, as the API
     /// answers them; at most [`MAX_READ`].
     pub async fn of_request(&self, request: &str) -> Result<Vec<Value>, DbError> {
@@ -341,6 +465,24 @@ impl OperationLog {
             .await?;
         rows.iter().map(entry_of).collect()
     }
+}
+
+/// What a reading of the Operation log by a Platform administrator asks
+/// for ([`OperationLog::filtered`]): each filter given matches exactly.
+#[derive(Debug, Default)]
+pub struct Filter<'a> {
+    pub user: Option<&'a str>,
+    pub application: Option<&'a str>,
+    pub resource: Option<&'a str>,
+    pub outcome: Option<&'a str>,
+    /// RFC 3339, checked: entries at or after it.
+    pub since: Option<&'a str>,
+    /// RFC 3339, checked: entries before it.
+    pub until: Option<&'a str>,
+    /// Entries whose `id` is below it.
+    pub before: Option<i64>,
+    /// How many at most: 1 to [`MAX_READ`].
+    pub limit: i64,
 }
 
 /// One entry as the API answers it, from a row of [`ENTRY_COLUMNS`].

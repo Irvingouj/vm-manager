@@ -66,6 +66,17 @@ pub(super) const NO_TRANSACTION: &str = "no-transaction";
 /// The `error` of the host's `rollback` when the request ended.
 pub(super) const REQUEST_ENDED: &str = "request-ended";
 
+/// Why the host rolls back a transaction whose request has ended: the
+/// Application was disabled (`application-disabled`), or the request is
+/// over (`request-ended`).
+pub(super) fn ended_why(in_flight: &InFlight) -> &'static str {
+    if in_flight.stop.is_stopped() {
+        super::APPLICATION_DISABLED
+    } else {
+        REQUEST_ENDED
+    }
+}
+
 /// `{ error: { kind: "no-transaction", message } }`: the same whatever the
 /// reason, and never the id.
 pub(super) fn no_transaction_wire() -> Value {
@@ -313,11 +324,11 @@ pub(super) async fn run(
     let why = loop {
         let command = tokio::select! {
             biased;
-            _ = &mut alive => break REQUEST_ENDED,
+            _ = &mut alive => break ended_why(&opened.in_flight),
             () = tokio::time::sleep_until(cap) => break "time",
             command = commands.recv() => match command {
                 Some(command) => command,
-                None => break REQUEST_ENDED,
+                None => break ended_why(&opened.in_flight),
             },
         };
         match command {
@@ -329,7 +340,7 @@ pub(super) async fn run(
                         continue;
                     }
                     After::Ended(why) => why,
-                    After::Abandoned => REQUEST_ENDED,
+                    After::Abandoned => ended_why(&opened.in_flight),
                 };
                 // Closed before anything is answered: a use of the id
                 // after this answer is `no-transaction`.

@@ -87,4 +87,5 @@ pub mod theme;
 pub mod tool;
 pub mod tool_credentials;
 pub mod trust;
+pub mod usage;
 pub mod user;

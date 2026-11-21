@@ -100,6 +100,10 @@ pub struct Ingress {
     /// open it (`vibe serve`); the local run serves every test User of the
     /// project.
     pub decides_opening: bool,
+    /// Where each request the Application's code was given is counted
+    /// (crate::usage), without waiting; `None` where nothing is counted
+    /// (the local run).
+    pub usage: Option<Arc<crate::usage::Usage>>,
 }
 
 /// What the request record knows.
@@ -123,22 +127,61 @@ impl Ingress {
         id: &str,
         port: Option<u16>,
     ) -> Response<Full<Bytes>> {
+        let (name, sign_out) = self.who_is_signed_in(id, port).await;
+        pages::not_shared(
+            &self.domain,
+            application,
+            id,
+            name.as_deref(),
+            sign_out.as_deref(),
+        )
+    }
+
+    /// With OIDC, the name of the person `id` (read for a page; when that
+    /// fails, the page shows the id alone) and the sign-in address's
+    /// sign-out; the stand-in keeps no record of people and has no
+    /// sign-out.
+    async fn who_is_signed_in(
+        &self,
+        id: &str,
+        port: Option<u16>,
+    ) -> (Option<String>, Option<String>) {
         if self.oidc.as_ref().is_some_and(|o| o.connected().is_some()) {
+            // A page of the platform's own, not a request of the
+            // Application's: one read, bounded by the pool's own limits.
             let name = self.registry.person_name(id).await.ok().flatten();
             let sign_out = format!(
                 "{}/sign-out",
                 self.public
                     .origin(&format!("{AUTH_NAME}.{}", self.domain), port)
             );
-            pages::not_shared(
+            (name, Some(sign_out))
+        } else {
+            (None, None)
+        }
+    }
+
+    /// What a disabled Application answers: its page to a page's request,
+    /// else one sentence (blackbox/CONTRACT.md, "What Platform
+    /// administrators see and stop: What a disabled Application answers").
+    async fn disabled_answer(
+        &self,
+        parts: &hyper::http::request::Parts,
+        application: &str,
+        id: &str,
+        port: Option<u16>,
+    ) -> Response<Full<Bytes>> {
+        if asks_for_a_page(parts) {
+            let (name, sign_out) = self.who_is_signed_in(id, port).await;
+            pages::disabled(
                 &self.domain,
                 application,
                 id,
                 name.as_deref(),
-                Some(&sign_out),
+                sign_out.as_deref(),
             )
         } else {
-            pages::not_shared(&self.domain, application, id, None, None)
+            disabled(application)
         }
     }
 
@@ -306,9 +349,9 @@ impl Ingress {
         let application = name.filter(|n| check_name(n).is_ok());
         // All the readings of this request share one limit, from the first.
         let mut deadline: Option<tokio::time::Instant> = None;
-        let mut found = match application {
-            Some(name) => self.registry.find(name),
-            None => Found::NoSuchApplication,
+        let (mut found, mut stop) = match application {
+            Some(name) => self.registry.find_for_request(name),
+            None => (Found::NoSuchApplication, None),
         };
         if let (Found::NotKnown, Some(name)) = (&found, application) {
             let until =
@@ -316,7 +359,11 @@ impl Ingress {
             found = match self.registry.read_back(name, until).await {
                 // Still not held (a forgetting while it was read): not
                 // known, never a guess.
-                Ok(_) => self.registry.find(name),
+                Ok(_) => {
+                    let (now, its_stop) = self.registry.find_for_request(name);
+                    stop = its_stop;
+                    now
+                }
                 Err(error) => {
                     // A write on its way is no failure: it is waited out by
                     // asking again at a later request.
@@ -366,6 +413,22 @@ impl Ingress {
             };
             return finish(&known, answer);
         }
+        // Disabled by a Platform administrator: told so, after the `403`
+        // (only someone who can open it learns it) and before whether a
+        // Version serves. Nothing of its code runs.
+        if let Some(name) = application
+            && kept.disabled()
+        {
+            let known = Known {
+                user: Some(&user.id),
+                application: Some(name),
+                ..known
+            };
+            let answer = self.disabled_answer(&parts, name, &user.id, port).await;
+            return finish(&known, answer);
+        }
+        // Memory knows it, so it was answered with its stop.
+        let stop = stop.unwrap_or_default();
         // The request holds this Version until it ends, whatever is sent
         // meanwhile.
         let Some(serving) = kept.serving().map(Arc::clone) else {
@@ -400,6 +463,7 @@ impl Ingress {
             declared: Arc::clone(&serving.declared),
             transactions: Transactions::default(),
             collected: Collected::default(),
+            stop,
         });
         let known = Known {
             user: Some(&in_flight.user.id),
@@ -458,7 +522,17 @@ impl Ingress {
             .runner
             .run(Arc::clone(&in_flight), serving, request)
             .await;
-        let ran = !matches!(outcome, Outcome::Busy);
+        let ran = matches!(
+            outcome,
+            Outcome::Answered(_) | Outcome::Failed | Outcome::Stopped { given: true }
+        );
+        // Disabled while it was in flight, whatever its code did: answered
+        // as a disabled Application is, unless its answer had begun to go.
+        let outcome = if in_flight.stop.is_stopped() {
+            Outcome::Stopped { given: ran }
+        } else {
+            outcome
+        };
         let response = match outcome {
             Outcome::Answered(answer) => {
                 let mut response = Response::new(Full::new(answer.body));
@@ -501,6 +575,10 @@ impl Ingress {
                 StatusCode::SERVICE_UNAVAILABLE,
                 "Busy: try again shortly.\n",
             ),
+            Outcome::Stopped { .. } => {
+                self.disabled_answer(&parts, &in_flight.application, &in_flight.user.id, port)
+                    .await
+            }
         };
         // The Application's code was given the request: its log entry,
         // made now and handed over without waiting, before the request
@@ -514,6 +592,9 @@ impl Ingress {
                 response.status(),
             );
             response.extensions_mut().insert(GivenToCode);
+            if let Some(usage) = &self.usage {
+                usage.count(&in_flight.application, &in_flight.user.id);
+            }
         }
         finish(&known, response)
     }
@@ -606,6 +687,17 @@ fn not_shared(application: &str) -> Response<Full<Bytes>> {
     let mut response = own(StatusCode::FORBIDDEN, "");
     *response.body_mut() = Full::new(Bytes::from(format!(
         "The Application {application} is not shared with you: ask one of its Contributors to share it.\n"
+    )));
+    response
+}
+
+/// A disabled Application's answer to a request that is not a page: one
+/// sentence naming it (a DNS label of at most 63 characters, so the body
+/// is at most 133 bytes), and no `retry-after`.
+fn disabled(application: &str) -> Response<Full<Bytes>> {
+    let mut response = own(StatusCode::SERVICE_UNAVAILABLE, "");
+    *response.body_mut() = Full::new(Bytes::from(format!(
+        "The Application {application} has been disabled by a Platform administrator.\n"
     )));
     response
 }

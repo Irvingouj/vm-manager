@@ -209,7 +209,17 @@ fn main() -> ExitCode {
             }
         },
         Some(Command::Setup(args)) => run_setup(&args),
-        Some(Command::Admin(args)) => tool::run(tool::Command::Admin(args)),
+        Some(Command::Admin(args)) => {
+            // What the command line cannot check alone is a usage error
+            // too, told the same way.
+            if let Some(problem) = tool::admin_usage_problem(&args) {
+                let error = <Cli as clap::CommandFactory>::command()
+                    .error(clap::error::ErrorKind::ArgumentConflict, problem);
+                error.print().ok();
+                return ExitCode::from(2);
+            }
+            tool::run(tool::Command::Admin(args))
+        }
         Some(Command::SignIn(args)) => tool::run(tool::Command::SignIn(args)),
         Some(Command::SignOut(output)) => tool::run(tool::Command::SignOut(output)),
         Some(Command::Whoami(output)) => tool::run(tool::Command::Whoami(output)),
@@ -332,6 +342,8 @@ fn run(serve: &Serve) -> Result<(), String> {
             writer,
             log,
             runner,
+            usage,
+            usage_writer,
             ..
         } = Platform::open(&address, limits).await.map_err(|error| {
             if let Some(found) = &error.unsupported_version {
@@ -478,10 +490,12 @@ fn run(serve: &Serve) -> Result<(), String> {
             logs,
             max_request_body_bytes: 1024 * 1024,
             decides_opening: true,
+            usage: Some(usage),
         });
         server::serve(listener, ingress, server::Limits::default(), tls).await;
         watching.shutdown().await;
         drop(writer);
+        drop(usage_writer);
         Ok(())
     })
 }

@@ -7,8 +7,8 @@
 //! structure brought up to date), the own databases, the Application
 //! registry, the Resources and their Grants, all within `start` (a time
 //! limit); then every own database brought to form and its outbox shipped;
-//! Logs' writer, the Operation log, the Operation gateway and the Request
-//! runner's engine threads.
+//! Logs' writer, the usage's writer, the Operation log, the Operation
+//! gateway and the Request runner's engine threads.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,6 +22,7 @@ use crate::platform_db::{self, Cause, DatabaseAddress, OpenError, PlatformDataba
 use crate::registry::Registry;
 use crate::resources::Resources;
 use crate::runner::{self, RequestRunner};
+use crate::usage::{self, Usage};
 
 /// The bounds the parts are made with.
 pub struct Limits {
@@ -49,6 +50,10 @@ pub struct Platform {
     pub log: Arc<OperationLog>,
     pub gateway: Arc<PlatformGateway>,
     pub runner: RequestRunner,
+    /// What each request an Application's code was given is counted in.
+    pub usage: Arc<Usage>,
+    /// The writer of the counts: owned here; dropping it ends its task.
+    pub usage_writer: usage::Writer,
 }
 
 impl Platform {
@@ -114,6 +119,7 @@ impl Platform {
         let resources = Arc::new(resources);
         let (logs, writer) = app_logs::start(Arc::clone(&database));
         let logs = Arc::new(logs);
+        let (usage, usage_writer) = usage::start(Arc::clone(&database));
         let log = Arc::new(OperationLog::new(Arc::clone(&database)));
         let gateway = Arc::new(PlatformGateway::new(
             Arc::clone(&resources),
@@ -134,6 +140,8 @@ impl Platform {
             log,
             gateway,
             runner,
+            usage,
+            usage_writer,
         })
     }
 }

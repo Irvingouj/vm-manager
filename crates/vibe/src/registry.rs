@@ -250,6 +250,10 @@ pub struct Kept {
     serving: Option<Arc<Serving>>,
     /// The Application's `serving_generation` `serving` is of.
     serving_generation: i64,
+    /// Whether a Platform administrator has disabled it.
+    disabled: bool,
+    /// The Application's `disabled_generation` `disabled` is of.
+    disabled_generation: i64,
 }
 
 impl Kept {
@@ -262,6 +266,20 @@ impl Kept {
     pub fn serving(&self) -> Option<&Arc<Serving>> {
         self.serving.as_ref()
     }
+
+    /// Whether a Platform administrator has disabled it.
+    pub fn disabled(&self) -> bool {
+        self.disabled
+    }
+
+    /// The same, with `lists` in place of its lists.
+    fn with_lists(&self, lists: Lists) -> Self {
+        Self {
+            lists: Arc::new(lists),
+            serving: self.serving.as_ref().map(Arc::clone),
+            ..*self
+        }
+    }
 }
 
 /// The generations a forgotten Application must be read back at, at
@@ -270,6 +288,49 @@ impl Kept {
 pub struct Seen {
     lists: i64,
     serving: i64,
+    disabled: i64,
+}
+
+/// What stops the requests in flight to one Application when it is
+/// disabled (blackbox/CONTRACT.md, "What Platform administrators see and
+/// stop: Requests in flight"). A request takes the Application's one with
+/// what memory holds of it ([`Registry::find_for_request`]); memory fires
+/// it when it puts a disabled state in, after the database committed it and
+/// before the disable is answered. Once fired it stays fired: the
+/// Application gets a new one when memory next holds it enabled. One value
+/// (a `watch`), so nothing queues.
+#[derive(Debug)]
+pub struct Stop {
+    fired: tokio::sync::watch::Sender<bool>,
+}
+
+impl Default for Stop {
+    fn default() -> Self {
+        Self {
+            fired: tokio::sync::watch::Sender::new(false),
+        }
+    }
+}
+
+impl Stop {
+    fn fire(&self) {
+        self.fired.send_replace(true);
+    }
+
+    /// Whether it has been fired: the Application was disabled.
+    pub fn is_stopped(&self) -> bool {
+        *self.fired.borrow()
+    }
+
+    /// Ends once it has been fired.
+    pub async fn stopped(&self) {
+        let mut fired = self.fired.subscribe();
+        if fired.wait_for(|fired| *fired).await.is_err() {
+            // The sender is `self`'s and lives as long as this borrow: not
+            // reached. Never taken as a stop.
+            std::future::pending::<()>().await;
+        }
+    }
 }
 
 /// What memory holds of an Application.
@@ -400,6 +461,16 @@ pub struct ApplicationRecord {
     pub created_by: String,
     /// RFC 3339, UTC.
     pub created_at: String,
+    /// Since when, and by whom, it is disabled; `None` when it is not.
+    pub disabled: Option<Disabled>,
+}
+
+/// A disable in force: when it was made (RFC 3339, UTC) and by which
+/// Platform administrator.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Disabled {
+    pub since: String,
+    pub by: String,
 }
 
 impl ApplicationRecord {
@@ -422,6 +493,8 @@ pub struct ListedApplication {
     pub serving_version: Option<u64>,
     /// Whether the User the list is for is a Contributor of it.
     pub contributor: bool,
+    /// Since when it is disabled; `None` when it is not.
+    pub disabled_since: Option<String>,
 }
 
 /// Which of the Applications a User contributes to or can open
@@ -601,7 +674,7 @@ pub(crate) fn declared_of(stored: &Value) -> Declared {
 /// What creating an Application came to.
 #[derive(Debug)]
 pub enum Created {
-    Created(ApplicationRecord),
+    Created(Box<ApplicationRecord>),
     NameTaken,
 }
 
@@ -668,6 +741,11 @@ pub struct Registry {
     /// crate::resources: at most [`crate::resources::READ_BACKS`] in the
     /// program. A request that finds them all taken is `503` at once.
     reading_back: Arc<Semaphore>,
+    /// Each Application's [`Stop`], by name: one per Application a request
+    /// was given (so at most one per Application). Taken only while
+    /// [`Registry::held`] is held (read or written), after it, and never
+    /// across an await.
+    stops: std::sync::Mutex<HashMap<Arc<str>, Arc<Stop>>>,
 }
 
 impl Registry {
@@ -708,7 +786,8 @@ impl Registry {
                 let applications = transaction
                     .query(
                         "SELECT a.id, a.name, a.lists_generation, a.serving_generation,
-                                a.id = ANY ($1), v.number, v.bundle, v.declared_access
+                                a.id = ANY ($1), v.number, v.bundle, v.declared_access,
+                                a.disabled_at IS NOT NULL, a.disabled_generation
                          FROM applications a
                          LEFT JOIN versions v ON v.application_id = a.id
                                              AND v.number = a.serving_version
@@ -755,6 +834,8 @@ impl Registry {
                 lists: Arc::new(read),
                 serving: serving_at(&name, row, 5)?.map(Arc::new),
                 serving_generation: get(row, 3)?,
+                disabled: get(row, 8)?,
+                disabled_generation: get(row, 9)?,
             };
             held.insert(name, Held::Known(Arc::new(kept)));
         }
@@ -770,7 +851,48 @@ impl Registry {
             held: RwLock::new(held),
             forgotten,
             reading_back,
+            stops: std::sync::Mutex::new(HashMap::new()),
         })
+    }
+
+    /// [`Registry::find`], with the Application's [`Stop`] when memory
+    /// knows it: both read under one lock, so that a disable put into
+    /// memory after this fires the one answered.
+    pub fn find_for_request(&self, name: &str) -> (Found, Option<Arc<Stop>>) {
+        let all = self.held.read().unwrap_or_else(PoisonError::into_inner);
+        match all.get(name) {
+            None => (Found::NoSuchApplication, None),
+            Some(Held::Unknown { .. }) => (Found::NotKnown, None),
+            Some(Held::Known(kept)) => {
+                let stop = {
+                    let mut stops = self.stops.lock().unwrap_or_else(PoisonError::into_inner);
+                    match stops.get(name) {
+                        Some(stop) => Arc::clone(stop),
+                        None => {
+                            let stop = Arc::new(Stop::default());
+                            stops.insert(Arc::from(name), Arc::clone(&stop));
+                            stop
+                        }
+                    }
+                };
+                (Found::Known(Arc::clone(kept)), Some(stop))
+            }
+        }
+    }
+
+    /// After memory's disabled state of `name` changed (`disabled`), with
+    /// [`Registry::held`] written: a disable fires the Application's
+    /// [`Stop`]; an enable leaves a fired one behind, so that the next
+    /// request gets a new one.
+    fn settle_stop(&self, name: &str, disabled: bool) {
+        let mut stops = self.stops.lock().unwrap_or_else(PoisonError::into_inner);
+        if disabled {
+            if let Some(stop) = stops.get(name) {
+                stop.fire();
+            }
+        } else if stops.get(name).is_some_and(|stop| stop.is_stopped()) {
+            stops.remove(name);
+        }
     }
 
     /// The Application `name` as memory has it: no round trip, and the
@@ -872,7 +994,8 @@ impl Registry {
                                 ARRAY(SELECT e.kind FROM application_entries e
                                       WHERE e.application_id = a.id ORDER BY e.id),
                                 ARRAY(SELECT e.name FROM application_entries e
-                                      WHERE e.application_id = a.id ORDER BY e.id)
+                                      WHERE e.application_id = a.id ORDER BY e.id),
+                                a.disabled_at IS NOT NULL, a.disabled_generation
                          FROM applications a
                          LEFT JOIN versions v ON v.application_id = a.id
                                              AND v.number = a.serving_version
@@ -899,6 +1022,8 @@ impl Registry {
             lists: Arc::new(lists),
             serving: serving_at(name, &row, 2)?.map(Arc::new),
             serving_generation: get(&row, 1)?,
+            disabled: get(&row, 7)?,
+            disabled_generation: get(&row, 8)?,
         }))
     }
 
@@ -917,12 +1042,14 @@ impl Registry {
                         lists: Arc::new(lists),
                         serving: None,
                         serving_generation: 0,
+                        disabled: false,
+                        disabled_generation: 0,
                     }))
                 } else {
                     Held::Unknown {
                         seen: Seen {
                             lists: lists.generation,
-                            serving: 0,
+                            ..Seen::default()
                         },
                         epoch: self.forgotten.fetch_add(1, Ordering::Relaxed),
                     }
@@ -931,11 +1058,7 @@ impl Registry {
             }
             Some(Held::Known(kept)) => {
                 if kept.lists.generation < lists.generation {
-                    *kept = Arc::new(Kept {
-                        lists: Arc::new(lists),
-                        serving: kept.serving.as_ref().map(Arc::clone),
-                        serving_generation: kept.serving_generation,
-                    });
+                    *kept = Arc::new(kept.with_lists(lists));
                 }
             }
             Some(Held::Unknown { seen, .. }) => {
@@ -954,8 +1077,8 @@ impl Registry {
         match all.get_mut(name) {
             None => {
                 let seen = Seen {
-                    lists: 0,
                     serving: generation,
+                    ..Seen::default()
                 };
                 let epoch = self.forgotten.fetch_add(1, Ordering::Relaxed);
                 all.insert(Arc::from(name), Held::Unknown { seen, epoch });
@@ -966,11 +1089,47 @@ impl Registry {
                         lists: Arc::clone(&kept.lists),
                         serving: Some(Arc::new(serving)),
                         serving_generation: generation,
+                        disabled: kept.disabled,
+                        disabled_generation: kept.disabled_generation,
                     });
                 }
             }
             Some(Held::Unknown { seen, .. }) => {
                 seen.serving = seen.serving.max(generation);
+            }
+        }
+    }
+
+    /// Puts into memory whether `name` is disabled, as a disable or an
+    /// enable committed it at `generation`: over a lower generation; over a
+    /// forgotten Application it only raises `seen`. A disable put in fires
+    /// the Application's [`Stop`]. An Application memory does not hold is
+    /// held as not known.
+    fn install_disabled(&self, name: &str, disabled: bool, generation: i64) {
+        let mut all = self.held.write().unwrap_or_else(PoisonError::into_inner);
+        match all.get_mut(name) {
+            None => {
+                let seen = Seen {
+                    disabled: generation,
+                    ..Seen::default()
+                };
+                let epoch = self.forgotten.fetch_add(1, Ordering::Relaxed);
+                all.insert(Arc::from(name), Held::Unknown { seen, epoch });
+            }
+            Some(Held::Known(kept)) => {
+                if kept.disabled_generation < generation {
+                    *kept = Arc::new(Kept {
+                        lists: Arc::clone(&kept.lists),
+                        serving: kept.serving.as_ref().map(Arc::clone),
+                        serving_generation: kept.serving_generation,
+                        disabled,
+                        disabled_generation: generation,
+                    });
+                    self.settle_stop(name, disabled);
+                }
+            }
+            Some(Held::Unknown { seen, .. }) => {
+                seen.disabled = seen.disabled.max(generation);
             }
         }
     }
@@ -981,10 +1140,12 @@ impl Registry {
     /// over one memory knows (its writes keep it).
     fn install_read(&self, name: &str, kept: Kept, began: Began) {
         let mut all = self.held.write().unwrap_or_else(PoisonError::into_inner);
+        let disabled = kept.disabled;
         match all.get_mut(name) {
             None => {
                 if matches!(began, Began::Nothing) {
                     all.insert(Arc::from(name), Held::Known(Arc::new(kept)));
+                    self.settle_stop(name, disabled);
                 }
             }
             Some(Held::Known(_)) => {}
@@ -993,8 +1154,10 @@ impl Registry {
                     && *epoch == at
                     && seen.lists <= kept.lists.generation
                     && seen.serving <= kept.serving_generation
+                    && seen.disabled <= kept.disabled_generation
                 {
                     *held = Held::Known(Arc::new(kept));
+                    self.settle_stop(name, disabled);
                 }
             }
         }
@@ -1019,6 +1182,7 @@ impl Registry {
                     Held::Known(kept) => Seen {
                         lists: kept.lists.generation,
                         serving: kept.serving_generation,
+                        disabled: kept.disabled_generation,
                     },
                     Held::Unknown { seen, .. } => *seen,
                 };
@@ -1109,7 +1273,7 @@ impl Registry {
         Ok(match created {
             Some(application) => {
                 self.install_lists(name, Lists::of(&application), true);
-                Created::Created(application)
+                Created::Created(Box::new(application))
             }
             None => Created::NameTaken,
         })
@@ -1178,8 +1342,10 @@ impl Registry {
                 client
                     .query(
                         concat!(
-                            "SELECT name, description, serving_version, contributor FROM (
+                            "SELECT name, description, serving_version, contributor, disabled_since FROM (
                                SELECT a.name, a.description, a.serving_version, ",
+                            rfc3339!("a.disabled_at"),
+                            " AS disabled_since, ",
                             is_contributor!("a.id", "$1", "$2"),
                             " AS contributor FROM applications a
                               WHERE a.id IN (SELECT e.application_id FROM application_entries e
@@ -1200,6 +1366,7 @@ impl Registry {
                     description: get(row, 1)?,
                     serving_version: get::<Option<i32>>(row, 2)?.map(number_of).transpose()?,
                     contributor: get(row, 3)?,
+                    disabled_since: get(row, 4)?,
                 })
             })
             .collect()
@@ -1839,6 +2006,252 @@ impl Registry {
             .await?;
         row.as_ref().map(version_of).transpose()
     }
+
+    /// Disables `name` (`disable`) as the Platform administrator `by`, or
+    /// enables it, within `limit` (blackbox/CONTRACT.md, "What Platform
+    /// administrators see and stop: Disabling and enabling"). One
+    /// transaction: one `UPDATE` that changes the row only where it is not
+    /// already so (two disables at once take the row's lock in turn, and
+    /// the second, re-reading the row, changes nothing), then the
+    /// Application read as it leaves it. Then memory, before this returns:
+    /// a disable put in stops the requests in flight. `None` when there is
+    /// no such Application; else the Application and whether it changed.
+    ///
+    /// Its COMMIT is sent only once the `UPDATE` (which takes the row's
+    /// lock) has answered; a failure or the end of `limit` forgets the
+    /// Application at once, as every write whose answer is lost does.
+    pub async fn set_disabled(
+        &self,
+        name: &str,
+        disable: bool,
+        by: &str,
+        limit: std::time::Duration,
+    ) -> Result<Option<(ApplicationRecord, bool)>, DbError> {
+        let write = self.database.pool().run(async |client: &mut Client| {
+            let transaction = client.transaction().await.map_err(DbError::from)?;
+            let row = if disable {
+                transaction
+                    .query_opt(
+                        "UPDATE applications
+                         SET disabled_at = now(), disabled_by = $2,
+                             disabled_generation = disabled_generation + 1
+                         WHERE name = $1 AND disabled_at IS NULL
+                         RETURNING disabled_generation",
+                        &[&name, &by],
+                    )
+                    .await
+            } else {
+                transaction
+                    .query_opt(
+                        "UPDATE applications
+                         SET disabled_at = NULL, disabled_by = NULL,
+                             disabled_generation = disabled_generation + 1
+                         WHERE name = $1 AND disabled_at IS NOT NULL
+                         RETURNING disabled_generation",
+                        &[&name],
+                    )
+                    .await
+            }
+            .map_err(DbError::from)?;
+            let generation: Option<i64> = row.as_ref().map(|row| get(row, 0)).transpose()?;
+            let record = record_of(&transaction, Key::Name(name)).await?;
+            transaction.commit().await.map_err(DbError::from)?;
+            Ok((generation, record))
+        });
+        let written = match tokio::time::timeout(limit, write).await {
+            Ok(written) => written,
+            Err(_) => Err(DbError::timed_out("disabling or enabling", limit)),
+        };
+        let (generation, record) = match written {
+            Ok(written) => written,
+            Err(error) => {
+                // The commit may land after this answer: forgotten at once.
+                let exists = !matches!(self.find(name), Found::NoSuchApplication);
+                self.after_lost(name, exists);
+                return Err(error);
+            }
+        };
+        let Some(record) = record else {
+            return Ok(None);
+        };
+        let changed = generation.is_some();
+        if let Some(generation) = generation {
+            self.install_disabled(name, disable, generation);
+            log::record(
+                if disable {
+                    "application-disabled"
+                } else {
+                    "application-enabled"
+                },
+                serde_json::json!({ "application": name, "by": by }),
+            );
+        }
+        Ok(Some((record, changed)))
+    }
+
+    /// One page of every Application of the installation, for Platform
+    /// administrators (blackbox/CONTRACT.md, "Every Application, on the
+    /// platform's API"): those whose name comes after `after` (byte order),
+    /// `limit` of them at most, by name, each with its serving Version's
+    /// Declared access, its Contributors (at most [`MAX_CONTRIBUTORS`]), how
+    /// many entries of each kind it is shared with, its disable, and its
+    /// usage over the last 30 UTC days. One query, in a read-only
+    /// transaction whose statements Postgres ends after `limit_time`.
+    pub async fn every_application(
+        &self,
+        after: Option<&str>,
+        limit: i64,
+        limit_time: std::time::Duration,
+    ) -> Result<Vec<AdminApplication>, DbError> {
+        let timeout = statement_timeout(limit_time);
+        let read = self.database.pool().run(async |client: &mut Client| {
+            let transaction = client
+                .build_transaction()
+                .read_only(true)
+                .start()
+                .await
+                .map_err(DbError::from)?;
+            transaction
+                .batch_execute(&timeout)
+                .await
+                .map_err(DbError::from)?;
+            let rows = transaction
+                .query(
+                    concat!(
+                        "WITH p AS (SELECT (now() AT TIME ZONE 'UTC')::date - 29 AS from_day)
+                         SELECT a.name, a.description, a.serving_version, a.created_by, ",
+                        rfc3339!("a.created_at"),
+                        ", (SELECT max(n.number) FROM versions n WHERE n.application_id = a.id),
+                           v.declared_access, ",
+                        rfc3339!("a.disabled_at"),
+                        ", a.disabled_by,
+                           c.kinds, c.names, c.people, c.emails, c.added_by, c.added_at,
+                           s.everyone, s.groups, s.people,
+                           to_char(p.from_day, 'YYYY-MM-DD'), u.requests, u.users
+                         FROM p, applications a
+                         LEFT JOIN versions v ON v.application_id = a.id
+                                             AND v.number = a.serving_version
+                         CROSS JOIN LATERAL (
+                            SELECT coalesce(array_agg(f.kind ORDER BY f.id), '{}') AS kinds,
+                                   coalesce(array_agg(f.name ORDER BY f.id), '{}') AS names,
+                                   coalesce(array_agg(w.name ORDER BY f.id), '{}') AS people,
+                                   coalesce(array_agg(w.email ORDER BY f.id), '{}') AS emails,
+                                   coalesce(array_agg(f.added_by ORDER BY f.id), '{}') AS added_by,
+                                   coalesce(array_agg(",
+                        rfc3339!("f.added_at"),
+                        " ORDER BY f.id), '{}') AS added_at
+                            FROM (SELECT e.id, e.kind, e.name, e.added_by, e.added_at
+                                  FROM application_entries e
+                                  WHERE e.application_id = a.id AND e.list = 'contributors'
+                                  ORDER BY e.id LIMIT $3) f
+                            LEFT JOIN users w ON f.kind = 'user' AND w.id = f.name
+                         ) c
+                         CROSS JOIN LATERAL (
+                            SELECT coalesce(bool_or(e.kind = 'everyone'), false) AS everyone,
+                                   count(*) FILTER (WHERE e.kind = 'group') AS groups,
+                                   count(*) FILTER (WHERE e.kind = 'user') AS people
+                            FROM application_entries e
+                            WHERE e.application_id = a.id AND e.list = 'shared_with'
+                         ) s
+                         CROSS JOIN LATERAL (
+                            SELECT coalesce(sum(g.requests), 0)::bigint AS requests,
+                                   count(DISTINCT g.user_id) AS users
+                            FROM application_usage g
+                            WHERE g.application = a.name AND g.day >= p.from_day
+                         ) u
+                         WHERE $1::text IS NULL OR a.name COLLATE \"C\" > $1::text COLLATE \"C\"
+                         ORDER BY a.name COLLATE \"C\"
+                         LIMIT $2"
+                    ),
+                    &[&after, &limit, &MAX_CONTRIBUTORS],
+                )
+                .await
+                .map_err(DbError::from)?;
+            transaction.commit().await.map_err(DbError::from)?;
+            Ok(rows)
+        });
+        let rows = match tokio::time::timeout(limit_time, read).await {
+            Ok(rows) => rows?,
+            Err(_) => return Err(DbError::timed_out("reading every Application", limit_time)),
+        };
+        rows.iter().map(admin_application_of).collect()
+    }
+}
+
+/// `SET LOCAL` of a statement and a lock timeout of `limit`, for a
+/// transaction whose statements Postgres must end then.
+pub(crate) fn statement_timeout(limit: std::time::Duration) -> String {
+    let ms = limit.as_millis();
+    format!("SET LOCAL statement_timeout = {ms}; SET LOCAL lock_timeout = {ms}")
+}
+
+/// An Application as Platform administrators' list of every Application
+/// has it ([`Registry::every_application`]).
+#[derive(Debug)]
+pub struct AdminApplication {
+    pub name: String,
+    pub description: Option<String>,
+    pub created_by: String,
+    /// RFC 3339, UTC.
+    pub created_at: String,
+    pub serving_version: Option<u64>,
+    pub latest_version: Option<u64>,
+    /// The serving Version's Declared access as it was taken; `None` when
+    /// no Version serves.
+    pub declared_access: Option<Value>,
+    /// In the order of the list.
+    pub contributors: Vec<Entry>,
+    pub everyone: bool,
+    pub groups: i64,
+    pub people: i64,
+    pub disabled: Option<Disabled>,
+    /// The first day usage is counted from (`YYYY-MM-DD`, UTC).
+    pub usage_from: String,
+    pub requests: i64,
+    pub users: i64,
+}
+
+fn admin_application_of(row: &Row) -> Result<AdminApplication, DbError> {
+    let kinds: Vec<&str> = get(row, 9)?;
+    let names: Vec<String> = get(row, 10)?;
+    let people: Vec<Option<String>> = get(row, 11)?;
+    let emails: Vec<Option<String>> = get(row, 12)?;
+    let added_by: Vec<String> = get(row, 13)?;
+    let added_at: Vec<String> = get(row, 14)?;
+    let mut contributors = Vec::with_capacity(kinds.len());
+    for (((((kind, name), person), email), by), at) in kinds
+        .into_iter()
+        .zip(names)
+        .zip(people)
+        .zip(emails)
+        .zip(added_by)
+        .zip(added_at)
+    {
+        contributors.push(Entry {
+            named: Named::of_stored(kind, name)?,
+            name: person,
+            email,
+            added_by: by,
+            added_at: at,
+        });
+    }
+    Ok(AdminApplication {
+        name: get(row, 0)?,
+        description: get(row, 1)?,
+        serving_version: get::<Option<i32>>(row, 2)?.map(number_of).transpose()?,
+        created_by: get(row, 3)?,
+        created_at: get(row, 4)?,
+        latest_version: get::<Option<i32>>(row, 5)?.map(number_of).transpose()?,
+        declared_access: get(row, 6)?,
+        disabled: disabled_of(get(row, 7)?, get(row, 8)?),
+        contributors,
+        everyone: get(row, 15)?,
+        groups: get(row, 16)?,
+        people: get(row, 17)?,
+        usage_from: get(row, 18)?,
+        requests: get(row, 19)?,
+        users: get(row, 20)?,
+    })
 }
 
 /// How an Application is looked up.
@@ -1860,7 +2273,9 @@ async fn record_of<C: GenericClient>(
                 "SELECT a.id, a.name, a.description, a.serving_version, a.created_by, ",
                 rfc3339!("a.created_at"),
                 ", (SELECT max(v.number) FROM versions v WHERE v.application_id = a.id),
-                   a.lists_generation
+                   a.lists_generation, ",
+                rfc3339!("a.disabled_at"),
+                ", a.disabled_by
                   FROM applications a WHERE ",
                 $condition
             )
@@ -1915,7 +2330,16 @@ async fn record_of<C: GenericClient>(
         latest_version: get::<Option<i32>>(&row, 6)?.map(number_of).transpose()?,
         created_by: get(&row, 4)?,
         created_at: get(&row, 5)?,
+        disabled: disabled_of(get(&row, 8)?, get(&row, 9)?),
     }))
+}
+
+/// A disable in force from its two columns, both set or both null.
+fn disabled_of(since: Option<String>, by: Option<String>) -> Option<Disabled> {
+    Some(Disabled {
+        since: since?,
+        by: by?,
+    })
 }
 
 /// An entry from the columns `kind, name, <person's name>, <person's

@@ -315,6 +315,9 @@ impl Live {
             log,
             gateway,
             runner,
+            // The local run counts nothing: its writer ends here.
+            usage: _,
+            usage_writer: _,
         } = Platform::open(
             &pg.platform_address(),
             Limits {
@@ -367,6 +370,7 @@ impl Live {
             logs,
             max_request_body_bytes: MAX_BODY_BYTES,
             decides_opening: false,
+            usage: None,
         };
         Ok(Self {
             database,

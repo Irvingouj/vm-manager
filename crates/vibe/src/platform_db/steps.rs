@@ -508,6 +508,41 @@ pub const STEPS: &[Step] = &[
         CREATE INDEX users_email ON users (lower(email));
     ",
     },
+    Step {
+        number: 16,
+        name: "disabling an application, its usage, the operation log's filters",
+        sql: "
+        -- An Application a Platform administrator disabled (blackbox/
+        -- CONTRACT.md, \"What Platform administrators see and stop\"): since
+        -- when and by whom, both null when it is not disabled. Its own
+        -- generation, added to by every disable and enable that changes it,
+        -- so that memory keeps the newer state whatever order changes report
+        -- back in (as `lists_generation`).
+        ALTER TABLE applications
+            ADD COLUMN disabled_at timestamptz,
+            ADD COLUMN disabled_by text,
+            ADD COLUMN disabled_generation bigint NOT NULL DEFAULT 0,
+            ADD CHECK ((disabled_at IS NULL) = (disabled_by IS NULL));
+        -- How many requests of each User an Application's code was given, by
+        -- UTC day. Written by the program every few seconds; rows older than
+        -- 30 days are deleted.
+        CREATE TABLE application_usage (
+            application text NOT NULL,
+            day date NOT NULL,
+            user_id text NOT NULL,
+            requests bigint NOT NULL CHECK (requests >= 0),
+            UNIQUE (application, day, user_id)
+        );
+        CREATE INDEX application_usage_day ON application_usage (day);
+        -- The Operation log's filters, each with `id` so that the newest
+        -- come first; `outcome` is not indexed (it changes when an entry is
+        -- completed, and four values do not narrow).
+        CREATE INDEX operation_log_user ON operation_log (user_id, id);
+        CREATE INDEX operation_log_application ON operation_log (application, id);
+        CREATE INDEX operation_log_resource ON operation_log (resource, id);
+        CREATE INDEX operation_log_time ON operation_log (time);
+    ",
+    },
 ];
 
 /// The advisory lock every step's transaction takes first: "vm steps".

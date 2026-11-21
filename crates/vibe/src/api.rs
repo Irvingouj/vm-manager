@@ -49,9 +49,9 @@ use crate::own_db::Migration;
 use crate::platform_db::DbError;
 use crate::platform_db::PlatformDatabase;
 use crate::registry::{
-    ApplicationRecord, Asked, Change, Changed, Created, DeclaredAccess, Entry, List, Listing,
-    MAX_CONTRIBUTORS, MAX_SHARED_WITH, NameProblem, Named, NewVersion, Registry, Resource, Sent,
-    Standing, VersionRecord, WentBack, check_name,
+    AdminApplication, ApplicationRecord, Asked, Change, Changed, Created, DeclaredAccess, Disabled,
+    Entry, List, Listing, MAX_CONTRIBUTORS, MAX_SHARED_WITH, NameProblem, Named, NewVersion,
+    Registry, Resource, Sent, Standing, VersionRecord, WentBack, check_name,
 };
 use crate::resources::{
     self, Connection, GrantWritten, Login, NewResource, Registered, Resources, is_resource_name,
@@ -192,6 +192,10 @@ enum Route<'a> {
     Contributors(&'a str),
     /// `/v1/applications/<name>/sharing`
     Sharing(&'a str),
+    /// `/v1/applications/<name>/disable` (`true`) and `/enable`
+    Disable(&'a str, bool),
+    /// `/v1/admin/applications`
+    AdminApplications,
     /// `/v1/resources`
     Resources,
     /// `/v1/resources/<name>`
@@ -221,7 +225,11 @@ impl Route<'_> {
     fn for_administrators(&self, method: &Method) -> bool {
         match self {
             Self::Resources => method != Method::GET,
-            Self::Grants(_) | Self::OperationLog | Self::Oidc => true,
+            Self::Grants(_)
+            | Self::OperationLog
+            | Self::Oidc
+            | Self::Disable(..)
+            | Self::AdminApplications => true,
             _ => false,
         }
     }
@@ -245,6 +253,9 @@ impl<'a> Route<'a> {
             ["applications", name, "logs"] => Some(Self::Logs(name)),
             ["applications", name, "contributors"] => Some(Self::Contributors(name)),
             ["applications", name, "sharing"] => Some(Self::Sharing(name)),
+            ["applications", name, "disable"] => Some(Self::Disable(name, true)),
+            ["applications", name, "enable"] => Some(Self::Disable(name, false)),
+            ["admin", "applications"] => Some(Self::AdminApplications),
             ["resources"] => Some(Self::Resources),
             ["resources", name] => Some(Self::Resource(name)),
             ["resources", name, "grants"] => Some(Self::Grants(name)),
@@ -483,33 +494,6 @@ fn read_grant(body: &[u8]) -> Result<(String, authz::AccessLevel), String> {
     let level = level_of(&access)
         .ok_or_else(|| "access is not one of structure, read, write".to_owned())?;
     Ok((group, level))
-}
-
-/// `?limit=<n>` of `GET /v1/operation-log`: 1 to 1000, written plainly;
-/// absent, 100. `None` for anything else. Other parameters are ignored.
-fn log_limit(query: Option<&str>) -> Option<u16> {
-    let mut limit = None;
-    for pair in query.unwrap_or("").split('&') {
-        let Some(value) = pair.strip_prefix("limit=") else {
-            if pair == "limit" {
-                return None;
-            }
-            continue;
-        };
-        if limit.is_some() {
-            return None;
-        }
-        limit = Some(value);
-    }
-    let Some(text) = limit else {
-        return Some(100);
-    };
-    let canonical = !text.is_empty()
-        && !text.starts_with('0')
-        && text.len() <= 4
-        && text.bytes().all(|b| b.is_ascii_digit());
-    let limit: u16 = canonical.then(|| text.parse().ok()).flatten()?;
-    (1..=oplog::MAX_READ).contains(&limit).then_some(limit)
 }
 
 /// `POST /v1/applications/<name>/go-back`
@@ -828,7 +812,29 @@ pub struct Api {
     credentials: Arc<ToolCredentials>,
     domain: Arc<str>,
     signing: Signing,
+    /// The readings for Platform administrators running at once (`GET
+    /// /v1/admin/applications`, `GET /v1/operation-log`): at most
+    /// [`ADMIN_READINGS`]; one more is answered `503` at once.
+    readings: tokio::sync::Semaphore,
 }
+
+/// Readings for Platform administrators at once in the program.
+const ADMIN_READINGS: usize = 2;
+
+/// The longest a request for Platform administrators reads or writes the
+/// platform database (blackbox/CONTRACT.md, "What Platform administrators
+/// see and stop: Bounds and costs").
+const ADMIN_READ_TIME: Duration = Duration::from_secs(10);
+
+/// The largest answer of `GET /v1/operation-log`: 4 MiB.
+const MAX_LOG_ANSWER_BYTES: usize = 4 * 1024 * 1024;
+
+/// The most Resources of an Application's Declared access the list of
+/// every Application shows.
+const MAX_DECLARED_LISTED: usize = 200;
+
+/// The most Applications to a page of the list of every Application.
+const MAX_ADMIN_PAGE: u8 = 100;
 
 impl Api {
     pub fn new(
@@ -848,6 +854,7 @@ impl Api {
             credentials,
             domain,
             signing,
+            readings: tokio::sync::Semaphore::new(ADMIN_READINGS),
         }
     }
 
@@ -921,7 +928,7 @@ impl Api {
         };
         let Some(route) = route else {
             return Answer::not_found(
-                "the API has no such path: its paths are /v1/me, /v1/installation, /v1/tool-credentials, /v1/tool-credentials/current, /v1/tool-sign-ins, /v1/oidc, /v1/applications, /v1/applications/<name>, /v1/applications/<name>/versions, /v1/applications/<name>/versions/<number>, /v1/applications/<name>/go-back, /v1/applications/<name>/logs, /v1/applications/<name>/contributors, /v1/applications/<name>/sharing, /v1/resources, /v1/resources/<name>, /v1/resources/<name>/grants, /v1/resources/<name>/structure and /v1/operation-log",
+                "the API has no such path: its paths are /v1/me, /v1/installation, /v1/tool-credentials, /v1/tool-credentials/current, /v1/tool-sign-ins, /v1/oidc, /v1/applications, /v1/applications/<name>, /v1/applications/<name>/versions, /v1/applications/<name>/versions/<number>, /v1/applications/<name>/go-back, /v1/applications/<name>/logs, /v1/applications/<name>/contributors, /v1/applications/<name>/sharing, /v1/applications/<name>/disable, /v1/applications/<name>/enable, /v1/admin/applications, /v1/resources, /v1/resources/<name>, /v1/resources/<name>/grants, /v1/resources/<name>/structure and /v1/operation-log",
             );
         };
         match route {
@@ -949,7 +956,11 @@ impl Api {
             Route::CurrentToolCredential => self.end_credential(with, method).await,
             Route::Grants(name) => self.grants(method, name, &body).await,
             Route::Structure(name) => Ok(self.structure(user, request, method, name).await),
-            Route::OperationLog => self.operation_log(method, query).await,
+            Route::OperationLog => Ok(self.operation_log(method, query).await),
+            Route::AdminApplications => Ok(self.every_application(method, query).await),
+            Route::Disable(name, disable) => {
+                Ok(self.disable(user, method, name, disable, &body).await)
+            }
             Route::Applications => self.applications(user, method, &body).await,
             Route::Application(name) => self.application(user, method, name).await,
             Route::Versions(name) => self.versions(user, method, name, query, &body).await,
@@ -1086,6 +1097,7 @@ impl Api {
                         address: format!("{}.{}", a.name, self.domain),
                         contributor: a.contributor,
                         serving_version: a.serving_version,
+                        disabled: a.disabled_since.is_some(),
                     })
                     .collect(),
             };
@@ -1917,19 +1929,197 @@ impl Api {
         })
     }
 
-    async fn operation_log(&self, method: &Method, query: Option<&str>) -> Result<Answer, DbError> {
+    /// `GET /v1/operation-log`, by a Platform administrator, with its
+    /// filters (blackbox/CONTRACT.md, "What Platform administrators see and
+    /// stop: Reading the Operation log").
+    async fn operation_log(&self, method: &Method, query: Option<&str>) -> Answer {
         if method != Method::GET {
-            return Ok(Answer::method_not_allowed(method, "GET"));
+            return Answer::method_not_allowed(method, "GET");
         }
-        let Some(limit) = log_limit(query) else {
-            return Ok(Answer::error(
-                StatusCode::BAD_REQUEST,
-                "malformed",
-                "?limit must be a whole number from 1 to 1000",
-            ));
+        let asked = match LogQuery::read(query) {
+            Ok(asked) => asked,
+            Err(problem) => {
+                return Answer::error(StatusCode::BAD_REQUEST, "malformed", &problem);
+            }
         };
-        let entries = self.log.newest(limit).await?;
-        Ok(Answer::json(StatusCode::OK, &EntriesView { entries }))
+        let Some(_permit) = self.reading() else {
+            return readings_busy();
+        };
+        let filter = asked.filter();
+        // What the answer holds besides its entries: `{"entries":[],
+        // "earlier":<id>}`, the id at most 20 digits.
+        let envelope = 64;
+        let max_bytes = MAX_LOG_ANSWER_BYTES - envelope;
+        match self.log.filtered(&filter, max_bytes, ADMIN_READ_TIME).await {
+            Ok((entries, more)) => {
+                let earlier = if more {
+                    entries
+                        .first()
+                        .and_then(|e| e.get("id"))
+                        .and_then(Value::as_i64)
+                } else {
+                    None
+                };
+                Answer::json(StatusCode::OK, &EntriesView { entries, earlier })
+            }
+            Err(error) if took_too_long(&error) => {
+                log::record(
+                    "platform-database-failed",
+                    json!({ "error": error.to_string() }),
+                );
+                Answer::error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "unavailable",
+                    "the reading took too long (more than 10 seconds in the platform database) and was ended: narrow it, with since and until or another filter, and read again",
+                )
+            }
+            Err(error) => Answer::unavailable(&error),
+        }
+    }
+
+    /// One of the [`ADMIN_READINGS`] readings for Platform administrators
+    /// at once, if one is free.
+    fn reading(&self) -> Option<tokio::sync::SemaphorePermit<'_>> {
+        self.readings.try_acquire().ok()
+    }
+
+    /// `GET /v1/admin/applications`, by a Platform administrator
+    /// (blackbox/CONTRACT.md, "Every Application, on the platform's API").
+    async fn every_application(&self, method: &Method, query: Option<&str>) -> Answer {
+        if method != Method::GET {
+            return Answer::method_not_allowed(method, "GET");
+        }
+        let (after, limit) = match admin_list_query(query) {
+            Ok(asked) => asked,
+            Err(problem) => {
+                return Answer::error(StatusCode::BAD_REQUEST, "malformed", &problem);
+            }
+        };
+        let Some(_permit) = self.reading() else {
+            return readings_busy();
+        };
+        let fetched = i64::from(limit).saturating_add(1);
+        let mut rows = match self
+            .registry
+            .every_application(after.as_deref(), fetched, ADMIN_READ_TIME)
+            .await
+        {
+            Ok(rows) => rows,
+            Err(error) => return Answer::unavailable(&error),
+        };
+        let limit = usize::from(limit);
+        let more = rows.len() > limit;
+        rows.truncate(limit);
+        // Taken out of what was read, not copied.
+        let declared: Vec<(Option<Value>, usize)> = rows
+            .iter_mut()
+            .map(|application| cut_declared(application.declared_access.take()))
+            .collect();
+        let next = if more {
+            rows.last().map(|a| a.name.as_str())
+        } else {
+            None
+        };
+        let applications = rows
+            .iter()
+            .zip(declared)
+            .map(|(application, (declared_access, declared_more))| {
+                self.admin_view(application, declared_access, declared_more)
+            })
+            .collect();
+        Answer::json(
+            StatusCode::OK,
+            &AdminApplicationsView { applications, next },
+        )
+    }
+
+    /// An Application of the list of every Application, its Declared
+    /// access already cut ([`cut_declared`]).
+    fn admin_view<'a>(
+        &self,
+        application: &'a AdminApplication,
+        declared_access: Option<Value>,
+        declared_more: usize,
+    ) -> AdminApplicationView<'a> {
+        AdminApplicationView {
+            name: &application.name,
+            description: application.description.as_deref(),
+            address: format!("{}.{}", application.name, self.domain),
+            created_by: &application.created_by,
+            created_at: &application.created_at,
+            serving_version: application.serving_version,
+            latest_version: application.latest_version,
+            declared_access,
+            declared_more,
+            contributors: application.contributors.iter().map(EntryView::of).collect(),
+            shared_with: SharedCountsView {
+                everyone: application.everyone,
+                groups: application.groups,
+                people: application.people,
+            },
+            disabled: application.disabled.as_ref().map(DisabledView::of),
+            usage: UsageView {
+                days: 30,
+                from: &application.usage_from,
+                requests: application.requests,
+                users: application.users,
+            },
+        }
+    }
+
+    /// `POST /v1/applications/<name>/disable` (`disable`) and `/enable`, by
+    /// a Platform administrator (blackbox/CONTRACT.md, "Disabling and
+    /// enabling, on the platform's API"). Each read and the write within
+    /// [`ADMIN_READ_TIME`].
+    async fn disable(
+        &self,
+        user: &User,
+        method: &Method,
+        name: &str,
+        disable: bool,
+        body: &[u8],
+    ) -> Answer {
+        if check_name(name).is_err() {
+            return no_application();
+        }
+        let found =
+            match tokio::time::timeout(ADMIN_READ_TIME, self.registry.application(name)).await {
+                Ok(Ok(found)) => found,
+                Ok(Err(error)) => return Answer::unavailable(&error),
+                Err(_) => {
+                    return Answer::unavailable(&DbError::timed_out(
+                        "reading the Application",
+                        ADMIN_READ_TIME,
+                    ));
+                }
+            };
+        if found.is_none() {
+            return no_application();
+        }
+        if method != Method::POST {
+            return Answer::method_not_allowed(method, "POST");
+        }
+        if !body.trim_ascii().is_empty()
+            && let Err(problem) = Object::read(body)
+        {
+            return Answer::malformed(&problem, "nothing, or {}");
+        }
+        let switched = self
+            .registry
+            .set_disabled(name, disable, &user.id, ADMIN_READ_TIME)
+            .await;
+        match switched {
+            Ok(Some((application, changed))) => Answer::json(
+                StatusCode::OK,
+                &SwitchedView {
+                    application: self.view(&application, user),
+                    changed,
+                },
+            ),
+            // Gone meanwhile.
+            Ok(None) => no_application(),
+            Err(error) => Answer::unavailable(&error),
+        }
     }
 
     /// The Application `name`; `None` also for a name no Application can
@@ -1958,6 +2148,7 @@ impl Api {
             latest_version: application.latest_version,
             created_by: &application.created_by,
             created_at: &application.created_at,
+            disabled: application.disabled.as_ref().map(DisabledView::of),
         }
     }
 }
@@ -1978,6 +2169,8 @@ struct ApplicationView<'a> {
     latest_version: Option<u64>,
     created_by: &'a str,
     created_at: &'a str,
+    /// Null when it is not disabled.
+    disabled: Option<DisabledView<'a>>,
 }
 
 /// The answer of a change of a list: the Application as it is after, and
@@ -2211,6 +2404,8 @@ struct ListedApplicationView<'a> {
     address: String,
     contributor: bool,
     serving_version: Option<u64>,
+    /// Whether a Platform administrator has disabled it.
+    disabled: bool,
 }
 
 #[derive(Serialize)]
@@ -2251,6 +2446,369 @@ struct StructureView<'a> {
 #[derive(Serialize)]
 struct EntriesView {
     entries: Vec<Value>,
+    /// The `id` of the first entry answered when an older one matches.
+    earlier: Option<i64>,
+}
+
+/// A disable in force, as the API answers it.
+#[derive(Serialize)]
+struct DisabledView<'a> {
+    since: &'a str,
+    by: &'a str,
+}
+
+impl<'a> DisabledView<'a> {
+    fn of(disabled: &'a Disabled) -> Self {
+        Self {
+            since: &disabled.since,
+            by: &disabled.by,
+        }
+    }
+}
+
+/// The answer of a disable or an enable: the Application as it is after,
+/// and whether this request changed it.
+#[derive(Serialize)]
+struct SwitchedView<'a> {
+    #[serde(flatten)]
+    application: ApplicationView<'a>,
+    changed: bool,
+}
+
+/// One Application of Platform administrators' list of every Application.
+#[derive(Serialize)]
+struct AdminApplicationView<'a> {
+    name: &'a str,
+    description: Option<&'a str>,
+    address: String,
+    created_by: &'a str,
+    created_at: &'a str,
+    serving_version: Option<u64>,
+    latest_version: Option<u64>,
+    /// At most [`MAX_DECLARED_LISTED`] Resources, by name.
+    declared_access: Option<Value>,
+    declared_more: usize,
+    contributors: Vec<EntryView<'a>>,
+    shared_with: SharedCountsView,
+    disabled: Option<DisabledView<'a>>,
+    usage: UsageView<'a>,
+}
+
+#[derive(Serialize)]
+struct SharedCountsView {
+    everyone: bool,
+    groups: i64,
+    people: i64,
+}
+
+#[derive(Serialize)]
+struct UsageView<'a> {
+    days: u8,
+    from: &'a str,
+    requests: i64,
+    users: i64,
+}
+
+#[derive(Serialize)]
+struct AdminApplicationsView<'a> {
+    applications: Vec<AdminApplicationView<'a>>,
+    next: Option<&'a str>,
+}
+
+/// A Declared access as stored, cut to its first [`MAX_DECLARED_LISTED`]
+/// Resources by name (byte order, as the map keeps them), and how many more
+/// it declares.
+fn cut_declared(stored: Option<Value>) -> (Option<Value>, usize) {
+    let mut more = 0;
+    let cut = stored.map(|mut stored| {
+        if let Some(Value::Object(resources)) = stored.get_mut("resources")
+            && resources.len() > MAX_DECLARED_LISTED
+        {
+            more = resources.len() - MAX_DECLARED_LISTED;
+            let kept: serde_json::Map<String, Value> = std::mem::take(resources)
+                .into_iter()
+                .take(MAX_DECLARED_LISTED)
+                .collect();
+            *resources = kept;
+        }
+        stored
+    });
+    (cut, more)
+}
+
+/// `503`: [`ADMIN_READINGS`] readings for Platform administrators run.
+fn readings_busy() -> Answer {
+    Answer::error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "unavailable",
+        "readings for Platform administrators are running: try again shortly",
+    )
+}
+
+/// Whether a reading failed because it passed its time.
+fn took_too_long(error: &DbError) -> bool {
+    use tokio_postgres::error::SqlState;
+    error.is_timeout()
+        || matches!(
+            error.code(),
+            Some(&SqlState::QUERY_CANCELED | &SqlState::LOCK_NOT_AVAILABLE)
+        )
+}
+
+/// A query's parameters, each value percent-decoded (`+` read as a space,
+/// as a form writes one), only those named in `known`; `Err` with the name
+/// of one given twice or whose value cannot be decoded. A parameter written
+/// without `=` has the empty value.
+fn query_parameters<'k>(
+    query: Option<&str>,
+    known: &[&'k str],
+) -> Result<BTreeMap<&'k str, String>, &'k str> {
+    let mut found = BTreeMap::new();
+    for pair in query.unwrap_or("").split('&') {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        let Some(name) = known.iter().find(|k| **k == key) else {
+            continue;
+        };
+        let spaced = value.replace('+', " ");
+        let Some(decoded) = percent_decoded(&spaced) else {
+            return Err(name);
+        };
+        if found.insert(*name, decoded).is_some() {
+            return Err(name);
+        }
+    }
+    Ok(found)
+}
+
+/// `?after` and `?limit` of `GET /v1/admin/applications`.
+fn admin_list_query(query: Option<&str>) -> Result<(Option<String>, u8), String> {
+    let mut found = query_parameters(query, &["after", "limit"])
+        .map_err(|name| format!("?{name} is given twice or is not percent-encoded"))?;
+    let limit = match found.get("limit") {
+        None => MAX_ADMIN_PAGE,
+        Some(text) => plain_number(text)
+            .and_then(|n| u8::try_from(n).ok())
+            .filter(|n| (1..=MAX_ADMIN_PAGE).contains(n))
+            .ok_or_else(|| {
+                "?limit must be a whole number from 1 to 100, written plainly".to_owned()
+            })?,
+    };
+    let after = found.remove("after");
+    if let Some(after) = &after
+        && matches!(check_name(after), Err(NameProblem::Invalid))
+    {
+        return Err("?after must be a name an Application could have: 1 to 63 lower-case letters, digits and hyphens".into());
+    }
+    Ok((after, limit))
+}
+
+/// A whole number written plainly: digits, no sign, no leading zero, above
+/// 0, at most 18 digits.
+fn plain_number(text: &str) -> Option<i64> {
+    let canonical = !text.is_empty()
+        && !text.starts_with('0')
+        && text.len() <= 18
+        && text.bytes().all(|b| b.is_ascii_digit());
+    canonical.then(|| text.parse().ok()).flatten()
+}
+
+/// Whether `text` is RFC 3339 with a date, a time, up to six digits of a
+/// second's fraction, and an offset (`Z` or `±hh:mm`), each part in its
+/// range; answers it as microseconds since 1970 (for comparing `since` with
+/// `until`).
+pub(crate) fn rfc3339_micros(text: &str) -> Option<i64> {
+    fn digits(text: &str) -> Option<i64> {
+        (!text.is_empty() && text.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| text.parse().ok())
+            .flatten()
+    }
+    let date = text.get(..10)?;
+    let rest = text.get(10..)?;
+    let (year, month, day) = (
+        digits(date.get(..4)?)?,
+        digits(date.get(5..7)?)?,
+        digits(date.get(8..10)?)?,
+    );
+    if date.get(4..5)? != "-" || date.get(7..8)? != "-" {
+        return None;
+    }
+    let rest = rest.strip_prefix(['T', 't'])?;
+    let (hour, minute, second) = (
+        digits(rest.get(..2)?)?,
+        digits(rest.get(3..5)?)?,
+        digits(rest.get(6..8)?)?,
+    );
+    if rest.get(2..3)? != ":" || rest.get(5..6)? != ":" {
+        return None;
+    }
+    let mut rest = rest.get(8..)?;
+    let mut micros = 0;
+    if let Some(fraction) = rest.strip_prefix('.') {
+        let length = fraction.bytes().take_while(u8::is_ascii_digit).count();
+        if length == 0 || length > 6 {
+            return None;
+        }
+        let padded = format!("{:0<6}", fraction.get(..length)?);
+        micros = digits(&padded)?;
+        rest = fraction.get(length..)?;
+    }
+    let offset = match rest {
+        "Z" | "z" => 0,
+        _ => {
+            let sign = match rest.get(..1)? {
+                "+" => 1,
+                "-" => -1,
+                _ => return None,
+            };
+            if rest.len() != 6 || rest.get(3..4)? != ":" {
+                return None;
+            }
+            let (h, m) = (digits(rest.get(1..3)?)?, digits(rest.get(4..6)?)?);
+            if h > 23 || m > 59 {
+                return None;
+            }
+            sign * (h * 60 + m)
+        }
+    };
+    let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    let days_in_month = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return None,
+    };
+    if year < 1 || day < 1 || day > days_in_month || hour > 23 || minute > 59 || second > 59 {
+        return None;
+    }
+    // Days since 1970-01-01 (the civil-from-days inverse).
+    let (y, m) = if month <= 2 {
+        (year - 1, month + 9)
+    } else {
+        (year, month - 3)
+    };
+    let era = y.div_euclid(400);
+    let year_of_era = y - era * 400;
+    let day_of_year = (153 * m + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    let days = era * 146_097 + day_of_era - 719_468;
+    let seconds = days * 86_400 + hour * 3600 + minute * 60 + second - offset * 60;
+    Some(seconds * 1_000_000 + micros)
+}
+
+/// The filters of `GET /v1/operation-log`, read and checked.
+#[derive(Debug, Default)]
+struct LogQuery {
+    user: Option<String>,
+    application: Option<String>,
+    resource: Option<String>,
+    outcome: Option<String>,
+    since: Option<String>,
+    until: Option<String>,
+    before: Option<i64>,
+    limit: i64,
+}
+
+impl LogQuery {
+    /// Every parameter's problem is told naming it.
+    fn read(query: Option<&str>) -> Result<Self, String> {
+        const NAMES: [&str; 8] = [
+            "user",
+            "application",
+            "resource",
+            "outcome",
+            "since",
+            "until",
+            "before",
+            "limit",
+        ];
+        let mut found = query_parameters(query, &NAMES)
+            .map_err(|name| format!("?{name} is given twice or is not percent-encoded"))?;
+        let mut asked = Self {
+            limit: 100,
+            ..Self::default()
+        };
+        if let Some(user) = found.remove("user") {
+            if user.is_empty() || user.len() > MAX_ENTRY_BYTES || user.chars().any(char::is_control)
+            {
+                return Err(
+                    "?user must be a user id of 1 to 256 bytes without control characters".into(),
+                );
+            }
+            asked.user = Some(user);
+        }
+        if let Some(application) = found.remove("application") {
+            if matches!(check_name(&application), Err(NameProblem::Invalid)) {
+                return Err("?application must be a name an Application could have: 1 to 63 lower-case letters, digits and hyphens".into());
+            }
+            asked.application = Some(application);
+        }
+        if let Some(resource) = found.remove("resource") {
+            if !is_resource_name(&resource) {
+                return Err("?resource must be a name a Resource could have".into());
+            }
+            asked.resource = Some(resource);
+        }
+        if let Some(outcome) = found.remove("outcome") {
+            if !matches!(
+                outcome.as_str(),
+                "allowed" | "refused" | "failed" | "unfinished"
+            ) {
+                return Err("?outcome must be allowed, refused, failed or unfinished".into());
+            }
+            asked.outcome = Some(outcome);
+        }
+        let mut times = [None, None];
+        for (at, name) in ["since", "until"].into_iter().enumerate() {
+            if let Some(time) = found.remove(name) {
+                let Some(micros) = rfc3339_micros(&time) else {
+                    return Err(format!(
+                        "?{name} must be RFC 3339 with a date, a time and an offset (Z or ±hh:mm, + written %2B), up to microseconds"
+                    ));
+                };
+                if let Some(slot) = times.get_mut(at) {
+                    *slot = Some(micros);
+                }
+                if at == 0 {
+                    asked.since = Some(time);
+                } else {
+                    asked.until = Some(time);
+                }
+            }
+        }
+        if let [Some(since), Some(until)] = times
+            && since >= until
+        {
+            return Err("?since must be before ?until".into());
+        }
+        if let Some(before) = found.remove("before") {
+            let Some(before) = plain_number(&before) else {
+                return Err("?before must be a positive whole number, written plainly".into());
+            };
+            asked.before = Some(before);
+        }
+        if let Some(limit) = found.remove("limit") {
+            asked.limit = plain_number(&limit)
+                .filter(|n| (1..=i64::from(oplog::MAX_READ)).contains(n))
+                .ok_or_else(|| {
+                    "?limit must be a whole number from 1 to 1000, written plainly".to_owned()
+                })?;
+        }
+        Ok(asked)
+    }
+
+    fn filter(&self) -> oplog::Filter<'_> {
+        oplog::Filter {
+            user: self.user.as_deref(),
+            application: self.application.as_deref(),
+            resource: self.resource.as_deref(),
+            outcome: self.outcome.as_deref(),
+            since: self.since.as_deref(),
+            until: self.until.as_deref(),
+            before: self.before,
+            limit: self.limit,
+        }
+    }
 }
 
 /// `401`: not signed in, or with a credential that signs nobody in.
@@ -2367,10 +2925,11 @@ mod tests {
 
     #[test]
     fn operation_log_limits_are_plain_numbers_from_1_to_1000() {
-        assert_eq!(log_limit(None), Some(100));
-        assert_eq!(log_limit(Some("")), Some(100));
-        assert_eq!(log_limit(Some("limit=1")), Some(1));
-        assert_eq!(log_limit(Some("limit=1000")), Some(1000));
+        let limit = |query: Option<&str>| LogQuery::read(query).ok().map(|asked| asked.limit);
+        assert_eq!(limit(None), Some(100));
+        assert_eq!(limit(Some("")), Some(100));
+        assert_eq!(limit(Some("limit=1")), Some(1));
+        assert_eq!(limit(Some("limit=1000")), Some(1000));
         for query in [
             "limit=0",
             "limit=1001",
@@ -2381,7 +2940,7 @@ mod tests {
             "limit=01",
             "limit=5&limit=6",
         ] {
-            assert_eq!(log_limit(Some(query)), None, "{query}");
+            assert_eq!(limit(Some(query)), None, "{query}");
         }
     }
 
