@@ -14,7 +14,7 @@ use std::fmt::Write as _;
 use bytes::Bytes;
 use hyper::{Method, StatusCode};
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Value, json};
 
 use super::client::{self, Sign};
 use super::credential_file::{Kept, Place};
@@ -56,6 +56,9 @@ struct Application {
     address: Theirs,
     serving_version: Option<u64>,
     latest_version: Option<u64>,
+    /// Since when and by whom it is disabled; null when it is not.
+    #[serde(default)]
+    disabled: Value,
 }
 
 /// A Version as `GET /v1/applications/<name>/versions` lists it.
@@ -270,14 +273,23 @@ pub(super) async fn go_back(args: &GoBackArgs) -> Result<Done, Ending> {
             gone.serving_version
         ).ok();
     }
-    Ok(Done {
-        json: json!({
-            "application": name,
-            "address": application.address,
-            "serving_version": gone.serving_version,
-            "was": gone.was,
-            "migrations_not_undone": gone.migrations_not_undone,
-        }),
-        text,
-    })
+    let mut json = json!({
+        "application": name,
+        "address": application.address,
+        "serving_version": gone.serving_version,
+        "was": gone.was,
+        "migrations_not_undone": gone.migrations_not_undone,
+        "disabled": application.disabled,
+    });
+    // Disabled: made all the same, and said.
+    if application.disabled.is_object() {
+        let warning = super::disabled_warning(name);
+        if let Some(message) = warning.get("message").and_then(Value::as_str) {
+            writeln!(text, "Warning (application-disabled): {message}").ok();
+        }
+        if let Some(object) = json.as_object_mut() {
+            object.insert("warnings".into(), json!([warning]));
+        }
+    }
+    Ok(Done { json, text })
 }

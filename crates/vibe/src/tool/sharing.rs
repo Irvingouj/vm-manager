@@ -312,6 +312,17 @@ fn shown(kept: &Kept, application: &Value) -> String {
         Some(number) => writeln!(text, "  Serving: Version {number}").ok(),
         None => writeln!(text, "  Serving: no Version yet").ok(),
     };
+    if let Some(disabled) = application.get("disabled").filter(|d| d.is_object()) {
+        let part =
+            |key: &str| Theirs::from(disabled.get(key).and_then(Value::as_str).unwrap_or(""));
+        writeln!(
+            text,
+            "  Disabled since {} by {}: its address answers that it is disabled, and none of its code runs. Only a Platform administrator enables it again.",
+            part("since"),
+            part("by")
+        )
+        .ok();
+    }
     if application.get("contributor") == Some(&Value::Bool(true)) {
         text.push_str("  You are one of its Contributors.\n");
     }

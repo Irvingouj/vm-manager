@@ -273,6 +273,10 @@ struct Application {
     serving_version: Option<u64>,
     /// The highest-numbered Version, `None` when there is none.
     latest_version: Option<u64>,
+    /// Since when and by whom a Platform administrator disabled it; null
+    /// when it is not disabled.
+    #[serde(default)]
+    disabled: Value,
 }
 
 /// A Version's migrations as its record has them.
@@ -1319,16 +1323,28 @@ fn deployed(ready: &Ready, application: &Application, created: bool, number: u64
     // A deploy is by a Contributor, to whom it is always answered.
     let shared_with = application.shared_with.as_deref().unwrap_or(&[]);
     let words = |text: &str| Theirs::from(text).to_string();
-    let mut text = format!(
-        "Deployed {}: it is live at {} as Version {number}",
-        words(&ready.name),
-        words(&application.address)
-    );
+    let disabled = application.disabled.is_object();
+    let mut text = if disabled {
+        // Never that it is served: it is not, until it is enabled.
+        format!(
+            "Deployed {} as Version {number}: a Platform administrator has disabled the Application, so {} answers that it is disabled until a Platform administrator enables it",
+            words(&ready.name),
+            words(&application.address)
+        )
+    } else {
+        format!(
+            "Deployed {}: it is live at {} as Version {number}",
+            words(&ready.name),
+            words(&application.address)
+        )
+    };
     text.push_str(if created {
         ", in an Application this deploy created.\n"
     } else {
         ".\n"
     });
+    let disabled_warning = disabled.then(|| super::disabled_warning(&ready.name));
+    let warnings: Vec<&Value> = ready.warnings.iter().chain(&disabled_warning).collect();
     if ready.added.is_empty() {
         text.push_str("It applied no migration.\n");
     } else {
@@ -1344,7 +1360,8 @@ fn deployed(ready: &Ready, application: &Application, created: bool, number: u64
         &application.contributors,
         Some(shared_with),
     ));
-    for (title, items) in [("Warnings", &ready.warnings), ("Notes", &ready.notes)] {
+    let notes: Vec<&Value> = ready.notes.iter().collect();
+    for (title, items) in [("Warnings", &warnings), ("Notes", &notes)] {
         if items.is_empty() {
             continue;
         }
@@ -1359,6 +1376,7 @@ fn deployed(ready: &Ready, application: &Application, created: bool, number: u64
         json: json!({
             "application": ready.name,
             "address": application.address,
+            "disabled": application.disabled,
             "version": number,
             "created": created,
             "git_commit": ready.git_commit,
@@ -1369,7 +1387,7 @@ fn deployed(ready: &Ready, application: &Application, created: bool, number: u64
                 "contributors": application.contributors,
                 "shared_with": shared_with,
             },
-            "warnings": ready.warnings,
+            "warnings": warnings,
             "notes": ready.notes,
         }),
         text,

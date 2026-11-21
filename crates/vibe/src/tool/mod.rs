@@ -58,7 +58,7 @@ mod test_users;
 mod theirs;
 mod versions;
 
-pub use admin::AdminArgs;
+pub use admin::{AdminArgs, usage_problem as admin_usage_problem};
 pub use check::CheckArgs;
 pub use deploy::DeployArgs;
 pub use generate::GenerateArgs;
@@ -388,6 +388,19 @@ pub fn run(command: Command) -> ExitCode {
         | Command::Resources(o)
         | Command::Applications(o) => o.json,
     };
+    // The members of an output whose contract orders them.
+    let order: Option<&[&str]> = match &command {
+        Command::GoBack(_) => Some(&[
+            "application",
+            "address",
+            "serving_version",
+            "was",
+            "migrations_not_undone",
+            "disabled",
+            "warnings",
+        ]),
+        _ => None,
+    };
     let outcome = match tokio::runtime::Builder::new_current_thread()
         .enable_io()
         .enable_time()
@@ -445,7 +458,11 @@ pub fn run(command: Command) -> ExitCode {
             let written = if done.json.is_null() && done.text.is_empty() {
                 Ok(())
             } else if json {
-                write_to(&mut io::stdout().lock(), &json_line(&done.json))
+                let line = match order {
+                    Some(order) => json_line_ordered(&done.json, order),
+                    None => json_line(&done.json),
+                };
+                write_to(&mut io::stdout().lock(), &line)
             } else {
                 write_to(&mut io::stdout().lock(), &done.text)
             };
@@ -492,6 +509,49 @@ fn json_line(value: &Value) -> String {
     }
     line.push('\n');
     line
+}
+
+/// `value`, an object, as [`json_line`] writes it, its members first in
+/// `order` (those it has), then the others as [`json_line`] orders them:
+/// for an output whose contract orders its members.
+fn json_line_ordered(value: &Value, order: &[&str]) -> String {
+    let Some(object) = value.as_object() else {
+        return json_line(value);
+    };
+    let mut written = String::from("{");
+    let named = order.iter().filter_map(|key| object.get_key_value(*key));
+    let others = object
+        .iter()
+        .filter(|(key, _)| !order.contains(&key.as_str()));
+    for (n, (key, member)) in named.chain(others).enumerate() {
+        if n > 0 {
+            written.push(',');
+        }
+        put!(written, "{}:{}", Value::from(key.as_str()), member);
+    }
+    written.push('}');
+    let mut line = String::new();
+    for c in written.chars() {
+        if theirs::is_escaped(c) {
+            put!(line, "\\u{:04x}", u32::from(c));
+        } else {
+            line.push(c);
+        }
+    }
+    line.push('\n');
+    line
+}
+
+/// The warning `application-disabled` of a deploy or a go-back to the
+/// disabled Application `name` (blackbox/CONTRACT.md, "What Platform
+/// administrators see and stop: What every surface shows").
+fn disabled_warning(name: &str) -> Value {
+    json!({
+        "reason": "application-disabled",
+        "message": format!(
+            "a Platform administrator has disabled the Application {name}: the Version is deployed, and is not served until a Platform administrator enables the Application; until then its address answers that it is disabled. Nothing in the project is wrong: tell the Builder so, who asks their IT"
+        ),
+    })
 }
 
 /// Writes a line on standard error, as the command goes; a standard error
@@ -1099,6 +1159,8 @@ struct ListedApplication {
     address: Theirs,
     contributor: bool,
     serving_version: Option<u64>,
+    /// Whether a Platform administrator has disabled it.
+    disabled: bool,
 }
 
 #[derive(Deserialize)]
@@ -1134,6 +1196,9 @@ async fn applications() -> Result<Done, Ending> {
                 say!(text, "  Serving: Version {number}");
             }
             None => text.push_str("  Serving: no Version yet\n"),
+        }
+        if a.disabled {
+            text.push_str("  Disabled by a Platform administrator: its address answers that it is disabled, and none of its code runs, until a Platform administrator enables it.\n");
         }
         text.push('\n');
     }
