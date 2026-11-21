@@ -2450,3 +2450,227 @@ A walk of the gate (`blackbox/tests/browser_look.rs`) opens, in a browser set to
 
 - Whether a page is pleasant is not a test's to say: the pages are looked at in a real browser, at 320, 768 and 1280 CSS pixels, light and dark, whenever they change, by the method of the project's UI/UX skill (`.claude/skills/ui-ux/`).
 - A switch on the page between light and dark (it follows the browser); a language other than English; print.
+
+## What Platform administrators see and stop (ticket: Platform administrators see every Application, disable any, and query the Operation log)
+
+What IT gets in exchange for gating nothing (ADR 0009). A Platform administrator lists every Application with its Declared access, its Contributors, its serving Version and how much it is used; disables any Application at once and enables it again; and reads the Operation log filtered by User, Application, Resource, outcome and time, a page at a time. All of it is on the platform's API and in the tool, under `vibe admin`. The Dashboard's pages for it are the ticket "The Dashboard for Platform administrators".
+
+This section builds on "The platform's API" (the error body, the reasons and their order), "The tool: Every command" (exit codes, `--json`, escaping), "The Operation log" and the sections that added to its entries, "Contributors and sharing" (the Application's object and its two lists), "Versions, going back, and logs" (paging with a cursor, `request` records), "A write whose answer is lost", "The Dashboard" and "The tool signs in through the browser: Who is a Platform administrator".
+
+### Who may
+
+- Everything in this section is for Platform administrators only: a User whose Groups hold the administrators' Group, as last read ("Who is a Platform administrator"; with the stand-in, the Group `--administrators-group` names). The same sign-in as every request of the API: a session or a tool credential.
+- Everyone else is refused as "Who is refused" says. Being a Contributor of an Application gives nothing here: a Contributor cannot disable or enable their own Application, and cannot read the Operation log of it.
+
+### Every Application, on the platform's API
+
+`GET /v1/admin/applications`, by a Platform administrator. Answers `200`:
+
+```json
+{ "applications": [
+    { "name": "incident-board", "description": "..." | null, "address": "incident-board.<domain>",
+      "created_by": "<user id>", "created_at": "<RFC 3339>",
+      "serving_version": 3 | null, "latest_version": 4 | null,
+      "declared_access": { "resources": { "devops": { "kind": "postgres", "access": "read" } } } | null,
+      "declared_more": 0,
+      "contributors": [ <entry>, ... ],
+      "shared_with": { "everyone": false, "groups": 2, "people": 5 },
+      "disabled": null | { "since": "<RFC 3339>", "by": "<user id>" },
+      "usage": { "days": 30, "from": "<YYYY-MM-DD>", "requests": 1234, "users": 17 } } ],
+  "next": "<name>" | null }
+```
+
+- **Every Application of the installation**, whoever it is shared with or not: one never shared, one with no Version, one that is disabled. Exactly once each. A Platform administrator's own `GET /v1/applications` is unchanged: their own list, as anyone's ("Contributors and sharing: On the platform's API").
+- **Order and paging.** By name, in byte order. `?limit=<n>` (1 to 100, default 100) Applications at most. `?after=<name>`: only Applications whose name comes after that one (it need not be an Application's name now, only one an Application could have). `next` is the name of the last Application answered when an Application comes after it, else null. So reading with `after=<next>` until `next` is null gives every Application once, also when Applications are made meanwhile (one made behind the cursor is in the next reading's answer, not this one's).
+- `serving_version` and `latest_version` are those of the Application's object ("Versions, going back, and logs: The latest Version").
+- **`declared_access`** is the serving Version's Declared access, as `POST /v1/applications/<name>/versions` took it, with its Resources by name; null when no Version serves. At most 200 Resources are listed for one Application (the first 200 by name); `declared_more` is how many more it declares (0 when none). The whole is `GET /v1/applications/<name>/versions/<number>`, which a Platform administrator may read ("Contributors and sharing").
+- **`contributors`**: every Contributor, each entry as the API answers an entry anywhere ("Contributors and sharing: On the platform's API": a person with `name` and `email`, `added_by`, `added_at`), in the order of the list. There are at most 100.
+- **`shared_with`** is counted here, not listed: `everyone` true when it is shared with everyone, `groups` and `people` the number of entries of each kind. The entries themselves are in `GET /v1/applications/<name>`, which shows `shared_with` to a Platform administrator.
+- **`disabled`**: null, or since when and by whom it is disabled (below).
+- **`usage`**: below.
+- **Read from what the platform database holds** (not only from what the program holds in memory): within 10 seconds, else `503` `unavailable`, as every read of the API.
+- Malformed: a `limit` outside 1 to 100 or not written plainly (digits, no sign, no leading zero), an `after` that no Application could be named (not a lower-case DNS label of 1 to 63 characters, as `invalid-name` says), either parameter given twice: `400` `malformed`. Other parameters are ignored. Any other method on the path: `405` `method-not-allowed`.
+
+### Usage: requests and Users
+
+Nothing counted requests or Users before this ticket (the program's log has a `request` record for each request, which the platform does not read back; "Logs" keep the newest 5,000 entries of an Application, which is no count). From this ticket on the platform counts them.
+
+- **What is counted.** A request is counted when the Application's code was given it: exactly the requests that have an entry in "Logs" (so a request whose code failed with `500` counts; one refused before the code, `401`, `403` not shared, a disabled Application's answer, `503`, `404`, does not). It is counted for the signed-in User whose request it was. `requests` is the number of such requests; `users` the number of different User ids among them.
+- **Over which period.** The last 30 days by UTC calendar day: the day of the reading (UTC) and the 29 before it. `days` is `30`; `from` is the first of those days (`YYYY-MM-DD`). An Application with no counted request in them has `requests` `0` and `users` `0`.
+- **Where it is kept.** In the platform database, in the table `application_usage`, one row per Application, day and User:
+
+  | Column | Type | What |
+  |---|---|---|
+  | `application` | `text` | The Application's name. |
+  | `day` | `date` | The UTC day the request was counted on. |
+  | `user_id` | `text` | The User's id. |
+  | `requests` | `bigint` | How many of their requests were counted that day. |
+
+  `(application, day, user_id)` is unique. Rows older than the period are deleted at least once a day. The tests read and write this table as the Postgres administrator (to count, and to place counts on past days); the rest of how the platform keeps it is its own affair.
+- **When it shows.** Counting is never in a request's way: no request waits for it, and a request is answered the same when it cannot be written. With the platform database answering, a counted request is in `usage` within 15 seconds of its response.
+- **Bounded.** Counts wait in the program's memory and are written at least every 10 seconds, in one transaction. At most 10,000 different (Application, day, User) wait at once; a request of a pair that does not fit is not counted, and the program's log has `{"event":"usage-dropped","requests":<n>}` at most once every 10 seconds while that lasts. So a count is never more than what happened, and is less only when that record says so. Counts waiting when the process is ended are lost (at most the last 10 seconds').
+
+### Disabling and enabling, on the platform's API
+
+`POST /v1/applications/<name>/disable` and `POST /v1/applications/<name>/enable`, by a Platform administrator, with an empty body or `{}` (any other JSON object is taken; its members are ignored; a body that is not a JSON object is `400` `malformed`). Each answers `200` with the Application's object as `GET /v1/applications/<name>` answers it to that administrator, and one more member, `"changed": <bool>`.
+
+- **The Application's object gains `"disabled"`** wherever the API answers it (`POST /v1/applications`, `GET /v1/applications/<name>`, the changes of its lists, the two requests here): null when it is not disabled, else `{ "since": "<RFC 3339>", "by": "<user id>" }`, the time the disable was made and the Platform administrator who made it. The same to everyone who may read the object.
+- **Disabling** a disabled Application changes nothing: `changed` false, `since` and `by` as they were. **Enabling** one that is not disabled changes nothing: `changed` false. Neither is refused. Two disables sent at once: one has `changed` true, and `by` is its caller's.
+- **At once.** Once the `200` of a disable has been received, no request to the Application's address is given to its code ("What a disabled Application answers"), and none in flight goes on ("Requests in flight"). Once the `200` of an enable has been received, every new request is served as before the disable, by the Version that serves now (which a deploy or a go-back made meanwhile may have changed).
+- **It is kept.** In the platform database, with the Application: stopping the program and starting it again leaves a disabled Application disabled, with its `since` and `by`. The program holds it in memory, in step with the platform database, like which Version serves ("Who is allowed": "The program decides from what it holds in memory"): a request adds no round trip to the platform database to learn it, and while the platform database cannot be reached a disabled Application stays disabled and an enabled one is served.
+- **Recorded.** The program's log gets `{"event":"application-disabled","application","by"}` or `{"event":"application-enabled","application","by"}` when something changed, and nothing when nothing did. The Operation log is not written: it records operations on Resources, and this is none.
+- Refusals, after `too-large` and `not-an-administrator` ("Who is refused"): `404` `not-found` for a name that no Application has (or that none could have); `405` `method-not-allowed` for another method; `400` `malformed` as above. A refused request changes nothing.
+
+### What a disabled Application answers
+
+In "Responses the program itself gives", after the `403` of "Contributors and sharing: Opening an Application" and before the `404` of an Application with no serving Version:
+
+| Condition | Status |
+|---|---|
+| The Application is disabled | 503 |
+
+- So only someone who can open the Application learns that it is disabled; someone who is not signed in, or who cannot open it, is answered as before (`401`, or `403` not shared).
+- **None of its code runs**, whatever the path and the method: no `printed`, `uncaught` or `host-call` record carries the request's id. It has no entry in "Logs" and is not counted in `usage`. The `request` record has the Application's name, `version` null and `status` 503.
+- The answer has no `retry-after`: unlike every other `503` the program gives, it does not say to try again shortly.
+- **A page**, to a `GET` or `HEAD` whose `Accept` has `text/html`: a page of the platform's own, with the headers every such page has ("Contributors and sharing: Opening an Application", `referrer-policy: same-origin` as "The Dashboard" set it) and the theme of "How the pages look". Its `<h1>` says that the Application is disabled. It names the Application, says that a Platform administrator has stopped it, that this is not something the person did or can undo, and to ask the company's IT (its Platform administrators) about it; it says whom the person is signed in as, as the page of an Application not shared with them does, with the same one link to sign out under OIDC and none with the stand-in. It names no administrator and shows neither `since` nor `by`. It has an element with `data-vm-disabled="<the Application's name>"`. Everything it shows of the person is escaped as HTML.
+- **Any other request**: `text/plain`, 1 to 200 bytes, the one sentence `The Application <name> has been disabled by a Platform administrator.` and a line end.
+- With OIDC the steps of a sign-in come first, as for an Application not shared ("The way through sign-in"): a person without a session is sent to sign in, and `/_vm/session` is answered as ever; the page above comes after.
+
+### Requests in flight
+
+A request is in flight from the moment its Application's code may be given it until its response is sent.
+
+- **Within 1 second of the `200` of a disable, every request in flight to that Application is answered** as a disabled Application answers ("What a disabled Application answers"), whatever its code was doing or had already returned, unless its response had already begun to be sent (then nothing more is promised of it). Its code is stopped. Requests waiting to be given to the code are answered the same and are never given to it.
+- **Every transaction it left open is rolled back**, as when a request ends ("Transactions: What the host does on its own"), with a `rollback` entry whose `error` is `application-disabled`. A statement still running is cancelled; its Operation log entry is `failed` with `error` `application-disabled`. So nothing such a request had not committed when the `200` was answered is kept.
+- **No operation of the Application is allowed after that `200`**: an operation its code still calls (from a request in flight, at any moment after) is refused with the reason `application-disabled`, before every other check but `no-request`, nothing is sent to any database, and it has its Operation log entry like every refusal. `application-disabled` joins "Refusal reasons"; its `fix` says that a Platform administrator has disabled the Application and that nothing in the code is wrong. It is the host's, not the Authorization decision's: the `authz` crate is unchanged. The SDK's `Refusal` type has it: `{ readonly reason: "application-disabled" }`.
+- The entry of such a request in "Logs" is made as for any request its code was given: with `status` `503` and what its code printed until it was stopped. It is counted in `usage` (its code was given it).
+- A shipment of the Change history is the platform's own work and goes on ("Shipping"): what was committed before the disable reaches `change_history` as ever.
+
+### What still works on a disabled Application
+
+Disabling stops the Application from serving. It changes nothing else of it, and takes nothing from its Contributors:
+
+- Its own database, its Versions, its two lists, its logs, its Change history and its Operation log entries are kept as they are.
+- **Its Contributors still deploy** (`POST /v1/applications/<name>/versions`, `vibe deploy`), **go back** and change its Contributors and whom it is shared with, as before. A Version sent while it is disabled applies its migrations and becomes the serving Version, and is served once the Application is enabled. Reading it (`GET /v1/applications/<name>`, its Versions, its logs) is as before.
+- Only a Platform administrator enables it. Deploying, going back and sharing do not.
+- The local run (`vibe request`, `vibe dev`) does not ask the installation and is not touched.
+
+### What every surface shows
+
+- **`GET /v1/applications`** (the User's own list): each Application gains `"disabled": <bool>`.
+- **`vibe applications`**: in words, a disabled Application's block says that it is disabled by a Platform administrator. With `--json`, the API's object.
+- **`vibe show`**: in words, when it is disabled, since when and by whom, and that a Platform administrator enables it again. With `--json`, the API's object (with `disabled`).
+- **`vibe deploy`** to a disabled Application: the deploy is made, and its output has `"disabled": { "since", "by" }` (null when it is not disabled) beside `address`, and a warning with reason `application-disabled` whose message says the Version is deployed and will not be served until a Platform administrator enables the Application, and to tell the Builder so. In words, the same; never that the Application is live at its address. Exit code `0`.
+- **`vibe go-back`** on a disabled Application: the same warning and `disabled` member in its output, exit code `0`.
+- **The Dashboard's list** ("The Dashboard: The list"): a disabled Application's element has `data-vm-disabled` (beside `data-vm-serving`, which is unchanged) and no `a[data-vm-open]`; it holds a mark of its own kind whose name, as a screen reader says it, is "Disabled". **One Application's page**: the element has `data-vm-disabled="<since>"`, no `a[data-vm-open]` (the address is still there, as text), and words saying that a Platform administrator disabled it and when. Who disabled it is not on the Dashboard's pages.
+
+### Reading the Operation log
+
+`GET /v1/operation-log`, by a Platform administrator, as "The Operation log" gives it, takes from this ticket on these parameters, each optional and at most once, each percent-decoded (`+` is a plus); they are combined: an entry is answered when it matches every one given.
+
+| Parameter | Matches an entry whose | Taken |
+|---|---|---|
+| `user=<id>` | `user` is exactly this | 1 to 256 bytes, no control characters |
+| `application=<name>` | `application` is exactly this | a name an Application could have; it need not have one now |
+| `resource=<name>` | `resource` is exactly this (so never an entry of an own database, whose `resource` is null) | a name a Resource could have ("Resources and Grants") |
+| `outcome=<outcome>` | `outcome` is this | `allowed`, `refused`, `failed` or `unfinished` |
+| `since=<time>` | `time` is at or after this | RFC 3339 with a date, a time and an offset (`Z` or `±hh:mm`; `+` written `%2B`), up to microseconds |
+| `until=<time>` | `time` is before this | as `since`; when both are given, `since` is before `until` |
+| `before=<id>` | `id` is below this | a positive whole number, written plainly |
+| `limit=<n>` | (how many) | 1 to 1000, written plainly; 100 without it |
+
+```json
+{ "entries": [ <entry>, ... ], "earlier": 17 | null }
+```
+
+- **What an entry holds** is unchanged: as "The Operation log" gives it, with what later sections added (`actor`, `own_database`, `transaction`; the entries of pulls and of `history`): `id`, `time`, `request`, `user`, `application`, `version`, `resource`, `actor`, `own_database`, `operation`, `statement` (without values), `outcome`, `reason`, `error`, `rows`, `duration_ms`, `transaction`. `time` is when the entry was written, as RFC 3339 in UTC with microseconds: given back as `since`, it matches that entry.
+- **Order and paging.** Entries are in the order of `id`. The answer holds the newest `limit` entries that match (with `before`: the newest `limit` of those whose `id` is below it), **oldest first**, as before. `earlier` is the `id` of the first entry answered when a matching entry is older than it, else null (also when no entry is answered). So reading again with `before=<earlier>` until `earlier` is null gives every matching entry once, newest pages first. `limit` alone, with no other parameter, answers exactly what it answered before this ticket, with `earlier` beside it.
+- **An entry answered `unfinished` is completed in place** later (its `outcome`, `rows`, `duration_ms`); reading it again shows it completed. With `outcome=unfinished` it matches only while it runs, or for ever when the program died meanwhile ("The Operation log").
+- **Entries of every Application**, also one deleted, disabled or never served; entries with a null `application` (a pull of a structure) match no `application` filter.
+- **No range is required**, and none is bounded: a reading is bounded by its page and by its time (below). An answer stops before its body would pass 4 MiB (a statement may be long); it then holds fewer than `limit` entries, always at least one when one matches, and `earlier` goes on from there.
+- Malformed, `400` `malformed`, with a message that names the parameter: a value not taken as the table says, an empty value, a parameter given twice, `since` not before `until`. Other parameters are ignored. Any other method: `405`.
+- **A reading takes at most 10 seconds** in the platform database. Past that it is ended and answered `503` `unavailable`, whose message says the reading took too long and to narrow it (with `since` and `until`, or another filter).
+- What `GET /v1/operation-log` never answers is as before: no value of a statement, a parameter or a row; no row of the Change history ("The Change history in the platform database").
+
+### The tool
+
+```
+vibe admin applications [--after <name>] [--limit <n>] [--json]
+vibe admin disable <application> [--json]
+vibe admin enable <application> [--json]
+vibe admin operation-log [--user <id>] [--application <name>] [--resource <name>] [--outcome <outcome>]
+                         [--since <time>] [--until <time>] [--before <id>] [--limit <n>] [--json]
+```
+
+All four need a sign-in (`4`), are made at the installation the tool is signed in to, and keep "The tool: Every command" (exit codes, `--json`, escaping of what the installation answered, a closed standard output). `vibe admin --help` names them beside `connect-oidc`. The API's refusals keep their reasons: `not-an-administrator` and `not-found` end with `3`, `malformed` with `3`, a `5xx` with `1`.
+
+**What the tool checks before it asks** (each is exit code `2`, the usual usage text on standard error, nothing asked): an `<application>`, `--application` or `--after` that no Application could be named; a `--resource` that no Resource could be named; a `--user` that is empty, longer than 256 bytes or has a control character; an `--outcome` other than the four; a `--since` or `--until` that is not RFC 3339 with an offset, or a `--since` not before `--until`; a `--before` that is not a positive whole number; a `--limit` outside 1 to 100 (`applications`) or 1 to 1000 (`operation-log`); an option given twice.
+
+**`vibe admin applications`** prints one page of `GET /v1/admin/applications`, exit code `0`. With `--json`, the API's answer as it is. In words, one block per Application: its name and address; `disabled since <time> by <user id>` when it is; the serving Version, or that none serves; its Declared access, each Resource with its level (and how many more when `declared_more` is not 0), or that it declares none; its Contributors, a person by name and email when known and by id, a Group as a Group; whom it is shared with as the counts say (everyone, or how many Groups and people, or nobody); and `<requests> requests by <users> Users in the last 30 days`. When `next` is not null, a last line says that more Applications follow and gives the whole command with `--after <next>`. With none: `{ "applications": [], "next": null }`, and in words that the installation has no Application yet.
+
+**`vibe admin disable`** prints, exit code `0`:
+
+```json
+{ "application": "incident-board", "address": "incident-board.<domain>",
+  "disabled": { "since": "<RFC 3339>", "by": "<user id>" }, "changed": true }
+```
+
+In words: that the Application is disabled and its address answers every request that it is disabled, including those that were in flight; or, with `changed` false, that it was disabled already, since when and by whom. Both say that `vibe admin enable <application>` serves it again. It asks for no confirmation: disabling destroys nothing and is undone by enabling (ADR 0009: IT stops a problem without waiting for anyone).
+
+**`vibe admin enable`** prints, exit code `0`:
+
+```json
+{ "application": "incident-board", "address": "incident-board.<domain>",
+  "disabled": null, "changed": true, "serving_version": 3 | null }
+```
+
+In words: that the Application serves again at its address as Version n, or that it is enabled and has no Version serving; with `changed` false, that it was not disabled.
+
+**`vibe admin operation-log`** prints one page of `GET /v1/operation-log` with the filters given, exit code `0`. With `--json`, the API's answer as it is: `{ "entries": [ ... ], "earlier": <id> | null }`. In words, one line per entry, oldest first: its `id`, its time (RFC 3339, UTC), the outcome, the User (or `-`), the Application and Version (or `-`), the Resource or `own database`, the operation, then `reason` or `error` when there is one, `rows` and `duration_ms` when there are; the statement on the next line, indented. Everything of an entry is escaped as any text of the installation's is. When `earlier` is not null, a last line says that older entries match and gives the whole command with `--before <earlier>`. With no entry: `no entries match` (and, when filters were given, which).
+
+### Who is refused
+
+Everyone who is not a Platform administrator, signed in however (session, tool credential, stand-in):
+
+| Request | Answer |
+|---|---|
+| `GET /v1/admin/applications` | `403` `not-an-administrator` |
+| `POST /v1/applications/<name>/disable`, `POST /v1/applications/<name>/enable` | `403` `not-an-administrator` |
+| `GET /v1/operation-log` | `403` `not-an-administrator`, as before |
+| `vibe admin applications`, `disable`, `enable`, `operation-log` | exit code `3`, reason `not-an-administrator`, the API's message |
+
+- **Nothing of the contents is in a refusal**, and nothing in it depends on them: the answer is the same, byte for byte, whatever the parameters and the body (well formed or not, a name an Application has, one it has not, one no Application could have), and whatever exists. `not-an-administrator` comes before `not-found`, `method-not-allowed` and `malformed` ("The platform's API": only `too-large` comes before it). The paths `/v1/applications/<name>/disable` and `/enable` are administrators' paths whatever `<name>` is. Nothing is changed by a refused request, and the program's log has no `application-disabled` or `application-enabled` record for it.
+- The tool prints nothing of the installation's but the error (with `--json`, the one `{ "error": ... }` object); without `--json`, nothing on standard output.
+- Someone not signed in: `401`, the same plain body as everywhere ("Responses the program itself gives"); the tool: exit code `4`.
+- A Contributor of the Application is refused as anyone else: `403` `not-an-administrator`.
+- A Platform administrator taken out of the administrators' Group at the identity provider is refused from their session's or credential's next renewal on; one put into it may from then on ("Who is a Platform administrator").
+
+### Bounds and costs
+
+- **Every wait has an end.** Each request here reads or writes the platform database within 10 seconds, else `503` `unavailable` (a disable or an enable answered so may or may not have been made: "A write whose answer is lost", below). Requests in flight are answered within 1 second of a disable's `200`. The tool waits as every command does ("Every command": 5 seconds to connect, 30 for the answer).
+- **Pages.** At most 100 Applications to a page, each with at most 100 Contributors and 200 declared Resources listed; at most 1,000 Operation log entries to a page and never more than 4 MiB.
+- **Readings at once.** At most 2 readings of `GET /v1/admin/applications` and `GET /v1/operation-log` together run at once in the program; a third is answered at once `503` `unavailable`, its message saying that readings for Platform administrators are running and to try again shortly. So these readings never hold more than two of the program's connections to the platform database, and requests to Applications and their operations are served meanwhile.
+- **Indexes.** The Operation log has an index for each filter that can narrow it: by User, by Application and by Resource (each with `id`, so that the newest come first), and by `time`. `outcome` is not indexed (it changes when an entry is completed, and four values do not narrow); a filter of `outcome` alone is bounded by the 10 seconds. What these indexes cost each entry's write is measured once, with and without them, and written down in the ticket; so is the time of a reading by each filter over an Operation log of 1,000,000 entries. These are not tests of the gate.
+- **Usage**: at most 10,000 pairs waiting, one write every 10 seconds, rows for 30 days (above).
+- **Disabled state** is a field the program already holds per Application in memory: checking it costs a request no round trip.
+
+### A write whose answer is lost
+
+"A write whose answer is lost: The rule" gains one row: **whether an Application is disabled** (a disable or an enable answered `503` `unavailable`). Meanwhile every request to that Application's address is `503` with `retry-after`, as for lists not known, and none of its code runs; once it is settled, requests are answered as the database says (disabled, or served). Nobody is served, and nobody is told the Application is disabled, on a guess.
+
+### The instruction file
+
+From this ticket on the template's `AGENTS.md` names `application-disabled` beside the other reasons, and says: when a deploy, a go-back or a request answers that the Application is disabled, a Platform administrator has stopped it; nothing in the project is wrong because of that, there is nothing to fix in the code and nothing to code around; tell the Builder, who asks their IT. It names no `vibe admin` command: those are for Platform administrators.
+
+### What this does not close
+
+- A record of every disable and enable beyond the program's log: the Application holds only the disable in force (`since`, `by`); who enabled it and earlier disables are in the program's log alone.
+- A reason or a message the Platform administrator writes when disabling, shown to Users or Contributors.
+- Disabling or enabling, the list of every Application and the Operation log in the browser: the ticket "The Dashboard for Platform administrators".
+- Filtering the list of Applications (by a Resource they declare, by being disabled, by usage): the list is read whole, a page at a time, and `declared_access` is in it, so "which Applications declare the HR database" is answered from it.
+- Following the Operation log as it is written (as `vibe logs --follow` follows logs): an entry's `id` is taken when it is written, and entries are written by many operations at once, so one with a lower `id` can become readable after one with a higher; paging by `before` does not miss such an entry once it is written, following by `after` would. A reading of the newest page may lack an entry being written at that moment; the next reading has it.
+- Filtering the local Operation log (`vibe local operation-log`): unchanged.
+- Usage by the minute or the hour, over another period than 30 days, or kept longer; an installation cannot set the period.
+- A retention period of the Operation log: kept until one is set, as the spec says.
+- A Platform administrator taking over an Application whose Contributors have all left ("Contributors and sharing: What this does not close").
+- Deleting an Application, and what its Operation log entries and usage become then: the ticket "Delete an Application, and restore it within the retention period".
