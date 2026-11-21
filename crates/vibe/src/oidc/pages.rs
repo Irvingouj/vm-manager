@@ -178,7 +178,7 @@ pub fn not_shared(
             escape(name),
             escape(id)
         ),
-        None => format!("<code class=\"id\">{}</code>", escape(id)),
+        None => format!("<code class=\"id as-name\">{}</code>", escape(id)),
     };
     page(
         Some(at),
@@ -344,18 +344,26 @@ pub fn tool_ask(
     sign_in: &str,
     wrong_code: bool,
 ) -> Response<Full<Bytes>> {
-    let mut more = Vec::new();
-    if let Some(email) = person.email {
-        more.push(escape(email));
-    }
-    more.push(format!("<code class=\"id\">{}</code>", escape(person.id)));
-    let who = match person.name {
-        Some(name) => format!(
-            "<span class=\"name\">{}</span><span class=\"more\">{}</span>",
+    let id = escape(person.id);
+    // The first thing known of the person is their name on the page; the
+    // id is small and soft only where something stands before it.
+    let who = match (person.name, person.email) {
+        (Some(name), Some(email)) => format!(
+            "<span class=\"name\">{}</span><span class=\"more\">{} <code class=\"id\">{id}</code></span>",
             escape(name),
-            more.join(" ")
+            escape(email)
         ),
-        None => format!("<span class=\"name\">{}</span>", more.join(" ")),
+        (Some(name), None) => format!(
+            "<span class=\"name\">{}</span><span class=\"more\"><code class=\"id\">{id}</code></span>",
+            escape(name)
+        ),
+        (None, Some(email)) => format!(
+            "<span class=\"name\">{}</span><span class=\"more\"><code class=\"id\">{id}</code></span>",
+            escape(email)
+        ),
+        (None, None) => {
+            format!("<span class=\"name\"><code class=\"id as-name\">{id}</code></span>")
+        }
     };
     let machine = if machine.is_empty() {
         "a machine that gave no name".to_owned()

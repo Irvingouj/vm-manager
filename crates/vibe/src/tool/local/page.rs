@@ -362,11 +362,7 @@ pub(super) fn chooser(
         let id = escape(&user.id);
         // The form holds the whole card, its hidden `user` first: one
         // button for each User, and everything said of them inside it.
-        body.push_str(if is_chosen {
-            "<li class=\"card chosen\">"
-        } else {
-            "<li class=\"card\">"
-        });
+        body.push_str("<li class=\"card\">");
         body.push_str(&format!(
             "<form method=\"post\" action=\"/_vm/test-user\"><input type=\"hidden\" name=\"user\" value=\"{id}\"><input type=\"hidden\" name=\"next\" value=\"{}\"><div class=\"text\">",
             escape(next)
@@ -412,8 +408,14 @@ pub(super) fn chooser(
             ));
         }
         body.push_str(&format!(
-            "</ul></div><button type=\"submit\"{}>Be this User<span class=\"vh\"> {}</span></button></form></li>\n",
-            if is_chosen { " class=\"quiet\"" } else { "" },
+            "</ul></div><button type=\"submit\">{}<span class=\"vh\"> {}</span></button></form></li>\n",
+            // The contract promises one button for each User, the chosen
+            // one included: there it goes on as them, it does not choose.
+            if is_chosen {
+                "Go on as this User"
+            } else {
+                "Be this User"
+            },
             name.as_deref().unwrap_or(&id)
         ));
     }

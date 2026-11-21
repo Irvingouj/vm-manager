@@ -131,7 +131,7 @@ impl<'a> Person<'a> {
                     }
                     (None, None) => {
                         lines.push_str(&format!(
-                            "<span class=\"name\"><code class=\"id\">{id}</code></span>"
+                            "<span class=\"name\"><code class=\"id as-name\">{id}</code></span>"
                         ));
                     }
                 }
@@ -224,7 +224,7 @@ fn page(
             "<span class=\"name\">{}</span> <code class=\"id\">{id}</code>",
             escape(name)
         ),
-        None => format!("<code class=\"id\">{id}</code>"),
+        None => format!("<code class=\"id as-name\">{id}</code>"),
     };
     let sign_out = viewer.sign_out.as_deref().map_or_else(String::new, |at| {
         format!(

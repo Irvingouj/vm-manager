@@ -61,10 +61,13 @@ a.brand:hover{color:var(--ink)}
 .place{font:600 .75rem/1rem var(--sans);letter-spacing:.06em;text-transform:uppercase;color:var(--ink-3);padding-left:.5rem;border-left:1px solid var(--line)}
 .place.host{font:400 .875rem/1.25rem var(--mono);letter-spacing:0;text-transform:none;white-space:normal;overflow-wrap:anywhere}
 .who{display:flex;align-items:center;gap:.5rem 1rem;margin-left:auto;min-width:0}
+.who>.btn{flex:none;white-space:nowrap}
 .person{display:flex;flex-direction:column;align-items:flex-end;text-align:right;min-width:0;line-height:1.25rem}
 .person .name{font-weight:600;font-size:.875rem}
 code.id{background:none;padding:0;border-radius:0;font-size:.875rem;line-height:1.25rem;color:var(--ink-3)}
 .person code.id{font-size:.75rem;line-height:1rem}
+code.id.as-name{font-size:1em;line-height:inherit;font-weight:600;color:var(--ink);overflow-wrap:anywhere}
+.person code.id.as-name{font-size:.875rem;line-height:1.25rem;word-break:break-all}
 .column{max-width:56rem;margin:0 auto;padding:2rem 1rem 4rem}
 .lone{max-width:32rem;margin:0 auto;padding:clamp(1.5rem,10vh,6rem) 1rem 4rem}
 .card{background:var(--surface);border:1px solid var(--card-edge);border-radius:.625rem;box-shadow:var(--shadow-1);padding:1rem}
@@ -141,13 +144,14 @@ h2+.sub{margin-top:1rem}
 .sub+.rows{margin-top:.5rem}
 .rows{list-style:none;padding:0;border-top:1px solid var(--line)}
 .rows>li{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:.5rem 1rem;padding:.75rem 0;border-bottom:1px solid var(--line)}
-.rows .who-is{display:flex;align-items:flex-start;gap:.75rem;min-width:0;flex:1 1 9rem;overflow-wrap:break-word}
+.rows .who-is{display:flex;align-items:flex-start;gap:.75rem;min-width:0;flex:1 1 16rem}
+.rows .who-is .lines{min-width:0;overflow-wrap:anywhere}
 .rows .who-is>.i{margin-top:.125rem;color:var(--ink-3)}
 .rows .who-is .lines>*{display:block}
 .rows .who-is .name{font-weight:600}
 .rows .who-is .more{font-size:.875rem;line-height:1.25rem;color:var(--ink-2)}
 .rows .who-is .more code.id{margin-left:.5rem}
-.rows .unseen{display:flex;align-items:center;gap:.25rem;color:var(--warn-soft-ink);font-size:.875rem;line-height:1.25rem}
+.rows .who-is .lines>.unseen{display:flex;align-items:flex-start;gap:.25rem;color:var(--warn-soft-ink);font-size:.875rem;line-height:1.25rem}
 .rows form{flex:none;margin-left:auto}
 .after{margin-top:.75rem}
 .share{margin-top:1.5rem}
@@ -183,7 +187,6 @@ table.res{width:100%;border-collapse:collapse;font-size:.875rem;line-height:1.25
 .users .name{font-weight:600;font-size:1.125rem;line-height:1.75rem}
 .users .ident{font-size:.875rem;line-height:1.25rem;color:var(--ink-2)}
 .users .ident code.id{margin-left:.5rem}
-.users .chosen{border-color:var(--accent)}
 .tags{list-style:none;padding:0;display:flex;flex-wrap:wrap;align-items:center;gap:.375rem .5rem;font-size:.875rem;line-height:1.25rem;color:var(--ink-2)}
 .tags>li{display:inline-flex;align-items:center;gap:.25rem}
 .tags .i{width:1rem;height:1rem;color:var(--ink-3)}
@@ -199,6 +202,7 @@ table.res{width:100%;border-collapse:collapse;font-size:.875rem;line-height:1.25
 .signed{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:.5rem 1rem}
 .signed p{display:flex;flex-wrap:wrap;align-items:center;gap:.25rem .5rem;min-width:0}
 .signed .i{width:1rem;height:1rem;color:var(--ink-3)}
+.signed p>code.as-name{flex:1 1 0;min-width:0}
 .signed .btn{margin-right:-.625rem}
 pre.message{white-space:pre-wrap;padding:.75rem 1rem;border-radius:.375rem;background:var(--surface-2);color:var(--ink);font-size:.875rem;line-height:1.25rem}
 details>summary{cursor:pointer;color:var(--accent);min-height:1.5rem}
@@ -210,6 +214,7 @@ details[open]>summary{margin-bottom:.5rem}
 .res td:first-child{flex:1 0 100%;margin-left:-1.75rem}
 .res td.lv{color:var(--ink)}
 .res td.lv::before{content:attr(data-label) " ";color:var(--ink-2)}
+.rows .who-is{flex-basis:auto}
 }
 @media (min-width:40rem){
 h1{font-size:1.875rem;line-height:2.25rem}
