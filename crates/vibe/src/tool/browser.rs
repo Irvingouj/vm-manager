@@ -22,8 +22,10 @@
 //!   port does not sign this tool in.
 //! - The listener takes one connection at a time, reads its head (at most
 //!   [`MAX_REQUEST_BYTES`]) within [`REQUEST_WAIT`], looks only at the first
-//!   line, takes only `GET /?grant=<...>`, answers one small page and
-//!   closes. It ends with the command.
+//!   line, takes only `GET /?grant=<...>`, answers one small page (the one
+//!   theme of the platform's pages, crate::theme, with the policy
+//!   `default-src 'none'; style-src 'unsafe-inline'`) and closes. It ends
+//!   with the command.
 //! - The verifier and the grant are [`Secret`]s, which do not print; each
 //!   body that carries them is bytes sent once.
 
@@ -45,6 +47,7 @@ use super::client::{self, Installation, Reply, Sign};
 use super::{Ending, failed, not_success, unexpected};
 use crate::oidc::secret::Secret;
 use crate::oidc::tool::{check_code, shown_code};
+use crate::theme::{self, Layout, Mark, Place};
 
 /// How often the installation is asked whether the sign-in was confirmed.
 pub const POLL_EVERY: Duration = Duration::from_secs(2);
@@ -161,7 +164,7 @@ pub async fn sign_in(
             }
             Reached::Browser(mut stream) => {
                 let Some(given) = read_grant(&mut stream).await else {
-                    answer(&mut stream, "404 Not Found", NOT_HERE).await;
+                    answer(&mut stream, "404 Not Found", Said::NotHere).await;
                     continue;
                 };
                 grant = Some(given);
@@ -170,15 +173,15 @@ pub async fn sign_in(
                 let made = poll(at, &verifier, grant.as_ref(), deadline).await;
                 match made {
                     Ok(Some(made)) => {
-                        answer(&mut stream, "200 OK", SIGNED_IN).await;
+                        answer(&mut stream, "200 OK", Said::SignedIn).await;
                         return Ok(made);
                     }
                     Ok(None) => {
-                        answer(&mut stream, "200 OK", NOT_YET).await;
+                        answer(&mut stream, "200 OK", Said::NotYet).await;
                         next_poll = Instant::now() + POLL_EVERY;
                     }
                     Err(ending) => {
-                        answer(&mut stream, "200 OK", FAILED).await;
+                        answer(&mut stream, "200 OK", Said::Failed).await;
                         return Err(ending);
                     }
                 }
@@ -366,19 +369,56 @@ async fn read_grant(stream: &mut TcpStream) -> Option<Secret> {
     })
 }
 
-const SIGNED_IN: &str = "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>Signed in</title></head><body><h1>The tool is signed in</h1><p>You can close this page and go back to the tool.</p></body></html>";
+/// What a page the tool serves on the loopback address says.
+#[derive(Clone, Copy)]
+enum Said {
+    /// The sign-in is the tool's.
+    SignedIn,
+    /// An answer that is not for the sign-in the tool waits for.
+    NotYet,
+    /// The tool could not finish.
+    Failed,
+    /// Anything but `GET /?grant=<...>`.
+    NotHere,
+}
 
-const NOT_YET: &str = "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>Not signed in</title></head><body><h1>The tool is not signed in</h1><p>This answer is not for the sign-in the tool is waiting for. Run vibe sign-in again if it has ended.</p></body></html>";
-
-const FAILED: &str = "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>Not signed in</title></head><body><h1>The tool could not finish signing in</h1><p>See what the tool says, then run vibe sign-in again.</p></body></html>";
-
-const NOT_HERE: &str = "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>Not here</title></head><body><p>Nothing is here.</p></body></html>";
+/// The page of `said`, dressed by the one theme (crate::theme): no form,
+/// no link, nothing loaded.
+fn page(said: Said) -> String {
+    let (title, main) = match said {
+        Said::SignedIn => (
+            "Signed in",
+            format!(
+                "<h1>The tool is signed in</h1>{}",
+                theme::notice(
+                    Mark::Ok,
+                    "role=\"status\"",
+                    "You can close this page and go back to the tool."
+                )
+            ),
+        ),
+        Said::NotYet => (
+            "Not signed in",
+            "<h1>The tool is not signed in</h1><p>This answer is not for the sign-in the tool is waiting for. Run <code>vibe sign-in</code> again if it has ended.</p>".to_owned(),
+        ),
+        Said::Failed => (
+            "Not signed in",
+            "<h1>The tool could not finish signing in</h1><p>See what the tool says, then run <code>vibe sign-in</code> again.</p>".to_owned(),
+        ),
+        Said::NotHere => (
+            "Not here",
+            "<h1>Nothing is here</h1><p class=\"soft\">This address is the tool's own, for the sign-in it is waiting for.</p>".to_owned(),
+        ),
+    };
+    theme::page(title, Place::Tool, Layout::Card, &main)
+}
 
 /// Writes one small page and closes, within [`REQUEST_WAIT`]; a browser
 /// that does not take it is not waited for.
-async fn answer(stream: &mut TcpStream, status: &str, page: &str) {
+async fn answer(stream: &mut TcpStream, status: &str, said: Said) {
+    let page = page(said);
     let text = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store\r\nContent-Security-Policy: default-src 'none'\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\nConnection: close\r\n\r\n{page}",
+        "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store\r\nContent-Security-Policy: default-src 'none'; style-src 'unsafe-inline'\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\nConnection: close\r\n\r\n{page}",
         page.len()
     );
     let written = tokio::time::timeout(REQUEST_WAIT, async {

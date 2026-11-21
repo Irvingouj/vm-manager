@@ -2,7 +2,8 @@
 //! every page of the platform's own carries (crate::oidc::pages's
 //! `own_headers`: `no-store`, `nosniff`, `same-origin`, and a policy with
 //! `default-src 'none'`, `frame-ancestors 'none'` and `form-action
-//! 'self'`), one small inline stylesheet, no script, no outside resource.
+//! 'self'`), the one theme of the platform's pages (crate::theme), no
+//! script, no outside resource.
 //! Everything that is not the platform's own text is escaped as HTML
 //! (crate::oidc::pages's `escape`), in text and in attributes alike.
 //!
@@ -33,38 +34,10 @@ use super::Seen;
 use crate::oidc::pages::{RETRY_AFTER_SECONDS, escape, own_headers};
 use crate::registry::{Declared, MAX_SHARED_WITH, Named};
 use crate::resources::level_name;
+use crate::theme::{self, CHEVRON, Layout, Mark, Place};
 use crate::user::User;
 
 type Answer = Response<Full<Bytes>>;
-
-/// One small stylesheet: the system's fonts, a width that reads on a
-/// laptop and a phone, a dark scheme, a visible focus. Any text breaks
-/// anywhere it must and no control is wider than its box, so a page holds
-/// to its window whatever names, addresses or ids it is given.
-const STYLE: &str = "\
-:root{color-scheme:light dark;--fg:#1c1c21;--bg:#fff;--muted:#5d5d68;--line:#d9d9e0;--card:#f6f6f9;--accent:#0b57d0;--on-accent:#fff;--warn:#a1340f}\
-@media (prefers-color-scheme:dark){:root{--fg:#e9e9ee;--bg:#141417;--muted:#a6a6b1;--line:#35353d;--card:#1d1d22;--accent:#8ab4f8;--on-accent:#0b1b33;--warn:#ffb595}}\
-*{box-sizing:border-box}\
-body{margin:0;font:1rem/1.5 system-ui,-apple-system,\"Segoe UI\",Roboto,sans-serif;color:var(--fg);background:var(--bg);overflow-wrap:anywhere}\
-header,main{max-width:46rem;margin:0 auto;padding:1rem}\
-header{display:flex;flex-wrap:wrap;gap:.25rem 1rem;align-items:baseline;border-bottom:1px solid var(--line)}\
-header p{margin:0;flex:1;color:var(--muted)}\
-a{color:var(--accent)}\
-:focus-visible{outline:3px solid var(--accent);outline-offset:2px}\
-h1{font-size:1.6rem;margin:.5rem 0 1rem}h2{font-size:1.2rem;margin:1.5rem 0 .5rem}\
-h3,h4{margin:1rem 0 .25rem}h4{font-size:.95rem;color:var(--muted)}\
-ul{padding-left:1.25rem}ul.apps{list-style:none;padding:0}\
-.app{background:var(--card);border:1px solid var(--line);border-radius:.5rem;padding:1rem;margin:0 0 1rem}\
-.app>h1,.app>h3{margin-top:0}\
-.open{display:inline-block;margin:.25rem 0;padding:.45rem 1.1rem;border-radius:.4rem;background:var(--accent);color:var(--on-accent);font-weight:600;text-decoration:none}\
-.muted{color:var(--muted)}\
-.mark{font-weight:600}.lower .mark,.none .mark,.error{color:var(--warn)}\
-.notice,.error{padding:.5rem .75rem;border-left:4px solid currentColor;background:var(--card)}\
-li form{display:inline;margin-left:.5rem}\
-button,input,select{font:inherit;max-width:100%}\
-form.share label{display:block;font-weight:600}\
-form.share input,form.share select{width:100%;max-width:24rem;margin-bottom:.5rem}\
-nav{display:flex;gap:1rem}";
 
 /// Whom a page is for: the User, their name when the platform knows it,
 /// and the sign-in address's sign-out with OIDC.
@@ -131,28 +104,50 @@ impl<'a> Person<'a> {
     /// seen signing in here yet, as the tool says it
     /// (crate::tool::sharing's `entry_words`); a Group as a Group,
     /// everyone as everyone.
+    /// The name, louder than the identifier after it: the name (600), the
+    /// email, then the id small and soft.
     fn words(&self, with_email: bool) -> String {
         match self.named {
             Named::User(id) => {
                 let mut text = String::new();
                 if let Some(name) = self.name {
-                    text.push_str(&format!("{} ", escape(name)));
+                    text.push_str(&format!("<span class=\"name\">{}</span> ", escape(name)));
                 }
                 if (with_email || self.name.is_none())
                     && let Some(email) = self.email
                 {
-                    text.push_str(&format!("&lt;{}&gt; ", escape(email)));
+                    let class = if self.name.is_none() { "name" } else { "soft" };
+                    text.push_str(&format!(
+                        "<span class=\"{class}\">&lt;{}&gt;</span> ",
+                        escape(email)
+                    ));
                 }
-                text.push_str(&format!("<code>{}</code>", escape(id)));
+                text.push_str(&format!("<code class=\"id\">{}</code>", escape(id)));
                 if self.unseen {
                     text.push_str(
-                        " <span class=\"muted\">(not seen signing in here yet: check the id)</span>",
+                        " <span class=\"soft small\">(not seen signing in here yet: check the id)</span>",
                     );
                 }
                 text
             }
-            Named::Group(group) => format!("the Group <code>{}</code>", escape(group)),
-            Named::Everyone => "everyone who can sign in to this installation".to_owned(),
+            Named::Group(group) => format!(
+                "<span class=\"name\">the Group <code>{}</code></span>",
+                escape(group)
+            ),
+            Named::Everyone => {
+                "<span class=\"name\">everyone who can sign in to this installation</span>"
+                    .to_owned()
+            }
+        }
+    }
+
+    /// Whom an unshare button names, for a reader who hears it: the name,
+    /// else the email, else the id; the Group; everyone.
+    fn object(&self) -> String {
+        match self.named {
+            Named::User(id) => escape(self.name.or(self.email).unwrap_or(id)),
+            Named::Group(group) => format!("the Group {}", escape(group)),
+            Named::Everyone => "everyone".to_owned(),
         }
     }
 }
@@ -202,25 +197,35 @@ pub(crate) enum Refusal {
 
 /// A page: `title` (escaped already) and `main`, the platform's own HTML
 /// with anything else in it escaped already.
-fn page(status: StatusCode, viewer: &Viewer<'_>, title: &str, main: &str) -> Answer {
-    let who = match &viewer.name {
+fn page(
+    status: StatusCode,
+    viewer: &Viewer<'_>,
+    title: &str,
+    layout: Layout,
+    main: &str,
+) -> Answer {
+    let id = escape(&viewer.user.id);
+    let person = match &viewer.name {
         Some(name) => format!(
-            "<strong>{}</strong> (<code>{}</code>)",
-            escape(name),
-            escape(&viewer.user.id)
+            "<span class=\"name\">{}</span> <code class=\"id\">{id}</code>",
+            escape(name)
         ),
-        None => format!("<code>{}</code>", escape(&viewer.user.id)),
+        None => format!("<code class=\"id\">{id}</code>"),
     };
     let sign_out = viewer.sign_out.as_deref().map_or_else(String::new, |at| {
-        format!("<a href=\"{}\">Sign out</a>", escape(at))
+        format!(
+            "<a class=\"btn quiet compact\" href=\"{}\">Sign out</a>",
+            escape(at)
+        )
     });
-    let html = format!(
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
-         <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
-         <title>{title} \u{2014} Dashboard</title><style>{STYLE}</style></head><body>\
-         <header><a href=\"/\">Dashboard</a><p data-vm-user=\"{}\">Signed in as {who}</p>{sign_out}</header>\
-         <main>{main}</main></body></html>\n",
-        escape(&viewer.user.id)
+    let who = format!(
+        "<div class=\"who\"><p class=\"person\" data-vm-user=\"{id}\"><span class=\"vh\">Signed in as </span>{person}</p>{sign_out}</div>"
+    );
+    let html = theme::page(
+        &format!("{title} \u{2014} Dashboard"),
+        Place::Dashboard { who: &who },
+        layout,
+        main,
     );
     let mut response = Response::new(Full::new(Bytes::from(html)));
     *response.status_mut() = status;
@@ -243,14 +248,16 @@ pub(crate) fn list(
     page_number: i64,
     more: bool,
 ) -> Answer {
-    let mut main = String::from("<h1>Your Applications</h1>");
+    let mut main = String::from("<h1 class=\"page-title\">Your Applications</h1>");
     let (mine, shared): (Vec<&Block<'_>>, Vec<&Block<'_>>) =
         blocks.iter().partition(|b| b.relation == "contributor");
     for (heading, group) in [("You contribute to", mine), ("Shared with you", shared)] {
         if group.is_empty() {
             continue;
         }
-        main.push_str(&format!("<section><h2>{heading}</h2><ul class=\"apps\">"));
+        main.push_str(&format!(
+            "<section class=\"group\"><h2 class=\"over\">{heading}</h2><ul class=\"apps\">"
+        ));
         for block in group {
             main.push_str("<li>");
             application_block(&mut main, block, 3);
@@ -261,38 +268,50 @@ pub(crate) fn list(
     if blocks.is_empty() {
         if page_number == 1 {
             main.push_str(
-                "<p>Nothing is shared with you yet, and you contribute to no Application.</p>\
-                 <p>When someone shares an Application with you, it shows here. An Application is made with the command-line tool <code>vibe</code>: a Coding agent runs it for you.</p>",
+                "<div class=\"empty\"><p class=\"first\">Nothing is shared with you yet, and you contribute to no Application.</p>\
+                 <p>When someone shares an Application with you, it shows here. An Application is made with the command-line tool <code>vibe</code>: a Coding agent runs it for you.</p></div>",
             );
         } else {
-            main.push_str("<p>There is no Application on this page.</p>");
+            main.push_str(
+                "<div class=\"empty\"><p class=\"first\">There is no Application on this page.</p></div>",
+            );
         }
     }
     if page_number > 1 || more {
-        main.push_str("<nav aria-label=\"Pages\">");
+        main.push_str("<nav class=\"pages\" aria-label=\"Pages\">");
         if page_number > 1 {
             main.push_str(&format!(
-                "<a data-vm-previous href=\"/?page={}\">\u{2190} Previous page</a>",
+                "<a class=\"btn\" data-vm-previous href=\"/?page={}\">\u{2190} Previous page</a>",
                 page_number - 1
             ));
         }
         if more {
             main.push_str(&format!(
-                "<a data-vm-next href=\"/?page={}\">Next page \u{2192}</a>",
+                "<a class=\"btn next\" data-vm-next href=\"/?page={}\">Next page \u{2192}</a>",
                 page_number + 1
             ));
         }
         main.push_str("</nav>");
     }
-    page(StatusCode::OK, viewer, "Your Applications", &main)
+    page(
+        StatusCode::OK,
+        viewer,
+        "Your Applications",
+        Layout::Column,
+        &main,
+    )
 }
 
 /// One Application's block: `level` is its heading's.
+/// In the list (`level` 3) it is a card; on its own page (`level` 1) it is
+/// the page's head and sections.
 fn application_block(out: &mut String, block: &Block<'_>, level: u8) {
     let sub = level + 1;
+    let whole = level == 1;
     let name = escape(block.name);
+    let class = if whole { "app whole" } else { "app card" };
     out.push_str(&format!(
-        "<article class=\"app\" data-vm-application=\"{name}\""
+        "<article class=\"{class}\" data-vm-application=\"{name}\""
     ));
     out.push_str(&format!(" data-vm-relation=\"{}\"", block.relation));
     match block.serving {
@@ -301,42 +320,66 @@ fn application_block(out: &mut String, block: &Block<'_>, level: u8) {
         }
         None => out.push_str(" data-vm-serving=\"none\">"),
     }
-    out.push_str(&format!("<h{level}>{name}</h{level}>"));
+    out.push_str(&format!(
+        "<div class=\"app-head\"><h{level}>{name}</h{level}>"
+    ));
+    if let (Some(_), Some(number)) = (&block.open, block.serving) {
+        out.push_str(&format!("<span class=\"pill\">Version {number}</span>"));
+    }
+    out.push_str("</div>");
     if let Some(description) = block.description {
         out.push_str(&format!(
-            "<p data-vm-description>{}</p>",
+            "<p class=\"desc\" data-vm-description>{}</p>",
             escape(description)
         ));
     }
+    if let Some(address) = &block.address {
+        out.push_str(&format!(
+            "<p class=\"small soft\">Address: <code class=\"id\">{}</code></p>",
+            escape(address)
+        ));
+    }
     match (&block.open, block.serving) {
-        (Some(open), Some(number)) => {
-            out.push_str(&format!("<p><a class=\"open\" data-vm-open href=\"{}\">Open {name}</a> <span class=\"muted\">Version {number}</span></p>",
-                escape(open)
-            ));
-        }
+        (Some(_), Some(_)) => {}
         (None, Some(number)) => {
             out.push_str(&format!(
-                "<p class=\"muted\">Version {number} serves it.</p>"
+                "<p class=\"soft\">Version {number} serves it.</p>"
             ));
         }
         (_, None) => {
-            out.push_str("<p class=\"muted\">Nothing is deployed yet: no Version serves it.</p>")
+            out.push_str("<p class=\"soft\">Nothing is deployed yet: no Version serves it.</p>")
         }
     }
     if block.relation == "none" {
-        out.push_str(
-            "<p>You read this page as a Platform administrator. It is not shared with you, so you cannot open it: ask one of its Contributors to share it with you if you need to.</p>",
-        );
-    }
-    if let Some(address) = &block.address {
-        out.push_str(&format!("<p>Address: <code>{}</code></p>", escape(address)));
-    }
-    if block.details {
-        out.push_str(&format!(
-            "<p><a data-vm-details href=\"/applications/{name}\">Details and sharing</a></p>"
+        out.push_str(&theme::notice(
+            Mark::Info,
+            "",
+            "You read this page as a Platform administrator. It is not shared with you, so you cannot open it: ask one of its Contributors to share it with you if you need to.",
         ));
     }
-    out.push_str(&format!("<h{sub}>Contributors</h{sub}><ul>"));
+    let open = match (&block.open, block.serving) {
+        (Some(open), Some(_)) => Some(format!(
+            "<a class=\"btn\" data-vm-open href=\"{}\">Open {name}</a>",
+            escape(open)
+        )),
+        _ => None,
+    };
+    if open.is_some() || block.details {
+        out.push_str("<div class=\"actions\">");
+        if let Some(open) = &open {
+            out.push_str(open);
+        }
+        if block.details {
+            out.push_str(&format!(
+                "<a class=\"btn quiet\" data-vm-details href=\"/applications/{name}\">Details and sharing</a>"
+            ));
+        }
+        out.push_str("</div>");
+    }
+    let heading = if whole { "" } else { " class=\"over\"" };
+    out.push_str(&format!(
+        "<div class=\"meta\"><h{sub}{heading}>Contributors</h{sub}><ul class=\"inline-people\">"
+    ));
     for person in &block.contributors {
         let (kind, id) = person.kind();
         out.push_str(&format!(
@@ -348,24 +391,24 @@ fn application_block(out: &mut String, block: &Block<'_>, level: u8) {
     }
     if block.more_contributors > 0 {
         out.push_str(&format!(
-            "<li data-vm-more-contributors=\"{0}\">and {0} more</li>",
+            "<li class=\"soft\" data-vm-more-contributors=\"{0}\">and {0} more</li>",
             block.more_contributors
         ));
     }
-    out.push_str("</ul>");
+    out.push_str("</ul></div>");
     if block.serving.is_some()
         && let Some(declared) = block.declared
         && !declared.is_empty()
     {
         out.push_str(&format!(
-            "<h{sub}>Resources it uses</h{sub}><ul class=\"resources\">"
+            "<div class=\"meta\"><h{sub}{heading}>Resources it uses</h{sub}><ul class=\"resources\">"
         ));
         for (resource, level) in declared {
             if let Some(seen) = block.seen.get(resource.as_str()) {
                 resource_item(out, resource, *level, seen);
             }
         }
-        out.push_str("</ul>");
+        out.push_str("</ul></div>");
     }
     out.push_str("</article>");
 }
@@ -392,31 +435,37 @@ fn resource_item(out: &mut String, name: &str, declared: AccessLevel, seen: &See
         out.push_str(&format!(" data-vm-ask=\"{}\"", escape(ask)));
     }
     out.push_str(&format!(
-        "><code>{}</code> (needs <b>{declared_name}</b>): ",
+        "><code>{}</code> <span class=\"soft\">(needs <b>{declared_name}</b>)</span> ",
         escape(name)
     ));
     let ask_words = ask.map_or_else(String::new, |a| format!(" Ask {}.", escape(a)));
-    match standing {
-        "enough" => {
-            out.push_str(&format!("<span class=\"mark\">\u{2713} Enough</span>: you hold <b>{yours}</b>."
-            ));
-        }
-        "lower" => {
-            out.push_str(&format!("<span class=\"mark\">! Too low</span>: you hold <b>{yours}</b>, so what needs more will be refused for you.{ask_words}"
-            ));
-        }
-        "none" => {
-            out.push_str(&format!("<span class=\"mark\">\u{2717} No access</span>: you hold no Grant on it, so this part of the Application will be refused for you.{ask_words}"
-            ));
-        }
-        "not-registered" => out.push_str(
-            "<span class=\"mark\">? Not registered</span>: no Resource of this name is registered, so this part works for nobody yet.",
+    let (mark, words) = match standing {
+        "enough" => ("\u{2713} Enough", format!("You hold <b>{yours}</b>.")),
+        "lower" => (
+            "! Too low",
+            format!(
+                "You hold <b>{yours}</b>, so what needs more will be refused for you.{ask_words}"
+            ),
         ),
-        _ => out.push_str(
-            "<span class=\"mark\">\u{2026} Cannot tell</span>: whether you hold a Grant on it cannot be told just now. Look again shortly.",
+        "none" => (
+            "\u{2717} No access",
+            format!(
+                "You hold no Grant on it, so this part of the Application will be refused for you.{ask_words}"
+            ),
         ),
-    }
-    out.push_str("</li>");
+        "not-registered" => (
+            "? Not registered",
+            "No Resource of this name is registered, so this part works for nobody yet.".to_owned(),
+        ),
+        _ => (
+            "\u{2026} Cannot tell",
+            "Whether you hold a Grant on it cannot be told just now. Look again shortly."
+                .to_owned(),
+        ),
+    };
+    out.push_str(&format!(
+        "<span class=\"st\">{mark}</span><span class=\"words\">{words}</span></li>"
+    ));
 }
 
 /// `GET /applications/<name>`: the Application; whom it is shared with
@@ -431,49 +480,60 @@ pub(crate) fn application(
 ) -> Answer {
     let name = escape(block.name);
     let action = format!("/applications/{name}/sharing");
-    let mut main = String::new();
+    let mut main = String::from(
+        "<nav class=\"crumbs\" aria-label=\"Back\"><a class=\"btn quiet compact back\" href=\"/\">\u{2190} All your Applications</a></nav>",
+    );
     if let Some(notice) = notice {
-        let (value, words) = match notice {
+        let (value, mark, words) = match notice {
             Notice::Shared => (
                 "shared",
+                Mark::Ok,
                 "Shared. The people it is shared with find it on their Dashboard and can open it now.",
             ),
             Notice::Unshared => (
                 "unshared",
+                Mark::Ok,
                 "Unshared. Whoever it was shared with that way no longer finds it or opens it.",
             ),
-            Notice::Nothing => ("nothing", "Nothing changed: it was so already."),
+            Notice::Nothing => ("nothing", Mark::Info, "Nothing changed: it was so already."),
         };
-        main.push_str(&format!(
-            "<p class=\"notice\" role=\"status\" data-vm-notice=\"{value}\">{words}</p>"
+        main.push_str(&theme::notice(
+            mark,
+            &format!("role=\"status\" data-vm-notice=\"{value}\""),
+            words,
         ));
     }
     application_block(&mut main, block, 1);
-    main.push_str("<section><h2>Who can open it</h2>");
+    main.push_str("<section class=\"section\"><h2>Who can open it</h2>");
     match shared {
         None => main.push_str(
-            "<p>Its Contributors can. Only its Contributors see whom else it is shared with.</p>",
+            "<p class=\"soft\">Its Contributors can. Only its Contributors see whom else it is shared with.</p>",
         ),
-        Some([]) => {
-            main.push_str("<p>It is shared with nobody: only its Contributors can open it.</p>")
-        }
+        Some([]) => main.push_str(
+            "<p class=\"soft\">It is shared with nobody: only its Contributors can open it.</p>",
+        ),
         Some(entries) => {
-            main.push_str("<p>Its Contributors, and:</p><ul>");
+            main.push_str("<p class=\"soft\">Its Contributors, and:</p><ul class=\"rows\">");
             for person in entries {
                 let (kind, id) = person.kind();
                 main.push_str(&format!("<li data-vm-shared=\"{kind}\""));
                 if let Some(id) = id {
                     main.push_str(&format!(" data-vm-id=\"{}\"", escape(id)));
                 }
-                main.push_str(&format!("{}>{}", person.marks(), person.words(true)));
+                main.push_str(&format!(
+                    "{}><span class=\"who-is\">{}</span>",
+                    person.marks(),
+                    person.words(true)
+                ));
                 if contributor {
                     main.push_str(&format!(
                         "<form data-vm-form=\"unshare\" method=\"post\" action=\"{action}\">\
                          <input type=\"hidden\" name=\"action\" value=\"unshare\">\
                          <input type=\"hidden\" name=\"kind\" value=\"{kind}\">\
                          <input type=\"hidden\" name=\"value\" value=\"{}\">\
-                         <button type=\"submit\">Unshare</button></form>",
-                        escape(id.unwrap_or_default())
+                         <button type=\"submit\" class=\"quiet danger\">Unshare<span class=\"vh\"> {}</span></button></form>",
+                        escape(id.unwrap_or_default()),
+                        person.object()
                     ));
                 }
                 main.push_str("</li>");
@@ -481,26 +541,27 @@ pub(crate) fn application(
             main.push_str("</ul>");
         }
     }
+    if !contributor && shared.is_some() {
+        main.push_str("<p class=\"soft\">Only its Contributors change whom it is shared with.</p>");
+    }
+    main.push_str("</section>");
     if contributor {
-        main.push_str(&format!("<h2>Share it</h2>\
-             <form class=\"share\" data-vm-form=\"share\" method=\"post\" action=\"{action}\">\
+        main.push_str(&format!("<section class=\"section\"><h2>Share it</h2>\
+             <form class=\"share card\" data-vm-form=\"share\" method=\"post\" action=\"{action}\">\
              <input type=\"hidden\" name=\"action\" value=\"share\">\
-             <label for=\"kind\">With</label>\
-             <select id=\"kind\" name=\"kind\">\
+             <div class=\"field\"><label for=\"kind\">With</label>\
+             <div class=\"control\"><select id=\"kind\" name=\"kind\">\
              <option value=\"email\">a person, by email address</option>\
              <option value=\"user\">a person, by user id</option>\
              <option value=\"group\">a Group</option>\
-             <option value=\"everyone\">everyone who can sign in</option></select>\
-             <label for=\"value\">Email address, user id or Group</label>\
-             <input id=\"value\" type=\"text\" name=\"value\" autocomplete=\"off\" spellcheck=\"false\">\
-             <p class=\"muted\">Leave it empty for everyone. Contributors are changed with the <code>vibe</code> tool.</p>\
-             <button type=\"submit\">Share</button></form>"
+             <option value=\"everyone\">everyone who can sign in</option></select>{CHEVRON}</div></div>\
+             <div class=\"field\"><label for=\"value\">Email address, user id or Group</label>\
+             <p class=\"help\" id=\"value-help\">Leave it empty for everyone. Contributors are changed with the <code>vibe</code> tool.</p>\
+             <div class=\"control\"><input id=\"value\" type=\"text\" name=\"value\" autocomplete=\"off\" spellcheck=\"false\" aria-describedby=\"value-help\"></div></div>\
+             <div class=\"form-actions\"><button type=\"submit\" class=\"primary\">Share {name}</button></div></form></section>"
         ));
-    } else if shared.is_some() {
-        main.push_str("<p>Only its Contributors change whom it is shared with.</p>");
     }
-    main.push_str("</section><p><a href=\"/\">\u{2190} All your Applications</a></p>");
-    page(StatusCode::OK, viewer, &name, &main)
+    page(StatusCode::OK, viewer, &name, Layout::Column, &main)
 }
 
 /// `303` to `location`, on the Dashboard.
@@ -583,11 +644,19 @@ pub(crate) fn refused(viewer: &Viewer<'_>, application: &str, refusal: &Refusal)
         ),
     };
     let main = format!(
-        "<h1>Not changed</h1><p class=\"error\" role=\"alert\" data-vm-error=\"{reason}\">{words}</p>\
-         <p><a data-vm-back href=\"/applications/{name}\">\u{2190} Back to {name}</a></p>"
+        "<h1>Not changed</h1>{}\
+         <div class=\"actions\"><a class=\"btn primary\" data-vm-back href=\"/applications/{name}\">\u{2190} Back to {name}</a></div>",
+        theme::notice(
+            Mark::Error,
+            &format!("role=\"alert\" data-vm-error=\"{reason}\""),
+            &words
+        )
     );
-    page(status, viewer, "Not changed", &main)
+    page(status, viewer, "Not changed", Layout::Card, &main)
 }
+
+/// The way back from a page that says one thing: the list.
+const BACK: &str = "<div class=\"actions\"><a class=\"btn primary\" href=\"/\">\u{2190} All your Applications</a></div>";
 
 /// `1,000`.
 fn thousands(n: i64) -> String {
@@ -610,10 +679,11 @@ pub(crate) fn not_shared(viewer: &Viewer<'_>, application: &str) -> Answer {
         StatusCode::FORBIDDEN,
         viewer,
         "Not shared with you",
+        Layout::Card,
         &format!(
             "<h1>Not shared with you</h1><p>The Application <code>{name}</code> is not shared with you.</p>\
-             <p>To open it or see it here, ask one of its Contributors to share it with you.</p>\
-             <p><a href=\"/\">\u{2190} All your Applications</a></p>"
+             <p class=\"soft\">To open it or see it here, ask one of its Contributors to share it with you.</p>\
+             {BACK}"
         ),
     )
 }
@@ -624,9 +694,9 @@ pub(crate) fn no_application(viewer: &Viewer<'_>, application: &str) -> Answer {
         StatusCode::NOT_FOUND,
         viewer,
         "No such Application",
+        Layout::Card,
         &format!(
-            "<h1>No such Application</h1><p>There is no Application named <code>{}</code>.</p>\
-             <p><a href=\"/\">\u{2190} All your Applications</a></p>",
+            "<h1>No such Application</h1><p>There is no Application named <code>{}</code>.</p>{BACK}",
             escape(application)
         ),
     )
@@ -638,7 +708,8 @@ pub(crate) fn not_found(viewer: &Viewer<'_>) -> Answer {
         StatusCode::NOT_FOUND,
         viewer,
         "Not found",
-        "<h1>Not found</h1><p>The Dashboard has no such page.</p><p><a href=\"/\">\u{2190} All your Applications</a></p>",
+        Layout::Card,
+        &format!("<h1>Not found</h1><p>The Dashboard has no such page.</p>{BACK}"),
     )
 }
 
@@ -648,7 +719,10 @@ pub(crate) fn method_not_allowed(viewer: &Viewer<'_>, allow: &'static str) -> An
         StatusCode::METHOD_NOT_ALLOWED,
         viewer,
         "Method not allowed",
-        "<h1>Method not allowed</h1><p>This address of the Dashboard does not take that method.</p><p><a href=\"/\">\u{2190} All your Applications</a></p>",
+        Layout::Card,
+        &format!(
+            "<h1>Method not allowed</h1><p>This address of the Dashboard does not take that method.</p>{BACK}"
+        ),
     );
     response
         .headers_mut()
@@ -662,7 +736,8 @@ pub(crate) fn bad_page(viewer: &Viewer<'_>) -> Answer {
         StatusCode::BAD_REQUEST,
         viewer,
         "No such page",
-        "<h1>No such page</h1><p>A page of the list is a whole number from 1 to 10000.</p><p><a href=\"/\">\u{2190} The first page</a></p>",
+        Layout::Card,
+        "<h1>No such page</h1><p>A page of the list is a whole number from 1 to 10000.</p><div class=\"actions\"><a class=\"btn primary\" href=\"/\">\u{2190} The first page</a></div>",
     )
 }
 
@@ -672,6 +747,7 @@ pub(crate) fn unavailable(viewer: &Viewer<'_>) -> Answer {
         StatusCode::SERVICE_UNAVAILABLE,
         viewer,
         "Try again shortly",
+        Layout::Card,
         "<h1>Try again shortly</h1><p>The Dashboard cannot be shown just now. Try again in a few seconds.</p>",
     )
 }

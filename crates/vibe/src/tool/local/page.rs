@@ -10,7 +10,7 @@
 //! a message) is escaped as HTML ([`escape`]), in text and in attributes
 //! alike; a `Location` holds only bytes from `!` to `~`; what is
 //! percent-encoded keeps only letters, digits, `-`, `.`, `_` and `~` (and
-//! `/` in a path).
+//! `/` in a path). A page is dressed by the one theme (crate::theme).
 
 use bytes::Bytes;
 use http_body_util::Full;
@@ -21,6 +21,7 @@ use hyper::header::{
 use hyper::{Response, StatusCode};
 
 use super::super::test_users::{TestUser, TestUsersFile};
+use crate::theme::{self, Layout, Mark, Place};
 
 /// The policy of every answer of the local run's own.
 const POLICY: &str = "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'";
@@ -30,10 +31,6 @@ pub(super) const COOKIE: &str = "vm_test_user";
 
 /// The page that chooses the test User.
 pub(super) const CHOOSER: &str = "/_vm/test-user";
-
-const STYLE: &str = "body{font-family:system-ui,sans-serif;max-width:46rem;margin:2rem auto;padding:0 1rem;line-height:1.4}\
-li{margin:0 0 1rem}.chosen{font-weight:bold}.said{border-left:4px solid #b00;padding-left:.75rem}\
-code{background:#eee;padding:0 .2rem}table{border-collapse:collapse}td,th{padding:0 .75rem 0 0;text-align:left}";
 
 /// `text` escaped as HTML, for text and for an attribute's value in
 /// double quotes alike.
@@ -134,15 +131,18 @@ fn own(status: StatusCode, content_type: &'static str, body: String) -> Response
     response
 }
 
-/// A whole page: `title` and `body` (already HTML).
-fn page(status: StatusCode, title: &str, body: &str) -> Response<Full<Bytes>> {
+/// A whole page: `title` (the platform's own text) and `body` (already
+/// HTML), as one card or, with `layout`, in a column.
+fn page(status: StatusCode, title: &str, layout: Layout, body: &str) -> Response<Full<Bytes>> {
+    let title = escape(title);
     own(
         status,
         "text/html; charset=utf-8",
-        format!(
-            "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\"><title>{}</title><style>{STYLE}</style></head>\n<body>\n<h1>{}</h1>\n{body}</body></html>\n",
-            escape(title),
-            escape(title)
+        theme::page(
+            &title,
+            Place::LocalRun,
+            layout,
+            &format!("<h1>{title}</h1>\n{body}"),
         ),
     )
 }
@@ -184,6 +184,7 @@ pub(super) fn not_found() -> Response<Full<Bytes>> {
     page(
         StatusCode::NOT_FOUND,
         "Not found",
+        Layout::Card,
         "<p>Nothing of the local run is at this address. Its page is <a href=\"/_vm/test-user\">/_vm/test-user</a>.</p>\n",
     )
 }
@@ -194,6 +195,7 @@ pub(super) fn misdirected(address: &str) -> Response<Full<Bytes>> {
     page(
         StatusCode::MISDIRECTED_REQUEST,
         "Not this address",
+        Layout::Card,
         &format!(
             "<p>This is the local run of the Application, and it answers only at its own address: <a href=\"{address}\">{address}</a>. Nothing was done.</p>\n"
         ),
@@ -205,6 +207,7 @@ pub(super) fn method_not_allowed() -> Response<Full<Bytes>> {
     let mut response = page(
         StatusCode::METHOD_NOT_ALLOWED,
         "Method not allowed",
+        Layout::Card,
         "<p>This page takes GET and POST.</p>\n",
     );
     response.headers_mut().insert(
@@ -219,6 +222,7 @@ pub(super) fn other_origin() -> Response<Full<Bytes>> {
     page(
         StatusCode::FORBIDDEN,
         "Not from this address",
+        Layout::Card,
         "<p>A test User is chosen only from the local run's own page. Nothing was chosen.</p>\n",
     )
 }
@@ -238,6 +242,7 @@ pub(super) fn unavailable(why: &str) -> Response<Full<Bytes>> {
     page(
         StatusCode::SERVICE_UNAVAILABLE,
         "Not now",
+        Layout::Card,
         &format!("<p>{}</p>\n", escape(why)),
     )
 }
@@ -249,7 +254,7 @@ pub(super) fn failed(error: &serde_json::Value) -> Response<Full<Bytes>> {
     let reason = error["reason"].as_str().unwrap_or("failed");
     let message = error["message"].as_str().unwrap_or_default();
     let mut body = format!(
-        "<p>The project as it is now cannot be served, so no Version of it is: the local run answers this page to every request until the project is corrected, and the first request after a change tries again.</p>\n<p>Reason: <code>{}</code></p>\n<pre style=\"white-space:pre-wrap\">{}</pre>\n",
+        "<p class=\"lead\">The project as it is now cannot be served, so no Version of it is: the local run answers this page to every request until the project is corrected, and the first request after a change tries again.</p>\n<p class=\"facts-line\">Reason: <code>{}</code></p>\n<pre class=\"message\">{}</pre>\n",
         escape(reason),
         escape(message)
     );
@@ -260,7 +265,7 @@ pub(super) fn failed(error: &serde_json::Value) -> Response<Full<Bytes>> {
             }
             if let Some(value) = value.as_str() {
                 body.push_str(&format!(
-                    "<p>{}: <code>{}</code></p>\n",
+                    "<p class=\"facts-line\">{}: <code>{}</code></p>\n",
                     escape(name),
                     escape(value)
                 ));
@@ -270,6 +275,7 @@ pub(super) fn failed(error: &serde_json::Value) -> Response<Full<Bytes>> {
     page(
         StatusCode::INTERNAL_SERVER_ERROR,
         "The project does not build",
+        Layout::Column,
         &body,
     )
 }
@@ -317,34 +323,57 @@ pub(super) fn chooser(
 ) -> Response<Full<Bytes>> {
     let mut body = String::new();
     if let Said::NotInFile(id) = said {
-        body.push_str(&format!(
-            "<p class=\"said\">{} is not a test User of vibe.dev.json: choose one of those below.</p>\n",
-            escape(id)
+        body.push_str(&theme::notice(
+            Mark::Error,
+            "role=\"alert\"",
+            &format!(
+                "<code>{}</code> is not a test User of vibe.dev.json: choose one of those below.",
+                escape(id)
+            ),
         ));
     }
     body.push_str(
-        "<p>The Application runs on this machine and is given each request as the test User chosen here, from vibe.dev.json as it is now.</p>\n<ul>\n",
+        "<p class=\"lead\">The Application runs on this machine and is given each request as the test User chosen here, from vibe.dev.json as it is now.</p>\n<ul class=\"users\">\n",
     );
     for user in &file.users {
         let is_chosen = chosen == Some(user.id.as_str());
+        let id = escape(&user.id);
+        // The form holds the whole card, its hidden `user` first: one
+        // button for each User, and everything said of them inside it.
         body.push_str(if is_chosen {
-            "<li class=\"chosen\">"
+            "<li class=\"card chosen\">"
         } else {
-            "<li>"
+            "<li class=\"card\">"
         });
-        body.push_str(&format!("<code>{}</code>", escape(&user.id)));
-        if let Some(name) = &user.display_name {
-            body.push_str(&format!(" {}", escape(name)));
-        }
-        if let Some(email) = &user.email {
-            body.push_str(&format!(" &lt;{}&gt;", escape(email)));
-        }
+        body.push_str(&format!(
+            "<form method=\"post\" action=\"/_vm/test-user\"><input type=\"hidden\" name=\"user\" value=\"{id}\"><input type=\"hidden\" name=\"next\" value=\"{}\">",
+            escape(next)
+        ));
+        let name = user.display_name.as_deref().map(escape);
+        body.push_str(&format!(
+            "<div class=\"user-head\"><span class=\"name\">{}</span>",
+            name.as_deref().unwrap_or(&id)
+        ));
         if is_chosen {
-            body.push_str(" (chosen now)");
+            body.push_str("<span class=\"pill on\">\u{2713} Chosen now</span>");
+        }
+        body.push_str("</div>");
+        if user.email.is_some() || name.is_some() {
+            body.push_str("<p class=\"ident\">");
+            if let Some(email) = &user.email {
+                body.push_str(&format!(
+                    "<span class=\"soft\">&lt;{}&gt;</span> ",
+                    escape(email)
+                ));
+            }
+            if name.is_some() {
+                body.push_str(&format!("<code class=\"id\">{id}</code>"));
+            }
+            body.push_str("</p>");
         }
         let groups: Vec<String> = user.groups.iter().map(|g| escape(g)).collect();
         body.push_str(&format!(
-            "<br>Groups: {}",
+            "<dl class=\"facts\"><dt>Groups</dt><dd>{}</dd>",
             if groups.is_empty() {
                 "(none)".to_owned()
             } else {
@@ -353,17 +382,16 @@ pub(super) fn chooser(
         ));
         for resource in pulled {
             body.push_str(&format!(
-                "<br>{}: {}",
+                "<dt><code>{}</code></dt><dd>{}</dd>",
                 escape(resource),
                 access(file, user, resource)
             ));
         }
         body.push_str(&format!(
-            "<form method=\"post\" action=\"/_vm/test-user\"><input type=\"hidden\" name=\"user\" value=\"{}\"><input type=\"hidden\" name=\"next\" value=\"{}\"><button type=\"submit\">Be this User</button></form></li>\n",
-            escape(&user.id),
-            escape(next)
+            "</dl><div class=\"form-actions\"><button type=\"submit\">Be this User<span class=\"vh\"> {}</span></button></div></form></li>\n",
+            name.as_deref().unwrap_or(&id)
         ));
     }
     body.push_str("</ul>\n");
-    page(status, "Choose the test User", &body)
+    page(status, "Choose the test User", Layout::Column, &body)
 }

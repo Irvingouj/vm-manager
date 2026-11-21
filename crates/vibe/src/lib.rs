@@ -52,6 +52,8 @@
 //! - [`server`]: the listening socket and the connections.
 //! - [`own_tls`]: the program serving HTTPS itself: its certificate and
 //!   key, checked at start and looked at again when they change.
+//! - [`theme`]: the one theme of every page of the platform's own: its
+//!   stylesheet, its marks and the shell of a page.
 //! - [`platform`]: the parts above put together, for `vibe serve` and for
 //!   the local run alike.
 
@@ -81,6 +83,7 @@ pub mod setup;
 pub mod sign_in;
 pub mod statement;
 pub mod structure;
+pub mod theme;
 pub mod tool;
 pub mod tool_credentials;
 pub mod trust;

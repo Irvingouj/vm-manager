@@ -18,3 +18,6 @@ warn-on-soft         #854d0e #fef9c3 4.5
 control-edge-on-bg   #8a8377 #f6f3ec 3
 control-edge-on-surf #8a8377 #fffdf9 3
 focus-on-bg          #c2410c #f6f3ec 3
+danger-on-bg         #b91c1c #f6f3ec 4.5
+quiet-hover          #9a3412 #efeadf 4.5
+danger-edge-on-surf  #b91c1c #fffdf9 3

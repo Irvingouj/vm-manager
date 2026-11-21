@@ -12,7 +12,9 @@
 //! script. Everything on a page that is not the platform's own text (an
 //! Application's name, an address, a code of the provider's) is escaped as
 //! HTML ([`escape`]). Nothing of a token, a code or a secret is ever on a
-//! page.
+//! page. A page is dressed by the one theme (crate::theme): a card that
+//! says one thing, under a header that links nowhere, so that the links a
+//! page has are exactly those said here.
 
 use bytes::Bytes;
 use http_body_util::Full;
@@ -21,6 +23,8 @@ use hyper::header::{
     RETRY_AFTER, SET_COOKIE, X_CONTENT_TYPE_OPTIONS,
 };
 use hyper::{HeaderMap, Response, StatusCode};
+
+use crate::theme::{self, Layout, Mark, Place};
 
 /// The policy of every answer of the platform's own here.
 const POLICY: &str = "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'";
@@ -32,8 +36,6 @@ const POLICY: &str = "default-src 'none'; style-src 'unsafe-inline'; frame-ances
 fn policy_with_port(port: u16) -> String {
     format!("{POLICY} http://127.0.0.1:{port}")
 }
-
-const STYLE: &str = "body{font-family:system-ui,sans-serif;max-width:40rem;margin:3rem auto;padding:0 1rem;line-height:1.5}";
 
 /// How long a `503` asks to wait, in seconds.
 pub const RETRY_AFTER_SECONDS: &str = "10";
@@ -81,8 +83,11 @@ fn page(status: StatusCode, title: &str, body: &str) -> Response<Full<Bytes>> {
     own(
         status,
         "text/html; charset=utf-8",
-        Bytes::from(format!(
-            "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>{title}</title><style>{STYLE}</style></head><body><h1>{title}</h1>{body}</body></html>\n"
+        Bytes::from(theme::page(
+            title,
+            Place::SignIn,
+            Layout::Card,
+            &format!("<h1>{title}</h1>{body}"),
         )),
     )
 }
@@ -92,8 +97,13 @@ fn page(status: StatusCode, title: &str, body: &str) -> Response<Full<Bytes>> {
 /// it again, and no link.
 fn way_on(again: Option<&str>) -> String {
     match again {
-        Some(again) => format!("<p><a href=\"{}\">Try again</a></p>", escape(again)),
-        None => "<p>To try again, open the Application's address again.</p>".to_owned(),
+        Some(again) => format!(
+            "<div class=\"actions\"><a class=\"btn primary\" href=\"{}\">Try again</a></div>",
+            escape(again)
+        ),
+        None => {
+            "<p class=\"soft\">To try again, open the Application's address again.</p>".to_owned()
+        }
     }
 }
 
@@ -102,7 +112,11 @@ pub fn failed(status: StatusCode, what: &str, again: Option<&str>) -> Response<F
     page(
         status,
         "Sign-in failed",
-        &format!("<p>{}</p>{}", escape(what), way_on(again)),
+        &format!(
+            "{}{}",
+            theme::notice(Mark::Error, "role=\"alert\"", &escape(what)),
+            way_on(again)
+        ),
     )
 }
 
@@ -131,21 +145,22 @@ pub fn not_shared(
 ) -> Response<Full<Bytes>> {
     let who = match name {
         Some(name) => format!(
-            "<strong>{}</strong> (id <code>{}</code>)",
+            "<strong>{}</strong> (id <code class=\"id\">{}</code>)",
             escape(name),
             escape(id)
         ),
-        None => format!("id <code>{}</code>", escape(id)),
+        None => format!("id <code class=\"id\">{}</code>", escape(id)),
     };
     page(
         StatusCode::FORBIDDEN,
         "This Application is not shared with you",
         &format!(
-            "<p>The Application <code>{}</code> is not shared with you. You are signed in as {who}.</p>\
-             <p>To open it, ask one of its Contributors to share it with you.</p>{}",
+            "<p>The Application <code>{}</code> is not shared with you.</p>\
+             <p class=\"soft\">To open it, ask one of its Contributors to share it with you.</p>\
+             <p class=\"aside small soft\">You are signed in as {who}.{}</p>",
             escape(application),
             sign_out.map_or_else(String::new, |address| format!(
-                "<p>Signed in as the wrong person? <a href=\"{}\">Sign out</a></p>",
+                " Signed in as the wrong person? <a href=\"{}\">Sign out</a>",
                 escape(address)
             )),
         ),
@@ -157,7 +172,7 @@ pub fn not_found() -> Response<Full<Bytes>> {
     page(
         StatusCode::NOT_FOUND,
         "Not found",
-        "<p>The sign-in address has no such page.</p><p><a href=\"/sign-out\">Sign out</a></p>",
+        "<p>The sign-in address has no such page.</p><div class=\"actions\"><a class=\"btn\" href=\"/sign-out\">Sign out</a></div>",
     )
 }
 
@@ -166,7 +181,7 @@ pub fn method_not_allowed() -> Response<Full<Bytes>> {
     page(
         StatusCode::METHOD_NOT_ALLOWED,
         "Method not allowed",
-        "<p>This page does not take that method.</p><p><a href=\"/sign-out\">Sign out</a></p>",
+        "<p>This page does not take that method.</p><div class=\"actions\"><a class=\"btn\" href=\"/sign-out\">Sign out</a></div>",
     )
 }
 
@@ -175,7 +190,7 @@ pub fn sign_out_form() -> Response<Full<Bytes>> {
     page(
         StatusCode::OK,
         "Sign out",
-        "<p>Sign out of every Application of this installation in this browser.</p><form method=\"post\" action=\"/sign-out\"><button type=\"submit\">Sign out</button></form>",
+        "<p>Sign out of every Application of this installation in this browser.</p><form method=\"post\" action=\"/sign-out\"><div class=\"actions\"><button type=\"submit\" class=\"primary\">Sign out</button></div></form>",
     )
 }
 
@@ -184,7 +199,14 @@ pub fn signed_out(clear: Option<HeaderValue>) -> Response<Full<Bytes>> {
     let mut response = page(
         StatusCode::OK,
         "Signed out",
-        "<p>You are signed out of every Application of this installation in this browser.</p><p>Your company's own sign-in may still be open: sign out there too if this browser is not yours alone.</p>",
+        &format!(
+            "{}<p class=\"soft\">Your company's own sign-in may still be open: sign out there too if this browser is not yours alone.</p>",
+            theme::notice(
+                Mark::Ok,
+                "role=\"status\"",
+                "You are signed out of every Application of this installation in this browser."
+            )
+        ),
     );
     if let Some(clear) = clear {
         response.headers_mut().append(SET_COOKIE, clear);
@@ -223,7 +245,7 @@ pub fn tool_failed(status: StatusCode, what: &str) -> Response<Full<Bytes>> {
         status,
         "The tool was not signed in",
         &format!(
-            "<p>{}</p><p>To sign the tool in, run <code>vibe sign-in</code> again on your computer.</p>",
+            "<p>{}</p><p class=\"soft\">To sign the tool in, run <code>vibe sign-in</code> again on your computer.</p>",
             escape(what)
         ),
     )
@@ -235,7 +257,7 @@ pub fn tool_over() -> Response<Full<Bytes>> {
     page(
         StatusCode::BAD_REQUEST,
         "This sign-in of the tool is over",
-        "<p>It was answered already, pushed out by a newer one, or ended after five wrong check codes or 10 minutes; or it was begun in another browser. Nothing was signed in.</p><p>To sign the tool in, run <code>vibe sign-in</code> again on your computer.</p>",
+        "<p>It was answered already, pushed out by a newer one, or ended after five wrong check codes or 10 minutes; or it was begun in another browser. Nothing was signed in.</p><p class=\"soft\">To sign the tool in, run <code>vibe sign-in</code> again on your computer.</p>",
     )
 }
 
@@ -273,35 +295,56 @@ pub fn tool_ask(
     if let Some(email) = person.email {
         who.push_str(&format!("{}, ", escape(email)));
     }
-    who.push_str(&format!("id <code>{}</code>", escape(person.id)));
+    who.push_str(&format!(
+        "id <code class=\"id\">{}</code>",
+        escape(person.id)
+    ));
     let machine = if machine.is_empty() {
         "a machine that gave no name".to_owned()
     } else {
         format!("the machine <strong>{}</strong>", escape(machine))
     };
-    let (where_, code) = match port {
+    let (before, field) = match port {
         Some(_) => (
-            "The tool is on this computer: once you confirm, this browser takes the sign-in to it.",
+            "<p class=\"soft\">The tool is on this computer: once you confirm, this browser takes the sign-in to it.</p>".to_owned(),
             String::new(),
         ),
-        None => (
-            "Type the check code the tool shows (eight letters and digits) to confirm.",
-            "<p><label>Check code <input type=\"text\" name=\"code\" autocomplete=\"off\" spellcheck=\"false\" maxlength=\"32\"></label></p>".to_owned(),
-        ),
+        None => {
+            let (wrong, described, invalid) = if wrong_code {
+                (
+                    theme::notice(
+                        Mark::Error,
+                        "id=\"code-error\" role=\"alert\"",
+                        "<strong>That is not the check code the tool shows.</strong> Look at it again; after five wrong codes this sign-in ends.",
+                    ),
+                    "code-help code-error",
+                    " aria-invalid=\"true\"",
+                )
+            } else {
+                (String::new(), "code-help", "")
+            };
+            (
+                String::new(),
+                format!(
+                    "<div class=\"field\"><label for=\"code\">Check code</label>\
+                     <p class=\"help\" id=\"code-help\">Type the check code the tool shows (eight letters and digits) to confirm.</p>{wrong}\
+                     <div class=\"control\"><input id=\"code\" class=\"code\" type=\"text\" name=\"code\" autocomplete=\"off\" spellcheck=\"false\" maxlength=\"32\" aria-describedby=\"{described}\"{invalid}></div></div>"
+                ),
+            )
+        }
     };
-    let wrong = if wrong_code {
-        "<p><strong>That is not the check code the tool shows.</strong> Look at it again; after five wrong codes this sign-in ends.</p>"
-    } else {
-        ""
-    };
+    let warning = theme::notice(
+        Mark::Warn,
+        "",
+        "<strong>Go on only if you ran <code>vibe sign-in</code> yourself, just now.</strong> If someone sent you this address, do not sign in: whoever runs that tool would act as you.",
+    );
     let body = format!(
         "<p>The command-line tool <code>vibe</code> on {machine} asks to be signed in as {who}.</p>\
-         <p><strong>Go on only if you ran <code>vibe sign-in</code> yourself, just now.</strong> If someone sent you this address, do not sign in: whoever runs that tool would act as you.</p>\
-         <p>{where_}</p>{wrong}\
+         {warning}{before}\
          <form method=\"post\" action=\"/tool\">\
-         <input type=\"hidden\" name=\"sign_in\" value=\"{}\">{code}\
-         <p><button type=\"submit\" name=\"answer\" value=\"confirm\">Sign the tool in</button> \
-         <button type=\"submit\" name=\"answer\" value=\"decline\">Do not sign it in</button></p>\
+         <input type=\"hidden\" name=\"sign_in\" value=\"{}\">{field}\
+         <div class=\"actions form-actions\"><button type=\"submit\" name=\"answer\" value=\"confirm\" class=\"primary\">Sign the tool in</button> \
+         <button type=\"submit\" name=\"answer\" value=\"decline\">Do not sign it in</button></div>\
          </form>",
         escape(sign_in)
     );
