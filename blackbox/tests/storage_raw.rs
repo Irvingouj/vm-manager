@@ -66,9 +66,11 @@ fn put_head_get_and_delete_answer_as_the_contract_says() {
         &s.as_writer(&get(MARKETING, "reports/q4.pdf")),
         "get of no file",
     );
-    assert_ok_null(
+    // `reports` is a folder (it holds `reports/q3.pdf`): not-a-file.
+    assert_not_reachable(
         &s.as_writer(&get(MARKETING, "reports")),
-        "get of a key no file has",
+        "not-a-file",
+        "get of a key that is a folder",
     );
 
     let deleted = s.as_writer(&delete(MARKETING, "reports/q3.pdf"));

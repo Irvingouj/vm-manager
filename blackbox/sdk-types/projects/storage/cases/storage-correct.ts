@@ -1,6 +1,6 @@
 // A correct use of Storage compiles with no diagnostics (CONTRACT.md,
 // "Storage: Through the SDK"): the handle of a Resource declared at write
-// is a `Storage`, at read a `ReadOnlyStorage`; every call has the types
+// is a `Storage<"<name>">`, at read a `ReadOnlyStorage<"<name>">`; every call has the types
 // the contract gives; `Refused` carries the kinds of a mismatch.
 import {
   defineApp,
@@ -30,8 +30,16 @@ export default defineApp(manifest, {
   async fetch(request, ctx) {
     const files = ctx.user().storage("marketing");
     const archive = ctx.user().storage("archive");
-    same<typeof files, Storage>(true);
-    same<typeof archive, ReadOnlyStorage>(true);
+    // The handles carry the Resource's name, and each is assignable to the
+    // interface written without one.
+    same<typeof files, Storage<"marketing">>(true);
+    same<typeof archive, ReadOnlyStorage<"archive">>(true);
+    const anyFiles: Storage = files;
+    const anyArchive: ReadOnlyStorage = archive;
+    const readable: ReadOnlyStorage = files;
+    void anyFiles;
+    void anyArchive;
+    void readable;
 
     const page = await archive.list({ prefix: "reports/", delimiter: "/" });
     same<typeof page, FileList>(true);
@@ -54,7 +62,7 @@ export default defineApp(manifest, {
     const file = await archive.get("reports/q3.pdf");
     same<typeof file, StoredFile | null>(true);
     if (file) {
-      same<typeof file.body, Uint8Array>(true);
+      same<typeof file.body, Uint8Array<ArrayBuffer>>(true);
       same<ReturnType<typeof file.text>, string>(true);
     }
 
