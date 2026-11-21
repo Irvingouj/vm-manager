@@ -2459,7 +2459,7 @@ This section builds on "The platform's API" (the error body, the reasons and the
 
 ### Who may
 
-- Everything in this section is for Platform administrators only: a User whose Groups hold the administrators' Group, as last read ("Who is a Platform administrator"; with the stand-in, the Group `--administrators-group` names). The same sign-in as every request of the API: a session or a tool credential.
+- Everything in this section is for Platform administrators only: a User whose Groups hold the administrators' Group, as last read ("Who is a Platform administrator"; with the stand-in, the Group `--administrators-group` names). The same sign-in as every request of the API.
 - Everyone else is refused as "Who is refused" says. Being a Contributor of an Application gives nothing here: a Contributor cannot disable or enable their own Application, and cannot read the Operation log of it.
 
 ### Every Application, on the platform's API
@@ -2561,7 +2561,7 @@ Disabling stops the Application from serving. It changes nothing else of it, and
 - **`vibe applications`**: in words, a disabled Application's block says that it is disabled by a Platform administrator. With `--json`, the API's object.
 - **`vibe show`**: in words, when it is disabled, since when and by whom, and that a Platform administrator enables it again. With `--json`, the API's object (with `disabled`).
 - **`vibe deploy`** to a disabled Application: the deploy is made, and its output has `"disabled": { "since", "by" }` (null when it is not disabled) beside `address`, and a warning with reason `application-disabled` whose message says the Version is deployed and will not be served until a Platform administrator enables the Application, and to tell the Builder so. In words, the same; never that the Application is live at its address. Exit code `0`.
-- **`vibe go-back`** on a disabled Application: the same warning and `disabled` member in its output, exit code `0`.
+- **`vibe go-back`**: its output gains `"disabled"`, always (null when the Application is not disabled, else `{ "since", "by" }`), after `migrations_not_undone`. On a disabled Application it also has `"warnings": [ { "reason": "application-disabled", "message": "..." } ]`, the message as `vibe deploy`'s; when it is not disabled the output has no `warnings` member. In words, the same; exit code `0`.
 - **The Dashboard's list** ("The Dashboard: The list"): a disabled Application's element has `data-vm-disabled` (beside `data-vm-serving`, which is unchanged) and no `a[data-vm-open]`; it holds a mark of its own kind whose name, as a screen reader says it, is "Disabled". **One Application's page**: the element has `data-vm-disabled="<since>"`, no `a[data-vm-open]` (the address is still there, as text), and words saying that a Platform administrator disabled it and when. Who disabled it is not on the Dashboard's pages.
 
 ### Reading the Operation log
@@ -2647,7 +2647,7 @@ Everyone who is not a Platform administrator, signed in however (session, tool c
 
 ### Bounds and costs
 
-- **Every wait has an end.** Each request here reads or writes the platform database within 10 seconds, else `503` `unavailable` (a disable or an enable answered so may or may not have been made: "A write whose answer is lost", below). Requests in flight are answered within 1 second of a disable's `200`. The tool waits as every command does ("Every command": 5 seconds to connect, 30 for the answer).
+- **Every wait has an end.** Each request here reads or writes the platform database within 10 seconds (these requests' own bound, whatever longer bound another request of the API has), else `503` `unavailable` (a disable or an enable answered so may or may not have been made: "A write whose answer is lost", below). Requests in flight are answered within 1 second of a disable's `200`. The tool waits as every command does ("Every command": 5 seconds to connect, 30 for the answer).
 - **Pages.** At most 100 Applications to a page, each with at most 100 Contributors and 200 declared Resources listed; at most 1,000 Operation log entries to a page and never more than 4 MiB.
 - **Readings at once.** At most 2 readings of `GET /v1/admin/applications` and `GET /v1/operation-log` together run at once in the program; a third is answered at once `503` `unavailable`, its message saying that readings for Platform administrators are running and to try again shortly. So these readings never hold more than two of the program's connections to the platform database, and requests to Applications and their operations are served meanwhile.
 - **Indexes.** The Operation log has an index for each filter that can narrow it: by User, by Application and by Resource (each with `id`, so that the newest come first), and by `time`. `outcome` is not indexed (it changes when an entry is completed, and four values do not narrow); a filter of `outcome` alone is bounded by the 10 seconds. What these indexes cost each entry's write is measured once, with and without them, and written down in the ticket; so is the time of a reading by each filter over an Operation log of 1,000,000 entries. These are not tests of the gate.
