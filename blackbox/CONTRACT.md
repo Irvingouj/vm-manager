@@ -2883,7 +2883,7 @@ vibe serve ... [--storage-root <directory>]
 
 - `--storage-root` names the one directory beneath which every Storage Resource's directory must be. It is an absolute path; one that is not is a start-up failure ("Starting and stopping": non-zero within 15 seconds, a message naming `--storage-root`).
 - Without it, nothing else changes, and every Storage registration is refused `storage-not-configured`.
-- With it, when it is not there, is not a directory, or the program cannot create a file in it, `vibe serve` **starts all the same** and writes before `listening` one record `{"event":"storage-root-unusable","problem":"missing" | "not-a-directory" | "not-writable"}`; registrations are then refused with the matching reason below, and Storage Resources already registered are as "When the directory cannot be used" says.
+- With it, when it is not there or is not a directory, `vibe serve` **starts all the same** and writes before `listening` one record `{"event":"storage-root-unusable","problem":"missing" | "not-a-directory"}`; every registration is then refused `directory-missing` or `not-a-directory` (below), and Storage Resources already registered are as "When the directory cannot be used" says. The root itself need not be writable by the program: it writes only inside a Resource's directory, and that is what a registration checks.
 
 ### Registering a Storage Resource
 
@@ -2901,7 +2901,7 @@ vibe serve ... [--storage-root <directory>]
 | Status | When | `reason` |
 |---|---|---|
 | 422 | The program was started without `--storage-root` | `storage-not-configured` |
-| 422 | `directory` is not an absolute path, is the storage root itself, or is not beneath it (also by a `..`, an empty segment or a `.` in it, which are not taken) | `outside-storage-root` |
+| 422 | `directory` is not an absolute path, is the storage root itself, or is not beneath it (also by a `..`, an empty segment or a `.` in it, which are not taken; one `/` at its end is dropped first) | `outside-storage-root` |
 | 422 | A component of it beneath the storage root, or the directory itself, is a symbolic link | `directory-link` |
 | 422 | It is not there | `directory-missing` |
 | 422 | It is there and is not a directory | `not-a-directory` |
@@ -2920,7 +2920,7 @@ vibe serve ... [--storage-root <directory>]
 
 ### When the directory cannot be used
 
-The program keeps each Storage Resource's directory open from when it loads the Resource (at start, at registration). When it cannot open it, or the directory's `.vibe-resource` is not there or names another Resource (a mount forgotten, another disk), the program's log has `{"event":"storage-unavailable","resource":"<name>","problem":"missing" | "not-a-directory" | "not-marked" | "marked-for-another"}` at most once a minute while it lasts, and every allowed operation on the Resource fails `{ error: { kind: "unavailable" } }`, its Operation log entry `failed` with `error` `unavailable`. Nothing is written anywhere then. It tries again at most every 10 seconds, at an operation; once the directory can be used, operations work, with no restart.
+The program keeps each Storage Resource's directory open from when it loads the Resource (at start, at registration); its `.vibe-resource` is looked at then and each time the directory is opened again, not at each operation. When it cannot open it, or the directory's `.vibe-resource` is not there or names another Resource (a mount forgotten, another disk), the program's log has `{"event":"storage-unavailable","resource":"<name>","problem":"missing" | "not-a-directory" | "not-marked" | "marked-for-another"}` at most once a minute while it lasts, and every allowed operation on the Resource fails `{ error: { kind: "unavailable" } }`, its Operation log entry `failed` with `error` `unavailable`. Nothing is written anywhere then. It tries again at most every 10 seconds, at an operation; once the directory can be used, operations work, with no restart.
 
 ### The Manifest, Declared access and a Version
 
@@ -2966,7 +2966,7 @@ export interface FileInfo {
   readonly lastModified: Date;      // whole seconds
 }
 export interface StoredFile extends FileInfo {
-  readonly body: Uint8Array;
+  readonly body: Uint8Array;        // over an ArrayBuffer of its own: a Response's body as it is
   text(): string;                   // body decoded as UTF-8 (malformed bytes become U+FFFD)
 }
 export interface ListOptions {
@@ -2998,7 +2998,7 @@ export interface Storage extends ReadOnlyStorage {
 - `ctx.user().db(name)` takes only names declared `postgres`, and `storage(name)` only names declared `storage`.
 - Each call is exactly one host operation (below), and so one Operation log entry. `files`, `folders` and `cursor` are the host's answer; `lastModified` is a `Date` of the host's time.
 - A refusal rejects with `Refused`, a failure with `OperationFailed` (`kind` the host's `error.kind`, `detail` its whole error), as for databases ("The SDK: Refusals and failures"). A `Refused` that escapes `fetch` is the `403` with `{ refusal, fix }`; an `OperationFailed` the fixed `500`.
-- A `body` that is none of the three, a `key` that is not a string, `options` of the wrong shape: a `TypeError`, and nothing is sent to the host. Everything else (the key's rules, the bounds) is the host's to decide, so that it is logged.
+- A `body` that is none of the three, a `key` that is not a string, `options` of the wrong shape (not an object, or a member of the wrong type, such as `prefix: 5`): a `TypeError`, and nothing is sent to the host. Everything else (the key's rules, the bounds) is the host's to decide, so that it is logged.
 
 **Compile errors**, asserted by the type tests in the compiler's words:
 
@@ -3033,7 +3033,7 @@ A key is taken when every one of these holds; otherwise the operation fails `{ e
 - Letter case matters: `Report.pdf` and `report.pdf` are two files.
 - Everything else is taken: spaces, `#`, `%`, `&`, `[`, `'`, a segment `.hidden`, non-Latin letters (`报告/第三季度.pdf`).
 - **A file and a folder of the same name cannot both exist.** A `put` of `a/b` while `a` is a file, or of `a` while a file's key begins with `a/`, fails `{ error: { kind: "key-conflict", message } }` and writes nothing.
-- A **prefix** (of `list`) is `""`, or a string `p` of at most 1,024 bytes such that `p + "x"` is a key that is taken (so `reports/`, `rep` and `报告/` are prefixes; `../`, `/x` and `a//` are not: `invalid-key` with the rule `p + "x"` breaks).
+- A **prefix** (of `list`) is `""`, or a string `p` such that `p + "x"` is a key that is taken, so of at most 1,023 bytes (`reports/`, `rep`, `报告/`, and also `.`, `..` and `a/` are prefixes; `../`, `/x` and `a//` are not: `invalid-key` with the rule `p + "x"` breaks).
 
 ### Through the raw interface
 
@@ -3062,7 +3062,7 @@ A file's metadata, in every answer: `{ "key", "size": <bytes>, "content_type", "
 - **delete** of a file whose folders are then empty removes those folders too: a folder exists only while a file is in it.
 - **list** answers the keys that begin with `prefix`, **in the byte order of their UTF-8** (`Z` < `a-b` < `a.b/x` < `a/b` < `a0` < `é`), at most `limit` (an integer from 1 to 1,000; 100 without it). With `delimiter: "/"`, every key that holds a `/` after the prefix is rolled up into its folder (`prefix` up to and with that `/`), listed once in `folders`, folders and files together in byte order and each counting once against `limit`. `cursor` is null when nothing follows; given back with the same `prefix` and `delimiter` it answers the next page, also when files were put or deleted meanwhile (a page never repeats a key or a folder a page before it answered, and a key put meanwhile behind the cursor is not answered). A `cursor` that a list of this Resource with this `prefix` and `delimiter` did not answer: `malformed`. A `delimiter` other than `"/"`: `malformed`.
 - **Content type without one given**, by the key's last extension, in any letter case: `.txt` `text/plain; charset=utf-8`, `.html` `.htm` `text/html; charset=utf-8`, `.css` `text/css`, `.js` `text/javascript`, `.json` `application/json`, `.csv` `text/csv`, `.md` `text/markdown`, `.xml` `application/xml`, `.pdf` `application/pdf`, `.png` `image/png`, `.jpg` `.jpeg` `image/jpeg`, `.gif` `image/gif`, `.webp` `image/webp`, `.svg` `image/svg+xml`, `.zip` `application/zip`, `.docx` `application/vnd.openxmlformats-officedocument.wordprocessingml.document`, `.xlsx` `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`, `.pptx` `application/vnd.openxmlformats-officedocument.presentationml.presentation`; any other, `application/octet-stream`. The same table gives the type of a file placed in the directory by hand.
-- **Malformed** (`{ error: { kind: "malformed", message } }`, no Operation log entry, nothing touched): arguments that are not an object; `resource` missing or not a string; `own` given; `as` neither `"user"` nor `"application"`; `key` missing or not a string (head, get, put, delete); `body` missing, not a string, or not base64 (put); `content_type` as above; `prefix` not a string; `delimiter`, `limit` or `cursor` as above.
+- **Malformed** (`{ error: { kind: "malformed", message } }`, no Operation log entry, nothing touched): arguments that are not an object; `resource` missing or not a string; `own` given; `as` neither `"user"` nor `"application"`; `key` missing or not a string (head, get, put, delete); `body` missing, not a string, or not base64 (put; a text longer than a body of 8 MiB encodes to is not looked at: it is past the bound, `limit` `bytes`, in its place in the order below); `content_type` as above; `prefix` not a string; `delimiter`, `limit` or `cursor` as above.
 
 **Failures** (`{ error: { kind, ... } }`, after the operation was allowed and its entry written):
 
@@ -3085,7 +3085,7 @@ As "Who is allowed", in that order, with the level each operation needs (`read` 
 
 - A Storage operation on a name the serving Version declares as `postgres`, or does not declare, is refused `not-declared`; the refusal has `"kind": "storage"` and, when the name is declared as `postgres`, `"declared_kind": "postgres"`. The fix says to declare it with `kind: "storage"`.
 - A Storage operation on a name declared `storage` for which no Resource of kind `storage` is registered is refused `not-registered`, with `"kind": "storage"` and, when a Resource of that name has another kind, `"registered_kind": "postgres"`; the fix says the name is registered as a database.
-- The same the other way: `query`, `execute`, `tx.begin` and a pull of structure on a name declared or registered as `storage` are refused `not-declared` or `not-registered` with `"kind": "postgres"` and `declared_kind` or `registered_kind` `"storage"`. Nothing else of these refusals changes.
+- The same the other way: `query`, `execute` and `tx.begin` on a name declared or registered as `storage` are refused `not-declared` or `not-registered` with `"kind": "postgres"` and `declared_kind` or `registered_kind` `"storage"`. Nothing else of these refusals changes.
 - A Version that declared the Resource at `read` is refused `declared-lower` (`declared` `read`, `needed` `write`) for put and delete. A User whose Groups hold `read` is refused `no-grant` (`held` `read`, `needed` `write`) for them, and one whose Groups hold nothing is refused `no-grant` (`held` null) for all five, with the Resource's `contact`.
 - A refused operation touches nothing: no file is read, made, changed or removed, and no folder is made.
 - The Authorization decision (`authz`) is unchanged: the host asks it with the level needed, after matching kinds.
@@ -3093,7 +3093,7 @@ As "Who is allowed", in that order, with the level each operation needs (`read` 
 ### Bounds
 
 - **Body**: 8 MiB (8,388,608 bytes; exactly that is taken) for a put's body and a get's file. Past it, `limit` `bytes`; the program never decodes or reads more than the bound and one byte of it.
-- **Key** and **prefix**: 1,024 bytes; **segments**: 64 of at most 255 bytes. **A list page**: 1 to 1,000. **Content type**: 255 bytes. **Cursor**: as the program made it (at most 2,048 bytes).
+- **Key**: 1,024 bytes; **prefix**: 1,023 bytes; **segments**: 64 of at most 255 bytes. **A list page**: 1 to 1,000. **Content type**: 255 bytes. **Cursor**: as the program made it (at most 2,048 bytes).
 - **Time**: 10 seconds an operation, from the moment it is decided; past it, `limit` `time`.
 - **At once** (no black-box test can provoke these in a test's time; they are read in the code at review): file work runs on 8 threads of its own, with at most 64 operations waiting for them, and storage operations hold at most 256 MiB of bodies at once in the program. An operation that finds no room within 5 seconds fails `unavailable` and touches nothing.
 - **A request to an Application** may now have a body of up to 8,454,144 bytes (8 MiB and 64 KiB), so that a file of the bound can be uploaded through a form; larger is `413`. `vibe request`'s `--data` and `--data-file` take the same.
@@ -3107,7 +3107,7 @@ Every Storage operation, allowed, refused or failed, has one entry, written befo
 |---|---|
 | `operation` | `storage.head`, `storage.get`, `storage.put`, `storage.delete` or `storage.list` |
 | `resource` | the Resource's name; `own_database` false; `actor` `user`; `transaction` null |
-| `statement` | the operation's word and its key, the key written as a JSON string: `get "reports/q3.pdf"`, `put "reports/q4.pdf"`, `head "..."`, `delete "..."`; for a list `list "<prefix>"`, and `list "<prefix>" delimiter "/"` with the delimiter. A key that breaks a rule is written the same (its control characters as JSON escapes, `\u0000`), cut after its first 1,024 bytes (at a character's end) with `...` after it. |
+| `statement` | the operation's word and its key, the key written as a JSON string: `get "reports/q3.pdf"`, `put "reports/q4.pdf"`, `head "..."`, `delete "..."`; for a list `list "<prefix>"`, and `list "<prefix>" delimiter "/"` with the delimiter. In that JSON string every character the rule `character` names (the controls U+0000 to U+001F and U+007F to U+009F, and the bidirectional marks; not `\`, which JSON writes `\\`) is written `\uXXXX`, so that an entry is safe to print. A key that breaks a rule is written the same, and one longer than 1,024 bytes is cut after its first 1,024 bytes (at a character's end) and `...` follows the closing quote: `put "<the first 1,024 bytes>"...`. |
 | `rows` | head and get: `1` when a file was answered, `0` for `null`; put: `1`; delete: null; list: the number of files and folders answered; null unless it ended |
 | `outcome`, `reason`, `error` | as for any operation; `error` as the table of failures says |
 | `duration_ms` | from when the directory was first touched; null when it was not |
@@ -3130,7 +3130,7 @@ For a Resource whose directory is `<dir>`:
 
 What a test shows, with a hostile fixture Application of its own that calls the raw interface (and the SDK, forced past its types) as a User holding `write`:
 
-- **Keys.** `../secret`, `a/../../secret`, `/etc/passwd`, `.`, `..`, `a/./b`, `a//b`, `a/`, ``, a key with NUL, with `\u0007`, with `‮`, `..\\secret`, `.vibe-resource`, `.vibe-staging/x`, a key of 1,025 bytes, a segment of 256 bytes, 65 segments, `café`: each fails `invalid-key` with its rule, through every one of the five operations, and has its `failed` entry; nothing is made or read anywhere, inside the directory or outside it.
+- **Keys.** `../secret`, `a/../../secret`, `/etc/passwd`, `.`, `..`, `a/./b`, `a//b`, `a/`, ``, a key with NUL, with `\u0007`, with `‮`, `..\\secret`, `.vibe-resource`, `.vibe-staging/x`, a key of 1,025 bytes, a segment of 256 bytes, 65 segments, `café`: each fails `invalid-key` with its rule through head, get, put and delete, and as a list's prefix when it is no prefix ("Keys"), and has its `failed` entry; those of them that are prefixes (`.`, `..`, `a/`, the empty one) list what begins with them like any prefix, which is nothing outside the directory. Nothing is made or read anywhere outside the directory, and nothing inside it by a failed operation.
 - **Links planted on the host.** The test makes, inside `<dir>`: `etc` → `/etc`; `secret` → a file outside the storage root that holds known bytes; `other` → the directory of another Storage Resource; `inner` → `<dir>/real.txt`; `deep/link` → `..`. Then: `get` and `head` of `etc/passwd`, `secret`, `other/theirs.txt`, `inner`, `deep/link/real.txt` fail `not-reachable` `link`; `put` of `etc/x`, `secret`, `other/x`, `deep/link/x` fail the same, and afterwards `/etc/x` and `<other>/x` do not exist, the outside file and the link `secret` are unchanged; `delete` of `secret` fails the same and the link is still there; `list` with and without a delimiter answers none of them (`deep/` is answered as a folder only if it holds a file that is reachable). None of the known bytes appears in any answer.
 - **Other things planted.** A FIFO `<dir>/pipe`: `get` answers `not-reachable` `not-a-file` at once, without waiting on the FIFO. A folder `<dir>/f/`: `get("f")` is `not-a-file`; `put("f")` is `key-conflict`.
 - **Two Resources.** Two Storage Resources on sibling directories never see each other's files: what is put through one is not listed, read or deletable through the other under any key, and registering a directory inside the other's, or holding it, is `directory-in-use`.
