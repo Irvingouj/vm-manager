@@ -978,18 +978,22 @@ fn holder_of<'a>(opened: &'a Opened, chain: &'a [OwnedFd], index: usize) -> Opti
 }
 
 /// Removes the folders a put made (`made`, indexes of `segments` and of
-/// `chain`) when the put failed: deepest first, each only when empty,
-/// stopping at the first that does not go.
+/// `chain`) when the put failed: deepest first, each only when empty. One
+/// already gone (`ENOENT`) is passed; it stops at the first that is there
+/// and does not go.
 fn unmake(opened: &Opened, chain: &[OwnedFd], segments: &[&str], made: &[usize]) {
     for &index in made.iter().rev() {
         let (Some(holder), Some(segment)) = (holder_of(opened, chain, index), segments.get(index))
         else {
             return;
         };
-        if rustix::fs::unlinkat(holder, *segment, AtFlags::REMOVEDIR).is_err() {
-            return;
+        match rustix::fs::unlinkat(holder, *segment, AtFlags::REMOVEDIR) {
+            Ok(()) => {
+                rustix::fs::fsync(holder).ok();
+            }
+            Err(Errno::NOENT) => {}
+            Err(_) => return,
         }
-        rustix::fs::fsync(holder).ok();
     }
 }
 
@@ -1026,7 +1030,11 @@ fn make_folders_into(
                     tries += 1;
                     match rustix::fs::mkdirat(parent, *segment, Mode::from_raw_mode(FOLDER_MODE)) {
                         Ok(()) => {
-                            made.push(index);
+                            // Once: made again after a delete removed it
+                            // meanwhile is the same folder of this put.
+                            if made.last() != Some(&index) {
+                                made.push(index);
+                            }
                             // The mode whatever the program's umask, on
                             // the folder just made, reached without a link.
                             if let Step::Folder(fd) = open_folder(parent, segment, opened.dev)? {
