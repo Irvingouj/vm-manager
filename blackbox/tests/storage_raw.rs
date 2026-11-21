@@ -19,8 +19,8 @@ use blackbox::api::assert_recent_rfc3339;
 use blackbox::scenario::{assert_malformed, assert_refusal, lines};
 use blackbox::storage::{
     BODY_BOUND, FILES, MARKETING, Storage, assert_got, assert_invalid_key, assert_metadata,
-    assert_not_reachable, assert_ok_metadata, assert_ok_null, binary_with, delete, get, head, list,
-    listed_names, mtime, op, place, put, tree, wanda,
+    assert_not_reachable, assert_ok_metadata, assert_ok_null, assert_pages_hold_the_limit,
+    binary_with, delete, get, head, list, listed_names, mtime, op, place, put, tree, wanda,
 };
 use serde_json::{Value, json};
 
@@ -715,36 +715,22 @@ fn the_limit_is_100_without_it_and_a_page_holds_at_most_limit() {
     for n in 0..105 {
         place(&dir.join(format!("f{n:03}.txt")), b"x");
     }
-    // A page may be short ("list"): at most `limit`, the cursor null only
-    // at the end.
-    let page = s.as_writer(&list(MARKETING, &json!({})));
-    let (files, _) = listed_names(&page["ok"]);
+    // At most `limit`, the cursor null only at the end; a page answered
+    // in under 4 seconds while more follow holds exactly the limit (only a
+    // list that stopped looking after 5 seconds is short).
+    let pages = s.timed_pages(&json!({}), None);
     assert!(
-        files.len() <= 100,
-        "expected at most 100 files without a limit, got {}",
-        files.len()
-    );
-    assert!(
-        page["ok"]["cursor"].is_string(),
+        pages[0].0["cursor"].is_string(),
         "more follow, so a cursor: {}",
-        page["ok"]["cursor"]
+        pages[0].0
     );
-    let mut all = files;
-    let mut cursor = page["ok"]["cursor"].as_str().map(str::to_owned);
-    while let Some(c) = cursor {
-        let next = s.as_writer(&list(MARKETING, &json!({ "cursor": c })));
-        let (files, _) = listed_names(&next["ok"]);
-        assert!(files.len() <= 100, "at most 100 without a limit: {next}");
-        all.extend(files);
-        cursor = next["ok"]["cursor"].as_str().map(str::to_owned);
-        assert!(all.len() <= 105, "the pages do not end: {}", all.len());
-    }
+    assert_pages_hold_the_limit(&pages, 100, "without a limit");
+    let all: Vec<String> = pages.iter().flat_map(|(p, _)| listed_names(p).0).collect();
     let expected: Vec<String> = (0..105).map(|n| format!("f{n:03}.txt")).collect();
     assert_eq!(all, expected, "the pages together, in order");
-    let ones = s.every_page(&json!({}), 1);
-    for one in &ones {
-        assert!(listed_names(one).0.len() <= 1, "`limit` 1: {one}");
-    }
+    let ones = s.timed_pages(&json!({}), Some(1));
+    assert_pages_hold_the_limit(&ones, 1, "`limit` 1");
+    let ones: Vec<Value> = ones.into_iter().map(|(p, _)| p).collect();
     assert_eq!(every_name(&ones), expected, "pages of `limit` 1 together");
 }
 

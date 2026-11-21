@@ -463,6 +463,37 @@ impl Storage {
         }
     }
 
+    /// Every page of a list of [`MARKETING`] as [`wanda`] with `more` (and
+    /// `limit` when given), following the cursor until it is null, each
+    /// with the time its call took.
+    pub fn timed_pages(&self, more: &Value, limit: Option<u64>) -> Vec<(Value, Duration)> {
+        let mut pages = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let mut args = more.clone();
+            if let Some(limit) = limit {
+                args["limit"] = json!(limit);
+            }
+            if let Some(c) = &cursor {
+                args["cursor"] = json!(c);
+            }
+            let asked = Instant::now();
+            let answer = self.as_writer(&list(MARKETING, &args));
+            let took = asked.elapsed();
+            let page = answer["ok"].clone();
+            if !page.is_object() {
+                self.vm.fail(&format!(
+                    "expected a page {{ ok: {{ files, folders, cursor }} }}, got {answer}"
+                ));
+            }
+            cursor = page["cursor"].as_str().map(str::to_owned);
+            pages.push((page, took));
+            if cursor.is_none() || pages.len() > 2000 {
+                return pages;
+            }
+        }
+    }
+
     /// Every entry of the Operation log, read by the administrator.
     pub fn log(&self) -> Vec<Value> {
         self.admin().operation_log_entries()
@@ -893,6 +924,29 @@ pub fn terminate(vm: Vm) -> Stopped {
     }
     drop(vm);
     Stopped { options }
+}
+
+/// A page answered in less than this while more follows holds exactly
+/// `limit`: only a list that stopped looking after 5 seconds is short.
+pub const QUICK_PAGE: Duration = Duration::from_secs(4);
+
+/// Fails unless each page holds at most `limit` names, and exactly `limit`
+/// when more follow and it was answered within [`QUICK_PAGE`].
+pub fn assert_pages_hold_the_limit(pages: &[(Value, Duration)], limit: usize, context: &str) {
+    for (n, (page, took)) in pages.iter().enumerate() {
+        let (files, folders) = listed_names(page);
+        let held = files.len() + folders.len();
+        assert!(
+            held <= limit,
+            "{context}: page {n} holds {held}, more than {limit}"
+        );
+        if page["cursor"].is_string() && *took < QUICK_PAGE {
+            assert_eq!(
+                held, limit,
+                "{context}: page {n} was answered in {took:?} with more following, so it holds exactly {limit}"
+            );
+        }
+    }
 }
 
 /// Ends the program with `SIGKILL` at once.

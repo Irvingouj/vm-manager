@@ -24,7 +24,8 @@ use std::time::Duration;
 use blackbox::scenario::Expected;
 use blackbox::storage::{
     BODY_BOUND, MARKETING, REQUEST_BODY_BOUND, Storage, assert_metadata, assert_ok_metadata,
-    assert_storage_entry, head, listed_names, place, storage_expected, wanda,
+    assert_pages_hold_the_limit, assert_storage_entry, head, listed_names, place, storage_expected,
+    wanda,
 };
 use serde_json::{Value, json};
 
@@ -239,11 +240,13 @@ fn a_list_page_holds_up_to_1000_and_its_cursor_is_at_most_2048_bytes() {
             b"",
         );
     }
-    // Pages of at most 1,000 (a page may be short), each cursor at most
-    // 2,048 bytes, until the cursor is null.
-    let pages = s.every_page(&json!({ "limit": 1000 }), 1000);
+    // Pages of at most 1,000, exactly 1,000 when answered in under 4
+    // seconds with more following, each cursor at most 2,048 bytes, until
+    // the cursor is null.
+    let pages = s.timed_pages(&json!({}), Some(1000));
+    assert_pages_hold_the_limit(&pages, 1000, "`limit` 1,000");
     let mut count = 0;
-    for page in &pages {
+    for (page, _) in &pages {
         let (files, _) = listed_names(page);
         assert!(
             files.len() <= 1000,
