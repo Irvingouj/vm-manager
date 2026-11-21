@@ -24,6 +24,16 @@ pub const SEGMENT_BYTES: usize = 255;
 /// with (`.vibe-resource`, `.vibe-staging/`): no segment of a key may.
 pub const RESERVED: &str = ".vibe-";
 
+/// Whether `segment` begins with [`RESERVED`], in any letter case (on a
+/// disk that does not tell letter case apart, `.VIBE-resource` is the
+/// marker itself).
+fn is_reserved(segment: &str) -> bool {
+    segment
+        .as_bytes()
+        .get(..RESERVED.len())
+        .is_some_and(|start| start.eq_ignore_ascii_case(RESERVED.as_bytes()))
+}
+
 /// A rule of "Keys", in the table's order: when several are broken, the
 /// first is named.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -144,7 +154,7 @@ pub fn check(text: &str) -> Result<(), Rule> {
     if !is_nfc(text) {
         return Err(Rule::NotNfc);
     }
-    if text.split('/').any(|s| s.starts_with(RESERVED)) {
+    if text.split('/').any(is_reserved) {
         return Err(Rule::Reserved);
     }
     Ok(())

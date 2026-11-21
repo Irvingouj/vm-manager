@@ -91,6 +91,7 @@ impl Platform {
             runner,
             start,
         } = limits;
+        let root = storage_root.map(Arc::new);
         let started = tokio::time::timeout(start, async {
             let database = Arc::new(PlatformDatabase::open(address, &pool).await?);
             let unreadable = |e: platform_db::DbError| {
@@ -118,14 +119,15 @@ impl Platform {
                 executor,
                 read_backs,
                 Arc::clone(&files),
+                root.as_ref().map(Arc::clone),
             )
             .await
             .map_err(unreadable)?;
-            let cursor_key = cursor_key(&database).await.map_err(unreadable)?;
-            Ok::<_, OpenError>((database, own, registry, resources, cursor_key))
+            let cursors = cursor_sealer(&database).await.map_err(unreadable)?;
+            Ok::<_, OpenError>((database, own, registry, resources, cursors))
         })
         .await;
-        let (database, own, registry, resources, cursor_key) = match started {
+        let (database, own, registry, resources, cursors) = match started {
             Ok(started) => started?,
             Err(_) => {
                 return Err(OpenError::new(
@@ -154,8 +156,8 @@ impl Platform {
         let storage = Arc::new(Storage {
             files,
             bodies: Arc::new(Bodies::default()),
-            cursors: storage::cursor::Sealer::new(&cursor_key),
-            root: storage_root.map(Arc::new),
+            cursors,
+            root,
         });
         let gateway = Arc::new(PlatformGateway::new(
             Arc::clone(&resources),
@@ -184,9 +186,12 @@ impl Platform {
     }
 }
 
-/// The key Storage lists' cursors are sealed with, as the platform database
-/// keeps it (step 17). Never printed.
-async fn cursor_key(database: &PlatformDatabase) -> Result<Vec<u8>, platform_db::DbError> {
+/// What seals Storage lists' cursors, made from the key the platform
+/// database keeps (step 17). The key's bytes are read into it and dropped:
+/// they are held nowhere else and never printed.
+async fn cursor_sealer(
+    database: &PlatformDatabase,
+) -> Result<storage::cursor::Sealer, platform_db::DbError> {
     database
         .pool()
         .run(async |client: &mut tokio_postgres::Client| {
@@ -194,7 +199,8 @@ async fn cursor_key(database: &PlatformDatabase) -> Result<Vec<u8>, platform_db:
                 .query_one("SELECT key FROM storage_cursor_key", &[])
                 .await
                 .map_err(platform_db::DbError::from)?;
-            row.try_get::<_, Vec<u8>>(0)
+            row.try_get::<_, &[u8]>(0)
+                .map(storage::cursor::Sealer::new)
                 .map_err(platform_db::DbError::from)
         })
         .await

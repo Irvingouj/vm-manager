@@ -1720,6 +1720,7 @@ impl Api {
             &name,
             &prepared.directory,
             Arc::clone(&prepared.opened),
+            Some(Arc::clone(root)),
             &self.storage.files,
         );
         let new = NewResource {

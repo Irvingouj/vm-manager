@@ -508,6 +508,9 @@ pub struct Resources {
     limits: executor::Limits,
     /// The file threads Storage Resources' directories are opened on.
     files: Arc<Files>,
+    /// The storage root the program was started with, from which each
+    /// Storage Resource's directory is reached.
+    root: Option<Arc<crate::storage::Root>>,
     /// By name. Held only for a lookup or an insert, never across an await.
     all: RwLock<BTreeMap<String, Arc<Resource>>>,
     /// The number of forgettings of Grants so far, each one's `epoch`.
@@ -564,6 +567,7 @@ impl Resources {
         limits: executor::Limits,
         reading_back: Arc<Semaphore>,
         files: Arc<Files>,
+        root: Option<Arc<crate::storage::Root>>,
     ) -> Result<Self, DbError> {
         let (locked, resources, grants) = database
             .pool()
@@ -605,6 +609,7 @@ impl Resources {
             database,
             limits,
             files,
+            root,
             all: RwLock::new(BTreeMap::new()),
             forgotten: AtomicU64::new(0),
             unknown: AtomicUsize::new(0),
@@ -621,7 +626,7 @@ impl Resources {
         let mut unknown = Vec::new();
         let mut all = BTreeMap::new();
         for row in &resources {
-            let resource = this.resource_of(row).await?;
+            let resource = this.resource_of(row)?;
             let grants = read.remove(&resource.id).unwrap_or_default();
             if locked.contains(&resource.id) {
                 *resource
@@ -641,11 +646,24 @@ impl Resources {
                 serde_json::json!({ "resources": unknown }),
             );
         }
+        // The directories, opened together, waited for START_WAIT in all.
+        let deadline = tokio::time::Instant::now() + crate::storage::directory::START_WAIT;
+        let mut openings = tokio::task::JoinSet::new();
+        for resource in all.values() {
+            if let Some(directory) = resource.storage() {
+                openings.spawn(directory.opening(deadline));
+            }
+        }
+        // Each opening ends by the deadline; the set is drained here, and
+        // what is left (none) ended with it.
+        while openings.join_next().await.is_some() {}
         *this.all.write().unwrap_or_else(PoisonError::into_inner) = all;
         Ok(this)
     }
 
-    async fn resource_of(&self, row: &Row) -> Result<Resource, DbError> {
+    /// The Resource of `row`; a Storage Resource's directory not opened yet
+    /// ([`Directory::opening`]).
+    fn resource_of(&self, row: &Row) -> Result<Resource, DbError> {
         let name: String = get(row, 1)?;
         let kind: &str = get(row, 8)?;
         let (kind, reach) = match kind {
@@ -654,9 +672,12 @@ impl Resources {
                     DbError::unexpected("a Storage Resource's stored location cannot be read")
                 })?;
                 let backend = match location {
-                    Location::Directory { directory } => {
-                        Directory::load(&name, std::path::Path::new(&directory), &self.files).await
-                    }
+                    Location::Directory { directory } => Directory::new(
+                        &name,
+                        std::path::Path::new(&directory),
+                        self.root.as_ref().map(Arc::clone),
+                        &self.files,
+                    ),
                 };
                 (ResourceKind::Storage, Reach::Storage(backend))
             }
@@ -949,7 +970,13 @@ impl Resources {
         let Some((row, grants)) = read else {
             return Ok(None);
         };
-        let resource = self.resource_of(&row).await?;
+        let resource = self.resource_of(&row)?;
+        if let Some(directory) = resource.storage() {
+            // Its own bound: one Resource, on an API request.
+            directory
+                .opening(tokio::time::Instant::now() + crate::storage::OPERATION_TIME)
+                .await;
+        }
         *resource
             .grants
             .write()

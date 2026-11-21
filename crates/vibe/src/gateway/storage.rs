@@ -454,6 +454,10 @@ impl StorageWork {
                 return Refusal::log_unavailable(self.resource_name()).to_wire();
             }
         };
+        // Handed to the directory: `duration_ms` runs from here, the waits
+        // for room and for a file thread included.
+        let started = tokio::time::Instant::now();
+        let elapsed = || Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
         // Room for a put's body among the bodies held at once (a get takes
         // its own once it knows the file's size).
         let _room = match &checked {
@@ -464,14 +468,13 @@ impl StorageWork {
                         "storage-busy",
                         json!({ "problem": "no room for the body among those held at once" }),
                     );
-                    let ending = failed_ending("unavailable", None);
+                    let ending = failed_ending("unavailable", elapsed());
                     self.finish(id, &ending).await;
                     return unavailable();
                 }
             },
             _ => None,
         };
-        let started = tokio::time::Instant::now();
         let deadline = tokio::time::Instant::from_std(self.until.deadline());
         let stop = Arc::clone(&self.in_flight.stop);
         let active = self.active;
@@ -489,11 +492,11 @@ impl StorageWork {
                 Some(done.unwrap_or(Err(Failure::Time)))
             }
         };
-        let duration_ms = Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
+        let duration_ms = elapsed();
         let Some(done) = ran else {
             // Disabled meanwhile: given up before it lands.
             self.until.give_up();
-            self.finish(id, &failed_ending(APPLICATION_DISABLED, None))
+            self.finish(id, &failed_ending(APPLICATION_DISABLED, duration_ms))
                 .await;
             return Refusal::application_disabled().to_wire();
         };

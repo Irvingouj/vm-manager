@@ -410,14 +410,11 @@ export interface ReadOnlyStorage<N extends string = string> {
   delete(this: FilesDeclaredAtRead<N>, key: string): Promise<void>;
 }
 
-/** A Storage Resource declared at `write`, as the User. Each call is one host operation. */
-export interface Storage {
-  /** The file's metadata, or null when no file has the key. */
-  head(key: string): Promise<FileInfo | null>;
-  /** The file read whole, or null when no file has the key. */
-  get(key: string): Promise<StoredFile | null>;
-  /** A page of the keys beginning with the prefix, in the byte order of their UTF-8. */
-  list(options?: ListOptions): Promise<FileList>;
+/**
+ * A Storage Resource declared at `write`, as the User. Each call is one host
+ * operation. `Name` is its name.
+ */
+export interface Storage<Name extends string = string> extends ReadOnlyStorage<Name> {
   /** Creates the file or replaces it whole; resolves to its metadata as written. */
   put(key: string, body: FileBody, options?: PutOptions): Promise<FileInfo>;
   /** Removes the file if there is one, and every folder it leaves empty. */
@@ -425,7 +422,7 @@ export interface Storage {
 }
 
 type StorageHandle<R extends Declarations, N extends keyof R & string> = R[N]["access"] extends "write"
-  ? Storage
+  ? Storage<N>
   : ReadOnlyStorage<N>;
 
 // ---------------------------------------------------------------- context

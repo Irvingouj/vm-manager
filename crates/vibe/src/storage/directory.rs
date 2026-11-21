@@ -29,11 +29,23 @@
 //!   whole keys), and walks depth-first. Links, FIFOs, devices and folders
 //!   on another file system are passed over; with the delimiter, a folder
 //!   is answered only when it holds a file that can be reached.
-//! - **Unavailable.** When the directory cannot be opened, or its
+//! - **Opening.** Every opening of the directory, at start too, reaches it
+//!   as a registration does: from the storage root the program was started
+//!   with, one component at a time, following no link ([`Root`]'s walk).
+//!   At start the directories are opened together, waited for
+//!   [`START_WAIT`] in all; the opening job sets the state itself, so one
+//!   answered late is in use as soon as it is. At most one opening of a
+//!   Resource is under way at once.
+//! - **Unavailable.** When the directory cannot be opened so, or its
 //!   `.vibe-resource` is not there or names another Resource, every
 //!   operation fails `unavailable`, nothing is written, the program's log
-//!   says `storage-unavailable` at most once a minute, and the directory is
-//!   tried again at most every [`RETRY`], at an operation.
+//!   says `storage-unavailable` at most once a minute (at once when the
+//!   problem is another), and the directory is tried again at most every
+//!   [`RETRY`], at an operation; `storage-available` once it can be used.
+//! - **Still at its place.** At an operation, at most every [`RETRY`], one
+//!   `stat` of the path (no link followed) tells whether it still names the
+//!   directory held; when not, the one held is let go and the path opened
+//!   again as above. Operations never follow the path.
 //!
 //! All file work runs on the program's file threads (crate::storage::files).
 //!
@@ -44,7 +56,8 @@ use std::collections::BinaryHeap;
 use std::io::{Read as _, Write as _};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use rustix::fs::{AtFlags, CWD, Dir, FileType, Mode, OFlags, Stat, XattrFlags};
@@ -106,40 +119,62 @@ impl Opened {
 /// `storage-unavailable`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Problem {
+    OutsideStorageRoot,
+    Link,
     Missing,
     NotADirectory,
     NotMarked,
     MarkedForAnother,
+    NoAnswer,
 }
 
 impl Problem {
     pub fn name(self) -> &'static str {
         match self {
+            Self::OutsideStorageRoot => "outside-storage-root",
+            Self::Link => "link",
             Self::Missing => "missing",
             Self::NotADirectory => "not-a-directory",
             Self::NotMarked => "not-marked",
             Self::MarkedForAnother => "marked-for-another",
+            Self::NoAnswer => "no-answer",
         }
     }
 }
 
+/// How long the program waits at start, in all, for the directories of
+/// the Storage Resources to be opened (they are opened together).
+pub const START_WAIT: Duration = Duration::from_secs(3);
+
 enum State {
-    Open(Arc<Opened>),
+    /// Held open; `checked` is when its path was last seen to name it.
+    Open {
+        opened: Arc<Opened>,
+        checked: Instant,
+    },
+    /// Not usable: `tried` is when it was last opened, `said` when
+    /// `storage-unavailable` was last written (`None`: not yet).
     Closed {
         problem: Problem,
         tried: Instant,
-        said: Instant,
+        said: Option<Instant>,
     },
 }
 
 struct Inner {
     /// The Resource's name, which its marker must hold.
     name: String,
-    /// The directory, as registered. Never printed.
+    /// The directory, as registered. Never printed. Used for nothing but
+    /// opening it and looking whether it still names the one held.
     path: PathBuf,
+    /// The storage root the program was started with: every opening walks
+    /// from it.
+    root: Option<Arc<Root>>,
     /// Locked only for a look or a change, never during file work or
     /// across an await.
     state: Mutex<State>,
+    /// An opening is under way: never more than one at once.
+    opening: AtomicBool,
 }
 
 /// A Storage Resource on a directory.
@@ -156,55 +191,103 @@ impl std::fmt::Debug for Directory {
     }
 }
 
+/// The one opening of a Resource's directory under way: the flag is let go
+/// when this is dropped (the job ran, or it was dropped without running).
+struct Opening(Arc<Inner>);
+
+impl Opening {
+    fn take(inner: &Arc<Inner>) -> Option<Self> {
+        inner
+            .opening
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| Self(Arc::clone(inner)))
+    }
+}
+
+impl Drop for Opening {
+    fn drop(&mut self) {
+        self.0.opening.store(false, Ordering::Release);
+    }
+}
+
 impl Directory {
-    /// The Resource `name` on `path`, opened on a file thread, its staging
-    /// emptied of what a crash left: at start, and for the local run. When
-    /// it cannot be used, it is held closed (and said so), and tried again
-    /// at an operation.
-    pub async fn load(name: &str, path: &Path, files: &Arc<Files>) -> Self {
-        let inner = Arc::new(Inner {
-            name: name.to_owned(),
-            path: path.to_owned(),
-            state: Mutex::new(State::Closed {
-                problem: Problem::Missing,
-                tried: Instant::now(),
-                said: Instant::now(),
-            }),
-        });
-        let opening = Arc::clone(&inner);
-        let opened = match files.run(move || open(&opening.path, &opening.name)).await {
-            Some(answer) => tokio::time::timeout(super::OPERATION_TIME, answer)
-                .await
-                .ok()
-                .and_then(Result::ok),
-            None => None,
-        };
-        let state = match opened {
-            Some(Ok(opened)) => State::Open(Arc::new(opened)),
-            Some(Err(problem)) => {
-                say_unavailable(name, problem);
-                closed(problem)
-            }
-            None => {
-                say_unavailable(name, Problem::Missing);
-                closed(Problem::Missing)
-            }
-        };
-        *inner.state.lock().unwrap_or_else(PoisonError::into_inner) = state;
+    /// The Resource `name` on `path`, not opened yet: unavailable until
+    /// [`Directory::opening`] has opened it. At start, and for a Resource
+    /// read from the platform database.
+    pub fn new(name: &str, path: &Path, root: Option<Arc<Root>>, files: &Arc<Files>) -> Self {
         Self {
-            inner,
+            inner: Arc::new(Inner {
+                name: name.to_owned(),
+                path: path.to_owned(),
+                root,
+                state: Mutex::new(State::Closed {
+                    problem: Problem::NoAnswer,
+                    tried: Instant::now(),
+                    said: None,
+                }),
+                opening: AtomicBool::new(false),
+            }),
             files: Arc::clone(files),
+        }
+    }
+
+    /// Opens the directory on a file thread, its staging emptied of what a
+    /// crash left, and waits for it until `deadline`. The job sets the
+    /// state itself, so an answer that comes later is in use as soon as it
+    /// comes; one that has not come by `deadline` is `no-answer`. Owns
+    /// nothing borrowed, so the openings at start run together.
+    pub fn opening(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> impl Future<Output = ()> + Send + 'static {
+        let inner = Arc::clone(&self.inner);
+        let files = Arc::clone(&self.files);
+        async move {
+            let Some(opening) = Opening::take(&inner) else {
+                return;
+            };
+            let placed = tokio::time::timeout_at(
+                deadline,
+                files.run(move || {
+                    let Opening(inner) = &opening;
+                    let opened = open(inner.root.as_deref(), &inner.path, &inner.name);
+                    inner.settle(opened);
+                    drop(opening);
+                }),
+            )
+            .await;
+            let answered = match placed {
+                Ok(Some(answer)) => {
+                    matches!(tokio::time::timeout_at(deadline, answer).await, Ok(Ok(())))
+                }
+                Ok(None) | Err(_) => false,
+            };
+            if !answered {
+                inner.no_answer();
+            }
         }
     }
 
     /// The Resource `name`, just registered on `path`, which registration
     /// opened and marked.
-    pub fn registered(name: &str, path: &Path, opened: Arc<Opened>, files: &Arc<Files>) -> Self {
+    pub fn registered(
+        name: &str,
+        path: &Path,
+        opened: Arc<Opened>,
+        root: Option<Arc<Root>>,
+        files: &Arc<Files>,
+    ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 name: name.to_owned(),
                 path: path.to_owned(),
-                state: Mutex::new(State::Open(opened)),
+                root,
+                state: Mutex::new(State::Open {
+                    opened,
+                    checked: Instant::now(),
+                }),
+                opening: AtomicBool::new(false),
             }),
             files: Arc::clone(files),
         }
@@ -224,7 +307,7 @@ impl Directory {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
         {
-            State::Open(opened) => Some(Arc::clone(opened)),
+            State::Open { opened, .. } => Some(Arc::clone(opened)),
             State::Closed { .. } => None,
         }
     }
@@ -258,15 +341,6 @@ impl Directory {
     }
 }
 
-fn closed(problem: Problem) -> State {
-    let now = Instant::now();
-    State::Closed {
-        problem,
-        tried: now,
-        said: now,
-    }
-}
-
 fn say_unavailable(name: &str, problem: Problem) {
     log::record(
         "storage-unavailable",
@@ -274,61 +348,136 @@ fn say_unavailable(name: &str, problem: Problem) {
     );
 }
 
+/// What [`Inner::opened`] does once it has looked at the state.
+enum Next {
+    Use(Arc<Opened>),
+    /// Look whether the path still names the directory held.
+    Check(Arc<Opened>),
+    Unavailable,
+    Reopen,
+}
+
 impl Inner {
     /// The directory, opened: held since it was loaded, or opened again
-    /// now when it could not be used and [`RETRY`] has passed. On a file
-    /// thread.
-    fn opened(&self) -> Result<Arc<Opened>, Failure> {
-        {
+    /// now when it could not be used and [`RETRY`] has passed. At most
+    /// every [`RETRY`] it looks (one `stat`, following no link) whether the
+    /// path still names the directory held; when it does not, the one held
+    /// is let go and the path opened again. On a file thread.
+    fn opened(self: &Arc<Self>) -> Result<Arc<Opened>, Failure> {
+        let next = {
             let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
             match &mut *state {
-                State::Open(opened) => return Ok(Arc::clone(opened)),
-                State::Closed { tried, .. } if tried.elapsed() < RETRY => {
-                    return Err(Failure::Unavailable);
+                State::Open { opened, checked } if checked.elapsed() < RETRY => {
+                    Next::Use(Arc::clone(opened))
                 }
-                // Taken by this thread: the others answer `unavailable`
+                // Taken by this thread: the others use the one held
                 // meanwhile.
-                State::Closed { tried, .. } => *tried = Instant::now(),
+                State::Open { opened, checked } => {
+                    *checked = Instant::now();
+                    Next::Check(Arc::clone(opened))
+                }
+                State::Closed { tried, .. } if tried.elapsed() < RETRY => Next::Unavailable,
+                State::Closed { .. } => Next::Reopen,
+            }
+        };
+        match next {
+            Next::Use(opened) => Ok(opened),
+            Next::Check(opened) if self.still_named(&opened) => Ok(opened),
+            Next::Unavailable => Err(Failure::Unavailable),
+            Next::Check(_) | Next::Reopen => {
+                let Some(opening) = Opening::take(self) else {
+                    return Err(Failure::Unavailable);
+                };
+                let opened = open(self.root.as_deref(), &self.path, &self.name);
+                let settled = self.settle(opened);
+                drop(opening);
+                settled.ok_or(Failure::Unavailable)
             }
         }
-        let opened = open(&self.path, &self.name);
+    }
+
+    /// Whether the path still names the directory `opened`: one `stat`,
+    /// not following a link in its last component.
+    fn still_named(&self, opened: &Opened) -> bool {
+        rustix::fs::statat(CWD, &self.path, AtFlags::SYMLINK_NOFOLLOW)
+            .is_ok_and(|stat| (stat.st_dev, stat.st_ino) == (opened.dev, opened.ino))
+    }
+
+    /// Holds what an opening found, and says it: `storage-available` when
+    /// it can be used again after `storage-unavailable` was said;
+    /// `storage-unavailable` at once when it could be used before or the
+    /// problem is another, else at most every [`SAY_AGAIN`].
+    fn settle(&self, opened: Result<Opened, Problem>) -> Option<Arc<Opened>> {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let now = Instant::now();
         match opened {
             Ok(opened) => {
                 let opened = Arc::new(opened);
-                *state = State::Open(Arc::clone(&opened));
-                log::record("storage-available", json!({ "resource": &self.name }));
-                Ok(opened)
-            }
-            Err(now) => {
-                if let State::Closed { problem, said, .. } = &mut *state
-                    && (said.elapsed() >= SAY_AGAIN || *problem != now)
-                {
-                    *problem = now;
-                    *said = Instant::now();
-                    say_unavailable(&self.name, now);
+                if let State::Closed { said: Some(_), .. } = &*state {
+                    log::record("storage-available", json!({ "resource": &self.name }));
                 }
-                Err(Failure::Unavailable)
+                *state = State::Open {
+                    opened: Arc::clone(&opened),
+                    checked: now,
+                };
+                Some(opened)
             }
+            Err(found) => {
+                let said = match &*state {
+                    State::Closed {
+                        problem,
+                        said: Some(said),
+                        ..
+                    } if *problem == found && said.elapsed() < SAY_AGAIN => *said,
+                    _ => {
+                        say_unavailable(&self.name, found);
+                        now
+                    }
+                };
+                *state = State::Closed {
+                    problem: found,
+                    tried: now,
+                    said: Some(said),
+                };
+                None
+            }
+        }
+    }
+
+    /// The opening at start was not answered in time: `no-answer`, said
+    /// once, unless the opening has said something meanwhile.
+    fn no_answer(&self) {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if let State::Closed {
+            problem,
+            said: said @ None,
+            ..
+        } = &mut *state
+        {
+            *problem = Problem::NoAnswer;
+            *said = Some(Instant::now());
+            say_unavailable(&self.name, Problem::NoAnswer);
         }
     }
 }
 
-/// Opens the directory of the Resource `name` at `path`, checks its marker
-/// and empties its staging of what a crash left (making it if it is not
-/// there).
-fn open(path: &Path, name: &str) -> Result<Opened, Problem> {
-    let fd = rustix::fs::openat(
-        CWD,
-        path,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .map_err(|e| match e {
-        Errno::NOTDIR | Errno::LOOP => Problem::NotADirectory,
-        _ => Problem::Missing,
+/// Opens the directory of the Resource `name` at `path`, reached from the
+/// storage root `root` one component at a time following no link, as a
+/// registration reaches it; checks its marker and empties its staging of
+/// what a crash left (making it if it is not there).
+fn open(root: Option<&Root>, path: &Path, name: &str) -> Result<Opened, Problem> {
+    let root = root.ok_or(Problem::OutsideStorageRoot)?;
+    let segments = path
+        .to_str()
+        .and_then(segments_of)
+        .ok_or(Problem::OutsideStorageRoot)?;
+    let beneath = root.beneath(&segments).ok_or(Problem::OutsideStorageRoot)?;
+    let walked = root.walk(beneath).map_err(|e| match e {
+        Walk::Link => Problem::Link,
+        Walk::NotADirectory => Problem::NotADirectory,
+        Walk::Missing => Problem::Missing,
     })?;
-    let opened = Opened::of(fd).map_err(|_| Problem::Missing)?;
+    let opened = walked.opened;
     match read_marker(opened.fd.as_fd()) {
         Marker::None => return Err(Problem::NotMarked),
         Marker::Names(marked) if marked != name => return Err(Problem::MarkedForAnother),
@@ -385,8 +534,18 @@ fn marker_of(name: &str) -> String {
     )
 }
 
-/// Removes what is in `.vibe-staging/` (what a crash left), making it when
-/// it is not there. Done when the Resource is loaded, before any put.
+/// The beginning of the name of every staging file this run of the
+/// program writes: `put-<a mark made once, at the first>-`. What an
+/// earlier run left has another.
+fn this_run() -> &'static str {
+    static RUN: OnceLock<String> = OnceLock::new();
+    RUN.get_or_init(|| format!("put-{}-", uuid::Uuid::new_v4().simple()))
+}
+
+/// Removes what is in `.vibe-staging/` that an earlier run left (a crash),
+/// making it when it is not there. Done each time the directory is opened;
+/// the staging files of this run's puts, which may be under way, are
+/// spared (their names begin with [`this_run`]).
 fn empty_staging(opened: &Opened) {
     let Ok(staging) = staging(opened) else {
         return;
@@ -397,6 +556,9 @@ fn empty_staging(opened: &Opened) {
     for entry in dir.flatten() {
         let name = entry.file_name().to_bytes();
         if name == b"." || name == b".." {
+            continue;
+        }
+        if name.starts_with(this_run().as_bytes()) {
             continue;
         }
         if entry.file_type() != FileType::Directory {
@@ -690,7 +852,7 @@ fn put(
 ) -> Result<Metadata, Failure> {
     let bytes = body.decode().ok_or(Failure::Unavailable)?;
     let staging = staging(opened)?;
-    let name = format!("put-{}", uuid::Uuid::new_v4().simple());
+    let name = format!("{}{}", this_run(), uuid::Uuid::new_v4().simple());
     let fd = rustix::fs::openat(
         &staging,
         name.as_str(),
@@ -723,58 +885,115 @@ fn put(
     for _ in 0..PUT_TRIES {
         let (chain, made) = make_folders(opened, &segments)?;
         let parent = chain.last().map_or(opened.fd.as_fd(), AsFd::as_fd);
-        match rustix::fs::statat(parent, last, AtFlags::SYMLINK_NOFOLLOW) {
-            Ok(stat) => match FileType::from_raw_mode(stat.st_mode) {
-                FileType::RegularFile => {}
-                FileType::Directory => return Err(Failure::KeyConflict),
-                FileType::Symlink => return Err(Failure::NotReachable(Unreachable::Link)),
-                _ => return Err(Failure::NotReachable(Unreachable::NotAFile)),
-            },
-            Err(Errno::NOENT) => {}
-            Err(e) => return Err(failure(e)),
-        }
-        if until.over() {
-            return Err(over(until));
-        }
-        match rustix::fs::renameat(&staged.staging, staged.name.as_str(), parent, last) {
-            Ok(()) => {
-                staged.landed = true;
-                rustix::fs::fsync(parent).map_err(failure)?;
-                // Each folder made, in the folder that holds it.
-                for index in made {
-                    let holder = match index.checked_sub(1) {
-                        None => Some(opened.fd.as_fd()),
-                        Some(before) => chain.get(before).map(AsFd::as_fd),
-                    };
-                    if let Some(holder) = holder {
-                        rustix::fs::fsync(holder).map_err(failure)?;
-                    }
-                }
-                let stat = rustix::fs::fstat(&staged.file).map_err(failure)?;
-                return Ok(Metadata {
-                    content_type: content_type
-                        .unwrap_or_else(|| content_type_of(key.as_str()).to_owned()),
-                    key: key.into_string(),
-                    size: u64::try_from(stat.st_size).unwrap_or(0),
-                    modified: stat.st_mtime,
-                });
-            }
+        match land(&mut staged, parent, last, until) {
+            Ok(true) => {}
             // A folder of it was removed meanwhile (a delete of its last
             // file): walked again.
-            Err(Errno::NOENT) => {}
-            Err(Errno::ISDIR | Errno::NOTEMPTY | Errno::EXIST) => return Err(Failure::KeyConflict),
-            Err(e) => return Err(failure(e)),
+            Ok(false) => {
+                unmake(opened, &chain, &segments, &made);
+                continue;
+            }
+            Err(failure) => {
+                unmake(opened, &chain, &segments, &made);
+                return Err(failure);
+            }
         }
+        rustix::fs::fsync(parent).map_err(failure)?;
+        // Each folder made, in the folder that holds it.
+        for index in made {
+            if let Some(holder) = holder_of(opened, &chain, index) {
+                rustix::fs::fsync(holder).map_err(failure)?;
+            }
+        }
+        let stat = rustix::fs::fstat(&staged.file).map_err(failure)?;
+        return Ok(Metadata {
+            content_type: content_type.unwrap_or_else(|| content_type_of(key.as_str()).to_owned()),
+            key: key.into_string(),
+            size: u64::try_from(stat.st_size).unwrap_or(0),
+            modified: stat.st_mtime,
+        });
     }
     Err(Failure::Unavailable)
 }
 
+/// Renames the staged file onto `last` in `parent`: `true` once it landed,
+/// `false` when a folder of its key was removed meanwhile.
+fn land(
+    staged: &mut Staged,
+    parent: BorrowedFd<'_>,
+    last: &str,
+    until: &Until,
+) -> Result<bool, Failure> {
+    match rustix::fs::statat(parent, last, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(stat) => match FileType::from_raw_mode(stat.st_mode) {
+            FileType::RegularFile => {}
+            FileType::Directory => return Err(Failure::KeyConflict),
+            FileType::Symlink => return Err(Failure::NotReachable(Unreachable::Link)),
+            _ => return Err(Failure::NotReachable(Unreachable::NotAFile)),
+        },
+        Err(Errno::NOENT) => {}
+        Err(e) => return Err(failure(e)),
+    }
+    if until.over() {
+        return Err(over(until));
+    }
+    match rustix::fs::renameat(&staged.staging, staged.name.as_str(), parent, last) {
+        Ok(()) => {
+            staged.landed = true;
+            Ok(true)
+        }
+        Err(Errno::NOENT) => Ok(false),
+        Err(Errno::ISDIR | Errno::NOTEMPTY | Errno::EXIST) => Err(Failure::KeyConflict),
+        Err(e) => Err(failure(e)),
+    }
+}
+
+/// The folder that holds the folder `index` of `chain`: the directory for
+/// the first.
+fn holder_of<'a>(opened: &'a Opened, chain: &'a [OwnedFd], index: usize) -> Option<BorrowedFd<'a>> {
+    match index.checked_sub(1) {
+        None => Some(opened.fd.as_fd()),
+        Some(before) => chain.get(before).map(AsFd::as_fd),
+    }
+}
+
+/// Removes the folders a put made (`made`, indexes of `segments` and of
+/// `chain`) when the put failed: deepest first, each only when empty,
+/// stopping at the first that does not go.
+fn unmake(opened: &Opened, chain: &[OwnedFd], segments: &[&str], made: &[usize]) {
+    for &index in made.iter().rev() {
+        let (Some(holder), Some(segment)) = (holder_of(opened, chain, index), segments.get(index))
+        else {
+            return;
+        };
+        if rustix::fs::unlinkat(holder, *segment, AtFlags::REMOVEDIR).is_err() {
+            return;
+        }
+        rustix::fs::fsync(holder).ok();
+    }
+}
+
 /// The folders `segments` opened from the directory, each one that is not
 /// there made (mode `0750`); and the indexes of those made. A file in the
-/// way is `key-conflict`.
+/// way is `key-conflict`. When it fails, the folders it made are removed.
 fn make_folders(opened: &Opened, segments: &[&str]) -> Result<(Vec<OwnedFd>, Vec<usize>), Failure> {
     let mut chain: Vec<OwnedFd> = Vec::with_capacity(segments.len());
     let mut made = Vec::new();
+    match make_folders_into(opened, segments, &mut chain, &mut made) {
+        Ok(()) => Ok((chain, made)),
+        Err(failure) => {
+            unmake(opened, &chain, segments, &made);
+            Err(failure)
+        }
+    }
+}
+
+fn make_folders_into(
+    opened: &Opened,
+    segments: &[&str],
+    chain: &mut Vec<OwnedFd>,
+    made: &mut Vec<usize>,
+) -> Result<(), Failure> {
     for (index, segment) in segments.iter().enumerate() {
         let mut tries = 0;
         let fd = loop {
@@ -805,7 +1024,7 @@ fn make_folders(opened: &Opened, segments: &[&str]) -> Result<(Vec<OwnedFd>, Vec
         };
         chain.push(fd);
     }
-    Ok((chain, made))
+    Ok(())
 }
 
 fn delete(opened: &Opened, key: &Key, until: &Until) -> Result<(), Failure> {
@@ -863,9 +1082,19 @@ fn delete(opened: &Opened, key: &Key, until: &Until) -> Result<(), Failure> {
 /// folder; ordered by its key in a list (a folder's name with `/`).
 #[derive(PartialEq, Eq)]
 struct Entry {
-    order: Vec<u8>,
     name: String,
     folder: bool,
+}
+
+/// The bytes a name is ordered by in a list: a folder's name with `/`.
+fn order_of(name: &[u8], folder: bool) -> impl Iterator<Item = &u8> {
+    name.iter().chain(folder.then_some(&b'/'))
+}
+
+impl Entry {
+    fn order(&self) -> impl Iterator<Item = &u8> {
+        order_of(self.name.as_bytes(), self.folder)
+    }
 }
 
 impl PartialOrd for Entry {
@@ -876,7 +1105,7 @@ impl PartialOrd for Entry {
 
 impl Ord for Entry {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.order.cmp(&other.order)
+        self.order().cmp(other.order())
     }
 }
 
@@ -888,11 +1117,12 @@ struct From {
 }
 
 impl From {
-    fn admits(&self, order: &[u8]) -> bool {
+    fn admits<'o>(&self, order: impl Iterator<Item = &'o u8>) -> bool {
+        let at = order.copied().cmp(self.order.iter().copied());
         if self.inclusive {
-            order >= self.order.as_slice()
+            at.is_ge()
         } else {
-            order > self.order.as_slice()
+            at.is_gt()
         }
     }
 }
@@ -950,25 +1180,21 @@ fn smallest(
         let Some(folder) = kind_of(dir, entry.file_name(), entry.file_type()) else {
             continue;
         };
-        let mut order = bytes.to_vec();
-        if folder {
-            order.push(b'/');
-        }
-        if from.is_some_and(|f| !f.admits(&order)) {
+        if from.is_some_and(|f| !f.admits(order_of(bytes, folder))) {
             continue;
         }
-        if kept.len() >= want && kept.peek().is_some_and(|top| order >= top.order) {
+        if kept.len() >= want
+            && kept
+                .peek()
+                .is_some_and(|top| order_of(bytes, folder).cmp(top.order()).is_ge())
+        {
             left = true;
             continue;
         }
         let Ok(name) = String::from_utf8(bytes.to_vec()) else {
             continue;
         };
-        kept.push(Entry {
-            order,
-            name,
-            folder,
-        });
+        kept.push(Entry { name, folder });
         if kept.len() > want {
             kept.pop();
             left = true;
@@ -1061,7 +1287,7 @@ impl Lister<'_> {
             match (left, entries.last()) {
                 (true, Some(last)) => {
                     from = Some(From {
-                        order: last.order.clone(),
+                        order: last.order().copied().collect(),
                         inclusive: false,
                     });
                 }
@@ -1208,15 +1434,6 @@ pub enum Refused {
 }
 
 impl Refused {
-    /// The HTTP status.
-    pub fn status(self) -> u16 {
-        match self {
-            Self::InUse => 409,
-            Self::Busy => 503,
-            _ => 422,
-        }
-    }
-
     pub fn reason(self) -> &'static str {
         match self {
             Self::NotConfigured => "storage-not-configured",
@@ -1355,6 +1572,22 @@ fn segments_of(text: &str) -> Option<Vec<String>> {
     Some(segments)
 }
 
+/// Why a walk from the root did not reach a directory.
+enum Walk {
+    Link,
+    Missing,
+    NotADirectory,
+}
+
+/// A directory reached from the root: opened, the identities of the root
+/// and of each folder on the way, and whether one of those folders holds a
+/// marker.
+struct Walked {
+    opened: Opened,
+    ancestors: Vec<(u64, u64)>,
+    marked_above: bool,
+}
+
 impl Root {
     /// The storage root `text`: an absolute path, else a message for the
     /// start-up failure naming `--storage-root`.
@@ -1451,58 +1684,18 @@ impl Root {
         taken: &[Taken],
     ) -> Result<Prepared, Refused> {
         let segments = segments_of(directory).ok_or(Refused::Outside)?;
-        let beneath = segments
-            .strip_prefix(self.segments.as_slice())
-            .filter(|rest| !rest.is_empty())
-            .ok_or(Refused::Outside)?
-            .to_vec();
+        let beneath = self.beneath(&segments).ok_or(Refused::Outside)?;
         let mut path = self.path.clone();
-        path.extend(&beneath);
-        let root = match rustix::fs::openat(
-            CWD,
-            &self.path,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-            Mode::empty(),
-        ) {
-            Ok(fd) => Opened::of(fd).map_err(|_| Refused::Missing)?,
-            Err(Errno::NOTDIR) => return Err(Refused::NotADirectory),
-            Err(_) => return Err(Refused::Missing),
-        };
-        // Each component beneath the root, one at a time, never through a
-        // link; the identity of each, and whether one holds a marker.
-        let mut current = root;
-        let mut ancestors: Vec<(u64, u64)> = vec![(current.dev, current.ino)];
-        let mut marked_above = false;
-        for (index, segment) in beneath.iter().enumerate() {
-            match rustix::fs::statat(&current.fd, segment.as_str(), AtFlags::SYMLINK_NOFOLLOW) {
-                Ok(stat) => match FileType::from_raw_mode(stat.st_mode) {
-                    FileType::Symlink => return Err(Refused::Link),
-                    FileType::Directory => {}
-                    _ => return Err(Refused::NotADirectory),
-                },
-                Err(Errno::NOENT) => return Err(Refused::Missing),
-                Err(Errno::NOTDIR) => return Err(Refused::NotADirectory),
-                Err(_) => return Err(Refused::Missing),
-            }
-            let fd = match rustix::fs::openat(
-                &current.fd,
-                segment.as_str(),
-                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                Mode::empty(),
-            ) {
-                Ok(fd) => fd,
-                Err(Errno::LOOP) => return Err(Refused::Link),
-                Err(Errno::NOTDIR) => return Err(Refused::NotADirectory),
-                Err(_) => return Err(Refused::Missing),
-            };
-            current = Opened::of(fd).map_err(|_| Refused::Missing)?;
-            if index + 1 < beneath.len() {
-                ancestors.push((current.dev, current.ino));
-                marked_above |=
-                    rustix::fs::statat(&current.fd, MARKER, AtFlags::SYMLINK_NOFOLLOW).is_ok();
-            }
-        }
-        let opened = current;
+        path.extend(beneath);
+        let Walked {
+            opened,
+            ancestors,
+            marked_above,
+        } = self.walk(beneath).map_err(|e| match e {
+            Walk::Link => Refused::Link,
+            Walk::NotADirectory => Refused::NotADirectory,
+            Walk::Missing => Refused::Missing,
+        })?;
         probe(&opened)?;
         let mut claims = self.claims_within(CLAIM_WAIT)?;
         // In use: another Resource's directory, inside one, or holding one;
@@ -1580,6 +1773,66 @@ impl Root {
             made_marker,
             made_staging,
             claim,
+        })
+    }
+
+    /// The segments of `segments` (an absolute path's) beneath the root,
+    /// when it is beneath it and not the root itself.
+    fn beneath<'s>(&self, segments: &'s [String]) -> Option<&'s [String]> {
+        segments
+            .strip_prefix(self.segments.as_slice())
+            .filter(|rest| !rest.is_empty())
+    }
+
+    /// The directory `beneath` the root, reached from the root one
+    /// component at a time, never through a link: as a registration checks
+    /// it and as every opening of a Resource's directory reaches it.
+    fn walk(&self, beneath: &[String]) -> Result<Walked, Walk> {
+        let root = match rustix::fs::openat(
+            CWD,
+            &self.path,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(fd) => Opened::of(fd).map_err(|_| Walk::Missing)?,
+            Err(Errno::NOTDIR) => return Err(Walk::NotADirectory),
+            Err(_) => return Err(Walk::Missing),
+        };
+        let mut current = root;
+        let mut ancestors: Vec<(u64, u64)> = vec![(current.dev, current.ino)];
+        let mut marked_above = false;
+        for (index, segment) in beneath.iter().enumerate() {
+            match rustix::fs::statat(&current.fd, segment.as_str(), AtFlags::SYMLINK_NOFOLLOW) {
+                Ok(stat) => match FileType::from_raw_mode(stat.st_mode) {
+                    FileType::Symlink => return Err(Walk::Link),
+                    FileType::Directory => {}
+                    _ => return Err(Walk::NotADirectory),
+                },
+                Err(Errno::NOTDIR) => return Err(Walk::NotADirectory),
+                Err(_) => return Err(Walk::Missing),
+            }
+            let fd = match rustix::fs::openat(
+                &current.fd,
+                segment.as_str(),
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            ) {
+                Ok(fd) => fd,
+                Err(Errno::LOOP) => return Err(Walk::Link),
+                Err(Errno::NOTDIR) => return Err(Walk::NotADirectory),
+                Err(_) => return Err(Walk::Missing),
+            };
+            current = Opened::of(fd).map_err(|_| Walk::Missing)?;
+            if index + 1 < beneath.len() {
+                ancestors.push((current.dev, current.ino));
+                marked_above |=
+                    rustix::fs::statat(&current.fd, MARKER, AtFlags::SYMLINK_NOFOLLOW).is_ok();
+            }
+        }
+        Ok(Walked {
+            opened: current,
+            ancestors,
+            marked_above,
         })
     }
 
