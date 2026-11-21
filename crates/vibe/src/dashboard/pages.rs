@@ -329,8 +329,9 @@ fn application_attributes(block: &Block<'_>, name: &str) -> String {
         .serving
         .map_or_else(|| "none".to_owned(), |number| number.to_string());
     format!(
-        "data-vm-application=\"{name}\" data-vm-relation=\"{}\" data-vm-serving=\"{serving}\"",
-        block.relation
+        "data-vm-application=\"{name}\" data-vm-relation=\"{}\" data-vm-serving=\"{serving}\" data-vm-attention=\"{}\"",
+        block.relation,
+        attention(block).word()
     )
 }
 
@@ -365,7 +366,7 @@ fn card(out: &mut String, block: &Block<'_>) {
     ));
     if block.serving.is_none() {
         out.push_str(&not_deployed());
-    } else if let Some(mark) = worst_standing(block) {
+    } else if let Some(mark) = attention(block).mark() {
         out.push_str(&mark);
     }
     out.push_str("</div>");
@@ -382,33 +383,65 @@ fn card(out: &mut String, block: &Block<'_>) {
     out.push_str("</article>");
 }
 
-/// The mark a card of the list carries when a part of the Application
-/// will not work for the person: the worst of its Resources' standings
-/// (whom to ask, and which part, are on its own page).
-fn worst_standing(block: &Block<'_>) -> Option<String> {
-    let declared = block.declared?;
-    let mut worst = 0;
-    for (resource, level) in declared {
-        if let Some(seen) = block.seen.get(resource.as_str()) {
-            let rank = match standing(*level, seen).1 {
-                "lower" | "none" => 3,
-                "not-registered" => 2,
-                "unknown" => 1,
-                _ => 0,
-            };
-            worst = worst.max(rank);
+/// The worst standing among the Resources the serving Version declares:
+/// one computation for both `data-vm-attention` and the list's mark, so
+/// the two cannot disagree.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Attention {
+    None,
+    Unknown,
+    NotRegistered,
+    MissingAccess,
+}
+
+impl Attention {
+    /// As `data-vm-attention` says it.
+    fn word(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Unknown => "unknown",
+            Self::NotRegistered => "not-registered",
+            Self::MissingAccess => "missing-access",
         }
     }
-    let (class, icon, words) = match worst {
-        3 => ("err", Icon::Cross, "Missing access"),
-        2 => ("warn", Icon::Warn, "Not set up"),
-        1 => ("", Icon::Pending, "Access unknown"),
-        _ => return None,
+
+    /// The mark a card of the list carries when a part of the Application
+    /// will not work for the person (whom to ask, and which part, are on
+    /// its own page); none for [`Attention::None`].
+    fn mark(self) -> Option<String> {
+        let (class, icon, words) = match self {
+            Self::MissingAccess => ("err", Icon::Cross, "Missing access"),
+            Self::NotRegistered => ("warn", Icon::Warn, "Not set up"),
+            Self::Unknown => ("", Icon::Pending, "Access unknown"),
+            Self::None => return None,
+        };
+        Some(format!(
+            "<span class=\"pill {class}\">{}{words}</span>",
+            icon.svg()
+        ))
+    }
+}
+
+/// The worst standing of the Application's declared Resources for the
+/// person; [`Attention::None`] with no Resource declared or no Version
+/// serving.
+fn attention(block: &Block<'_>) -> Attention {
+    let Some(declared) = block.declared.filter(|_| block.serving.is_some()) else {
+        return Attention::None;
     };
-    Some(format!(
-        "<span class=\"pill {class}\">{}{words}</span>",
-        icon.svg()
-    ))
+    let mut worst = Attention::None;
+    for (resource, level) in declared {
+        if let Some(seen) = block.seen.get(resource.as_str()) {
+            let this = match standing(*level, seen).1 {
+                "lower" | "none" => Attention::MissingAccess,
+                "not-registered" => Attention::NotRegistered,
+                "unknown" => Attention::Unknown,
+                _ => Attention::None,
+            };
+            worst = worst.max(this);
+        }
+    }
+    worst
 }
 
 /// What the User holds of a Resource declared at `declared`, as
