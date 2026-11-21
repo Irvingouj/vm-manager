@@ -39,10 +39,14 @@ const RESOURCE_KEYS: [&str; 8] = [
     "your_access",
 ];
 
-const APPLICATION_KEYS: [&str; 5] = [
+// `disabled` from the ticket "Platform administrators see every
+// Application, disable any, and query the Operation log" on (CONTRACT.md,
+// "What Platform administrators see and stop: What every surface shows").
+const APPLICATION_KEYS: [&str; 6] = [
     "address",
     "contributor",
     "description",
+    "disabled",
     "name",
     "serving_version",
 ];
@@ -196,9 +200,11 @@ fn get_applications_lists_those_the_user_contributes_to_by_name() {
         body,
         json!({ "applications": [
             { "name": "alpha-tool", "description": null, "address": format!("alpha-tool.{DOMAIN}"),
-              "contributor": true, "serving_version": null },
+              "contributor": true, "serving_version": null,
+              "disabled": false },
             { "name": "zeta-board", "description": "Where incidents are triaged",
-              "address": format!("zeta-board.{DOMAIN}"), "contributor": true, "serving_version": 2 },
+              "address": format!("zeta-board.{DOMAIN}"), "contributor": true, "serving_version": 2,
+              "disabled": false },
         ] }),
         "expected alice's Applications, by name, and not bob's"
     );
@@ -209,7 +215,8 @@ fn get_applications_lists_those_the_user_contributes_to_by_name() {
         vm.api_as(&bob).list_applications().json(),
         json!({ "applications": [
             { "name": "bobs-app", "description": null, "address": format!("bobs-app.{DOMAIN}"),
-              "contributor": true, "serving_version": null },
+              "contributor": true, "serving_version": null,
+              "disabled": false },
         ] })
     );
     // Sharing a Group with a Contributor is not being one.

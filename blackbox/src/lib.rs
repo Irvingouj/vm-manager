@@ -106,6 +106,10 @@
 //!   files of `deploy/` copied unchanged to a folder of the test's, an
 //!   installation started from them with Compose and taken down whatever
 //!   happens, and the identity provider on the Docker bridge's address;
+//! - [`admin`] is what the tests of what Platform administrators see and
+//!   stop share: the list of every Application, disabling and enabling,
+//!   what a disabled Application answers, usage, and the Operation log
+//!   read with its filters a page at a time;
 //! - [`release`] is what the tests of the first release share: the
 //!   package's version, the scripts of `scripts/` run by their interface
 //!   with a time limit, a throwaway clone of the repository for a tag or a
@@ -123,6 +127,7 @@
     reason = "test code: a failed expectation here is a failing test, not a crash on the serving path"
 )]
 
+pub mod admin;
 pub mod api;
 pub mod browser;
 pub mod changed_outside;

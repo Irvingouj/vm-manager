@@ -259,9 +259,11 @@ fn vm_applications_lists_those_the_user_contributes_to() {
         listed,
         json!({ "applications": [
             { "name": "alpha-tool", "description": "Rota of who is on call",
-              "address": format!("alpha-tool.{DOMAIN}"), "contributor": true, "serving_version": null },
+              "address": format!("alpha-tool.{DOMAIN}"), "contributor": true, "serving_version": null,
+              "disabled": false },
             { "name": "zeta-board", "description": "Where incidents are triaged",
-              "address": format!("zeta-board.{DOMAIN}"), "contributor": true, "serving_version": 1 },
+              "address": format!("zeta-board.{DOMAIN}"), "contributor": true, "serving_version": 1,
+              "disabled": false },
         ] }),
         "expected alice's Applications by name, and not bob's"
     );

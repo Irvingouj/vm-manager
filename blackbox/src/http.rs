@@ -23,9 +23,10 @@ use serde_json::Value;
 /// answer.
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The largest answer the client reads. A larger one is an error, not a
-/// bigger buffer.
-const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+/// The largest answer the client reads, its head included. A larger one is
+/// an error, not a bigger buffer. A body of 4 MiB (the most a page of the
+/// Operation log holds) and its head fit.
+const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024 + 64 * 1024;
 
 /// A request this large or larger is written on its own thread.
 const WRITE_ON_A_THREAD_FROM: usize = 64 * 1024;

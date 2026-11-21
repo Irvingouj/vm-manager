@@ -397,11 +397,16 @@ pub struct Deployed {
     pub notes: Vec<Value>,
 }
 
-/// The fields of what `vibe deploy --json` prints, sorted.
-pub const DEPLOYED_KEYS: [&str; 11] = [
+/// The fields of what `vibe deploy --json` prints, sorted. `disabled` is
+/// there from the ticket "Platform administrators see every Application,
+/// disable any, and query the Operation log" on: null, or `{ since, by }`
+/// when the Application is disabled (CONTRACT.md, "What Platform
+/// administrators see and stop: What every surface shows").
+pub const DEPLOYED_KEYS: [&str; 12] = [
     "address",
     "application",
     "created",
+    "disabled",
     "git_commit",
     "migrations_applied",
     "notes",
