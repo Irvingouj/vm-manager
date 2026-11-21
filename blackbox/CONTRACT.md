@@ -2868,3 +2868,325 @@ A page with the status the API gives, an element `data-vm-error="<the API's reas
 - Showing times in the reader's own time zone (no script: the page cannot know it).
 - Counting Applications, Resources or entries over the installation; usage over another period than 30 days.
 - A paged list of Resources, and a bound on the number of Resources and of a Resource's Grants: the API answers all of them today; "Resources and Grants in full" sets the bound and the pages follow it.
+
+## Storage (ticket: Storage: a shared, named file Resource, on a mounted directory now and S3 later)
+
+A second kind of Resource: a named place of files (ADR 0019). A Platform administrator registers it on a directory beneath the installation's storage root; Groups are given Grants on it at `read` or `write`; an Application declares it in its Manifest with `kind: "storage"` and reads and writes its files through the SDK, as the User of the request, each operation decided by the Authorization decision and recorded in the Operation log. Everything "Resources and Grants", "Who is allowed", "The Operation log" and "A write whose answer is lost" say of a Resource holds for a Storage Resource unless this section says otherwise. A Resource registered before this ticket is of kind `postgres`, as it always was.
+
+This section builds on "Serving", "The platform's API", "Resources and Grants", "Who is allowed", "The Operation log", "The SDK", "The tool", "Pulling a Resource's structure", "A project", "Deploying", the two sections of the local loop, "The Dashboard", "What Platform administrators see and stop" and "Installing".
+
+### The storage root
+
+```
+vibe serve ... [--storage-root <directory>]
+```
+
+- `--storage-root` names the one directory beneath which every Storage Resource's directory must be. It is an absolute path; one that is not is a start-up failure ("Starting and stopping": non-zero within 15 seconds, a message naming `--storage-root`).
+- Without it, nothing else changes, and every Storage registration is refused `storage-not-configured`.
+- With it, when it is not there, is not a directory, or the program cannot create a file in it, `vibe serve` **starts all the same** and writes before `listening` one record `{"event":"storage-root-unusable","problem":"missing" | "not-a-directory" | "not-writable"}`; registrations are then refused with the matching reason below, and Storage Resources already registered are as "When the directory cannot be used" says.
+
+### Registering a Storage Resource
+
+`POST /v1/resources`, by a Platform administrator, as for a database, with `kind` `storage` and `location` in place of `connection`:
+
+```json
+{ "name": "marketing", "kind": "storage", "description": "...", "owner": "...", "contact": "whom to ask for access",
+  "location": { "backend": "directory", "directory": "/var/lib/vibe/storage/marketing" } }
+```
+
+- `kind` is `postgres` or `storage`; anything else is `400 malformed`. A `storage` Resource has `location` and no `connection`; a `postgres` one `connection` and no `location`; either the other way, or both, or neither: `400 malformed`. `location.backend` is `directory` (the only one in this ticket; anything else is `400 malformed`); `location.directory` is a string.
+- `name`, `description`, `owner`, `contact` and the name's rules are as for a database ("Resources and Grants"): `400 invalid-name`, `409 name-taken`.
+- Then the directory is checked, in this order; the first that fails refuses, and nothing is registered or written:
+
+| Status | When | `reason` |
+|---|---|---|
+| 422 | The program was started without `--storage-root` | `storage-not-configured` |
+| 422 | `directory` is not an absolute path, is the storage root itself, or is not beneath it (also by a `..`, an empty segment or a `.` in it, which are not taken) | `outside-storage-root` |
+| 422 | A component of it beneath the storage root, or the directory itself, is a symbolic link | `directory-link` |
+| 422 | It is not there | `directory-missing` |
+| 422 | It is there and is not a directory | `not-a-directory` |
+| 422 | The program cannot create a file in it (shown by creating one and removing it) | `directory-not-writable` |
+| 422 | Its file system does not keep extended attributes in the `user.` namespace | `directory-unusable` |
+| 409 | It is the directory of another Resource of this installation, is inside one, or holds one; or it holds a `.vibe-resource` file naming another Resource | `directory-in-use` |
+
+  Each message says what to do (make the directory on the host and give it to the program's user; choose a directory of its own; start `vibe serve` with `--storage-root`). **No message, answer or log record holds the directory's path**, as none holds a database's connection.
+- When the checks pass, the program writes in the directory a file `.vibe-resource` (whose contents are the program's own; it names the Resource) and a directory `.vibe-staging/`, then registers the Resource. A `.vibe-resource` naming this same Resource is taken (a registration whose answer was lost, asked again after the Resource was removed from memory).
+- Answers `201` with `{ "name", "kind": "storage", "description", "owner", "contact", "created_by", "created_at" }`: nothing of `location`.
+- `GET /v1/resources` and `GET /v1/resources/<name>` show it like any Resource, with `"kind": "storage"` and `your_access` (`read`, `write` or null). Nothing of its location.
+
+### Grants on it
+
+`POST /v1/resources/<name>/grants` as for a database, with `access` `read` or `write`. `structure` on a Storage Resource is `400 malformed`, the message saying that a Storage Resource has two levels, `read` and `write`. A User holds the highest level of their Groups' Grants, as ever. `GET /v1/resources/<name>/grants` is unchanged.
+
+### When the directory cannot be used
+
+The program keeps each Storage Resource's directory open from when it loads the Resource (at start, at registration). When it cannot open it, or the directory's `.vibe-resource` is not there or names another Resource (a mount forgotten, another disk), the program's log has `{"event":"storage-unavailable","resource":"<name>","problem":"missing" | "not-a-directory" | "not-marked" | "marked-for-another"}` at most once a minute while it lasts, and every allowed operation on the Resource fails `{ error: { kind: "unavailable" } }`, its Operation log entry `failed` with `error` `unavailable`. Nothing is written anywhere then. It tries again at most every 10 seconds, at an operation; once the directory can be used, operations work, with no restart.
+
+### The Manifest, Declared access and a Version
+
+```ts
+resources: {
+  devops:    { kind: "postgres", access: "read" },
+  marketing: { kind: "storage",  access: "write" },
+}
+```
+
+- `kind` is `postgres` or `storage`. For `storage`, `access` is `read` or `write`. The SDK's tooling (`manifest`) answers `manifest-invalid` for any other kind or level, its message naming the two kinds.
+- `POST /v1/applications/<name>/versions` takes `declared_access.resources.<name>.kind` `storage` with `access` `read` or `write`; `storage` with `structure`, or a kind that is neither: `400 malformed`. `structures` may not name a Resource declared `storage` (`400 malformed`): it has no structure.
+- A Version's Declared access is shown as sent wherever it is shown (`GET /v1/applications/<name>/versions/<n>`, `GET /v1/admin/applications`).
+
+### Through the SDK
+
+```ts
+import { defineApp, Refused, OperationFailed } from "@vm/sdk";
+
+export default defineApp(manifest, {
+  async fetch(request, ctx) {
+    const files = ctx.user().storage("marketing");
+    const page = await files.list({ prefix: "reports/", delimiter: "/" });
+    const info = await files.head("reports/q3.pdf");                     // FileInfo | null
+    const file = await files.get("reports/q3.pdf");                      // StoredFile | null
+    await files.put("reports/q4.pdf", await request.arrayBuffer(), { contentType: "application/pdf" });
+    await files.delete("reports/old.pdf");
+    return file ? new Response(file.body, { headers: { "content-type": file.contentType } }) : new Response("none", { status: 404 });
+  },
+});
+```
+
+The types, exported by `@vm/sdk`:
+
+```ts
+export interface StorageDeclaration { readonly kind: "storage"; readonly access: "read" | "write" }
+// ResourceDeclaration becomes DatabaseDeclaration ({ kind: "postgres", access }) | StorageDeclaration.
+
+export interface FileInfo {
+  readonly key: string;
+  readonly size: number;            // bytes
+  readonly contentType: string;
+  readonly lastModified: Date;      // whole seconds
+}
+export interface StoredFile extends FileInfo {
+  readonly body: Uint8Array;
+  text(): string;                   // body decoded as UTF-8 (malformed bytes become U+FFFD)
+}
+export interface ListOptions {
+  readonly prefix?: string;         // "" without it
+  readonly delimiter?: "/";
+  readonly limit?: number;          // 1 to 1000; 100 without it
+  readonly cursor?: string;         // a cursor a list answered
+}
+export interface FileList {
+  readonly files: readonly FileInfo[];
+  readonly folders: readonly string[];   // with delimiter "/" only; each ends with "/"
+  readonly cursor: string | null;        // null when nothing follows
+}
+export type FileBody = string | Uint8Array | ArrayBuffer;   // a string is written as UTF-8
+export interface PutOptions { readonly contentType?: string }
+
+export interface ReadOnlyStorage {
+  head(key: string): Promise<FileInfo | null>;
+  get(key: string): Promise<StoredFile | null>;
+  list(options?: ListOptions): Promise<FileList>;
+}
+export interface Storage extends ReadOnlyStorage {
+  put(key: string, body: FileBody, options?: PutOptions): Promise<FileInfo>;
+  delete(key: string): Promise<void>;
+}
+```
+
+- `ctx.user().storage(name)`: a Storage Resource the Manifest declares, as the User: a `Storage` when declared at `write`, a `ReadOnlyStorage` when declared at `read`. A handle holds no identity; every call is one host operation decided from the request in flight, as for databases.
+- `ctx.user().db(name)` takes only names declared `postgres`, and `storage(name)` only names declared `storage`.
+- Each call is exactly one host operation (below), and so one Operation log entry. `files`, `folders` and `cursor` are the host's answer; `lastModified` is a `Date` of the host's time.
+- A refusal rejects with `Refused`, a failure with `OperationFailed` (`kind` the host's `error.kind`, `detail` its whole error), as for databases ("The SDK: Refusals and failures"). A `Refused` that escapes `fetch` is the `403` with `{ refusal, fix }`; an `OperationFailed` the fixed `500`.
+- A `body` that is none of the three, a `key` that is not a string, `options` of the wrong shape: a `TypeError`, and nothing is sent to the host. Everything else (the key's rules, the bounds) is the host's to decide, so that it is logged.
+
+**Compile errors**, asserted by the type tests in the compiler's words:
+
+- `ctx.user().storage("payroll")` when the Manifest does not declare `payroll` as `storage`: the message lists the names declared `storage` (`... is not assignable to parameter of type '"marketing" | "archive"'`); also when `payroll` is declared `postgres`.
+- `ctx.user().db("marketing")` when `marketing` is declared `storage`: the message lists the names declared `postgres`.
+- `put` or `delete` through a handle declared at `read`: the message contains `'marketing' is declared at 'read' in manifest.ts. Declare it at 'write' to change files.`
+- `ctx.app().storage(...)`: `Property 'storage' does not exist on type 'ActingAsApplication'.`
+
+Forced past the types, each ends at the host: `not-declared`, `declared-lower`, `not-own-database` (`ctx.app().storage(name)` exists at run time for that reason).
+
+`Refusal` gains, for `not-declared` and `not-registered`, the optional details below (`kind`, `declared_kind`, `registered_kind`).
+
+### Keys
+
+A file is named by a **key**, relative to the Resource. There are no directories: `/` separates a key's segments, and a **folder** is the keys that begin with `<folder>/`. It exists exactly while one of them does; it is never made, listed as a file, or deleted on its own.
+
+A key is taken when every one of these holds; otherwise the operation fails `{ error: { kind: "invalid-key", rule: "<rule>", message } }`, after it was allowed (below), and nothing is read or written:
+
+| `rule` | The key must |
+|---|---|
+| `empty` | not be empty |
+| `too-long` | be at most 1,024 bytes of UTF-8 (exactly 1,024 is taken) |
+| `too-deep` | have at most 64 segments |
+| `empty-segment` | have no empty segment: no `/` at its start or end, no `//` |
+| `segment-too-long` | have no segment longer than 255 bytes |
+| `dot-segment` | have no segment that is `.` or `..` |
+| `character` | hold no control character (U+0000 to U+001F, U+007F to U+009F), no `\`, and none of U+061C, U+200E, U+200F, U+202A to U+202E, U+2066 to U+2069 |
+| `not-nfc` | be in Unicode normalisation form C (`café` is refused; `café` is taken) |
+| `reserved` | have no segment that begins with `.vibe-` |
+
+- When several rules are broken, the first in the table is named.
+- Letter case matters: `Report.pdf` and `report.pdf` are two files.
+- Everything else is taken: spaces, `#`, `%`, `&`, `[`, `'`, a segment `.hidden`, non-Latin letters (`报告/第三季度.pdf`).
+- **A file and a folder of the same name cannot both exist.** A `put` of `a/b` while `a` is a file, or of `a` while a file's key begins with `a/`, fails `{ error: { kind: "key-conflict", message } }` and writes nothing.
+- A **prefix** (of `list`) is `""`, or a string `p` of at most 1,024 bytes such that `p + "x"` is a key that is taken (so `reports/`, `rep` and `报告/` are prefixes; `../`, `/x` and `a//` are not: `invalid-key` with the rule `p + "x"` breaks).
+
+### Through the raw interface
+
+Five operations. Each takes `resource` (the Resource's name) and optionally `as`, as `query` does ("Operations on the own database"): `as: "application"` is refused `not-own-database`; `own` is `malformed` here. Arguments the operation does not have are ignored.
+
+```js
+env.VM.invoke("storage.head",   { resource: "marketing", key: "reports/q3.pdf" })
+env.VM.invoke("storage.get",    { resource: "marketing", key: "reports/q3.pdf" })
+env.VM.invoke("storage.put",    { resource: "marketing", key: "reports/q3.pdf", body: "<base64>", content_type: "application/pdf" })
+env.VM.invoke("storage.delete", { resource: "marketing", key: "reports/q3.pdf" })
+env.VM.invoke("storage.list",   { resource: "marketing", prefix: "reports/", delimiter: "/", limit: 100, cursor: "<cursor>" })
+```
+
+A file's metadata, in every answer: `{ "key", "size": <bytes>, "content_type", "last_modified": "<RFC 3339, UTC, whole seconds, e.g. 2026-11-21T10:15:30Z>" }`.
+
+| Operation | Needs | Answer |
+|---|---|---|
+| `storage.head` | `read` | `{ ok: <metadata> }`, or `{ ok: null }` when no file has the key |
+| `storage.get` | `read` | `{ ok: { ...<metadata>, "body": "<the bytes, base64 with padding>" } }`, or `{ ok: null }` |
+| `storage.put` | `write` | `{ ok: <metadata of the file as written> }` |
+| `storage.delete` | `write` | `{ ok: {} }`, the same whether there was a file or not |
+| `storage.list` | `read` | `{ ok: { "files": [ <metadata>, ... ], "folders": [ "<prefix + segment + />", ... ], "cursor": "<opaque>" | null } }` |
+
+- **put** creates the file or replaces it whole: the last put to finish wins. A reader sees the file as it was before or as it is after, never in part; a put that fails leaves the file as it was. `body` is the bytes in standard base64 (with or without padding; anything else is `malformed`). `content_type` is optional: 1 to 255 bytes of printable ASCII (U+0020 to U+007E) holding a `/`, kept as given; anything else is `malformed`. Without it, the type is the one the key's extension gives (below).
+- **get** answers the file as one whole version of it. A file larger than the body bound is not read: `limit` `bytes` (its `head` answers, with its `size`).
+- **delete** of a file whose folders are then empty removes those folders too: a folder exists only while a file is in it.
+- **list** answers the keys that begin with `prefix`, **in the byte order of their UTF-8** (`Z` < `a-b` < `a.b/x` < `a/b` < `a0` < `é`), at most `limit` (an integer from 1 to 1,000; 100 without it). With `delimiter: "/"`, every key that holds a `/` after the prefix is rolled up into its folder (`prefix` up to and with that `/`), listed once in `folders`, folders and files together in byte order and each counting once against `limit`. `cursor` is null when nothing follows; given back with the same `prefix` and `delimiter` it answers the next page, also when files were put or deleted meanwhile (a page never repeats a key or a folder a page before it answered, and a key put meanwhile behind the cursor is not answered). A `cursor` that a list of this Resource with this `prefix` and `delimiter` did not answer: `malformed`. A `delimiter` other than `"/"`: `malformed`.
+- **Content type without one given**, by the key's last extension, in any letter case: `.txt` `text/plain; charset=utf-8`, `.html` `.htm` `text/html; charset=utf-8`, `.css` `text/css`, `.js` `text/javascript`, `.json` `application/json`, `.csv` `text/csv`, `.md` `text/markdown`, `.xml` `application/xml`, `.pdf` `application/pdf`, `.png` `image/png`, `.jpg` `.jpeg` `image/jpeg`, `.gif` `image/gif`, `.webp` `image/webp`, `.svg` `image/svg+xml`, `.zip` `application/zip`, `.docx` `application/vnd.openxmlformats-officedocument.wordprocessingml.document`, `.xlsx` `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`, `.pptx` `application/vnd.openxmlformats-officedocument.presentationml.presentation`; any other, `application/octet-stream`. The same table gives the type of a file placed in the directory by hand.
+- **Malformed** (`{ error: { kind: "malformed", message } }`, no Operation log entry, nothing touched): arguments that are not an object; `resource` missing or not a string; `own` given; `as` neither `"user"` nor `"application"`; `key` missing or not a string (head, get, put, delete); `body` missing, not a string, or not base64 (put); `content_type` as above; `prefix` not a string; `delimiter`, `limit` or `cursor` as above.
+
+**Failures** (`{ error: { kind, ... } }`, after the operation was allowed and its entry written):
+
+| `kind` | When | Entry's `error` |
+|---|---|---|
+| `invalid-key` (`rule`) | The key, or the prefix, breaks a rule of "Keys" | `invalid-key` |
+| `limit` (`limit: "bytes"`) | A put's body, or a file to get, is larger than 8 MiB | `bytes` |
+| `limit` (`limit: "time"`) | The operation did not end within 10 seconds | `time` |
+| `key-conflict` | A put where a file is a folder of the key, or a folder is the key | `key-conflict` |
+| `not-reachable` (`reason: "link" \| "not-a-file" \| "other-filesystem"`) | The key, or a folder on its way, is a symbolic link; the key is something other than a regular file (a folder, a FIFO, a device); a folder on its way is on another file system than the Resource's directory | `not-reachable` |
+| `full` | The disk or the quota of the Resource's directory is full | `full` |
+| `unavailable` | The directory cannot be used ("When the directory cannot be used"), any other error of the file system, or the program has no room for the operation now ("Bounds") | `unavailable` |
+
+- Order for every operation: malformed; who is allowed (a refusal); `invalid-key`; for a put, `limit` `bytes`; then the directory. A `get` of a key that is a folder answers `not-reachable` `not-a-file`, not `null`; a `head` the same.
+- A put that fails `limit` `time` may still land after the answer (a system call cannot be stopped); it lands whole or not at all.
+
+### Who is allowed
+
+As "Who is allowed", in that order, with the level each operation needs (`read` for head, get and list; `write` for put and delete) and `application-disabled` where "Requests in flight" puts it. A Storage operation and a database operation are each decided only against Resources of their own kind:
+
+- A Storage operation on a name the serving Version declares as `postgres`, or does not declare, is refused `not-declared`; the refusal has `"kind": "storage"` and, when the name is declared as `postgres`, `"declared_kind": "postgres"`. The fix says to declare it with `kind: "storage"`.
+- A Storage operation on a name declared `storage` for which no Resource of kind `storage` is registered is refused `not-registered`, with `"kind": "storage"` and, when a Resource of that name has another kind, `"registered_kind": "postgres"`; the fix says the name is registered as a database.
+- The same the other way: `query`, `execute`, `tx.begin` and a pull of structure on a name declared or registered as `storage` are refused `not-declared` or `not-registered` with `"kind": "postgres"` and `declared_kind` or `registered_kind` `"storage"`. Nothing else of these refusals changes.
+- A Version that declared the Resource at `read` is refused `declared-lower` (`declared` `read`, `needed` `write`) for put and delete. A User whose Groups hold `read` is refused `no-grant` (`held` `read`, `needed` `write`) for them, and one whose Groups hold nothing is refused `no-grant` (`held` null) for all five, with the Resource's `contact`.
+- A refused operation touches nothing: no file is read, made, changed or removed, and no folder is made.
+- The Authorization decision (`authz`) is unchanged: the host asks it with the level needed, after matching kinds.
+
+### Bounds
+
+- **Body**: 8 MiB (8,388,608 bytes; exactly that is taken) for a put's body and a get's file. Past it, `limit` `bytes`; the program never decodes or reads more than the bound and one byte of it.
+- **Key** and **prefix**: 1,024 bytes; **segments**: 64 of at most 255 bytes. **A list page**: 1 to 1,000. **Content type**: 255 bytes. **Cursor**: as the program made it (at most 2,048 bytes).
+- **Time**: 10 seconds an operation, from the moment it is decided; past it, `limit` `time`.
+- **At once** (no black-box test can provoke these in a test's time; they are read in the code at review): file work runs on 8 threads of its own, with at most 64 operations waiting for them, and storage operations hold at most 256 MiB of bodies at once in the program. An operation that finds no room within 5 seconds fails `unavailable` and touches nothing.
+- **A request to an Application** may now have a body of up to 8,454,144 bytes (8 MiB and 64 KiB), so that a file of the bound can be uploaded through a form; larger is `413`. `vibe request`'s `--data` and `--data-file` take the same.
+- Through the SDK an operation of 8 MiB holds the body and its base64 text in the Application's heap: one request can hold one such body at a time.
+
+### The Operation log
+
+Every Storage operation, allowed, refused or failed, has one entry, written before the directory is touched and completed when the operation ends; one that cannot be written refuses the operation `log-unavailable` and nothing is touched ("The Operation log"). A malformed one has none.
+
+| Field | For a Storage operation |
+|---|---|
+| `operation` | `storage.head`, `storage.get`, `storage.put`, `storage.delete` or `storage.list` |
+| `resource` | the Resource's name; `own_database` false; `actor` `user`; `transaction` null |
+| `statement` | the operation's word and its key, the key written as a JSON string: `get "reports/q3.pdf"`, `put "reports/q4.pdf"`, `head "..."`, `delete "..."`; for a list `list "<prefix>"`, and `list "<prefix>" delimiter "/"` with the delimiter. A key that breaks a rule is written the same (its control characters as JSON escapes, `\u0000`), cut after its first 1,024 bytes (at a character's end) with `...` after it. |
+| `rows` | head and get: `1` when a file was answered, `0` for `null`; put: `1`; delete: null; list: the number of files and folders answered; null unless it ended |
+| `outcome`, `reason`, `error` | as for any operation; `error` as the table of failures says |
+| `duration_ms` | from when the directory was first touched; null when it was not |
+
+- **No field holds a file's contents**, its content type or its size: only its key. The cursor is not recorded.
+- The program's `host-call` record names the operation (`storage.get`, ...) as for any call.
+- `GET /v1/operation-log?resource=marketing` and `vibe admin operation-log --resource marketing` find these entries like any.
+
+### What is on the directory
+
+For a Resource whose directory is `<dir>`:
+
+- After a put of `key`, the file `<dir>/<key>` (its segments as folders) holds exactly the bytes put, as a regular file with a link count of 1, owned by the program's user, mode `0640`; each folder it needed was made with mode `0750`. Its extended attribute `user.vibe.content-type` holds the content type given (none when none was given). Its time of modification is the time of last change, to the second.
+- After a delete, `<dir>/<key>` is gone, and so is every folder of it left empty.
+- A file placed in `<dir>` by hand (by someone on the host) whose path is a key that is taken is a file of the Resource like any other: listed, read, replaced, deleted, with the content type of the table when it has no attribute.
+- Besides the files, `<dir>` holds `.vibe-resource` and `.vibe-staging/`, which are never listed or reachable (their names are `reserved`). `.vibe-staging/` is empty when no put is under way; what a crash left there is removed when the Resource is next loaded.
+- Names on the disk that are not keys that are taken (a control character, `\`, a name beginning with `.vibe-`, a name not in NFC) are never listed and cannot be reached.
+
+### Nothing reaches outside
+
+What a test shows, with a hostile fixture Application of its own that calls the raw interface (and the SDK, forced past its types) as a User holding `write`:
+
+- **Keys.** `../secret`, `a/../../secret`, `/etc/passwd`, `.`, `..`, `a/./b`, `a//b`, `a/`, ``, a key with NUL, with `\u0007`, with `‮`, `..\\secret`, `.vibe-resource`, `.vibe-staging/x`, a key of 1,025 bytes, a segment of 256 bytes, 65 segments, `café`: each fails `invalid-key` with its rule, through every one of the five operations, and has its `failed` entry; nothing is made or read anywhere, inside the directory or outside it.
+- **Links planted on the host.** The test makes, inside `<dir>`: `etc` → `/etc`; `secret` → a file outside the storage root that holds known bytes; `other` → the directory of another Storage Resource; `inner` → `<dir>/real.txt`; `deep/link` → `..`. Then: `get` and `head` of `etc/passwd`, `secret`, `other/theirs.txt`, `inner`, `deep/link/real.txt` fail `not-reachable` `link`; `put` of `etc/x`, `secret`, `other/x`, `deep/link/x` fail the same, and afterwards `/etc/x` and `<other>/x` do not exist, the outside file and the link `secret` are unchanged; `delete` of `secret` fails the same and the link is still there; `list` with and without a delimiter answers none of them (`deep/` is answered as a folder only if it holds a file that is reachable). None of the known bytes appears in any answer.
+- **Other things planted.** A FIFO `<dir>/pipe`: `get` answers `not-reachable` `not-a-file` at once, without waiting on the FIFO. A folder `<dir>/f/`: `get("f")` is `not-a-file`; `put("f")` is `key-conflict`.
+- **Two Resources.** Two Storage Resources on sibling directories never see each other's files: what is put through one is not listed, read or deletable through the other under any key, and registering a directory inside the other's, or holding it, is `directory-in-use`.
+
+### Durability
+
+- A put whose answer was received is on the disk: after the program is stopped (also killed with `SIGKILL`) and started again against the same platform database and storage root, the file has its bytes, its content type and its time of last change, and the Resource answers as before.
+- The Grants, the Resource and its location are in the platform database like any Resource's.
+
+### Pulling a Storage Resource, checking and deploying
+
+- `GET /v1/resources/<name>/structure` on a Storage Resource, decided as for a database (a Grant at any level; `no-grant` otherwise, with `resource` and `contact`), answers `200` with `{ "resource", "kind": "storage", "your_access", "contact" }`: no `fingerprint`, `schema_ts`, `standin_sql` or `unsupported`. Its Operation log entry is as for a pull (`operation` `structure`, `statement` null). On a database the answer gains `"kind": "postgres"`; nothing else changes.
+- `vibe pull <name>` on a Storage Resource writes one file, `resources/<name>/storage.json`, under the rules of the other files a pull writes (whole or not at all, no link followed, not over a file the tool did not write, unchanged when nothing changed): `{ "generated": "vibe pull. Do not edit.", "resource": "<name>", "kind": "storage", "contact": "<the contact>" }`, two spaces a level, and a line end. A file there without that `generated` is `not-generated`. It copies the Builder's own Grant into `vibe.dev.json` as for a database (`test_users`). Its output is as for a database with `fingerprint` null and `unsupported` empty.
+- `vibe check`, check `resources`: a declared Resource must be registered **with the kind the Manifest declares** (else `resource-kind-mismatch`, with `resource`, `declared_kind` and `registered_kind`, the message saying to correct `kind` in `manifest.ts` or to choose another Resource) and be pulled: for `storage`, `resources/<name>/storage.json` there with its `generated` (else `resource-not-pulled`, naming `vibe pull <name>`). `own-grant-below-declared` and `pulled-not-declared` hold for Storage as for databases.
+- `vibe deploy` pulls each declared Storage Resource again as it does a database (step 5), writes `storage.json` when it changed, and sends no `structures` entry for it. The rest is unchanged.
+
+### The tool and the Dashboard
+
+- `vibe resources`: the kind is said for each Resource (`marketing (storage)`). For a Storage Resource the access is said in its own words: `read` that files can be listed and read, `write` that they can also be put and deleted; no access, whom to ask, as for any. `--json` is unchanged (`kind` is `storage`).
+- `vibe admin applications`: the Declared access says each Resource's kind with its level.
+- The Dashboard's page of one Application: each declared Resource's element gains `data-vm-kind="postgres" | "storage"`; `data-vm-declared`, `data-vm-yours`, `data-vm-standing` and `data-vm-ask` are as for a database (`yours` is never `structure` for Storage). The list's `data-vm-attention` counts Storage Resources like any.
+
+### The local loop
+
+- **A local Storage for each pulled Storage Resource** (each `resources/<name>/storage.json` the tool wrote): the folder `.vibe/local/storage/<name>/` of the project's local state, made by the first run that needs it, with the same backend, rules and bounds as an installation (its `.vibe-resource` and `.vibe-staging/` included), registered under its name with the contact of `storage.json`. A Storage Resource the Manifest declares and that is not pulled is not registered: its operations are refused `not-registered`, as for a database. One no longer pulled has its folder removed by the next run.
+- **The Grants of `vibe.dev.json` decide**, as for databases. A Grant at `structure` on a pulled Storage Resource is a note, `grant-level-not-for-kind` (with `group` and `resource`), and holds nothing.
+- The output of `vibe request`, `vibe dev`'s `rebuilt` line and `vibe local reset` gain `"storages": [ { "resource", "directory": ".vibe/local/storage/<name>", "made": <bool> } ]`, every pulled Storage Resource by name. `operations` holds the Storage operations' entries like any. In words, one line for each.
+- What the Application puts there stays from one run to the next and while `vibe dev` runs. A file the Builder or the Coding agent places in the folder by hand is a file of the local Storage (the way to give it test files). `vibe local reset` empties every local Storage folder (but keeps it).
+- `vibe dev`'s page `/_vm/test-user` shows, for each pulled Resource, Storage ones included, the access each test User's Groups give.
+- On a disk that does not tell letter case apart (macOS's default), `Report.pdf` and `report.pdf` are one file locally; they are two in an installation.
+
+### Installing
+
+- `deploy/compose.yaml` gains one value and one mount: `VIBE_STORAGE_DIR` (the host's folder for Storage; `./storage` without it) is mounted **read-write** at `/var/lib/vibe/storage` (a bind, made by Compose when it is not there), and `vibe` is started with `--storage-root /var/lib/vibe/storage`. Everything else of `vibe`'s hardening is as before: read-only root filesystem, no capability, `no-new-privileges`, the image's user `65532:65532`, no tmpfs.
+- `deploy/README.md` says, with every command written out: make the folder and give it to the image's user (`mkdir -p storage && sudo chown 65532:65532 storage`), make one folder in it for each Storage Resource (`sudo -u '#65532' mkdir storage/marketing`, or `mkdir` and `chown`), register it as `/var/lib/vibe/storage/<folder>`, and back the folder up with the host's own tools. `deploy/.env.example` lists `VIBE_STORAGE_DIR`.
+- A folder holding nothing but `compose.yaml`, `.env` and `certs/` still comes up and answers; Storage registrations are then refused (`directory-missing`, or `directory-not-writable` while `storage/` is not the image user's) until the administrator does the above.
+- **What the install tests show**, besides what "What the install tests show" says (whose `docker inspect` line becomes: no mount but `/etc/vibe/ca` read-only and `/var/lib/vibe/storage` read-write):
+  - with `storage/` owned by `65532:65532` and `storage/marketing/` made in it, a Platform administrator registers `marketing` over HTTPS; a Contributor deploys a fixture Application declaring it at `write`; a request as a User of a Group granted `write` puts a file; **the file is on the host at `storage/marketing/<key>` with the bytes put**, and the Application's `get` answers it;
+  - after restarting `vibe`, after `down` then `up`, and after an upgrade to a second tag of the image, the file is there and `get` answers it;
+  - registering a folder that is not there, a file, and a folder owned by root with mode `0755` is refused `directory-missing`, `not-a-directory`, `directory-not-writable`;
+  - with `VIBE_STORAGE_DIR` naming another host folder, that folder is the one used.
+
+### The instruction file
+
+From this ticket on the template's `AGENTS.md` names `ctx.user().storage(name)` beside `ctx.user().db(name)`, says that a Storage Resource is declared with `kind: "storage"` and pulled with `vibe pull` like a database, that a file is named by a key (`/` between folders, no `..`, no leading `/`), that a file is at most 8 MiB, that `get` and `head` answer `null` when there is no file, and that in the local run files are in `.vibe/local/storage/<name>/`, where test files may be placed by hand.
+
+### What this does not close
+
+- **S3**, and any backend but a directory: the ADR records what it must keep. `location.backend` takes `directory` only.
+- **An Application's own storage** (as its own database is its own): only shared Storage Resources.
+- **Serving a stored file from an address without code**: a file reaches a User only through the Application's code ("Static files" is a Version's own files).
+- **Rules per folder or per file**: a Grant covers the whole Resource; a company that needs two rules registers two Resources.
+- **Bodies larger than 8 MiB**, ranges, streaming, appending, renaming, copying, and conditional writes (create only if absent, replace only if unchanged).
+- **Quotas** set by the platform: the disk's own and `full`.
+- Versions of a file, a recycle bin, or undoing a put or a delete: a put replaces and a delete removes, at once.
+- Showing a Storage Resource's location to a Platform administrator, changing it, or removing a Resource: the ticket "Resources and Grants in full".
+- Someone with write access to the host's folder can change or remove files the Applications then read; the platform guarantees only that it reads and writes nothing outside the folder, and that what it writes is whole.
+- Hard links planted on the host are read as files (ADR 0019).
+- The local loop on Windows (keys with `:`, `*`, `?`, `"`, `<`, `>`, `|`, or ending with `.` or a space, which Windows cannot name): the ticket on the three systems.
