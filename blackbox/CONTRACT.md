@@ -2044,7 +2044,7 @@ The first page an employee sees: the Applications they contribute to and those s
 | `GET /applications/<name>` | `200`, one Application (below) |
 | `POST /applications/<name>/sharing` | a change of whom it is shared with (below) |
 | One of these paths with another method | `405`, with `allow`: `GET, HEAD` for the first two, `POST` for the third |
-| Any other path | `404` |
+| Any other path | `404` (the paths under `/admin`: "The Dashboard for Platform administrators") |
 
 - `HEAD` is answered as `GET`, without a body.
 - Every answer to someone signed in is a page of the platform's own, the refusals included: `text/html; charset=utf-8`, with the headers every such page has ("Contributors and sharing: Opening an Application": `cache-control: no-store`, `x-content-type-options: nosniff`, `referrer-policy: same-origin`, a `content-security-policy` with `default-src 'none'` and `frame-ancestors 'none'`), and a policy that lets a form lead only to the Dashboard itself (`form-action 'self'`). No page has a `<script>`, an event-handler attribute or a `javascript:` address.
@@ -2101,7 +2101,7 @@ Pages are read by people; the attributes named `data-vm-...` below are what a te
 
 - Changing the Contributors, creating, describing, disabling or deleting an Application from the Dashboard.
 - Searching the list.
-- What a Platform administrator sees of every Application: its ticket. Here an administrator's list is their own, as anyone's.
+- What a Platform administrator sees of every Application: "The Dashboard for Platform administrators". An administrator's own list (`GET /`) is their own, as anyone's.
 - A Dashboard in another language than English.
 
 ## The local run on a busy machine (ticket: The local run's private Postgres passes its time limits under the gate's load, and the refusal does not say which limit)
@@ -2408,7 +2408,7 @@ Everything the platform derives from how it is reached is as with `--public-sche
 
 Until this ticket each family of pages carried a few lines of style of its own, and the page the tool serves while it signs in had none. From here on every page of the platform's own is dressed by one theme, the same identity as the website. What a page says, its `data-vm-...` marks and its forms are as the sections above say: this section adds what can be seen and measured, and takes nothing away.
 
-**The pages** it speaks of: the Dashboard's pages (the list, one Application's page, their refusals), the sign-in address's pages (the tool's sign-in page, the sign-out page, the pages of refusal and of failure), the page an Application's address answers in the platform's name, the local run's own pages (the test-User page, the page of a wrong `Host`), and the page the tool itself serves on the loopback address while it signs in.
+**The pages** it speaks of: the Dashboard's pages (the list, one Application's page, their refusals, and the pages for Platform administrators of "The Dashboard for Platform administrators"), the sign-in address's pages (the tool's sign-in page, the sign-out page, the pages of refusal and of failure), the page an Application's address answers in the platform's name, the local run's own pages (the test-User page, the page of a wrong `Host`), and the page the tool itself serves on the loopback address while it signs in.
 
 ### One theme, nothing loaded
 
@@ -2562,7 +2562,7 @@ Disabling stops the Application from serving. It changes nothing else of it, and
 - **`vibe show`**: in words, when it is disabled, since when and by whom, and that a Platform administrator enables it again. With `--json`, the API's object (with `disabled`).
 - **`vibe deploy`** to a disabled Application: the deploy is made, and its output has `"disabled": { "since", "by" }` (null when it is not disabled) beside `address`, and a warning with reason `application-disabled` whose message says the Version is deployed and will not be served until a Platform administrator enables the Application, and to tell the Builder so. In words, the same; never that the Application is live at its address. Exit code `0`.
 - **`vibe go-back`**: its output gains `"disabled"`, always (null when the Application is not disabled, else `{ "since", "by" }`), after `migrations_not_undone`. On a disabled Application it also has `"warnings": [ { "reason": "application-disabled", "message": "..." } ]`, the message as `vibe deploy`'s; when it is not disabled the output has no `warnings` member. In words, the same; exit code `0`.
-- **The Dashboard's list** ("The Dashboard: The list"): a disabled Application's element has `data-vm-disabled` (beside `data-vm-serving`, which is unchanged) and no `a[data-vm-open]`; it holds a mark of its own kind whose name, as a screen reader says it, is "Disabled". **One Application's page**: the element has `data-vm-disabled="<since>"`, no `a[data-vm-open]` (the address is still there, as text), and words saying that a Platform administrator disabled it and when. Who disabled it is not on the Dashboard's pages.
+- **The Dashboard's list** ("The Dashboard: The list"): a disabled Application's element has `data-vm-disabled` (beside `data-vm-serving`, which is unchanged) and no `a[data-vm-open]`; it holds a mark of its own kind whose name, as a screen reader says it, is "Disabled". **One Application's page**: the element has `data-vm-disabled="<since>"`, no `a[data-vm-open]` (the address is still there, as text), and words saying that a Platform administrator disabled it and when. Who disabled it is on the Dashboard's pages for a Platform administrator only ("The Dashboard for Platform administrators"); a Contributor or a User does not learn it there.
 
 ### Reading the Operation log
 
@@ -2649,7 +2649,7 @@ Everyone who is not a Platform administrator, signed in however (session, tool c
 
 - **Every wait has an end.** Each request here reads or writes the platform database within 10 seconds (these requests' own bound, whatever longer bound another request of the API has), else `503` `unavailable` (a disable or an enable answered so may or may not have been made: "A write whose answer is lost", below). Requests in flight are answered within 1 second of a disable's `200`. The tool waits as every command does ("Every command": 5 seconds to connect, 30 for the answer).
 - **Pages.** At most 100 Applications to a page, each with at most 100 Contributors and 200 declared Resources listed; at most 1,000 Operation log entries to a page and never more than 4 MiB.
-- **Readings at once.** At most 2 readings of `GET /v1/admin/applications` and `GET /v1/operation-log` together run at once in the program; a third is answered at once `503` `unavailable`, its message saying that readings for Platform administrators are running and to try again shortly. So these readings never hold more than two of the program's connections to the platform database, and requests to Applications and their operations are served meanwhile.
+- **Readings at once.** At most 2 readings of `GET /v1/admin/applications` and `GET /v1/operation-log` together, the Dashboard's pages that show them included ("The Dashboard for Platform administrators"), run at once in the program; a third is answered at once `503` `unavailable`, its message saying that readings for Platform administrators are running and to try again shortly. So these readings never hold more than two of the program's connections to the platform database, and requests to Applications and their operations are served meanwhile.
 - **Indexes.** The Operation log has an index for each filter that can narrow it: by User, by Application and by Resource (each with `id`, so that the newest come first), and by `time`. `outcome` is not indexed (it changes when an entry is completed, and four values do not narrow); a filter of `outcome` alone is bounded by the 10 seconds. What these indexes cost each entry's write is measured once, with and without them, and written down in the ticket; so is the time of a reading by each filter over an Operation log of 1,000,000 entries. These are not tests of the gate.
 - **Usage**: at most 10,000 pairs waiting, one write every 10 seconds, rows for 30 days (above).
 - **Disabled state** is a field the program already holds per Application in memory: checking it costs a request no round trip.
@@ -2666,7 +2666,7 @@ From this ticket on the template's `AGENTS.md` names `application-disabled` besi
 
 - A record of every disable and enable beyond the program's log: the Application holds only the disable in force (`since`, `by`); who enabled it and earlier disables are in the program's log alone.
 - A reason or a message the Platform administrator writes when disabling, shown to Users or Contributors.
-- Disabling or enabling, the list of every Application and the Operation log in the browser: the ticket "The Dashboard for Platform administrators".
+- Disabling or enabling, the list of every Application and the Operation log in the browser: the section "The Dashboard for Platform administrators", below.
 - Filtering the list of Applications (by a Resource they declare, by being disabled, by usage): the list is read whole, a page at a time, and `declared_access` is in it, so "which Applications declare the HR database" is answered from it.
 - Following the Operation log as it is written (as `vibe logs --follow` follows logs): an entry's `id` is taken when it is written, and entries are written by many operations at once, so one with a lower `id` can become readable after one with a higher; paging by `before` does not miss such an entry once it is written, following by `after` would. A reading of the newest page may lack an entry being written at that moment; the next reading has it.
 - Filtering the local Operation log (`vibe local operation-log`): unchanged.
@@ -2674,3 +2674,197 @@ From this ticket on the template's `AGENTS.md` names `application-disabled` besi
 - A retention period of the Operation log: kept until one is set, as the spec says.
 - A Platform administrator taking over an Application whose Contributors have all left ("Contributors and sharing: What this does not close").
 - Deleting an Application, and what its Operation log entries and usage become then: the ticket "Delete an Application, and restore it within the retention period".
+
+## The Dashboard for Platform administrators (ticket: The Dashboard for Platform administrators)
+
+What "What Platform administrators see and stop" gives a Platform administrator through the API and the tool, in the browser, on the Dashboard's address: every Application with its usage, disabling and enabling one, the Operation log with its filters, the installation, and the Resources with their Grants as they can be read today. These are pages of the Dashboard's own ("The Dashboard"), with links and forms and **no script**, in the one theme ("How the pages look"). The forms that give, change and revoke a Grant come with the ticket "Resources and Grants in full".
+
+**Each page shows what the API answers, and each form changes what the API changes**: the same Applications, entries, Resources and Grants as the request named for each below, from the same reading, with the same refusals and bounds. A page adds no fact of its own and leaves none out but what is said below.
+
+This section builds on "The Dashboard" (its address, its sign-in, its headers, escaping, `HEAD`, the `503` while the platform database cannot be reached, the width of 320 CSS pixels, `data-vm-user`), "Sign-in and sessions: Whose request it is", "How the pages look" (with "Said once, and without words where that can be done"), "The tool signs in through the browser: Who is a Platform administrator", "Resources and Grants", "Listing Resources" and "What Platform administrators see and stop".
+
+### Who may
+
+- A Platform administrator, as "What Platform administrators see and stop: Who may" says: a User whose Groups, as last read, hold the administrators' Group (with the stand-in, the Group `--administrators-group` names). It is decided at each request, from the session's Groups as last read; nothing is remembered between two requests.
+- Everyone else is refused as "Who is refused" (below) says, signed in however.
+
+### The way in
+
+- **On every page of the Dashboard** (the list, an Application's page, the pages below, the pages of refusal and of error, a `404` and a `405`), **a Platform administrator's header holds one link `a[data-vm-admin]`** to `/admin/applications`. Its name, as a screen reader says it, is "Administration"; what is seen is a mark of its own kind (a shield) with that word beside it from 40rem up, the mark alone below that.
+- **Nobody else's header holds it**: for someone who is not a Platform administrator no page of the Dashboard has an element with `data-vm-admin` or `data-vm-admin-sections`, no link whose `href` begins with `/admin`, and not the word "Administration".
+- It follows the person as "Who may" says: a person put into the administrators' Group has the link from their session's next renewal on; one taken out of it no longer has it from then on.
+- **The administrator's pages** are under one prefix, `/admin`. Each of them (not the Application's page, not the confirmation of a disable) has, under the header, one `nav[data-vm-admin-sections]` with four links `a[data-vm-section="applications" | "operation-log" | "resources" | "installation"]`; the one of the page itself has `aria-current="page"`.
+
+### What it answers
+
+Added to "The Dashboard: What it answers":
+
+| Request | Answer |
+|---|---|
+| `GET /admin` | `303` to `/admin/applications` |
+| `GET /admin/applications` | `200`, every Application (below) |
+| `GET /admin/applications/<name>/disable` | `200`, the page that confirms a disable (below) |
+| `POST /admin/applications/<name>/disable` | the disable (below) |
+| `POST /admin/applications/<name>/enable` | the enable (below) |
+| `GET /admin/operation-log` | `200`, the Operation log (below) |
+| `GET /admin/resources` | `200`, the Resources and their Grants (below) |
+| `GET /admin/installation` | `200`, the installation (below) |
+| One of these paths with another method | `405`, a page, with `allow`: `GET, HEAD` for the `GET` paths, `GET, HEAD, POST` for `/disable`, `POST` for `/enable` |
+| Any other path under `/admin` | `404`, a page |
+
+- `HEAD` is answered as `GET`, without a body. Every answer is a page of the platform's own with the headers, the policy (`form-action 'self'` included) and the escaping "The Dashboard: What it answers" gives every page of the Dashboard; `<title>` is the page's own name, then ` — Dashboard`.
+- **Order.** Sign-in first ("The Dashboard: Signing in to it": a person with no session is sent to sign in, and comes back to the address asked for through `next`); then the origin rule ("Whose request it is"); then, for every path that is `/admin` or begins with `/admin/`, whether the person is a Platform administrator ("Who is refused"), before `404`, `405`, `400` and everything else. So nobody but a Platform administrator learns which paths, names or parameters these pages have.
+- `?changed=` on an Application's page also takes `disabled`, `enabled` and `nothing` (below); any other value is ignored, as before.
+- Statements on the platform database: each page is one reading of the request it names below (as many statements as that request makes), beside the session's and the person's name. These readings count against "Bounds and costs: Readings at once" of the section before: at most 2 readings of every Application and of the Operation log run at once, the API's and the Dashboard's together; a third is answered at once (below).
+
+### Every Application (`GET /admin/applications`)
+
+- **Exactly what `GET /v1/admin/applications` answers**, one page of it: every Application of the installation, the ones never shared, with no Version or disabled included, each once, by name in byte order, 100 to a page. `?after=<name>` is the API's `after`; without it, the first page.
+- **Paging.** When the API's `next` is not null the page has a link `a[data-vm-next]` to `/admin/applications?after=<next>`; when `after` was given, a link `a[data-vm-first]` to `/admin/applications`. There is no link to the page before (the API pages forward only).
+- An `after` the API would refuse (not a name an Application could have, empty, given twice): `400`, a page with an element `data-vm-error="malformed"` saying that the address does not name a place in the list, and the link `a[data-vm-first]`. Other parameters are ignored.
+- With no Application: words saying that the installation has no Application yet and that a Builder makes one with the `vibe` tool.
+- **Each Application is one element** with `data-vm-application="<name>"`, `data-vm-serving="<the serving Version's number>"` or `"none"`, `data-vm-requests="<usage.requests>"` and `data-vm-users="<usage.users>"`, and, when it is disabled, `data-vm-disabled="<disabled.since>"`. It has no `data-vm-relation` and no `data-vm-attention`: they say what the reader can open, which is not what this list is about.
+- **What is seen first**, in this order of weight: its name, which is the link `a[data-vm-details]` to `/applications/<name>`; beside the name at most one mark of its state: "Disabled" (a mark of its own kind, `--danger`) when it is disabled, else "Not deployed" (the dashed circle) when no Version serves, else none; its requests and Users in the last 30 days, as two numbers in tabular figures (the words "in the last 30 days" and the day `usage.from` are said once, over the list, not in each element); and its description (`data-vm-description`) when it has one.
+- **What is one step away**, in one `<details>` of the element whose `<summary>` names the Application for a reader who hears it:
+  - the serving Version's number and, when it is not the same, the latest one's;
+  - **its Declared access**: each Resource an element `data-vm-declared-resource="<name>"` with `data-vm-declared="<level>"`, its name and level; when `declared_more` is not 0, an element `data-vm-declared-more="<n>"` saying how many more it declares; words saying that it declares none, or that no Version serves;
+  - **its Contributors**: each an element `data-vm-contributor="user" | "group"` with `data-vm-id`, a person by name and email when known and by id, a Group as a Group (as on an Application's page);
+  - **whom it is shared with, counted**: an element `data-vm-shared-count` with `data-vm-everyone="true" | "false"`, `data-vm-groups="<n>"`, `data-vm-people="<n>"`, saying "everyone", or how many Groups and people, or that only its Contributors open it;
+  - when it is disabled, since when (the time, in UTC) and by whom (the user id), in an element `data-vm-disabled-by="<user id>"`;
+  - who made it and when.
+- No address as text, and no `a[data-vm-open]`: opening an Application is for those it is shared with, from their own list.
+
+### One Application, as a Platform administrator sees it (`GET /applications/<name>`)
+
+A Platform administrator's view of one Application is **the Application's own page** ("The Dashboard: One Application"), with more on it; there is no second page of an Application under `/admin`. Everything that page shows anyone, it shows them as before (with `data-vm-relation="none"` when it is not shared with them).
+
+To a Platform administrator, and to nobody else, the page has besides:
+
+- **Its usage**: an element `data-vm-usage` with `data-vm-requests` and `data-vm-users`, the numbers of `usage` of that Application as `GET /v1/admin/applications` answers them, saying "in the last 30 days".
+- **When it is disabled**: beside the words of "What every surface shows" (that a Platform administrator disabled it, and when), **by whom**: the element with `data-vm-disabled="<since>"` also has `data-vm-disabled-by="<user id>"` and that id in its text.
+- **When it is not disabled**: a link `a[data-vm-disable]` to `/admin/applications/<name>/disable`, a destructive button in looks (quiet, `--danger` text), whose name, as a screen reader says it, is "Disable <name>". It is a link and not a form: it leads to the page that confirms it.
+- **When it is disabled**: one `form[data-vm-form="enable"]`, `method="post"`, `action="/admin/applications/<name>/enable"`, with one button whose text is "Enable <name>" and no other field.
+- A link `a[data-vm-operation-log]` to `/admin/operation-log?application=<name>`: its Operation log, one step away.
+- With `?changed=disabled`, `?changed=enabled` or `?changed=nothing`, an element `data-vm-notice` of that value saying so (`nothing`: it was disabled already, or not disabled; the rest of the page says which).
+
+A Contributor who is not a Platform administrator sees none of these, and a Platform administrator's own list (`GET /`) is unchanged: theirs, as anyone's.
+
+### Disabling (`GET` and `POST /admin/applications/<name>/disable`)
+
+- **`GET`: a page of its own that names the Application and asks.** Its `<h1>` names it ("Disable <name>?"). Under it, in a few words: that its address will answer every request that it is disabled, those in flight included, from the moment it is confirmed; that nothing of it is deleted, and its Contributors can still deploy; that "Enable <name>" on its page serves it again. Its usage (requests and Users in the last 30 days) is on the page, so that whoever disables knows how many people it stops. One `form[data-vm-form="disable"]`, `method="post"`, `action="/admin/applications/<name>/disable"`, with one button whose text is "Disable <name>" (the page's one primary action, a `--danger` fill) and no other field; and a quiet link `a[data-vm-back]` to `/applications/<name>`, "Keep it serving". The element that holds it has `data-vm-confirm="<name>"`.
+- The same page of an Application that is disabled already says so, since when and by whom, and has no form: its link `a[data-vm-back]` leads to the Application's page, where it is enabled.
+- A name no Application has, or that none could have: `404`, a page with `data-vm-error="not-found"` naming it, and a link `a[data-vm-back]` to `/admin/applications`.
+- **`POST`: the change `POST /v1/applications/<name>/disable` makes**, by that Platform administrator: the same `disabled` (`since`, and `by` their user id), the same "At once" (no request is given to its code once the answer is sent, those in flight are answered within 1 second), the same program's log record `application-disabled` when something changed and none when nothing did. The Operation log is not written.
+- The body is `application/x-www-form-urlencoded`, at most 4 KiB, and nothing in it is looked at (the form has no field). A body over 4 KiB: `400`, `data-vm-error="malformed"`, nothing changed. A body that has not come whole within 10 seconds: `408`, `data-vm-error="timed-out"`, nothing changed.
+- **Made**: `303` to `/applications/<name>?changed=disabled`, or `?changed=nothing` when it was disabled already (`changed` false: `since` and `by` as they were).
+
+### Enabling (`POST /admin/applications/<name>/enable`)
+
+- **One button**, on the Application's page: no page confirms it (enabling stops nothing; ADR 0009).
+- **The change `POST /v1/applications/<name>/enable` makes**, by that Platform administrator, with the same "At once" (every new request served as before the disable, by the Version that serves now) and the same `application-enabled` record when something changed.
+- The body as for a disable. **Made**: `303` to `/applications/<name>?changed=enabled`, or `?changed=nothing` when it was not disabled.
+
+### When a disable or an enable is refused
+
+A page with the status the API gives, an element `data-vm-error="<the API's reason>"` whose words are for a person at a browser (what was refused and what to do; no path of the API, no JSON), and a link `a[data-vm-back]`; nothing is changed:
+
+- `404` `not-found`: no Application of that name (named), link to `/admin/applications`.
+- `400` `malformed`, `408` `timed-out`: as above, link to `/applications/<name>`.
+- `403` `not-an-administrator`: "Who is refused" (below).
+- **`503` `unavailable`** (the platform database did not answer within 10 seconds, or could not be reached), with `retry-after`: the words say that **it cannot be told whether it was made**, and to look at the Application's page, which says what the platform database holds once that is settled ("A write whose answer is lost": meanwhile the Application's address answers `503` with `retry-after` and runs none of its code). Link to `/applications/<name>`.
+
+### The Operation log (`GET /admin/operation-log`)
+
+- **The entries `GET /v1/operation-log` answers to the same filters with `limit=100`**, newest first on the page (the API's page reversed: the newest entry at the top), and nothing else of the Operation log.
+- **The filters are one `form[data-vm-form="operation-log"]` with `method="get"`** and `action="/admin/operation-log"`: a filtered view is an address, kept, bookmarked and sent like any other. Its fields, each with a visible label above it, each optional:
+
+  | Field (`name`) | Control | Means the API's |
+  |---|---|---|
+  | `user` | text input, "User id" | `user` |
+  | `application` | text input, "Application" | `application` |
+  | `resource` | text input, "Resource" | `resource` |
+  | `outcome` | `select`: "Any" (value empty), "Allowed", "Refused", "Failed", "Unfinished" (values `allowed`, `refused`, `failed`, `unfinished`) | `outcome` |
+  | `since` | `input type="datetime-local"`, `step="1"`, "From (UTC)" | `since` |
+  | `until` | `input type="datetime-local"`, `step="1"`, "Before (UTC)" | `until` |
+
+  One submit button, "Show entries", and a quiet link `a[data-vm-clear]` to `/admin/operation-log` when a filter is given.
+- **An empty field is a filter not given** (a form sent with `method="get"` sends every field, the empty ones included; the API refuses an empty value, the page does not send one). White space around a value is dropped. Each field holds, when the page is shown, the filter it was given.
+- **A time is entered in UTC.** A page with no script cannot know the reader's time zone, and the times of the entries are shown in UTC: what is read in a row can be typed into a field as it is. `since` and `until` are taken as a browser's `datetime-local` sends them, `YYYY-MM-DDTHH:MM`, `YYYY-MM-DDTHH:MM:SS` or with a fraction of a second of up to six digits, and read as that time in UTC; and, for an address written by hand or by a Coding agent, as RFC 3339 with an offset (`Z` or `±hh:mm`), as the API takes them. The words of the two labels say "UTC".
+- **`before=<id>`** is taken from the address as the API takes it; it has no field: it is what the link to older entries carries. Other parameters (`limit` included) are ignored.
+- **Paging.** When the API's `earlier` is not null, a link `a[data-vm-older]` at the foot of the entries to the same address with `before=<earlier>` (the filters kept, the empty ones left out). When `before` was given, a link `a[data-vm-newest]` to the same filters without it. So following `a[data-vm-older]` until there is none shows every matching entry once, as the API's paging does.
+- **Each entry is one element** with `data-vm-entry="<id>"`, `data-vm-outcome="<outcome>"` and `data-vm-time="<time, as the API gives it>"`. **What is seen first**, in this order: the outcome as a mark of its own kind and colour, whose name, as a screen reader says it, is the outcome's word (allowed: a check; refused: a cross; failed: a triangle; unfinished: three dots); the time, in UTC, to the second (the column's head says "UTC", once); the User (or a dash); the Application and Version (or a dash); the Resource, or the words "own database"; the operation; and for an entry `refused` or `failed`, its `reason` or `error`, in an element `data-vm-reason` or `data-vm-error-code`. **One step away**, in a `<details>` of the entry: the statement (without values, as the API gives it; monospace, broken where the line ends), `rows`, `duration_ms`, the `request`, the `transaction`, the `actor`, and the entry's `id`.
+- **The User, the Application and the Resource of an entry are links** `a[data-vm-filter="user" | "application" | "resource"]` to the same address with that filter set to the entry's value (the other filters kept, `before` dropped): narrowing is one click.
+- **Nothing matches**: an element `data-vm-empty` in words: with filters, that no entry matches them, naming each filter given and its value (escaped); with none, that the Operation log has no entry yet and that each operation of an Application on a Resource or on its own database writes one.
+- **A malformed filter** (what the API would refuse as `malformed`: a value not taken as its table says, a name no Application or Resource could have, an `outcome` other than the four, a time that cannot be read, `since` not before `until`, a field given twice, a `before` that is not a positive whole number): `400`, the page with the form and **no entry**; beside the field, an element `data-vm-field-error="<field>"` whose words say what was wrong and what is taken (for `since` not before `until`: beside `until`; for `before`: over the entries' place, with the link `a[data-vm-newest]`). **What was typed is kept**: each text field holds the value it was given (escaped), the `select` the choice made; a time the browser's field cannot hold is quoted in the error's words.
+- **The bounds, as the page shows them.**
+  - **10 seconds**: a reading that takes longer is ended and answered `503`, `data-vm-error="unavailable"`, with the form and the filters kept, **no** `retry-after`, and words saying that the reading took too long and to narrow it with a time range or another filter.
+  - **Readings at once**: a third reading while two run is answered at once `503`, `data-vm-error="unavailable"`, with `retry-after`, the form and the filters kept, and words saying that other readings for Platform administrators are running and to try again shortly. The same for every page of every Application.
+  - **4 MiB**: the entries are those of the API's answer, which stops before its body would pass 4 MiB; a page then holds fewer than 100 entries, always at least one when one matches, and `a[data-vm-older]` goes on from the oldest shown. Nothing on the page says so: nothing is missing.
+  - While the platform database cannot be reached: the `503` of "The Dashboard: What it answers", with `retry-after`.
+- Every value of an entry is escaped as HTML ("The Dashboard: What it answers"): a statement, a user id, a reason. The page holds nothing the API's entry does not: no value of a statement, a parameter or a row, no row of the Change history.
+
+### The installation (`GET /admin/installation`)
+
+- **What `GET /v1/installation` answers**: the installation's domain, in an element `data-vm-domain`; how people sign in, in an element `data-vm-sign-in="oidc" | "stand-in"` (`none` cannot be seen here: nobody is signed in then); and, with `oidc`, the sign-in address, as text.
+- **With `oidc`, the connection, as `GET /v1/oidc` answers it**: first, **the issuer**, in an element `data-vm-issuer`, and the administrators' Group, in an element `data-vm-administrators-group`; one step away, in a `<details>`: the client id, the Groups claim, the scopes, when it was connected and by whom (a user id, or the words "the setup credential" for `setup-credential`). Words say that the connection is changed with the tool, `vibe admin connect-oidc`.
+- **With the stand-in**: words saying that sign-in is the stand-in, for tests and the local run, and that OIDC is not connected. No element `data-vm-issuer`.
+- **Never a secret**: the page, its source and its headers hold no byte of the OIDC client secret, of the setup credential, of `VIBE_SECRET_KEY`, of a session's cookie or refresh token, or of a tool credential. A test reads the whole answer, headers and body, for each of them.
+- What the API does not answer is not shown: the program's version, whether the identity provider answers now, how many people have signed in.
+
+### Resources and Grants, read only (`GET /admin/resources`)
+
+- **Every Resource `GET /v1/resources` answers**, by name, each with **its Grants as `GET /v1/resources/<name>/grants` answers them**, by Group. All on one page: `GET /v1/resources` has no paging.
+- **Each Resource is one element** `data-vm-resource="<name>"` with `data-vm-kind="postgres"`. **What is seen first**: its name (monospace, 600), its description, and **its Grants**: each an element `data-vm-grant="<Group>"` with `data-vm-access="structure" | "read" | "write"`, the Group with the mark of a Group and its level beside it; a Resource with no Grant says that no Group holds one, so nobody's request reaches it. **One step away**, in a `<details>` of the element: its owner (`data-vm-owner`), whom to ask (`data-vm-contact`), its kind in words, who registered it and when, and a link `a[data-vm-operation-log]` to `/admin/operation-log?resource=<name>`.
+- `your_access` (what the reading Platform administrator holds through their own Groups) is not shown: it is about them as a User, not about the Resource.
+- **Never a credential, in the page or its source**: no password, no host, port, database or role of a Resource's connection (none is in any answer of the API: "Resources and Grants"). A test registers a Resource whose passwords, host, database and roles are recognisable strings and finds none of them in the answer, headers and body.
+- **No form**: nothing on this page gives, changes or revokes a Grant, or registers a Resource. Words, once, over the list, say that Grants are given and Resources registered on the platform's API for now (the ticket "Resources and Grants in full" brings them to the tool and to this page).
+- **What cannot be shown, because the API does not answer it, and is not invented**: when a Grant was given and by whom; whether a Resource's database can be reached or its logins work (registering does not connect); which Applications declare a Resource (that is on the list of every Application, Resource by Resource, in each one's Declared access).
+- With no Resource registered: words saying that none is registered yet and that a Platform administrator registers one on the platform's API.
+- **While the Grants on a Resource cannot be told** ("A write whose answer is lost": the API answers `GET /v1/resources` and `GET /v1/resources/<name>/grants` `503` `unavailable` then): `503`, `data-vm-error="unavailable"`, with `retry-after`, and words saying that the platform is finding out the Grants on that Resource (named) and to try again shortly. No Grant is shown on a guess.
+- Every text of a Resource (description, owner, contact, a Group) is escaped as HTML.
+
+### Who is refused
+
+**Everyone who is not a Platform administrator**, signed in however (an OIDC session, the stand-in):
+
+| Request | Answer |
+|---|---|
+| `GET` or `HEAD` of any path that is `/admin` or begins with `/admin/` | `403`, the refusal page |
+| `POST` (or any other method) to any such path | `403`, the refusal page; nothing changed |
+
+- **The refusal page** is a page of the platform's own with an element `data-vm-error="not-an-administrator"`, an `<h1>` and a sentence saying that these pages are for the installation's Platform administrators, who are the members of a Group of the company's directory, and to ask the company's IT if the person should be one. It names no Platform administrator and no Group, and has a link `a[data-vm-back]` to `/`. Its header is the person's, as on every page, without `a[data-vm-admin]`.
+- **Nothing of the contents is in it, and nothing in it depends on them**: for the same person the body is the same, byte for byte, whatever the path under `/admin`, the parameters and the body (well formed or not; a name an Application has, one it has not, one no Application could have), and whatever exists. It comes before `404`, `405`, `400`, `408` and `413`. A body sent with a refused `POST` is not read past what the program reads of any body.
+- **Nothing is changed by a refused request**: the Application stays as it was, and the program's log has no `application-disabled` or `application-enabled` record for it.
+- **A Contributor of the Application is refused as anyone else**, on its disable and enable.
+- **Someone not signed in**: as on every path of the Dashboard ("Signing in to it"): with OIDC, a `GET` or `HEAD` whose `Accept` has `text/html` is `302` to sign in (and, once signed in, they come back to the address asked for and are answered as above), anything else `401`, `text/plain`; with the stand-in and no stand-in headers, `401`. Nothing is changed.
+- **A form sent from another origin** (a page of an Application, or of any other site, posting to `/admin/applications/<name>/disable` or `/enable`, or a `GET` of an administrator's page that is not a navigation of the whole page): `403`, `text/plain`, as "Sign-in and sessions: Whose request it is" says with the Dashboard's address in place of the Application's, **also when the person is a Platform administrator**; nothing is changed. An `<iframe>` of these pages is refused the same and is not shown (`frame-ancestors 'none'`).
+- **A Platform administrator taken out of the administrators' Group** at the identity provider is refused from their session's next renewal on: every page under `/admin` is the refusal page, the header has no `a[data-vm-admin]`, the Application's page shows them none of what is a Platform administrator's (and refuses it as anyone's when it is not shared with them), and a confirmation page loaded before and submitted after is refused and changes nothing. One put into the Group may from then on.
+
+### How the pages look, and the browser's walks
+
+- **Every page of this section is one of "the pages" of "How the pages look"** and keeps all of it: one `<style>`, `color-scheme`, `lang="en"`, one `<h1>`, contrast in light and in dark, sizes, targets, a visible focus, no motion under `prefers-reduced-motion`, no page wider than 320 CSS pixels, a name for every `<svg>`, and what is held back is in a `<details>` or on a page a link leads to. Long names, user ids, Groups, statements and issuers are broken where the line ends.
+- **Said once.** On these pages the signed-in person's id is in the header once (`data-vm-user`), and the entries, Contributors and Grants carry no `data-vm-user` (an entry's User is in its text and in `a[data-vm-filter="user"]`). "In the last 30 days" is said once on the list of every Application. The administrator's link is in the header only, and the four sections in `nav[data-vm-admin-sections]` only.
+- **`browser_look`** walks, besides its pages, in light and in dark: the list of every Application with a disabled one and one that is not deployed on it, one Application's page as a Platform administrator sees it with its enable form, the page that confirms a disable, the Operation log with entries of each outcome and with a `<details>` opened, the Operation log with a malformed filter (its error beside its field), the installation with OIDC connected, the Resources with Grants, and the refusal page of someone who is not a Platform administrator. Each joins the 320-pixel walk.
+- **A browser walk of this ticket** (`blackbox/tests/browser_admin.rs`, over HTTPS with OIDC connected to the harness's identity provider, as "A real browser in the gate: What it walks" says), **as a Platform administrator**:
+  1. Signs in at the Dashboard, finds `a[data-vm-admin]` in the header, follows it to every Application, and finds there an Application never shared with them, with its usage and, behind its `<details>`, its Contributors and Declared access; follows `a[data-vm-next]` over a second page.
+  2. Opens an Application's page from the list, follows `a[data-vm-disable]`, is shown the page that names it, and confirms by its button; is on the Application's page with `data-vm-notice="disabled"`, which says when and by whom; a User's own browser, at the Application's address, is shown the page of a disabled Application; the list of every Application marks it "Disabled".
+  3. Enables it by the button of its page; is on the page with `data-vm-notice="enabled"`; the User's browser is served by the Application again.
+  4. Opens the Operation log, filters by Application and by outcome with the form; the address in the browser holds the filters, opened again it shows the same entries; a time typed into "From (UTC)" narrows it; follows `a[data-vm-older]`; follows an entry's `a[data-vm-filter="user"]`; a filter that matches nothing says so in words.
+  5. Opens the installation, which names the issuer of the harness's identity provider and holds no byte of the client secret.
+  6. Opens the Resources, which show a Resource registered by the test with its Grants, and none of its connection.
+- **As someone who is not a Platform administrator** (a Contributor of the Application, signed in by OIDC): their header has no `a[data-vm-admin]`; each address of the pages above typed into the browser is refused in words with nothing of its contents; the disable form, sent as a browser sends a form of the Dashboard's (`Origin` and `Sec-Fetch-...` as "Whose request it is" says, by the harness's own browser, since no page of theirs holds the form), is refused and the Application still serves.
+- **The Platform administrator taken out of the Group**: with a short `--session-renewal`, the browser holds the page that confirms a disable, the harness's identity provider takes the person out of the administrators' Group, and after the renewal the confirmation is refused, the Application still serves, and the header has no `a[data-vm-admin]`.
+- **From another origin**: a page served by an Application's address that posts a form to `/admin/applications/<name>/disable` in the administrator's browser is refused `403`, and the Application still serves.
+
+### What this does not close
+
+- **The forms that give, change and revoke a Grant**, and a revoked Grant stopping within one session renewal: the second part of this ticket, with "Resources and Grants in full".
+- Registering a Resource, replacing its logins, checking that they connect: the tool, with "Resources and Grants in full" (as the ticket chose: a credential typed into a page is a larger thing to defend than one read from the tool's environment).
+- Connecting OIDC, or changing the connection: the tool (`vibe admin connect-oidc`).
+- Changing an Application's Contributors or whom it is shared with as a Platform administrator, and taking over an Application whose Contributors have all left.
+- Searching or filtering the list of every Application (by a Resource, by being disabled, by usage), sorting it otherwise than by name, and a link to the page before.
+- A reason written when disabling; a record of earlier disables and of who enabled.
+- Following the Operation log as it is written, exporting it, and a range over the entries' `id`.
+- Showing times in the reader's own time zone (no script: the page cannot know it).
+- Counting Applications, Resources or entries over the installation; usage over another period than 30 days.
+- A paged list of Resources, and a bound on the number of Resources and of a Resource's Grants: the API answers all of them today; "Resources and Grants in full" sets the bound and the pages follow it.
