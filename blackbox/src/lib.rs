@@ -118,7 +118,11 @@
 //!   package's version, the scripts of `scripts/` run by their interface
 //!   with a time limit, a throwaway clone of the repository for a tag or a
 //!   `LICENSE`, the notices read into their two parts, and a tool archive
-//!   read entry by entry.
+//!   read entry by entry;
+//! - [`storage`] is what the tests of Storage share: a storage root of the
+//!   test's own, a program started on it, Storage Resources registered on
+//!   its directories, the five operations through the raw fixture, and the
+//!   host's directory looked at from outside the program.
 //!
 //! Every wait has a timeout, so a failing test fails within seconds and
 //! never hangs. Each test starts its own program on its own port, so tests
@@ -178,6 +182,7 @@ pub mod sessions;
 pub mod shared_database;
 pub mod sharing;
 pub mod sql;
+pub mod storage;
 pub mod structure;
 pub mod tls;
 pub mod tool;

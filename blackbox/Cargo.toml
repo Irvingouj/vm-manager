@@ -41,6 +41,11 @@ url.workspace = true
 # rustls (the same crates, with the same features, as the workspace's).
 rustls.workspace = true
 tokio-rustls.workspace = true
+# What the tests of Storage look at on the host's directory themselves
+# (CONTRACT.md, "Storage: What is on the directory"): a file's extended
+# attribute `user.vibe.content-type`, and a FIFO planted. The workspace's
+# rustix, safe Rust.
+rustix.workspace = true
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
 
 [dev-dependencies]

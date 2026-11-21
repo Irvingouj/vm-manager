@@ -224,6 +224,7 @@ dependencies = [
  "liblzma",
  "rcgen",
  "ring",
+ "rustix 1.1.6",
  "rustls",
  "serde_json",
  "sha2 0.10.9",
