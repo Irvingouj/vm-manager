@@ -305,6 +305,7 @@ code.cmd{white-space:nowrap}
 .sections a{padding-inline:.25rem;white-space:nowrap}
 .sections a[aria-current=page]{padding-inline:.5rem}
 .filters{padding:0;background:none;border:0;box-shadow:none}
+.filter-grid input[type=datetime-local]{letter-spacing:-.03em}
 .admin-link{padding-inline:.5rem}
 dl.facts.big{grid-template-columns:1fr;gap:0}
 dl.facts.big dd+dt{margin-top:.75rem}
