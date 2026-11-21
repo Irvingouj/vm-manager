@@ -1131,7 +1131,7 @@ impl Front {
         let path = request.uri().path();
         if path == page::CHOOSER {
             return match *request.method() {
-                Method::GET | Method::HEAD => self.chooser(&request).await,
+                Method::GET | Method::HEAD => self.chooser(&request, application).await,
                 Method::POST => self.choose(request, application).await,
                 _ => page::method_not_allowed(),
             };
@@ -1187,7 +1187,11 @@ impl Front {
     }
 
     /// `GET /_vm/test-user`.
-    async fn chooser(&self, request: &Request<Incoming>) -> Response<Full<Bytes>> {
+    async fn chooser(
+        &self,
+        request: &Request<Incoming>,
+        application: &str,
+    ) -> Response<Full<Bytes>> {
         let next = request
             .uri()
             .query()
@@ -1199,6 +1203,7 @@ impl Front {
         match self.users(true).await {
             Ok((file, pulled)) => page::chooser(
                 StatusCode::OK,
+                application,
                 &file,
                 &pulled,
                 chosen.as_deref(),
@@ -1244,6 +1249,7 @@ impl Front {
         } else {
             page::chooser(
                 StatusCode::BAD_REQUEST,
+                application,
                 &file,
                 &pulled,
                 chosen.as_deref(),

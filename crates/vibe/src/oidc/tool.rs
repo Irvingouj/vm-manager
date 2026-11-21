@@ -272,6 +272,7 @@ impl Oidc {
     ) -> Page {
         let Some(asked) = read_query(parts.uri.query()) else {
             return pages::tool_failed(
+                &self.domain,
                 StatusCode::BAD_REQUEST,
                 "This address is not one that the command vibe sign-in makes: it needs a challenge of 43 base64url characters, a port of 1024 to 65535 when there is one, and the machine's name of at most 64 bytes, each once.",
             );
@@ -280,6 +281,7 @@ impl Oidc {
             Ok(configuration) => configuration,
             Err(problem) => {
                 return pages::tool_failed(
+                    &self.domain,
                     StatusCode::BAD_GATEWAY,
                     &format!(
                         "The company's sign-in could not be used: {}.",
@@ -289,7 +291,7 @@ impl Oidc {
             }
         };
         let Some(browser) = self.browser_value(parts) else {
-            return pages::unavailable(None);
+            return pages::unavailable(&self.domain, None);
         };
         let Some(begun) = self.states.begin_tool(
             &digest(&browser),
@@ -297,7 +299,7 @@ impl Oidc {
             asked.port,
             &asked.machine,
         ) else {
-            return pages::unavailable(None);
+            return pages::unavailable(&self.domain, None);
         };
         let authorization = self.authorization(connected, &configuration, &begun, port);
         let cookie = self.sign_in_cookie(&browser, SIGN_IN_COOKIE_SECONDS);
@@ -313,13 +315,13 @@ impl Oidc {
         tokens: &Tokens,
     ) -> Page {
         let Some(value) = Secret::random() else {
-            return pages::unavailable(None);
+            return pages::unavailable(&self.domain, None);
         };
         let row_digest = value.digest();
         let sealed = match &tokens.refresh_token {
             Some(token) => match self.sessions.seal_token(token, &row_digest) {
                 Some(sealed) => Some(sealed),
-                None => return pages::unavailable(None),
+                None => return pages::unavailable(&self.domain, None),
             },
             None => None,
         };
@@ -383,9 +385,10 @@ impl Oidc {
             .await;
         if let Err(error) = stored {
             log_database(&error);
-            return pages::unavailable(None);
+            return pages::unavailable(&self.domain, None);
         }
         pages::tool_ask(
+            &self.domain,
             &Person {
                 id: &claims.sub,
                 name: claims.name.as_deref(),
@@ -415,27 +418,27 @@ impl Oidc {
                     .starts_with("application/x-www-form-urlencoded")
             });
         if !form {
-            return pages::tool_not_a_form();
+            return pages::tool_not_a_form(&self.domain);
         }
         let read = Limited::new(body, MAX_FORM_BYTES).collect();
         let Ok(Ok(collected)) = tokio::time::timeout(FORM_READ_TIMEOUT, read).await else {
-            return pages::tool_not_a_form();
+            return pages::tool_not_a_form(&self.domain);
         };
         let Some(posted) = read_form(&collected.to_bytes()) else {
-            return pages::tool_not_a_form();
+            return pages::tool_not_a_form(&self.domain);
         };
         let Some(browser) =
             cookies::find(&parts.headers, cookies::sign_in_name(self.secure())).map(digest)
         else {
-            return pages::tool_over();
+            return pages::tool_over(&self.domain);
         };
         let sign_in = digest(&posted.sign_in);
         let awaiting = match self.awaiting(&sign_in).await {
             Ok(Some(awaiting)) if same(&awaiting.browser, &browser) => awaiting,
-            Ok(_) => return pages::tool_over(),
+            Ok(_) => return pages::tool_over(&self.domain),
             Err(error) => {
                 log_database(&error);
-                return pages::unavailable(None);
+                return pages::unavailable(&self.domain, None);
             }
         };
         let done = match (posted.answer, awaiting.port) {
@@ -456,7 +459,7 @@ impl Oidc {
         };
         done.unwrap_or_else(|error| {
             log_database(&error);
-            pages::unavailable(None)
+            pages::unavailable(&self.domain, None)
         })
     }
 
@@ -498,7 +501,7 @@ impl Oidc {
 
     async fn declined(&self, awaiting: &Awaiting) -> Result<Page, DbError> {
         self.end_sign_in(awaiting.id).await?;
-        Ok(pages::tool_declined())
+        Ok(pages::tool_declined(&self.domain))
     }
 
     async fn end_sign_in(&self, id: i64) -> Result<u64, DbError> {
@@ -541,10 +544,10 @@ impl Oidc {
     /// computer with a one-time grant. Only ever to `127.0.0.1`.
     async fn confirmed_with_port(&self, awaiting: &Awaiting, port: u16) -> Result<Page, DbError> {
         let Some(grant) = Secret::random() else {
-            return Ok(pages::unavailable(None));
+            return Ok(pages::unavailable(&self.domain, None));
         };
         if !self.confirm(awaiting.id, Some(&grant.digest())).await? {
-            return Ok(pages::tool_over());
+            return Ok(pages::tool_over(&self.domain));
         }
         let location = format!("http://127.0.0.1:{port}/?grant={}", grant.expose());
         Ok(pages::see_other(&location))
@@ -554,9 +557,9 @@ impl Oidc {
     /// poll.
     async fn confirmed(&self, awaiting: &Awaiting) -> Result<Page, DbError> {
         if !self.confirm(awaiting.id, None).await? {
-            return Ok(pages::tool_over());
+            return Ok(pages::tool_over(&self.domain));
         }
-        Ok(pages::tool_signed_in())
+        Ok(pages::tool_signed_in(&self.domain))
     }
 
     /// A wrong check code: counted; the page again, or, at the fifth, the
@@ -605,16 +608,17 @@ impl Oidc {
             })
             .await?;
         let Some(wrong) = counted else {
-            return Ok(pages::tool_over());
+            return Ok(pages::tool_over(&self.domain));
         };
         if wrong >= MAX_WRONG_CODES {
             log::record(
                 "tool-sign-in-ended",
                 json!({ "reason": "wrong-check-codes" }),
             );
-            return Ok(pages::tool_over());
+            return Ok(pages::tool_over(&self.domain));
         }
         Ok(pages::tool_ask(
+            &self.domain,
             &Person {
                 id: &awaiting.user,
                 name: awaiting.name.as_deref(),

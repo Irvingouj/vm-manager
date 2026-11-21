@@ -66,9 +66,6 @@ const PAGE_SIZE: i64 = 100;
 /// The highest `?page=`.
 const MAX_PAGE: i64 = 10_000;
 
-/// How many Contributors an Application shows in the list.
-const CONTRIBUTORS_LISTED: i64 = 20;
-
 /// The largest body of a change of sharing.
 const MAX_FORM_BYTES: usize = 4096;
 
@@ -204,12 +201,11 @@ impl Ingress {
         let shown = if names.is_empty() {
             HashMap::new()
         } else {
-            match self.registry.shown(&names, CONTRIBUTORS_LISTED).await {
+            match self.registry.shown(&names, 0).await {
                 Ok(shown) => shown,
                 Err(error) => return self.unavailable(viewer, &error),
             }
         };
-        let records = viewer.records_people();
         let declared: BTreeSet<&str> = shown
             .values()
             .flat_map(|s| s.declared.keys().map(String::as_str))
@@ -232,24 +228,7 @@ impl Ingress {
                         .serving_version
                         .map(|_| self.open_address(&listed.name, port)),
                     address: None,
-                    details: true,
-                    contributors: shown.map_or_else(Vec::new, |s| {
-                        s.contributors
-                            .iter()
-                            .map(|p| {
-                                pages::Person::of(
-                                    &p.named,
-                                    p.name.as_deref(),
-                                    p.email.as_deref(),
-                                    records,
-                                )
-                            })
-                            .collect()
-                    }),
-                    more_contributors: shown.map_or(0, |s| {
-                        s.contributors_count
-                            .saturating_sub(i64::try_from(s.contributors.len()).unwrap_or(0))
-                    }),
+                    contributors: Vec::new(),
                     declared: shown.map(|s| &s.declared),
                     seen: &seen,
                 }
@@ -319,7 +298,6 @@ impl Ingress {
                 self.public
                     .origin(&format!("{}.{}", record.name, self.domain), port),
             ),
-            details: false,
             contributors: record
                 .contributors
                 .iter()
@@ -327,7 +305,6 @@ impl Ingress {
                     pages::Person::of(&e.named, e.name.as_deref(), e.email.as_deref(), records)
                 })
                 .collect(),
-            more_contributors: 0,
             declared,
             seen: &seen,
         };

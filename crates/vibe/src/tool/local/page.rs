@@ -21,7 +21,7 @@ use hyper::header::{
 use hyper::{Response, StatusCode};
 
 use super::super::test_users::{TestUser, TestUsersFile};
-use crate::theme::{self, Layout, Mark, Place};
+use crate::theme::{self, Icon, Layout, Mark, Place};
 
 /// The policy of every answer of the local run's own.
 const POLICY: &str = "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'";
@@ -131,9 +131,16 @@ fn own(status: StatusCode, content_type: &'static str, body: String) -> Response
     response
 }
 
-/// A whole page: `title` (the platform's own text) and `body` (already
-/// HTML), as one card or, with `layout`, in a column.
-fn page(status: StatusCode, title: &str, layout: Layout, body: &str) -> Response<Full<Bytes>> {
+/// A whole page: `title` (the platform's own text), `heading` (its one
+/// `<h1>`, HTML) and `body` (already HTML), as one card or, with
+/// `layout`, in a column.
+fn page(
+    status: StatusCode,
+    title: &str,
+    heading: &str,
+    layout: Layout,
+    body: &str,
+) -> Response<Full<Bytes>> {
     let title = escape(title);
     own(
         status,
@@ -142,7 +149,7 @@ fn page(status: StatusCode, title: &str, layout: Layout, body: &str) -> Response
             &title,
             Place::LocalRun,
             layout,
-            &format!("<h1>{title}</h1>\n{body}"),
+            &format!("{heading}\n{body}"),
         ),
     )
 }
@@ -184,8 +191,9 @@ pub(super) fn not_found() -> Response<Full<Bytes>> {
     page(
         StatusCode::NOT_FOUND,
         "Not found",
+        &theme::state_title(Mark::Info, Icon::Unknown, "No such page"),
         Layout::Card,
-        "<p>Nothing of the local run is at this address. Its page is <a href=\"/_vm/test-user\">/_vm/test-user</a>.</p>\n",
+        "<p>The local run's page is <a href=\"/_vm/test-user\">/_vm/test-user</a>, where the test User is chosen.</p>\n",
     )
 }
 
@@ -195,9 +203,10 @@ pub(super) fn misdirected(address: &str) -> Response<Full<Bytes>> {
     page(
         StatusCode::MISDIRECTED_REQUEST,
         "Not this address",
+        &theme::state_title(Mark::Info, Icon::Unknown, "Not this address"),
         Layout::Card,
         &format!(
-            "<p>This is the local run of the Application, and it answers only at its own address: <a href=\"{address}\">{address}</a>. Nothing was done.</p>\n"
+            "<p>The local run answers only at the Application's own address: <a href=\"{address}\">{address}</a>. Nothing was done.</p>\n"
         ),
     )
 }
@@ -207,6 +216,7 @@ pub(super) fn method_not_allowed() -> Response<Full<Bytes>> {
     let mut response = page(
         StatusCode::METHOD_NOT_ALLOWED,
         "Method not allowed",
+        &theme::state_title(Mark::Info, Icon::Unknown, "Method not allowed"),
         Layout::Card,
         "<p>This page takes GET and POST.</p>\n",
     );
@@ -222,6 +232,7 @@ pub(super) fn other_origin() -> Response<Full<Bytes>> {
     page(
         StatusCode::FORBIDDEN,
         "Not from this address",
+        &theme::state_title(Mark::Error, Icon::Cross, "Not from this address"),
         Layout::Card,
         "<p>A test User is chosen only from the local run's own page. Nothing was chosen.</p>\n",
     )
@@ -242,6 +253,7 @@ pub(super) fn unavailable(why: &str) -> Response<Full<Bytes>> {
     page(
         StatusCode::SERVICE_UNAVAILABLE,
         "Not now",
+        &theme::state_title(Mark::Warn, Icon::Later, "Not now"),
         Layout::Card,
         &format!("<p>{}</p>\n", escape(why)),
     )
@@ -249,14 +261,14 @@ pub(super) fn unavailable(why: &str) -> Response<Full<Bytes>> {
 
 /// `500`: the project as it is now does not build (or its test Users, its
 /// migrations or its test rows fail): the reason and the message the
-/// command gives, escaped.
+/// command gives, escaped. The reason and the other facts of the failure
+/// are a list of name and value under the title, the message after them.
 pub(super) fn failed(error: &serde_json::Value) -> Response<Full<Bytes>> {
     let reason = error["reason"].as_str().unwrap_or("failed");
     let message = error["message"].as_str().unwrap_or_default();
-    let mut body = format!(
-        "<p class=\"lead\">The project as it is now cannot be served, so no Version of it is: the local run answers this page to every request until the project is corrected, and the first request after a change tries again.</p>\n<p class=\"facts-line\">Reason: <code>{}</code></p>\n<pre class=\"message\">{}</pre>\n",
-        escape(reason),
-        escape(message)
+    let mut facts = format!(
+        "<dl class=\"facts\"><dt>Reason</dt><dd><code>{}</code></dd>",
+        escape(reason)
     );
     if let Some(fields) = error.as_object() {
         for (name, value) in fields {
@@ -264,17 +276,24 @@ pub(super) fn failed(error: &serde_json::Value) -> Response<Full<Bytes>> {
                 continue;
             }
             if let Some(value) = value.as_str() {
-                body.push_str(&format!(
-                    "<p class=\"facts-line\">{}: <code>{}</code></p>\n",
+                facts.push_str(&format!(
+                    "<dt>{}</dt><dd><code>{}</code></dd>",
                     escape(name),
                     escape(value)
                 ));
             }
         }
     }
+    facts.push_str("</dl>\n");
+    let body = format!(
+        "{facts}<pre class=\"message\">{}</pre>\n\
+         <p class=\"lead\">Every request is answered with this page until the project is corrected; the first request after a change tries again.</p>\n",
+        escape(message)
+    );
     page(
         StatusCode::INTERNAL_SERVER_ERROR,
         "The project does not build",
+        &theme::state_title(Mark::Error, Icon::Cross, "The project does not build"),
         Layout::Column,
         &body,
     )
@@ -310,11 +329,13 @@ pub(super) enum Said<'a> {
     NotInFile(&'a str),
 }
 
-/// The page that chooses the test User: every User of `file`, each with
-/// its id, its name and email when it has them, its Groups, its access on
-/// each pulled Resource of `pulled`, and a button; `chosen` marked.
+/// The page that chooses the test User of `application`: every User of
+/// `file`, each with its id, its name and email when it has them, its
+/// Groups, its access on each pulled Resource of `pulled`, and a button;
+/// `chosen` marked by its card's edge and a check.
 pub(super) fn chooser(
     status: StatusCode,
+    application: &str,
     file: &TestUsersFile,
     pulled: &[String],
     chosen: Option<&str>,
@@ -332,9 +353,10 @@ pub(super) fn chooser(
             ),
         ));
     }
-    body.push_str(
-        "<p class=\"lead\">The Application runs on this machine and is given each request as the test User chosen here, from vibe.dev.json as it is now.</p>\n<ul class=\"users\">\n",
-    );
+    body.push_str(&format!(
+        "<p class=\"lead\"><code>{}</code> is given each request as the User chosen here, from vibe.dev.json as it is now.</p>\n<ul class=\"users\">\n",
+        escape(application)
+    ));
     for user in &file.users {
         let is_chosen = chosen == Some(user.id.as_str());
         let id = escape(&user.id);
@@ -346,7 +368,7 @@ pub(super) fn chooser(
             "<li class=\"card\">"
         });
         body.push_str(&format!(
-            "<form method=\"post\" action=\"/_vm/test-user\"><input type=\"hidden\" name=\"user\" value=\"{id}\"><input type=\"hidden\" name=\"next\" value=\"{}\">",
+            "<form method=\"post\" action=\"/_vm/test-user\"><input type=\"hidden\" name=\"user\" value=\"{id}\"><input type=\"hidden\" name=\"next\" value=\"{}\"><div class=\"text\">",
             escape(next)
         ));
         let name = user.display_name.as_deref().map(escape);
@@ -355,43 +377,52 @@ pub(super) fn chooser(
             name.as_deref().unwrap_or(&id)
         ));
         if is_chosen {
-            body.push_str("<span class=\"pill on\">\u{2713} Chosen now</span>");
+            body.push_str(&format!(
+                "<span class=\"pill on\">{}Chosen</span>",
+                Icon::Check.svg()
+            ));
         }
         body.push_str("</div>");
         if user.email.is_some() || name.is_some() {
             body.push_str("<p class=\"ident\">");
             if let Some(email) = &user.email {
-                body.push_str(&format!(
-                    "<span class=\"soft\">&lt;{}&gt;</span> ",
-                    escape(email)
-                ));
+                body.push_str(&escape(email));
             }
             if name.is_some() {
                 body.push_str(&format!("<code class=\"id\">{id}</code>"));
             }
             body.push_str("</p>");
         }
-        let groups: Vec<String> = user.groups.iter().map(|g| escape(g)).collect();
         body.push_str(&format!(
-            "<dl class=\"facts\"><dt>Groups</dt><dd>{}</dd>",
-            if groups.is_empty() {
-                "(none)".to_owned()
-            } else {
-                groups.join(", ")
-            }
+            "<ul class=\"tags\"><li>{}",
+            theme::icon(Icon::Group, "Groups:")
         ));
+        if user.groups.is_empty() {
+            body.push_str("no Group");
+        } else {
+            let groups: Vec<String> = user.groups.iter().map(|g| escape(g)).collect();
+            body.push_str(&groups.join(", "));
+        }
+        body.push_str("</li>");
         for resource in pulled {
             body.push_str(&format!(
-                "<dt><code>{}</code></dt><dd>{}</dd>",
+                "<li><code>{}</code> {}</li>",
                 escape(resource),
                 access(file, user, resource)
             ));
         }
         body.push_str(&format!(
-            "</dl><div class=\"form-actions\"><button type=\"submit\">Be this User<span class=\"vh\"> {}</span></button></div></form></li>\n",
+            "</ul></div><button type=\"submit\"{}>Be this User<span class=\"vh\"> {}</span></button></form></li>\n",
+            if is_chosen { " class=\"quiet\"" } else { "" },
             name.as_deref().unwrap_or(&id)
         ));
     }
     body.push_str("</ul>\n");
-    page(status, "Choose the test User", Layout::Column, &body)
+    page(
+        status,
+        "Choose the test User",
+        "<h1>Choose the test User</h1>",
+        Layout::Column,
+        &body,
+    )
 }

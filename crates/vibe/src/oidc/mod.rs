@@ -336,7 +336,7 @@ impl Oidc {
             Some(state) => state,
             None => match Secret::random() {
                 Some(state) => state.expose().to_owned(),
-                None => return Some(pages::unavailable(None)),
+                None => return Some(pages::unavailable(&self.domain, None)),
             },
         };
         let next = parts.uri.path_and_query().map_or("/", |p| p.as_str());
@@ -363,7 +363,7 @@ impl Oidc {
             );
         }
         let Some(connected) = self.connected() else {
-            return pages::not_found();
+            return pages::not_found(&self.domain);
         };
         let read = parts.method == Method::GET || parts.method == Method::HEAD;
         let post = parts.method == Method::POST;
@@ -373,12 +373,12 @@ impl Oidc {
             ("/tool", true) => self.tool_begin(&connected, parts, port).await,
             ("/tool", false) if post => self.tool_answer(parts, body).await,
             ("/me", true) => self.me(parts).await,
-            ("/sign-out", true) => pages::sign_out_form(),
+            ("/sign-out", true) => pages::sign_out_form(&self.domain),
             ("/sign-out", false) if post => self.sign_out(parts).await,
             ("/sign-in" | "/callback" | "/me" | "/sign-out" | "/tool", _) => {
-                pages::method_not_allowed()
+                pages::method_not_allowed(&self.domain)
             }
-            _ => pages::not_found(),
+            _ => pages::not_found(&self.domain),
         }
     }
 
@@ -397,6 +397,7 @@ impl Oidc {
         let query = Query::of(parts);
         let Some(application) = query.get("application").filter(|a| signs_in_to(a)) else {
             return pages::failed(
+                &self.domain,
                 StatusCode::BAD_REQUEST,
                 "The address names no Application that could exist.",
                 None,
@@ -409,6 +410,7 @@ impl Oidc {
             !s.is_empty() && s.len() <= MAX_STEP_ONE_STATE && !s.chars().any(char::is_control)
         }) else {
             return pages::failed(
+                &self.domain,
                 StatusCode::BAD_REQUEST,
                 "The address does not say which sign-in this is, or says it in more than 128 bytes.",
                 again,
@@ -420,13 +422,14 @@ impl Oidc {
                     .to_application(session, application, &next, state, port, Vec::new())
                     .await;
             }
-            Current::Unavailable => return pages::unavailable(again),
+            Current::Unavailable => return pages::unavailable(&self.domain, again),
             Current::None => {}
         }
         let configuration = match connected.provider.configuration(None).await {
             Ok(configuration) => configuration,
             Err(problem) => {
                 return pages::failed(
+                    &self.domain,
                     StatusCode::BAD_GATEWAY,
                     &format!(
                         "The company's sign-in could not be used: {}.",
@@ -437,7 +440,7 @@ impl Oidc {
             }
         };
         let Some(browser) = self.browser_value(parts) else {
-            return pages::unavailable(again);
+            return pages::unavailable(&self.domain, again);
         };
         // Through the provider, a long `next` is `/`: the `state` carries
         // it, and some providers cut a long `state`.
@@ -450,7 +453,7 @@ impl Oidc {
             .states
             .begin(&digest(&browser), state, application, &next)
         else {
-            return pages::unavailable(again);
+            return pages::unavailable(&self.domain, again);
         };
         let authorization = self.authorization(connected, &configuration, &begun, port);
         let cookie = self.sign_in_cookie(&browser, SIGN_IN_COOKIE_SECONDS);
@@ -471,7 +474,7 @@ impl Oidc {
         let again = format!("{}{next}", self.app_origin(application, port));
         let again = Some(again.as_str());
         if application != DASHBOARD_NAME && !self.registry.may_serve(application) {
-            let mut answer = pages::no_application(application);
+            let mut answer = pages::no_application(&self.domain, application);
             for cookie in cookies {
                 answer
                     .headers_mut()
@@ -480,7 +483,7 @@ impl Oidc {
             return answer;
         }
         let Some(code) = Secret::random() else {
-            return pages::unavailable(again);
+            return pages::unavailable(&self.domain, again);
         };
         if let Err(error) = self
             .sessions
@@ -488,7 +491,7 @@ impl Oidc {
             .await
         {
             log_database(&error);
-            return pages::unavailable(again);
+            return pages::unavailable(&self.domain, again);
         }
         let query = form_urlencoded::Serializer::new(String::new())
             .append_pair("code", code.expose())
@@ -514,6 +517,7 @@ impl Oidc {
         // sign-in was for: these pages link nowhere.
         let Some(state) = query.get("state") else {
             return pages::failed(
+                &self.domain,
                 StatusCode::BAD_REQUEST,
                 "The sign-in came back without saying which sign-in it was.",
                 None,
@@ -525,6 +529,7 @@ impl Oidc {
             Ok(opened) => opened,
             Err(NotTaken::Unreadable) => {
                 return pages::failed(
+                    &self.domain,
                     StatusCode::BAD_REQUEST,
                     "This browser did not start this sign-in.",
                     None,
@@ -532,6 +537,7 @@ impl Oidc {
             }
             Err(NotTaken::TooOld) => {
                 return pages::failed(
+                    &self.domain,
                     StatusCode::BAD_REQUEST,
                     "The sign-in took more than 10 minutes.",
                     None,
@@ -543,14 +549,14 @@ impl Oidc {
             Opened::Tool(tool) => {
                 // The `state` opened with it, so it is there.
                 let Some(browser) = browser else {
-                    return pages::tool_over();
+                    return pages::tool_over(&self.domain);
                 };
                 return match self
                     .exchanged(connected, &query, &tool.verifier(), &tool.nonce(), port)
                     .await
                 {
                     Ok(tokens) => self.tool_awaiting(&tool, &browser, &tokens).await,
-                    Err((status, what)) => pages::tool_failed(status, &what),
+                    Err((status, what)) => pages::tool_failed(&self.domain, status, &what),
                 };
             }
         };
@@ -571,10 +577,10 @@ impl Oidc {
             .await
         {
             Ok(tokens) => tokens,
-            Err((status, what)) => return pages::failed(status, &what, again),
+            Err((status, what)) => return pages::failed(&self.domain, status, &what, again),
         };
         let Some(value) = Secret::random() else {
-            return pages::unavailable(again);
+            return pages::unavailable(&self.domain, again);
         };
         let session = match self
             .sessions
@@ -588,7 +594,7 @@ impl Oidc {
             Ok(session) => session,
             Err(error) => {
                 log_database(&error);
-                return pages::unavailable(again);
+                return pages::unavailable(&self.domain, again);
             }
         };
         let cookies: Vec<HeaderValue> = self.session_cookie(&value).into_iter().collect();
@@ -682,10 +688,10 @@ impl Oidc {
             && let Err(error) = self.sessions.end_by_cookie(&digest(value)).await
         {
             log_database(&error);
-            return pages::unavailable(Some("/sign-out"));
+            return pages::unavailable(&self.domain, Some("/sign-out"));
         }
         let clear = cookies::set_cookie(cookies::session_name(self.secure()), "", 0, self.secure());
-        pages::signed_out(clear)
+        pages::signed_out(&self.domain, clear)
     }
 
     /// Step 4: `GET <application address>/_vm/session`.
@@ -698,7 +704,8 @@ impl Oidc {
         let query = Query::of(parts);
         let again = format!("{}/", self.app_origin(application, port));
         let again = Some(again.as_str());
-        let refused = |what: &str| pages::failed(StatusCode::BAD_REQUEST, what, again);
+        let refused =
+            |what: &str| pages::failed(&self.domain, StatusCode::BAD_REQUEST, what, again);
         if parts.method != Method::GET && parts.method != Method::HEAD {
             return refused("This address takes only a GET.");
         }
@@ -710,7 +717,7 @@ impl Oidc {
             Ok(None) => return refused("The sign-in code is unknown, or was already used."),
             Err(error) => {
                 log_database(&error);
-                return pages::unavailable(again);
+                return pages::unavailable(&self.domain, again);
             }
         };
         let cookie = cookies::find(&parts.headers, cookies::sign_in_name(self.secure()));
@@ -728,7 +735,7 @@ impl Oidc {
             );
         }
         let Some(value) = Secret::random() else {
-            return pages::unavailable(again);
+            return pages::unavailable(&self.domain, again);
         };
         match self
             .sessions
@@ -739,7 +746,7 @@ impl Oidc {
             Ok(false) => return refused("The session this code was made from has ended."),
             Err(error) => {
                 log_database(&error);
-                return pages::unavailable(again);
+                return pages::unavailable(&self.domain, again);
             }
         }
         let next = path_only(query.get("next"));

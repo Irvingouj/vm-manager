@@ -21,3 +21,9 @@ focus-on-bg          #ff7a3d #12110e 3
 danger-on-bg         #fca5a5 #12110e 4.5
 quiet-hover          #ff9a66 #27251f 4.5
 danger-edge-on-surf  #fca5a5 #1c1a16 3
+ok-mark-on-surface   #bbf7d0 #1c1a16 3
+ok-mark-on-bg        #bbf7d0 #12110e 3
+warn-mark-on-surface #fef08a #1c1a16 3
+warn-mark-on-bg      #fef08a #12110e 3
+danger-mark-on-bg    #fca5a5 #12110e 3
+ink3-mark-on-surface #9a9282 #1c1a16 3

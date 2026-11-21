@@ -47,7 +47,7 @@ use super::client::{self, Installation, Reply, Sign};
 use super::{Ending, failed, not_success, unexpected};
 use crate::oidc::secret::Secret;
 use crate::oidc::tool::{check_code, shown_code};
-use crate::theme::{self, Layout, Mark, Place};
+use crate::theme::{self, Icon, Layout, Mark, Place};
 
 /// How often the installation is asked whether the sign-in was confirmed.
 pub const POLL_EVERY: Duration = Duration::from_secs(2);
@@ -389,25 +389,34 @@ fn page(said: Said) -> String {
         Said::SignedIn => (
             "Signed in",
             format!(
-                "<h1>The tool is signed in</h1>{}",
-                theme::notice(
-                    Mark::Ok,
-                    "role=\"status\"",
-                    "You can close this page and go back to the tool."
-                )
+                "{}<p role=\"status\">You can close this page and go back to the tool.</p>",
+                theme::state_title(Mark::Ok, Icon::Check, "The tool is signed in")
             ),
         ),
         Said::NotYet => (
             "Not signed in",
-            "<h1>The tool is not signed in</h1><p>This answer is not for the sign-in the tool is waiting for. Run <code>vibe sign-in</code> again if it has ended.</p>".to_owned(),
+            format!(
+                "{}<p>This answer is not for the sign-in the tool is waiting for. Run <code>vibe sign-in</code> again if it has ended.</p>",
+                theme::state_title(Mark::Error, Icon::Cross, "The tool is not signed in")
+            ),
         ),
         Said::Failed => (
             "Not signed in",
-            "<h1>The tool could not finish signing in</h1><p>See what the tool says, then run <code>vibe sign-in</code> again.</p>".to_owned(),
+            format!(
+                "{}<p>See what the tool says, then run <code>vibe sign-in</code> again.</p>",
+                theme::state_title(
+                    Mark::Error,
+                    Icon::Cross,
+                    "The tool could not finish signing in"
+                )
+            ),
         ),
         Said::NotHere => (
             "Not here",
-            "<h1>Nothing is here</h1><p class=\"soft\">This address is the tool's own, for the sign-in it is waiting for.</p>".to_owned(),
+            format!(
+                "{}<p class=\"soft\">This address is the tool's own, for the sign-in it is waiting for.</p>",
+                theme::state_title(Mark::Info, Icon::Unknown, "Nothing is here")
+            ),
         ),
     };
     theme::page(title, Place::Tool, Layout::Card, &main)

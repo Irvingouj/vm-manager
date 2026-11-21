@@ -130,9 +130,15 @@ impl Ingress {
                 self.public
                     .origin(&format!("{AUTH_NAME}.{}", self.domain), port)
             );
-            pages::not_shared(application, id, name.as_deref(), Some(&sign_out))
+            pages::not_shared(
+                &self.domain,
+                application,
+                id,
+                name.as_deref(),
+                Some(&sign_out),
+            )
         } else {
-            pages::not_shared(application, id, None, None)
+            pages::not_shared(&self.domain, application, id, None, None)
         }
     }
 
