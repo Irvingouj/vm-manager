@@ -18,6 +18,12 @@
 //   /sleep?ms=<n>            never touches the body; waits n ms, then answers
 //                            200 `slept`. A body held back meanwhile must not
 //                            fail: nothing is reading it.
+//   /read-one-then-sleep?ms=<n>
+//                            asks for the body (reads one chunk, prints
+//                            `asked for the body`), then waits n ms without
+//                            reading any more, prints `done waiting` and
+//                            answers 200 `slept`. A body that goes quiet
+//                            meanwhile is one the platform is waiting for.
 //   /read-all                prints one line, then reads the body to its end
 //                            (or until the stream fails) and answers 200 with
 //                            { bytes, error }. A body the platform fails
@@ -38,6 +44,16 @@ globalThis.default = {
     if (url.pathname === "/sleep") {
       const ms = Number(url.searchParams.get("ms") ?? "0") || 0;
       await new Promise((resolve) => setTimeout(resolve, ms));
+      return new Response("slept");
+    }
+
+    if (url.pathname === "/read-one-then-sleep") {
+      const ms = Number(url.searchParams.get("ms") ?? "0") || 0;
+      const reader = request.body.getReader();
+      await reader.read();
+      console.log("asked for the body");
+      await new Promise((resolve) => setTimeout(resolve, ms));
+      console.log("done waiting");
       return new Response("slept");
     }
 

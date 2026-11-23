@@ -21,6 +21,7 @@
     reason = "test code: a failed expectation is a failing test"
 )]
 
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::time::Duration;
 
 use blackbox::body::{BodyEnd, Head, Raw, assert_framed_truly, pattern_block};
@@ -116,14 +117,70 @@ fn assert_next_request_is_answered_as_its_own(raw: &mut Raw, vm: &Vm, after: &st
     assert_framed_truly(&head, u64::try_from(body.len()).expect("fits"), after);
 }
 
+/// An echo case: its label, its `h=` parameter, and the listed header it
+/// sets (none for a lying length).
+type EchoCase = (String, String, Option<(&'static str, &'static str)>);
+
+/// Runs `case`, and notes in `failures` what it panicked with: each case of
+/// a scenario is run, so that one header's failure does not hide the next.
+fn collect(failures: &mut Vec<String>, what: &str, case: impl FnOnce()) {
+    if let Err(panic) = catch_unwind(AssertUnwindSafe(case)) {
+        let message = panic
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| panic.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+            .unwrap_or_default();
+        let first: String = message.lines().take(3).collect::<Vec<_>>().join(" | ");
+        failures.push(format!("{what}: {first}"));
+    }
+}
+
+fn assert_no_failures(failures: &[String]) {
+    assert!(
+        failures.is_empty(),
+        "{} case(s) failed:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}
+
+/// A made body of `size` bytes under a code-set header, on its own
+/// kept-alive connection: the answer's framing, then the next request.
+///
+/// The client sends no body here (a GET) or its whole body (the echoes), so
+/// the platform has no reason of its own to close the connection: a
+/// connection that closes after the code's `connection: close` is that
+/// header honoured, which the contract forbids ("the platform keeps the
+/// connection open whatever the code set").
+fn made_case(vm: &Vm, kind: &str, size: usize, name: &str, value: &str) {
+    let mut raw = Raw::connect_keep_alive(vm.address());
+    let (head, body, end) = raw.exchange(
+        "GET",
+        &format!("/made?kind={kind}&size={size}{}", sets(name, value)),
+        &vm.host_of(APP),
+        Some(&bob()),
+        None,
+        WITHIN,
+    );
+    let what = format!("a made {kind} of {size} bytes with `{name}: {value}` set");
+    assert_eq!(head.status, 200, "{what}: got {}", head.status);
+    assert_eq!(end, BodyEnd::Whole, "{what}");
+    assert_eq!(
+        body.len(),
+        size,
+        "{what}: expected the body's own {size} bytes, not the code's length"
+    );
+    assert_not_sent_as_set(&head, name, value, &what);
+    assert_framed_truly(&head, u64::try_from(size).expect("fits"), &what);
+    assert_next_request_is_answered_as_its_own(&mut raw, vm, &what);
+}
+
 #[test]
 fn a_body_the_code_made_is_sent_with_the_platforms_framing_and_the_next_request_is_its_own() {
-    // About 2 seconds. A string of 10 bytes under each listed header, and
-    // under a content-length that is too short (5), too long (100) and
-    // (for a body of 100 KiB) a few hundred times its size.
+    // About 3 seconds. Each case has its own connection and is run whatever
+    // the others did. Lying lengths first, then each listed header.
     let vm = vm();
-    let mut raw = Raw::connect_keep_alive(vm.address());
-
+    let mut failures = Vec::new();
     for (kind, size, lie) in [
         ("string", 10, "5"),
         ("string", 10, "100"),
@@ -133,110 +190,86 @@ fn a_body_the_code_made_is_sent_with_the_platforms_framing_and_the_next_request_
         ("string", 102_400, "5"),
         ("string", 10, "0"),
     ] {
-        let what = format!("a made {kind} of {size} bytes with `content-length: {lie}` set");
-        let (head, body, end) = raw.exchange(
-            "GET",
-            &format!(
-                "/made?kind={kind}&size={size}{}",
-                sets("content-length", lie)
-            ),
-            &vm.host_of(APP),
-            Some(&bob()),
-            None,
-            WITHIN,
+        collect(
+            &mut failures,
+            &format!("{kind} of {size} under content-length {lie}"),
+            || made_case(&vm, kind, size, "content-length", lie),
         );
-        assert_eq!(head.status, 200, "{what}: got {}", head.status);
-        assert_eq!(end, BodyEnd::Whole, "{what}");
-        assert_eq!(
-            body.len(),
-            size,
-            "{what}: expected the body's own {size} bytes, not the code's length"
-        );
-        assert_framed_truly(&head, u64::try_from(size).expect("fits"), &what);
-        assert_next_request_is_answered_as_its_own(&mut raw, &vm, &what);
     }
-
     for (name, value) in LISTED {
-        let (head, body, end) = raw.exchange(
-            "GET",
-            &format!("/made?kind=string&size=10{}", sets(name, value)),
-            &vm.host_of(APP),
-            Some(&bob()),
-            None,
-            WITHIN,
-        );
-        let what = format!("a made body with `{name}: {value}` set");
-        assert_eq!(head.status, 200, "{what}: got {}", head.status);
-        assert_eq!(end, BodyEnd::Whole, "{what}");
-        assert_eq!(body, b"xxxxxxxxxx", "{what}");
-        assert_not_sent_as_set(&head, name, value, &what);
-        assert_framed_truly(&head, 10, &what);
-        assert_next_request_is_answered_as_its_own(&mut raw, &vm, &what);
+        collect(&mut failures, &format!("string under {name}"), || {
+            made_case(&vm, "string", 10, name, value);
+        });
     }
-
     // The contract's own example: `content-length: 5` over 10 bytes arrives
     // as those 10 bytes with `content-length: 10`.
-    let (head, body, _) = raw.exchange(
-        "GET",
-        &format!("/made?kind=string&size=10{}", sets("content-length", "5")),
-        &vm.host_of(APP),
-        Some(&bob()),
-        None,
-        WITHIN,
-    );
-    assert_eq!(body.len(), 10);
-    assert_eq!(head.content_length(), Some(10), "the platform's own length");
+    collect(&mut failures, "the contract's example", || {
+        let mut raw = Raw::connect_keep_alive(vm.address());
+        let (head, body, _) = raw.exchange(
+            "GET",
+            &format!("/made?kind=string&size=10{}", sets("content-length", "5")),
+            &vm.host_of(APP),
+            Some(&bob()),
+            None,
+            WITHIN,
+        );
+        assert_eq!(body.len(), 10);
+        assert_eq!(head.content_length(), Some(10), "the platform's own length");
+    });
+    assert_no_failures(&failures);
 }
 
 #[test]
 fn a_request_body_given_back_unread_is_sent_with_the_platforms_framing_and_the_next_request_is_its_own()
  {
-    // About 2 seconds. The same, for a body the host feeds: the echo of a
-    // 256 KiB request body, under each listed header and under a length that
-    // is too short and one that is far too long. The answer states the
-    // request's length (that sentence is the response bullet before).
+    // About 3 seconds. The same, for a body the host feeds: the echo of a
+    // 256 KiB request body, sent whole by the client, under each listed
+    // header and under lying lengths. The answer states the request's
+    // length. Each case has its own connection and is run whatever the
+    // others did.
     let vm = vm();
     let block = pattern_block(256 * 1024);
     let len = u64::try_from(block.len()).expect("fits");
-    let mut raw = Raw::connect_keep_alive(vm.address());
-
-    // The lying lengths first: they are the contract's reason.
-    let mut cases: Vec<(String, String)> = Vec::new();
+    let mut cases: Vec<EchoCase> = Vec::new();
     for lie in ["5", "100", "10000000", "0"] {
         cases.push((
-            format!("`content-length: {lie}`"),
+            format!("content-length: {lie}"),
             sets("content-length", lie),
+            None,
         ));
     }
     for (n, v) in LISTED {
-        cases.push((format!("`{n}: {v}`"), sets(n, v)));
+        cases.push((format!("{n}: {v}"), sets(n, v), Some((n, v))));
     }
-    for (what, set) in cases {
-        let what = format!("a request body given back with {what} set");
-        let (head, body, end) = raw.exchange(
-            "POST",
-            &format!("/echo-unread?status=200{set}"),
-            &vm.host_of(APP),
-            Some(&bob()),
-            Some(&block),
-            WITHIN,
-        );
-        assert_eq!(head.status, 200, "{what}: got {}", head.status);
-        assert_eq!(end, BodyEnd::Whole, "{what}");
-        assert_eq!(body, block, "{what}: expected the request's own bytes");
-        assert_eq!(
-            head.content_length(),
-            Some(len),
-            "{what}: expected the request's stated content-length"
-        );
-        assert!(!head.chunked(), "{what}: sent chunked with a length stated");
-        for (name, value) in LISTED {
-            if what.contains(&format!("`{name}: {value}`")) {
+    let mut failures = Vec::new();
+    for (label, set, listed) in cases {
+        collect(&mut failures, &format!("echo under {label}"), || {
+            let what = format!("a request body given back with `{label}` set");
+            let mut raw = Raw::connect_keep_alive(vm.address());
+            let (head, body, end) = raw.exchange(
+                "POST",
+                &format!("/echo-unread?status=200{set}"),
+                &vm.host_of(APP),
+                Some(&bob()),
+                Some(&block),
+                WITHIN,
+            );
+            assert_eq!(head.status, 200, "{what}: got {}", head.status);
+            assert_eq!(end, BodyEnd::Whole, "{what}");
+            assert_eq!(body, block, "{what}: expected the request's own bytes");
+            assert_eq!(
+                head.content_length(),
+                Some(len),
+                "{what}: expected the request's stated content-length"
+            );
+            assert!(!head.chunked(), "{what}: sent chunked with a length stated");
+            if let Some((name, value)) = listed {
                 assert_not_sent_as_set(&head, name, value, &what);
             }
-        }
-        assert_next_request_is_answered_as_its_own(&mut raw, &vm, &what);
+            assert_next_request_is_answered_as_its_own(&mut raw, &vm, &what);
+        });
     }
+    assert_no_failures(&failures);
 }
 
 #[test]

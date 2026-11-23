@@ -313,71 +313,91 @@ fn failed_stream_lines() -> Value {
 }
 
 #[test]
-fn a_body_of_no_stated_length_past_the_bound_fails_the_stream_and_is_answered_413() {
-    // About 10 to 40 seconds: 5 GiB and a byte cross loopback in 1 MiB
-    // chunks (5,121 of them), read by the program as the code pulls them.
-    // The writing is on a thread, the answer is read meanwhile: a 413 that
-    // the program sends before it closes is read before any reset can
-    // discard it. `written` counts what the client has handed to the kernel,
-    // which is ahead of what the program has read by what the socket
-    // buffers hold (a few MiB), so a program that fails more than that early
-    // is caught, and one that fails a few MiB early is not: the byte-exact
-    // bound is untestable from outside.
-    let vm = vm();
-    let block = pattern_block(usize::try_from(MIB).expect("fits"));
+fn a_body_given_back_unread_is_cut_once_the_request_has_passed_the_bound() {
+    // CONTRACT.md: no test reads 5 GiB through the code (its CPU limit ends
+    // it); "the bound for a body of no stated length is shown where the host
+    // does the reading: the body given back and sent by the host is cut once
+    // the request has passed the bound". Not measured yet (today's program
+    // refuses long before): 5.4 GB through loopback twice (in, out) in 4 MiB
+    // chunks should take 10 to 30 seconds; the whole test is kept inside 45
+    // seconds by the 40-second limit on the reading, and the writer, which
+    // runs on a thread, stops by itself when the program closes.
+    let vm = Vm::with_stand_in(&[("body-echo", "body-response.js")]);
+    let piece = pattern_block(usize::try_from(4 * MIB).expect("fits"));
     let mut raw = Raw::connect(vm.address());
     raw.send_head(
         "POST",
-        "/read-all",
-        &vm.host_of(APP),
+        "/echo-unread",
+        &vm.host_of("body-echo"),
         Some(&bob()),
         Framing::Chunked,
         &[],
     );
     let mut writer = raw.split_writer();
     let written = AtomicU64::new(0);
+    let writer_ended = AtomicBool::new(false);
     let stop = AtomicBool::new(false);
-    let (head, at_answer) = thread::scope(|scope| {
-        scope.spawn(|| {
+    let (head, received, end, writer_error, at_end) = thread::scope(|scope| {
+        let writing = scope.spawn(|| {
+            let mut error = None;
             while !stop.load(Ordering::Relaxed) {
-                if writer.send_chunk(&block).is_err() {
-                    return;
+                if let Err(problem) = writer.send_chunk(&piece) {
+                    error = Some(problem);
+                    break;
                 }
-                written.fetch_add(MIB, Ordering::Relaxed);
+                written.fetch_add(4 * MIB, Ordering::Relaxed);
             }
+            writer_ended.store(true, Ordering::Relaxed);
+            error
         });
         let head = raw.try_read_head(Duration::from_secs(40));
-        let at_answer = written.load(Ordering::Relaxed);
+        let mut received: u64 = 0;
+        let end = if head.is_ok() {
+            Some(raw.drain_body(Duration::from_secs(40), |bytes| {
+                received += u64::try_from(bytes.len()).expect("a piece below usize");
+            }))
+        } else {
+            None
+        };
+        // The writer sees the connection go by itself; give it time to.
+        let waited = Instant::now();
+        while !writer_ended.load(Ordering::Relaxed) && waited.elapsed() < Duration::from_secs(12) {
+            thread::sleep(Duration::from_millis(50));
+        }
+        let at_end = written.load(Ordering::Relaxed);
         stop.store(true, Ordering::Relaxed);
         raw.go_away();
-        (head, at_answer)
+        let error = writing.join().expect("the writer's thread ended");
+        (head, received, end, error, at_end)
     });
-    let head = head.unwrap_or_else(|e| panic!("{e} ({at_answer} bytes written)"));
+    let head = head.unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(
-        head.status, 413,
-        "expected 413 once the body passed the bound; the platform answered after {at_answer} bytes were written"
+        head.status, 200,
+        "expected the echo's head, got {}",
+        head.status
+    );
+    assert!(head.chunked(), "expected the body sent chunked");
+    assert_eq!(head.content_length(), None);
+    assert_eq!(
+        end,
+        Some(BodyEnd::ClosedShort),
+        "expected the response ended without a clean end once the request passed the bound ({received} bytes received, {at_end} written)"
     );
     assert!(
-        at_answer > REQUEST_BODY_BOUND,
-        "the platform answered 413 after only {at_answer} bytes were written; the bound is 5,368,774,656 and a body of no stated length fails one byte past it"
+        received <= REQUEST_BODY_BOUND,
+        "expected no more than the bound ({REQUEST_BODY_BOUND}) back, got {received}"
     );
-
-    // The code was reading the stream it was given: the stream failed for it
-    // (it printed that), and its entry and records are there with the
-    // platform's answer.
-    let id = head.request_id();
-    let (entry, _) = wait_for_entry(&vm.api_as(&installer()), APP, &id);
-    assert_eq!(entry["status"], 413, "{entry}");
-    assert_eq!(
-        entry["printed"],
-        failed_stream_lines(),
-        "expected the code to see its stream fail, and its lines in the entry of a request whose body failed, {entry}"
+    assert!(
+        received >= REQUEST_BODY_BOUND - 64 * MIB,
+        "expected the body cut at the bound, not long before it: {received} bytes came back"
     );
-    assert_eq!(
-        printed_records(&vm, &id).len(),
-        2,
-        "expected the code's two printed records"
+    assert!(
+        writer_error.is_some(),
+        "expected the client's writer to see the connection go ({at_end} bytes written)"
     );
+    // The head was decided before the body: its entry has the head's status.
+    let (entry, _) = wait_for_entry(&vm.api_as(&installer()), "body-echo", &head.request_id());
+    assert_eq!(entry["status"], 200, "{entry}");
 }
 
 fn printed_records(vm: &Vm, id: &str) -> Vec<Value> {
@@ -506,6 +526,123 @@ fn a_body_nobody_is_reading_is_not_timed_out_while_the_code_runs_for_longer_than
     assert_eq!(body, b"slept");
     let (entry, _) = wait_for_entry(&vm.api_as(&installer()), APP, &head.request_id());
     assert_eq!(entry["status"], 200, "{entry}");
+}
+
+#[test]
+fn a_body_the_code_asked_for_and_then_stopped_reading_fails_after_ten_quiet_seconds() {
+    // About 13 seconds. "Once the code has asked for it, the platform reads
+    // a little ahead (at most 4 MiB) and waits for more only while that
+    // room is not full": the code reads one chunk and waits 12 seconds; the
+    // client sends 16 bytes and nothing more, so the platform is waiting for
+    // a byte it has room for, and after 10 seconds the body fails. The code
+    // goes on to its end (12 s), and the `408` is sent in place of its 200.
+    let vm = vm();
+    let mut raw = Raw::connect(vm.address());
+    raw.send_head(
+        "POST",
+        "/read-one-then-sleep?ms=12000",
+        &vm.host_of(APP),
+        Some(&bob()),
+        Framing::Chunked,
+        &[],
+    );
+    raw.send_chunk(&pattern_block(16))
+        .expect("a chunk is written");
+    let head = raw.read_head(Duration::from_secs(30));
+    assert_eq!(
+        head.status, 408,
+        "expected 408 for a body the platform waited 10 s for after the code asked for it, got {}",
+        head.status
+    );
+    let id = head.request_id();
+    let (entry, _) = wait_for_entry(&vm.api_as(&installer()), APP, &id);
+    assert_eq!(entry["status"], 408, "{entry}");
+    assert_eq!(
+        entry["printed"],
+        serde_json::json!([
+            { "level": "log", "message": "asked for the body", "loading": false },
+            { "level": "log", "message": "done waiting", "loading": false }
+        ]),
+        "expected the code to go on to its end after its body failed, {entry}"
+    );
+}
+
+#[test]
+fn a_body_nobody_asked_for_is_not_taken_from_the_client() {
+    // About 4 seconds. A client sends a 64 MiB body to a route that sleeps 3
+    // seconds without touching it. "A body nobody has asked for yet is not
+    // read": the client's writes block once the socket buffers (about 10 MB
+    // on loopback) are full, so far fewer than 64 MiB are accepted by the
+    // time the answer comes. 32 MiB leaves a wide margin for the buffers.
+    let vm = vm();
+    let total: u64 = 64 * MIB;
+    let block = pattern_block(CHUNK);
+    let mut raw = Raw::connect(vm.address());
+    raw.send_head(
+        "POST",
+        "/sleep?ms=3000",
+        &vm.host_of(APP),
+        Some(&bob()),
+        Framing::Length(total),
+        &[],
+    );
+    let mut writer = raw.split_writer();
+    let accepted = AtomicU64::new(0);
+    let stop = AtomicBool::new(false);
+    let (head, at_answer) = thread::scope(|scope| {
+        scope.spawn(|| {
+            let step = u64::try_from(CHUNK).expect("fits");
+            while !stop.load(Ordering::Relaxed) && accepted.load(Ordering::Relaxed) < total {
+                if writer.write(&block).is_err() {
+                    return;
+                }
+                accepted.fetch_add(step, Ordering::Relaxed);
+            }
+        });
+        let head = raw.try_read_head(Duration::from_secs(20));
+        let at_answer = accepted.load(Ordering::Relaxed);
+        stop.store(true, Ordering::Relaxed);
+        raw.go_away();
+        (head, at_answer)
+    });
+    let head = head.unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(head.status, 200, "got {}", head.status);
+    assert!(
+        at_answer < total / 2,
+        "expected the program not to take a body nobody asked for ({} MiB of 64 were accepted by the time the code answered)",
+        at_answer / MIB
+    );
+}
+
+#[test]
+fn an_unread_body_the_client_had_not_finished_sending_closes_the_connection_after_the_answer() {
+    // About 1 second. "The unread body is dropped, and the connection is
+    // closed after the answer when the client had not finished sending it."
+    // (The platform's own close; the code's `connection` header is never
+    // honoured, `body_framing.rs`.) The client states a MiB, sends none.
+    let vm = vm();
+    let mut raw = Raw::connect_keep_alive(vm.address());
+    raw.send_head(
+        "POST",
+        "/never-reads",
+        &vm.host_of(APP),
+        Some(&bob()),
+        Framing::Length(MIB),
+        &[],
+    );
+    let head = raw.read_head(ANSWER_WAIT);
+    assert_eq!(head.status, 200, "got {}", head.status);
+    let mut body = Vec::new();
+    assert_eq!(
+        raw.drain_body(Duration::from_secs(5), |b| body.extend_from_slice(b)),
+        BodyEnd::Whole
+    );
+    assert_eq!(body, b"never-reads answered 200");
+    assert!(
+        raw.wait_closed_without_taking(Duration::from_secs(5))
+            .is_some(),
+        "expected the connection closed after the answer: the client had not finished sending the body"
+    );
 }
 
 #[test]
