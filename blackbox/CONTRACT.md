@@ -3410,6 +3410,7 @@ vibe admin outbound remove <host> [--json]
 - **Rules per Application** (this Application may call that host, another may not), **secrets** the platform keeps and adds to a call so that the code never holds them, and named HTTP clients: Milestone 2 (the spec, "Out of Scope"). In Milestone 1 a credential for the outside is in the Application's own code or database, which its Contributors can read.
 - **What is sent to a listed host** is the Application's affair: the list says where data may go, not which data. An administrator who lists a host that takes uploads from anyone has opened that door to every Application.
 - **A share for each Application** of the program's 256 calls: first come; the ticket "Resources and Grants in full".
+- **Several Applications whose names do not resolve**: four of them, each with its 16 lookups hanging, take the program's 64 places, and the calls of the others are `unreachable` `dns` while that lasts. The system's resolver cannot be given up once it was asked; a resolver of the platform's own, with a time of its own for each question, would close this.
 - A listed host that itself fetches an address given to it (an open relay) reaches where the platform would not: the list is the administrators' judgement of the host.
 - DNS answers are the resolver's: the platform checks the addresses it is given and connects to those, and does not validate DNSSEC.
 
