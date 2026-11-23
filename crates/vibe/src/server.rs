@@ -7,7 +7,9 @@
 //! every listener (more wait in the system's accept backlog); a request's
 //! head within [`Limits::header_read`], and hyper's own bound on its size
 //! (about 400 KiB, at most 100 headers); a connection open at most
-//! [`Limits::connection`]. A request's body is the handler's to bound.
+//! [`Limits::connection`], except while a body is being sent on it (the
+//! contract: the limit on one connection's life does not cut a body being
+//! sent). A request's body is the handler's to bound.
 //!
 //! **TLS** ([`Tls`]): when the program serves TLS itself, each accepted
 //! connection's handshake is made in its own task, holding its permit like
@@ -28,8 +30,6 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use bytes::Bytes;
-use http_body_util::Full;
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -43,6 +43,7 @@ use tokio_rustls::TlsAcceptor;
 
 use crate::ingress::Ingress;
 use crate::log;
+use crate::sent::{self, Sent};
 
 /// The limits of the server.
 #[derive(Clone, Debug)]
@@ -52,7 +53,10 @@ pub struct Limits {
     pub connections: usize,
     /// The longest a client may take to send a request's head.
     pub header_read: Duration,
-    /// The longest one connection may stay open.
+    /// The longest one connection may stay open, while no body is being
+    /// sent on it; a body being sent suspends the limit, which starts again
+    /// when the sending has ended (blackbox/CONTRACT.md, "What an
+    /// Application is handed").
     pub connection: Duration,
     /// Once stopping: the longest the connections open then are given to
     /// finish the requests they serve.
@@ -84,19 +88,15 @@ pub struct Tls {
     pub handshake: Duration,
 }
 
-/// What answers each request.
+/// What answers each request. It answers a [`Sent`] body: whole for every
+/// body the program has in hand, streamed for a body the host itself feeds
+/// (blackbox/CONTRACT.md, "What an Application is handed").
 pub trait Handler: Send + Sync + 'static {
-    fn handle(
-        &self,
-        request: Request<Incoming>,
-    ) -> impl Future<Output = Response<Full<Bytes>>> + Send;
+    fn handle(&self, request: Request<Incoming>) -> impl Future<Output = Response<Sent>> + Send;
 }
 
 impl Handler for Ingress {
-    fn handle(
-        &self,
-        request: Request<Incoming>,
-    ) -> impl Future<Output = Response<Full<Bytes>>> + Send {
+    fn handle(&self, request: Request<Incoming>) -> impl Future<Output = Response<Sent>> + Send {
         Ingress::handle(self, request)
     }
 }
@@ -220,13 +220,18 @@ struct Connection<H> {
 
 impl<H: Handler> Connection<H> {
     /// Serves HTTP/1.1 on `io` until the client is done, the connection's
-    /// time is over, or the server stops.
+    /// time is over, the server stops, or a body being sent is ended early.
     async fn serve<S>(mut self, io: S)
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         let handler = self.handler;
-        let service = service_fn(move |request| {
+        // The handler hears about the connection through this pair: a body
+        // it sends as a stream marks itself here, and asks for the
+        // connection to end (`cut`) when it must be ended early.
+        let (control, watch) = sent::pair();
+        let service = service_fn(move |mut request: Request<Incoming>| {
+            request.extensions_mut().insert(control.clone());
             let handler = Arc::clone(&handler);
             async move { Ok::<_, Infallible>(handler.handle(request).await) }
         });
@@ -236,19 +241,47 @@ impl<H: Handler> Connection<H> {
             .header_read_timeout(self.header_read);
         let connection = builder.serve_connection(TokioIo::new(io), service);
         tokio::pin!(connection);
-        // A connection past its time is dropped; a client that went away
-        // needs nothing more.
-        let stopped = &mut self.stopped;
-        tokio::time::timeout(self.connection_limit, async {
+        // One connection's life: `connection_limit` while nothing is being
+        // sent. The time a body was being sent is not counted, and after the
+        // sending the connection has its limit again as after any answer
+        // (CONTRACT.md, "What an Application is handed"): the timer's branch
+        // is off while `sending`, and it is reset whole when the sending
+        // ends. A client that went away ends the connection's own future;
+        // nothing more is needed.
+        let limit = self.connection_limit;
+        let life = tokio::time::sleep(limit);
+        tokio::pin!(life);
+        let mut sending = false;
+        let mut stream_begins = watch.streaming.clone();
+        let mut stream_ends = watch.streaming.clone();
+        let mut cut = watch.cut;
+        loop {
+            let mut stopping = false;
             tokio::select! {
                 _ = connection.as_mut() => return,
-                _ = stopped.wait_for(|stop| *stop) => {}
+                // Fires when the server stops (or the signal's sender is
+                // gone, which only happens when the server is ending).
+                _ = self.stopped.wait_for(|stopped| *stopped) => {
+                    stopping = true;
+                }
+                _ = cut.changed() => return,
+                _ = stream_begins.wait_for(|streaming| *streaming), if !sending => {
+                    sending = true;
+                }
+                _ = stream_ends.wait_for(|streaming| !*streaming), if sending => {
+                    sending = false;
+                    life.as_mut().reset(tokio::time::Instant::now() + limit);
+                }
+                _ = &mut life, if !sending => return,
             }
-            connection.as_mut().graceful_shutdown();
-            connection.as_mut().await.ok();
-        })
-        .await
-        .ok();
+            if stopping {
+                // The server stops: the request it serves is finished, and
+                // no more are taken on this connection.
+                connection.as_mut().graceful_shutdown();
+                connection.as_mut().await.ok();
+                return;
+            }
+        }
     }
 }
 

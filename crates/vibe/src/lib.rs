@@ -50,6 +50,8 @@
 //!   requests' path, and read through the API.
 //! - [`log`]: the program's log, one JSON record per line.
 //! - [`server`]: the listening socket and the connections.
+//! - [`sent`]: the body a response sends: whole, or a body the host feeds
+//!   streamed to the client and ended early when it must be.
 //! - [`own_tls`]: the program serving HTTPS itself: its certificate and
 //!   key, checked at start and looked at again when they change.
 //! - [`theme`]: the one theme of every page of the platform's own: its
@@ -78,6 +80,7 @@ pub mod platform_db;
 pub mod registry;
 pub mod resources;
 pub mod runner;
+pub mod sent;
 pub mod server;
 pub mod setup;
 pub mod sign_in;

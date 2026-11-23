@@ -76,6 +76,49 @@ const __vm_platform_glue_5c1e = (function (global) {
   const failure = function () {
     return new ResponseCtor('', { status: 500 });
   };
+  // A response whose body is a stream the code still holds a reader on is
+  // not one it can give back (CONTRACT.md, "Any other response body": as
+  // `new Response` of a locked stream throws in a browser). The lock is
+  // read through the getter captured here, before Application code runs, so
+  // a guest that redefines `locked` on its stream or on
+  // `ReadableStream.prototype`, or that replaces the stream's prototype,
+  // does not change the answer. A stream of the guest's own or the request's
+  // body is recognised by `instanceof` or by the native id it carries.
+  const StreamCtor = global.ReadableStream;
+  const lockedGetter = (function () {
+    try {
+      const descriptor =
+        StreamCtor === undefined ? null : Object.getOwnPropertyDescriptor(StreamCtor.prototype, 'locked');
+      return descriptor !== null && typeof descriptor.get === 'function' ? descriptor.get : null;
+    } catch (e) {
+      return null;
+    }
+  })();
+  const holdsReaderOn = function (response) {
+    let body;
+    try {
+      body = response.body;
+    } catch (e) {
+      return false;
+    }
+    if (body === null || typeof body !== 'object' || lockedGetter === null) {
+      return false;
+    }
+    let isStream = false;
+    try {
+      isStream = (StreamCtor !== undefined && body instanceof StreamCtor) || typeof body._nativeStreamId === 'number';
+    } catch (e) {
+      isStream = false;
+    }
+    if (!isStream) {
+      return false;
+    }
+    try {
+      return apply(lockedGetter, body, []) === true;
+    } catch (e) {
+      return false;
+    }
+  };
   const serve = function (request, runtimeContext) {
     return new PromiseCtor(function (resolve) {
       const fail = function (error) {
@@ -125,6 +168,10 @@ const __vm_platform_glue_5c1e = (function (global) {
           function (response) {
             settled();
             if (response instanceof ResponseCtor) {
+              if (holdsReaderOn(response)) {
+                fail(new ErrorCtor('the response body is a ReadableStream the code still holds a reader on: release the reader before giving the body back'));
+                return;
+              }
               resolve(response);
             } else {
               fail(new ErrorCtor('the fetch handler did not answer with a Response'));

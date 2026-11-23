@@ -24,8 +24,9 @@ use crate::execution_helpers::{
 use crate::runtime::{CallbackMessage, SchedulerMessage};
 use crate::security::{CpuEnforcer, TimeoutGuard, TurnGuard, next_request_id};
 use openworkers_core::{
-    FetchInit, HttpResponse, OperationsHandle, RequestBody, ResponseBody, ResponseSender,
-    RuntimeLimits, Script, TerminationReason, WebSocketId, WebSocketIncoming, WebSocketUpgrade,
+    FetchInit, HttpMethod, HttpResponse, OperationsHandle, RequestBody, ResponseBody,
+    ResponseSender, RuntimeLimits, Script, TerminationReason, WebSocketId, WebSocketIncoming,
+    WebSocketUpgrade,
 };
 
 /// How long a blockConcurrencyWhile callback may hold the events back.
@@ -113,6 +114,8 @@ struct FetchInFlight {
     held: Option<Held<HttpResponse>>,
     /// Set once the guest knows that the client hung up
     disconnected: bool,
+    /// The request was a `HEAD`: its answer has no body on the wire
+    head_request: bool,
 }
 
 struct AlarmInFlight {
@@ -811,6 +814,7 @@ impl ExecutionContext {
             upgrade,
             held: None,
             disconnected: false,
+            head_request: req.method == HttpMethod::Head,
         })
     }
 
@@ -899,7 +903,13 @@ impl ExecutionContext {
 
                 let socket = read_response_socket(scope, handle);
 
-                match read_response_object(scope, handle, &stream_manager, buffer_size) {
+                match read_response_object(
+                    scope,
+                    handle,
+                    &stream_manager,
+                    buffer_size,
+                    event.head_request,
+                ) {
                     Ok((status, response)) => {
                         let response = match (socket, event.upgrade.take()) {
                             (Some(ws_id), Some(upgrade)) => {

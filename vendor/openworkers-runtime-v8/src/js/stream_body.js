@@ -101,14 +101,26 @@
 
                     const chunk = toBytes(value, encoder);
 
-                    // A full channel takes nothing: wait for room and try again
-                    while (!__responseStreamWrite(streamId, chunk)) {
-                        if (__responseStreamIsClosed(streamId)) {
-                            cancelled = true;
-                            break;
+                    // The host takes a chunk of at most 64 KiB ("a chunk the
+                    // code writes to the host is at most 64 KiB"): a larger
+                    // chunk is sent in pieces of that size, each waiting for
+                    // room on its own.
+                    for (let at = 0; at < chunk.length; at += 65536) {
+                        const piece = chunk.subarray(at, Math.min(at + 65536, chunk.length));
+
+                        // A full channel takes nothing: wait for room and try again
+                        while (!__responseStreamWrite(streamId, piece)) {
+                            if (__responseStreamIsClosed(streamId)) {
+                                cancelled = true;
+                                break;
+                            }
+
+                            await writable(streamId);
                         }
 
-                        await writable(streamId);
+                        if (cancelled) {
+                            break;
+                        }
                     }
 
                     if (cancelled) {

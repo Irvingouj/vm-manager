@@ -551,11 +551,16 @@ pub fn trigger_fetch_handler(
 
 /// The Response the handle answered, as an HttpResponse: its body streams
 /// when the guest streams it, and is buffered otherwise.
+///
+/// `head_request` says the request was a `HEAD`: like a `204` or `304`
+/// answer, it has no body on the wire, so a stream given back is not asked
+/// for and is closed instead of taken (vendor/VENDORED.md, patch 10).
 pub fn read_response_object(
     scope: &mut v8::ContextScope<v8::HandleScope>,
     handle: Option<v8::Local<v8::Object>>,
     stream_manager: &Arc<StreamManager>,
     buffer_size: usize,
+    head_request: bool,
 ) -> Result<(u16, HttpResponse), String> {
     let resp_obj = handle
         .and_then(|handle| answered_response(scope, handle))
@@ -584,8 +589,12 @@ pub fn read_response_object(
 
     // Determine body type: streaming or buffered
     let body = if let Some(stream_id) = response_stream_id {
-        // Response stream - take the receiver from StreamManager
-        if let Some(receiver) = stream_manager.take_receiver(stream_id) {
+        // An answer with no body on the wire has none: nothing of a stream
+        // given back is asked for, and it is closed (patch 10).
+        if head_request || matches!(status, 204 | 304) {
+            stream_manager.close_stream(stream_id);
+            ResponseBody::None
+        } else if let Some(receiver) = stream_manager.take_receiver(stream_id) {
             let (tx, rx) = tokio::sync::mpsc::channel(buffer_size);
 
             // Clone stream_manager to use in the spawned task
@@ -615,6 +624,18 @@ pub fn read_response_object(
                                     break;
                                 }
                                 None => {
+                                    // The source ended without its end (the
+                                    // stream was closed, or the request ended
+                                    // mid-body). Never a clean end for a body
+                                    // the host sends: with a chunked answer a
+                                    // clean terminator would claim whole what
+                                    // is short (vendor/VENDORED.md, patch
+                                    // 13).
+                                    let _ = tx
+                                        .send(Err(
+                                            "the body's source ended without its end".to_string(),
+                                        ))
+                                        .await;
                                     break;
                                 }
                             }

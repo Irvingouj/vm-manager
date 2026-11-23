@@ -23,11 +23,29 @@ fn native_schedule_interval(state: &Rc<TimerState>, id: u64, interval: u64) {
         .send(SchedulerMessage::ScheduleInterval(id, interval));
 }
 
-#[glue_v8::method(fast, state = Rc<TimerState>)]
-fn native_schedule_writable(state: &Rc<TimerState>, id: u64, stream_id: u64) {
+/// Waits for room in a stream the guest made, then fires timer `id`.
+///
+/// Only a stream the guest made itself may be waited on
+/// (vendor/VENDORED.md, patch 12): the scheduler's wait closes the stream
+/// when the request is cancelled, which for the request's body (a host-fed
+/// stream) would cut a body the host is sending. A call naming any other
+/// stream throws, and nothing is waited on or closed. Not `fast`: the
+/// refusal has to throw into the guest, and a fast call cannot.
+#[glue_v8::method(state = Rc<TimerState>)]
+fn native_schedule_writable(
+    state: &Rc<TimerState>,
+    id: u64,
+    stream_id: u64,
+) -> Result<(), String> {
+    if !state.manager.is_guest_stream(stream_id) {
+        return Err(format!(
+            "waiting for room in stream {stream_id}: it is not a stream this Application made with __responseStreamCreate in this request"
+        ));
+    }
     let _ = state
         .scheduler_tx
         .send(SchedulerMessage::ScheduleWritable(id, stream_id));
+    Ok(())
 }
 
 #[glue_v8::method(fast, state = Rc<TimerState>)]
@@ -38,10 +56,12 @@ fn native_clear_timer(state: &Rc<TimerState>, id: u64) {
 pub fn setup_timers(
     scope: &mut v8::PinScope,
     scheduler_tx: mpsc::UnboundedSender<SchedulerMessage>,
+    manager: std::sync::Arc<super::super::stream_manager::StreamManager>,
 ) {
     // Create state for timer functions
     let state = Rc::new(TimerState {
         scheduler_tx: scheduler_tx.clone(),
+        manager,
     });
 
     // Keeps the Rc alive for the context; the templates below only borrow it.

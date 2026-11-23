@@ -28,7 +28,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use http_body_util::{BodyExt, Full};
 use hyper::header::{HOST, HeaderName, HeaderValue};
 use hyper::{Method, Request};
@@ -45,8 +45,8 @@ use super::postgres::{
 };
 use super::standins::{self, Standin};
 use super::{
-    DOMAIN, DRAIN_WAIT, KEPT_VERSIONS, MAX_BODY_BYTES, NO_COMMIT, PLATFORM_WAIT, PgFailed,
-    Progress, Stage, control, database_failed, local_state_failed, open_failed, rows,
+    DOMAIN, DRAIN_WAIT, KEPT_VERSIONS, NO_COMMIT, PLATFORM_WAIT, PgFailed, Progress, Stage,
+    control, database_failed, local_state_failed, open_failed, rows,
 };
 use crate::api::{Api, Signing, read_version};
 use crate::app_logs::{self, Query, Writer};
@@ -375,7 +375,10 @@ impl Live {
             credentials,
             runner,
             logs,
-            max_request_body_bytes: MAX_BODY_BYTES,
+            // The same bound as `vibe serve` (blackbox/CONTRACT.md, "What an
+            // Application is handed"); `vibe request`'s own `--data` and
+            // `--data-file` stay at [`MAX_BODY_BYTES`].
+            max_request_body_bytes: crate::ingress::MAX_REQUEST_BODY_BYTES,
             decides_opening: false,
             usage: None,
         };
@@ -1016,10 +1019,26 @@ pub(super) async fn serve_and_collect(
     let response = live.ingress.handle(request).await;
     let given_to_code = response.extensions().get::<GivenToCode>().is_some();
     let (parts, body) = response.into_parts();
-    let body = match body.collect().await {
-        Ok(collected) => collected.to_bytes(),
-        Err(never) => match never {},
-    };
+    // The body is read whole here, as the tool prints it: a body being sent
+    // in process hands its chunks over as they come. A body that fails on
+    // the way keeps what came of it, and a warning below says so.
+    let mut body = body;
+    let mut collected = BytesMut::new();
+    let mut body_failed = false;
+    while let Some(frame) = body.frame().await {
+        match frame {
+            Ok(frame) => {
+                if let Ok(data) = frame.into_data() {
+                    collected.extend_from_slice(&data);
+                }
+            }
+            Err(_) => {
+                body_failed = true;
+                break;
+            }
+        }
+    }
+    let body = collected.freeze();
     // A response to HEAD has no body, as on the wire.
     let body = if asked.method == Method::HEAD {
         Bytes::new()
@@ -1035,6 +1054,12 @@ pub(super) async fn serve_and_collect(
 
     progress.set(Stage::Recording);
     let mut warnings = Vec::new();
+    if body_failed {
+        warnings.push(incomplete(
+            "body",
+            "the response's body was cut short while it was being sent: the body above is what came of it",
+        ));
+    }
     if !live.gateway.drain(DRAIN_WAIT).await {
         warnings.push(incomplete(
             "operations",

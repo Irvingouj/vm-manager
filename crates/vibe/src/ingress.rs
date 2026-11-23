@@ -27,18 +27,38 @@
 //! refusals are short plain text. Every answer carries `x-vm-request-id`,
 //! and the request's `request` record is written just before the answer
 //! goes, after everything the Application did with it.
+//!
+//! **The request's body** is not collected: after every check above, it is
+//! handed to the runtime as a stream fed from the connection as the code
+//! reads it ([`Pump`]). Nothing is read, and no clock runs, until the body
+//! is asked for — the code's first read, or the response taking it to send
+//! — so a body nobody asks for is not read and not timed, and `100
+//! Continue` is not sent. A stated `content-length` over
+//! [`MAX_REQUEST_BODY_BYTES`] is the `413` before the code runs; a body
+//! with no stated length that passes it, and a body no byte of which
+//! arrives for [`BODY_STALLED_AFTER`] while it is being read, fail its
+//! stream, and the request is answered `413`/`408` when the answer has not
+//! been decided yet (a disable first). A body the code never reads is
+//! dropped with the request. How an answer is framed is the platform's, and
+//! a `HEAD`, `204` or `304` answer has no body on the wire
+//! (blackbox/CONTRACT.md, "What an Application is handed").
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::error::Error;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full, Limited};
+use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
 use hyper::body::Body;
-use hyper::header::{CONTENT_TYPE, HOST, HeaderName, HeaderValue, RETRY_AFTER, SET_COOKIE};
-use hyper::{HeaderMap, Request, Response, StatusCode};
+use hyper::header::{
+    CONTENT_LENGTH, CONTENT_TYPE, HOST, HeaderName, HeaderValue, RETRY_AFTER, SET_COOKIE,
+    TRANSFER_ENCODING,
+};
+use hyper::{HeaderMap, Method, Request, Response, StatusCode};
 use openworkers_core::{HttpMethod, HttpRequest, RequestBody};
 use serde_json::json;
+use tokio::sync::{mpsc, watch};
 use tokio_postgres::error::SqlState;
 
 use crate::api::{Answer, Api, Caller, SignedInWith};
@@ -52,7 +72,8 @@ use crate::oidc::{AUTH_NAME, Oidc, SESSION_PATH, asks_for_a_page, pages, signs_i
 use crate::origin::{Public, from_another_origin};
 use crate::registry::{Found, Registry, check_name};
 use crate::resources::{READ_BACK_WAIT, Resources};
-use crate::runner::{InFlight, Outcome, RequestRunner};
+use crate::runner::{AnswerBody, InFlight, Outcome, RequestRunner};
+use crate::sent::{OwnedTask, Sent, SentControl, SentStream};
 use crate::sign_in::{RESERVED_HEADER_PREFIX, SignIn, SignedIn, remove_reserved_headers};
 use crate::tool_credentials::{self, Digest, Presented, ToolCredentials};
 use crate::user::User;
@@ -73,8 +94,33 @@ const API_NAME: &str = "api";
 /// (see [`Ingress::disabled_answer`] for the budget it fits in).
 const NAME_READ_WAIT: Duration = Duration::from_millis(300);
 
-/// The longest a client may take to send a request's body.
+/// The longest a client may take to send a request's body (the platform's
+/// own forms of the Dashboard, which still read theirs whole).
 pub(crate) const BODY_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The largest a request's body may be, under `vibe serve` and in the local
+/// run alike (blackbox/CONTRACT.md, "What an Application is handed"): 5 GiB
+/// and 64 KiB (5,368,774,656 bytes); exactly that is taken.
+pub const MAX_REQUEST_BODY_BYTES: usize = 5 * 1024 * 1024 * 1024 + 64 * 1024;
+
+/// A chunk of a request's body on its way to the code: at most 64 KiB
+/// (blackbox/CONTRACT.md, "Storage: Bounds"). A frame from the connection
+/// may be larger, and is sent in pieces of this size.
+const BODY_CHUNK: usize = 64 * 1024;
+
+/// Chunks of a request's body in flight between the connection and the
+/// runtime's own stream: when the channel is full the pump waits, so the
+/// connection is read only as the code (or the host, for a body being sent)
+/// takes chunks. Two here, and the runtime's own stream holds at most
+/// `stream_buffer_size + 1` = 17 chunks between its pump and the code: at
+/// most 19 × 64 KiB ≈ 1.2 MiB is read ahead of the reader, under the 4 MiB
+/// the contract states.
+const BODY_CHUNKS: usize = 2;
+
+/// How long a read of the request's body may take without a byte while it is
+/// being read, before its stream fails and the request is answered `408`
+/// (blackbox/CONTRACT.md, "What an Application is handed").
+const BODY_STALLED_AFTER: Duration = Duration::from_secs(10);
 
 pub struct Ingress {
     /// The installation's domain, in lower case.
@@ -210,13 +256,17 @@ impl Ingress {
     /// Answers one request: off the wire (`vibe serve`, whose body is
     /// [`hyper::body::Incoming`]) or handed over in the process (the local
     /// run's).
-    pub async fn handle<B>(&self, request: Request<B>) -> Response<Full<Bytes>>
+    pub async fn handle<B>(&self, request: Request<B>) -> Response<Sent>
     where
-        B: Body<Data = Bytes> + Send,
-        B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+        B: Body<Data = Bytes> + Send + Unpin + 'static,
+        B::Error: Into<Box<dyn Error + Send + Sync>>,
     {
         let id: Arc<str> = uuid::Uuid::new_v4().to_string().into();
         let (mut parts, body) = request.into_parts();
+        // The connection's side of a body being sent, put there by
+        // crate::server; absent in the local run's in-process requests,
+        // which have no connection to end.
+        let control = parts.extensions.remove::<SentControl>();
         let known = Known {
             request: &id,
             application: None,
@@ -500,27 +550,44 @@ impl Ingress {
                 own(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed.\n"),
             );
         };
-        let read = Limited::new(body, self.max_request_body_bytes).collect();
-        let body = match tokio::time::timeout(BODY_READ_TIMEOUT, read).await {
-            Ok(Ok(collected)) => collected.to_bytes(),
-            Err(_) => {
-                return finish(
-                    &known,
-                    own(
-                        StatusCode::REQUEST_TIMEOUT,
-                        "The request body did not arrive in time.\n",
-                    ),
-                );
-            }
-            Ok(Err(_)) => {
-                return finish(
-                    &known,
-                    own(
-                        StatusCode::PAYLOAD_TOO_LARGE,
-                        "The request body is too large.\n",
-                    ),
-                );
-            }
+        // A stated length over the bound is `413` before the code runs
+        // (blackbox/CONTRACT.md, "What an Application is handed"). A body
+        // that states none has its bound checked as it is read, by the
+        // pump: it fails the stream, and the request is answered `413` when
+        // the answer has not been decided yet.
+        let stated_length = parts
+            .headers
+            .get(CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|text| text.trim().parse::<u64>().ok());
+        if stated_length.is_some_and(|stated| {
+            stated > u64::try_from(MAX_REQUEST_BODY_BYTES).unwrap_or(u64::MAX)
+        }) {
+            return finish(
+                &known,
+                own(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "The request body is too large.\n",
+                ),
+            );
+        }
+        // The body is handed to the runtime as a stream, fed from the
+        // connection as the code reads it: nothing is collected here, and
+        // the checks above came before its first byte. A request with no
+        // body (or `content-length: 0`) is `None`, as before. Nothing is
+        // read, and no clock runs, until the body is asked for (the code's
+        // first read, or the response taking it to send): the runtime says
+        // when that is, on `asked`.
+        let (asked_tx, asked_rx) = watch::channel(false);
+        let (body, mut pump) = if body.is_end_stream() {
+            (RequestBody::None, None)
+        } else {
+            // Bound: `BODY_CHUNKS` chunks; when the channel is full the pump
+            // waits, so the connection is read only as the code (or the
+            // body's sending) takes its chunks.
+            let (chunks_tx, chunks_rx) = mpsc::channel(BODY_CHUNKS);
+            let pump = Pump::start(body, chunks_tx, self.max_request_body_bytes, asked_rx);
+            (RequestBody::Stream(chunks_rx), Some(pump))
         };
         remove_reserved_headers(&mut parts.headers);
         tool_credentials::remove_credentials(&mut parts.headers);
@@ -533,17 +600,18 @@ impl Ingress {
                 serving.application, self.domain, path_and_query
             ),
             headers: for_application(&parts.headers),
-            body: if body.is_empty() {
-                RequestBody::None
-            } else {
-                RequestBody::Bytes(body)
-            },
+            body,
         };
 
         let outcome = self
             .runner
-            .run(Arc::clone(&in_flight), serving, request)
+            .run(Arc::clone(&in_flight), serving, request, asked_tx)
             .await;
+        // How the body ended, when it has: a failure found before the
+        // answer was decided is the platform's to answer for, whatever the
+        // code did; one found later ends the connection, which the client
+        // can tell by the `content-length` it was promised.
+        let body_failed = pump.as_ref().and_then(Pump::ended);
         let ran = matches!(
             outcome,
             Outcome::Answered(_) | Outcome::Failed | Outcome::Stopped { given: true }
@@ -555,57 +623,102 @@ impl Ingress {
         } else {
             outcome
         };
-        let response = match outcome {
-            Outcome::Answered(answer) => {
-                let mut response = Response::new(Full::new(answer.body));
+        let platform_answer = match body_failed {
+            Some(BodyEnd::TooLarge) => Some((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "The request body is too large.\n",
+            )),
+            Some(BodyEnd::Stalled) => Some((
+                StatusCode::REQUEST_TIMEOUT,
+                "The request body did not arrive in time.\n",
+            )),
+            Some(BodyEnd::Ended | BodyEnd::Gone | BodyEnd::GivenUp) | None => None,
+        };
+        // A disable comes first (CONTRACT.md, "What an Application is
+        // handed"): a request to an Application disabled meanwhile is
+        // answered as disabled, also when its body had failed.
+        let mut response = match (outcome, platform_answer) {
+            (Outcome::Stopped { .. }, _) => self
+                .disabled_answer(&parts, &in_flight.application, &in_flight.user.id, port)
+                .await
+                .map(Sent::from),
+            (_, Some((status, text))) => own(status, text).map(Sent::from),
+            (Outcome::Answered(answer), None) => {
+                // An answer with no body on the wire has none, whatever the
+                // code answered (CONTRACT.md, "What an Application is
+                // handed"): nothing is sent, a `204` carries no
+                // `content-length`, and a body given back is not asked for.
+                let bodiless = parts.method == Method::HEAD || matches!(answer.status, 204 | 304);
+                let mut response = match answer.body {
+                    AnswerBody::Whole(_) if bodiless => {
+                        Response::new(Sent::Whole(Full::new(Bytes::new())))
+                    }
+                    AnswerBody::Whole(body) => Response::new(Sent::Whole(Full::new(body))),
+                    AnswerBody::Streamed { chunks } if bodiless => {
+                        // Not asked for: the runtime closed the stream, and
+                        // the pump (not moved into the response) is dropped
+                        // with the request, so nothing is read from the
+                        // client.
+                        drop(chunks);
+                        Response::new(Sent::Whole(Full::new(Bytes::new())))
+                    }
+                    AnswerBody::Streamed { chunks } => {
+                        // A body the host itself feeds, which the code did
+                        // not read: the host sends it, and its pump ends with
+                        // it. The connection watches the sending (see
+                        // crate::sent).
+                        let mut owned = Vec::new();
+                        if let Some(task) = pump.as_mut().and_then(Pump::take_task) {
+                            owned.push(task);
+                        }
+                        Response::new(Sent::Stream(SentStream::new(
+                            chunks,
+                            control.clone(),
+                            Some(Arc::clone(&in_flight.stop)),
+                            owned,
+                        )))
+                    }
+                };
                 *response.status_mut() = StatusCode::from_u16(answer.status)
                     .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                let headers = response.headers_mut();
-                for (name, value) in answer.headers {
-                    let (Ok(name), Ok(value)) =
-                        (HeaderName::try_from(name), HeaderValue::try_from(value))
-                    else {
-                        continue;
-                    };
-                    // The platform's headers are the platform's to set.
-                    if name.as_str().starts_with(RESERVED_HEADER_PREFIX) {
-                        continue;
+                // How the answer is framed is the platform's: the code's own
+                // framing headers are never sent (CONTRACT.md, "How a
+                // response is framed").
+                copy_headers(response.headers_mut(), &in_flight, answer.headers);
+                if bodiless {
+                    response.headers_mut().remove(CONTENT_LENGTH);
+                    response.headers_mut().remove(TRANSFER_ENCODING);
+                } else if matches!(response.body(), Sent::Stream(_)) {
+                    // The host sets `content-length` itself: the request's
+                    // stated one, or none — and the body is sent chunked.
+                    match stated_length {
+                        Some(length) => {
+                            if let Ok(value) = HeaderValue::from_str(&length.to_string()) {
+                                response.headers_mut().insert(CONTENT_LENGTH, value);
+                            }
+                        }
+                        None => {
+                            response.headers_mut().remove(CONTENT_LENGTH);
+                        }
                     }
-                    // Nor can the code set the platform's cookies, or a
-                    // cookie the other Applications would be sent.
-                    if name == SET_COOKIE
-                        && let Some(dropped) = cookies::judge_set_cookie(value.as_bytes())
-                    {
-                        log::record(
-                            "set-cookie-dropped",
-                            json!({
-                                "application": &*in_flight.application,
-                                "reason": dropped.reason(),
-                            }),
-                        );
-                        continue;
-                    }
-                    headers.append(name, value);
                 }
                 response
             }
-            Outcome::Failed => own(
+            (Outcome::Failed, None) => own(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "The Application failed. The reason is in the program's log.\n",
-            ),
-            Outcome::Busy => own(
+            )
+            .map(Sent::from),
+            (Outcome::Busy, None) => own(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "Busy: try again shortly.\n",
-            ),
-            Outcome::Stopped { .. } => {
-                self.disabled_answer(&parts, &in_flight.application, &in_flight.user.id, port)
-                    .await
-            }
+            )
+            .map(Sent::from),
         };
         // The Application's code was given the request: its log entry,
         // made now and handed over without waiting, before the request
-        // record.
-        let mut response = response;
+        // record. The head is decided now; a body it streams goes on after
+        // this, and the records do not wait for it.
         if ran {
             self.logs.request_ended(
                 &in_flight,
@@ -773,8 +886,52 @@ fn own(status: StatusCode, text: &'static str) -> Response<Full<Bytes>> {
     response
 }
 
+/// The headers a response's body is framed with: the platform's to set,
+/// never the code's (blackbox/CONTRACT.md, "How a response is framed").
+const FRAMING_HEADERS: [&str; 7] = [
+    "content-length",
+    "transfer-encoding",
+    "connection",
+    "keep-alive",
+    "upgrade",
+    "te",
+    "trailer",
+];
+
+/// The Application's own headers on its answer: the platform's headers are
+/// the platform's to set, the framing headers are the platform's alone, and
+/// no code sets the platform's cookies or a cookie the other Applications
+/// would be sent.
+fn copy_headers(headers: &mut HeaderMap, in_flight: &InFlight, code: Vec<(String, String)>) {
+    for (name, value) in code {
+        let (Ok(name), Ok(value)) = (HeaderName::try_from(name), HeaderValue::try_from(value))
+        else {
+            continue;
+        };
+        if name.as_str().starts_with(RESERVED_HEADER_PREFIX) {
+            continue;
+        }
+        if FRAMING_HEADERS.contains(&name.as_str()) {
+            continue;
+        }
+        if name == SET_COOKIE
+            && let Some(dropped) = cookies::judge_set_cookie(value.as_bytes())
+        {
+            log::record(
+                "set-cookie-dropped",
+                json!({
+                    "application": &*in_flight.application,
+                    "reason": dropped.reason(),
+                }),
+            );
+            continue;
+        }
+        headers.append(name, value);
+    }
+}
+
 /// Writes the request record, then names the request on its answer.
-fn finish(known: &Known<'_>, mut response: Response<Full<Bytes>>) -> Response<Full<Bytes>> {
+fn finish<B: Into<Sent>>(known: &Known<'_>, response: Response<B>) -> Response<Sent> {
     log::record(
         "request",
         json!({
@@ -787,10 +944,178 @@ fn finish(known: &Known<'_>, mut response: Response<Full<Bytes>>) -> Response<Fu
             "status": response.status().as_u16(),
         }),
     );
+    let mut response = response.map(Into::into);
     if let Ok(id) = HeaderValue::from_str(known.request) {
         response
             .headers_mut()
             .insert(HeaderName::from_static(REQUEST_ID_HEADER), id);
     }
     response
+}
+
+/// How a request's body ended, as far as the platform must answer for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BodyEnd {
+    /// The body arrived whole.
+    Ended,
+    /// The body was given up before its end: nobody asked for it, or its
+    /// reader went away, or the sending stopped. Nothing is owed for it
+    /// (CONTRACT.md, "What an Application is handed": a body nobody has
+    /// asked for is not read and not timed; a body the code stopped reading
+    /// is dropped).
+    GivenUp,
+    /// A body with no stated length passed [`MAX_REQUEST_BODY_BYTES`].
+    TooLarge,
+    /// No byte arrived for [`BODY_STALLED_AFTER`] while it was being read.
+    Stalled,
+    /// The client's side failed otherwise (it went away, say): no answer of
+    /// the platform's is owed for it.
+    Gone,
+}
+
+/// The request's body, read off the connection into the runtime's stream by
+/// a task of its own, with an owner: dropping the [`Pump`] ends the task,
+/// which drops the rest of the body unread. The task is handed to the
+/// response when the response is the body itself, so that a body being sent
+/// goes on being read after the code has ended.
+struct Pump {
+    task: Option<OwnedTask>,
+    ended: Arc<Mutex<Option<BodyEnd>>>,
+}
+
+impl Pump {
+    /// Starts reading `body` into `chunks`, at most `max` bytes, once
+    /// `asked` says the body is wanted.
+    fn start<B>(
+        body: B,
+        chunks: mpsc::Sender<Result<Bytes, String>>,
+        max: usize,
+        asked: watch::Receiver<bool>,
+    ) -> Self
+    where
+        B: Body<Data = Bytes> + Send + Unpin + 'static,
+        B::Error: Into<Box<dyn Error + Send + Sync>>,
+    {
+        let ended = Arc::new(Mutex::new(None));
+        let reported = Arc::clone(&ended);
+        let task = tokio::spawn(async move {
+            read_body(body, chunks, max, reported, asked).await;
+        });
+        Self {
+            task: Some(OwnedTask::new(task)),
+            ended,
+        }
+    }
+
+    /// How the body ended, once it has; `None` while it is being read.
+    fn ended(&self) -> Option<BodyEnd> {
+        *self
+            .ended
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Takes the task, for a body the response sends itself: it must go on
+    /// feeding the body after the request's code has ended.
+    fn take_task(&mut self) -> Option<OwnedTask> {
+        self.task.take()
+    }
+}
+
+/// Reads the request's body into `chunks` a piece of at most [`BODY_CHUNK`]
+/// at a time, under the body's bound and the no-byte wait, once `asked` says
+/// the code (or the response) wants it. A failure is put on the stream (the
+/// code's read fails with it) and kept for the platform's answer
+/// ([`Pump::ended`]).
+async fn read_body<B>(
+    body: B,
+    chunks: mpsc::Sender<Result<Bytes, String>>,
+    max: usize,
+    ended: Arc<Mutex<Option<BodyEnd>>>,
+    mut asked: watch::Receiver<bool>,
+) where
+    B: Body<Data = Bytes> + Send + Unpin + 'static,
+    B::Error: Into<Box<dyn Error + Send + Sync>>,
+{
+    // Nothing is taken from the client, and no clock runs, before the body
+    // is asked for. This wait has no timeout of its own and needs none: its
+    // owner ends it. The signal's sender is dropped when the request is
+    // never given to the code (the runner answers `Busy`, or the
+    // Application is disabled while the request waits), and the pump task
+    // itself is aborted when the request's handling ends (`Pump` is dropped,
+    // or the `SentStream` that took it).
+    if asked.wait_for(|asked| *asked).await.is_err() {
+        finish_body(&ended, BodyEnd::GivenUp);
+        return;
+    }
+    let mut body = Limited::new(body, max);
+    loop {
+        let frame = match tokio::time::timeout(BODY_STALLED_AFTER, body.frame()).await {
+            Ok(Some(Ok(frame))) => frame,
+            Ok(None) => {
+                finish_body(&ended, BodyEnd::Ended);
+                return;
+            }
+            Ok(Some(Err(error))) => {
+                // Only the bound has an answer of the platform's; another
+                // failure is the client's own (it went away).
+                let kind = if error.downcast_ref::<LengthLimitError>().is_some() {
+                    BodyEnd::TooLarge
+                } else {
+                    BodyEnd::Gone
+                };
+                finish_body(&ended, kind);
+                // No timeout of its own: when the code is reading, the
+                // runtime takes the chunk at once; otherwise the message is
+                // dropped with the receiver, and the pump is aborted at the
+                // request's end, or (for a body being sent) by the 30-second
+                // watchdog or the response body being dropped.
+                chunks.send(Err(BODY_FAILED.to_owned())).await.ok();
+                return;
+            }
+            Err(_) => {
+                finish_body(&ended, BodyEnd::Stalled);
+                // As above: bounded by the reader or by the pump's owner,
+                // not by a timeout here.
+                chunks.send(Err(BODY_FAILED.to_owned())).await.ok();
+                return;
+            }
+        };
+        let Some(bytes) = frame.into_data().ok() else {
+            // Trailers: nothing of the body itself.
+            continue;
+        };
+        // `split_to` is a view of the frame, never a copy: the frame from
+        // the connection may be larger than a chunk, and each piece is at
+        // most `BODY_CHUNK`.
+        let mut rest = bytes;
+        while !rest.is_empty() {
+            let take = rest.len().min(BODY_CHUNK);
+            let piece = rest.split_to(take);
+            // Waits while the room is full (backpressure), and is ended by
+            // its owner: the receiver going away (the code stopped reading,
+            // the request ended) makes it fail at once; a body being sent
+            // cannot stall here for ever either (the response body's drop,
+            // or its 30-second watchdog, aborts the pump).
+            if chunks.send(Ok(piece)).await.is_err() {
+                // The body was dropped before it was read: nothing more.
+                finish_body(&ended, BodyEnd::GivenUp);
+                return;
+            }
+        }
+    }
+}
+
+/// What a code read of a failed body sees.
+const BODY_FAILED: &str =
+    "the request's body failed: it is too large, or it stalled, or the client went away";
+
+/// Notes how the body ended, once.
+fn finish_body(ended: &Mutex<Option<BodyEnd>>, kind: BodyEnd) {
+    let mut ended = ended
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if ended.is_none() {
+        *ended = Some(kind);
+    }
 }

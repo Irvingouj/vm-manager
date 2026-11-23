@@ -29,8 +29,8 @@ use crate::runtime::stream_manager;
 use crate::runtime::{SchedulerMessage, bindings, crypto, text_encoding};
 use crate::security::{CpuEnforcer, TimeoutGuard, TurnGuard, next_request_id};
 use openworkers_core::{
-    Event, HttpResponse, OperationsHandle, RequestBody, ResponseBody, RuntimeLimits, Script,
-    TerminationReason, WebSocketId, WorkerCode,
+    Event, HttpMethod, HttpResponse, OperationsHandle, RequestBody, ResponseBody, RuntimeLimits,
+    Script, TerminationReason, WebSocketId, WorkerCode,
 };
 
 /// The CPU floor of the top level of a script: a large bundle needs more to
@@ -164,7 +164,7 @@ impl ExecutionContext {
             // Always setup native bindings (not in snapshot)
             bindings::setup_console(scope, log_callback.clone());
             bindings::setup_performance(scope);
-            bindings::setup_timers(scope, scheduler_tx.clone());
+            bindings::setup_timers(scope, scheduler_tx.clone(), stream_manager.clone());
             bindings::setup_fetch_helpers(scope); // Must be before setup_fetch
             bindings::setup_fetch(
                 scope,
@@ -181,6 +181,7 @@ impl ExecutionContext {
                 scheduler_tx.clone(),
                 stream_callbacks.clone(),
                 next_callback_id.clone(),
+                stream_manager.clone(),
             );
             bindings::setup_response_stream_ops(scope, stream_manager.clone());
             bindings::setup_websocket(scope, ws_event_callbacks.clone());
@@ -1242,6 +1243,7 @@ impl ExecutionContext {
         .await?;
 
         // -- Phase 3: Read response (fair queue + lock) --
+        let head_request = req.method == HttpMethod::Head;
         let ((status, response), marks, socket) = {
             let pooled = Arc::clone(&self.pooled);
             let async_waiter = self.async_waiter.clone();
@@ -1275,11 +1277,21 @@ impl ExecutionContext {
                     let marks = read_marks(scope, handle);
                     let socket = read_response_socket(scope, handle);
 
+                    // A response whose body is a stream the host feeds (the
+                    // request's own body given back): said here, before the
+                    // response is handed to the host, so that the host can
+                    // send it itself and knows whether the guest read it
+                    // (vendor/VENDORED.md, patch 6).
+                    if let Some(stream_id) = get_response_stream_id(scope, handle) {
+                        self.request.stream_manager.note_host_response(stream_id);
+                    }
+
                     read_response_object(
                         scope,
                         handle,
                         &self.request.stream_manager,
                         self.limits.stream_buffer_size,
+                        head_request,
                     )
                     .map(|answer| (answer, marks, socket))
                 };

@@ -508,9 +508,10 @@ fn run(serve: &Serve) -> Result<(), String> {
             credentials,
             runner,
             logs,
-            // 8 MiB and 64 KiB: a file of Storage's bound uploaded through
-            // a form (blackbox/CONTRACT.md, "Storage: Bounds").
-            max_request_body_bytes: vibe::storage::BODY_BYTES + 64 * 1024,
+            // 5 GiB and 64 KiB: the bound of a request's body, under
+            // `vibe serve` and in the local run alike (blackbox/CONTRACT.md,
+            // "What an Application is handed").
+            max_request_body_bytes: vibe::ingress::MAX_REQUEST_BODY_BYTES,
             decides_opening: true,
             usage: Some(usage),
         });

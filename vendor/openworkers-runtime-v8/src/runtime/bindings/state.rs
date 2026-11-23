@@ -14,6 +14,10 @@ pub type LogCallback = Arc<dyn Fn(LogLevel, String) + Send + Sync>;
 #[derive(Clone)]
 pub struct TimerState {
     pub scheduler_tx: mpsc::UnboundedSender<SchedulerMessage>,
+    /// The streams themselves: waiting for room in one is only for a stream
+    /// the guest made, refused here inside the guest's call
+    /// (vendor/VENDORED.md, patch 12).
+    pub manager: std::sync::Arc<super::super::stream_manager::StreamManager>,
 }
 
 /// State for console logging (bypasses scheduler, uses direct callback)
@@ -47,6 +51,10 @@ pub struct StreamState {
     pub scheduler_tx: mpsc::UnboundedSender<SchedulerMessage>,
     pub callbacks: Rc<RefCell<HashMap<CallbackId, v8::Global<v8::Function>>>>,
     pub next_id: Rc<RefCell<CallbackId>>,
+    /// The streams themselves: a cancel acts on them now, inside the guest's
+    /// call, so that a body cancelled and then given back is never taken for
+    /// sending (vendor/VENDORED.md, patch 12).
+    pub manager: std::sync::Arc<super::super::stream_manager::StreamManager>,
 }
 
 /// State for response streaming operations

@@ -38,9 +38,15 @@ fn native_stream_read(
 }
 
 /// Native stream cancel - cancels a native stream
+///
+/// The cancel acts on the stream here, inside the guest's call, and not only
+/// through a scheduler message: the guest may cancel its body and give it
+/// back in the same handler, and the response takes its stream before the
+/// scheduler would get to a message (vendor/VENDORED.md, patch 12).
 #[glue_v8::method(state = Rc<StreamState>)]
 fn native_stream_cancel(scope: &mut v8::PinScope, state: &Rc<StreamState>, stream_id: u64) {
     let _ = scope;
+    state.manager.cancel_stream(stream_id);
     let _ = state
         .scheduler_tx
         .send(SchedulerMessage::StreamCancel(stream_id));
@@ -53,11 +59,13 @@ pub fn setup_stream_ops(
     scheduler_tx: mpsc::UnboundedSender<SchedulerMessage>,
     stream_callbacks: Rc<RefCell<HashMap<CallbackId, v8::Global<v8::Function>>>>,
     next_callback_id: Rc<RefCell<CallbackId>>,
+    manager: Arc<stream_manager::StreamManager>,
 ) {
     let state = Rc::new(StreamState {
         scheduler_tx,
         callbacks: stream_callbacks,
         next_id: next_callback_id,
+        manager,
     });
 
     // Keeps the Rc alive for the context; the templates below only borrow it.
@@ -144,9 +152,37 @@ pub fn setup_stream_ops(
 
 /// Create a new response stream
 #[glue_v8::method(state = Rc<ResponseStreamState>)]
-fn response_stream_create(scope: &mut v8::PinScope, state: &Rc<ResponseStreamState>) -> u64 {
+fn response_stream_create(
+    scope: &mut v8::PinScope,
+    state: &Rc<ResponseStreamState>,
+) -> Result<u64, String> {
     let _ = scope;
-    state.manager.create_stream("response".to_string())
+    // At most 16 streams of the guest's own towards the host for one request
+    // (vendor/VENDORED.md, patch 8): the 17th is an error thrown to the
+    // guest, which the platform's glue turns into a failed response body.
+    state
+        .manager
+        .check_guest_stream(stream_manager::MAX_GUEST_STREAMS)?;
+    let stream_id = state.manager.create_stream("response".to_string());
+    state.manager.mark_guest_stream(stream_id);
+    Ok(stream_id)
+}
+
+/// Whether `stream_id` is a stream this guest made itself, refusing any
+/// other with an error thrown to it (vendor/VENDORED.md, patch 12): the
+/// request's own body (a host-fed stream) is not the guest's to write to,
+/// end or fail.
+fn only_guest_stream(
+    state: &ResponseStreamState,
+    stream_id: u64,
+    what: &str,
+) -> Result<(), String> {
+    if state.manager.is_guest_stream(stream_id) {
+        return Ok(());
+    }
+    Err(format!(
+        "{what}: stream {stream_id} is not a stream this Application made with __responseStreamCreate in this request"
+    ))
 }
 
 /// Write to a response stream - returns true if written, false if full/error
@@ -156,28 +192,49 @@ fn response_stream_write(
     state: &Rc<ResponseStreamState>,
     stream_id: u64,
     chunk: v8::Local<v8::Uint8Array>,
-) -> bool {
+) -> Result<bool, String> {
     let _ = scope;
+    // Only the guest's own streams can be written to (vendor/VENDORED.md,
+    // patch 12): writing to the request's body (a host-fed stream) would put
+    // bytes the client never sent into a body the host sends back.
+    only_guest_stream(state, stream_id, "a chunk written to the host")?;
     let len = chunk.byte_length();
+    // A chunk the guest writes to the host is at most 64 KiB
+    // (vendor/VENDORED.md, patch 7): a larger one is refused, an error thrown
+    // to the guest.
+    if len > stream_manager::MAX_CHUNK_BYTES {
+        return Err(format!(
+            "a chunk written to the host is at most {} bytes; this one is {len}",
+            stream_manager::MAX_CHUNK_BYTES
+        ));
+    }
     let mut bytes_vec = vec![0u8; len];
     chunk.copy_contents(&mut bytes_vec);
 
-    state
+    Ok(state
         .manager
         .try_write_chunk(
             stream_id,
             stream_manager::StreamChunk::Data(bytes::Bytes::from(bytes_vec)),
         )
-        .is_ok()
+        .is_ok())
 }
 
 /// End a response stream
 #[glue_v8::method(state = Rc<ResponseStreamState>)]
-fn response_stream_end(scope: &mut v8::PinScope, state: &Rc<ResponseStreamState>, stream_id: u64) {
+fn response_stream_end(
+    scope: &mut v8::PinScope,
+    state: &Rc<ResponseStreamState>,
+    stream_id: u64,
+) -> Result<(), String> {
     let _ = scope;
+    // Ending a host-fed stream from the guest would cut the request's own
+    // body short (vendor/VENDORED.md, patch 12).
+    only_guest_stream(state, stream_id, "ending a response stream")?;
     let _ = state
         .manager
         .try_write_chunk(stream_id, stream_manager::StreamChunk::Done);
+    Ok(())
 }
 
 /// Fail a response stream
@@ -191,11 +248,15 @@ fn response_stream_error(
     state: &Rc<ResponseStreamState>,
     stream_id: u64,
     message: String,
-) {
+) -> Result<(), String> {
     let _ = scope;
+    // Failing a host-fed stream from the guest would fail the request's own
+    // body (vendor/VENDORED.md, patch 12).
+    only_guest_stream(state, stream_id, "failing a response stream")?;
     let _ = state
         .manager
         .try_write_chunk(stream_id, stream_manager::StreamChunk::Error(message));
+    Ok(())
 }
 
 /// Check if a response stream is closed

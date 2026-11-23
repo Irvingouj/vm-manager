@@ -34,7 +34,8 @@ use openworkers_core::{
     Script, TerminationReason,
 };
 use openworkers_runtime_v8::Worker;
-use tokio::sync::{Semaphore, mpsc, oneshot};
+use openworkers_runtime_v8::runtime::stream_manager::StreamManager;
+use tokio::sync::{Semaphore, mpsc, oneshot, watch};
 use tokio::task::JoinSet;
 
 use crate::app_logs::Collected;
@@ -73,7 +74,23 @@ pub struct InFlight {
 pub struct Answer {
     pub status: u16,
     pub headers: Vec<(String, String)>,
-    pub body: Bytes,
+    pub body: AnswerBody,
+}
+
+/// The answer's body.
+#[derive(Debug)]
+pub enum AnswerBody {
+    /// The whole body, at most `Limits::max_body_bytes`: every body the code
+    /// made, and one it began to read before giving back.
+    Whole(Bytes),
+    /// The request's own body, given back unread: a stream the host itself
+    /// feeds, which the host sends itself, after the code has ended if need
+    /// be (blackbox/CONTRACT.md, "What an Application is handed"). Never
+    /// collected here; at most 16 chunks of 64 KiB are in flight in the
+    /// runtime's channel, and the platform sets `content-length`.
+    Streamed {
+        chunks: mpsc::Receiver<Result<Bytes, String>>,
+    },
 }
 
 /// How a request ended.
@@ -142,6 +159,11 @@ struct Job {
     in_flight: Arc<InFlight>,
     serving: Arc<Serving>,
     request: HttpRequest,
+    /// Says that the request's body has been asked for: the runtime sets it
+    /// when the code first reads the body, or the response takes it to send
+    /// (vendor/VENDORED.md, patch 9). Its sender gone means nobody was ever
+    /// given the request.
+    asked: watch::Sender<bool>,
     reply: oneshot::Sender<Outcome>,
     /// Set by whichever comes first: the engine taking the job, or the
     /// request being stopped while it waits (then the engine drops it).
@@ -208,12 +230,14 @@ impl RequestRunner {
         }
     }
 
-    /// Runs one request to its end.
+    /// Runs one request to its end. `asked` says when its body is first
+    /// asked for (see [`Job::asked`]).
     pub async fn run(
         &self,
         in_flight: Arc<InFlight>,
         serving: Arc<Serving>,
         request: HttpRequest,
+        asked: watch::Sender<bool>,
     ) -> Outcome {
         let (reply, mut answer) = oneshot::channel();
         let taken = Arc::new(AtomicBool::new(false));
@@ -223,6 +247,7 @@ impl RequestRunner {
             in_flight,
             serving,
             request,
+            asked,
             reply,
             taken: Arc::clone(&taken),
         };
@@ -315,7 +340,9 @@ impl Engine {
                         }
                         let engine = Arc::clone(&engine);
                         running.spawn_local(async move {
-                            let outcome = engine.serve(job.in_flight, &job.serving, job.request).await;
+                            let outcome = engine
+                                .serve(job.in_flight, &job.serving, job.request, job.asked)
+                                .await;
                             // The waiter may have given up; then nobody needs it.
                             job.reply.send(outcome).ok();
                             drop(permit);
@@ -332,6 +359,7 @@ impl Engine {
         in_flight: Arc<InFlight>,
         serving: &Serving,
         request: HttpRequest,
+        asked: watch::Sender<bool>,
     ) -> Outcome {
         if in_flight.stop.is_stopped() {
             return Outcome::Stopped { given: false };
@@ -350,7 +378,7 @@ impl Engine {
                 host.end();
                 return Outcome::Stopped { given: true };
             }
-            served = tokio::time::timeout(deadline, self.serve_in(&host, serving, request)) => served,
+            served = tokio::time::timeout(deadline, self.serve_in(&host, serving, request, asked)) => served,
         };
         match served {
             Ok(outcome) => {
@@ -373,6 +401,7 @@ impl Engine {
         host: &Arc<HostOps>,
         serving: &Serving,
         request: HttpRequest,
+        asked: watch::Sender<bool>,
     ) -> Outcome {
         let script = Script::with_bindings(
             glue::script(&serving.bundle),
@@ -396,11 +425,20 @@ impl Engine {
                 return Outcome::Failed;
             }
         };
+        // The runtime's streams, read after the event for the one thing the
+        // host needs to know of them: which host-fed stream became the
+        // response's body, and whether the code read it
+        // (vendor/VENDORED.md, patch 6).
+        let stream_manager = worker.stream_manager();
+        // The request's body is read only when the code (or the response)
+        // asks for it (vendor/VENDORED.md, patch 9). Attached before the
+        // event: a body asked for at its first read is seen.
+        stream_manager.watch_asked(asked);
         let (event, response) = Event::fetch(request);
         host.begin();
         let (ran, answer) = tokio::join!(
             worker.exec(event),
-            collect(response, self.limits.max_body_bytes)
+            collect(stream_manager, response, self.limits.max_body_bytes)
         );
         host.end();
         // The context, and all it holds, goes now.
@@ -433,25 +471,47 @@ fn describe(reason: &TerminationReason) -> String {
 }
 
 /// The Application's response, its body read whole up to `max_body_bytes`.
+///
+/// The one body not read here is a stream the runtime says the host itself
+/// feeds and the Application's code did not read (the request's own body
+/// given back): it is handed on as it is, to be sent by the connection. A
+/// body the code began to read is no longer the host's to vouch for, and is
+/// read whole as every other body is (blackbox/CONTRACT.md, "What an
+/// Application is handed").
 async fn collect(
+    stream_manager: Arc<StreamManager>,
     response: oneshot::Receiver<HttpResponse>,
     max_body_bytes: usize,
 ) -> Result<Answer, String> {
     let response = response
         .await
         .map_err(|_| "the Application gave no response".to_owned())?;
+    // Told by the runtime before the response was sent (vendor/VENDORED.md,
+    // patch 6): `Some(read)` when the response's body is a host-fed stream,
+    // and whether the code had read from it.
+    let host_fed = stream_manager.host_response();
     let body = match response.body {
-        ResponseBody::None => Bytes::new(),
+        ResponseBody::None => AnswerBody::Whole(Bytes::new()),
         ResponseBody::Bytes(bytes) => {
             if bytes.len() > max_body_bytes {
                 return Err(format!(
                     "the response body is larger than {max_body_bytes} bytes"
                 ));
             }
-            bytes
+            AnswerBody::Whole(bytes)
         }
-        ResponseBody::Stream(mut chunks) => {
+        ResponseBody::Stream(chunks) => {
+            if let Some(host_fed) = host_fed
+                && !host_fed.read
+            {
+                return Ok(Answer {
+                    status: response.status,
+                    headers: response.headers,
+                    body: AnswerBody::Streamed { chunks },
+                });
+            }
             let mut body = BytesMut::new();
+            let mut chunks = chunks;
             while let Some(chunk) = chunks.recv().await {
                 let chunk = chunk.map_err(|e| format!("the response body failed: {e}"))?;
                 if body.len() + chunk.len() > max_body_bytes {
@@ -461,7 +521,7 @@ async fn collect(
                 }
                 body.extend_from_slice(&chunk);
             }
-            body.freeze()
+            AnswerBody::Whole(body.freeze())
         }
     };
     Ok(Answer {

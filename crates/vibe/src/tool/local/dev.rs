@@ -82,6 +82,7 @@ use super::{
     one_line, read_records, request_output, reset_output, standins,
 };
 use crate::runner;
+use crate::sent::Sent;
 use crate::server::{self, Handler};
 use crate::sign_in::ChosenTestUser;
 use crate::user::User;
@@ -1043,7 +1044,7 @@ impl Front {
     }
 
     /// Answers one request. See the module's text.
-    async fn answer(&self, request: Request<Incoming>) -> Response<Full<Bytes>> {
+    async fn answer(&self, request: Request<Incoming>) -> Response<Sent> {
         // Copied: compared again after the look, while the request is still
         // held; a few bytes, once a request.
         let host = request
@@ -1076,15 +1077,16 @@ impl Front {
                 return page::redirect(
                     StatusCode::TEMPORARY_REDIRECT,
                     &format!("http://{application}.localhost:{}{target}", self.port),
-                );
+                )
+                .map(Sent::from);
             }
-            Which::Other => return page::misdirected(&address),
+            Which::Other => return page::misdirected(&address).map(Sent::from),
         }
         if own_path {
-            return self.own_path(request, &application).await;
+            return self.own_path(request, &application).await.map(Sent::from);
         }
         if let Some(Err(answer)) = ready {
-            return *answer;
+            return (*answer).map(Sent::from);
         }
         self.application_request(request, &address).await
     }
@@ -1320,20 +1322,21 @@ impl Front {
         &self,
         request: Request<Incoming>,
         address: &str,
-    ) -> Response<Full<Bytes>> {
+    ) -> Response<Sent> {
         let users = self.users(false).await;
         let Ok(state) = tokio::time::timeout(READ_WAIT, self.state.read()).await else {
-            return page::unavailable("vibe dev is busy: try again shortly.");
+            return page::unavailable("vibe dev is busy: try again shortly.").map(Sent::from);
         };
         if let Some((_, report)) = &state.failed {
-            return page::failed(error_of(report));
+            return page::failed(error_of(report)).map(Sent::from);
         }
         let Some(session) = state.session.as_ref() else {
-            return page::unavailable("vibe dev is starting the local databases over.");
+            return page::unavailable("vibe dev is starting the local databases over.")
+                .map(Sent::from);
         };
         let file = match users {
             Ok((file, _)) => file,
-            Err(ending) => return page::failed(error_of(&ending.printed().1)),
+            Err(ending) => return page::failed(error_of(&ending.printed().1)).map(Sent::from),
         };
         // Copied: the request owns its User, as the file has it now; once
         // a request.
@@ -1356,9 +1359,10 @@ impl Front {
                         page::CHOOSER,
                         page::percent_encode(target, true)
                     ),
-                );
+                )
+                .map(Sent::from);
             }
-            return page::no_user(address);
+            return page::no_user(address).map(Sent::from);
         };
         let (mut parts, body) = request.into_parts();
         without_test_user_cookie(&mut parts.headers);
@@ -1397,10 +1401,7 @@ impl Front {
 }
 
 impl Handler for Front {
-    fn handle(
-        &self,
-        request: Request<Incoming>,
-    ) -> impl Future<Output = Response<Full<Bytes>>> + Send {
+    fn handle(&self, request: Request<Incoming>) -> impl Future<Output = Response<Sent>> + Send {
         self.answer(request)
     }
 }

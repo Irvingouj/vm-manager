@@ -620,7 +620,12 @@ pub async fn run_event_loop(
                     }
 
                     SchedulerMessage::StreamCancel(stream_id) => {
-                        stream_manager.close_stream(stream_id);
+                        // A guest's cancel of a host-fed stream the response
+                        // has not taken closes it for good, marks it used and
+                        // does not ask for it; one the response took is the
+                        // host's and the cancel is ignored. Any other stream
+                        // closes as before (vendor/VENDORED.md, patch 12).
+                        stream_manager.cancel_stream(stream_id);
                     }
 
                     SchedulerMessage::BeginRequest(abort) => {

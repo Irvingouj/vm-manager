@@ -133,3 +133,12 @@ impl RequestContext {
         }
     }
 }
+
+impl Drop for RequestContext {
+    /// What a request's body held is given back when the request ends: a
+    /// host-fed stream nobody took will never be read, so it is closed, and
+    /// the host's pump for it ends (vendor/VENDORED.md, patch 11).
+    fn drop(&mut self) {
+        self.stream_manager.close_unread_host_fed();
+    }
+}
