@@ -300,6 +300,7 @@ fn a_platform_administrator_walks_every_page_of_theirs() {
         names,
         [
             "application",
+            "host",
             "outcome",
             "resource",
             "since",

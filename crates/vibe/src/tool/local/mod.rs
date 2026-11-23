@@ -1573,9 +1573,13 @@ fn in_words(json: &Value, shown: &Shown) -> String {
 }
 
 /// One operation of the Operation log, on one line: its Resource or the
-/// own database, its outcome, the reason of a refusal.
+/// own database, its outcome, the reason of a refusal. The entry of a
+/// `fetch` shows the host it called (`→ <host>`) where another shows its
+/// Resource.
 fn operation_line(entry: &Value) -> String {
-    let target = if entry["own_database"].as_bool() == Some(true) {
+    let target = if let Some(host) = entry["host"].as_str() {
+        format!("\u{2192} {}", Theirs::from(host))
+    } else if entry["own_database"].as_bool() == Some(true) {
         "the own database".to_owned()
     } else {
         entry["resource"].as_str().map_or_else(

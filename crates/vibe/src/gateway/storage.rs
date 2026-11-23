@@ -568,6 +568,7 @@ impl StorageWork {
             operation: self.op.name(),
             statement: &self.statement,
             transaction: None,
+            host: None,
         }
     }
 

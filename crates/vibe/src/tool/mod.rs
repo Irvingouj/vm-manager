@@ -50,6 +50,7 @@ mod generate;
 mod local;
 mod logs;
 mod new;
+mod outbound;
 mod project_tools;
 mod pull;
 mod sharing;
@@ -67,6 +68,7 @@ pub use local::{
 };
 pub use logs::LogsArgs;
 pub use new::NewArgs;
+pub use outbound::{OutboundAdminArgs, OutboundAdminCommand, OutboundArgs, OutboundChangeArgs};
 pub use pull::PullArgs;
 pub use sharing::{ChangeArgs, ContributorsArgs, ContributorsCommand, ShowArgs};
 pub use versions::{GoBackArgs, VersionsArgs};
@@ -176,6 +178,7 @@ pub enum Command {
     SignOut(Output),
     Whoami(Output),
     Resources(Output),
+    Outbound(OutboundArgs),
     Applications(Output),
     Pull(PullArgs),
     New(NewArgs),
@@ -383,6 +386,7 @@ pub fn run(command: Command) -> ExitCode {
         Command::Show(args) => args.output.json,
         Command::Share(args) | Command::Unshare(args) => args.json(),
         Command::Contributors(args) => args.json(),
+        Command::Outbound(args) => args.output.json,
         Command::SignOut(o)
         | Command::Whoami(o)
         | Command::Resources(o)
@@ -414,6 +418,7 @@ pub fn run(command: Command) -> ExitCode {
                     Command::SignOut(_) => sign_out().await,
                     Command::Whoami(_) => whoami().await,
                     Command::Resources(_) => resources().await,
+                    Command::Outbound(args) => outbound::list(&args).await,
                     Command::Applications(_) => applications().await,
                     Command::Pull(args) => pull::pull(&args).await,
                     Command::New(args) => new::new(&args),

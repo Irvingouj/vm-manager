@@ -206,6 +206,11 @@ enum Route<'a> {
     Grants(&'a str),
     /// `/v1/resources/<name>/structure`
     Structure(&'a str),
+    /// `/v1/outbound-hosts`
+    OutboundHosts,
+    /// `/v1/outbound-hosts/<entry>`, the entry as it was written in the
+    /// path (percent-encoded), not decoded yet.
+    OutboundEntry(&'a str),
     /// `/v1/operation-log`
     OperationLog,
     /// `/v1/me`
@@ -231,7 +236,8 @@ impl Route<'_> {
             | Self::OperationLog
             | Self::Oidc
             | Self::Disable(..)
-            | Self::AdminApplications => true,
+            | Self::AdminApplications
+            | Self::OutboundEntry(_) => true,
             _ => false,
         }
     }
@@ -262,6 +268,8 @@ impl<'a> Route<'a> {
             ["resources", name] => Some(Self::Resource(name)),
             ["resources", name, "grants"] => Some(Self::Grants(name)),
             ["resources", name, "structure"] => Some(Self::Structure(name)),
+            ["outbound-hosts"] => Some(Self::OutboundHosts),
+            ["outbound-hosts", entry] => Some(Self::OutboundEntry(entry)),
             ["operation-log"] => Some(Self::OperationLog),
             ["me"] => Some(Self::Me),
             ["tool-credentials"] => Some(Self::ToolCredentials),
@@ -858,6 +866,8 @@ pub(crate) enum ListChanged {
 pub struct Api {
     registry: Arc<Registry>,
     resources: Arc<Resources>,
+    /// The one list of hosts Applications may call, from memory.
+    outbound: Arc<crate::outbound::Outbound>,
     /// The storage root and the file threads, for registering a Storage
     /// Resource.
     storage: Arc<Storage>,
@@ -902,6 +912,13 @@ impl Api {
             .collect()
     }
 
+    /// Every entry of the outbound list, in the byte order of `host`, as
+    /// the Dashboard's page of it shows them: from memory, as the API
+    /// answers them.
+    pub(crate) fn outbound_entries(&self) -> Vec<crate::outbound::Kept> {
+        self.outbound.entries()
+    }
+
     #[expect(
         clippy::too_many_arguments,
         reason = "the parts the API answers from, each named, made once at start"
@@ -909,6 +926,7 @@ impl Api {
     pub fn new(
         registry: Arc<Registry>,
         resources: Arc<Resources>,
+        outbound: Arc<crate::outbound::Outbound>,
         storage: Arc<Storage>,
         log: Arc<OperationLog>,
         logs: Arc<Logs>,
@@ -919,6 +937,7 @@ impl Api {
         Self {
             registry,
             resources,
+            outbound,
             storage,
             log,
             logs,
@@ -999,7 +1018,7 @@ impl Api {
         };
         let Some(route) = route else {
             return Answer::not_found(
-                "the API has no such path: its paths are /v1/me, /v1/installation, /v1/tool-credentials, /v1/tool-credentials/current, /v1/tool-sign-ins, /v1/oidc, /v1/applications, /v1/applications/<name>, /v1/applications/<name>/versions, /v1/applications/<name>/versions/<number>, /v1/applications/<name>/go-back, /v1/applications/<name>/logs, /v1/applications/<name>/contributors, /v1/applications/<name>/sharing, /v1/applications/<name>/disable, /v1/applications/<name>/enable, /v1/admin/applications, /v1/resources, /v1/resources/<name>, /v1/resources/<name>/grants, /v1/resources/<name>/structure and /v1/operation-log",
+                "the API has no such path: its paths are /v1/me, /v1/installation, /v1/tool-credentials, /v1/tool-credentials/current, /v1/tool-sign-ins, /v1/oidc, /v1/applications, /v1/applications/<name>, /v1/applications/<name>/versions, /v1/applications/<name>/versions/<number>, /v1/applications/<name>/go-back, /v1/applications/<name>/logs, /v1/applications/<name>/contributors, /v1/applications/<name>/sharing, /v1/applications/<name>/disable, /v1/applications/<name>/enable, /v1/admin/applications, /v1/resources, /v1/resources/<name>, /v1/resources/<name>/grants, /v1/resources/<name>/structure, /v1/outbound-hosts, /v1/outbound-hosts/<entry> and /v1/operation-log",
             );
         };
         match route {
@@ -1022,6 +1041,8 @@ impl Api {
         let answer = match route {
             Route::Resources => self.resources_route(user, method, &body).await,
             Route::Resource(name) => self.resource(user, method, name).await,
+            Route::OutboundHosts => Ok(self.outbound_hosts(method)),
+            Route::OutboundEntry(entry) => Ok(self.outbound_entry(user, method, entry).await),
             Route::Me => Ok(self.me(user, method)),
             Route::ToolCredentials => Ok(self.make_credential(user, with, method, &body).await),
             Route::CurrentToolCredential => self.end_credential(with, method).await,
@@ -1050,6 +1071,107 @@ impl Api {
             Route::Installation | Route::ToolSignIns => Ok(not_signed_in()),
         };
         answer.unwrap_or_else(|error| Answer::unavailable(&error))
+    }
+
+    /// `GET /v1/outbound-hosts`, by anyone signed in: the list, in the byte
+    /// order of `host`, from memory (blackbox/CONTRACT.md, "Outbound
+    /// calls: The list").
+    fn outbound_hosts(&self, method: &Method) -> Answer {
+        if method != Method::GET {
+            return Answer::method_not_allowed(method, "GET");
+        }
+        let entries = self.outbound.entries();
+        let hosts: Vec<OutboundHostView<'_>> = entries
+            .iter()
+            .map(|kept| OutboundHostView {
+                host: kept.host(),
+                added_by: kept.added_by(),
+                added_at: kept.added_at(),
+            })
+            .collect();
+        Answer::json(StatusCode::OK, &OutboundHostsView { hosts })
+    }
+
+    /// `PUT` and `DELETE /v1/outbound-hosts/<entry>`, by a Platform
+    /// administrator (the caller checked before the entry is looked at):
+    /// the entry read as the list reads it, then added or removed, in the
+    /// platform database and in memory, within the bound of an
+    /// administrators' request.
+    async fn outbound_entry(&self, user: &User, method: &Method, written: &str) -> Answer {
+        let add = if *method == Method::PUT {
+            true
+        } else if *method == Method::DELETE {
+            false
+        } else {
+            return Answer::method_not_allowed(method, "PUT or DELETE");
+        };
+        let entry = match percent_decoded(written) {
+            Some(text) => crate::outbound::Entry::parse(&text).map_err(|problem| {
+                Answer::error(
+                    StatusCode::BAD_REQUEST,
+                    "malformed",
+                    &crate::outbound::problem_words(problem),
+                )
+            }),
+            None => Err(Answer::error(
+                StatusCode::BAD_REQUEST,
+                "malformed",
+                "the entry is not percent-encoded as a path segment: encode it, such as api.example.com%3A8443",
+            )),
+        };
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(refused) => return refused,
+        };
+        if add {
+            match crate::outbound::Outbound::add(&self.outbound, &entry, &user.id).await {
+                Ok(put) => {
+                    if put.changed {
+                        log::record(
+                            "outbound-host-added",
+                            json!({ "host": put.kept.host(), "by": &user.id }),
+                        );
+                    }
+                    Answer::json(
+                        StatusCode::OK,
+                        &OutboundAddedView {
+                            host: put.kept.host(),
+                            added_by: put.kept.added_by(),
+                            added_at: put.kept.added_at(),
+                            changed: put.changed,
+                        },
+                    )
+                }
+                Err(crate::outbound::AddProblem::TooMany) => Answer::error(
+                    StatusCode::CONFLICT,
+                    "too-many",
+                    &format!(
+                        "the list holds {} hosts already, the most it takes: remove one with `vibe admin outbound remove <host>`, then add this one",
+                        crate::outbound::MOST
+                    ),
+                ),
+                Err(crate::outbound::AddProblem::Database(error)) => Answer::unavailable(&error),
+            }
+        } else {
+            match crate::outbound::Outbound::remove(&self.outbound, &entry).await {
+                Ok(removed) => {
+                    if removed.changed {
+                        log::record(
+                            "outbound-host-removed",
+                            json!({ "host": &removed.host, "by": &user.id }),
+                        );
+                    }
+                    Answer::json(
+                        StatusCode::OK,
+                        &OutboundRemovedView {
+                            host: &removed.host,
+                            changed: removed.changed,
+                        },
+                    )
+                }
+                Err(error) => Answer::unavailable(&error),
+            }
+        }
     }
 
     /// Why OIDC cannot be connected now, if it cannot: the stand-in first,
@@ -2802,6 +2924,36 @@ struct EntriesView {
     earlier: Option<i64>,
 }
 
+/// The answer of `GET /v1/outbound-hosts`.
+#[derive(Serialize)]
+struct OutboundHostsView<'a> {
+    hosts: Vec<OutboundHostView<'a>>,
+}
+
+/// One entry of `GET /v1/outbound-hosts`.
+#[derive(Serialize)]
+struct OutboundHostView<'a> {
+    host: &'a str,
+    added_by: &'a str,
+    added_at: &'a str,
+}
+
+/// The answer of a `PUT /v1/outbound-hosts/<entry>`.
+#[derive(Serialize)]
+struct OutboundAddedView<'a> {
+    host: &'a str,
+    added_by: &'a str,
+    added_at: &'a str,
+    changed: bool,
+}
+
+/// The answer of a `DELETE /v1/outbound-hosts/<entry>`.
+#[derive(Serialize)]
+struct OutboundRemovedView<'a> {
+    host: &'a str,
+    changed: bool,
+}
+
 /// A disable in force, as the API answers it.
 #[derive(Serialize)]
 struct DisabledView<'a> {
@@ -3096,6 +3248,8 @@ pub(crate) struct LogQuery {
     pub user: Option<String>,
     pub application: Option<String>,
     pub resource: Option<String>,
+    /// The host of a `fetch`, as the list writes it.
+    pub host: Option<String>,
     pub outcome: Option<String>,
     pub since: Option<String>,
     pub until: Option<String>,
@@ -3104,10 +3258,11 @@ pub(crate) struct LogQuery {
 }
 
 /// The filters of `GET /v1/operation-log`, as named in a query.
-pub(crate) const LOG_FILTERS: [&str; 7] = [
+pub(crate) const LOG_FILTERS: [&str; 8] = [
     "user",
     "application",
     "resource",
+    "host",
     "outcome",
     "since",
     "until",
@@ -3136,6 +3291,10 @@ impl LogProblem {
             }
             Self::Value("application") => "?application must be a name an Application could have: 1 to 63 lower-case letters, digits and hyphens".into(),
             Self::Value("resource") => "?resource must be a name a Resource could have".into(),
+            Self::Value("host") => format!(
+                "?host must be a call's host with its port when it is not 443, as the list writes one, 1 to {} bytes, a name or an address",
+                crate::outbound::MAX_FILTER_BYTES
+            ),
             Self::Value("outcome") => "?outcome must be allowed, refused, failed or unfinished".into(),
             Self::Value(time @ ("since" | "until")) => format!(
                 "?{time} must be RFC 3339 with a date, a time and an offset (Z or ±hh:mm, + written %2B), up to microseconds"
@@ -3190,6 +3349,14 @@ impl LogQuery {
             }
             asked.resource = Some(resource);
         }
+        if let Some(host) = found.remove("host") {
+            let usable = host.len() <= crate::outbound::MAX_FILTER_BYTES
+                && crate::outbound::Entry::parse(&host).is_ok();
+            if !usable {
+                return Err(LogProblem::Value("host"));
+            }
+            asked.host = Some(host);
+        }
         if let Some(outcome) = found.remove("outcome") {
             if !matches!(
                 outcome.as_str(),
@@ -3234,6 +3401,7 @@ impl LogQuery {
             user: self.user.as_deref(),
             application: self.application.as_deref(),
             resource: self.resource.as_deref(),
+            host: self.host.as_deref(),
             outcome: self.outcome.as_deref(),
             since: self.since.as_deref(),
             until: self.until.as_deref(),

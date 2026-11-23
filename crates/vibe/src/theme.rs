@@ -302,8 +302,8 @@ code.cmd{white-space:nowrap}
 .rows .who-is{flex-basis:auto}
 .admin-link .word,.sections a:not([aria-current=page]) .word{position:absolute;width:1px;height:1px;margin:-1px;padding:0;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;border:0}
 .sections ul{flex-wrap:nowrap}
-.sections a{padding-inline:.25rem;white-space:nowrap}
-.sections a[aria-current=page]{padding-inline:.5rem}
+.sections a{padding-inline:.25rem;white-space:nowrap;font-size:.875rem}
+.sections a[aria-current=page]{padding-inline:.25rem}
 .filters{padding:0;background:none;border:0;box-shadow:none}
 .filter-grid input[type=datetime-local]{letter-spacing:-.03em}
 .admin-link{padding-inline:.5rem}
@@ -424,6 +424,8 @@ pub enum Icon {
     Stop,
     /// A triangle pointing right: serve again (enable).
     Play,
+    /// A circle with an arrow leaving it: calls to the outside.
+    Outbound,
 }
 
 impl Icon {
@@ -504,6 +506,9 @@ impl Icon {
             }
             Self::Play => {
                 "<svg class=\"i\" viewBox=\"0 0 20 20\" aria-hidden=\"true\" focusable=\"false\"><path d=\"M6.5 4.5v11l9-5.5z\"/></svg>"
+            }
+            Self::Outbound => {
+                "<svg class=\"i\" viewBox=\"0 0 20 20\" aria-hidden=\"true\" focusable=\"false\"><circle cx=\"7.5\" cy=\"11.5\" r=\"4.75\"/><path d=\"M10.5 8.5l6.5-5.5M12.5 3h4.5v4.5\"/></svg>"
             }
         }
     }

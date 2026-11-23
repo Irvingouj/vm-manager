@@ -365,6 +365,7 @@ impl Live {
             usage: _,
             usage_writer: _,
             storage,
+            outbound,
         } = Platform::open(
             &pg.platform_address(),
             Limits {
@@ -377,6 +378,7 @@ impl Live {
                 start: PLATFORM_WAIT,
             },
             root,
+            crate::outbound::PrivateRanges::none(),
         )
         .await
         .map_err(|error| open_failed(error, who.command))?;
@@ -398,6 +400,7 @@ impl Live {
             api: Api::new(
                 Arc::clone(&registry),
                 Arc::clone(&resources),
+                outbound,
                 Arc::clone(&storage),
                 Arc::clone(&log),
                 Arc::clone(&logs),

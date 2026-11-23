@@ -559,6 +559,28 @@ pub const STEPS: &[Step] = &[
             VALUES (decode(replace(gen_random_uuid()::text || gen_random_uuid()::text, '-', ''), 'hex'));
     ",
     },
+    Step {
+        number: 18,
+        name: "the outbound list, and the Operation log's host",
+        sql: "
+        -- The hosts Applications may call (crate::outbound; blackbox/
+        -- CONTRACT.md, \"Outbound calls: The list\"): one entry a row, as
+        -- outbound::Entry writes it. At most 1,000 entries: the writer
+        -- counts them under this table's EXCLUSIVE lock in the transaction
+        -- that inserts one, so two writers cannot pass the bound together.
+        CREATE TABLE outbound_hosts (
+            host text PRIMARY KEY,
+            added_by text NOT NULL,
+            added_at timestamptz NOT NULL DEFAULT now()
+        );
+        -- Every entry of the Operation log gains the host a `fetch` called
+        -- (null for every other operation). The index holds the entries
+        -- that have a host only: nearly all entries are another operation's
+        -- and pay nothing for it.
+        ALTER TABLE operation_log ADD COLUMN host text;
+        CREATE INDEX operation_log_host ON operation_log (host, id) WHERE host IS NOT NULL;
+    ",
+    },
 ];
 
 /// The advisory lock every step's transaction takes first: "vm steps".

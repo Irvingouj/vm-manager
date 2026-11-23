@@ -84,6 +84,9 @@ enum Command {
     /// Every registered Resource: its description, your Access level, and
     /// whom to ask.
     Resources(tool::Output),
+    /// The hosts Applications may call, as the Platform administrators
+    /// listed them, and who added each.
+    Outbound(tool::OutboundArgs),
     /// The Applications you contribute to and those shared with you: name,
     /// description, address, and which is which.
     Applications(tool::Output),
@@ -175,6 +178,12 @@ struct Serve {
     /// registered.
     #[arg(long)]
     storage_root: Option<String>,
+    /// An address or range in CIDR form whose outbound calls are opened
+    /// all the same (an installation whose outside is partly inside):
+    /// at most 16 times. Without it, nothing inside the machine's network
+    /// or the machine itself is ever called, whatever the list says.
+    #[arg(long, value_name = "RANGE")]
+    outbound_private: Vec<String>,
 }
 
 /// `vibe setup`.
@@ -229,6 +238,7 @@ fn main() -> ExitCode {
         Some(Command::SignOut(output)) => tool::run(tool::Command::SignOut(output)),
         Some(Command::Whoami(output)) => tool::run(tool::Command::Whoami(output)),
         Some(Command::Resources(output)) => tool::run(tool::Command::Resources(output)),
+        Some(Command::Outbound(args)) => tool::run(tool::Command::Outbound(args)),
         Some(Command::Applications(output)) => tool::run(tool::Command::Applications(output)),
         Some(Command::Pull(args)) => tool::run(tool::Command::Pull(args)),
         Some(Command::New(args)) => tool::run(tool::Command::New(args)),
@@ -301,6 +311,11 @@ fn run(serve: &Serve) -> Result<(), String> {
             serve.listen
         ));
     }
+    // The ranges the operator opens for outbound calls, parsed here: a
+    // value that is not an address or a range stops the start, before the
+    // platform database is opened.
+    let outbound_private = vibe::outbound::PrivateRanges::parse(&serve.outbound_private)
+        .map_err(|problem| format!("--outbound-private {problem}"))?;
     // The program's own TLS (crate::own_tls): both files or neither, checked
     // here, before anything else is started.
     let own_tls = match own_tls::Files::from_environment()? {
@@ -356,6 +371,7 @@ fn run(serve: &Serve) -> Result<(), String> {
             database,
             registry,
             resources,
+            outbound,
             logs,
             writer,
             log,
@@ -364,7 +380,7 @@ fn run(serve: &Serve) -> Result<(), String> {
             usage_writer,
             storage,
             ..
-        } = Platform::open(&address, limits, storage_root).await.map_err(|error| {
+        } = Platform::open(&address, limits, storage_root, outbound_private).await.map_err(|error| {
             if let Some(found) = &error.unsupported_version {
                 log::record(
                     "postgres-version-unsupported",
@@ -480,6 +496,7 @@ fn run(serve: &Serve) -> Result<(), String> {
                 "stand_in_sign_in": sign_in.is_stand_in(),
                 "sign_in": sign_in_name,
                 "tls": serves_tls,
+                "outbound_private": &serve.outbound_private,
             }),
         );
         let ingress = Arc::new(Ingress {
@@ -487,6 +504,7 @@ fn run(serve: &Serve) -> Result<(), String> {
             api: Api::new(
                 Arc::clone(&registry),
                 resources,
+                outbound,
                 Arc::clone(&storage),
                 log,
                 Arc::clone(&logs),

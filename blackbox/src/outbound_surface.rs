@@ -268,3 +268,205 @@ pub fn signed_in(vm: &Vm, user: &User) -> Machine {
 pub fn asked(vm: &Vm) -> usize {
     admin::request_records(vm)
 }
+
+/// A TCP proxy between a program and its Postgres, which can hold the
+/// bytes one connection sends towards the database (neither delivered nor
+/// refused) while every other connection, and new ones, pass.
+///
+/// [`DbProxy::arm`] says: hold the first connection that, from now on,
+/// sends a chunk holding the word `delete` (any case), from that chunk on.
+/// [`DbProxy::release`] delivers what was held, in order, and then lets
+/// the connection end as its client ended it (the server sees what the
+/// client sent, then the end).
+pub struct DbProxy {
+    address: std::net::SocketAddr,
+    state: std::sync::Arc<ProxyState>,
+}
+
+#[derive(Default)]
+struct ProxyState {
+    needle: std::sync::Mutex<Option<Vec<u8>>>,
+    first_bytes: std::sync::Mutex<Vec<String>>,
+    held: std::sync::atomic::AtomicUsize,
+    released: std::sync::atomic::AtomicBool,
+    stopped: std::sync::atomic::AtomicBool,
+}
+
+impl DbProxy {
+    /// Listens on a port of 127.0.0.1 and forwards to `target`.
+    pub fn start(target: std::net::SocketAddr) -> Self {
+        use std::net::TcpListener;
+        use std::sync::Arc;
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .unwrap_or_else(|e| panic!("the harness's proxy cannot listen: {e}"));
+        listener
+            .set_nonblocking(true)
+            .unwrap_or_else(|e| panic!("the harness's proxy: {e}"));
+        let address = listener
+            .local_addr()
+            .unwrap_or_else(|e| panic!("the harness's proxy: {e}"));
+        let state = Arc::new(ProxyState::default());
+        let shared = Arc::clone(&state);
+        thread::spawn(move || {
+            while !shared.stopped.load(std::sync::atomic::Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((client, _)) => {
+                        let Ok(server) = std::net::TcpStream::connect(target) else {
+                            continue;
+                        };
+                        proxy_pair(client, server, &shared);
+                    }
+                    Err(_) => thread::sleep(Duration::from_millis(10)),
+                }
+            }
+        });
+        Self { address, state }
+    }
+
+    /// Where a program connects.
+    pub fn address(&self) -> std::net::SocketAddr {
+        self.address
+    }
+
+    /// Holds the first connection that sends a chunk holding these bytes,
+    /// from that chunk on.
+    pub fn arm(&self, needle: &str) {
+        if let Ok(mut slot) = self.state.needle.lock() {
+            *slot = Some(needle.as_bytes().to_vec());
+        }
+    }
+
+    /// The first bytes (at most 120, lossy) of each chunk that was held.
+    pub fn held_chunks(&self) -> Vec<String> {
+        self.state
+            .first_bytes
+            .lock()
+            .map(|v| v.clone())
+            .unwrap_or_default()
+    }
+
+    /// How many connections are being held.
+    pub fn held(&self) -> usize {
+        self.state.held.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Delivers what was held.
+    pub fn release(&self) {
+        self.state
+            .released
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl Drop for DbProxy {
+    fn drop(&mut self) {
+        self.state
+            .stopped
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.state
+            .released
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Whether `bytes` hold the armed needle; if they do the proxy is disarmed
+/// and the chunk's first bytes are kept.
+fn take_needle(state: &ProxyState, bytes: &[u8]) -> bool {
+    let Ok(mut slot) = state.needle.lock() else {
+        return false;
+    };
+    let found = slot
+        .as_ref()
+        .is_some_and(|n| !n.is_empty() && bytes.windows(n.len()).any(|w| w == n.as_slice()));
+    if found {
+        *slot = None;
+        if let Ok(mut seen) = state.first_bytes.lock() {
+            seen.push(String::from_utf8_lossy(&bytes[..bytes.len().min(120)]).into_owned());
+        }
+    }
+    found
+}
+
+fn proxy_pair(
+    client: std::net::TcpStream,
+    server: std::net::TcpStream,
+    state: &std::sync::Arc<ProxyState>,
+) {
+    use std::io::{Read, Write};
+    use std::net::Shutdown;
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering::SeqCst;
+    let (Ok(mut client_in), Ok(mut server_out)) = (client.try_clone(), server.try_clone()) else {
+        return;
+    };
+    let (mut server_in, mut client_out) = (server, client);
+    // Server to client: plain.
+    thread::spawn(move || {
+        let mut chunk = [0_u8; 16 * 1024];
+        while let Ok(n) = server_in.read(&mut chunk) {
+            if n == 0 || client_out.write_all(&chunk[..n]).is_err() {
+                break;
+            }
+        }
+        drop(client_out.shutdown(Shutdown::Both));
+    });
+    // Client to server: held when armed and a DELETE goes by.
+    let state = Arc::clone(state);
+    thread::spawn(move || {
+        drop(client_in.set_read_timeout(Some(Duration::from_millis(50))));
+        let mut chunk = [0_u8; 16 * 1024];
+        let mut held: Option<Vec<u8>> = None;
+        let mut ended = false;
+        loop {
+            if let Some(buffer) = held.as_mut() {
+                if state.released.load(SeqCst) {
+                    drop(server_out.write_all(buffer));
+                    held = None;
+                    state.held.fetch_sub(1, SeqCst);
+                    if ended {
+                        break;
+                    }
+                    continue;
+                }
+                if ended {
+                    thread::sleep(Duration::from_millis(20));
+                    continue;
+                }
+            }
+            match client_in.read(&mut chunk) {
+                Ok(0) => {
+                    ended = true;
+                    if held.is_none() {
+                        break;
+                    }
+                }
+                Ok(n) => {
+                    let bytes = &chunk[..n];
+                    if let Some(buffer) = held.as_mut() {
+                        if let Ok(mut seen) = state.first_bytes.lock() {
+                            seen.push(String::from_utf8_lossy(&bytes[..n.min(120)]).into_owned());
+                        }
+                        buffer.extend_from_slice(bytes);
+                    } else if take_needle(&state, bytes) {
+                        state.held.fetch_add(1, SeqCst);
+                        held = Some(bytes.to_vec());
+                    } else if server_out.write_all(bytes).is_err() {
+                        break;
+                    }
+                }
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
+                Err(_) => {
+                    ended = true;
+                    if held.is_none() {
+                        break;
+                    }
+                }
+            }
+        }
+        drop(server_out.shutdown(Shutdown::Write));
+    });
+}

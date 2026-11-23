@@ -15,6 +15,8 @@ This folder is one Application for the company's internal platform. The person y
 - `resources/<name>/` is written by `vibe pull <name>`. Read it, import its tables from `resources/<name>/schema.ts`, never edit it. You may add `resources/<name>/relations.ts` with Drizzle relations of your own; pull again after adding it.
 - Storage: a Resource with `kind: "storage"` in `manifest.ts`, pulled with `vibe pull` like a database. Its files are reached with `ctx.user().storage("<name>")`: `get` and `head` answer `null` when there is no file. A file is named by a key — `/` between folders, no `..`, no leading `/` — and a file's body is a stream: `file.body`, or `await file.text()` / `json()` / `arrayBuffer()` for a small one. A download is `new Response(file.body)`; an upload is `put(key, request.body)`. A file is at most 5 GiB. In the local run, files are in `.vibe/local/storage/<name>/`, where test files may be placed by hand.
 
+`fetch` to the outside is allowed only to the hosts the Platform administrators listed, over `https`; `vibe outbound` shows them. A call to any other host rejects with `Refused`, reason `host-not-listed`: report it to the Builder, who asks a Platform administrator to allow the host, and do not work around it. In the local run, the hosts are `outbound.hosts` in `vibe.dev.json`, which is the Builder's own list.
+
 ## Commands
 
 Run them from this folder. Each has `--help` and `--json` (one JSON object on standard output); the exit code says how it ended: `0` done, `1` failed, `2` wrong command line, `3` refused or waiting for a person, `4` not signed in.
@@ -28,6 +30,7 @@ Run them from this folder. Each has `--help` and `--json` (one JSON object on st
 | `vibe unshare <name> --user <id>` | stops sharing it with them (the same options) |
 | `vibe contributors add <name> --user <id>` | makes people or a Group Contributors, who can deploy it and change who sees it (`vibe contributors remove` takes them off) |
 | `vibe resources` | every company Resource, the Builder's access to it, and whom to ask |
+| `vibe outbound` | the hosts Applications may call, and who allowed each |
 | `vibe pull <name>` | writes `resources/<name>/` with that Resource's tables |
 | `vibe generate` | writes the next migration from `src/db/schema.ts` into `migrations/`; stops before one that destroys data |
 | `vibe check` | checks the Manifest, the Resources, the migrations and the types |

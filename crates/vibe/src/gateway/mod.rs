@@ -533,6 +533,20 @@ pub struct PlatformGateway {
     storage: Arc<crate::storage::Storage>,
     own: Arc<OwnDatabases>,
     log: Arc<OperationLog>,
+    /// The hosts Applications may call, from memory; the next stage's
+    /// `fetch` decides with it.
+    #[expect(
+        dead_code,
+        reason = "the fetch operation, the next stage, decides every call with it"
+    )]
+    outbound: Arc<crate::outbound::Outbound>,
+    /// The ranges the operator of the machine opened; the next stage's
+    /// `fetch` asks it about every address it would connect to.
+    #[expect(
+        dead_code,
+        reason = "the fetch operation, the next stage, answers addresses with it"
+    )]
+    outbound_private: crate::outbound::PrivateRanges,
     operations: Arc<Operations>,
     /// The bytes of the host calls not yet answered of all requests
     /// (blackbox/CONTRACT.md, "A host call's arguments are bounded"): the
@@ -548,6 +562,8 @@ impl PlatformGateway {
         storage: Arc<crate::storage::Storage>,
         own: Arc<OwnDatabases>,
         log: Arc<OperationLog>,
+        outbound: Arc<crate::outbound::Outbound>,
+        outbound_private: crate::outbound::PrivateRanges,
         runtime: Handle,
     ) -> Self {
         Self {
@@ -555,6 +571,8 @@ impl PlatformGateway {
             storage,
             own,
             log,
+            outbound,
+            outbound_private,
             operations: Arc::new(Operations {
                 runtime,
                 tasks: Mutex::new(JoinSet::new()),
@@ -1532,6 +1550,7 @@ impl Work {
             operation: self.kind.name(),
             statement: &self.statement,
             transaction: self.transaction.as_deref(),
+            host: None,
         }
     }
 

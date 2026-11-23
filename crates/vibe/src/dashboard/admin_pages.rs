@@ -48,20 +48,22 @@ fn kind_words(kind: Option<&str>) -> &'static str {
     }
 }
 
-/// The four sections of the pages of Platform administrators.
+/// The five sections of the pages of Platform administrators.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Section {
     Applications,
     OperationLog,
     Resources,
+    Outbound,
     Installation,
 }
 
 impl Section {
-    const ALL: [Self; 4] = [
+    const ALL: [Self; 5] = [
         Self::Applications,
         Self::OperationLog,
         Self::Resources,
+        Self::Outbound,
         Self::Installation,
     ];
 
@@ -80,6 +82,7 @@ impl Section {
                 Icon::Log,
             ),
             Self::Resources => ("resources", "/admin/resources", "Resources", Icon::Database),
+            Self::Outbound => ("outbound", "/admin/outbound", "Outbound", Icon::Outbound),
             Self::Installation => (
                 "installation",
                 "/admin/installation",
@@ -518,6 +521,7 @@ pub(crate) struct Typed {
     pub user: String,
     pub application: String,
     pub resource: String,
+    pub host: String,
     pub outcome: String,
     pub since: String,
     pub until: String,
@@ -533,6 +537,7 @@ impl Typed {
             &self.user,
             &self.application,
             &self.resource,
+            &self.host,
             &self.outcome,
             &self.since,
             &self.until,
@@ -586,6 +591,7 @@ fn asked_filters(asked: &LogQuery) -> Vec<(&'static str, &str)> {
         ("user", asked.user.as_deref()),
         ("application", asked.application.as_deref()),
         ("resource", asked.resource.as_deref()),
+        ("host", asked.host.as_deref()),
         ("outcome", asked.outcome.as_deref()),
         ("since", asked.since.as_deref()),
         ("until", asked.until.as_deref()),
@@ -601,6 +607,7 @@ fn typed_filters(typed: &Typed) -> Vec<(&'static str, &str)> {
         ("user", typed.user.as_str()),
         ("application", typed.application.as_str()),
         ("resource", typed.resource.as_str()),
+        ("host", typed.host.as_str()),
         ("outcome", typed.outcome.as_str()),
         ("since", typed.since.as_str()),
         ("until", typed.until.as_str()),
@@ -694,6 +701,7 @@ fn filter_form(out: &mut String, typed: &Typed, error: Option<(&str, &str)>) {
         ("user", "User id", &typed.user),
         ("application", "Application", &typed.application),
         ("resource", "Resource", &typed.resource),
+        ("host", "Host", &typed.host),
     ] {
         write!(
             out,
@@ -781,6 +789,7 @@ fn entries_html(
                         "user" => "User id",
                         "application" => "Application",
                         "resource" => "Resource",
+                        "host" => "Host",
                         "outcome" => "Outcome",
                         "since" => "From",
                         _ => "Before",
@@ -826,18 +835,24 @@ fn entries_html(
     }
 }
 
-/// A link narrowing to `kind` = `value`: the other filters kept,
+/// The address narrowing to `kind` = `value`: the other filters kept,
 /// `before` dropped.
-fn filter_link(filters: &[(&str, &str)], kind: &str, value: &str) -> String {
+fn filter_url(filters: &[(&str, &str)], kind: &str, value: &str) -> String {
     let mut narrowed: Vec<(&str, &str)> = filters
         .iter()
         .filter(|(name, _)| *name != kind)
         .copied()
         .collect();
     narrowed.push((kind, value));
+    log_address(&narrowed, None)
+}
+
+/// A link narrowing to `kind` = `value`: the other filters kept,
+/// `before` dropped.
+fn filter_link(filters: &[(&str, &str)], kind: &str, value: &str) -> String {
     format!(
         "<a data-vm-filter=\"{kind}\" href=\"{}\">{}</a>",
-        escape(&log_address(&narrowed, None)),
+        escape(&filter_url(filters, kind, value)),
         escape(value)
     )
 }
@@ -911,26 +926,40 @@ fn entry_html(
             .ok();
         }
     }
-    match text("resource") {
-        Some(resource) => {
-            // Its registered kind; a Storage operation tells its own when the
-            // Resource is no longer registered.
-            let kind = kinds.get(resource).copied().or_else(|| {
-                text("operation")
-                    .filter(|operation| operation.starts_with("storage."))
-                    .map(|_| "storage")
-            });
+    match text("host") {
+        Some(host) => {
+            // A fetch's entry shows where it went, where another shows its
+            // Resource.
             write!(
                 out,
-                "<span>{}{}</span>",
-                theme::icon(kind_icon(kind), "Resource"),
-                filter_link(filters, "resource", resource)
+                "<span>{icon}<a data-vm-filter=\"host\" href=\"{}\">\u{2192} {}</a></span>",
+                escape(&filter_url(filters, "host", host)),
+                escape(host),
+                icon = theme::icon(Icon::Outbound, "Host")
             )
             .ok();
         }
-        None => {
-            write!(out, "<span>{}own database</span>", Icon::Database.svg()).ok();
-        }
+        None => match text("resource") {
+            Some(resource) => {
+                // Its registered kind; a Storage operation tells its own when the
+                // Resource is no longer registered.
+                let kind = kinds.get(resource).copied().or_else(|| {
+                    text("operation")
+                        .filter(|operation| operation.starts_with("storage."))
+                        .map(|_| "storage")
+                });
+                write!(
+                    out,
+                    "<span>{}{}</span>",
+                    theme::icon(kind_icon(kind), "Resource"),
+                    filter_link(filters, "resource", resource)
+                )
+                .ok();
+            }
+            None => {
+                write!(out, "<span>{}own database</span>", Icon::Database.svg()).ok();
+            }
+        },
     }
     write!(
         out,
@@ -1081,6 +1110,37 @@ pub(crate) fn installation(
         "Installation",
         &main,
     )
+}
+
+/// `GET /admin/outbound`: the outbound list, read only (blackbox/
+/// CONTRACT.md, "Outbound calls: The Dashboard").
+pub(crate) fn outbound(viewer: &Viewer<'_>, entries: &[crate::outbound::Kept]) -> Answer {
+    let mut main = String::from("<h1 class=\"page-title\">Outbound</h1>");
+    if entries.is_empty() {
+        main.push_str(
+            "<div class=\"empty\"><p class=\"first\">Nothing can be called yet: no host is listed, so nothing leaves an Application.</p>\
+             <p>A Platform administrator allows a host with <code class=\"cmd\">vibe admin outbound add &lt;host&gt;</code>.</p></div>",
+        );
+    } else {
+        main.push_str(
+            "<p class=\"lead\">Applications may call these hosts, over https, on the port each one names (443 unless written). Read only: a Platform administrator changes the list from the command-line tool, with <code>vibe admin outbound add</code> and <code>vibe admin outbound remove</code>.</p>\
+             <ul class=\"rows\" aria-label=\"Hosts\">",
+        );
+        for kept in entries {
+            let host = escape(kept.host());
+            let by = escape(kept.added_by());
+            write!(
+                main,
+                "<li data-vm-outbound-host=\"{host}\"><span class=\"who-is\"><span class=\"lines\"><code class=\"name\">{host}</code>\
+                 <span class=\"more\">added by <code class=\"id\">{by}</code> on <time datetime=\"{}\">{}</time></span></span></span></li>",
+                escape(kept.added_at()),
+                escape(&when(kept.added_at()))
+            )
+            .ok();
+        }
+        main.push_str("</ul>");
+    }
+    section_page(StatusCode::OK, viewer, Section::Outbound, "Outbound", &main)
 }
 
 /// `GET /admin/resources`: every Resource with its Grants, read only.

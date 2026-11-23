@@ -236,6 +236,7 @@ fn the_filters_are_one_get_form_with_labelled_fields_choices_and_one_button() {
             ("user".to_owned(), "text".to_owned(), None),
             ("application".to_owned(), "text".to_owned(), None),
             ("resource".to_owned(), "text".to_owned(), None),
+            ("host".to_owned(), "text".to_owned(), None),
             (
                 "since".to_owned(),
                 "datetime-local".to_owned(),
@@ -247,7 +248,7 @@ fn the_filters_are_one_get_form_with_labelled_fields_choices_and_one_button() {
                 Some("1".to_owned())
             ),
         ],
-        "expected the fields user, application, resource (text), since and until (datetime-local, step 1), in that order\n{}",
+        "expected the fields user, application, resource, host (text), since and until (datetime-local, step 1), in that order\n{}",
         page.describe()
     );
     let selects = form.named("select");

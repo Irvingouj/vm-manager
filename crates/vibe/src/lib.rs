@@ -21,6 +21,9 @@
 //!   host, and is decided.
 //! - [`resources`]: the Resources (shared databases) and their Grants,
 //!   held in memory in step with the platform database.
+//! - [`outbound`]: the one list of hosts Applications may call, held in
+//!   memory in step with the platform database, and the ranges the
+//!   operator of the machine may open for those calls.
 //! - [`executor`]: the Database executor: bounded pools of connections to
 //!   shared databases and the limits of one statement.
 //! - [`statement`]: a statement without its values, for the Operation log.
@@ -73,6 +76,7 @@ pub mod oidc;
 pub mod open_files;
 pub mod oplog;
 pub mod origin;
+pub mod outbound;
 pub mod own_db;
 pub mod own_tls;
 pub mod platform;

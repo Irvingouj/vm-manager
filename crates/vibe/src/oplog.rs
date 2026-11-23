@@ -34,7 +34,7 @@ macro_rules! ENTRY_COLUMNS {
             rfc3339!("time"),
             ", request, user_id, application, version, resource, operation,
                statement, outcome, reason, error, rows, duration_ms,
-               actor, own_database, transaction_id"
+               actor, own_database, transaction_id, host"
         )
     };
 }
@@ -63,6 +63,9 @@ pub struct Entry<'a> {
     /// The transaction's id, for a statement in a transaction and for its
     /// `begin`, `commit` and `rollback`; `None` otherwise.
     pub transaction: Option<&'a str>,
+    /// The host an outbound call went to, as the list writes it (the next
+    /// stage: a `fetch`'s entry); `None` for every other operation.
+    pub host: Option<&'a str>,
 }
 
 /// How an allowed operation ended.
@@ -97,8 +100,8 @@ impl OperationLog {
                 .execute(
                     "INSERT INTO operation_log (request, user_id, application, version, resource,
                                                 actor, own_database, operation, statement,
-                                                transaction_id, outcome, reason)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'refused', $11)",
+                                                transaction_id, outcome, reason, host)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'refused', $11, $12)",
                     &[
                         &entry.request,
                         &entry.user,
@@ -111,6 +114,7 @@ impl OperationLog {
                         &entry.statement,
                         &entry.transaction,
                         &reason,
+                        &entry.host,
                     ],
                 )
                 .await
@@ -142,8 +146,8 @@ impl OperationLog {
                 .execute(
                     "INSERT INTO operation_log (request, user_id, application, version, resource,
                                                 actor, own_database, operation, statement,
-                                                transaction_id, outcome, error)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+                                                transaction_id, outcome, error, host)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
                     &[
                         &entry.request,
                         &entry.user,
@@ -157,6 +161,7 @@ impl OperationLog {
                         &entry.transaction,
                         &outcome,
                         &error,
+                        &entry.host,
                     ],
                 )
                 .await
@@ -175,8 +180,8 @@ impl OperationLog {
                 .query_one(
                     "INSERT INTO operation_log (request, user_id, application, version, resource,
                                                 actor, own_database, operation, statement,
-                                                transaction_id, outcome)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'unfinished')
+                                                transaction_id, outcome, host)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'unfinished', $11)
                      RETURNING id",
                     &[
                         &entry.request,
@@ -189,6 +194,7 @@ impl OperationLog {
                         &entry.operation,
                         &entry.statement,
                         &entry.transaction,
+                        &entry.host,
                     ],
                 )
                 .await
@@ -342,6 +348,7 @@ impl OperationLog {
             ("user_id", &filter.user),
             ("application", &filter.application),
             ("resource", &filter.resource),
+            ("host", &filter.host),
             ("outcome", &filter.outcome),
         ] {
             if let Some(value) = value {
@@ -419,7 +426,7 @@ impl OperationLog {
             Err(_) => return Err(DbError::timed_out("reading the Operation log", limit_time)),
         };
         let matched = match rows.first() {
-            Some(row) => get::<i64>(row, 17)?,
+            Some(row) => get::<i64>(row, 18)?,
             None => 0,
         };
         let limit = usize::try_from(filter.limit).unwrap_or(usize::MAX);
@@ -474,6 +481,8 @@ pub struct Filter<'a> {
     pub user: Option<&'a str>,
     pub application: Option<&'a str>,
     pub resource: Option<&'a str>,
+    /// The host of a `fetch`, exactly as the list writes it.
+    pub host: Option<&'a str>,
     pub outcome: Option<&'a str>,
     /// RFC 3339, checked: entries at or after it.
     pub since: Option<&'a str>,
@@ -487,7 +496,7 @@ pub struct Filter<'a> {
 
 /// One entry as the API answers it, from a row of [`ENTRY_COLUMNS`].
 fn entry_of(row: &tokio_postgres::Row) -> Result<Value, DbError> {
-    let mut entry = Map::with_capacity(17);
+    let mut entry = Map::with_capacity(18);
     entry.insert("id".into(), get::<i64>(row, 0)?.into());
     entry.insert("time".into(), get::<String>(row, 1)?.into());
     entry.insert("request".into(), get::<Option<String>>(row, 2)?.into());
@@ -505,6 +514,7 @@ fn entry_of(row: &tokio_postgres::Row) -> Result<Value, DbError> {
     entry.insert("rows".into(), get::<Option<i64>>(row, 12)?.into());
     entry.insert("duration_ms".into(), get::<Option<i64>>(row, 13)?.into());
     entry.insert("transaction".into(), get::<Option<String>>(row, 16)?.into());
+    entry.insert("host".into(), get::<Option<String>>(row, 17)?.into());
     Ok(Value::Object(entry))
 }
 

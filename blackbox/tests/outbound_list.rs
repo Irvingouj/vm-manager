@@ -645,3 +645,70 @@ fn a_change_has_a_record_in_the_programs_log_and_what_changed_nothing_has_none()
         );
     }
 }
+
+/// Names whose last label is a number: not names, and not taken.
+const NUMERIC: [&str; 9] = [
+    "127.1",
+    "0x7f.0.0.1",
+    "2130706433",
+    "1.2.3",
+    "010.0.0.1",
+    "203.0.113.010",
+    "example.123",
+    "example.0x1f",
+    "*.example.123",
+];
+
+#[test]
+fn a_name_whose_last_label_is_a_number_is_malformed_for_put_and_delete_and_adds_nothing() {
+    let vm = start();
+    let admin = administrator();
+    for entry in NUMERIC {
+        for method in ["PUT", "DELETE"] {
+            let answer = request(&vm, Some(&admin), method, &path_of(entry)).send();
+            assert!(
+                answer.status == 400,
+                "expected `400` `malformed` for {method} {entry:?} (a number is not a name), got\n{}",
+                answer.describe()
+            );
+            assert_api_error(&answer, 400, "malformed");
+        }
+    }
+    assert!(hosts(&vm).is_empty(), "nothing was added");
+    assert_eq!(change_records(&vm), 0);
+}
+
+#[test]
+fn names_that_only_look_like_numbers_and_an_address_in_its_usual_form_are_taken() {
+    let vm = start();
+    let admin = administrator();
+    for entry in [
+        "203.0.113.7",
+        "1.example.com",
+        "123.example.com",
+        "example.com1",
+        "x0x1f.example.org",
+    ] {
+        assert_added(
+            &put(&vm, &admin, entry),
+            entry,
+            &admin.id,
+            &format!("PUT {entry:?}"),
+        );
+    }
+}
+
+#[test]
+fn an_entry_is_one_path_segment() {
+    let vm = start();
+    let admin = administrator();
+    let answer = request(&vm, Some(&admin), "PUT", "/v1/outbound-hosts/a/b").send();
+    assert!(
+        answer.status == 404 || answer.status == 400,
+        "expected `404` or `400` for PUT /v1/outbound-hosts/a/b, got\n{}",
+        answer.describe()
+    );
+    let answer = request(&vm, Some(&admin), "PUT", "/v1/outbound-hosts/a%2Fb").send();
+    assert_api_error(&answer, 400, "malformed");
+    assert!(hosts(&vm).is_empty(), "nothing was added");
+}

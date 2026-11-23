@@ -400,3 +400,34 @@ fn what_the_tool_checks_before_it_asks_is_exit_code_2_and_asks_nothing() {
         "what was refused added nothing and removed nothing"
     );
 }
+
+#[test]
+fn a_name_whose_last_label_is_a_number_is_refused_by_the_tool_before_it_asks() {
+    let vm = start();
+    let machine = signed_in(&vm, &administrator());
+    for entry in [
+        "127.1",
+        "0x7f.0.0.1",
+        "2130706433",
+        "1.2.3",
+        "010.0.0.1",
+        "203.0.113.010",
+        "example.123",
+        "example.0x1f",
+        "*.example.123",
+    ] {
+        for verb in ["add", "remove"] {
+            let before = asked(&vm);
+            let run = machine.run(&["admin", "outbound", verb, entry]);
+            assert_eq!(
+                run.code,
+                Some(2),
+                "expected exit code 2 for `vibe admin outbound {verb} {entry}`\n{}",
+                run.describe()
+            );
+            thread::sleep(Duration::from_millis(100));
+            assert_eq!(asked(&vm), before, "expected nothing asked for {entry}");
+        }
+    }
+    assert!(hosts(&vm).is_empty());
+}

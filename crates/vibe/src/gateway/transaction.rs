@@ -399,6 +399,7 @@ impl Opened {
             operation,
             statement: operation,
             transaction,
+            host: None,
         }
     }
 

@@ -17,6 +17,7 @@ use crate::app_logs::{self, Logs, Writer};
 use crate::executor;
 use crate::gateway::{Gateway, PlatformGateway};
 use crate::oplog::OperationLog;
+use crate::outbound::{Outbound, PrivateRanges};
 use crate::own_db::OwnDatabases;
 use crate::platform_db::{self, Cause, DatabaseAddress, OpenError, PlatformDatabase, PoolLimits};
 use crate::registry::Registry;
@@ -44,6 +45,8 @@ pub struct Platform {
     pub own: Arc<OwnDatabases>,
     pub registry: Arc<Registry>,
     pub resources: Arc<Resources>,
+    /// The one list of hosts Applications may call, in memory.
+    pub outbound: Arc<Outbound>,
     pub logs: Arc<Logs>,
     /// The writer of Logs: owned here; dropping it ends its task, and
     /// [`Writer::finish`] waits for what is queued.
@@ -64,15 +67,24 @@ pub struct Platform {
 impl Platform {
     /// Assembles the parts on the platform database at `address`. The
     /// error is a message for whoever started the program; it never holds
-    /// the password.
+    /// the password. `outbound_private` is the ranges the operator of the
+    /// machine opened for outbound calls.
     pub async fn open(
         address: &DatabaseAddress,
         limits: Limits,
         storage_root: Option<Root>,
+        outbound_private: PrivateRanges,
     ) -> Result<Self, OpenError> {
         let files = Files::start()
             .map_err(|e| OpenError::new(None, format!("cannot start the file threads: {e}")))?;
-        let opened = Self::assemble(address, limits, storage_root, Arc::clone(&files)).await;
+        let opened = Self::assemble(
+            address,
+            limits,
+            storage_root,
+            outbound_private,
+            Arc::clone(&files),
+        )
+        .await;
         if opened.is_err() {
             files.stop(storage::files::STOP_WAIT).await;
         }
@@ -83,6 +95,7 @@ impl Platform {
         address: &DatabaseAddress,
         limits: Limits,
         storage_root: Option<Root>,
+        outbound_private: PrivateRanges,
         files: Arc<Files>,
     ) -> Result<Self, OpenError> {
         let Limits {
@@ -123,11 +136,14 @@ impl Platform {
             )
             .await
             .map_err(unreadable)?;
+            let outbound = Outbound::load(Arc::clone(&database))
+                .await
+                .map_err(unreadable)?;
             let cursors = cursor_sealer(&database).await.map_err(unreadable)?;
-            Ok::<_, OpenError>((database, own, registry, resources, cursors))
+            Ok::<_, OpenError>((database, own, registry, resources, outbound, cursors))
         })
         .await;
-        let (database, own, registry, resources, cursors) = match started {
+        let (database, own, registry, resources, outbound, cursors) = match started {
             Ok(started) => started?,
             Err(_) => {
                 return Err(OpenError::new(
@@ -149,6 +165,7 @@ impl Platform {
         own.ship_all();
         let registry = Arc::new(registry);
         let resources = Arc::new(resources);
+        let outbound = Arc::new(outbound);
         let (logs, writer) = app_logs::start(Arc::clone(&database));
         let logs = Arc::new(logs);
         let (usage, usage_writer) = usage::start(Arc::clone(&database));
@@ -164,6 +181,8 @@ impl Platform {
             Arc::clone(&storage),
             Arc::clone(&own),
             Arc::clone(&log),
+            Arc::clone(&outbound),
+            outbound_private,
             tokio::runtime::Handle::current(),
         ));
         let as_gateway: Arc<dyn Gateway> = Arc::clone(&gateway) as Arc<dyn Gateway>;
@@ -174,6 +193,7 @@ impl Platform {
             own,
             registry,
             resources,
+            outbound,
             logs,
             writer,
             log,

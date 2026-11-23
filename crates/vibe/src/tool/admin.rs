@@ -69,6 +69,9 @@ pub enum AdminCommand {
     Enable(SwitchArgs),
     /// Read the Operation log, newest page first, filtered.
     OperationLog(OperationLogArgs),
+    /// Allow Applications to call a host, or stop allowing it: add,
+    /// remove.
+    Outbound(super::outbound::OutboundAdminArgs),
 }
 
 /// `vibe admin applications`.
@@ -106,6 +109,10 @@ pub struct OperationLogArgs {
     /// Only the entries on this Resource.
     #[arg(long, value_parser = resource_name)]
     pub resource: Option<String>,
+    /// Only the entries whose host is exactly this: a fetch's host, as the
+    /// list writes it.
+    #[arg(long, value_parser = super::outbound::host_filter)]
+    pub host: Option<String>,
     /// Only the entries of this outcome.
     #[arg(long, value_parser = ["allowed", "refused", "failed", "unfinished"])]
     pub outcome: Option<String>,
@@ -208,6 +215,10 @@ impl AdminArgs {
             AdminCommand::Applications(args) => args.output.json,
             AdminCommand::Disable(args) | AdminCommand::Enable(args) => args.output.json,
             AdminCommand::OperationLog(args) => args.output.json,
+            AdminCommand::Outbound(args) => match &args.command {
+                super::outbound::OutboundAdminCommand::Add(args) => args.output.json,
+                super::outbound::OutboundAdminCommand::Remove(args) => args.output.json,
+            },
         }
     }
 }
@@ -219,6 +230,14 @@ pub async fn admin(args: &AdminArgs) -> Result<Done, Ending> {
         AdminCommand::Disable(args) => switch(args, true).await,
         AdminCommand::Enable(args) => switch(args, false).await,
         AdminCommand::OperationLog(args) => operation_log(args).await,
+        AdminCommand::Outbound(args) => match &args.command {
+            super::outbound::OutboundAdminCommand::Add(args) => {
+                super::outbound::change(super::outbound::Change::Add, args).await
+            }
+            super::outbound::OutboundAdminCommand::Remove(args) => {
+                super::outbound::change(super::outbound::Change::Remove, args).await
+            }
+        },
     }
 }
 
@@ -519,6 +538,7 @@ async fn operation_log(args: &OperationLogArgs) -> Result<Done, Ending> {
         ("user", args.user.clone()),
         ("application", args.application.clone()),
         ("resource", args.resource.clone()),
+        ("host", args.host.clone()),
         ("outcome", args.outcome.clone()),
         ("since", args.since.clone()),
         ("until", args.until.clone()),
@@ -585,10 +605,15 @@ fn entry_line(words: &mut String, entry: &Value) {
         (Some(application), None) => put!(line, " {}", Theirs::from(application)),
         (None, _) => line.push_str(" -"),
     }
-    match member("resource").as_str() {
-        Some(resource) => put!(line, " {}", Theirs::from(resource)),
-        None if member("own_database").as_bool() == Some(true) => line.push_str(" own database"),
-        None => line.push_str(" -"),
+    match member("host").as_str() {
+        Some(host) => put!(line, " \u{2192} {}", Theirs::from(host)),
+        None => match member("resource").as_str() {
+            Some(resource) => put!(line, " {}", Theirs::from(resource)),
+            None if member("own_database").as_bool() == Some(true) => {
+                line.push_str(" own database")
+            }
+            None => line.push_str(" -"),
+        },
     }
     put!(line, " {}", or_dash("operation"));
     for name in ["reason", "error"] {

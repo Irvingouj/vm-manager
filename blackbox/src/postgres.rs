@@ -1197,6 +1197,26 @@ impl Platform {
         }
     }
 
+    /// This name on this instance, reached at `address` instead of at the
+    /// instance's own: a harness proxy that stands between a program and its
+    /// database ([`crate::outbound_surface::DbProxy`]).
+    pub fn on_address(
+        postgres: &PrivatePostgres,
+        name: &str,
+        address: std::net::SocketAddr,
+    ) -> Self {
+        Self {
+            name: name.to_owned(),
+            url: format!(
+                "postgres://{SUPERUSER}:{}@{}:{}/{name}",
+                postgres.password().expose(),
+                address.ip(),
+                address.port()
+            ),
+            role: SUPERUSER.to_owned(),
+        }
+    }
+
     /// A fresh name on the shared Postgres, for a role of its own that is
     /// not a superuser and may only create databases and roles (`LOGIN
     /// CREATEDB CREATEROLE`): what CONTRACT.md says `VIBE_DATABASE_URL`'s role

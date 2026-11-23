@@ -38,6 +38,7 @@ enum Route<'a> {
     Enable(&'a str),
     OperationLog,
     Resources,
+    Outbound,
     Installation,
 }
 
@@ -50,6 +51,7 @@ impl<'a> Route<'a> {
             "/admin/applications" => return Some(Self::Applications),
             "/admin/operation-log" => return Some(Self::OperationLog),
             "/admin/resources" => return Some(Self::Resources),
+            "/admin/outbound" => return Some(Self::Outbound),
             "/admin/installation" => return Some(Self::Installation),
             _ => {}
         }
@@ -94,6 +96,7 @@ impl Ingress {
             Some(Route::Applications) => self.every_application_page(viewer, query).await,
             Some(Route::OperationLog) => self.operation_log_page(viewer, query).await,
             Some(Route::Resources) => self.resources_page(viewer).await,
+            Some(Route::Outbound) => self.outbound_page(viewer).await,
             Some(Route::Installation) => self.installation_page(viewer).await,
         }
     }
@@ -245,6 +248,17 @@ impl Ingress {
         }
     }
 
+    /// `GET /admin/outbound`: the list from memory, as `GET
+    /// /v1/outbound-hosts` answers it, once the platform database is seen
+    /// to answer (a page of the Dashboard tells nothing while it cannot).
+    async fn outbound_page(&self, viewer: &Viewer<'_>) -> Answer {
+        if let Err(error) = self.registry.probe().await {
+            return self.unavailable(viewer, &error);
+        }
+        let entries = self.api.outbound_entries();
+        admin_pages::outbound(viewer, &entries)
+    }
+
     /// `GET /admin/installation`: what `GET /v1/installation` answers, and
     /// with OIDC the connection as `GET /v1/oidc` reads it.
     async fn installation_page(&self, viewer: &Viewer<'_>) -> Answer {
@@ -287,6 +301,7 @@ fn typed(query: Option<&str>) -> Typed {
             "user" => value.clone_into(&mut typed.user),
             "application" => value.clone_into(&mut typed.application),
             "resource" => value.clone_into(&mut typed.resource),
+            "host" => value.clone_into(&mut typed.host),
             "outcome" => value.clone_into(&mut typed.outcome),
             "since" | "until" => {
                 let held = as_rfc3339(value)
@@ -400,6 +415,11 @@ fn field_error(problem: &LogProblem, typed: &Typed) -> (&'static str, String) {
         LogProblem::Value("outcome") => (
             "outcome",
             "Choose an outcome: allowed, refused, failed or unfinished.".to_owned(),
+        ),
+        LogProblem::Value("host") => (
+            "host",
+            "A host is a name or an address, with its port when it is not 443, as the list writes one (api.example.com, api.example.com:8443, [2001:db8::7])."
+                .to_owned(),
         ),
         LogProblem::Value("since") => (
             "since",
