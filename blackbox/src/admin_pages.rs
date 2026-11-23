@@ -32,15 +32,19 @@ pub const OPERATION_LOG: &str = "/admin/operation-log";
 /// The Resources and their Grants.
 pub const RESOURCES: &str = "/admin/resources";
 
+/// The outbound list.
+pub const OUTBOUND: &str = "/admin/outbound";
+
 /// The installation.
 pub const INSTALLATION: &str = "/admin/installation";
 
-/// The four sections of `nav[data-vm-admin-sections]`: (`data-vm-section`,
+/// The five sections of `nav[data-vm-admin-sections]`: (`data-vm-section`,
 /// the path it links to).
-pub const SECTIONS: [(&str, &str); 4] = [
+pub const SECTIONS: [(&str, &str); 5] = [
     ("applications", APPLICATIONS),
     ("operation-log", OPERATION_LOG),
     ("resources", RESOURCES),
+    ("outbound", OUTBOUND),
     ("installation", INSTALLATION),
 ];
 
@@ -66,6 +70,7 @@ pub fn get_paths(application: &str) -> Vec<String> {
         disable_target(application),
         OPERATION_LOG.to_owned(),
         RESOURCES.to_owned(),
+        OUTBOUND.to_owned(),
         INSTALLATION.to_owned(),
     ]
 }
@@ -77,6 +82,7 @@ pub fn pages_with_sections(application: &str) -> Vec<(String, Option<&'static st
         (APPLICATIONS.to_owned(), Some("applications")),
         (OPERATION_LOG.to_owned(), Some("operation-log")),
         (RESOURCES.to_owned(), Some("resources")),
+        (OUTBOUND.to_owned(), Some("outbound")),
         (INSTALLATION.to_owned(), Some("installation")),
         (disable_target(application), None),
     ]
@@ -175,7 +181,7 @@ pub fn assert_no_admin_trace(page: &Page, context: &str) {
 }
 
 /// Fails unless the page has, under its header, one
-/// `nav[data-vm-admin-sections]` with the four links of [`SECTIONS`], each
+/// `nav[data-vm-admin-sections]` with the five links of [`SECTIONS`], each
 /// to its path, the one of `current` with `aria-current="page"` and no
 /// other with `aria-current`.
 pub fn assert_sections(page: &Page, current: &str, context: &str) {
@@ -222,12 +228,12 @@ pub fn assert_sections(page: &Page, current: &str, context: &str) {
     assert_eq!(
         sorted,
         wanted_sorted,
-        "{context}: expected the four links of the sections (section, element:path, aria-current), {current:?} the current one\n{}",
+        "{context}: expected the five links of the sections (section, element:path, aria-current), {current:?} the current one\n{}",
         page.describe()
     );
     assert_eq!(
         root.with_attr("data-vm-section").len(),
-        4,
+        SECTIONS.len(),
         "{context}: expected the sections' links in `nav[data-vm-admin-sections]` only\n{}",
         page.describe()
     );

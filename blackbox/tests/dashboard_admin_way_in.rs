@@ -7,7 +7,7 @@
 //! `data-vm-admin`, no `data-vm-admin-sections`, no link under `/admin`,
 //! not the word); it follows the person's Groups, decided at each request;
 //! each administrator's page under `/admin` but the confirmation of a
-//! disable has one `nav[data-vm-admin-sections]` with the four sections,
+//! disable has one `nav[data-vm-admin-sections]` with the five sections,
 //! its own `aria-current="page"`, and an Application's page has none.
 //!
 //! Acceptance criterion (ticket "The Dashboard for Platform
@@ -210,7 +210,7 @@ fn the_way_in_follows_the_groups_of_each_request_with_the_stand_in() {
 }
 
 #[test]
-fn each_administrators_page_has_the_four_sections_its_own_current_and_others_have_none() {
+fn each_administrators_page_has_the_five_sections_its_own_current_and_others_have_none() {
     let vm = with_board();
     let dashboard = Dashboard::new(&vm, &administrator());
     for (path, section) in pages_with_sections(APP) {

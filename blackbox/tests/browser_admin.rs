@@ -476,6 +476,7 @@ fn someone_not_a_platform_administrator_is_refused_every_page_and_the_disable() 
         OPERATION_LOG.to_owned(),
         INSTALLATION.to_owned(),
         RESOURCES.to_owned(),
+        blackbox::admin_pages::OUTBOUND.to_owned(),
     ] {
         browser.navigate(&site.dashboard(&path));
         if path.starts_with("/admin") {

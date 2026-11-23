@@ -19,7 +19,7 @@
 use std::time::Duration;
 
 use blackbox::admin_pages::{
-    APPLICATIONS, INSTALLATION, OPERATION_LOG, RESOURCES, assert_title, disable_target,
+    APPLICATIONS, INSTALLATION, OPERATION_LOG, OUTBOUND, RESOURCES, assert_title, disable_target,
     enable_target, get_paths,
 };
 use blackbox::dashboard::{
@@ -64,6 +64,7 @@ fn each_path_of_the_table_answers_its_status_with_a_page_and_its_title() {
         (disable_target(APP), 200),
         (OPERATION_LOG.to_owned(), 200),
         (RESOURCES.to_owned(), 200),
+        (OUTBOUND.to_owned(), 200),
         (INSTALLATION.to_owned(), 200),
     ] {
         let page = dashboard.page(&target, status, &target);
@@ -88,6 +89,7 @@ fn another_method_on_a_path_of_the_table_is_405_with_allow() {
         APPLICATIONS,
         OPERATION_LOG,
         RESOURCES,
+        OUTBOUND,
         INSTALLATION,
     ] {
         for method in ["POST", "DELETE", "PUT"] {
@@ -219,6 +221,7 @@ fn every_answer_has_the_headers_and_the_policy_of_the_dashboards_pages() {
         ),
         (OPERATION_LOG.to_owned(), 200, dashboard.get(OPERATION_LOG)),
         (RESOURCES.to_owned(), 200, dashboard.get(RESOURCES)),
+        (OUTBOUND.to_owned(), 200, dashboard.get(OUTBOUND)),
         (INSTALLATION.to_owned(), 200, dashboard.get(INSTALLATION)),
         ("/admin/nope".to_owned(), 404, dashboard.get("/admin/nope")),
         (
@@ -324,7 +327,13 @@ fn with_the_platform_database_stopped_an_administrators_page_is_503_with_retry_a
     // once: "relation does not exist" after the restart).
     blackbox::admin::platform_sql(&vm).batch("CHECKPOINT");
     postgres.stop();
-    for target in [APPLICATIONS, OPERATION_LOG, RESOURCES, INSTALLATION] {
+    for target in [
+        APPLICATIONS,
+        OPERATION_LOG,
+        RESOURCES,
+        OUTBOUND,
+        INSTALLATION,
+    ] {
         let target = target.to_owned();
         let response = dashboard
             .navigation("GET", &target)
@@ -363,7 +372,13 @@ fn with_the_platform_database_stopped_an_administrators_page_is_503_with_retry_a
     postgres
         .start_again()
         .unwrap_or_else(|e| panic!("the harness could not start its Postgres again: {e}"));
-    for target in [RESOURCES, INSTALLATION, APPLICATIONS, OPERATION_LOG] {
+    for target in [
+        RESOURCES,
+        INSTALLATION,
+        OUTBOUND,
+        APPLICATIONS,
+        OPERATION_LOG,
+    ] {
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
         loop {
             let response = dashboard

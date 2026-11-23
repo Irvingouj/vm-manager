@@ -275,15 +275,16 @@ fn admin_at_320() -> (Site, Firefox) {
 }
 
 /// Each section's name as the contract gives it.
-const SECTION_NAMES: [(&str, &str); 4] = [
+const SECTION_NAMES: [(&str, &str); 5] = [
     ("applications", "Applications"),
     ("operation-log", "Operation log"),
     ("resources", "Resources"),
+    ("outbound", "Outbound"),
     ("installation", "Installation"),
 ];
 
 #[test]
-fn at_320_css_pixels_the_four_sections_are_on_one_row_named_and_the_pages_own_shows_its_word() {
+fn at_320_css_pixels_the_five_sections_are_on_one_row_named_and_the_pages_own_shows_its_word() {
     firefox::required();
     let (site, mut browser) = admin_at_320();
     for (section, path) in SECTIONS {
@@ -330,7 +331,7 @@ return { height: r.height, links };",
             "{at}: the sections' `nav` is {height} CSS pixels high, at most 64"
         );
         let links = measured["links"].as_array().cloned().unwrap_or_default();
-        assert_eq!(links.len(), 4, "{at}: four links: {links:?}");
+        assert_eq!(links.len(), 5, "{at}: five links: {links:?}");
         let tops: Vec<f64> = links
             .iter()
             .map(|l| l["top"].as_f64().unwrap_or(0.0))
@@ -343,7 +344,7 @@ return { height: r.height, links };",
         let highest_bottom = bottoms.iter().copied().fold(f64::MAX, f64::min);
         assert!(
             lowest_top < highest_bottom,
-            "{at}: the four links on one row (each link's box shares a line with every other): {links:?}"
+            "{at}: the five links on one row (each link's box shares a line with every other): {links:?}"
         );
         for link in &links {
             let this = link["section"].as_str().unwrap_or("?");

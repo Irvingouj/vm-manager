@@ -30,7 +30,7 @@
 )]
 
 use blackbox::admin_pages::{
-    APPLICATIONS, INSTALLATION, OPERATION_LOG, RESOURCES, SECTIONS, disable_target,
+    APPLICATIONS, INSTALLATION, OPERATION_LOG, OUTBOUND, RESOURCES, SECTIONS, disable_target,
 };
 use blackbox::browser::url;
 use blackbox::dashboard::{
@@ -330,6 +330,7 @@ fn the_pages_of_platform_administrators_say_each_thing_once() {
         OPERATION_LOG.to_owned(),
         INSTALLATION.to_owned(),
         RESOURCES.to_owned(),
+        OUTBOUND.to_owned(),
     ];
     let section_paths: Vec<&str> = SECTIONS.iter().map(|(_, path)| *path).collect();
     for target in &pages {
