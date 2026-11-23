@@ -3409,3 +3409,65 @@ vibe admin outbound remove <host> [--json]
 - **A share for each Application** of the program's 256 calls: first come; the ticket "Resources and Grants in full".
 - A listed host that itself fetches an address given to it (an open relay) reaches where the platform would not: the list is the administrators' judgement of the host.
 - DNS answers are the resolver's: the platform checks the addresses it is given and connects to those, and does not validate DNSSEC.
+
+## Resources and Grants in full
+
+The ticket "Resources and Grants in full: credentials encrypted, revoking, listing". A Platform administrator finishes what they do with Resources: a shared database's logins are kept sealed under the installation's key and are checked when they are supplied; a Resource's logins can be replaced and the Resource removed; Grants are set, changed, revoked and listed.
+
+This section is written in stages, as the ticket is built. **Stage one, here: what is sealed, and what the program does at start.** Registering with checks, replacing logins, listing, removing, revoking a Grant and the Dashboard's forms follow in the next stages and are not promised yet. It builds on "Resources and Grants", "The Application's own database", and "The tool signs in through the browser, and OIDC is connected from the tool: The installation's key" (ADR 0018).
+
+### What is sealed, and under which key
+
+The key is the installation's key of ADR 0018, `VIBE_SECRET_KEY`, in the environment of `vibe serve` and nowhere else; this ticket adds no second key and no other place for it.
+
+- **A shared database's connection** (`connection` of `POST /v1/resources`: host, port, database, and each login's role and password) is kept in the platform database only as a sealed value (AES-256-GCM, a key made from the installation's key for this use alone, as "The installation's key" says of the OIDC client secret). Host, port, database and roles are sealed with the passwords, not only the passwords.
+- **The sealed value belongs to its Resource's row.** It does not open when copied to another Resource's row (or when its Resource's name or id is not the one it was sealed for). A person with write access to the platform database cannot make one Resource reach another's database by moving what is stored.
+- **An own database's role passwords** (`platform_password`, `runtime_password` of `own_databases`, and the older `owner_password` where a row still has one) are kept the same way, each bound to its Application's row.
+- A Storage Resource's `location` is not a credential and is not sealed. It is stored as before.
+- What is already sealed (the OIDC client secret, sessions', tool credentials' and tool sign-ins' refresh tokens) is as before.
+
+**A dump of the platform database holds no usable credential.** A test registers a database Resource whose host, port, database, two roles and three passwords are recognisable strings, makes an Application with an own database, reads every column of every table of the platform database as the Postgres administrator (also `pg_dump`), and finds none of the recognisable strings, whole, or as hex or base64 of them, and no run of 64 lower-case hex digits in `own_databases` (the form an own database's password had before this ticket).
+
+**Nor does a statement the program sends to the platform database carry one.** The values are sealed in the program, before the statement is built, so the parameters of `INSERT INTO resources` and `INSERT INTO own_databases` (and of every statement that writes them later) are sealed bytes. With statement logging fully on in the platform database (`log_statement = all`, `log_min_duration_statement = 0`, parameters logged whole, also on error: the harness's `server_log::log_everything`), the server log after a registration and an own database's first Version holds none of the recognisable strings above and no run of 64 lower-case hex digits in a statement that names `own_databases`. (The shared database's own server log sees what Postgres is always sent: SCRAM messages, never a password. The verifiers sent to an own database's Postgres are as before: `docs/research/what-postgres-sees.md`.)
+
+### At start
+
+All of this is read at start, and written to the program's log; none of it stops the program from serving ("Serving: Starting and stopping" keeps its start-up failures: a key that is set to anything but 32 bytes in base64 is still one).
+
+- **With the key, and sealed values that open**: nothing is said; each database Resource is served as before.
+- **A platform database from before this ticket** (a Resource whose stored connection is not sealed, an own database with a password in clear): at the first start with the key, the program seals each of them in place, one Resource or Application at a time, in a transaction of its own that is made only if the row is as it was read (a compare-and-set), and writes one record `{"event":"credentials-sealed","resources":<n>,"own_databases":<n>}` when it has done, and `{"event":"credentials-sealed-old-copies","message":"..."}` whose message says that earlier copies of the clear values remain in backups and in the database server's old files, and that logins of shared databases should be changed there and replaced here (replacing a Resource's logins comes with the next stage of this ticket). Afterwards no column of the platform database holds a clear one (the dump test above, run on a database made by the previous program). Starting again changes nothing. An interrupted sealing leaves each row either sealed or as it was, and the next start finishes it. It is done before `listening` and ends within 15 seconds for 1,000 Resources and 1,000 own databases; a row that cannot be sealed in time is left as it was, and the program serves it as below.
+- **Without the key** (`VIBE_SECRET_KEY` not set): the program serves all the same. Every database Resource, and every own database, is **not served**: the log has one record `{"event":"resource-unusable","resource":"<name>","problem":"no-secret-key"}` for each Resource and `{"event":"own-database-unusable","application":"<name>","problem":"no-secret-key"}` for each own database, at start and then at most once a minute for each while it lasts; no Resource's logins are opened. Storage Resources, Grants, Applications without an own database, outbound calls, sign-in as the stand-in and everything that holds no sealed login work as before. (A Resource whose connection is still in clear is not served either: without the key it cannot be sealed, and the clear value is not used.)
+- **With another key than the one the values were sealed under** (or a value that was moved to another row): the same, with `"problem":"does-not-open"`, for the Resources and own databases whose values do not open; those that do open are served.
+- What "not served" means, for a database Resource:
+  - An operation that is allowed (every refusal before the check of a Grant is given as ever) fails `{ error: { kind: "unavailable" } }`, and its Operation log entry is `failed` with `error` `unavailable`. Nothing is sent to any database. This is what "Storage: When the directory cannot be used" does for a directory that cannot be used. The Coding agent's `fix` is not needed: it is not the Application's fault.
+  - `GET /v1/resources/<name>/structure`: `503` `structure-unavailable`, its Operation log entry `failed` with `error` `unavailable`.
+  - `GET /v1/resources` and `GET /v1/resources/<name>` still list it (a Resource's existence, description and whom to ask are visible to all).
+- **An own database that is not served** (no key): a request that would use it fails as an operation on a Resource does (`unavailable`); a Version with migrations sent to it is `503` `unavailable`. With another key (`does-not-open`) the program does not wait for the right one: the roles' passwords are the platform's to choose ("An Application's own database": it chooses them and sets them on the roles as the platform's own role), so at the next use of that own database it chooses new ones, sets them, seals them, and writes `{"event":"own-database-passwords-replaced","application":"<name>","reason":"does-not-open"}`; nothing of the Application's data or Change history is touched.
+- Registering or changing a database Resource without the key: `409` `no-secret-key`, nothing registered or changed; the message says to start the program with `VIBE_SECRET_KEY`. Storage Resources do not need the key.
+- `vibe serve --help` says that `VIBE_SECRET_KEY` seals Resources' logins and own databases' passwords.
+- **The local run** (`vibe request`, `vibe dev`) keeps a key of its own, made at its first run: 32 random bytes in base64 in `.vibe/local/secret-key`, mode `0600`, never printed, never read from the environment; `.vibe/local/` is the Builder's own state ("The local loop"), a link there is `local-state` as for any other name, and `vibe local reset` leaves the file in place. So the local platform database seals as an installation's does, and no Builder has to set a variable to run. (The local databases hold only test data.)
+
+### Bounds
+
+- **Sealing at start**: 15 seconds in all, before `listening`; what is not sealed by then is left as it was and is not served until a later start seals it.
+- The records `resource-unusable` and `own-database-unusable`: one for each at start, then at most one a minute for each while it lasts.
+- Nothing here adds a queue, a buffer or a wait: a Resource or an own database that is not served is answered at once.
+
+### What this does not close
+
+- **Replacing a Resource's logins, and a list that says which Resources are not usable**: the next stage of this ticket. Until then a database Resource whose value does not open stays unserved.
+- **Replacing the installation's key** while keeping what is sealed under it: not here.
+- **Encryption in transit to the databases.** What the program sends to a shared database, to an own database and to the platform database is not encrypted by the program (it connects without TLS). SCRAM keeps a password off the wire; the rows travel in clear. A company that needs it puts the database behind a tunnel or a proxy that terminates TLS.
+- **Old copies.** Clear values of earlier programs remain in backups, in Postgres's write-ahead log and in the table's dead rows until they are vacuumed; logins of shared databases should be changed at the database after an upgrade, and the sealing record says so.
+- **The key is in the program's environment**: someone who can read it and the platform database can open every sealed value; and the program's memory holds a login's password while its pool exists. The key is not in a hardware or cloud key store; there is no key file option and no key for each Resource.
+- **Who can write the platform database can still change it**: delete a row, or put back an older sealed value of the same Resource. They cannot make one Resource open another's.
+- **Own databases' `vm.keys`** are in each own database, as clear bytes, readable by the database's platform role; a dump of the platform database does not hold them, a dump of the whole server does.
+- **`storage_cursor_key`** (the key a Storage list's cursor is signed with, in the platform database) is kept in clear: it protects a cursor's integrity and is not a credential. It is named here so that nobody reads "no usable credential in a dump" as covering it.
+
+### What changes in earlier sections
+
+- "The tool signs in through the browser: The installation's key": "Without it the program serves all the same, but OIDC cannot be connected" gains: and no database Resource and no own database is served ("At start", above). What the platform seals with the key gains: a database Resource's connection and an own database's role passwords.
+- "The Application's own database: What it looks like in Postgres": "Their passwords are the platform's own and never appear in an answer, a log record or an error message." gains: and they are kept in the platform database sealed.
+- "The local loop": `.vibe/local/` holds one file more, `secret-key`.
+- "Installing": `deploy/README.md` says that `VIBE_SECRET_KEY` seals Resources' logins and own databases' passwords, and that losing it means supplying every Resource's logins again.
+- The black-box tests: every program they start that registers a database Resource or makes an own database is started with a `VIBE_SECRET_KEY`; a test that wants none says so.
