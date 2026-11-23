@@ -44,12 +44,23 @@
 //!
 //! A Resource's connection and logins are held as a [`Connection`], which
 //! never prints, and stored as the [`sealed`] module writes them, the one
-//! place that knows the stored form (the ticket "Resources and Grants in
-//! full" encrypts it there). Each Resource holds a pool per login (crate::
-//! executor): its read pool, its write pool when it was registered with a
-//! write login, and its structure pool when it was registered with a
-//! structure login (the Structure puller's, crate::structure). A pool
-//! connects on first use.
+//! place that knows the stored form: sealed under the installation's key
+//! (crate::credentials) and bound to the Resource's id and name, so that a
+//! value moved to another row does not open. A database Resource whose
+//! stored value opens holds a pool per login (crate::executor): its read
+//! pool, its write pool when it was registered with a write login, and its
+//! structure pool when it was registered with a structure login (the
+//! Structure puller's, crate::structure). A pool connects on first use.
+//!
+//! A database Resource whose value does not open, a Resource still in the
+//! clear form of before (which the sealing at start did not reach), or a
+//! platform database from which the key is missing, is **not served**
+//! (blackbox/CONTRACT.md, "Resources and Grants in full: At start"): it is
+//! in memory with its name, description, owner and contact, and every
+//! operation on it is answered `unavailable` without anything sent to any
+//! database. The program's log says why for each (`does-not-open`,
+//! `not-sealed`, `no-secret-key`), once at start and then at most once a
+//! minute for each while it lasts ([`Resource::mention_unserved`]).
 //!
 //! A Resource is of a kind (blackbox/CONTRACT.md, "Storage"): `postgres`, a
 //! shared database as above, or `storage`, a named place of files, whose
@@ -71,6 +82,7 @@ use tokio_postgres::error::SqlState;
 use tokio_postgres::types::FromSql;
 use tokio_postgres::{Client, Row};
 
+use crate::credentials::Vault;
 use crate::executor::{self, Level, Levels, Password, Source, Target};
 use crate::log;
 use crate::platform_db::{DbError, PlatformDatabase, rfc3339};
@@ -212,22 +224,43 @@ struct Pools {
 }
 
 /// The stored form of a [`Connection`] (and of a Storage Resource's
-/// location): the one place that writes and reads it. For now the Connection as JSON; the ticket "Resources and Grants in
-/// full" encrypts it here, and nothing else changes.
+/// location): the one place that writes and reads it.
+///
+/// A connection is the sealed form of crate::oidc::seal (`1 || nonce ||
+/// ciphertext || tag`), sealed under the key of its use with the Resource's
+/// id and name as the associated data (crate::credentials). The form of
+/// before this ticket is the connection as JSON, which begins with `{`; it
+/// is told from the sealed form without a key and is never used, only
+/// sealed at the first start with the key.
+///
+/// A Storage Resource's location is not a credential: it is stored as
+/// before, as JSON.
 mod sealed {
     use super::Connection;
+    use crate::credentials::{Vault, resource_connection_bound};
 
-    pub(super) fn seal(connection: &Connection) -> Option<Vec<u8>> {
-        serde_json::to_vec(connection).ok()
+    /// `connection` sealed for the Resource `id`, whose name is `name`.
+    pub(super) fn seal(
+        connection: &Connection,
+        vault: &Vault,
+        id: i64,
+        name: &str,
+    ) -> Option<Vec<u8>> {
+        let plain = serde_json::to_vec(connection).ok()?;
+        let bound = resource_connection_bound(id, name);
+        vault.resource_sealer().seal_bytes(plain, &bound)
     }
 
-    /// `None` if it cannot be read; the reason is not given, as it could
-    /// quote what is stored.
-    pub(super) fn open(stored: &[u8]) -> Option<Connection> {
-        serde_json::from_slice(stored).ok()
+    /// What `stored` holds, sealed for the Resource `id`, whose name is
+    /// `name`; `None` if it does not open. The reason is not given, as it
+    /// could quote what is stored.
+    pub(super) fn open(stored: &[u8], vault: &Vault, id: i64, name: &str) -> Option<Connection> {
+        let bound = resource_connection_bound(id, name);
+        let opened = vault.resource_sealer().open_bytes(stored, &bound)?;
+        serde_json::from_slice(&opened).ok()
     }
 
-    /// A Storage Resource's location, kept as a connection is.
+    /// A Storage Resource's location, kept as before.
     pub(super) fn seal_location(location: &crate::storage::Location) -> Option<Vec<u8>> {
         serde_json::to_vec(location).ok()
     }
@@ -259,7 +292,7 @@ pub enum NewReach {
     },
 }
 
-/// How a Resource is reached: by its pools, or by its backend.
+/// How a Resource is reached: by its pools, by its backend, or not at all.
 #[derive(Debug)]
 #[expect(
     clippy::large_enum_variant,
@@ -267,8 +300,27 @@ pub enum NewReach {
 )]
 enum Reach {
     Database(Pools),
+    /// A database Resource whose connection is not served now: no key, a
+    /// value that does not open, or a clear value that could not be sealed
+    /// in time. Its name and what everyone may see are as any Resource's.
+    Unserved(Unserved),
     Storage(Directory),
 }
+
+/// Why a database Resource is not served, and when its problem was last
+/// written to the program's log.
+#[derive(Debug)]
+struct Unserved {
+    /// `no-secret-key`, `does-not-open` or `not-sealed`
+    /// (blackbox/CONTRACT.md, "Resources and Grants in full: At start").
+    problem: &'static str,
+    /// Held only for a check and a write, never across an await.
+    said: std::sync::Mutex<Option<Instant>>,
+}
+
+/// How often, at most, a Resource that is not served is written to the log
+/// again while it lasts.
+const MENTION_EVERY: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Copy, Debug)]
 struct Granted {
@@ -332,8 +384,37 @@ impl Resource {
     fn pools(&self) -> Option<&Pools> {
         match &self.reach {
             Reach::Database(pools) => Some(pools),
-            Reach::Storage(_) => None,
+            Reach::Unserved(_) | Reach::Storage(_) => None,
         }
+    }
+
+    /// Why this database Resource is not served now; `None` for one that
+    /// is, and for a Storage Resource.
+    pub fn unserved(&self) -> Option<&'static str> {
+        match &self.reach {
+            Reach::Unserved(unserved) => Some(unserved.problem),
+            Reach::Database(_) | Reach::Storage(_) => None,
+        }
+    }
+
+    /// Writes the `resource-unusable` record of this Resource now, unless
+    /// it was written less than a minute ago; and `force` writes it
+    /// whatever was written before (the start's record, for each).
+    pub fn mention_unserved(&self, force: bool) {
+        let Reach::Unserved(unserved) = &self.reach else {
+            return;
+        };
+        {
+            let mut said = unserved.said.lock().unwrap_or_else(PoisonError::into_inner);
+            if !force && said.is_some_and(|at| at.elapsed() < MENTION_EVERY) {
+                return;
+            }
+            *said = Some(Instant::now());
+        }
+        log::record(
+            "resource-unusable",
+            serde_json::json!({ "resource": &self.name, "problem": unserved.problem }),
+        );
     }
 
     /// The pool of the read login; `None` for a Resource that is no
@@ -360,7 +441,7 @@ impl Resource {
     pub fn storage(&self) -> Option<&Directory> {
         match &self.reach {
             Reach::Storage(backend) => Some(backend),
-            Reach::Database(_) => None,
+            Reach::Database(_) | Reach::Unserved(_) => None,
         }
     }
 
@@ -505,6 +586,10 @@ pub enum GrantWritten {
 
 pub struct Resources {
     database: Arc<PlatformDatabase>,
+    /// The installation's key, as the keys a Resource's connection is
+    /// sealed and opened with; `None` when the program was started without
+    /// it, and then no database Resource is served.
+    vault: Option<Arc<Vault>>,
     limits: executor::Limits,
     /// The file threads Storage Resources' directories are opened on.
     files: Arc<Files>,
@@ -564,6 +649,7 @@ impl Resources {
     /// waiting write keeps neither the start nor the other Resources back.
     pub async fn load(
         database: Arc<PlatformDatabase>,
+        vault: Option<Arc<Vault>>,
         limits: executor::Limits,
         reading_back: Arc<Semaphore>,
         files: Arc<Files>,
@@ -607,6 +693,7 @@ impl Resources {
             .collect::<Result<_, _>>()?;
         let this = Self {
             database,
+            vault,
             limits,
             files,
             root,
@@ -627,7 +714,15 @@ impl Resources {
         let mut all = BTreeMap::new();
         for row in &resources {
             let resource = this.resource_of(row)?;
+            // One record for each database Resource not served, at start.
+            resource.mention_unserved(true);
             let grants = read.remove(&resource.id).unwrap_or_default();
+            // A Grant is not a credential and needs no key: a Resource that
+            // is not served remembers its Grants as any other does, and a
+            // row another session holds leaves them unknown as for any other
+            // (blackbox/CONTRACT.md, "A write whose answer is lost"): a User
+            // with a Grant is answered `unavailable`, one without `no-grant`,
+            // and `grants-unknown` only while the Grants are not known.
             if locked.contains(&resource.id) {
                 *resource
                     .grants
@@ -662,8 +757,11 @@ impl Resources {
     }
 
     /// The Resource of `row`; a Storage Resource's directory not opened yet
-    /// ([`Directory::opening`]).
+    /// ([`Directory::opening`]). A database Resource whose connection does
+    /// not open, or with no key to open it, is [`Reach::Unserved`] and not
+    /// an error: the Resource exists, and is not served.
     fn resource_of(&self, row: &Row) -> Result<Resource, DbError> {
+        let id: i64 = get(row, 0)?;
         let name: String = get(row, 1)?;
         let kind: &str = get(row, 8)?;
         let (kind, reach) = match kind {
@@ -682,17 +780,37 @@ impl Resources {
                 (ResourceKind::Storage, Reach::Storage(backend))
             }
             _ => {
-                let connection = sealed::open(get(row, 5)?).ok_or_else(|| {
-                    DbError::unexpected("a Resource's stored connection cannot be read")
-                })?;
-                (
-                    ResourceKind::Postgres,
-                    Reach::Database(connection.into_pools(&name, &self.limits)),
-                )
+                let stored: Vec<u8> = get(row, 5)?;
+                let reach = match &self.vault {
+                    Some(vault) if !crate::oidc::seal::is_sealed(&stored) => {
+                        // The clear form of before, which the sealing at start
+                        // did not reach in time: not served until a later
+                        // start seals it (blackbox/CONTRACT.md, "Resources
+                        // and Grants in full: At start").
+                        Reach::Unserved(Unserved {
+                            problem: "not-sealed",
+                            said: std::sync::Mutex::new(None),
+                        })
+                    }
+                    Some(vault) => match sealed::open(&stored, vault, id, &name) {
+                        Some(connection) => {
+                            Reach::Database(connection.into_pools(&name, &self.limits))
+                        }
+                        None => Reach::Unserved(Unserved {
+                            problem: "does-not-open",
+                            said: std::sync::Mutex::new(None),
+                        }),
+                    },
+                    None => Reach::Unserved(Unserved {
+                        problem: "no-secret-key",
+                        said: std::sync::Mutex::new(None),
+                    }),
+                };
+                (ResourceKind::Postgres, reach)
             }
         };
         Ok(Resource {
-            id: get(row, 0)?,
+            id,
             kind,
             reach,
             name,
@@ -737,44 +855,106 @@ impl Resources {
             .collect()
     }
 
+    /// Whether this program was started with the installation's key: a
+    /// database Resource cannot be registered without it.
+    pub fn has_vault(&self) -> bool {
+        self.vault.is_some()
+    }
+
     /// Registers `new`, by `by`. The name must have passed
     /// [`is_resource_name`]. Does not connect to the database.
+    ///
+    /// A database Resource's connection is sealed in the program before the
+    /// `INSERT` that carries it is built (crate::credentials): in one
+    /// transaction, its row's id is taken from the sequence first, the
+    /// associated data is bound to that id and the name, and the `INSERT`
+    /// sends sealed bytes and never a clear credential. One transaction, so
+    /// that a registration whose answer is lost is still one write that may
+    /// land.
     pub async fn register(&self, new: NewResource, by: &str) -> Result<Registered, DbError> {
-        let (kind, stored) = match &new.reach {
-            NewReach::Database(connection) => (ResourceKind::Postgres, sealed::seal(connection)),
-            NewReach::Storage { location, .. } => {
-                (ResourceKind::Storage, sealed::seal_location(location))
-            }
+        let kind = match &new.reach {
+            NewReach::Database(_) => ResourceKind::Postgres,
+            NewReach::Storage { .. } => ResourceKind::Storage,
         };
-        let stored = stored
-            .ok_or_else(|| DbError::unexpected("a Resource's connection cannot be stored"))?;
         let kind_name = kind.name();
         let inserted = self
             .database
             .pool()
             .run(async |client: &mut Client| {
-                client
-                    .query_opt(
-                        concat!(
-                            "INSERT INTO resources (name, kind, description, owner, contact,
-                                                    connection, created_by)
-                             VALUES ($1, $7, $2, $3, $4, $5, $6)
-                             ON CONFLICT (name) DO NOTHING
-                             RETURNING id, ",
-                            rfc3339!("created_at")
-                        ),
-                        &[
-                            &new.name,
-                            &new.description,
-                            &new.owner,
-                            &new.contact,
-                            &stored,
-                            &by,
-                            &kind_name,
-                        ],
-                    )
-                    .await
-                    .map_err(DbError::from)
+                let transaction = client.transaction().await.map_err(DbError::from)?;
+                let row = match &new.reach {
+                    NewReach::Database(connection) => {
+                        let vault = self.vault.as_ref().ok_or_else(|| {
+                            DbError::unexpected(
+                                "a database Resource cannot be registered without the key",
+                            )
+                        })?;
+                        let id: i64 = transaction
+                            .query_one(
+                                "SELECT nextval(pg_get_serial_sequence('resources', 'id'))",
+                                &[],
+                            )
+                            .await
+                            .and_then(|row| row.try_get(0))
+                            .map_err(DbError::from)?;
+                        let stored =
+                            sealed::seal(connection, vault, id, &new.name).ok_or_else(|| {
+                                DbError::unexpected("a Resource's connection cannot be sealed")
+                            })?;
+                        transaction
+                            .query_opt(
+                                concat!(
+                                    "INSERT INTO resources (id, name, kind, description, owner,
+                                                            contact, connection, created_by)
+                                     OVERRIDING SYSTEM VALUE
+                                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                                     ON CONFLICT (name) DO NOTHING
+                                     RETURNING id, ",
+                                    rfc3339!("created_at")
+                                ),
+                                &[
+                                    &id,
+                                    &new.name,
+                                    &kind_name,
+                                    &new.description,
+                                    &new.owner,
+                                    &new.contact,
+                                    &stored,
+                                    &by,
+                                ],
+                            )
+                            .await
+                    }
+                    NewReach::Storage { location, .. } => {
+                        let stored = sealed::seal_location(location).ok_or_else(|| {
+                            DbError::unexpected("a Resource's location cannot be stored")
+                        })?;
+                        transaction
+                            .query_opt(
+                                concat!(
+                                    "INSERT INTO resources (name, kind, description, owner,
+                                                            contact, connection, created_by)
+                                     VALUES ($1, $2, $3, $4, $5, $6, $7)
+                                     ON CONFLICT (name) DO NOTHING
+                                     RETURNING id, ",
+                                    rfc3339!("created_at")
+                                ),
+                                &[
+                                    &new.name,
+                                    &kind_name,
+                                    &new.description,
+                                    &new.owner,
+                                    &new.contact,
+                                    &stored,
+                                    &by,
+                                ],
+                            )
+                            .await
+                    }
+                }
+                .map_err(DbError::from)?;
+                transaction.commit().await.map_err(DbError::from)?;
+                Ok(row)
             })
             .await;
         let row = match inserted {
@@ -971,6 +1151,8 @@ impl Resources {
             return Ok(None);
         };
         let resource = self.resource_of(&row)?;
+        // At most once a minute, as any operation that meets it.
+        resource.mention_unserved(false);
         if let Some(directory) = resource.storage() {
             // Its own bound: one Resource, on an API request.
             directory
@@ -1152,8 +1334,10 @@ mod tests {
             )),
         );
         assert_eq!(format!("{connection:?}"), "Connection(<hidden>)");
-        let stored = sealed::seal(&connection).unwrap();
-        let opened = sealed::open(&stored).unwrap();
+        let key = crate::oidc::key::InstallationKey::random().unwrap();
+        let vault = Vault::new(&key).unwrap();
+        let stored = sealed::seal(&connection, &vault, 7, "devops").unwrap();
+        let opened = sealed::open(&stored, &vault, 7, "devops").unwrap();
         assert_eq!(opened.port, 6543);
         assert_eq!(opened.read.role, "secret_role");
         assert_eq!(
@@ -1164,11 +1348,12 @@ mod tests {
             opened.structure.map(|s| s.role).as_deref(),
             Some("secret_structure")
         );
-        assert!(sealed::open(b"not what was stored").is_none());
-        // What was stored before write logins existed still opens.
+        assert!(sealed::open(b"not what was stored", &vault, 7, "devops").is_none());
+        // A value sealed for one row does not open in another.
+        assert!(sealed::open(&stored, &vault, 8, "devops").is_none());
+        assert!(sealed::open(&stored, &vault, 7, "ledger").is_none());
+        // What was stored before this ticket, in clear, does not open.
         let older = br#"{"host":"h","port":1,"database":"d","read":{"role":"r","password":"p"}}"#;
-        let opened = sealed::open(older).unwrap();
-        assert!(opened.write.is_none());
-        assert!(opened.structure.is_none());
+        assert!(sealed::open(older, &vault, 7, "devops").is_none());
     }
 }

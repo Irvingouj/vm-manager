@@ -32,6 +32,8 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use rustix::fs::{FlockOperation, flock};
 use rustix::process::{Pid, Signal, kill_process, kill_process_group, test_kill_process};
 use serde_json::{Value, json};
@@ -492,6 +494,72 @@ impl Local {
                 "{} cannot be read ({error})",
                 path.display()
             ))),
+        }
+    }
+
+    /// The local run's installation key: 32 random bytes in base64 in
+    /// `.vibe/local/secret-key`, mode `0600`, made at the first run and read
+    /// as it is from then on (blackbox/CONTRACT.md, "Resources and Grants in
+    /// full: At start"). Never read from the environment, never printed;
+    /// `vibe local reset` leaves it in place. A link there is not followed:
+    /// the caller's check of the local state has named it already, and this
+    /// refuses it too.
+    pub(super) fn secret_key(&self) -> Result<crate::oidc::key::InstallationKey, StateFailed> {
+        let path = self.dir.join("secret-key");
+        let unreadable = |error: std::io::Error| {
+            StateFailed::State(format!(
+                "{} cannot be read ({error}); if it is a link or not this project's own key file, remove it",
+                path.display()
+            ))
+        };
+        let nofollow = super::nofollow().ok_or_else(|| {
+            StateFailed::State(format!(
+                "{} cannot be read (the platform's O_NOFOLLOW does not fit an int), so no link there is followed",
+                path.display()
+            ))
+        })?;
+        match super::read_plain_file(&path, STATE_BYTES) {
+            Ok(Some(bytes)) => {
+                let text = String::from_utf8(bytes).map_err(|_| {
+                    StateFailed::State(format!(
+                        "{} is not an installation's key: remove it, and the next run makes a new one (the local databases' Resources and own databases get new logins)",
+                        path.display()
+                    ))
+                })?;
+                crate::oidc::key::InstallationKey::from_base64(&text, || {
+                    format!(
+                        "{} is not an installation's key: it must be 32 random bytes in base64. Remove it, and the next run makes a new one (the local databases' Resources and own databases get new logins)",
+                        path.display()
+                    )
+                })
+                .map_err(StateFailed::State)
+            }
+            Ok(None) => {
+                let key = crate::oidc::key::InstallationKey::random().ok_or_else(|| {
+                    StateFailed::NoRandomness(
+                        "the operating system gave no randomness for the installation's key"
+                            .to_owned(),
+                    )
+                })?;
+                let written = (|| {
+                    let mut file = std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .mode(0o600)
+                        // `create_new` refuses an existing name; the flag
+                        // says so for a link too.
+                        .custom_flags(nofollow)
+                        .open(&path)?;
+                    file.write_all(STANDARD.encode(key.expose()).as_bytes())?;
+                    file.write_all(b"\n")?;
+                    file.sync_all()
+                })();
+                written.map_err(|error| {
+                    StateFailed::State(format!("{} cannot be written ({error})", path.display()))
+                })?;
+                Ok(key)
+            }
+            Err(error) => Err(unreadable(error)),
         }
     }
 

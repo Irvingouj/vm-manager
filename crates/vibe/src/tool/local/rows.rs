@@ -851,6 +851,10 @@ async fn remake(
                 .said("the own database made anew has migrations already")
                 .ending(name)
         }
+        // The local run always has its own key, so neither is expected.
+        Problem::NotServed | Problem::NoSecretKey => {
+            PgFailed::new(STEP, "making the own database anew", Cause::Server(None)).ending(name)
+        }
     };
     own.prepare(number, target.application, BUILDER, &[])
         .await

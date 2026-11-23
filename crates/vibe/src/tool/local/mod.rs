@@ -582,7 +582,7 @@ const LOCAL_ENTRIES: usize = 1000;
 
 /// The names the tool itself uses directly in `.vibe/local/`: each is
 /// looked at by name as well as in the listing, whatever the listing said.
-const OWN_NAMES: [&str; 8] = [
+const OWN_NAMES: [&str; 9] = [
     "storage",
     "postgres",
     "lock",
@@ -591,6 +591,7 @@ const OWN_NAMES: [&str; 8] = [
     "vibe.log",
     "postgres.log",
     "dev.json",
+    "secret-key",
 ];
 
 /// Checks the local state for a link before a command reads, makes,

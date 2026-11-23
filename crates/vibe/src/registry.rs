@@ -760,6 +760,14 @@ pub enum Sent {
         step: crate::own_db::Step,
         cause: crate::platform_db::Cause,
     },
+    /// The Application's own database is not served (no key, a value that
+    /// does not open, a row still in clear): nothing of this Version was
+    /// applied or recorded.
+    OwnDatabaseNotServed,
+    /// The program has no installation's key, and this Application has no
+    /// own database: a first Version is refused `409` `no-secret-key`, and
+    /// nothing of it is kept.
+    NoSecretKey,
 }
 
 pub struct Registry {
@@ -1762,6 +1770,8 @@ impl Registry {
             Err(Problem::Unavailable { step, cause }) => {
                 return Ok(Sent::OwnDatabaseUnavailable { step, cause });
             }
+            Err(Problem::NotServed) => return Ok(Sent::OwnDatabaseNotServed),
+            Err(Problem::NoSecretKey) => return Ok(Sent::NoSecretKey),
         }
         self.record(name, id, version, &sender.id).await
     }

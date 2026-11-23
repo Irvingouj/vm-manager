@@ -75,6 +75,7 @@ impl Platform {
         storage_root: Option<Root>,
         outbound_private: PrivateRanges,
         itself: crate::outbound::Itself,
+        vault: Option<Arc<crate::credentials::Vault>>,
     ) -> Result<Self, OpenError> {
         let files = Files::start()
             .map_err(|e| OpenError::new(None, format!("cannot start the file threads: {e}")))?;
@@ -85,6 +86,7 @@ impl Platform {
             outbound_private,
             itself,
             Arc::clone(&files),
+            vault,
         )
         .await;
         if opened.is_err() {
@@ -100,6 +102,7 @@ impl Platform {
         outbound_private: PrivateRanges,
         itself: crate::outbound::Itself,
         files: Arc<Files>,
+        vault: Option<Arc<crate::credentials::Vault>>,
     ) -> Result<Self, OpenError> {
         let Limits {
             pool,
@@ -108,30 +111,61 @@ impl Platform {
             start,
         } = limits;
         let root = storage_root.map(Arc::new);
-        let started = tokio::time::timeout(start, async {
-            let database = Arc::new(PlatformDatabase::open(address, &pool).await?);
-            let unreadable = |e: platform_db::DbError| {
-                OpenError::of(
-                    &e,
-                    format!(
-                        "cannot read the Applications and Resources from the platform database \"{}\": {e}",
-                        address.database()
-                    ),
-                )
+        let not_ready = || {
+            OpenError::new(
+                Some(Cause::TimedOut(start)),
+                format!(
+                    "the platform database \"{}\" on Postgres at {} was not ready within {} s",
+                    address.database(),
+                    address.server(),
+                    platform_db::seconds_text(start)
+                ),
+            )
+        };
+        let database =
+            match tokio::time::timeout(start, PlatformDatabase::open(address, &pool)).await {
+                Ok(opened) => Arc::new(opened?),
+                Err(_) => return Err(not_ready()),
             };
+        // Before the parts that serve are read: what a platform database
+        // from before this ticket holds in clear is sealed in place, one row
+        // at a time, within its own 15 seconds (blackbox/CONTRACT.md,
+        // "Resources and Grants in full: At start"). It is not part of the
+        // start-up time above, and it never stops the program from serving.
+        if let Some(vault) = &vault {
+            vault.seal_old(&database).await;
+        }
+        let unreadable = |e: platform_db::DbError| {
+            OpenError::of(
+                &e,
+                format!(
+                    "cannot read the Applications and Resources from the platform database \"{}\": {e}",
+                    address.database()
+                ),
+            )
+        };
+        let started = tokio::time::timeout(start, async {
             let own = Arc::new(
-                OwnDatabases::load(Arc::clone(&database), address)
-                    .await
-                    .map_err(unreadable)?,
+                OwnDatabases::load(
+                    Arc::clone(&database),
+                    address,
+                    vault.as_ref().map(Arc::clone),
+                )
+                .await
+                .map_err(unreadable)?,
             );
             // One bound on readings of what memory does not know, for both.
             let read_backs = crate::resources::read_backs();
-            let registry =
-                Registry::load(Arc::clone(&database), Arc::clone(&own), Arc::clone(&read_backs))
-                    .await
-                    .map_err(unreadable)?;
+            let registry = Registry::load(
+                Arc::clone(&database),
+                Arc::clone(&own),
+                Arc::clone(&read_backs),
+            )
+            .await
+            .map_err(unreadable)?;
             let resources = Resources::load(
                 Arc::clone(&database),
+                vault.as_ref().map(Arc::clone),
                 executor,
                 read_backs,
                 Arc::clone(&files),
@@ -143,22 +177,12 @@ impl Platform {
                 .await
                 .map_err(unreadable)?;
             let cursors = cursor_sealer(&database).await.map_err(unreadable)?;
-            Ok::<_, OpenError>((database, own, registry, resources, outbound, cursors))
+            Ok::<_, OpenError>((own, registry, resources, outbound, cursors))
         })
         .await;
-        let (database, own, registry, resources, outbound, cursors) = match started {
+        let (own, registry, resources, outbound, cursors) = match started {
             Ok(started) => started?,
-            Err(_) => {
-                return Err(OpenError::new(
-                    Some(Cause::TimedOut(start)),
-                    format!(
-                        "the platform database \"{}\" on Postgres at {} was not ready within {} s",
-                        address.database(),
-                        address.server(),
-                        platform_db::seconds_text(start)
-                    ),
-                ));
-            }
+            Err(_) => return Err(not_ready()),
         };
         // Before serving: every own database in this program's form, its
         // migration role closed (each within its own time limits).

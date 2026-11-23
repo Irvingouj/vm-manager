@@ -168,10 +168,7 @@ impl Installation {
 
     /// The installation's key the program was started with, if any.
     pub fn key(&self) -> Option<SecretKey> {
-        self.vm
-            .options()
-            .env_value("VIBE_SECRET_KEY")
-            .map(SecretKey::of)
+        self.vm.options().secret_key_value().map(SecretKey::of)
     }
 
     /// Ends the program and starts it again with the same options on the

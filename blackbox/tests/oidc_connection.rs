@@ -700,7 +700,9 @@ fn without_the_installation_s_key_oidc_cannot_be_connected() {
     let provider = Provider::start(&[ada()]);
     let at = Installation::unconnected(
         provider,
-        &VmOptions::new().args_extra(&["--public-scheme", "http"]),
+        &VmOptions::new()
+            .args_extra(&["--public-scheme", "http"])
+            .without_secret_key(),
     );
     let setup = setup_credential(at.vm.platform());
     let connection = Connection::to(&at.provider);
@@ -782,7 +784,8 @@ fn with_the_stand_in_and_no_key_the_stand_in_is_said_first() {
         &VmOptions::new()
             .args_extra(&["--public-scheme", "http"])
             .stand_in_sign_in()
-            .administrators_group(ADMINISTRATORS),
+            .administrators_group(ADMINISTRATORS)
+            .without_secret_key(),
     );
     let connection = Connection::to(&at.provider);
     let as_administrator = at

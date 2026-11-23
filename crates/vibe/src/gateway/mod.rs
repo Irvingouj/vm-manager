@@ -1584,23 +1584,35 @@ impl Work {
             On::Resource {
                 resource: Some(resource),
                 ..
-            } => match self.kind {
-                Kind::Query | Kind::Begin(_) | Kind::History => match resource.read_pool() {
-                    Some(pool) => pool,
-                    // Allowed means registered as a database: not reached.
-                    None => return error_to_wire(json!({ "kind": "unavailable" })),
-                },
-                Kind::Execute => match resource.write_pool() {
-                    Some(pool) => pool,
-                    None => {
-                        let answer = error_to_wire(json!({
-                            "kind": "read-only-resource",
-                            "message": "the Resource was registered without a write login, so nothing can be written to it: ask a Platform administrator to register its write login, or use query",
-                        }));
-                        return self.failed_unsent("read-only-resource", answer).await;
-                    }
-                },
-            },
+            } => {
+                // A database Resource that is not served (no key, a value
+                // that does not open): an allowed operation fails
+                // `unavailable`, with its entry, and nothing is sent to any
+                // database (blackbox/CONTRACT.md, "Resources and Grants in
+                // full: At start").
+                if resource.unserved().is_some() {
+                    resource.mention_unserved(false);
+                    let answer = error_to_wire(json!({ "kind": "unavailable" }));
+                    return self.failed_unsent("unavailable", answer).await;
+                }
+                match self.kind {
+                    Kind::Query | Kind::Begin(_) | Kind::History => match resource.read_pool() {
+                        Some(pool) => pool,
+                        // Allowed means registered as a database: not reached.
+                        None => return error_to_wire(json!({ "kind": "unavailable" })),
+                    },
+                    Kind::Execute => match resource.write_pool() {
+                        Some(pool) => pool,
+                        None => {
+                            let answer = error_to_wire(json!({
+                                "kind": "read-only-resource",
+                                "message": "the Resource was registered without a write login, so nothing can be written to it: ask a Platform administrator to register its write login, or use query",
+                            }));
+                            return self.failed_unsent("read-only-resource", answer).await;
+                        }
+                    },
+                }
+            }
             On::Own => {
                 own_pool = self
                     .own

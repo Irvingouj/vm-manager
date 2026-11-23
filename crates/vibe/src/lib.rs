@@ -21,6 +21,9 @@
 //!   host, and is decided.
 //! - [`resources`]: the Resources (shared databases) and their Grants,
 //!   held in memory in step with the platform database.
+//! - [`credentials`]: what the installation's key seals besides OIDC: a
+//!   database Resource's connection and an own database's role passwords,
+//!   and sealing a platform database from before this ticket at start.
 //! - [`outbound`]: the one list of hosts Applications may call, held in
 //!   memory in step with the platform database, and the ranges the
 //!   operator of the machine may open for those calls.
@@ -66,6 +69,7 @@ pub mod api;
 pub mod app_logs;
 pub mod check;
 pub mod cookies;
+pub mod credentials;
 pub mod dashboard;
 pub mod executor;
 pub mod gateway;

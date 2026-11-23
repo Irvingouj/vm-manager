@@ -16,6 +16,12 @@
 //! - **The OIDC connection's client secret** at rest
 //!   (crate::oidc::connection), a fixed label's digest as the associated
 //!   data.
+//! - **A database Resource's connection** and **an own database's role
+//!   passwords** at rest (crate::credentials, blackbox/CONTRACT.md,
+//!   "Resources and Grants in full"): a key of their own, and the
+//!   associated data a digest of the fixed label, the row's id and its
+//!   name (or which password it is), so that a value moved to another row
+//!   does not open there.
 //!
 //! So a dump of the platform database gives no secret. Another key leaves
 //! everything sealed unreadable: the connection is not used until OIDC is
@@ -34,7 +40,15 @@ use super::key::InstallationKey;
 use super::secret::Secret;
 
 /// The first byte of the stored form.
-const FORM: u8 = 1;
+pub const FORM: u8 = 1;
+
+/// Whether `stored` is in the sealed form at all: the first byte is
+/// [`FORM`]. What was stored in clear before a value was sealed (a
+/// Resource's connection as JSON, an own database's password as hex) is
+/// not.
+pub fn is_sealed(stored: &[u8]) -> bool {
+    stored.first() == Some(&FORM)
+}
 
 /// What a key is for.
 #[derive(Clone, Copy)]
@@ -43,6 +57,8 @@ pub enum Use {
     SignInState,
     ToolSignInState,
     ClientSecret,
+    ResourceConnection,
+    OwnDatabasePassword,
 }
 
 impl Use {
@@ -52,6 +68,8 @@ impl Use {
             Self::SignInState => b"vm: a sign-in under way",
             Self::ToolSignInState => b"vm: a sign-in of the tool under way",
             Self::ClientSecret => b"vm: the OIDC connection's client secret",
+            Self::ResourceConnection => b"vm: a database Resource's connection",
+            Self::OwnDatabasePassword => b"vm: an own database's password",
         }
     }
 }

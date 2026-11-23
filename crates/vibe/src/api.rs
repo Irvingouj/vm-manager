@@ -1619,6 +1619,16 @@ impl Api {
                         "the platform could not prepare the Application's own database: nothing was applied; try again shortly",
                     )
                 }
+                Sent::OwnDatabaseNotServed => Answer::error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "unavailable",
+                    "the Application's own database is not served now, so nothing of this Version was applied or recorded: the program was started without the installation's key, or the own database's passwords cannot be read. A Platform administrator starts the program with VIBE_SECRET_KEY (32 random bytes in base64); with another key, the own database gets new passwords at its next use, and the Version can be sent again",
+                ),
+                Sent::NoSecretKey => Answer::error(
+                    StatusCode::CONFLICT,
+                    "no-secret-key",
+                    "a first Version makes the Application's own database, whose role passwords are sealed under the installation's key, and this program was started without it: start the program with VIBE_SECRET_KEY (32 random bytes in base64, as `openssl rand -base64 32` makes them), then send the Version again",
+                ),
             },
         )
     }
@@ -1799,7 +1809,20 @@ impl Api {
             ));
         }
         let new = match new {
-            ToRegister::Database(new) => new,
+            ToRegister::Database(new) => {
+                // A database Resource's logins are sealed under the
+                // installation's key, which this program was started
+                // without: nothing is registered (blackbox/CONTRACT.md,
+                // "Resources and Grants in full: At start").
+                if !self.resources.has_vault() {
+                    return Ok(Answer::error(
+                        StatusCode::CONFLICT,
+                        "no-secret-key",
+                        "a database Resource's logins are sealed under the installation's key, and this program was started without it: start the program with VIBE_SECRET_KEY (32 random bytes in base64, as `openssl rand -base64 32` makes them), then register the Resource again",
+                    ));
+                }
+                new
+            }
             ToRegister::Storage {
                 name,
                 description,

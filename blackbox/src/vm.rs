@@ -27,6 +27,17 @@ pub const START_TIMEOUT: Duration = Duration::from_secs(20);
 /// How long a test waits for a record it expects in the log.
 pub const LOG_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// The installation's key every program the harness starts is given in
+/// `VIBE_SECRET_KEY` unless the test says otherwise ([`VmOptions::env`] with
+/// another key, [`VmOptions::without_secret_key`] for none): 32 bytes in
+/// base64 (CONTRACT.md, "Resources and Grants in full": every program the
+/// tests start is started with a key; a test that wants none says so). A
+/// test key, never an installation's.
+pub const TEST_SECRET_KEY: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
+
+/// The name of the installation's key in the program's environment.
+pub const SECRET_KEY_NAME: &str = "VIBE_SECRET_KEY";
+
 /// How many lines of the program's log a failure message shows.
 const LOG_LINES_SHOWN: usize = 200;
 
@@ -81,6 +92,9 @@ pub struct VmOptions {
     extra_args: Vec<String>,
     /// Environment variables the program is started with.
     env: Vec<EnvVar>,
+    /// The program is started with no `VIBE_SECRET_KEY` at all, not even
+    /// [`TEST_SECRET_KEY`].
+    no_secret_key: bool,
     /// How the harness reaches a program that serves TLS itself
     /// (CONTRACT.md, "The program serves TLS itself"): `None` for one that
     /// listens in plain HTTP. Nothing of it is given to the program.
@@ -136,6 +150,7 @@ impl Default for VmOptions {
             listen: None,
             extra_args: Vec::new(),
             env: Vec::new(),
+            no_secret_key: false,
             tls: None,
             hidden: Vec::new(),
         }
@@ -225,6 +240,9 @@ impl VmOptions {
     /// any value given for it before.
     #[must_use]
     pub fn env(mut self, name: &str, value: &str) -> Self {
+        if name == SECRET_KEY_NAME {
+            self.no_secret_key = false;
+        }
         self.env.retain(|e| e.name != name);
         self.env.push(EnvVar {
             name: name.to_owned(),
@@ -233,20 +251,42 @@ impl VmOptions {
         self
     }
 
-    /// Starts the program without this environment variable.
+    /// Starts the program without this environment variable (for
+    /// `VIBE_SECRET_KEY`: with no key, not even the harness's own).
     #[must_use]
     pub fn without_env(mut self, name: &str) -> Self {
+        if name == SECRET_KEY_NAME {
+            self.no_secret_key = true;
+        }
         self.env.retain(|e| e.name != name);
         self
     }
 
+    /// Starts the program with no `VIBE_SECRET_KEY`: the one way a test
+    /// gets a program without the installation's key.
+    #[must_use]
+    pub fn without_secret_key(self) -> Self {
+        self.without_env(SECRET_KEY_NAME)
+    }
+
     /// The value given for this environment variable, if any. It may be a
-    /// secret: never print it.
+    /// secret: never print it. (The harness's own key is not "given": see
+    /// [`VmOptions::secret_key_value`].)
     pub fn env_value(&self, name: &str) -> Option<&str> {
         self.env
             .iter()
             .find(|e| e.name == name)
             .map(|e| e.value.as_str())
+    }
+
+    /// The installation's key the program is started with: the one given
+    /// with [`VmOptions::env`], else [`TEST_SECRET_KEY`], and none after
+    /// [`VmOptions::without_secret_key`]. Never print it.
+    pub fn secret_key_value(&self) -> Option<&str> {
+        if self.no_secret_key {
+            return None;
+        }
+        Some(self.env_value(SECRET_KEY_NAME).unwrap_or(TEST_SECRET_KEY))
     }
 
     /// The harness reaches the program over TLS, trusting these
@@ -288,13 +328,18 @@ impl VmOptions {
     /// before a program without the stand-in starts. It listens in plain
     /// HTTP, as ever.
     fn installer(&self) -> Self {
-        Self {
+        let installer = Self {
             extra_args: Vec::new(),
             env: Vec::new(),
             tls: None,
             ..self.clone()
         }
-        .stand_in_sign_in()
+        .stand_in_sign_in();
+        // The key stays: what the installer makes is sealed under it.
+        match self.env_value(SECRET_KEY_NAME) {
+            Some(key) => installer.env(SECRET_KEY_NAME, key),
+            None => installer,
+        }
     }
 
     /// The `vibe` arguments for these options. `VIBE_DATABASE_URL` goes in the
@@ -519,6 +564,7 @@ impl Vm {
             .env_remove("VIBE_OIDC_CLIENT_SECRET")
             .env_remove("VIBE_SECRET_KEY")
             .env_remove("VIBE_SETUP_CREDENTIAL")
+            .envs(options.secret_key_value().map(|key| (SECRET_KEY_NAME, key)))
             .envs(options.env.iter().map(|e| (&e.name, &e.value)))
             .stdin(Stdio::null())
             .stdout(Stdio::null())

@@ -35,8 +35,21 @@
 //!   `CREATE`, no `TEMPORARY`, no `TRUNCATE`, member of no role.
 //!
 //! The platform's role and the runtime role have passwords the platform
-//! generates, stores in the platform database (table `own_databases`) and
-//! never prints; Postgres is only ever sent SCRAM verifiers.
+//! generates, stores in the platform database (table `own_databases`) sealed
+//! under the installation's key for the Application's row
+//! (crate::credentials), and never prints; Postgres is only ever sent SCRAM
+//! verifiers. Without that key no own database is served
+//! (blackbox/CONTRACT.md, "Resources and Grants in full: At start"): every
+//! operation that would use one fails `unavailable` without reaching it;
+//! a Version sent to one, with or without migrations, is `503`
+//! `unavailable` and is not recorded; and a first Version, which would make
+//! one, is `409` `no-secret-key` and is not kept. One whose stored passwords
+//! do not open (another key, passwords moved from another Application) gets
+//! new ones at its next use — a request that uses it, or a Version sent to
+//! it — set on its roles as the platform's own role, sealed, with the record
+//! `own-database-passwords-replaced`; a replacement that fails is tried
+//! again at a later use, at most once in 10 seconds. Nothing of the
+//! Application's data or Change history is touched.
 //!
 //! The platform's own role (that of `VIBE_DATABASE_URL`) needs only
 //! `CREATEDB` and `CREATEROLE`: it creates the three roles, makes itself
@@ -78,6 +91,9 @@ use tokio::task::JoinSet;
 use tokio::time::Instant;
 use tokio_postgres::{CancelToken, Client, Config, GenericClient, NoTls, Row, Transaction};
 
+use crate::credentials::{
+    Password as WhichPassword, Vault, is_sealed_own_password, open_own_password, seal_own_password,
+};
 use crate::executor::{self, IdentityKey, Levels, Password, Source, Target};
 use crate::log;
 use crate::migration_text;
@@ -315,6 +331,15 @@ pub enum Problem {
     /// Postgres's SQLSTATE if it gave one): never Postgres's message, which
     /// could name a role beside the word password.
     Unavailable { step: Step, cause: Cause },
+    /// The own database is not served now (no key, a value that does not
+    /// open, a row still in clear): nothing was applied and nothing
+    /// recorded (blackbox/CONTRACT.md, "Resources and Grants in full: At
+    /// start").
+    NotServed,
+    /// The program was started without the installation's key, and this
+    /// Application has no own database: a first Version is `409`
+    /// `no-secret-key` and nothing of it is kept.
+    NoSecretKey,
 }
 
 /// A step of making, readying or using an own database: a short fixed name
@@ -435,6 +460,10 @@ pub mod steps {
         "reading the migrations' text",
     );
     pub const MIGRATE: Step = Step::new("own-database-migrate", "applying migrations");
+    pub const PASSWORDS_REPLACED: Step = Step::new(
+        "own-database-passwords-replaced",
+        "replacing the own database's role passwords",
+    );
 }
 
 impl Problem {
@@ -445,6 +474,8 @@ impl Problem {
             Self::Failed { .. } => "a migration failed",
             Self::Refused { .. } => "a migration was refused",
             Self::Unavailable { step, .. } => step.words,
+            Self::NotServed => "the own database is not served",
+            Self::NoSecretKey => "a first Version without the installation's key",
         }
     }
 
@@ -599,6 +630,64 @@ impl Known {
     }
 }
 
+/// A ready own database that is not served now, and why.
+#[derive(Debug)]
+struct Unusable {
+    /// `n`: the Application's id.
+    number: i64,
+    /// `no-secret-key`, `does-not-open` or `not-sealed` (blackbox/CONTRACT.md,
+    /// "Resources and Grants in full: At start").
+    problem: &'static str,
+    /// Held while its passwords are replaced, so that two uses choose once.
+    replacing: tokio::sync::Mutex<()>,
+    /// When a replacement was last tried: at most once in
+    /// [`REPLACEMENT_EVERY`] for one own database (blackbox/CONTRACT.md,
+    /// "Resources and Grants in full: At start"). Held only for a check and
+    /// a write, never across an await.
+    attempted: Mutex<Option<Instant>>,
+    /// When the problem was last written to the program's log: at most once
+    /// a minute for each while it lasts. Held only for a check and a
+    /// write, never across an await.
+    said: Mutex<Option<Instant>>,
+}
+
+impl Unusable {
+    fn new(number: i64, problem: &'static str) -> Self {
+        Self {
+            number,
+            problem,
+            replacing: tokio::sync::Mutex::new(()),
+            attempted: Mutex::new(None),
+            said: Mutex::new(None),
+        }
+    }
+
+    /// Writes the `own-database-unusable` record now, unless one was
+    /// written less than a minute ago; `force` writes it whatever was
+    /// written before (the start's record, for each).
+    fn mention(&self, application: &str, force: bool) {
+        {
+            let mut said = self.said.lock().unwrap_or_else(PoisonError::into_inner);
+            if !force && said.is_some_and(|at| at.elapsed() < MENTION_EVERY) {
+                return;
+            }
+            *said = Some(Instant::now());
+        }
+        log::record(
+            "own-database-unusable",
+            serde_json::json!({ "application": application, "problem": self.problem }),
+        );
+    }
+}
+
+/// How often, at most, an own database that is not served is written to the
+/// log again while it lasts.
+const MENTION_EVERY: Duration = Duration::from_secs(60);
+
+/// How often, at most, a replacement of an own database's passwords is
+/// tried, after one failed: at later uses, at most once in this time.
+const REPLACEMENT_EVERY: Duration = Duration::from_secs(10);
+
 /// The names of `n`'s database and roles.
 struct Names {
     database: String,
@@ -672,6 +761,10 @@ type CaptureState = Vec<(u32, String, String)>;
 
 pub struct OwnDatabases {
     platform: Arc<PlatformDatabase>,
+    /// The installation's key, as the keys the role passwords are sealed
+    /// and opened with; `None` when the program was started without it, and
+    /// then no own database is served.
+    vault: Option<Arc<Vault>>,
     /// Where Postgres is: the platform database's server.
     host: String,
     port: u16,
@@ -683,6 +776,16 @@ pub struct OwnDatabases {
     /// per Application. Held only for a lookup or an insert, never across
     /// an await.
     known: RwLock<HashMap<Arc<str>, Arc<Known>>>,
+    /// Every ready own database that is not served now (no key, a password
+    /// that does not open), by Application, with the reason. One whose
+    /// passwords do not open gets new ones at its next use and moves to
+    /// `known`. Held only for a lookup or an insert, never across an await.
+    unusable: RwLock<HashMap<Arc<str>, Arc<Unusable>>>,
+    /// Each Application's forgetting, by name: a number that rises when
+    /// [`OwnDatabases::forget`] lets it go, so that a provisioning or a
+    /// replacement under way does not put it back into `known`. Held only
+    /// for a check or a write, never across an await, and after `known`.
+    forgotten: Mutex<HashMap<Arc<str>, u64>>,
     /// Held only to find, make or let go of a pool, never across an await.
     pools: Mutex<Pools>,
     /// The Versions being sent, each a task of its own so that it runs to
@@ -702,12 +805,18 @@ pub struct OwnDatabases {
 }
 
 impl OwnDatabases {
-    /// Reads every ready own database from the platform database, choosing
-    /// a password for the platform's role of each that has none yet (one
-    /// made before ADR 0017). Connects to none of them.
+    /// Reads every ready own database from the platform database. With the
+    /// key, each row's role passwords are opened; a row whose passwords do
+    /// not open, a row still in clear (which the sealing at start did not
+    /// reach), and every row when there is no key, is held as not served
+    /// (`does-not-open`, `not-sealed`, `no-secret-key`) and written to the
+    /// log once. A row with no platform password (one made before ADR 0017)
+    /// gets one, sealed, now; what the row holds is what is served. Connects
+    /// to none of them.
     pub async fn load(
         platform: Arc<PlatformDatabase>,
         address: &DatabaseAddress,
+        vault: Option<Arc<Vault>>,
     ) -> Result<Self, DbError> {
         let rows = platform
             .pool()
@@ -724,32 +833,55 @@ impl OwnDatabases {
             })
             .await?;
         let mut known = HashMap::with_capacity(rows.len());
+        let mut unusable: HashMap<Arc<str>, Arc<Unusable>> = HashMap::new();
         for row in &rows {
             let name: &str = row.try_get(0).map_err(DbError::from)?;
             let number: i64 = row.try_get(1).map_err(DbError::from)?;
-            let platform_password =
-                match row.try_get::<_, Option<String>>(2).map_err(DbError::from)? {
-                    Some(password) => Secret(password),
-                    None => Self::choose_platform_password(&platform, number).await?,
-                };
-            known.insert(
-                Arc::from(name),
-                Arc::new(Known::new(
-                    number,
-                    platform_password,
-                    Secret(row.try_get(3).map_err(DbError::from)?),
-                )),
-            );
+            let stored_platform: Option<String> = row.try_get(2).map_err(DbError::from)?;
+            let stored_runtime: Option<String> = row.try_get(3).map_err(DbError::from)?;
+            let opened = match &vault {
+                None => Opened::NoKey,
+                Some(vault) => {
+                    Self::open_passwords(
+                        &platform,
+                        vault,
+                        number,
+                        stored_platform.as_deref(),
+                        stored_runtime.as_deref(),
+                    )
+                    .await?
+                }
+            };
+            match opened {
+                Opened::Values(platform_password, runtime_password) => {
+                    known.insert(
+                        Arc::from(name),
+                        Arc::new(Known::new(number, platform_password, runtime_password)),
+                    );
+                }
+                Opened::NoKey => {
+                    unusable.insert(Arc::from(name), unusable_of(name, number, "no-secret-key"));
+                }
+                Opened::Clear => {
+                    unusable.insert(Arc::from(name), unusable_of(name, number, "not-sealed"));
+                }
+                Opened::DoesNotOpen => {
+                    unusable.insert(Arc::from(name), unusable_of(name, number, "does-not-open"));
+                }
+            }
         }
         Ok(Self {
             host: address.host().to_owned(),
             port: address.port(),
             prefix: address.database().to_owned(),
+            vault,
             limits: executor::Limits {
                 size: RUNTIME_POOL_SIZE,
                 ..executor::Limits::default()
             },
             known: RwLock::new(known),
+            unusable: RwLock::new(unusable),
+            forgotten: Mutex::new(HashMap::new()),
             pools: Mutex::new(Pools {
                 held: HashMap::with_capacity(OWN_POOLS_HELD),
                 clock: 0,
@@ -765,30 +897,128 @@ impl OwnDatabases {
         })
     }
 
-    /// Stores a password for the platform's role of the own database `n`
-    /// unless one is stored, and answers the one stored.
-    async fn choose_platform_password(
+    /// The two role passwords as the row stores them, opened; a platform
+    /// password that is not stored yet (a row from before ADR 0017) is
+    /// chosen and sealed now, and what the row then holds is what is
+    /// served (another program may have filled it meanwhile).
+    async fn open_passwords(
         platform: &PlatformDatabase,
+        vault: &Vault,
         number: i64,
-    ) -> Result<Secret, DbError> {
-        let fresh = Secret::generate();
-        platform
-            .pool()
-            .run(async |client: &mut Client| {
-                client
-                    .query_one(
-                        "UPDATE own_databases SET platform_password = coalesce(platform_password, $2)
-                         WHERE application_id = $1 RETURNING platform_password",
-                        &[&number, &fresh.0],
-                    )
-                    .await
-                    .and_then(|row| row.try_get(0))
-                    .map(Secret)
-                    .map_err(DbError::from)
-            })
-            .await
+        stored_platform: Option<&str>,
+        stored_runtime: Option<&str>,
+    ) -> Result<Opened, DbError> {
+        // The clear form of before, which the sealing at start did not
+        // reach: not served until a later start seals it.
+        let Some(stored_runtime) = stored_runtime else {
+            return Ok(Opened::Clear);
+        };
+        if !is_sealed_own_password(stored_runtime) {
+            return Ok(Opened::Clear);
+        }
+        let platform_password = match stored_platform {
+            Some(stored) => {
+                if !is_sealed_own_password(stored) {
+                    return Ok(Opened::Clear);
+                }
+                match open_own_password(vault, number, WhichPassword::Platform, stored) {
+                    Some(password) => Secret(password),
+                    None => return Ok(Opened::DoesNotOpen),
+                }
+            }
+            None => {
+                let fresh = Secret::generate();
+                let sealed =
+                    seal_own_password(vault, number, WhichPassword::Platform, &fresh.0)
+                        .ok_or_else(|| {
+                            DbError::unexpected(
+                                "sealing an own database's password: the operating system gave no randomness",
+                            )
+                        })?;
+                // Stored under its own statement, and the value that is
+                // served is what the row holds afterwards: a row another
+                // program filled meanwhile is not overwritten.
+                let updated: Option<String> = platform
+                    .pool()
+                    .run(async |client: &mut Client| {
+                        let row = client
+                            .query_opt(
+                                "UPDATE own_databases SET platform_password = $2
+                                 WHERE application_id = $1 AND platform_password IS NULL
+                                 RETURNING platform_password",
+                                &[&number, &sealed],
+                            )
+                            .await
+                            .map_err(DbError::from)?;
+                        match row {
+                            Some(row) => row.try_get(0).map(Some).map_err(DbError::from),
+                            None => Ok(None),
+                        }
+                    })
+                    .await?;
+                let stored = match updated {
+                    Some(stored) => stored,
+                    None => platform
+                        .pool()
+                        .run(async |client: &mut Client| {
+                            let row = client
+                                .query_opt(
+                                    "SELECT platform_password FROM own_databases
+                                          WHERE application_id = $1",
+                                    &[&number],
+                                )
+                                .await
+                                .map_err(DbError::from)?;
+                            match row {
+                                Some(row) => {
+                                    row.try_get::<_, Option<String>>(0).map_err(DbError::from)
+                                }
+                                None => Ok(None),
+                            }
+                        })
+                        .await?
+                        .unwrap_or_default(),
+                };
+                if !is_sealed_own_password(&stored) {
+                    return Ok(Opened::Clear);
+                }
+                match open_own_password(vault, number, WhichPassword::Platform, &stored) {
+                    Some(password) => Secret(password),
+                    None => return Ok(Opened::DoesNotOpen),
+                }
+            }
+        };
+        let runtime = match open_own_password(vault, number, WhichPassword::Runtime, stored_runtime)
+        {
+            Some(password) => Secret(password),
+            None => return Ok(Opened::DoesNotOpen),
+        };
+        Ok(Opened::Values(platform_password, runtime))
     }
+}
 
+/// What opening an own database's stored passwords came to.
+enum Opened {
+    /// Both open; the own database is served.
+    Values(Secret, Secret),
+    /// No key was given: not served, and no value opened.
+    NoKey,
+    /// A password is still in the clear form of before: the sealing at
+    /// start did not reach the row, which is not served until it does.
+    Clear,
+    /// Sealed, and does not open: another key, or a value moved from
+    /// another Application's row.
+    DoesNotOpen,
+}
+
+/// An own database held as not served, its record written at start.
+fn unusable_of(name: &str, number: i64, problem: &'static str) -> Arc<Unusable> {
+    let held = Arc::new(Unusable::new(number, problem));
+    held.mention(name, true);
+    held
+}
+
+impl OwnDatabases {
     /// Before the program serves: brings every ready own database to
     /// [`FORM`] and closes its migration role (the program may have been
     /// stopped while one was open). One that cannot be is logged and left
@@ -881,6 +1111,12 @@ impl OwnDatabases {
     /// Makes sure the own database of the Application `name`, numbered
     /// `number`, exists, and applies the migrations of `list` it has not
     /// had, all or none, as sent by the Contributor `sender`.
+    ///
+    /// A first Version without the key is [`Problem::NoSecretKey`] and is
+    /// not kept. A Version sent to an own database that is not served, with
+    /// or without migrations, is [`Problem::NotServed`] and is not recorded;
+    /// with `does-not-open`, the Version is a use that replaces the
+    /// passwords first.
     pub async fn prepare(
         &self,
         number: i64,
@@ -890,7 +1126,10 @@ impl OwnDatabases {
     ) -> Result<(), Problem> {
         let known = match self.known(name) {
             Some((_, known)) => known,
-            None => self.provision(number, name).await?,
+            None => match self.replace_at_use(name).await? {
+                Some((_, known)) => known,
+                None => self.provision(number, name).await?,
+            },
         };
         self.migrate(&known, name, sender, list).await
     }
@@ -906,20 +1145,9 @@ impl OwnDatabases {
     /// (which stay, by their names, and get new passwords), its database,
     /// the platform's schema and keys. Answers its number when it had one.
     pub async fn forget(&self, application: &str) -> Result<Option<i64>, DbError> {
-        let removed = self
-            .known
-            .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(application);
-        self.pools
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .held
-            .remove(application);
-        let Some(known) = removed else {
+        let Some(number) = self.let_go(application) else {
             return Ok(None);
         };
-        let number = known.number;
         self.platform
             .pool()
             .run(async |client: &mut Client| {
@@ -936,7 +1164,45 @@ impl OwnDatabases {
                 transaction.commit().await.map_err(DbError::from)
             })
             .await?;
+        // Once more, now that the rows are gone: a provisioning that began
+        // between the first letting go and the deletion read the rows that
+        // were still there, and what it put back is not stored any more.
+        self.let_go(application);
         Ok(Some(number))
+    }
+
+    /// Lets go of what this program holds of `application`'s own database
+    /// (what it knows, what it holds as not served, its pool) and answers
+    /// its number when it held one. Under the known map's lock, in the
+    /// order every writer takes them (`known`, `unusable`, `forgotten`),
+    /// and raising the Application's forgetting before either map changes:
+    /// a provisioning or a replacement under way either put the own
+    /// database back before this (and it is removed here) or sees the new
+    /// number and does not.
+    fn let_go(&self, application: &str) -> Option<i64> {
+        let number = {
+            let mut all = self.known.write().unwrap_or_else(PoisonError::into_inner);
+            let held = self
+                .unusable
+                .write()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(application);
+            let mut forgotten = self
+                .forgotten
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let generation = forgotten.entry(Arc::from(application)).or_insert(0);
+            *generation = generation.saturating_add(1);
+            all.remove(application)
+                .map(|known| known.number)
+                .or_else(|| held.map(|held| held.number))
+        };
+        self.pools
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .held
+            .remove(application);
+        number
     }
 
     /// The name of the own database of the Application numbered `number`.
@@ -952,10 +1218,11 @@ impl OwnDatabases {
         self.ask_shipment(application, false);
     }
 
-    /// Whether `application` has an own database this program knows: one
-    /// whose outbox [`OwnDatabases::ship_and_wait`] can ship.
+    /// Whether `application` has a ready own database this program knows:
+    /// one whose outbox [`OwnDatabases::ship_and_wait`] can ship, or one it
+    /// holds as not served (no key, a password that does not open).
     pub fn has_own_database(&self, application: &str) -> bool {
-        self.known(application).is_some()
+        self.known(application).is_some() || self.unusable(application).is_some()
     }
 
     /// Asks for a shipment of `application`'s outbox and waits for it:
@@ -1048,8 +1315,12 @@ impl OwnDatabases {
         application: &str,
         write: bool,
     ) -> Result<Option<Arc<executor::Pool>>, Problem> {
-        let Some((key, known)) = self.known(application) else {
-            return Ok(None);
+        let (key, known) = match self.known(application) {
+            Some(found) => found,
+            None => match self.replace_at_use(application).await? {
+                Some(found) => found,
+                None => return Ok(None),
+            },
         };
         self.ensure_form(application, &known).await?;
         let identity = self.identity_key(&known).await?;
@@ -1426,6 +1697,170 @@ impl OwnDatabases {
             .map(|(name, known)| (Arc::clone(name), Arc::clone(known)))
     }
 
+    fn unusable(&self, application: &str) -> Option<(Arc<str>, Arc<Unusable>)> {
+        self.unusable
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_key_value(application)
+            .map(|(name, held)| (Arc::clone(name), Arc::clone(held)))
+    }
+
+    /// How many times `forget` has let `application` go: a provisioning or a
+    /// replacement under way compares it before putting the own database
+    /// back into memory.
+    fn generation(&self, application: &str) -> u64 {
+        self.forgotten
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(application)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// An own database that is not served, at its next use — a request that
+    /// uses it, or a Version sent to it: without the key it stays so
+    /// (`unavailable`, nothing sent, nothing recorded); with a password that
+    /// does not open, the platform chooses new passwords, sets them on the
+    /// roles as the platform's own role (within [`SETUP_TIMEOUT`]), seals
+    /// them for the Application's row, keeps them, writes
+    /// `own-database-passwords-replaced`, and serves it. A replacement that
+    /// fails is tried again at a later use, at most once in
+    /// [`REPLACEMENT_EVERY`]; the use that found it failing is
+    /// `unavailable`. `None` when `application` has no own database held as
+    /// not served, or once another use has replaced its passwords (then the
+    /// known one).
+    async fn replace_at_use(
+        &self,
+        application: &str,
+    ) -> Result<Option<(Arc<str>, Arc<Known>)>, Problem> {
+        let Some((name, held)) = self.unusable(application) else {
+            return Ok(self.known(application));
+        };
+        // The forgetting `forget` last did: a replacement began before it
+        // must not put the own database back.
+        let generation = self.generation(application);
+        held.mention(application, false);
+        if held.problem != "does-not-open" {
+            return Err(Problem::NotServed);
+        }
+        let Some(vault) = &self.vault else {
+            return Err(Problem::NotServed);
+        };
+        // One at a time: two operations that meet it together choose once.
+        let _turn = tokio::time::timeout(SETUP_TIMEOUT, held.replacing.lock())
+            .await
+            .map_err(|_| Problem::timed_out(steps::TURN, SETUP_TIMEOUT))?;
+        if let Some(known) = self.known(application) {
+            return Ok(Some(known));
+        }
+        if self.generation(application) != generation {
+            return Err(Problem::NotServed);
+        }
+        // At most one attempt in `REPLACEMENT_EVERY`, whatever became of it:
+        // a failed replacement is tried again at a later use, never on every
+        // use.
+        {
+            let mut attempted = held
+                .attempted
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if attempted.is_some_and(|at| at.elapsed() < REPLACEMENT_EVERY) {
+                return Err(Problem::NotServed);
+            }
+            *attempted = Some(Instant::now());
+        }
+        let platform_password = Secret::generate();
+        let runtime_password = Secret::generate();
+        let names = self.names(held.number)?;
+        tokio::time::timeout(
+            SETUP_TIMEOUT,
+            self.set_passwords(&names, &platform_password, &runtime_password),
+        )
+        .await
+        .map_err(|_| Problem::timed_out(steps::PASSWORDS_REPLACED, SETUP_TIMEOUT))??;
+        let sealed_platform = seal_own_password(
+            vault,
+            held.number,
+            WhichPassword::Platform,
+            &platform_password.0,
+        )
+        .ok_or_else(|| Problem::internal(steps::PASSWORDS_REPLACED))?;
+        let sealed_runtime = seal_own_password(
+            vault,
+            held.number,
+            WhichPassword::Runtime,
+            &runtime_password.0,
+        )
+        .ok_or_else(|| Problem::internal(steps::PASSWORDS_REPLACED))?;
+        self.platform
+            .pool()
+            .run(async |client: &mut Client| {
+                client
+                    .execute(
+                        "UPDATE own_databases
+                            SET platform_password = $2, runtime_password = $3
+                          WHERE application_id = $1",
+                        &[&held.number, &sealed_platform, &sealed_runtime],
+                    )
+                    .await
+                    .map_err(DbError::from)
+            })
+            .await
+            .map_err(|e| Problem::unavailable(steps::PASSWORDS_REPLACED, &e))?;
+        log::record(
+            "own-database-passwords-replaced",
+            serde_json::json!({ "application": application, "reason": held.problem }),
+        );
+        let known = Arc::new(Known::new(held.number, platform_password, runtime_password));
+        // Under the known map's lock, as `forget` takes it: an own database
+        // it let go is not put back.
+        let mut all = self.known.write().unwrap_or_else(PoisonError::into_inner);
+        if self.generation(application) != generation {
+            return Err(Problem::NotServed);
+        }
+        self.unusable
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(application);
+        let known = Arc::clone(all.entry(name).or_insert(known));
+        Ok(Some((Arc::from(application), known)))
+    }
+
+    /// Sets the two logging-in role passwords on the roles, as the
+    /// platform's own role: the SCRAM verifiers are derived in the program
+    /// and Postgres is sent those, never the passwords. The roles are not
+    /// created, and nothing of the database or its data is touched.
+    async fn set_passwords(
+        &self,
+        names: &Names,
+        platform_password: &Secret,
+        runtime_password: &Secret,
+    ) -> Result<(), Problem> {
+        let [platform_verifier, runtime_verifier] =
+            verifiers([platform_password, runtime_password]).await?;
+        self.platform
+            .pool()
+            .run(async |client: &mut Client| {
+                let transaction = client.transaction().await.map_err(DbError::from)?;
+                for (role, verifier) in [
+                    (&names.platform, &platform_verifier),
+                    (&names.runtime, &runtime_verifier),
+                ] {
+                    transaction
+                        .batch_execute(&format!(
+                            "ALTER ROLE {} LOGIN PASSWORD {}",
+                            quote_identifier(role),
+                            literal(verifier)
+                        ))
+                        .await
+                        .map_err(DbError::from)?;
+                }
+                transaction.commit().await.map_err(DbError::from)
+            })
+            .await
+            .map_err(|e| Problem::unavailable(steps::PASSWORDS_REPLACED, &e))
+    }
+
     fn names(&self, number: i64) -> Result<Names, Problem> {
         let database = format!("{}_app_{number}", self.prefix);
         let names = Names {
@@ -1445,6 +1880,9 @@ impl OwnDatabases {
     /// Creates the own database of `name` and its roles, or finishes what
     /// an earlier attempt left half done.
     async fn provision(&self, number: i64, name: &str) -> Result<Arc<Known>, Problem> {
+        // The forgetting `forget` last did: a provisioning begun before one
+        // must not put the own database back, its rows having been deleted.
+        let generation = self.generation(name);
         let names = self.names(number)?;
         let (known, ready) = self.passwords(number).await?;
         if !ready {
@@ -1473,15 +1911,65 @@ impl OwnDatabases {
             );
         }
         let known = Arc::new(known);
+        // Under the known map's lock, as `forget` takes it: what it let go
+        // while this was under way is not put back, and this use is given
+        // what memory holds (or what it made, for this answer only).
         let mut all = self.known.write().unwrap_or_else(PoisonError::into_inner);
+        if self.generation(name) != generation {
+            return Ok(match all.get(name) {
+                Some(known) => Arc::clone(known),
+                None => known,
+            });
+        }
         let known = all.entry(Arc::from(name)).or_insert(known);
         Ok(Arc::clone(known))
     }
 
-    /// The Application's passwords as stored, storing new ones first if it
-    /// has none; and whether its own database is ready.
+    /// The Application's passwords as stored, choosing and storing new ones
+    /// first if it has none or they do not open (sealed for its row, before
+    /// any statement carries them); and whether its own database is ready.
     async fn passwords(&self, number: i64) -> Result<(Known, bool), Problem> {
+        // Without the key no own database is made. A first Version, which
+        // makes one with or without migrations, is `409` `no-secret-key`
+        // and nothing of it is kept; a Version to an own database that
+        // exists but is not served is `503` `unavailable`
+        // (blackbox/CONTRACT.md, "Resources and Grants in full: At start").
+        let Some(vault) = self.vault.as_ref() else {
+            let exists = self
+                .platform
+                .pool()
+                .run(async |client: &mut Client| {
+                    client
+                        .query_opt(
+                            "SELECT 1 FROM own_databases WHERE application_id = $1",
+                            &[&number],
+                        )
+                        .await
+                        .map(|row| row.is_some())
+                        .map_err(DbError::from)
+                })
+                .await
+                .map_err(|e| Problem::unavailable(steps::PASSWORDS, &e))?;
+            return Err(if exists {
+                Problem::NotServed
+            } else {
+                Problem::NoSecretKey
+            });
+        };
         let fresh = (Secret::generate(), Secret::generate());
+        let seal = |which: WhichPassword, password: &Secret| {
+            seal_own_password(vault, number, which, &password.0)
+                .ok_or_else(|| Problem::internal(steps::PASSWORDS))
+        };
+        let (fresh_platform, fresh_runtime) = (
+            seal(WhichPassword::Platform, &fresh.0)?,
+            seal(WhichPassword::Runtime, &fresh.1)?,
+        );
+        let fresh_again = (Secret::generate(), Secret::generate());
+        let (again_platform, again_runtime) = (
+            seal(WhichPassword::Platform, &fresh_again.0)?,
+            seal(WhichPassword::Runtime, &fresh_again.1)?,
+        );
         self.platform
             .pool()
             .run(async |client: &mut Client| {
@@ -1489,7 +1977,7 @@ impl OwnDatabases {
                     .execute(
                         "INSERT INTO own_databases (application_id, platform_password, runtime_password, form)
                          VALUES ($1, $2, $3, $4) ON CONFLICT (application_id) DO NOTHING",
-                        &[&number, &fresh.0.0, &fresh.1.0, &FORM],
+                        &[&number, &fresh_platform, &fresh_runtime, &FORM],
                     )
                     .await
                     .map_err(DbError::from)?;
@@ -1498,7 +1986,7 @@ impl OwnDatabases {
                     .execute(
                         "UPDATE own_databases SET platform_password = $2
                          WHERE application_id = $1 AND platform_password IS NULL",
-                        &[&number, &fresh.0.0],
+                        &[&number, &fresh_platform],
                     )
                     .await
                     .map_err(DbError::from)?;
@@ -1512,12 +2000,34 @@ impl OwnDatabases {
                     )
                     .await
                     .map_err(DbError::from)?;
-                let known = Known::new(
-                    number,
-                    Secret(row.try_get(0).map_err(DbError::from)?),
-                    Secret(row.try_get(1).map_err(DbError::from)?),
-                );
-                Ok((known, row.try_get(2).map_err(DbError::from)?))
+                let stored_platform: String = row.try_get(0).map_err(DbError::from)?;
+                let stored_runtime: String = row.try_get(1).map_err(DbError::from)?;
+                let opened = open_own_password(vault, number, WhichPassword::Platform, &stored_platform)
+                    .zip(open_own_password(vault, number, WhichPassword::Runtime, &stored_runtime));
+                let (platform_password, runtime_password) = match opened {
+                    Some((platform_password, runtime_password)) => {
+                        (Secret(platform_password), Secret(runtime_password))
+                    }
+                    // Stored under another key, or in the clear form of
+                    // before: this program chooses new ones, and the roles
+                    // are given them next.
+                    None => {
+                        client
+                            .execute(
+                                "UPDATE own_databases
+                                    SET platform_password = $2, runtime_password = $3
+                                  WHERE application_id = $1",
+                                &[&number, &again_platform, &again_runtime],
+                            )
+                            .await
+                            .map_err(DbError::from)?;
+                        (fresh_again.0, fresh_again.1)
+                    }
+                };
+                Ok((
+                    Known::new(number, platform_password, runtime_password),
+                    row.try_get(2).map_err(DbError::from)?,
+                ))
             })
             .await
             .map_err(|e| Problem::unavailable(steps::PASSWORDS, &e))

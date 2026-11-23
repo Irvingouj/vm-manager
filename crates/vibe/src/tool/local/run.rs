@@ -374,6 +374,20 @@ impl Live {
                     ),
                 )
             })?;
+        // The local run's own installation key: `.vibe/local/secret-key`,
+        // made at the first run, never read from the environment
+        // (blackbox/CONTRACT.md, "Resources and Grants in full: At start").
+        let key = pg
+            .local
+            .secret_key()
+            .map_err(|failed| failed.ending(who.command))?;
+        let vault = Arc::new(crate::credentials::Vault::new(&key).map_err(|problem| {
+            Ending::new(
+                1,
+                "failed",
+                format!("{} could not make its keys: {problem}", who.command),
+            )
+        })?);
         let Platform {
             database,
             own,
@@ -407,6 +421,7 @@ impl Live {
                 bare: false,
                 local: true,
             },
+            Some(vault),
         )
         .await
         .map_err(|error| open_failed(error, who.command))?;
@@ -1132,9 +1147,11 @@ async fn local_version(
         Sent::OwnDatabaseUnavailable { step, cause } => {
             Err(own_database_unavailable(step, cause, name))
         }
-        Sent::Busy | Sent::NoSuchApplication | Sent::NotAContributor => {
-            Err(tool_failed(name, "could not make the local Version", who))
-        }
+        Sent::Busy
+        | Sent::NoSuchApplication
+        | Sent::NotAContributor
+        | Sent::OwnDatabaseNotServed
+        | Sent::NoSecretKey => Err(tool_failed(name, "could not make the local Version", who)),
     }
 }
 

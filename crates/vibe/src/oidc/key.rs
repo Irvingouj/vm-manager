@@ -3,11 +3,18 @@
 //! environment of `vibe serve` only. Every key that seals something is made
 //! from it, one for each use (crate::oidc::seal).
 //!
+//! The local run has a key of its own, made at its first run and kept in
+//! `.vibe/local/secret-key` (crate::tool::local; blackbox/CONTRACT.md,
+//! "Resources and Grants in full: At start"): never read from the
+//! environment, never printed. It seals the local platform database's
+//! Resources and own databases as an installation's does.
+//!
 //! [`InstallationKey`] has no `Debug` and no `Display`, and no message
 //! about the variable ever repeats its value.
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
+use ring::rand::{SecureRandom, SystemRandom};
 
 /// The variable that holds the key.
 pub const VARIABLE: &str = "VIBE_SECRET_KEY";
@@ -32,12 +39,27 @@ impl InstallationKey {
             )
         };
         let value = value.into_string().map_err(|_| wrong())?;
-        let bytes = STANDARD.decode(value.trim()).map_err(|_| wrong())?;
-        let key = <[u8; KEY_BYTES]>::try_from(bytes.as_slice()).map_err(|_| wrong())?;
-        Ok(Some(Self(key)))
+        Ok(Some(Self::from_base64(&value, wrong)?))
     }
 
-    /// The bytes, where a key for one use is made from them.
+    /// The key of this base64 text, whose problem `wrong` says in words
+    /// that never repeat the text: 32 bytes in base64, and nothing else.
+    pub fn from_base64(text: &str, wrong: impl Fn() -> String) -> Result<Self, String> {
+        let bytes = STANDARD.decode(text.trim()).map_err(|_| wrong())?;
+        let key = <[u8; KEY_BYTES]>::try_from(bytes.as_slice()).map_err(|_| wrong())?;
+        Ok(Self(key))
+    }
+
+    /// 32 bytes from the operating system's random source; `None` when it
+    /// gives no randomness.
+    pub fn random() -> Option<Self> {
+        let mut bytes = [0_u8; KEY_BYTES];
+        SystemRandom::new().fill(&mut bytes).ok()?;
+        Some(Self(bytes))
+    }
+
+    /// The bytes, where a key for one use is made from them, and where the
+    /// local run writes its key to its file.
     pub fn expose(&self) -> &[u8; KEY_BYTES] {
         &self.0
     }

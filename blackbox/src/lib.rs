@@ -134,6 +134,12 @@
 //!   the local project whose Application reads and writes a pulled Storage
 //!   Resource.
 //!
+//! - [`sealed`] is what the tests of Resources' logins and own databases'
+//!   passwords sealed under the installation's key share: a program and a
+//!   shared database, a dump of the platform database searched for what it
+//!   must not hold, the stored values read and written from outside, and a
+//!   restart with another key or none.
+//!
 //! Every wait has a timeout, so a failing test fails within seconds and
 //! never hangs. Each test starts its own program on its own port, so tests
 //! run in parallel.
@@ -191,6 +197,7 @@ pub mod release;
 pub mod scenario;
 pub mod sdk;
 pub mod sdk_history;
+pub mod sealed;
 pub mod server_log;
 pub mod sessions;
 pub mod shared_database;

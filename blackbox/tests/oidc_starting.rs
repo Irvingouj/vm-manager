@@ -125,7 +125,7 @@ fn the_oidc_options_of_serve_are_gone_and_each_is_exit_code_2() {
 #[test]
 fn the_client_secret_in_the_environment_of_serve_is_not_looked_at() {
     for options in [
-        VmOptions::new().stand_in_sign_in(),
+        VmOptions::new().stand_in_sign_in().without_secret_key(),
         VmOptions::new().env("VIBE_SECRET_KEY", SecretKey::fresh().expose()),
     ] {
         let vm = Vm::start(&options.env("VIBE_OIDC_CLIENT_SECRET", SECRET));
@@ -279,7 +279,7 @@ fn a_key_of_32_random_bytes_in_base64_is_taken() {
 
 #[test]
 fn without_a_key_the_program_serves_all_the_same() {
-    let vm = Vm::start(&VmOptions::new());
+    let vm = Vm::start(&VmOptions::new().without_secret_key());
     assert_eq!(vm.listening()["sign_in"], "none", "{}", vm.listening());
     let answer = installation_of(&vm);
     assert_eq!(answer.status, 200, "{}", answer.describe());

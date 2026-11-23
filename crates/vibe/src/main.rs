@@ -60,6 +60,12 @@ enum Command {
     /// on api.<domain>. The platform database is named by VIBE_DATABASE_URL,
     /// the installation's key is VIBE_SECRET_KEY.
     ///
+    /// The installation's key, VIBE_SECRET_KEY (32 random bytes in base64,
+    /// as `openssl rand -base64 32` makes them), seals the logins of
+    /// database Resources and the passwords of Applications' own databases;
+    /// without it the program serves all the same, and no database Resource
+    /// and no own database is served.
+    ///
     /// To serve HTTPS itself, with no reverse proxy before it, set both
     /// VIBE_TLS_CERT_FILE, the PEM file of the certificate for *.<domain>
     /// and its chain, and VIBE_TLS_KEY_FILE, the PEM file of its private key
@@ -347,6 +353,12 @@ fn run(serve: &Serve) -> Result<(), String> {
         }
     };
     let key = InstallationKey::from_environment()?;
+    // The keys that seal Resources' connections and own databases'
+    // passwords, made from the installation's key for their uses alone.
+    let vault = key
+        .as_ref()
+        .map(|key| vibe::credentials::Vault::new(key).map(Arc::new))
+        .transpose()?;
     let address = database_address()?;
     let sign_in: Box<dyn SignIn> = if serve.stand_in_sign_in {
         Box::new(StandInSignIn)
@@ -390,6 +402,7 @@ fn run(serve: &Serve) -> Result<(), String> {
                 bare: true,
                 local: false,
             },
+            vault,
         )
         .await.map_err(|error| {
             if let Some(found) = &error.unsupported_version {
