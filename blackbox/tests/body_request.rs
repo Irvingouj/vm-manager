@@ -39,7 +39,7 @@ use blackbox::body::{BodyEnd, CHUNK, Framing, MIB, REQUEST_BODY_BOUND, Raw, patt
 use blackbox::dev::Dev;
 use blackbox::local::{Local, OUTSIDER, local_project};
 use blackbox::logs::{page, wait_for_entry};
-use blackbox::records::{is_from_application_code, request_of};
+use blackbox::records::is_from_application_code;
 use blackbox::{INSTALLER, Vm, fixture_bundle};
 use serde_json::Value;
 
@@ -65,11 +65,14 @@ fn vm() -> Vm {
 }
 
 /// Every record of request `id` that Application code made (a `printed`, an
-/// `uncaught` or a `host-call`).
+/// `uncaught` or a `host-call`). It waits for the request's `request`
+/// record, which is written last for its request ("What the log records per
+/// request"), so every record of the code is there when it returns.
 fn code_records(vm: &Vm, id: &str) -> Vec<Value> {
-    vm.records()
+    vm.records_of_id(id)
+        .all
         .into_iter()
-        .filter(|r| request_of(r) == Some(id) && is_from_application_code(r))
+        .filter(is_from_application_code)
         .collect()
 }
 
@@ -216,8 +219,9 @@ fn a_stated_content_length_over_the_bound_is_413_before_the_code_and_has_no_log_
         "expected the platform's 413 answer framed whole"
     );
 
-    // It was answered before the code ran: no record of Application code,
-    // and no entry in the Application's logs.
+    // It was answered before the code ran: no record of Application code
+    // (read once the request's own `request` record is there, which is
+    // written last), and no entry in the Application's logs.
     let code = code_records(&vm, &id);
     assert!(
         code.is_empty(),
@@ -669,11 +673,6 @@ fn the_same_bound_of_a_requests_body_holds_in_the_local_run_under_vibe_dev() {
         .declare_length(over_bound)
         .send();
     over.expect_status(413);
-    assert!(
-        dev.events("request").is_empty(),
-        "expected no `request` line for a request answered before the code, got {:?}",
-        dev.events("request")
-    );
 
     // Exactly the bound: taken, and answered by the code without the body.
     let exact = dev
@@ -688,12 +687,30 @@ fn the_same_bound_of_a_requests_body_holds_in_the_local_run_under_vibe_dev() {
         serde_json::json!(OUTSIDER),
         "expected the code's own answer for a body of exactly the bound"
     );
-    assert!(
-        dev.events("request")
-            .iter()
-            .any(|line| line["request_id"] == serde_json::json!(exact.request_id())),
-        "expected a `request` line for the request the code was given\n{}",
-        dev.stdout()
+
+    // `vibe dev` writes the line of a request when it ends, not before its
+    // answer: wait for the line of the second request (up to 10 seconds).
+    // Lines come in order, so the first request's line, had there been one,
+    // is there by then: the second's is the only one.
+    let exact_id = serde_json::json!(exact.request_id());
+    let began = Instant::now();
+    while !dev
+        .events("request")
+        .iter()
+        .any(|line| line["request_id"] == exact_id)
+    {
+        assert!(
+            began.elapsed() < Duration::from_secs(10),
+            "expected a `request` line for the request the code was given within 10 s\n{}",
+            dev.stdout()
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+    let lines = dev.events("request");
+    assert_eq!(
+        lines.len(),
+        1,
+        "expected a `request` line for the request the code was given and none for the one answered before the code, got {lines:?}"
     );
 
     dev.stop("INT").expect_code(0);
