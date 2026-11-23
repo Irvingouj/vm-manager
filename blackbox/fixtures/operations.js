@@ -36,10 +36,29 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 const message = (e) => String((e && e.message) || e);
 
+// A Storage get answers `ok.body`, a ReadableStream fed by the host: it is
+// no JSON. It is left out of the answer (which says `bodyIsStream` beside
+// `ok`) and cancelled at once, so that its place among the files open at once (16 for one request) is free
+// again for the next call of this request.
+async function withoutStream(answer) {
+  const ok = answer && answer.ok;
+  if (ok && typeof ok === "object" && ok.body && typeof ok.body === "object") {
+    const isStream = typeof ReadableStream !== "undefined" && ok.body instanceof ReadableStream;
+    try {
+      await ok.body.cancel();
+    } catch (e) {
+      // A body that cannot be cancelled is still not JSON.
+    }
+    const { body, ...metadata } = ok;
+    return { ...answer, ok: metadata, bodyIsStream: isStream };
+  }
+  return answer;
+}
+
 function call(c) {
   try {
     return Promise.resolve(env.VM.invoke(c.operation, c.arguments)).then(
-      (answer) => answer,
+      (answer) => withoutStream(answer),
       (e) => ({ threw: message(e) }),
     );
   } catch (e) {

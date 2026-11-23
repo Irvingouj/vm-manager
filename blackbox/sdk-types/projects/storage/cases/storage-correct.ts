@@ -1,7 +1,9 @@
 // A correct use of Storage compiles with no diagnostics (CONTRACT.md,
 // "Storage: Through the SDK"): the handle of a Resource declared at write
 // is a `Storage<"<name>">`, at read a `ReadOnlyStorage<"<name>">`; every call has the types
-// the contract gives; `Refused` carries the kinds of a mismatch.
+// the contract gives; a file's body is the ReadableStream the host feeds,
+// and the four readers read it to its end, one use each; `Refused` carries
+// the kinds of a mismatch.
 import {
   defineApp,
   OperationFailed,
@@ -24,7 +26,16 @@ function same<A, B>(_proof: Equal<A, B>): void {}
 const declared: StorageDeclaration = { kind: "storage", access: "write" };
 const options: ListOptions = { prefix: "reports/", delimiter: "/", limit: 100, cursor: "c" };
 const putOptions: PutOptions = { contentType: "application/pdf" };
-const bodies: FileBody[] = ["text", new Uint8Array([1, 2]), new ArrayBuffer(2)];
+// The kinds a put takes, `null` (an empty file) among them.
+const bodies: FileBody[] = [
+  "text",
+  new Uint8Array([1, 2]),
+  new ArrayBuffer(2),
+  new DataView(new ArrayBuffer(2)),
+  new Blob(["x"]),
+  new ReadableStream<Uint8Array>(),
+  null,
+];
 
 export default defineApp(manifest, {
   async fetch(request, ctx) {
@@ -62,14 +73,26 @@ export default defineApp(manifest, {
     const file = await archive.get("reports/q3.pdf");
     same<typeof file, StoredFile | null>(true);
     if (file) {
-      same<typeof file.body, Uint8Array<ArrayBuffer>>(true);
-      same<ReturnType<typeof file.text>, string>(true);
+      // The body is a stream the host feeds, never the file whole.
+      same<typeof file.body, ReadableStream<Uint8Array>>(true);
+      same<typeof file.bodyUsed, boolean>(true);
+      same<ReturnType<typeof file.arrayBuffer>, Promise<ArrayBuffer>>(true);
+      same<ReturnType<typeof file.bytes>, Promise<Uint8Array>>(true);
+      same<ReturnType<typeof file.text>, Promise<string>>(true);
+      same<ReturnType<typeof file.json>, Promise<unknown>>(true);
     }
 
-    const written = await files.put("reports/q4.pdf", await request.arrayBuffer(), putOptions);
+    // `request.body` is the DOM's `ReadableStream<Uint8Array> | null`: a
+    // body a put takes as it is, a request with no body being an empty file.
+    const written = await files.put("reports/q4.pdf", request.body, putOptions);
     same<typeof written, FileInfo>(true);
     for (const body of bodies) await files.put("reports/q5.pdf", body);
     await files.put("notes.txt", "a string is written as UTF-8");
+    await files.put("reports/q6.pdf", await request.arrayBuffer());
+    await files.put("reports/q7.pdf", new Uint8Array([1, 2]));
+    await files.put("reports/q8.pdf", new Blob(["x"]));
+    await files.put("reports/q9.pdf", new ReadableStream<Uint8Array>());
+    await files.put("reports/q10.pdf", null);
     const removed = await files.delete("reports/old.pdf");
     same<typeof removed, void>(true);
 

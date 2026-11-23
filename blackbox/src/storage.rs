@@ -10,18 +10,23 @@
 //!   Group, with helpers to register Storage Resources on directories of
 //!   the root, give Grants, install fixture Applications whose Declared
 //!   access names kinds, and call the five operations through the raw
-//!   fixture `fixtures/operations.js`;
-//! - checks on what the operations answer (a file's metadata, `invalid-key`
-//!   with its rule, `not-reachable` with its reason) and on their
-//!   Operation log entries;
+//!   fixture `fixtures/operations.js` or the stream fixtures
+//!   `fixtures/storage-stream-*.js`;
+//! - checks on what the operations answer (a file's metadata, a body read
+//!   as the stream the host feeds, `invalid-key` with its rule,
+//!   `not-reachable` with its reason) and on their Operation log entries;
 //! - what the tests look at on the host's directory themselves: bytes,
 //!   mode, link count, owner, the extended attribute
 //!   `user.vibe.content-type`, the tree of a folder without following a
 //!   link, and a FIFO planted;
+//! - sparse files and their byte-for-byte check, the staging folder's
+//!   sizes, and raw requests (`crate::body::Raw`) for the cases an HTTP
+//!   client would hide: a body held back, a client that reads slowly or
+//!   stops half way;
 //! - stopping the program with `SIGTERM` or `SIGKILL` and starting it
 //!   again against the same platform database and storage root.
 
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::{FileExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -31,6 +36,7 @@ use base64::engine::general_purpose::STANDARD;
 use serde_json::{Map, Value, json};
 
 use crate::api::{Api, SOME_GIT_COMMIT};
+use crate::body::{Framing, Raw};
 use crate::http::{Response, User};
 use crate::program::run_to_exit;
 use crate::scenario::{ADMINISTRATORS, Expected, administrator, assert_entry, lines};
@@ -57,11 +63,27 @@ pub const FILES: &str = "files";
 /// at `read` in [`Storage::ready`].
 pub const VIEWER: &str = "viewer";
 
-/// The body bound: 8 MiB.
-pub const BODY_BOUND: usize = 8 * 1024 * 1024;
+/// The Application (`fixtures/storage-stream-read.js`) that reads a file's
+/// body as the stream the host feeds, installed by [`Storage::ready_streams`].
+pub const STREAM_READ: &str = "stream-read";
 
-/// The bound of a request to an Application: 8 MiB and 64 KiB.
-pub const REQUEST_BODY_BOUND: usize = 8 * 1024 * 1024 + 64 * 1024;
+/// The Application (`fixtures/storage-stream-put.js`) that puts each kind of
+/// body the raw interface takes, installed by [`Storage::ready_streams`].
+pub const STREAM_PUT: &str = "stream-put";
+
+/// The Application (`fixtures/storage-stream-hostile.js`) that opens every
+/// stream it may and writes the largest chunks it can, installed by
+/// [`Storage::ready_streams`].
+pub const STREAM_HOSTILE: &str = "stream-hostile";
+
+/// The file bound: 5 GiB (5,368,709,120 bytes; exactly that is taken).
+pub const FILE_BOUND: u64 = 5 * 1024 * 1024 * 1024;
+
+/// The bound of a chunk the host feeds or takes: 64 KiB.
+pub const CHUNK_BOUND: usize = 64 * 1024;
+
+/// The bound of a request to an Application: 5 GiB and 64 KiB.
+pub const REQUEST_BODY_BOUND: u64 = FILE_BOUND + 64 * 1024;
 
 /// How long a request with Storage operations may take.
 pub const STORAGE_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -89,11 +111,27 @@ pub fn b64(bytes: &[u8]) -> String {
     STANDARD.encode(bytes)
 }
 
-/// The bytes of standard base64 with padding; fails the test otherwise.
-pub fn unb64(text: &str, context: &str) -> Vec<u8> {
-    STANDARD.decode(text).unwrap_or_else(|e| {
-        panic!("{context}: expected standard base64 with padding ({e}), got {text:?}")
-    })
+/// FNV-1a, 32 bits, from the offset basis `0x811c9dc5`: the digest the
+/// stream fixtures (`fixtures/storage-stream-*.js`) compute too, so that a
+/// body read or written may be checked without sending it whole.
+pub fn fnv1a(bytes: &[u8]) -> u32 {
+    let mut hash: u32 = 0x811c_9dc5;
+    for &byte in bytes {
+        hash ^= u32::from(byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    hash
+}
+
+/// `bytes` as lower-case hex, two digits a byte: how a test hands the
+/// stream fixtures bytes that are not UTF-8 (the fixture makes an
+/// `ArrayBuffer` of them itself, so the host sees one of the four kinds).
+pub fn hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
 }
 
 /// A temporary folder of the test's own: `root/` (the storage root, made)
@@ -219,10 +257,12 @@ pub fn delete(resource: &str, key: &str) -> Value {
     )
 }
 
-/// `storage.put` of `bytes` at `key` on `resource`, with this content type
-/// when given.
-pub fn put(resource: &str, key: &str, bytes: &[u8], content_type: Option<&str>) -> Value {
-    let mut args = json!({ "resource": resource, "key": key, "body": b64(bytes) });
+/// `storage.put` of `text` at `key` on `resource`, with this content type
+/// when given. The body is a string, which the host writes as UTF-8; a body
+/// of bytes that are not UTF-8 goes through the fixture `storage-stream-put`
+/// (`Storage::put_hex_ok`).
+pub fn put(resource: &str, key: &str, text: &str, content_type: Option<&str>) -> Value {
+    let mut args = json!({ "resource": resource, "key": key, "body": text });
     if let Some(content_type) = content_type {
         args["content_type"] = json!(content_type);
     }
@@ -278,6 +318,20 @@ impl Storage {
         s.grant(MARKETING, FILE_WRITERS, "write");
         s.install(FILES, "operations.js", &[(MARKETING, "storage", "write")]);
         s.install(VIEWER, "operations.js", &[(MARKETING, "storage", "read")]);
+        s
+    }
+
+    /// [`Storage::ready`] plus the stream fixtures declaring [`MARKETING`]
+    /// at `write`: [`STREAM_READ`], [`STREAM_PUT`] and [`STREAM_HOSTILE`].
+    pub fn ready_streams() -> Self {
+        let s = Self::ready();
+        for (name, file) in [
+            (STREAM_READ, "storage-stream-read.js"),
+            (STREAM_PUT, "storage-stream-put.js"),
+            (STREAM_HOSTILE, "storage-stream-hostile.js"),
+        ] {
+            s.install(name, file, &[(MARKETING, "storage", "write")]);
+        }
         s
     }
 
@@ -425,16 +479,58 @@ impl Storage {
         self.one(&wanda(), FILES, call).1
     }
 
-    /// Puts `bytes` at `key` of [`MARKETING`] as [`wanda`], failing the test
+    /// Puts `text` at `key` of [`MARKETING`] as [`wanda`], failing the test
     /// unless it is `{ ok }`; the metadata answered.
-    pub fn put_ok(&self, key: &str, bytes: &[u8], content_type: Option<&str>) -> Value {
-        let answer = self.as_writer(&put(MARKETING, key, bytes, content_type));
+    pub fn put_ok(&self, key: &str, text: &str, content_type: Option<&str>) -> Value {
+        let answer = self.as_writer(&put(MARKETING, key, text, content_type));
         if !answer["ok"].is_object() {
             self.vm.fail(&format!(
                 "expected the put of {key:?} to be answered {{ ok: <metadata> }}, got {answer}"
             ));
         }
         answer["ok"].clone()
+    }
+
+    /// Puts bytes that are not UTF-8 at `key` of [`MARKETING`] as [`wanda`]
+    /// through [`STREAM_PUT`]'s `/put-buffer` (an `ArrayBuffer` body),
+    /// failing the test unless it is `{ ok }`; the metadata answered.
+    pub fn put_hex_ok(&self, key: &str, bytes: &[u8], content_type: Option<&str>) -> Value {
+        let mut body = json!({
+            "resource": MARKETING,
+            "key": key,
+            "hex": hex(bytes),
+        });
+        if let Some(content_type) = content_type {
+            body["content_type"] = json!(content_type);
+        }
+        let (_, answer) = self.post(&wanda(), STREAM_PUT, "/put-buffer", &body);
+        let answer = &answer["answer"];
+        if !answer["ok"].is_object() {
+            self.vm.fail(&format!(
+                "expected the put of {key:?} through an ArrayBuffer to be answered {{ ok: <metadata> }}, got {answer}"
+            ));
+        }
+        answer["ok"].clone()
+    }
+
+    /// A get of `key` of [`MARKETING`] as [`rita`] through [`STREAM_READ`]'s
+    /// `/read`: the answer's metadata and the body read to its end, as
+    /// `{ ok: <metadata>, isStream, read: { length, digest, chunks,
+    /// maxChunk } }` (or `read.failed` when the stream failed).
+    pub fn read(&self, key: &str) -> Value {
+        self.read_on(&rita(), MARKETING, key)
+    }
+
+    /// A get of `key` of `resource` as `user` through [`STREAM_READ`]'s
+    /// `/read`, as [`Storage::read`].
+    pub fn read_on(&self, user: &User, resource: &str, key: &str) -> Value {
+        let (_, body) = self.post(
+            user,
+            STREAM_READ,
+            "/read",
+            &json!({ "resource": resource, "key": key }),
+        );
+        body["answer"].clone()
     }
 
     /// Every page of a list of [`MARKETING`] with these arguments, `limit`
@@ -680,27 +776,41 @@ pub fn assert_ok_metadata(
     assert_metadata(&answer["ok"], key, size, content_type, context);
 }
 
-/// Fails unless `answer` is a get's `{ ok: { ...metadata, body } }` holding
-/// exactly `bytes` (base64 with padding) with this content type.
-pub fn assert_got(answer: &Value, key: &str, bytes: &[u8], content_type: &str, context: &str) {
+/// Fails unless `answer` is what [`STREAM_READ`]'s `/read` answered for a
+/// file of `bytes` with this content type: `{ ok: <metadata>, isStream,
+/// read: { length, digest, chunks, maxChunk } }`, the body read to its end
+/// with the same bytes, fed in chunks of at most 64 KiB.
+pub fn assert_read(answer: &Value, key: &str, bytes: &[u8], content_type: &str, context: &str) {
     let ok = &answer["ok"];
     assert!(
         ok.is_object(),
-        "{context}: expected {{ ok: {{ ...metadata, body }} }}, got {answer}"
+        "{context}: expected {{ ok: {{ ...metadata }}, isStream, read }} for the file {key:?}, got {answer}"
     );
-    let body = ok["body"]
-        .as_str()
-        .unwrap_or_else(|| panic!("{context}: expected `body`, the bytes in base64, got {answer}"));
+    assert_metadata(ok, key, bytes.len(), content_type, context);
     assert_eq!(
-        body,
-        b64(bytes),
-        "{context}: expected the body to be the bytes put, in standard base64 with padding"
+        answer["isStream"], true,
+        "{context}: expected the get's `body` a ReadableStream fed by the host, got {answer}"
     );
-    let mut metadata = ok.clone();
-    if let Some(o) = metadata.as_object_mut() {
-        o.remove("body");
-    }
-    assert_metadata(&metadata, key, bytes.len(), content_type, context);
+    let read = &answer["read"];
+    assert_eq!(
+        read["length"].as_u64(),
+        u64::try_from(bytes.len()).ok(),
+        "{context}: expected the body to end after exactly its size in bytes, got {answer}"
+    );
+    assert_eq!(
+        read["digest"].as_u64(),
+        Some(u64::from(fnv1a(bytes))),
+        "{context}: expected the body to be the bytes of the file, got {answer}"
+    );
+    assert!(
+        read["chunks"].as_u64().is_some_and(|n| n >= 1),
+        "{context}: expected the body fed in at least one chunk, got {answer}"
+    );
+    let max_chunk = read["maxChunk"].as_u64().unwrap_or(u64::MAX);
+    assert!(
+        max_chunk <= u64::try_from(CHUNK_BOUND).unwrap_or(0),
+        "{context}: expected the host to feed the body in chunks of at most {CHUNK_BOUND} bytes, got a chunk of {max_chunk}: {answer}"
+    );
 }
 
 /// Fails unless `answer` is `{ ok: null }`.
@@ -1011,5 +1121,197 @@ pub fn eventually(within: Duration, mut condition: impl FnMut() -> bool) -> bool
             return false;
         }
         std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Makes a sparse file of `size` bytes at `path`: zeros, but every
+/// [`SPARSE_EVERY`] bytes hold [`SPARSE_BLOCK`] bytes of a pattern that
+/// depends on the block's index, so that a body served from it is checked
+/// byte for byte ([`SparseCheck`]) without the test writing or holding all
+/// of it. The pattern of a block is [`sparse_pattern`].
+pub fn place_sparse(path: &Path, size: u64) {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .unwrap_or_else(|e| panic!("cannot create {}: {e}", parent.display()));
+    }
+    let file = std::fs::File::create(path)
+        .unwrap_or_else(|e| panic!("cannot create {}: {e}", path.display()));
+    file.set_len(size)
+        .unwrap_or_else(|e| panic!("cannot set the length of {}: {e}", path.display()));
+    let mut block = 0_u64;
+    while block * SPARSE_EVERY < size {
+        let offset = block * SPARSE_EVERY;
+        let length = usize::try_from((size - offset).min(SPARSE_BLOCK)).unwrap_or(0);
+        let bytes = sparse_pattern(block, length);
+        file.write_all_at(&bytes, offset)
+            .unwrap_or_else(|e| panic!("cannot write {} at {offset}: {e}", path.display()));
+        block += 1;
+    }
+}
+
+/// The distance between the patterned blocks of a sparse file: 64 MiB, so
+/// that even a file of the 5 GiB bound holds a few MiB of pattern and the
+/// rest holes.
+pub const SPARSE_EVERY: u64 = 64 * 1024 * 1024;
+
+/// The length of each patterned block of a sparse file: 64 KiB, one chunk.
+pub const SPARSE_BLOCK: u64 = 64 * 1024;
+
+/// The pattern at the start of the `block`th patterned block of a sparse
+/// file: a byte that varies with the block and the position, so that a
+/// misplaced byte is seen by [`SparseCheck`].
+pub fn sparse_pattern(block: u64, length: usize) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(length);
+    for position in 0..length {
+        let n = block
+            .wrapping_mul(0x9e37_79b9)
+            .wrapping_add(u64::try_from(position).unwrap_or(0));
+        bytes.push(u8::try_from((n ^ (n >> 24)) & 0xff).unwrap_or(0));
+    }
+    bytes
+}
+
+/// Checks, piece by piece and with `memcmp`s only, that what arrives is the
+/// whole sparse file of `size` bytes [`place_sparse`] makes: the pattern at
+/// its places and zeros between them, the length exact. A test hands each
+/// piece it receives to [`SparseCheck::take`] and ends with
+/// [`SparseCheck::finish`].
+pub struct SparseCheck {
+    size: u64,
+    offset: u64,
+    zeros: Vec<u8>,
+    patterns: Vec<Vec<u8>>,
+    /// The first offset that was not what the file holds, and what was
+    /// expected there.
+    pub first_wrong: Option<u64>,
+}
+
+impl SparseCheck {
+    pub fn new(size: u64) -> Self {
+        let blocks = size.div_ceil(SPARSE_EVERY);
+        let patterns = (0..blocks)
+            .map(|block| {
+                let at = block * SPARSE_EVERY;
+                let length = usize::try_from((size - at).min(SPARSE_BLOCK)).unwrap_or(0);
+                sparse_pattern(block, length)
+            })
+            .collect();
+        Self {
+            size,
+            offset: 0,
+            zeros: vec![0_u8; 1024 * 1024],
+            patterns,
+            first_wrong: None,
+        }
+    }
+
+    /// How many bytes have been taken.
+    pub fn taken(&self) -> u64 {
+        self.offset
+    }
+
+    /// Takes the next piece of the body.
+    pub fn take(&mut self, piece: &[u8]) {
+        let mut rest = piece;
+        while !rest.is_empty() {
+            let block = self.offset / SPARSE_EVERY;
+            let within = self.offset % SPARSE_EVERY;
+            let pattern = usize::try_from(block)
+                .ok()
+                .and_then(|n| self.patterns.get(n));
+            let pattern_length = pattern.map_or(0, |p| u64::try_from(p.len()).unwrap_or(0));
+            let (expected, room): (&[u8], u64) = if within < pattern_length {
+                let start = usize::try_from(within).unwrap_or(0);
+                let tail = pattern.and_then(|p| p.get(start..)).unwrap_or_default();
+                (tail, pattern_length - within)
+            } else {
+                (self.zeros.as_slice(), SPARSE_EVERY - within)
+            };
+            let room = room.min(self.size.saturating_sub(self.offset));
+            let now = rest
+                .len()
+                .min(usize::try_from(room).unwrap_or(usize::MAX))
+                .min(expected.len());
+            if now == 0 {
+                // Past the file's end, or the zeros slice ended: a piece
+                // longer than the file.
+                if self.offset >= self.size {
+                    self.first_wrong.get_or_insert(self.offset);
+                    return;
+                }
+                continue;
+            }
+            if rest.get(..now) != expected.get(..now) {
+                self.first_wrong.get_or_insert(self.offset);
+            }
+            rest = rest.get(now..).unwrap_or_default();
+            self.offset += u64::try_from(now).unwrap_or(0);
+        }
+    }
+
+    /// Fails the test unless exactly the file's bytes were taken.
+    pub fn assert_whole(&self, context: &str) {
+        assert_eq!(
+            self.offset, self.size,
+            "{context}: expected the body to be exactly {} bytes",
+            self.size
+        );
+        assert_eq!(
+            self.first_wrong, None,
+            "{context}: expected the body to be the file's bytes; the first byte that is not is at that offset"
+        );
+    }
+}
+
+/// The sizes of the files under `<dir>/.vibe-staging`, in bytes.
+pub fn staging_sizes(dir: &Path) -> Vec<u64> {
+    let Ok(entries) = std::fs::read_dir(dir.join(".vibe-staging")) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| entry.metadata().ok())
+        .map(|metadata| metadata.len())
+        .collect()
+}
+
+/// A raw `POST` of `body` as JSON to `application` as `user`, written
+/// whole, the answer left to read ([`crate::body::Raw::read_head`] and
+/// [`crate::body::Raw::drain_body`]).
+pub fn post_raw(vm: &Vm, user: &User, application: &str, target: &str, body: &Value) -> Raw {
+    let bytes = body.to_string().into_bytes();
+    let mut raw = Raw::connect(vm.address());
+    raw.send_head(
+        "POST",
+        target,
+        &vm.host_of(application),
+        Some(user),
+        Framing::Length(u64::try_from(bytes.len()).unwrap_or(0)),
+        &[("content-type", "application/json")],
+    );
+    raw.write(&bytes)
+        .unwrap_or_else(|e| panic!("cannot write the request {target}: {e}"));
+    raw
+}
+
+/// The entries of the Operation log whose `request` is `id`.
+pub fn entries_by_request(s: &Storage, id: &str) -> Vec<Value> {
+    s.log()
+        .into_iter()
+        .filter(|e| e["request"].as_str() == Some(id))
+        .collect()
+}
+
+/// [`crate::body::peak_rss_during`] that cannot hang: when `work` panics
+/// (a failed expectation, a timeout of the harness) the sampler is told to
+/// stop before the panic goes on, where the bare function would wait for it
+/// for ever.
+pub fn sampled<T>(pid: u32, work: impl FnOnce() -> T) -> (T, u64) {
+    let (outcome, peak) = crate::body::peak_rss_during(pid, || {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
+    });
+    match outcome {
+        Ok(value) => (value, peak),
+        Err(panic) => std::panic::resume_unwind(panic),
     }
 }

@@ -7,9 +7,12 @@
 //! What each call answers and that it is exactly one host operation;
 //! refusals as `Refused` with the kinds of a mismatch, failures as
 //! `OperationFailed`, and what escapes `fetch`; arguments of the wrong type
-//! a `TypeError` with nothing sent; a body of 8 MiB put and read back, and
-//! uploaded; hostile keys forced past the types. The compile errors are
-//! the type tests of `blackbox/sdk-types/projects/storage/`.
+//! a `TypeError` with nothing sent; a body put and read back with the
+//! readers, and an upload of the request's own body; hostile keys forced
+//! past the types. The body as a stream, every kind a put takes and what
+//! is refused, and the readers each once, are in
+//! `blackbox/tests/storage_stream_*.rs`. The compile errors are the type
+//! tests of `blackbox/sdk-types/projects/storage/`.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -22,12 +25,16 @@ use blackbox::User;
 use blackbox::http::Response;
 use blackbox::sdk::{SDK_REQUEST_TIMEOUT, built, install};
 use blackbox::storage::{
-    BODY_BOUND, FILE_READERS, FILE_WRITERS, FILES_CONTACT, MARKETING, Storage, assert_host_calls,
-    b64, mtime, nobody, place, rita, tree, wanda,
+    FILE_READERS, FILE_WRITERS, FILES_CONTACT, MARKETING, Storage, assert_host_calls, b64, mtime,
+    nobody, rita, tree, wanda,
 };
 use serde_json::{Value, json};
 
 const APP: &str = "sdk-files";
+
+/// A body past the old 8 MiB bound: any size the file bound allows goes
+/// through the readers whole.
+const EIGHT_MIB: usize = 8 * 1024 * 1024;
 
 fn encode(text: &str) -> String {
     url::form_urlencoded::byte_serialize(text.as_bytes()).collect()
@@ -137,17 +144,22 @@ fn put_get_head_list_and_delete_through_the_sdk_each_one_host_operation() {
         "get",
     );
     assert_eq!(
-        f["isUint8Array"], true,
-        "expected `body` a Uint8Array: {got}"
+        f["isStream"], true,
+        "expected `body` a ReadableStream fed by the host: {got}"
     );
     assert_eq!(
-        f["bodyB64"],
+        f["bodyUsedAfter"], true,
+        "expected `bodyUsed` true once the body was read: {got}"
+    );
+    assert_eq!(
+        f["bytesB64"],
         json!(b64(&bytes)),
         "expected the bytes put: {got}"
     );
+    let (_, text) = ok_json(&s, &rita(), "GET", "/get-text?key=reports/q3.pdf", b"");
     assert!(
-        f["text"].as_str().unwrap().contains('\u{fffd}'),
-        "expected text() to decode malformed bytes as U+FFFD: {got}"
+        text["text"].as_str().unwrap().contains('\u{fffd}'),
+        "expected text() to decode malformed bytes as U+FFFD: {text}"
     );
     let (response, headed) = ok_json(&s, &rita(), "GET", "/head?key=reports/q3.pdf", b"");
     assert_host_calls(&s.vm, &response, &["storage.head"], "a head");
@@ -410,50 +422,43 @@ fn arguments_of_the_wrong_type_are_a_type_error_and_nothing_is_sent() {
 }
 
 #[test]
-fn a_body_of_8_mib_goes_through_the_sdk_and_through_an_upload() {
+fn a_body_goes_through_the_sdk_and_through_an_upload_of_the_requests_own_body() {
     let s = files();
     let (_, big) = ok_json(
         &s,
         &wanda(),
         "GET",
-        &format!("/big?key=big/eight.bin&size={BODY_BOUND}"),
+        &format!("/big?key=big/eight.bin&size={EIGHT_MIB}"),
         b"",
     );
     assert_eq!(
         big["same"], true,
-        "expected 8 MiB put and read back whole: {big}"
+        "expected 8 MiB put and read back whole through `bytes()`: {big}"
     );
     assert_info(
         &big["put"],
         "big/eight.bin",
-        BODY_BOUND,
+        EIGHT_MIB,
         "application/octet-stream",
         "8 MiB put",
     );
-    let upload = vec![0x5a_u8; BODY_BOUND];
-    let (_, up) = ok_json(&s, &wanda(), "POST", "/upload?key=big/upload.bin", &upload);
+    let upload = vec![0x5a_u8; EIGHT_MIB];
+    let (response, up) = ok_json(&s, &wanda(), "POST", "/upload?key=big/upload.bin", &upload);
     assert_info(
         &up["info"],
         "big/upload.bin",
-        BODY_BOUND,
+        EIGHT_MIB,
         "application/octet-stream",
-        "an upload",
+        "an upload of the request's own body",
+    );
+    assert_host_calls(
+        &s.vm,
+        &response,
+        &["storage.put"],
+        "put(key, request.body) is one host operation",
     );
     let on_disk = std::fs::read(s.dir(MARKETING).join("big/upload.bin")).unwrap();
     assert!(on_disk == upload, "expected the upload's bytes on the disk");
-    place(
-        &s.dir(MARKETING).join("big/over.bin"),
-        &vec![1; BODY_BOUND + 1],
-    );
-    let (_, failed) = ok_json(
-        &s,
-        &wanda(),
-        "GET",
-        "/caught?case=get&key=big/over.bin",
-        b"",
-    );
-    assert_eq!(failed["error"]["kind"], "limit", "{failed}");
-    assert_eq!(failed["error"]["detail"]["limit"], "bytes", "{failed}");
 }
 
 #[test]

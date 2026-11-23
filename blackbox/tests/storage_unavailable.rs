@@ -26,7 +26,7 @@ use blackbox::Vm;
 use blackbox::records::event;
 use blackbox::scenario::Expected;
 use blackbox::storage::{
-    FILE_READERS, FILE_WRITERS, FILES, MARKETING, Storage, assert_got, assert_ok_metadata,
+    FILE_READERS, FILE_WRITERS, FILES, MARKETING, Storage, assert_ok_metadata, assert_read,
     assert_storage_entry, delete, eventually, get, head, list, put, storage_expected, terminate,
     tree, wanda,
 };
@@ -60,7 +60,7 @@ fn unavailable_then_mended_on(
     break_it: &dyn Fn(&Path),
     mend: &dyn Fn(&Path),
 ) {
-    s.put_ok("kept.txt", b"kept", None);
+    s.put_ok("kept.txt", "kept", None);
     let Storage { vm, place } = s;
     let stopped = terminate(vm);
     break_it(dir);
@@ -96,7 +96,7 @@ fn calls() -> [(&'static str, Value, &'static str); 5] {
         ),
         (
             "storage.put",
-            put(MARKETING, "new/file.txt", b"new", None),
+            put(MARKETING, "new/file.txt", "new", None),
             "put \"new/file.txt\"",
         ),
         (
@@ -172,7 +172,7 @@ fn assert_works_again(s: &Storage, dir: &Path, problem: &str) {
         "{problem}: expected operations to work again within about 10 seconds of the directory being usable, with no restart"
     );
     assert_ok_metadata(
-        &s.as_writer(&put(MARKETING, "after.txt", b"after", None)),
+        &s.as_writer(&put(MARKETING, "after.txt", "after", None)),
         "after.txt",
         5,
         "text/plain; charset=utf-8",
@@ -231,7 +231,7 @@ fn a_directory_marked_for_another_resource_another_disk_is_unavailable_until_it_
     let dir = s.dir(MARKETING);
     s.register("other");
     let other = s.dir("other");
-    s.put_ok("kept.txt", b"kept", None);
+    s.put_ok("kept.txt", "kept", None);
     let Storage { vm, place } = s;
     let stopped = terminate(vm);
     std::fs::rename(&dir, aside(&dir)).unwrap();
@@ -244,7 +244,7 @@ fn a_directory_marked_for_another_resource_another_disk_is_unavailable_until_it_
         vm: stopped.start(),
         place,
     };
-    let answer = s.as_writer(&put(MARKETING, "x.txt", b"x", None));
+    let answer = s.as_writer(&put(MARKETING, "x.txt", "x", None));
     assert_eq!(
         answer["error"]["kind"], "unavailable",
         "expected a put into a directory marked for another Resource to fail `unavailable`, got {answer}"
@@ -296,7 +296,7 @@ fn outside_the_root_then_back(other_root: Option<&str>) {
     let s = Storage::ready();
     let dir = s.dir(MARKETING);
     let root = s.root();
-    s.put_ok("kept.txt", b"kept", None);
+    s.put_ok("kept.txt", "kept", None);
     let other = other_root.map(|name| s.place.base.join(name));
     if let Some(other) = &other {
         std::fs::create_dir(other).unwrap();
@@ -422,9 +422,9 @@ fn assert_available_record(s: &Storage) {
 
 #[test]
 fn a_directory_moved_away_while_the_program_runs_and_an_empty_one_in_its_place_is_let_go() {
-    let s = Storage::ready();
+    let s = Storage::ready_streams();
     let dir = s.dir(MARKETING);
-    s.put_ok("kept.txt", b"kept", None);
+    s.put_ok("kept.txt", "kept", None);
     let aside = aside(&dir);
     std::fs::rename(&dir, &aside).unwrap();
     std::fs::create_dir(&dir).unwrap();
@@ -450,8 +450,8 @@ fn a_directory_moved_away_while_the_program_runs_and_an_empty_one_in_its_place_i
         back,
         "expected the directory in use again within about 10 seconds of it being back, with no restart"
     );
-    assert_got(
-        &s.as_writer(&get(MARKETING, "kept.txt")),
+    assert_read(
+        &s.read("kept.txt"),
         "kept.txt",
         b"kept",
         "text/plain; charset=utf-8",
@@ -465,7 +465,7 @@ fn a_directory_moved_away_while_the_program_runs_and_an_empty_one_in_its_place_i
 fn a_directory_removed_and_made_again_empty_while_the_program_runs_stays_unavailable() {
     let s = Storage::ready();
     let dir = s.dir(MARKETING);
-    s.put_ok("kept.txt", b"kept", None);
+    s.put_ok("kept.txt", "kept", None);
     std::fs::remove_dir_all(&dir).unwrap();
     std::fs::create_dir(&dir).unwrap();
     becomes_unavailable(&s, &dir, "not-marked");
@@ -484,7 +484,7 @@ fn a_directory_removed_and_made_again_empty_while_the_program_runs_stays_unavail
 fn a_directory_moved_away_while_the_program_runs_is_missing_until_it_is_back() {
     let s = Storage::ready();
     let dir = s.dir(MARKETING);
-    s.put_ok("kept.txt", b"kept", None);
+    s.put_ok("kept.txt", "kept", None);
     let aside = aside(&dir);
     std::fs::rename(&dir, &aside).unwrap();
     let aside_before = tree(&aside);

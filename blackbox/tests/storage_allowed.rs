@@ -41,7 +41,7 @@ fn five(resource: &str, key: &str) -> Vec<(&'static str, String, Value)> {
         (
             "storage.put",
             statement_of("put", key),
-            put(resource, key, b"refused bytes", None),
+            put(resource, key, "refused bytes", None),
         ),
         (
             "storage.delete",
@@ -69,7 +69,7 @@ fn assert_untouched(before: &[String], s: &Storage, context: &str) {
 #[test]
 fn a_user_whose_groups_hold_nothing_is_refused_every_operation_with_the_contact() {
     let s = Storage::ready();
-    s.put_ok("kept/file.txt", b"kept", None);
+    s.put_ok("kept/file.txt", "kept", None);
     let file = s.dir(MARKETING).join("kept/file.txt");
     let time = mtime(&file);
     let before = tree(&s.place.base);
@@ -114,7 +114,7 @@ fn a_user_whose_groups_hold_nothing_is_refused_every_operation_with_the_contact(
 #[test]
 fn a_reader_reads_and_is_refused_put_and_delete_with_what_they_hold() {
     let s = Storage::ready();
-    s.put_ok("kept.txt", b"kept", None);
+    s.put_ok("kept.txt", "kept", None);
     let before = tree(&s.place.base);
     for (operation, statement, call) in five(MARKETING, "kept.txt") {
         let (response, answer) = s.one(&rita(), FILES, &call);
@@ -151,7 +151,7 @@ fn a_reader_reads_and_is_refused_put_and_delete_with_what_they_hold() {
 #[test]
 fn a_version_that_declared_read_is_refused_put_and_delete_even_for_a_writer() {
     let s = Storage::ready();
-    s.put_ok("kept.txt", b"kept", None);
+    s.put_ok("kept.txt", "kept", None);
     let before = tree(&s.place.base);
     for (operation, statement, call) in five(MARKETING, "kept.txt") {
         let (response, answer) = s.one(&wanda(), VIEWER, &call);
@@ -185,7 +185,7 @@ fn a_version_that_declared_read_is_refused_put_and_delete_even_for_a_writer() {
 #[test]
 fn declared_lower_comes_before_no_grant_and_not_declared_before_everything_about_the_resource() {
     let s = Storage::ready();
-    let answer = s.one(&nobody(), VIEWER, &put(MARKETING, "x", b"x", None)).1;
+    let answer = s.one(&nobody(), VIEWER, &put(MARKETING, "x", "x", None)).1;
     assert_refusal(
         &answer,
         "declared-lower",
@@ -416,7 +416,7 @@ fn a_resource_name_that_tries_to_leave_is_not_declared() {
         "storage-hostile.js",
         &[(MARKETING, "storage", "write")],
     );
-    s.put_ok("x.txt", b"x", None);
+    s.put_ok("x.txt", "x", None);
     let (_, body) = s.post(&wanda(), "hostile", "/names", &json!({ "key": "x.txt" }));
     for (name, answer) in body["answers"].as_object().unwrap() {
         assert_eq!(
@@ -437,7 +437,7 @@ fn when_the_entry_cannot_be_written_the_operation_is_refused_and_nothing_is_touc
     s.grant(MARKETING, FILE_READERS, "read");
     s.grant(MARKETING, "file-writers", "write");
     s.install(FILES, "operations.js", &[(MARKETING, "storage", "write")]);
-    s.put_ok("kept.txt", b"kept", None);
+    s.put_ok("kept.txt", "kept", None);
     platform_postgres.stop();
     let before = tree(&s.place.base);
     for (operation, _, call) in five(MARKETING, "kept.txt") {
@@ -468,7 +468,7 @@ fn after_a_disable_no_storage_operation_of_the_application_is_allowed() {
         .as_user(&wanda())
         .method("POST")
         .json(&json!({
-            "calls": [put(MARKETING, "before.txt", b"x", None), put(MARKETING, "after.txt", b"x", None)],
+            "calls": [put(MARKETING, "before.txt", "x", None), put(MARKETING, "after.txt", "x", None)],
             "pauseMs": 1500,
         }))
         .timeout(Duration::from_secs(20));

@@ -17,17 +17,17 @@
 use std::os::unix::fs::MetadataExt;
 
 use blackbox::storage::{
-    CONTENT_TYPE_ATTRIBUTE, MARKETING, Storage, assert_got, assert_invalid_key, assert_ok_metadata,
-    assert_ok_null, binary_with, delete, get, head, list, listed_names, mode, mtime, my_uid, place,
-    set_xattr, terminate, tree, xattr,
+    CONTENT_TYPE_ATTRIBUTE, MARKETING, Storage, assert_invalid_key, assert_ok_metadata,
+    assert_ok_null, assert_read, binary_with, delete, get, head, list, listed_names, mode, mtime,
+    my_uid, place, set_xattr, terminate, tree, xattr,
 };
 use serde_json::json;
 
 #[test]
 fn a_put_leaves_the_bytes_in_a_regular_file_of_mode_0640_in_folders_of_mode_0750() {
-    let s = Storage::ready();
+    let s = Storage::ready_streams();
     let bytes = binary_with("on the disk");
-    let written = s.put_ok("reports/2025/q3.bin", &bytes, Some("application/x-report"));
+    let written = s.put_hex_ok("reports/2025/q3.bin", &bytes, Some("application/x-report"));
     let dir = s.dir(MARKETING);
     let file = dir.join("reports/2025/q3.bin");
     assert_eq!(
@@ -71,14 +71,14 @@ fn a_put_leaves_the_bytes_in_a_regular_file_of_mode_0640_in_folders_of_mode_0750
         "expected its time of modification, to the second"
     );
 
-    s.put_ok("plain.txt", b"none given", None);
+    s.put_ok("plain.txt", "none given", None);
     assert_eq!(
         xattr(&dir.join("plain.txt"), CONTENT_TYPE_ATTRIBUTE),
         None,
         "expected no attribute when no content type was given"
     );
     // Replacing with no content type removes the one given before.
-    s.put_ok("reports/2025/q3.bin", b"again", None);
+    s.put_ok("reports/2025/q3.bin", "again", None);
     assert_eq!(xattr(&file, CONTENT_TYPE_ATTRIBUTE), None);
     assert_eq!(mode(&file), 0o640);
     assert_eq!(std::fs::symlink_metadata(&file).unwrap().nlink(), 1);
@@ -93,8 +93,8 @@ fn a_put_leaves_the_bytes_in_a_regular_file_of_mode_0640_in_folders_of_mode_0750
 fn a_delete_removes_the_file_and_every_folder_it_leaves_empty() {
     let s = Storage::ready();
     let dir = s.dir(MARKETING);
-    s.put_ok("a/b/c/d.txt", b"x", None);
-    s.put_ok("a/keep.txt", b"x", None);
+    s.put_ok("a/b/c/d.txt", "x", None);
+    s.put_ok("a/keep.txt", "x", None);
     s.as_writer(&delete(MARKETING, "a/b/c/d.txt"));
     assert!(!dir.join("a/b/c/d.txt").exists());
     assert!(
@@ -118,7 +118,7 @@ fn a_delete_removes_the_file_and_every_folder_it_leaves_empty() {
 
 #[test]
 fn a_file_placed_by_hand_is_a_file_of_the_resource_like_any_other() {
-    let s = Storage::ready();
+    let s = Storage::ready_streams();
     let dir = s.dir(MARKETING);
     place(&dir.join("hand/report.PDF"), b"by hand");
     place(&dir.join("hand/typed.bin"), b"typed by hand");
@@ -133,21 +133,21 @@ fn a_file_placed_by_hand_is_a_file_of_the_resource_like_any_other() {
         ["hand/report.PDF", "hand/typed.bin"],
         "{listed}"
     );
-    assert_got(
-        &s.as_writer(&get(MARKETING, "hand/report.PDF")),
+    assert_read(
+        &s.read("hand/report.PDF"),
         "hand/report.PDF",
         b"by hand",
         "application/pdf",
         "a file placed by hand, typed by the table",
     );
-    assert_got(
-        &s.as_writer(&get(MARKETING, "hand/typed.bin")),
+    assert_read(
+        &s.read("hand/typed.bin"),
         "hand/typed.bin",
         b"typed by hand",
         "text/x-hand",
         "a file placed by hand with the attribute",
     );
-    s.put_ok("hand/report.PDF", b"replaced", None);
+    s.put_ok("hand/report.PDF", "replaced", None);
     assert_eq!(
         std::fs::read(dir.join("hand/report.PDF")).unwrap(),
         b"replaced"
@@ -160,7 +160,7 @@ fn a_file_placed_by_hand_is_a_file_of_the_resource_like_any_other() {
 fn names_on_the_disk_that_are_not_keys_are_never_listed_and_cannot_be_reached() {
     let s = Storage::ready();
     let dir = s.dir(MARKETING);
-    s.put_ok("ok.txt", b"ok", None);
+    s.put_ok("ok.txt", "ok", None);
     let odd = [
         "bell\u{7}.txt",
         "back\\slash.txt",
@@ -238,7 +238,7 @@ fn the_directory_holds_its_marker_and_staging_and_what_a_crash_left_there_is_rem
             .unwrap()
             .is_dir()
     );
-    s.put_ok("kept.txt", b"kept", None);
+    s.put_ok("kept.txt", "kept", None);
     let Storage { vm, place } = s;
     let stopped = terminate(vm);
     // What a crash in the middle of a put leaves.

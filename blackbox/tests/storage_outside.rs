@@ -159,7 +159,7 @@ fn planted() -> Planted {
     s.register("other");
     let other = s.dir("other");
     place(&other.join("theirs.txt"), b"their bytes, never to be read");
-    s.put_ok("real.txt", b"real", None);
+    s.put_ok("real.txt", "real", None);
     let known = format!("known-{}", blackbox::shared_database::token()).into_bytes();
     let outside_file = s.place.outside().join("secret.txt");
     std::fs::write(&outside_file, &known).unwrap();
@@ -201,7 +201,7 @@ fn links_planted_on_the_host_are_never_followed() {
         }
     }
     for key in ["etc/x", "secret", "other/x", "deep/link/x"] {
-        let answer = s.as_writer(&put(MARKETING, key, b"planted through a link", None));
+        let answer = s.as_writer(&put(MARKETING, key, "planted through a link", None));
         assert_not_reachable(&answer, "link", &format!("put of {key}"));
         answers.push(answer);
     }
@@ -296,7 +296,7 @@ fn a_fifo_is_not_a_file_at_once_and_a_planted_folder_is_not_a_file_and_conflicts
         "not-a-file",
         "get of a folder",
     );
-    let answer = s.as_writer(&put(MARKETING, "f", b"x", None));
+    let answer = s.as_writer(&put(MARKETING, "f", "x", None));
     assert_eq!(
         answer["error"]["kind"], "key-conflict",
         "expected a put onto a planted folder to be `key-conflict`, got {answer}"
@@ -328,8 +328,8 @@ fn two_resources_never_see_each_others_files() {
         &[("alpha", "storage", "write"), ("beta", "storage", "write")],
     );
     let call = |c: &Value| s.one(&wanda(), "both", c).1;
-    assert!(call(&put("alpha", "x.txt", b"alpha's", None))["ok"].is_object());
-    assert!(call(&put("alpha", "dir/y.txt", b"alpha's", None))["ok"].is_object());
+    assert!(call(&put("alpha", "x.txt", "alpha's", None))["ok"].is_object());
+    assert!(call(&put("alpha", "dir/y.txt", "alpha's", None))["ok"].is_object());
     let listed = call(&list("beta", &json!({})));
     assert_eq!(
         listed,
@@ -345,7 +345,7 @@ fn two_resources_never_see_each_others_files() {
         assert_invalid_key(&call(&get("beta", key)), "dot-segment", key);
         assert_invalid_key(&call(&delete("beta", key)), "dot-segment", key);
     }
-    assert!(call(&put("beta", "x.txt", b"beta's", None))["ok"].is_object());
+    assert!(call(&put("beta", "x.txt", "beta's", None))["ok"].is_object());
     assert_eq!(std::fs::read(a.join("x.txt")).unwrap(), b"alpha's");
     assert_eq!(std::fs::read(a.join("dir/y.txt")).unwrap(), b"alpha's");
     assert_eq!(std::fs::read(b.join("x.txt")).unwrap(), b"beta's");

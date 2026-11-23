@@ -28,8 +28,8 @@ use blackbox::api::{assert_json_content_type, assert_recent_rfc3339};
 use blackbox::postgres::Platform;
 use blackbox::scenario::administrator;
 use blackbox::storage::{
-    FILE_READERS, FILE_WRITERS, FILES_CONTACT, MARKETING, Place, Storage, b64, get, list,
-    postgres_body, put, set_mode, storage_body, tree, wanda,
+    FILE_READERS, FILE_WRITERS, FILES_CONTACT, MARKETING, Place, Storage, get, list, postgres_body,
+    put, set_mode, storage_body, tree, wanda,
 };
 use blackbox::{User, VmOptions, assert_api_error};
 use serde_json::{Value, json};
@@ -659,9 +659,18 @@ fn registrations_asked_at_the_same_moment_are_decided_one_after_the_other() {
         });
     }
 
+    /// Sets the flag on every way out of the scope, a panic included: the
+    /// threads that loop on it would keep the scope waiting for ever.
+    struct StopOnDrop<'a>(&'a AtomicBool);
+    impl Drop for StopOnDrop<'_> {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
     let stop = AtomicBool::new(false);
     let program = &s;
     std::thread::scope(|scope| {
+        let _stops = StopOnDrop(&stop);
         let listers: Vec<_> = (0..4)
             .map(|_| scope.spawn(|| keep_the_file_threads_busy(program, &stop)))
             .collect();
@@ -740,13 +749,22 @@ fn registrations_asked_at_the_same_moment_are_decided_one_after_the_other() {
                 ("inner/crossed.txt", "crossed.txt")
             };
             let secret = format!("put through {}", pair.names[from]);
-            s.one(
-                &wanda(),
-                "cross",
-                &put(&pair.names[from], put_key, secret.as_bytes(), None),
+            let written = s
+                .one(
+                    &wanda(),
+                    "cross",
+                    &put(&pair.names[from], put_key, &secret, None),
+                )
+                .1;
+            assert!(
+                written["ok"].is_object(),
+                "expected the file put through {} to land: {written}",
+                pair.names[from]
             );
             let got = s.one(&wanda(), "cross", &get(&pair.names[to], get_key)).1;
-            if got["ok"]["body"] == b64(secret.as_bytes()).as_str() {
+            // A file answered at all is one read across: a Resource that
+            // does not hold the key answers `{ ok: null }`.
+            if got["ok"].is_object() {
                 crossed.push(format!(
                     "{} read what was put through {}",
                     pair.names[to], pair.names[from]

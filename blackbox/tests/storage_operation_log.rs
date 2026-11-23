@@ -43,7 +43,7 @@ fn allowed<'a>(id: &'a str) -> Expected<'a> {
 #[test]
 fn each_allowed_operation_has_its_entry_with_every_field() {
     let s = Storage::ready();
-    let (id, _, entry) = logged(&s, &put(MARKETING, "reports/q4.pdf", b"pdf bytes", None));
+    let (id, _, entry) = logged(&s, &put(MARKETING, "reports/q4.pdf", "pdf bytes", None));
     assert_storage_entry(
         &entry,
         &storage_expected(
@@ -108,8 +108,8 @@ fn each_allowed_operation_has_its_entry_with_every_field() {
         ),
         "a get that answered null",
     );
-    s.put_ok("reports/2025/a.pdf", b"x", None);
-    s.put_ok("top.txt", b"x", None);
+    s.put_ok("reports/2025/a.pdf", "x", None);
+    s.put_ok("top.txt", "x", None);
     let (id, _, entry) = logged(&s, &list(MARKETING, &json!({ "prefix": "reports/" })));
     assert_storage_entry(
         &entry,
@@ -152,7 +152,7 @@ fn each_allowed_operation_has_its_entry_with_every_field() {
 fn a_failure_after_the_directory_was_touched_has_a_duration_and_one_before_has_none() {
     let s = Storage::ready();
     symlink(s.place.outside(), s.dir(MARKETING).join("etc")).unwrap();
-    s.put_ok("a", b"x", None);
+    s.put_ok("a", "x", None);
     // invalid-key: the directory never touched.
     let (id, _, entry) = logged(&s, &get(MARKETING, "../secret"));
     assert_storage_entry(
@@ -176,7 +176,7 @@ fn a_failure_after_the_directory_was_touched_has_a_duration_and_one_before_has_n
             "not-reachable",
         ),
         (
-            put(MARKETING, "a/b", b"x", None),
+            put(MARKETING, "a/b", "x", None),
             "put \"a/b\"",
             "key-conflict",
         ),
@@ -250,7 +250,7 @@ fn a_key_is_written_as_a_json_string_and_cut_after_1024_bytes() {
     );
     // The cut: `put "<the first 1,024 bytes>"...`.
     let long = "a".repeat(1025);
-    let (_, _, entry) = logged(&s, &put(MARKETING, &long, b"x", None));
+    let (_, _, entry) = logged(&s, &put(MARKETING, &long, "x", None));
     assert_eq!(
         entry["statement"].as_str(),
         Some(format!("put \"{}\"...", "a".repeat(1024)).as_str()),
@@ -258,7 +258,7 @@ fn a_key_is_written_as_a_json_string_and_cut_after_1024_bytes() {
     );
     // Cut at a character's end: 1,023 bytes and then a character of two.
     let wide = format!("{}éb", "a".repeat(1023));
-    let (_, _, entry) = logged(&s, &put(MARKETING, &wide, b"x", None));
+    let (_, _, entry) = logged(&s, &put(MARKETING, &wide, "x", None));
     assert_eq!(
         entry["statement"].as_str(),
         Some(format!("put \"{}\"...", "a".repeat(1023)).as_str()),
@@ -272,11 +272,11 @@ fn no_field_holds_a_files_contents_content_type_or_size_nor_a_cursor() {
     let marker = format!("contents-{}", blackbox::shared_database::token());
     let content_type = format!("application/x-{marker}-type");
     let bytes = format!("{marker} {}", "z".repeat(4321));
-    s.put_ok("secret/plan.txt", bytes.as_bytes(), Some(&content_type));
+    s.put_ok("secret/plan.txt", &bytes, Some(&content_type));
     s.as_writer(&get(MARKETING, "secret/plan.txt"));
     s.as_writer(&head(MARKETING, "secret/plan.txt"));
     for n in 0..3 {
-        s.put_ok(&format!("secret/{n}.txt"), b"x", None);
+        s.put_ok(&format!("secret/{n}.txt"), "x", None);
     }
     let first = s.as_writer(&list(MARKETING, &json!({ "limit": 1 })));
     let cursor = first["ok"]["cursor"].as_str().unwrap().to_owned();
@@ -328,7 +328,7 @@ fn the_host_call_record_names_the_operation() {
         &wanda(),
         FILES,
         &[
-            put(MARKETING, "a.txt", b"x", None),
+            put(MARKETING, "a.txt", "x", None),
             head(MARKETING, "a.txt"),
             get(MARKETING, "a.txt"),
             list(MARKETING, &json!({})),
@@ -358,7 +358,7 @@ fn the_host_call_record_names_the_operation() {
 fn the_entries_are_found_by_resource_on_the_api_and_with_the_tool() {
     let s = Storage::ready();
     s.register_postgres("devops");
-    s.put_ok("found.txt", b"x", None);
+    s.put_ok("found.txt", "x", None);
     s.as_writer(&get(MARKETING, "found.txt"));
     let page = s
         .admin()
@@ -400,22 +400,17 @@ fn assert_duration(entry: &Value, handed: bool, what: &str) {
 #[test]
 fn duration_ms_is_a_number_once_the_operation_is_handed_to_the_directory_and_null_before() {
     let s = Storage::ready();
-    s.install(
-        "bodies",
-        "storage-bodies.js",
-        &[(MARKETING, "storage", "write")],
-    );
     symlink(s.place.outside(), s.dir(MARKETING).join("etc")).unwrap();
-    s.put_ok("a", b"x", None);
+    s.put_ok("a", "x", None);
     // Handed to the directory: allowed, key-conflict, not-reachable.
     for (call, what) in [
-        (put(MARKETING, "b.txt", b"x", None), "an allowed put"),
+        (put(MARKETING, "b.txt", "x", None), "an allowed put"),
         (get(MARKETING, "b.txt"), "an allowed get"),
         (head(MARKETING, "none"), "a head answered null"),
         (list(MARKETING, &json!({})), "an allowed list"),
         (delete(MARKETING, "b.txt"), "an allowed delete"),
         (
-            put(MARKETING, "a/b", b"x", None),
+            put(MARKETING, "a/b", "x", None),
             "a put failed `key-conflict`",
         ),
         (get(MARKETING, "etc/passwd"), "a get failed `not-reachable`"),
@@ -423,7 +418,7 @@ fn duration_ms_is_a_number_once_the_operation_is_handed_to_the_directory_and_nul
         let (_, _, entry) = logged(&s, &call);
         assert_duration(&entry, true, what);
     }
-    // Ended before: a refusal, invalid-key, a put's `limit` `bytes`.
+    // Ended before: a refusal, invalid-key.
     let (response, answer) = s.one(&blackbox::storage::nobody(), FILES, &head(MARKETING, "a"));
     assert!(
         answer["refused"].is_object(),
@@ -432,18 +427,9 @@ fn duration_ms_is_a_number_once_the_operation_is_handed_to_the_directory_and_nul
     assert_duration(&s.entry_of(&response), false, "a refusal");
     let (_, _, entry) = logged(&s, &get(MARKETING, "../secret"));
     assert_duration(&entry, false, "`invalid-key`");
-    let (response, body) = s.post(
-        &wanda(),
-        "bodies",
-        "/put-made",
-        &json!({ "resource": MARKETING, "key": "big.bin", "size": blackbox::storage::BODY_BOUND + 1, "byte": 65 }),
-    );
-    assert_eq!(
-        body["answer"]["error"]["limit"], "bytes",
-        "expected a put of 8 MiB and one byte `limit` `bytes`, got {}",
-        body["answer"]["error"]
-    );
-    assert_duration(&s.entry_of(&response), false, "a put's `limit` `bytes`");
+    // A put whose body was over the file bound before a byte of it was read
+    // is pinned in `storage_stream_bounds.rs` (its body is the request's own,
+    // with a stated content-length).
     // unavailable: handed to a directory that cannot be used.
     let dir = s.dir(MARKETING);
     let blackbox::storage::Storage { vm, place } = s;

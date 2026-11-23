@@ -17,38 +17,49 @@
 use blackbox::Vm;
 use blackbox::scenario::assert_refusal;
 use blackbox::storage::{
-    FILES, FILES_CONTACT, MARKETING, Stopped, Storage, assert_got, get, head, kill, list,
-    listed_names, nobody, put, rita, terminate, wanda,
+    FILES, FILES_CONTACT, MARKETING, Stopped, Storage, assert_read, head, kill, list, listed_names,
+    nobody, put, rita, terminate, wanda,
 };
 use serde_json::{Value, json};
+
+/// One file a surviving program keeps: its key, the text put (or `None`
+/// when its bytes are not UTF-8), the bytes on the disk, the content type
+/// given to the put and the one answered.
+type File<'a> = (&'a str, Option<&'a str>, &'a [u8], Option<&'a str>, &'a str);
 
 /// Puts three files, stops the program with `stop`, starts it again, and
 /// checks that each file and the Resource answer as before.
 fn survives(stop: fn(Vm) -> Stopped, what: &str) {
-    let s = Storage::ready();
-    let files: [(&str, &[u8], Option<&str>, &str); 3] = [
+    let s = Storage::ready_streams();
+    let files: [File<'_>; 3] = [
         (
             "reports/q3.pdf",
+            Some("%PDF the report"),
             b"%PDF the report",
             None,
             "application/pdf",
         ),
         (
             "typed.bin",
+            None,
             b"\x00\x01typed",
             Some("application/x-typed"),
             "application/x-typed",
         ),
         (
             "报告/第三季度.txt",
+            Some("第三季度"),
             "第三季度".as_bytes(),
             None,
             "text/plain; charset=utf-8",
         ),
     ];
     let mut written: Vec<Value> = Vec::new();
-    for (key, bytes, content_type, _) in files {
-        written.push(s.put_ok(key, bytes, content_type));
+    for (key, text, bytes, content_type, _) in files {
+        written.push(match text {
+            Some(text) => s.put_ok(key, text, content_type),
+            None => s.put_hex_ok(key, bytes, content_type),
+        });
     }
     let resource_before = s.admin().get_resource(MARKETING).json();
     let Storage { vm, place } = s;
@@ -57,9 +68,9 @@ fn survives(stop: fn(Vm) -> Stopped, what: &str) {
         vm: stopped.start(),
         place,
     };
-    for ((key, bytes, _, content_type), before) in files.iter().zip(&written) {
-        let got = s.as_writer(&get(MARKETING, key));
-        assert_got(&got, key, bytes, content_type, &format!("{what}: {key}"));
+    for ((key, _, bytes, _, content_type), before) in files.iter().zip(&written) {
+        let got = s.read(key);
+        assert_read(&got, key, bytes, content_type, &format!("{what}: {key}"));
         assert_eq!(
             got["ok"]["last_modified"], before["last_modified"],
             "{what}: expected {key}'s time of last change kept"
@@ -85,7 +96,7 @@ fn survives(stop: fn(Vm) -> Stopped, what: &str) {
     );
     assert!(s.one(&rita(), FILES, &head(MARKETING, "typed.bin")).1["ok"].is_object());
     assert_refusal(
-        &s.one(&rita(), FILES, &put(MARKETING, "x", b"x", None)).1,
+        &s.one(&rita(), FILES, &put(MARKETING, "x", "x", None)).1,
         "no-grant",
         &json!({ "resource": MARKETING, "user": "rita", "needed": "write", "held": "read", "contact": FILES_CONTACT }),
         what,
@@ -97,12 +108,8 @@ fn survives(stop: fn(Vm) -> Stopped, what: &str) {
         what,
     );
     assert!(
-        s.one(
-            &wanda(),
-            FILES,
-            &put(MARKETING, "after.txt", b"after", None)
-        )
-        .1["ok"]
+        s.one(&wanda(), FILES, &put(MARKETING, "after.txt", "after", None))
+            .1["ok"]
             .is_object(),
         "{what}: a put after the restart"
     );
@@ -125,7 +132,7 @@ fn a_file_put_survives_the_program_killed_and_started_again() {
 #[test]
 fn a_file_whose_answer_was_received_is_on_the_disk_at_once_before_any_stop() {
     let s = Storage::ready();
-    s.put_ok("now.txt", b"at once", None);
+    s.put_ok("now.txt", "at once", None);
     assert_eq!(
         std::fs::read(s.dir(MARKETING).join("now.txt")).unwrap(),
         b"at once"

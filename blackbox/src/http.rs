@@ -432,6 +432,12 @@ impl Response {
             .unwrap_or_else(|e| panic!("{e}"))
     }
 
+    /// Parses an answer a test read with its own socket, naming the request
+    /// it answers; an error says what is wrong with the answer's head.
+    pub fn parse_raw(raw: &[u8], request: &str) -> Result<Self, String> {
+        Self::parse_answer(raw, request.to_owned(), false)
+    }
+
     /// Every header, as (name in lower case, value), in order.
     pub fn headers(&self) -> &[(String, String)] {
         &self.headers

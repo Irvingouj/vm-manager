@@ -13,7 +13,7 @@
 
 use blackbox::scenario::Expected;
 use blackbox::storage::{
-    FILES, MARKETING, Storage, assert_got, assert_invalid_key, assert_ok_metadata, assert_ok_null,
+    FILES, MARKETING, Storage, assert_invalid_key, assert_ok_metadata, assert_ok_null, assert_read,
     assert_storage_entry, delete, get, head, list, listed_names, put, statement_of,
     storage_expected, tree, wanda,
 };
@@ -63,7 +63,7 @@ fn a_key_that_breaks_a_rule_fails_invalid_key_naming_it_and_has_its_failed_entry
         for (operation, word, call) in [
             ("storage.head", "head", head(MARKETING, &key)),
             ("storage.get", "get", get(MARKETING, &key)),
-            ("storage.put", "put", put(MARKETING, &key, b"x", None)),
+            ("storage.put", "put", put(MARKETING, &key, "x", None)),
             ("storage.delete", "delete", delete(MARKETING, &key)),
         ] {
             let (response, answer) = s.one(&wanda(), FILES, &call);
@@ -113,14 +113,14 @@ fn when_several_rules_are_broken_the_first_of_the_table_is_named() {
         ("cafe\u{301}/.vibe-x".to_owned(), "not-nfc"),
         ("//..".to_owned(), "empty-segment"),
     ] {
-        let answer = s.as_writer(&put(MARKETING, &key, b"x", None));
+        let answer = s.as_writer(&put(MARKETING, &key, "x", None));
         assert_invalid_key(&answer, rule, &format!("{key:?}"));
     }
 }
 
 #[test]
 fn the_bounds_of_a_key_are_taken_exactly() {
-    let s = Storage::ready();
+    let s = Storage::ready_streams();
     let segment = "s".repeat(255);
     let longest = [
         "a".repeat(255),
@@ -140,7 +140,7 @@ fn the_bounds_of_a_key_are_taken_exactly() {
     );
     assert_eq!(wide.len(), 1024, "the harness's own check");
     for key in [segment.as_str(), &longest, &deepest, &wide] {
-        let answer = s.as_writer(&put(MARKETING, key, b"edge", None));
+        let answer = s.as_writer(&put(MARKETING, key, "edge", None));
         assert_ok_metadata(
             &answer,
             key,
@@ -148,8 +148,8 @@ fn the_bounds_of_a_key_are_taken_exactly() {
             "application/octet-stream",
             &format!("a key at the bound ({} bytes)", key.len()),
         );
-        assert_got(
-            &s.as_writer(&get(MARKETING, key)),
+        assert_read(
+            &s.read(key),
             key,
             b"edge",
             "application/octet-stream",
@@ -166,18 +166,18 @@ fn the_bounds_of_a_key_are_taken_exactly() {
 
 #[test]
 fn letter_case_matters_and_everything_else_is_taken() {
-    let s = Storage::ready();
-    s.put_ok("Report.pdf", b"upper", None);
-    s.put_ok("report.pdf", b"lower", None);
-    assert_got(
-        &s.as_writer(&get(MARKETING, "Report.pdf")),
+    let s = Storage::ready_streams();
+    s.put_ok("Report.pdf", "upper", None);
+    s.put_ok("report.pdf", "lower", None);
+    assert_read(
+        &s.read("Report.pdf"),
         "Report.pdf",
         b"upper",
         "application/pdf",
         "Report.pdf",
     );
-    assert_got(
-        &s.as_writer(&get(MARKETING, "report.pdf")),
+    assert_read(
+        &s.read("report.pdf"),
         "report.pdf",
         b"lower",
         "application/pdf",
@@ -201,7 +201,7 @@ fn letter_case_matters_and_everything_else_is_taken() {
         "x.vibe-y",
         "tab-less ~!@$^*()_+={}|;:,<>?",
     ] {
-        let answer = s.as_writer(&put(MARKETING, key, key.as_bytes(), None));
+        let answer = s.as_writer(&put(MARKETING, key, key, None));
         assert!(
             answer["ok"].is_object(),
             "expected the key {key:?} taken, got {answer}"
@@ -218,15 +218,15 @@ fn letter_case_matters_and_everything_else_is_taken() {
 #[test]
 fn a_file_and_a_folder_of_the_same_name_cannot_both_exist() {
     let s = Storage::ready();
-    s.put_ok("a", b"a file", None);
-    s.put_ok("b/c", b"in a folder", None);
+    s.put_ok("a", "a file", None);
+    s.put_ok("b/c", "in a folder", None);
     let before = tree(&s.place.base);
     for (key, what) in [
         ("a/b", "a key beneath a file"),
         ("a/b/c", "a key two beneath a file"),
         ("b", "a key that is a folder"),
     ] {
-        let (response, answer) = s.one(&wanda(), FILES, &put(MARKETING, key, b"x", None));
+        let (response, answer) = s.one(&wanda(), FILES, &put(MARKETING, key, "x", None));
         assert_eq!(
             answer["error"]["kind"], "key-conflict",
             "{what}: expected {{ error: {{ kind: \"key-conflict\", message }} }}, got {answer}"
@@ -251,9 +251,9 @@ fn a_file_and_a_folder_of_the_same_name_cannot_both_exist() {
     );
     // Gone, the folder makes room for a file, and the file for a folder.
     s.as_writer(&delete(MARKETING, "b/c"));
-    s.put_ok("b", b"now a file", None);
+    s.put_ok("b", "now a file", None);
     s.as_writer(&delete(MARKETING, "a"));
-    s.put_ok("a/b", b"now in a folder", None);
+    s.put_ok("a/b", "now in a folder", None);
 }
 
 /// A list on `prefix`, which must fail `invalid-key` with `rule` (or
@@ -286,7 +286,7 @@ fn list_prefix(s: &Storage, prefix: &str, rule: Option<&str>) -> Value {
 fn a_prefix_is_one_that_with_a_character_after_it_is_a_key_that_is_taken() {
     let s = Storage::ready();
     for key in ["reports/q3.pdf", "报告/a.txt", "x.txt"] {
-        s.put_ok(key, b"x", None);
+        s.put_ok(key, "x", None);
     }
     for prefix in ["", "reports/", "rep", "报告/", "a/", ".", ".."] {
         list_prefix(&s, prefix, None);
@@ -329,7 +329,7 @@ fn a_prefix_is_one_that_with_a_character_after_it_is_a_key_that_is_taken() {
 
 #[test]
 fn reserved_names_are_reserved_in_any_letter_case_and_the_marker_is_untouched() {
-    let s = Storage::ready();
+    let s = Storage::ready_streams();
     let marker = s.dir(MARKETING).join(".vibe-resource");
     let marker_before = std::fs::read(&marker).unwrap();
     let before = tree(&s.place.base);
@@ -343,7 +343,7 @@ fn reserved_names_are_reserved_in_any_letter_case_and_the_marker_is_untouched() 
         for call in [
             head(MARKETING, key),
             get(MARKETING, key),
-            put(MARKETING, key, b"over the marker", None),
+            put(MARKETING, key, "over the marker", None),
             delete(MARKETING, key),
         ] {
             let (response, answer) = s.one(&wanda(), FILES, &call);
@@ -372,9 +372,9 @@ fn reserved_names_are_reserved_in_any_letter_case_and_the_marker_is_untouched() 
     );
     // Without the hyphen they are keys like any other.
     for key in [".vibe", ".VIBEX", "a/.Vibe"] {
-        s.put_ok(key, b"taken", None);
-        assert_got(
-            &s.as_writer(&get(MARKETING, key)),
+        s.put_ok(key, "taken", None);
+        assert_read(
+            &s.read(key),
             key,
             b"taken",
             "application/octet-stream",

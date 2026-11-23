@@ -50,8 +50,8 @@ const json = (value, status = 200) =>
     headers: { "content-type": "application/json" },
   });
 
-// "planted by a hostile Application", in base64.
-const PLANTED = "cGxhbnRlZCBieSBhIGhvc3RpbGUgQXBwbGljYXRpb24=";
+// "planted by a hostile Application": a string body, written as UTF-8.
+const PLANTED = "planted by a hostile Application";
 
 // Arguments no Storage operation has, each naming a place outside.
 const OUTSIDE = { directory: "/etc", path: "/etc/passwd", root: "/", location: { backend: "directory", directory: "/" } };

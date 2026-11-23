@@ -18,17 +18,17 @@ use std::collections::HashSet;
 use blackbox::api::assert_recent_rfc3339;
 use blackbox::scenario::{assert_malformed, assert_refusal, lines};
 use blackbox::storage::{
-    BODY_BOUND, FILES, MARKETING, Storage, assert_got, assert_invalid_key, assert_metadata,
-    assert_not_reachable, assert_ok_metadata, assert_ok_null, assert_pages_hold_the_limit,
-    binary_with, delete, get, head, list, listed_names, mtime, op, place, put, tree, wanda,
+    FILES, MARKETING, Storage, assert_metadata, assert_not_reachable, assert_ok_metadata,
+    assert_ok_null, assert_pages_hold_the_limit, assert_read, binary_with, delete, get, head, list,
+    listed_names, mtime, op, place, put, tree, wanda,
 };
 use serde_json::{Value, json};
 
 #[test]
 fn put_head_get_and_delete_answer_as_the_contract_says() {
-    let s = Storage::ready();
+    let s = Storage::ready_streams();
     let bytes = binary_with("every byte");
-    let written = s.as_writer(&put(MARKETING, "reports/q3.pdf", &bytes, None));
+    let written = s.put_hex_ok("reports/q3.pdf", &bytes, None);
     assert_ok_metadata(
         &written,
         "reports/q3.pdf",
@@ -36,11 +36,7 @@ fn put_head_get_and_delete_answer_as_the_contract_says() {
         "application/pdf",
         "the put",
     );
-    assert_recent_rfc3339(
-        &written["ok"]["last_modified"],
-        120,
-        "the put's last_modified",
-    );
+    assert_recent_rfc3339(&written["last_modified"], 120, "the put's last_modified");
 
     let headed = s.as_writer(&head(MARKETING, "reports/q3.pdf"));
     assert_ok_metadata(
@@ -51,12 +47,12 @@ fn put_head_get_and_delete_answer_as_the_contract_says() {
         "the head",
     );
     assert_eq!(
-        headed["ok"], written["ok"],
+        headed["ok"], written,
         "expected head to answer the metadata the put answered"
     );
-    let got = s.as_writer(&get(MARKETING, "reports/q3.pdf"));
-    assert_got(&got, "reports/q3.pdf", &bytes, "application/pdf", "the get");
-    assert_eq!(got["ok"]["last_modified"], written["ok"]["last_modified"]);
+    let got = s.read("reports/q3.pdf");
+    assert_read(&got, "reports/q3.pdf", &bytes, "application/pdf", "the get");
+    assert_eq!(got["ok"]["last_modified"], written["last_modified"]);
 
     assert_ok_null(
         &s.as_writer(&head(MARKETING, "reports/q4.pdf")),
@@ -93,9 +89,9 @@ fn put_head_get_and_delete_answer_as_the_contract_says() {
 
 #[test]
 fn a_put_replaces_the_file_whole_and_the_last_put_wins() {
-    let s = Storage::ready();
-    s.put_ok("notes/a.txt", &[b'x'; 5000], Some("text/x-first"));
-    let second = s.put_ok("notes/a.txt", b"short", None);
+    let s = Storage::ready_streams();
+    s.put_ok("notes/a.txt", &"x".repeat(5000), Some("text/x-first"));
+    let second = s.put_ok("notes/a.txt", "short", None);
     assert_metadata(
         &second,
         "notes/a.txt",
@@ -103,8 +99,8 @@ fn a_put_replaces_the_file_whole_and_the_last_put_wins() {
         "text/plain; charset=utf-8",
         "the second put",
     );
-    assert_got(
-        &s.as_writer(&get(MARKETING, "notes/a.txt")),
+    assert_read(
+        &s.read("notes/a.txt"),
         "notes/a.txt",
         b"short",
         "text/plain; charset=utf-8",
@@ -114,44 +110,6 @@ fn a_put_replaces_the_file_whole_and_the_last_put_wins() {
         std::fs::read(s.dir(MARKETING).join("notes/a.txt")).unwrap(),
         b"short"
     );
-}
-
-#[test]
-fn a_body_is_standard_base64_with_or_without_padding_and_anything_else_is_malformed() {
-    let s = Storage::ready();
-    for (body, bytes) in [("aGk=", b"hi".as_slice()), ("aGk", b"hi"), ("", b"")] {
-        let answer = s.as_writer(&op(
-            "storage.put",
-            &json!({ "resource": MARKETING, "key": "b.bin", "body": body }),
-        ));
-        assert_ok_metadata(
-            &answer,
-            "b.bin",
-            bytes.len(),
-            "application/octet-stream",
-            body,
-        );
-        assert_eq!(
-            std::fs::read(s.dir(MARKETING).join("b.bin")).unwrap(),
-            bytes
-        );
-    }
-    for body in ["a-_b", "aGk=!", "aG k=", "@@@@", "aGk==="] {
-        let (response, answer) = s.one(
-            &wanda(),
-            FILES,
-            &op(
-                "storage.put",
-                &json!({ "resource": MARKETING, "key": "bad.bin", "body": body }),
-            ),
-        );
-        assert_malformed(&answer, &format!("a body {body:?}"));
-        assert!(
-            s.entries_of(&response).is_empty(),
-            "no entry for a malformed put"
-        );
-    }
-    assert!(!s.dir(MARKETING).join("bad.bin").exists());
 }
 
 #[test]
@@ -166,7 +124,7 @@ fn a_content_type_given_is_kept_as_given() {
         &longest,
         " / ",
     ] {
-        let answer = s.as_writer(&put(MARKETING, "report.pdf", b"x", Some(given)));
+        let answer = s.as_writer(&put(MARKETING, "report.pdf", "x", Some(given)));
         assert_ok_metadata(&answer, "report.pdf", 1, given, given);
         assert_ok_metadata(
             &s.as_writer(&head(MARKETING, "report.pdf")),
@@ -198,7 +156,7 @@ fn a_content_type_of_the_wrong_shape_is_malformed() {
             FILES,
             &op(
                 "storage.put",
-                &json!({ "resource": MARKETING, "key": "c.txt", "body": "eA==", "content_type": given }),
+                &json!({ "resource": MARKETING, "key": "c.txt", "body": "x", "content_type": given }),
             ),
         );
         assert_malformed(&answer, &format!("a content type: {what}"));
@@ -209,7 +167,7 @@ fn a_content_type_of_the_wrong_shape_is_malformed() {
 
 #[test]
 fn without_a_content_type_the_keys_last_extension_gives_it_in_any_letter_case() {
-    let s = Storage::ready();
+    let s = Storage::ready_streams();
     let table = [
         ("a.txt", "text/plain; charset=utf-8"),
         ("a.html", "text/html; charset=utf-8"),
@@ -249,16 +207,16 @@ fn without_a_content_type_the_keys_last_extension_gives_it_in_any_letter_case() 
         ("folder.pdf/inside", "application/octet-stream"),
     ];
     for (key, wanted) in table {
-        let answer = s.as_writer(&put(MARKETING, key, b"x", None));
+        let answer = s.as_writer(&put(MARKETING, key, "x", None));
         assert_ok_metadata(&answer, key, 1, wanted, key);
-        assert_got(&s.as_writer(&get(MARKETING, key)), key, b"x", wanted, key);
+        assert_read(&s.read(key), key, b"x", wanted, key);
     }
 }
 
 #[test]
 fn the_metadata_time_is_the_files_time_of_last_change_to_the_second() {
     let s = Storage::ready();
-    let written = s.put_ok("t.txt", b"time", None);
+    let written = s.put_ok("t.txt", "time", None);
     let file = s.dir(MARKETING).join("t.txt");
     let seconds = blackbox::api::parse_rfc3339(written["last_modified"].as_str().unwrap()).unwrap();
     assert_eq!(
@@ -270,8 +228,8 @@ fn the_metadata_time_is_the_files_time_of_last_change_to_the_second() {
 
 #[test]
 fn arguments_of_the_wrong_shape_are_malformed_with_no_entry_and_nothing_touched() {
-    let s = Storage::ready();
-    s.put_ok("kept.txt", b"kept", None);
+    let s = Storage::ready_streams();
+    s.put_ok("kept.txt", "kept", None);
     let before = tree(&s.place.base);
     let key = |op_name: &str, more: Value| {
         let mut args = more;
@@ -292,27 +250,27 @@ fn arguments_of_the_wrong_shape_are_malformed_with_no_entry_and_nothing_touched(
             ("arguments null", Value::Null),
             (
                 "resource missing",
-                json!({ "key": "kept.txt", "body": "eA==" }),
+                json!({ "key": "kept.txt", "body": "x" }),
             ),
             (
                 "resource a number",
-                json!({ "resource": 1, "key": "kept.txt", "body": "eA==" }),
+                json!({ "resource": 1, "key": "kept.txt", "body": "x" }),
             ),
             (
                 "own given",
-                json!({ "resource": MARKETING, "own": true, "key": "kept.txt", "body": "eA==" }),
+                json!({ "resource": MARKETING, "own": true, "key": "kept.txt", "body": "x" }),
             ),
             (
                 "own false given",
-                json!({ "resource": MARKETING, "own": false, "key": "kept.txt", "body": "eA==" }),
+                json!({ "resource": MARKETING, "own": false, "key": "kept.txt", "body": "x" }),
             ),
             (
                 "as another word",
-                json!({ "resource": MARKETING, "as": "admin", "key": "kept.txt", "body": "eA==" }),
+                json!({ "resource": MARKETING, "as": "admin", "key": "kept.txt", "body": "x" }),
             ),
             (
                 "as a number",
-                json!({ "resource": MARKETING, "as": 1, "key": "kept.txt", "body": "eA==" }),
+                json!({ "resource": MARKETING, "as": 1, "key": "kept.txt", "body": "x" }),
             ),
         ] {
             cases.push((format!("{operation}: {what}"), op(operation, &args)));
@@ -326,15 +284,15 @@ fn arguments_of_the_wrong_shape_are_malformed_with_no_entry_and_nothing_touched(
     ] {
         cases.push((
             format!("{operation}: key missing"),
-            key(operation, json!({ "body": "eA==" })),
+            key(operation, json!({ "body": "x" })),
         ));
         cases.push((
             format!("{operation}: key a number"),
-            key(operation, json!({ "key": 5, "body": "eA==" })),
+            key(operation, json!({ "key": 5, "body": "x" })),
         ));
         cases.push((
             format!("{operation}: key null"),
-            key(operation, json!({ "key": null, "body": "eA==" })),
+            key(operation, json!({ "key": null, "body": "x" })),
         ));
     }
     cases.push((
@@ -386,8 +344,8 @@ fn arguments_of_the_wrong_shape_are_malformed_with_no_entry_and_nothing_touched(
     }
     assert_eq!(records.host_calls().len(), cases.len());
     assert_eq!(tree(&s.place.base), before, "expected nothing touched");
-    assert_got(
-        &s.as_writer(&get(MARKETING, "kept.txt")),
+    assert_read(
+        &s.read("kept.txt"),
         "kept.txt",
         b"kept",
         "text/plain; charset=utf-8",
@@ -409,8 +367,8 @@ fn a_cursor_is_good_only_for_the_list_of_this_resource_prefix_and_delimiter() {
         ],
     );
     for key in ["a/1", "a/2", "a/3", "b/1"] {
-        s.put_ok(key, b"x", None);
-        s.one(&wanda(), "both", &put("other", key, b"x", None));
+        s.put_ok(key, "x", None);
+        s.one(&wanda(), "both", &put("other", key, "x", None));
     }
     let first = s.as_writer(&list(MARKETING, &json!({ "prefix": "a/", "limit": 1 })));
     let cursor = first["ok"]["cursor"].as_str().unwrap().to_owned();
@@ -458,7 +416,7 @@ fn a_cursor_is_good_only_for_the_list_of_this_resource_prefix_and_delimiter() {
 #[test]
 fn as_user_is_taken_and_as_application_is_not_own_database() {
     let s = Storage::ready();
-    let mut args = json!({ "resource": MARKETING, "key": "u.txt", "as": "user", "body": "eA==" });
+    let mut args = json!({ "resource": MARKETING, "key": "u.txt", "as": "user", "body": "x" });
     assert_ok_metadata(
         &s.as_writer(&op("storage.put", &args)),
         "u.txt",
@@ -490,7 +448,7 @@ fn as_user_is_taken_and_as_application_is_not_own_database() {
 fn arguments_an_operation_does_not_have_are_ignored() {
     let s = Storage::ready();
     let extra = json!({
-        "resource": MARKETING, "key": "x.txt", "body": "eA==",
+        "resource": MARKETING, "key": "x.txt", "body": "x",
         "sql": "drop table x", "params": [1], "values": "text", "tx": "t",
         "directory": "/etc", "user": "it-admin", "limit": 3, "prefix": "zzz",
     });
@@ -524,22 +482,17 @@ fn arguments_an_operation_does_not_have_are_ignored() {
 #[test]
 fn failures_come_in_their_order() {
     let s = Storage::ready();
-    s.install(
-        "bodies",
-        "storage-bodies.js",
-        &[(MARKETING, "storage", "write")],
-    );
     let dir = s.dir(MARKETING);
     std::os::unix::fs::symlink(s.place.outside(), dir.join("etc")).unwrap();
-    // malformed before a refusal: a User with no Grant, a body that is not
-    // base64.
+    // malformed before a refusal: a User with no Grant, a body that is none
+    // of the four.
     let answer = s
         .one(
             &blackbox::storage::nobody(),
             FILES,
             &op(
                 "storage.put",
-                &json!({ "resource": MARKETING, "key": "../x", "body": "@" }),
+                &json!({ "resource": MARKETING, "key": "../x", "body": 5 }),
             ),
         )
         .1;
@@ -552,34 +505,8 @@ fn failures_come_in_their_order() {
         answer["refused"]["refusal"]["reason"], "no-grant",
         "expected a refusal before the key is looked at, got {answer}"
     );
-    // invalid-key before limit bytes: a body one byte over the bound.
-    let made = |key: &str| {
-        s.post(
-            &wanda(),
-            "bodies",
-            "/put-made",
-            &json!({ "resource": MARKETING, "key": key, "size": BODY_BOUND + 1, "byte": 66 }),
-        )
-        .1["answer"]
-            .clone()
-    };
-    assert_invalid_key(
-        &made("../x"),
-        "dot-segment",
-        "a bad key and a body too large",
-    );
-    // limit bytes before the directory: a key through a link.
-    let answer = made("etc/x");
-    assert_eq!(
-        (
-            answer["error"]["kind"].as_str(),
-            answer["error"]["limit"].as_str()
-        ),
-        (Some("limit"), Some("bytes")),
-        "expected `limit` `bytes` before the directory is looked at, got {answer}"
-    );
     // A get or head of a folder is not-a-file, not null.
-    s.put_ok("folder/file.txt", b"f", None);
+    s.put_ok("folder/file.txt", "f", None);
     for call in [get(MARKETING, "folder"), head(MARKETING, "folder")] {
         assert_not_reachable(
             &s.as_writer(&call),
@@ -607,7 +534,7 @@ fn list_answers_keys_in_the_byte_order_of_their_utf8() {
     let s = Storage::ready();
     let keys = ["é", "a0", "a/b", "a.b/x", "a-b", "Z", "a/c/d", "b"];
     for key in keys {
-        s.put_ok(key, key.as_bytes(), None);
+        s.put_ok(key, key, None);
     }
     let listed = s.as_writer(&list(MARKETING, &json!({})));
     let ok = &listed["ok"];
@@ -659,7 +586,7 @@ fn with_the_delimiter_keys_roll_up_into_folders_listed_once_in_byte_order_with_t
         "top.txt",
         "Zed/x",
     ] {
-        s.put_ok(key, b"x", None);
+        s.put_ok(key, "x", None);
     }
     let root = s.as_writer(&list(MARKETING, &json!({ "delimiter": "/" })));
     let (files, folders) = listed_names(&root["ok"]);
@@ -738,7 +665,7 @@ fn the_limit_is_100_without_it_and_a_page_holds_at_most_limit() {
 fn a_cursor_answers_the_next_page_also_when_files_were_put_and_deleted_meanwhile() {
     let s = Storage::ready();
     for key in ["b", "d", "f", "h", "j", "l"] {
-        s.put_ok(key, b"x", None);
+        s.put_ok(key, "x", None);
     }
     // Pages of at most 2 until `d` is answered (a page may be short).
     let mut seen: Vec<String> = Vec::new();
@@ -765,9 +692,9 @@ fn a_cursor_answers_the_next_page_also_when_files_were_put_and_deleted_meanwhile
     let before = seen.len();
     let last = seen.last().unwrap().clone();
     // Meanwhile: put behind the cursor and ahead of it, delete ahead.
-    s.put_ok("a", b"x", None);
-    s.put_ok("c", b"x", None);
-    s.put_ok("e", b"x", None);
+    s.put_ok("a", "x", None);
+    s.put_ok("c", "x", None);
+    s.put_ok("e", "x", None);
     s.as_writer(&delete(MARKETING, "f"));
     s.as_writer(&delete(MARKETING, "d"));
     while let Some(c) = cursor {
@@ -818,7 +745,7 @@ fn a_cursor_answers_the_next_page_also_when_files_were_put_and_deleted_meanwhile
 fn a_folder_answered_on_one_page_is_not_answered_again_on_the_next() {
     let s = Storage::ready();
     for key in ["a.txt", "b/1", "b/2", "b/3", "c.txt", "d/1"] {
-        s.put_ok(key, b"x", None);
+        s.put_ok(key, "x", None);
     }
     // Pages of at most 2 until `b/` is answered (a page may be short).
     let mut seen: Vec<String> = Vec::new();
@@ -840,8 +767,8 @@ fn a_folder_answered_on_one_page_is_not_answered_again_on_the_next() {
         assert!(cursor.is_some(), "more follow `b/`, so a cursor: {seen:?}");
     }
     // A file put meanwhile in the folder already answered.
-    s.put_ok("b/0", b"x", None);
-    s.put_ok("b/9", b"x", None);
+    s.put_ok("b/0", "x", None);
+    s.put_ok("b/9", "x", None);
     while cursor.is_some() {
         let (names, next) = page_of(&cursor);
         seen.extend(names);
@@ -858,7 +785,7 @@ fn a_folder_answered_on_one_page_is_not_answered_again_on_the_next() {
 #[test]
 fn the_platforms_own_names_are_never_listed() {
     let s = Storage::ready();
-    s.put_ok("a.txt", b"x", None);
+    s.put_ok("a.txt", "x", None);
     for args in [
         json!({}),
         json!({ "delimiter": "/" }),
