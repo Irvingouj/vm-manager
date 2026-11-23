@@ -166,6 +166,7 @@ pub mod history_reading;
 pub mod history_rewrite;
 pub mod history_shipping;
 pub mod history_structure;
+pub mod host_call;
 pub mod http;
 pub mod install;
 pub mod left_behind;

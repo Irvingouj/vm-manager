@@ -3238,3 +3238,38 @@ From this ticket on the template's `AGENTS.md` names `ctx.user().storage(name)` 
 - Hard links planted on the host are read as files (ADR 0019).
 - A file someone on the host writes in place while an Application reads it is outside the platform's promise: what the Application reads may be a mix of what was there, and if the file becomes shorter than it was when opened the stream fails — it is never ended as if whole. Files are placed whole by renaming them into the directory, as the platform itself does.
 - The local loop on Windows (keys with `:`, `*`, `?`, `"`, `<`, `>`, `|`, or ending with `.` or a space, which Windows cannot name): the ticket on the three systems.
+
+## A host call's arguments are bounded (ticket: A host call's arguments are not bounded: 24 requests of large calls take 870 MB before any operation runs)
+
+A host call is `env.VM.invoke(operation, args)` ("The raw host interface"), which everything of the SDK goes through. The host takes a copy of `args` and keeps it until the call is answered. Before this ticket nothing bounded that copy's size, nor how many of them the host kept at once: one string in the Application's memory, given to a thousand calls that wait, was a thousand copies in the program.
+
+### The size of a call's arguments
+
+- It is the number of bytes of `JSON.stringify(args)` as UTF-8; or, when that is more, 32 bytes for each value in `args`: each string, number, boolean, `null`, array and object, and each key of an object. (So `{ "resource": "devops", "sql": "select 1" }` is 38 bytes by its text and 160 by its five values, and counts as 160; arguments made of many small values count for more than their text, as they take more of the program.) Arguments not given (`undefined`) are of size 0.
+- **A put's `body` is not arguments.** Whatever kind it is (a stream, bytes, a string), it reaches the host as a body does, in pieces of at most 64 KiB, and counts as a body ("Storage", "Bounds"): a put of a string of 20 MiB writes its 20 MiB as UTF-8, as before this ticket. What the platform's glue hands the host for it counts for at most 128 KiB, whatever the body (a short string may travel with the arguments). A put of a string of more than 64 KiB holds one of its request's 16 streams of its own while it runs, as a put of bytes does.
+
+### The bounds
+
+- **One call: at most 8 MiB** (8,388,608; exactly that is taken). A larger one is answered `{ error: { kind: "limit", limit: "arguments" } }`.
+- **One request: at most 16 MiB in its calls not yet answered, and at most 1,024 calls not yet answered.** A call that would pass the first is answered `{ error: { kind: "limit", limit: "arguments" } }`; one that would pass the second, `{ error: { kind: "limit", limit: "calls" } }`.
+- **The program: at most 256 MiB in the calls not yet answered of all requests.** A call that would pass it is answered `{ error: { kind: "unavailable" } }`.
+- A call counts from the moment it is made until the host has let go of its arguments, and then no longer: that is when the call is answered, or, for a call whose request ended first, when the operation under way has ended (it is not cut: at most its own time). So a request may make any number of calls one after another, each of 8 MiB, and any number at once that the host answers at once (a refusal that needs no Operation log entry, a malformed call, an operation the host does not know).
+- Each of the three is answered at once, never waited for, and is decided before anything else about the call: whatever the operation's name, known to the host or not, with or without a request in flight. Nothing of the operation runs, nothing reaches a database or a Storage Resource, and the call has **no Operation log entry** (as a malformed call has none). The program's log has its `host-call` record: `refused`, with the reason `limit` for the first two bounds and `unavailable` for the program's.
+- A call past a bound does not end the request and does not count against it afterwards: the code may catch the answer and go on, and its next call within the bounds is served.
+- The bounds are the same in the local run (`vibe dev`, `vibe request`).
+- Through the SDK such an answer is the error any other `limit` or `unavailable` is ("The SDK"); the SDK adds nothing.
+
+### Memory
+
+A test may measure the program's resident memory.
+
+- **What the host keeps for a request's calls is what is counted, not a multiple of it.** One request that gives the same string of 1 MiB to four hundred calls that wait (a `query` that sleeps; a request's CPU time does not allow many more of that size) has as many of them under way as its 16 MiB take and the others answered `limit`; the program's memory does not grow by more than 128 MiB for that request, where before this ticket it grew by more than 1 GiB.
+- **A call too large is not copied.** The call's size is known from the Application's own memory, before any copy of it is made on the host's side; a hostile Application that makes calls of 20 MiB as fast as it can, in every request it is given, makes the program hold nothing for them beyond what the Application's own memory is allowed (64 MiB of heap for each request in flight).
+- Many small values are not a way round: arguments of two million `0`s (4 MiB of text, 64 MiB by their values) are refused as too large without the program having built them.
+
+### What this does not close
+
+- **What a request's own memory may hold**: 64 MiB of heap for each request in flight. A request that builds large strings takes that much of the program whether or not it makes a call; the ticket "Limits per request".
+- **Other ways the Application's code reaches the host with a value of its own size** (a printed line, a response's headers, timers, the natives of the runtime the platform does not serve): the tickets "Limits per request" and "No argument and no native of the runtime lets an Application stop the program", where what was read of them for this ticket is recorded.
+- **A share for each Application of the program's 256 MiB**: it is first come, as the open files of Storage are; the ticket "Resources and Grants in full".
+- The bounds are fixed numbers of the program; making them settable is the ticket "Limits per request".
