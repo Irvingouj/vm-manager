@@ -45,6 +45,11 @@ tracing = "0.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
+# The counting scan of a host call's arguments (vendor/VENDORED.md,
+# patch 17): finding a string's end in its contents, without a look at
+# any other byte. Already in the tree through the host's other crates.
+memchr = "2.8"
+
 # V8 serialization (for automatic Rust <-> JS type conversion)
 serde_v8 = { package = "openworkers-serde-v8", version = "152.2.2" }
 

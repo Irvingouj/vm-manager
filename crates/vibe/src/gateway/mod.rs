@@ -3,11 +3,16 @@
 //!
 //! Interface: [`Gateway::operate`], called by the Request runner's host
 //! side synchronously, inside the Application's call, with the request in
-//! flight read at that moment and whether it is still in flight. It answers
-//! a [`Decision`]: the refusal's reason, if refused, for the program's
-//! `host-call` record (written at once, by the caller), and the answer
-//! Application code will receive, as a future. Who is asking is never read
-//! from anything the Application passes.
+//! flight read at that moment, whether it is still in flight, and the
+//! call's arguments' size as the native measured them
+//! (vendor/VENDORED.md, patch 17). The bounds on what the request and the
+//! program hold of calls not yet answered are decided first
+//! ([`calls`], blackbox/CONTRACT.md, "A host call's arguments are
+//! bounded"), then the operation. It answers a [`Decision`]: the
+//! refusal's reason, if refused, for the program's `host-call` record
+//! (written at once, by the caller), and the answer Application code will
+//! receive, as a future. Who is asking is never read from anything the
+//! Application passes.
 //!
 //! Operations: `whoami`, and `query` (needs `read`; a read-only
 //! transaction) and `execute` (needs `write`; a read-write transaction),
@@ -75,9 +80,12 @@ use tokio::runtime::Handle;
 use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio::task::JoinSet;
 
+mod calls;
 mod storage;
 mod transaction;
 
+pub(crate) use calls::{Guard, Took};
+pub use calls::{ProgramCalls, RequestCalls, WORD_BYTES, WORD_CALLS, WORD_PROGRAM};
 pub use transaction::{CAP, PER_REQUEST, Transactions};
 
 use crate::check;
@@ -120,6 +128,14 @@ pub const APPLICATION_DISABLED: &str = "application-disabled";
 /// a refusal Application code receives: it gets `{ error: { kind:
 /// "malformed" } }`.
 pub const MALFORMED: &str = "malformed";
+/// The `host-call` record's reason for a call past one of the bounds on
+/// a call's arguments (blackbox/CONTRACT.md, "A host call's arguments are
+/// bounded"). Not a refusal Application code receives: it gets `{ error:
+/// { kind: "limit", limit: ... } }`.
+pub const LIMIT: &str = "limit";
+/// The record's reason for a call that would pass the program's bound.
+/// Application code receives `{ error: { kind: "unavailable" } }`.
+pub const UNAVAILABLE: &str = "unavailable";
 
 impl Refusal {
     fn new(reason: &'static str, fix: String) -> Self {
@@ -352,6 +368,31 @@ fn malformed(problem: &str) -> Decision {
     }
 }
 
+/// A call that would pass one of its request's bounds
+/// (blackbox/CONTRACT.md, "A host call's arguments are bounded"):
+/// `{ error: { kind: "limit", limit: which } }`, answered at once, with
+/// no Operation log entry; the `host-call` record says `limit`.
+fn call_limit(which: &'static str) -> Decision {
+    Decision {
+        refused: Some(LIMIT),
+        answer: Box::pin(std::future::ready(error_to_wire(
+            json!({ "kind": "limit", "limit": which }),
+        ))),
+    }
+}
+
+/// A call that would pass the program's: `{ error: { kind: "unavailable" } }`,
+/// answered at once, with no Operation log entry; the record says
+/// `unavailable`.
+fn call_unavailable() -> Decision {
+    Decision {
+        refused: Some(UNAVAILABLE),
+        answer: Box::pin(std::future::ready(error_to_wire(
+            json!({ "kind": "unavailable" }),
+        ))),
+    }
+}
+
 /// An id that is not an open transaction of the request in flight: the same
 /// answer whatever the reason, and no Operation log entry. The `host-call`
 /// record says `no-transaction`.
@@ -426,14 +467,29 @@ impl Decision {
 /// Decides and runs the operations Application code asks for.
 pub trait Gateway: Send + Sync {
     /// One operation, for the request that `in_flight` is; `active` says
-    /// whether it is still in flight. Must decide without waiting.
+    /// whether it is still in flight, and `size` is the call's
+    /// arguments' bytes as the native measured them
+    /// (vendor/VENDORED.md, patch 17) — 0 for arguments not given. Must
+    /// decide without waiting, and first against the request's and the
+    /// program's bounds on calls not yet answered
+    /// (blackbox/CONTRACT.md, "A host call's arguments are bounded").
     fn operate(
         &self,
         in_flight: &Arc<InFlight>,
         active: bool,
         operation: &str,
         args: Value,
+        size: u64,
     ) -> Decision;
+
+    /// The program's count of host calls not yet answered, when this
+    /// gateway keeps one: asked once per request by the engine, to be
+    /// asked before a call's arguments are copied or parsed
+    /// (vendor/VENDORED.md, patch 17). `None` when the gateway holds
+    /// nothing, and then no call is refused before it is read.
+    fn held_calls(&self) -> Option<Arc<ProgramCalls>> {
+        None
+    }
 }
 
 /// Operations under way at once; past it an operation waits to start.
@@ -478,6 +534,10 @@ pub struct PlatformGateway {
     own: Arc<OwnDatabases>,
     log: Arc<OperationLog>,
     operations: Arc<Operations>,
+    /// The bytes of the host calls not yet answered of all requests
+    /// (blackbox/CONTRACT.md, "A host call's arguments are bounded"): the
+    /// program's 256 MiB.
+    held: Arc<ProgramCalls>,
 }
 
 impl PlatformGateway {
@@ -500,6 +560,7 @@ impl PlatformGateway {
                 tasks: Mutex::new(JoinSet::new()),
                 permits: Arc::new(Semaphore::new(OPERATIONS_AT_ONCE)),
             }),
+            held: Arc::new(ProgramCalls::default()),
         }
     }
 
@@ -509,6 +570,7 @@ impl PlatformGateway {
         in_flight: &Arc<InFlight>,
         active: bool,
         args: &Value,
+        held: Option<Guard>,
     ) -> Decision {
         let call = match Call::read(args) {
             Ok(call) => call,
@@ -517,12 +579,12 @@ impl PlatformGateway {
             Err(problem) => return malformed(problem),
         };
         let target = match call.target {
-            Target::Tx(id) => return self.in_transaction(kind, in_flight, active, id, call),
+            Target::Tx(id) => return self.in_transaction(kind, in_flight, active, id, call, held),
             target => target,
         };
         let actor = call.actor;
         let (on, refusal) = self.decide(kind.needed(), actor, target, in_flight, active);
-        let work = self.work(kind, in_flight, active, actor, on, call, refusal);
+        let work = self.work(kind, in_flight, active, actor, on, call, refusal, held);
         if !active {
             // Refused (`no-request` comes first). Answered at once: the
             // runtime may not settle a call made while no event runs, as
@@ -546,6 +608,7 @@ impl PlatformGateway {
         active: bool,
         id: &str,
         call: Call<'_>,
+        held: Option<Guard>,
     ) -> Decision {
         // A transaction belongs to the request in flight; with none, there
         // is nothing to look it up in.
@@ -569,7 +632,16 @@ impl PlatformGateway {
         let (on, refusal) = self.decide(needed, found.actor, target, in_flight, active);
         let work = Work {
             transaction: Some(Arc::clone(&found.id)),
-            ..self.work(kind, in_flight, active, found.actor, on, call, refusal)
+            ..self.work(
+                kind,
+                in_flight,
+                active,
+                found.actor,
+                on,
+                call,
+                refusal,
+                held,
+            )
         };
         if let Some(refusal) = &work.refusal {
             let refused = Some(refusal.reason);
@@ -584,7 +656,13 @@ impl PlatformGateway {
     /// `tx.begin`: decided like an operation needing its `access` on its
     /// target; then, within the request's bound on open transactions, a
     /// task of its own takes a connection and begins it.
-    fn begin(&self, in_flight: &Arc<InFlight>, active: bool, args: &Value) -> Decision {
+    fn begin(
+        &self,
+        in_flight: &Arc<InFlight>,
+        active: bool,
+        args: &Value,
+        held: Option<Guard>,
+    ) -> Decision {
         let begin = match Begin::read(args) {
             Ok(begin) => begin,
             Err(_) if !active => return Decision::refused(&Refusal::no_request()),
@@ -604,6 +682,7 @@ impl PlatformGateway {
             refusal,
             transaction: None,
             history: None,
+            _held: held,
             log: Arc::clone(&self.log),
             own: Arc::clone(&self.own),
         };
@@ -659,8 +738,19 @@ impl PlatformGateway {
     }
 
     /// `tx.commit` (`commit`) or `tx.rollback`: handed to the transaction's
-    /// task, after the statements made before it.
-    fn end(&self, in_flight: &Arc<InFlight>, active: bool, args: &Value, commit: bool) -> Decision {
+    /// task, after the statements made before it. The call's guard does
+    /// not travel: only the transaction's id does, so the host has let
+    /// go of the call's arguments when this returns, and the call stops
+    /// counting then, as the contract has it.
+    fn end(
+        &self,
+        in_flight: &Arc<InFlight>,
+        active: bool,
+        args: &Value,
+        // Dropped when this returns, unread: the call stops counting then.
+        _held: Option<Guard>,
+        commit: bool,
+    ) -> Decision {
         let id = match args.as_object().and_then(|args| args.get("tx")) {
             Some(Value::String(id)) => id,
             _ if !active => return Decision::refused(&Refusal::no_request()),
@@ -684,7 +774,13 @@ impl PlatformGateway {
     /// `history` (blackbox/CONTRACT.md, "Reading: the operation `history`"):
     /// decided as a `query` on the own database is; then, in a task of its
     /// own, logged, and the history read ([`OwnDatabases::read_history`]).
-    fn history(&self, in_flight: &Arc<InFlight>, active: bool, args: &Value) -> Decision {
+    fn history(
+        &self,
+        in_flight: &Arc<InFlight>,
+        active: bool,
+        args: &Value,
+        held: Option<Guard>,
+    ) -> Decision {
         let (actor, read) = match read_history(args) {
             Ok(read) => read,
             Err(_) if !active => return Decision::refused(&Refusal::no_request()),
@@ -705,6 +801,7 @@ impl PlatformGateway {
             refusal,
             transaction: None,
             history: Some(Box::new(read)),
+            _held: held,
             log: Arc::clone(&self.log),
             own: Arc::clone(&self.own),
         };
@@ -862,6 +959,7 @@ impl PlatformGateway {
         target: On,
         call: Call<'_>,
         refusal: Option<Refusal>,
+        held: Option<Guard>,
     ) -> Work {
         let (sql, params) = match refusal {
             // Copied: sent from another thread, after the call.
@@ -881,6 +979,7 @@ impl PlatformGateway {
             refusal,
             transaction: None,
             history: None,
+            _held: held,
             log: Arc::clone(&self.log),
             own: Arc::clone(&self.own),
         }
@@ -999,19 +1098,40 @@ impl Gateway for PlatformGateway {
         active: bool,
         operation: &str,
         args: Value,
+        size: u64,
     ) -> Decision {
+        // The bounds on what the request and the program hold of calls not
+        // yet answered (blackbox/CONTRACT.md, "A host call's arguments are
+        // bounded"), decided first, before anything else about the call:
+        // whatever the operation's name, known to the host or not. The
+        // call's own bound the native decided before anything of it was
+        // copied (vendor/VENDORED.md, patch 17). With no request in flight
+        // too: code that runs while its script loads can make as many calls
+        // as code in a request can, and a refusal that has an Operation log
+        // entry keeps its arguments until the entry is written.
+        let held = match in_flight.calls.take(&self.held, size) {
+            // The guard travels with the call's arguments: into the work
+            // below, and so into the future that waits for a permit and
+            // the task that runs the operation, which outlives a request
+            // that ended. A call answered at once drops it here, holding
+            // nothing after it returns.
+            Took::Taken(guard) => Some(guard),
+            Took::Calls => return call_limit("calls"),
+            Took::Bytes => return call_limit("arguments"),
+            Took::Program => return call_unavailable(),
+        };
         if let Some(op) = storage::Op::of(operation) {
             // Owned: a put's body is moved on, never copied.
-            return self.storage(op, in_flight, active, args);
+            return self.storage(op, in_flight, active, args, held);
         }
         let args = &args;
         match operation {
-            "query" => self.on_database(Kind::Query, in_flight, active, args),
-            "execute" => self.on_database(Kind::Execute, in_flight, active, args),
-            "history" => self.history(in_flight, active, args),
-            "tx.begin" => self.begin(in_flight, active, args),
-            "tx.commit" => self.end(in_flight, active, args, true),
-            "tx.rollback" => self.end(in_flight, active, args, false),
+            "query" => self.on_database(Kind::Query, in_flight, active, args, held),
+            "execute" => self.on_database(Kind::Execute, in_flight, active, args, held),
+            "history" => self.history(in_flight, active, args, held),
+            "tx.begin" => self.begin(in_flight, active, args, held),
+            "tx.commit" => self.end(in_flight, active, args, held, true),
+            "tx.rollback" => self.end(in_flight, active, args, held, false),
             _ if !active => Decision::refused(&Refusal::no_request()),
             _ if in_flight.stop.is_stopped() => Decision::refused(&Refusal::application_disabled()),
             // Nothing the Application passes is read: who is asking is the
@@ -1024,6 +1144,14 @@ impl Gateway for PlatformGateway {
             }))),
             other => Decision::refused(&Refusal::unknown_operation(other)),
         }
+    }
+
+    /// The program's count of host calls not yet answered
+    /// (blackbox/CONTRACT.md, "A host call's arguments are bounded"),
+    /// for the engine to ask before a call's arguments are copied or
+    /// parsed (vendor/VENDORED.md, patch 17).
+    fn held_calls(&self) -> Option<Arc<ProgramCalls>> {
+        Some(Arc::clone(&self.held))
     }
 }
 
@@ -1374,6 +1502,12 @@ struct Work {
     transaction: Option<Arc<str>>,
     /// What a `history` reads; `None` for every other operation.
     history: Option<Box<HistoryRead>>,
+    /// The call's place among what its request and the program hold of
+    /// calls not yet answered (blackbox/CONTRACT.md, "A host call's
+    /// arguments are bounded"): read by no one, only held — given back
+    /// when this work, with the call's arguments, is let go of, here or
+    /// in the task that runs it.
+    _held: Option<Guard>,
     log: Arc<OperationLog>,
     own: Arc<OwnDatabases>,
 }

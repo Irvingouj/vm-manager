@@ -260,7 +260,12 @@
                     throw new TypeError('invoke: the command is not a string');
                 }
 
-                __nativeBindingInvoke(name, command, args === undefined ? null : args, resolve, reject);
+                // Patched (vendor/VENDORED.md, patch 17): arguments not
+                // given pass as they are, so the native sees them as
+                // `undefined` — of size 0 to the host — instead of `null`,
+                // a value like any other. Both become `null` on the
+                // host's side, as before.
+                __nativeBindingInvoke(name, command, args, resolve, reject);
             }),
         }),
 

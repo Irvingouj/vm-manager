@@ -86,7 +86,12 @@ function padOf(length, multibyte) {
       padBytes = 0;
     }
     padBytes += length;
-    if (multibyte) {
+    if (multibyte === "lone") {
+      // A lone surrogate is written by JSON.stringify as \ud800: 6 bytes.
+      const unit = "\ud800a"; // 7 bytes of text
+      const units = Math.floor(length / 7);
+      s = unit.repeat(units) + "a".repeat(length - units * 7);
+    } else if (multibyte) {
       const unit = "€é\u{1F600}a"; // 3 + 2 + 4 + 1 bytes
       const units = Math.floor(length / 10);
       s = unit.repeat(units) + "a".repeat(length - units * 10);
@@ -133,7 +138,7 @@ function build(spec) {
   const overhead = utf8(JSON.stringify(withPad("")));
   const length = p.bytes - overhead;
   if (length < 0) throw new Error("the arguments are larger than " + p.bytes + " bytes without the pad");
-  const args = withPad(padOf(length, !!p.multibyte));
+  const args = withPad(padOf(length, p.multibyte));
   return args;
 }
 
@@ -206,6 +211,78 @@ globalThis.default = {
       if (body.awaitHeld) out.heldAll = await Promise.all(promises);
       out.after = await sequential(body.after);
       return json(out);
+    }
+
+    if (url.pathname === "/getter") {
+      // A call made from a getter that JSON.stringify runs while it reads
+      // another call's arguments. The getter may run more than once.
+      const pad = (big) => ({ pad: "a".repeat(big ? 8 * 1024 * 1024 : 5) });
+      const inners = [];
+      const outerArgs = {
+        get g() {
+          inners.push(
+            Promise.resolve(env.VM.invoke("nonesuch", pad(body.inner === "big"))).then(
+              (answer) => ({ answer }),
+              (e) => ({ threw: message(e) }),
+            ),
+          );
+          return 1;
+        },
+        ...pad(body.outer === "big"),
+      };
+      let outer;
+      try {
+        outer = { answer: await env.VM.invoke("nonesuch", outerArgs) };
+      } catch (e) {
+        outer = { threw: message(e) };
+      }
+      return json({ outer, inners: await Promise.all(inners), startedAt });
+    }
+
+    if (url.pathname === "/abandon") {
+      // Starts calls and answers at once, without awaiting them. With `tx`,
+      // inside a transaction left open (begun, statements queued, no commit).
+      let txid;
+      if (body.tx) {
+        const began = await env.VM.invoke("tx.begin", { own: true, as: "application", access: "write" });
+        txid = began.ok && began.ok.tx;
+        if (!txid) return json({ began, startedAt });
+      }
+      for (const c of expand(body.held)) {
+        const args = build(c.spec);
+        if (txid) {
+          delete args.own;
+          delete args.as;
+          args.tx = txid;
+        }
+        Promise.resolve(env.VM.invoke(c.op, args)).catch(() => {});
+      }
+      return json({ abandoned: true, tx: !!txid, startedAt });
+    }
+
+    if (url.pathname === "/native") {
+      // The runtime's own natives, called past the raw interface.
+      if (body.probe) {
+        const names = Object.getOwnPropertyNames(globalThis).filter((n) => n.startsWith("__"));
+        return json({ names: names.map((n) => [n, typeof globalThis[n]]), envKeys: Object.keys(env), vmKeys: Object.getOwnPropertyNames(env.VM) });
+      }
+      const f = globalThis.__nativeBindingInvoke;
+      const results = [];
+      const args = { pad: "a".repeat(body.bytes - 10) };
+      for (let i = 0; i < body.count; i++) {
+        results.push(
+          await new Promise((resolve) => {
+            const timer = setTimeout(() => resolve({ pending: true }), 2000);
+            try {
+              f(body.binding, "nonesuch", args, (v) => { clearTimeout(timer); resolve({ resolved: v }); }, (e) => { clearTimeout(timer); resolve({ rejected: message(e) }); });
+            } catch (e) {
+              clearTimeout(timer);
+              resolve({ threw: message(e) });
+            }
+          }),
+        );
+      }
+      return json({ results: results.slice(0, 3), distinct: [...new Set(results.map((r) => JSON.stringify(r)))].slice(0, 5), count: results.length });
     }
 
     if (url.pathname === "/leave") {

@@ -545,6 +545,7 @@ impl Ingress {
             transactions: Transactions::default(),
             collected: Collected::default(),
             bodies: std::sync::Arc::new(crate::storage::bodies::Bodies::default()),
+            calls: std::sync::Arc::new(crate::gateway::RequestCalls::default()),
             // The request's stated length: a put of its own body checks
             // the file's bound against it before a byte is read.
             content_length: stated_length,

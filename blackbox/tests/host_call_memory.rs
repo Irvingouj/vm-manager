@@ -205,3 +205,59 @@ fn calls_of_two_million_zeros_made_as_fast_as_can_be_in_several_requests_make_th
         rose / MIB as u64
     );
 }
+
+#[test]
+fn the_runtimes_own_binding_call_with_arguments_past_the_bound_ends_nothing_and_holds_nothing() {
+    // `__nativeBindingInvoke(binding, operation, args, resolve, reject)`
+    // called past the raw interface, a hundred times with arguments of
+    // 8 MiB and a byte, under the binding of the raw interface and under
+    // a name made up. The contract promises only: the request goes on
+    // (it is answered), nothing runs (no Operation log entry), and the
+    // program holds nothing for them. What each call answers is shown in
+    // the failure message and not asserted.
+    let h = Calls::start();
+    warm(&h);
+    for binding in ["VM", "NOSUCH"] {
+        let before_log = h.log_len();
+        let (answer, rose) = rise(&h, || {
+            h.post(
+                "/native",
+                &json!({ "binding": binding, "count": 100, "bytes": 8 * MIB + 1 }),
+            )
+        });
+        let (response, body) = answer;
+        eprintln!(
+            "MEASURED native binding {binding}: rose {} MiB, answers {}",
+            rose / MIB as u64,
+            short(&body["distinct"])
+        );
+        assert_eq!(
+            body["count"],
+            json!(100),
+            "{binding}: expected the request to go on through all its hundred calls and answer, got {}",
+            short(&body)
+        );
+        assert_eq!(
+            h.log_len(),
+            before_log,
+            "{binding}: expected no Operation log entry"
+        );
+        assert!(
+            h.own.entries_of(&response).is_empty(),
+            "{binding}: expected nothing to have run"
+        );
+        assert!(
+            rose <= 128 * MIB as u64,
+            "{binding}: expected the program's memory to rise by no more than 128 MiB for a hundred calls of 8 MiB and a byte (what they answered: {}), it rose by {} MiB",
+            short(&body["distinct"]),
+            rose / MIB as u64
+        );
+        // The program serves on.
+        let (_, results) = h.seq(&[call("whoami", json!({ "undefined": true }))]);
+        assert!(
+            results[0]["answer"]["ok"].is_object(),
+            "{}",
+            short(&results[0])
+        );
+    }
+}

@@ -212,7 +212,7 @@ fn a_call_past_the_bound_has_no_operation_log_entry_a_refused_record_and_the_req
     let before = h.log_len();
     let (response, results) = h.seq(&[
         sized("nonesuch", CALL_BOUND + 1),
-        quick(64),
+        quick(1024),
         // A known operation that would have an entry, were it decided.
         padded(
             "query",
@@ -270,14 +270,18 @@ fn a_call_past_the_bound_has_no_operation_log_entry_a_refused_record_and_the_req
         2,
         "expected two `host-call` records `refused` with reason `limit` (one a call of `nonesuch`, one of `query`), got\n{refused:?}"
     );
-    // Refused for the size, not for the name: the unknown-operation reason
-    // is not on the record of a call past the bound.
-    assert!(
-        refused
-            .iter()
-            .filter(|r| r["operation"] == "nonesuch")
-            .all(|r| r["reason"] == "limit"),
-        "expected the refused call of `nonesuch` past the bound recorded with `limit`, not `unknown-operation`: {refused:?}"
+    // Refused for the size, not for the name: of the two calls of
+    // `nonesuch`, the one past the bound is recorded with `limit` and only
+    // the small one after it with `unknown-operation`.
+    let nonesuch: Vec<&str> = refused
+        .iter()
+        .filter(|r| r["operation"] == "nonesuch")
+        .filter_map(|r| r["reason"].as_str())
+        .collect();
+    assert_eq!(
+        nonesuch,
+        ["limit", "unknown-operation"],
+        "expected the call of `nonesuch` past the bound recorded with `limit` and the small one after it with `unknown-operation`: {refused:?}"
     );
 }
 
@@ -317,5 +321,92 @@ fn a_put_of_a_string_body_is_not_arguments_but_its_other_arguments_are() {
         &results[1],
         "arguments",
         "a put whose key (not its body) makes the arguments larger than 8 MiB",
+    );
+}
+
+/// What `/getter` makes: the outer call's arguments have a getter, which
+/// `JSON.stringify` runs while it reads them, and which makes another call
+/// with arguments of its own. Each call is decided by its own size.
+fn getter_case(outer_big: bool, inner_big: bool) {
+    let h = Calls::start();
+    let context = format!("outer {outer_big}, inner {inner_big}");
+    let (response, body) = h.post(
+        "/getter",
+        &json!({
+            "outer": if outer_big { "big" } else { "small" },
+            "inner": if inner_big { "big" } else { "small" },
+        }),
+    );
+    let inners = h.results(&body, "inners");
+    assert!(
+        !inners.is_empty(),
+        "{context}: the getter was to make its call at least once, got {}",
+        short(&body)
+    );
+    let check = |result: &serde_json::Value, big: bool, what: &str| {
+        if big {
+            assert_limit(
+                &json!({ "answer": result["answer"] }),
+                "arguments",
+                &format!("{context}: the {what} call (past the bound)"),
+            );
+        } else {
+            assert_eq!(
+                result["answer"]["refused"]["refusal"]["reason"].as_str(),
+                Some("unknown-operation"),
+                "{context}: expected the {what} call (small) served as what it is, got {}",
+                short(result)
+            );
+        }
+    };
+    check(&body["outer"], outer_big, "outer");
+    for inner in &inners {
+        check(inner, inner_big, "inner");
+    }
+    let reasons: Vec<String> = h
+        .refused_records(&response)
+        .iter()
+        .filter(|r| r["operation"] == "nonesuch")
+        .filter_map(|r| r["reason"].as_str().map(str::to_owned))
+        .collect();
+    let count = |reason: &str| reasons.iter().filter(|r| *r == reason).count();
+    let limits = usize::from(outer_big) + if inner_big { inners.len() } else { 0 };
+    let unknowns = usize::from(!outer_big) + if inner_big { 0 } else { inners.len() };
+    assert_eq!(
+        (count("limit"), count("unknown-operation")),
+        (limits, unknowns),
+        "{context}: expected the `host-call` records to say `limit` {limits} times and `unknown-operation` {unknowns} times (one record for each call, by its own size), got {reasons:?}"
+    );
+}
+
+#[test]
+fn a_call_made_from_a_getter_while_another_calls_arguments_are_read_is_decided_by_its_own_size() {
+    getter_case(false, true);
+    getter_case(true, false);
+    getter_case(false, false);
+}
+
+#[test]
+fn arguments_with_lone_surrogates_are_counted_as_json_stringify_writes_them() {
+    // A lone surrogate is `\ud800` in JSON text: six bytes.
+    let h = Calls::start();
+    let lone = |bytes: usize| {
+        call(
+            "nonesuch",
+            json!({ "pad": { "bytes": bytes, "base": {}, "path": "pad", "multibyte": "lone" } }),
+        )
+    };
+    let (_, results) = h.seq(&[lone(CALL_BOUND), lone(CALL_BOUND + 1)]);
+    assert_measured(&results[0], CALL_BOUND, "lone surrogates");
+    assert_measured(&results[1], CALL_BOUND + 1, "lone surrogates");
+    assert_taken(
+        &results[0],
+        "nonesuch",
+        "arguments of exactly 8,388,608 bytes of JSON text holding lone surrogates",
+    );
+    assert_limit(
+        &results[1],
+        "arguments",
+        "arguments of 8,388,609 bytes of JSON text holding lone surrogates",
     );
 }

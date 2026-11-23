@@ -309,14 +309,11 @@ fn holder_body() -> Value {
     })
 }
 
-#[test]
-fn a_call_that_would_pass_the_256_mib_of_the_program_is_unavailable_at_once_until_the_holders_end()
-{
-    // The own database's pool holds a few connections and a call waits for
-    // one at most 5 seconds, so the holders' calls are waiting for the
-    // probes' time only: the test checks that none was answered before the
-    // probes were made (its own precondition).
-    let h = Calls::start();
+/// The program-wide scenario: sixteen requests hold 252 MiB of calls that
+/// wait; probes of 4 MiB exactly are taken, one byte more is `unavailable`;
+/// after the holders end the large call is served. The same answers whatever
+/// happened to the program before.
+fn program_scenario(h: &Calls) {
     let body = holder_body();
     let before = h.own.vm.records().len();
     let (holders, probed_to, probe_results, probe_response) = std::thread::scope(|scope| {
@@ -416,6 +413,76 @@ fn a_call_that_would_pass_the_256_mib_of_the_program_is_unavailable_at_once_unti
         "a query of 8 MiB once the holders ended",
     );
     assert_eq!(h.own.entries_of(&response).len(), 1);
+}
+
+#[test]
+fn a_call_that_would_pass_the_256_mib_of_the_program_is_unavailable_at_once_until_the_holders_end()
+{
+    let h = Calls::start();
+    program_scenario(&h);
+}
+
+/// How long the calls left behind sleep in the database.
+const SLEEP_LEFT: u32 = 1;
+
+fn wait_until_the_sleepers_are_gone(h: &Calls) {
+    let own_database = h.own.own_database(blackbox::host_call::APP);
+    let sql = own_database.superuser();
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let mut quiet = 0;
+    while std::time::Instant::now() < deadline && quiet < 3 {
+        let running = sql
+            .value(&format!(
+                "select count(*) from pg_stat_activity where datname = '{}' and query like '%pg_sleep({SLEEP_LEFT})%' and pid <> pg_backend_pid()",
+                own_database.name
+            ))
+            .and_then(|n| n.parse::<usize>().ok())
+            .unwrap_or(1);
+        quiet = if running == 0 { quiet + 1 } else { 0 };
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    assert!(
+        quiet >= 3,
+        "the test's own precondition: the sleeping statements the requests left behind were to end within 60 seconds"
+    );
+}
+
+/// Twenty requests one after another, each starting calls that wait with
+/// close to 16 MiB of arguments (15.75 MiB) and answering at once without
+/// awaiting them: the calls are left behind. With `tx`, inside a
+/// transaction the request leaves open.
+fn leave_calls_behind(h: &Calls, tx: bool) {
+    let body = json!({
+        "tx": tx,
+        "held": [
+            times(sleeper(SLEEP_LEFT, 4 * MIB), 3),
+            sleeper(SLEEP_LEFT, 4 * MIB - 256 * 1024),
+        ],
+    });
+    for n in 0..20 {
+        let (_, answer) = h.post("/abandon", &body);
+        assert_eq!(
+            answer["abandoned"],
+            json!(true),
+            "request {n} (tx {tx}): expected the request to start its calls and answer at once, got {}",
+            short(&answer)
+        );
+    }
+    wait_until_the_sleepers_are_gone(h);
+}
+
+#[test]
+fn calls_left_behind_by_requests_that_ended_are_given_back() {
+    let h = Calls::start();
+    leave_calls_behind(&h, false);
+    program_scenario(&h);
+}
+
+#[test]
+fn calls_left_behind_in_an_open_transaction_by_requests_that_ended_are_given_back() {
+    let h = Calls::start();
+    leave_calls_behind(&h, true);
+    program_scenario(&h);
 }
 
 #[test]

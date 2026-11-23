@@ -1463,6 +1463,7 @@ dependencies = [
  "flate2",
  "futures",
  "libc",
+ "memchr",
  "openworkers-core",
  "openworkers-glue-v8",
  "openworkers-runtime-v8-gc-derive",

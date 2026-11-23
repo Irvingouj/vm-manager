@@ -93,6 +93,18 @@ const __vm_platform_glue_5c1e = (function (global) {
   // does not change the answer. A stream of the guest's own or the request's
   // body is recognised by `instanceof` or by the native id it carries.
   const StreamCtor = global.ReadableStream;
+  // The stream's own `cancel`, captured before Application code runs: what
+  // ends a stream given to a put that was answered before its body was read
+  // (see `release`). The stream's `cancel` property is no use for that, since
+  // `claimStream` replaces it with a refusal, and a reader's `cancel` goes
+  // through that property.
+  const streamCancel = (function () {
+    try {
+      return StreamCtor === undefined ? null : StreamCtor.prototype.cancel;
+    } catch (e) {
+      return null;
+    }
+  })();
   const lockedGetter = (function () {
     try {
       const descriptor =
@@ -145,6 +157,7 @@ const __vm_platform_glue_5c1e = (function (global) {
   const nativeResponseError = global.__responseStreamError;
   const nativeResponseIsClosed = global.__responseStreamIsClosed;
   const nativeScheduleWritable = global.__nativeScheduleWritable;
+  const nativeStreamCancel = global.__nativeStreamCancel;
   const TextEncoderCtor = global.TextEncoder;
   // A chunk of a stream given to a put: its bytes (a `Uint8Array`, any
   // other view of one, an `ArrayBuffer`) or a string, written as UTF-8.
@@ -170,26 +183,140 @@ const __vm_platform_glue_5c1e = (function (global) {
   // Writes `bytes` to the stream `id` in pieces of at most 64 KiB,
   // waiting for room between them: an empty chunk writes nothing, and the
   // file has the same bytes however large the chunks the code made.
-  const writePieces = async function (id, bytes) {
-    for (let at = 0; at < bytes.length; at += CHUNK) {
-      const piece = bytes.subarray(at, Math.min(at + CHUNK, bytes.length));
-      for (;;) {
-        if (nativeResponseWrite(id, piece)) break;
-        if (nativeResponseIsClosed(id)) return false;
-        await writable(id);
+  //
+  // `gate.over` says that the put it belongs to was answered (see
+  // `release`): a pump that finds it set stops at once and writes nothing
+  // more. A native that throws because the stream is gone ends the write
+  // as a closed stream does.
+  const writePieces = async function (id, bytes, gate) {
+    try {
+      for (let at = 0; at < bytes.length; at += CHUNK) {
+        const piece = bytes.subarray(at, Math.min(at + CHUNK, bytes.length));
+        for (;;) {
+          if (gate.over) return false;
+          if (nativeResponseWrite(id, piece)) break;
+          if (nativeResponseIsClosed(id)) return false;
+          await writable(id);
+        }
       }
+      return !gate.over;
+    } catch (e) {
+      return false;
+    }
+  };
+  // Runs `step` and drops whatever it throws or rejects with: for the
+  // pumps, which nobody awaits, so that none of them can end unhandled.
+  const quietly = async function (step) {
+    try {
+      await step();
+    } catch (e) {
+      // Nothing to tell: the put's own answer is what the code sees.
+    }
+  };
+  const pumpBytes = function (id, bytes, gate) {
+    return quietly(async function () {
+      if (await writePieces(id, bytes, gate)) nativeResponseEnd(id);
+    });
+  };
+  // The JSON text a string would add to a call's arguments, walked
+  // without building it: each character's own UTF-8, or the escape that
+  // carries it — `"` and `\` doubled, the short escapes of the controls
+  // JSON writes short, every other control as `\uXXXX`, and a lone
+  // surrogate the same (a well-formed stringify escapes it); a surrogate
+  // pair is its one character of 4 bytes. Whether all of it is at most
+  // `bytes`, not counting the quotes ("between its quotes"); the walk
+  // stops as soon as it is not.
+  const jsonAtMost = function (text, bytes) {
+    let size = 0;
+    const length = text.length;
+    for (let i = 0; i < length; i++) {
+      const code = text.charCodeAt(i);
+      if (code === 0x22 || code === 0x5c || code === 0x08 || code === 0x09 || code === 0x0a || code === 0x0c || code === 0x0d) {
+        size += 2;
+      } else if (code < 0x20) {
+        size += 6;
+      } else if (code < 0x80) {
+        size += 1;
+      } else if (code < 0x800) {
+        size += 2;
+      } else if (code >= 0xd800 && code <= 0xdbff) {
+        const next = i + 1 < length ? text.charCodeAt(i + 1) : 0;
+        if (next >= 0xdc00 && next <= 0xdfff) {
+          size += 4;
+          i += 1;
+        } else {
+          size += 6;
+        }
+      } else if (code >= 0xdc00 && code <= 0xdfff) {
+        size += 6;
+      } else {
+        size += 3;
+      }
+      if (size > bytes) return false;
     }
     return true;
   };
-  const pumpBytes = async function (id, bytes) {
-    if (await writePieces(id, bytes)) nativeResponseEnd(id);
+  // A string's UTF-8 written to the stream `id` in pieces of at most
+  // 64 KiB, one piece encoded at a time, so the whole encoding is never
+  // built (the string may be 20 MiB and the context has 64 MiB). A piece
+  // never splits a surrogate pair — it is one code point of 4 bytes — and
+  // a lone surrogate is encoded as U+FFFD, as TextEncoder does and as the
+  // raw interface's own path of a short string does.
+  const writeStringPieces = async function (id, text, gate) {
+    const encoder = new TextEncoderCtor();
+    const length = text.length;
+    let at = 0;
+    while (at < length) {
+      // The largest slice from `at` whose UTF-8 is at most 64 KiB.
+      let size = 0;
+      let end = at;
+      while (end < length) {
+        const code = text.charCodeAt(end);
+        let step = 1;
+        let add;
+        if (code < 0x80) {
+          add = 1;
+        } else if (code < 0x800) {
+          add = 2;
+        } else if (code >= 0xd800 && code <= 0xdbff) {
+          const next = end + 1 < length ? text.charCodeAt(end + 1) : 0;
+          if (next >= 0xdc00 && next <= 0xdfff) {
+            add = 4;
+            step = 2;
+          } else {
+            add = 3;
+          }
+        } else {
+          add = 3;
+        }
+        if (size + add > CHUNK) break;
+        size += add;
+        end += step;
+      }
+      // One code point never passes the bound, so a piece is always made.
+      if (!(await writePieces(id, encoder.encode(text.substring(at, end)), gate))) return false;
+      at = end;
+    }
+    return true;
   };
-  const pumpStream = async function (id, stream) {
+  const pumpString = function (id, text, gate) {
+    return quietly(async function () {
+      if (await writeStringPieces(id, text, gate)) nativeResponseEnd(id);
+    });
+  };
+  const pumpStream = function (id, stream, gate) {
+    return quietly(function () {
+      return pumpStreamTo(id, stream, gate);
+    });
+  };
+  const pumpStreamTo = async function (id, stream, gate) {
     let failed = null;
     try {
       const reader = stream.getReader();
       for (;;) {
+        if (gate.over) return;
         const read = await reader.read();
+        if (gate.over) return;
         if (read.done) break;
         const bytes = viewBytes(read.value);
         if (bytes === null) {
@@ -198,13 +325,14 @@ const __vm_platform_glue_5c1e = (function (global) {
           throw new TypeErrorCtor('a chunk of a stream given to a put must be a Uint8Array, an ArrayBuffer, a view of one, or a string');
         }
         if (bytes.length === 0) continue;
-        if (!(await writePieces(id, bytes))) return;
+        if (!(await writePieces(id, bytes, gate))) return;
       }
     } catch (error) {
       failed = error;
     }
     // A stream that failed ends the put as `body-failed`, never as if it
-    // had ended cleanly.
+    // had ended cleanly. A put already answered has no use for either.
+    if (gate.over) return;
     if (failed !== null) nativeResponseError(id, describe(failed));
     else nativeResponseEnd(id);
   };
@@ -219,9 +347,28 @@ const __vm_platform_glue_5c1e = (function (global) {
   // What the glue hands the host in place of a put's `body`, or the body
   // itself when JSON can carry it, or nothing when it can carry the
   // refusal too (a number, a boolean, a Blob: the host answers
-  // `malformed`).
-  const putBody = function (body) {
-    if (typeof body === 'string' || body === null) return body;
+  // `malformed`). A string whose JSON would pass 64 KiB is a body like
+  // bytes are (CONTRACT.md, "A host call's arguments are bounded"):
+  // pumped into a stream of the code's own, so that whatever the body,
+  // the glue hands the host at most 64 KiB for it — a short string may
+  // travel with the arguments.
+  const putBody = function (body, gate) {
+    if (typeof body === 'string') {
+      if (jsonAtMost(body, CHUNK)) return body;
+      let id;
+      try {
+        id = nativeResponseCreate();
+      } catch (e) {
+        // The code may not have another stream of its own (the bound is
+        // 16 a request): the host answers `unavailable` in its place in
+        // the order.
+        return { $busy: true };
+      }
+      gate.id = id;
+      pumpString(id, body, gate);
+      return { $pumped: id };
+    }
+    if (body === null) return body;
     if (body !== null && typeof body === 'object') {
       if (typeof body._nativeStreamId === 'number') {
         // The stream is the put's from the call on: like a body given to
@@ -245,7 +392,9 @@ const __vm_platform_glue_5c1e = (function (global) {
         }
         // The pump takes the stream's reader, which locks it, and the
         // stream is the put's from the call on.
-        pumpStream(id, body);
+        gate.id = id;
+        gate.stream = body;
+        pumpStream(id, body, gate);
         claimStream(body);
         return { $pumped: id };
       }
@@ -257,7 +406,8 @@ const __vm_platform_glue_5c1e = (function (global) {
         } catch (e) {
           return { $busy: true };
         }
-        pumpBytes(id, bytes);
+        gate.id = id;
+        pumpBytes(id, bytes, gate);
         return { $pumped: id, $length: bytes.length };
       }
     }
@@ -291,15 +441,57 @@ const __vm_platform_glue_5c1e = (function (global) {
       resolve(answer);
     };
   };
-  const invokeThrough = function (binding, command, args, resolve, reject) {
-    if (command === 'storage.put' && args !== null && typeof args === 'object' && !Array.isArray(args)) {
-      const given = args.body;
-      if (given !== undefined) {
-        const body = putBody(given);
-        if (body !== undefined) args.body = body;
-      }
+  // A put is answered: the stream of the code's own the glue made for its
+  // body stops counting against the request's 16, whatever the answer was
+  // and whether or not the host ever took the stream (a refusal, a
+  // `malformed`, a `limit` or an `unavailable` decided before the body was
+  // read leave it with no reader). The pump stops, the code's own stream
+  // (if the body was one) is cancelled — its source's `cancel` is called,
+  // and a read the pump was waiting on is settled — and the runtime closes
+  // the stream towards the host: a pump waiting for room is woken and finds
+  // it closed. A put the host took is over when it is answered, so nothing
+  // it read is cut; cancelling a stream that already ended does nothing.
+  const release = function (gate) {
+    if (gate.over) return;
+    gate.over = true;
+    const id = gate.id;
+    const stream = gate.stream;
+    if (stream !== null && typeof streamCancel === 'function') {
+      quietly(function () {
+        return apply(streamCancel, stream, []);
+      });
     }
-    nativeInvoke(binding, command, args, answered(command, resolve), reject);
+    if (id !== null) {
+      quietly(function () {
+        nativeStreamCancel(id);
+      });
+    }
+  };
+  const invokeThrough = function (binding, command, args, resolve, reject) {
+    const gate = { over: false, id: null, stream: null };
+    let given = resolve;
+    let failed = reject;
+    if (command === 'storage.put' && args !== null && typeof args === 'object' && !Array.isArray(args)) {
+      const body = args.body;
+      if (body !== undefined) {
+        const marked = putBody(body, gate);
+        if (marked !== undefined) args.body = marked;
+      }
+      given = function (answer) {
+        release(gate);
+        return resolve(answer);
+      };
+      failed = function (error) {
+        release(gate);
+        return reject(error);
+      };
+    }
+    try {
+      nativeInvoke(binding, command, args, answered(command, given), failed);
+    } catch (error) {
+      release(gate);
+      throw error;
+    }
   };
   defineProperty(global, '__nativeBindingInvoke', { value: invokeThrough, writable: true, enumerable: false, configurable: true });
   const serve = function (request, runtimeContext) {

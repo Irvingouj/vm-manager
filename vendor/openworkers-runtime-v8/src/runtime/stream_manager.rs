@@ -5,6 +5,8 @@ use std::sync::{Arc, Mutex};
 use std::task::Waker;
 use tokio::sync::{mpsc, watch};
 
+use super::call_args;
+
 pub type StreamId = u64;
 
 /// Default high water mark for stream buffers (number of chunks)
@@ -21,6 +23,11 @@ pub const MAX_CHUNK_BYTES: usize = 64 * 1024;
 /// (blackbox/CONTRACT.md, "Storage: Bounds"); one more is an error thrown to
 /// the guest (vendor/VENDORED.md, patch 8).
 pub const MAX_GUEST_STREAMS: usize = 16;
+
+/// The most streams of its own a guest may make in one request in all, open
+/// or closed (patch 17): what bounds the set of their ids, which is kept for
+/// the whole request (patch 12).
+pub const MAX_GUEST_STREAMS_MADE: usize = 16_384;
 
 /// A chunk of data from a stream
 #[derive(Debug, Clone)]
@@ -65,6 +72,10 @@ pub struct StreamManager {
     /// (patch 8): at most [`MAX_GUEST_STREAMS`], and the only ids the
     /// guest's own response natives may write to (patch 12).
     guest_streams: Arc<Mutex<HashSet<StreamId>>>,
+    /// Those of `guest_streams` that were open when last looked at (patch
+    /// 17): never more than [`MAX_GUEST_STREAMS`], so counting the open ones
+    /// does not walk every stream the request ever made.
+    guest_open: Arc<Mutex<Vec<StreamId>>>,
     /// Host-fed streams the response took to send (patch 11): their sending
     /// goes on after the event, so they are not closed with the request.
     taken: Arc<Mutex<HashSet<StreamId>>>,
@@ -77,6 +88,13 @@ pub struct StreamManager {
     /// the host reads it only then (patch 9). The channel says once, and
     /// stays said.
     asked: Arc<Mutex<Option<watch::Sender<bool>>>>,
+    /// The host's precheck of a call's arguments (patch 17): asked by
+    /// `__nativeBindingInvoke` before a call's text within its own bound
+    /// is copied or parsed, so that a call the host would refuse for
+    /// what its request or the program holds is refused without that
+    /// work. The host attaches one per request, like `asked`; `clear()`
+    /// leaves it, for the same reason.
+    call_precheck: Arc<Mutex<Option<call_args::Precheck>>>,
     /// Next stream ID to allocate
     next_id: Arc<Mutex<StreamId>>,
     /// High water mark for new streams
@@ -101,9 +119,11 @@ impl StreamManager {
             host_fed: Arc::new(Mutex::new(HashMap::new())),
             host_response: Arc::new(Mutex::new(None)),
             guest_streams: Arc::new(Mutex::new(HashSet::new())),
+            guest_open: Arc::new(Mutex::new(Vec::new())),
             taken: Arc::new(Mutex::new(HashSet::new())),
             request_body: Arc::new(Mutex::new(None)),
             asked: Arc::new(Mutex::new(None)),
+            call_precheck: Arc::new(Mutex::new(None)),
             next_id: Arc::new(Mutex::new(1)),
             high_water_mark,
             waker: Arc::new(AtomicWaker::new()),
@@ -384,6 +404,7 @@ impl StreamManager {
         self.host_fed.lock().unwrap().clear();
         *self.host_response.lock().unwrap() = None;
         self.guest_streams.lock().unwrap().clear();
+        self.guest_open.lock().unwrap().clear();
         self.taken.lock().unwrap().clear();
         // The request's body went with its streams; a reused context has
         // none until the host pumps the next request's (patch 15).
@@ -401,6 +422,33 @@ impl StreamManager {
     /// client.
     pub fn watch_asked(&self, asked: watch::Sender<bool>) {
         *self.asked.lock().unwrap() = Some(asked);
+    }
+
+    /// The host's precheck of a call's arguments (patch 17), attached per
+    /// request before the event: asked by `__nativeBindingInvoke` with the
+    /// call's binding name and the UTF-8 length of its JSON text, within
+    /// the call's own bound, before anything of the call is copied or
+    /// parsed.
+    pub fn set_call_precheck(&self, precheck: call_args::Precheck) {
+        *self
+            .call_precheck
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(precheck);
+    }
+
+    /// What the host's precheck says about a call of `utf8` bytes on the
+    /// binding `binding`, or `None` when it says nothing (there is no
+    /// request, no precheck, or the call may be held).
+    pub fn call_precheck(&self, binding: &str, utf8: u64) -> Option<&'static str> {
+        // The host's code is not run under the lock, and a lock another
+        // thread poisoned is read all the same: this is called inside a V8
+        // callback, where a panic cannot unwind.
+        let precheck = self
+            .call_precheck
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()?;
+        precheck(binding, utf8)
     }
 
     /// Says that the host-fed body was asked for. Once set it stays set.
@@ -439,11 +487,29 @@ impl StreamManager {
         }
     }
 
-    /// Refuses the stream past `most` of the guest's own for this request
-    /// (patch 8).
+    /// Refuses the stream past `most` of the guest's own open in this
+    /// request (patch 8), and the one past [`MAX_GUEST_STREAMS_MADE`] made
+    /// in it in all (patch 17).
     pub fn check_guest_stream(&self, most: usize) -> Result<(), String> {
-        let made = self.guest_streams.lock().unwrap();
-        if made.len() >= most {
+        if self.guest_streams.lock().unwrap().len() >= MAX_GUEST_STREAMS_MADE {
+            return Err(format!(
+                "at most {MAX_GUEST_STREAMS_MADE} streams of its own may an Application make in one request: this one is one more"
+            ));
+        }
+        // A stream counts while it is open (patch 17): one closed, or whose
+        // reader has gone (a put that took it and ended), stops counting,
+        // though its id stays the guest's own for the rest of the request.
+        // One the guest ended that nobody read is still open: what was
+        // written to it is still held.
+        let mut open = self.guest_open.lock().unwrap();
+        {
+            let senders = self
+                .senders
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            open.retain(|id| senders.get(id).is_some_and(|sender| !sender.is_closed()));
+        }
+        if open.len() >= most {
             return Err(format!(
                 "at most {most} streams of its own may an Application have open towards the host in one request: this one is one more"
             ));
@@ -455,6 +521,7 @@ impl StreamManager {
     /// its response natives may write to, end or fail.
     pub fn mark_guest_stream(&self, stream_id: StreamId) {
         self.guest_streams.lock().unwrap().insert(stream_id);
+        self.guest_open.lock().unwrap().push(stream_id);
     }
 
     /// Whether `stream_id` is a stream the guest made itself with

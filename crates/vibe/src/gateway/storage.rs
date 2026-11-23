@@ -50,6 +50,7 @@ use openworkers_runtime_v8::runtime::stream_manager::{StreamChunk, StreamId, Str
 use serde_json::{Map, Value, json};
 use tokio::sync::{mpsc, oneshot};
 
+use super::Guard as CallGuard;
 use super::transaction::ended_why;
 use super::{
     APPLICATION_DISABLED, Decision, Dispatched, On, PlatformGateway, Refusal, Target, actor_name,
@@ -337,13 +338,15 @@ fn statement(op: Op, asked: &Asked) -> String {
 
 impl PlatformGateway {
     /// A Storage operation: read, decided and dispatched as every
-    /// operation is.
+    /// operation is. The call's guard travels into the work, with its
+    /// arguments; a call answered at once here drops it, holding nothing.
     pub(super) fn storage(
         &self,
         op: Op,
         in_flight: &Arc<InFlight>,
         active: bool,
         args: Value,
+        held: Option<CallGuard>,
     ) -> Decision {
         let read = match read_args(op, args, &self.storage.cursors) {
             Ok(read) => read,
@@ -434,6 +437,7 @@ impl PlatformGateway {
             asked: Some(read.asked),
             taken,
             pre_taken,
+            _held: held,
             log: Arc::clone(&self.log),
             storage: Arc::clone(&self.storage),
             until: Until::new(decided + OPERATION_TIME),
@@ -462,6 +466,10 @@ struct StorageWork {
     /// The place among the bodies open at once, taken at the decision
     /// when one was free then.
     pre_taken: Option<Guard>,
+    /// The call's place among what its request and the program hold of
+    /// calls not yet answered: read by no one, only held — given back
+    /// with this work, here or in the task that runs the operation.
+    _held: Option<CallGuard>,
     log: Arc<OperationLog>,
     storage: Arc<Storage>,
     /// 10 seconds from the decision: head, get, delete and list.

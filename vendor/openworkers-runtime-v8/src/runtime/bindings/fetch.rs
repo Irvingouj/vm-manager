@@ -1,6 +1,8 @@
 #[cfg(feature = "invoke")]
 use super::super::scheduler::{InvokeFuture, PANICKED};
 use super::super::scheduler::FetchFuture;
+#[cfg(feature = "invoke")]
+use super::super::call_args;
 use super::super::{CallbackId, SchedulerMessage};
 use super::state::FetchState;
 use crate::v8_helpers::throw_type_error;
@@ -699,22 +701,59 @@ fn setup_invoke(scope: &mut v8::PinScope) {
                 return throw_type_error(scope, "invoke: the command is not a string");
             };
 
-            // Patched (vendor/VENDORED.md): the arguments are read as
+            // Patched (vendor/VENDORED.md, patch 5): the arguments are read as
             // JSON.stringify reads them. serde_v8 unwraps a property read
             // that throws (a getter, a Proxy trap), and a panic inside this
             // callback aborts the process; here, what the guest's code
             // throws goes back to the guest.
-            let call_args = {
+            //
+            // Patched (vendor/VENDORED.md, patch 17): the call's own bound
+            // is decided before anything of it is copied. The JSON text's
+            // UTF-8 length is asked of the V8 string without copying it, so
+            // a call past the bound is refused with nothing copied at all;
+            // the host's precheck — attached per request — is asked next,
+            // so a call the host would refuse for what its request or the
+            // program holds is refused without being copied or parsed; a
+            // text within every bound is scanned for its values before a
+            // `serde_json::Value` is built, so arguments of many small
+            // values are refused without being built. What was decided is
+            // set for the host (`crate::runtime::call_args`), which is
+            // entered inside this call (patch 2) and reads it there.
+            let (call_args, decided) = {
                 let value = args.get(2);
                 if value.is_undefined() {
-                    serde_json::Value::Null
+                    (serde_json::Value::Null, call_args::Call::Size(0))
                 } else {
                     let Some(text) = v8::json::stringify(scope, value) else {
                         return;
                     };
-                    match serde_json::from_str(&text.to_rust_string_lossy(scope)) {
-                        Ok(call_args) => call_args,
-                        Err(_) => serde_json::Value::Null,
+                    let utf8 = text.utf8_length(scope);
+                    if utf8 > call_args::TEXT_BYTES {
+                        (serde_json::Value::Null, call_args::Call::Refused)
+                    } else if let Some(streams) = get_state!(scope, super::state::StreamState)
+                        && let Some(word) = streams.manager.call_precheck(
+                            &binding,
+                            u64::try_from(utf8).unwrap_or(u64::MAX),
+                        )
+                    {
+                        (serde_json::Value::Null, call_args::Call::WouldRefuse(word))
+                    } else {
+                        let text = text.to_rust_string_lossy(scope);
+                        let values = call_args::count_values(&text);
+                        if values > call_args::VALUES {
+                            (serde_json::Value::Null, call_args::Call::Refused)
+                        } else {
+                            let size = u64::try_from(utf8)
+                                .unwrap_or(u64::MAX)
+                                .max(values * call_args::BYTES_A_VALUE);
+                            let parsed = match serde_json::from_str(&text) {
+                                Ok(call_args) => call_args,
+                                // What JSON cannot hold (too deep, say)
+                                // becomes `null`, as before.
+                                Err(_) => serde_json::Value::Null,
+                            };
+                            (parsed, call_args::Call::Size(size))
+                        }
                     }
                 }
             };
@@ -743,10 +782,14 @@ fn setup_invoke(scope: &mut v8::PinScope) {
             // handler is entered while the request that made the call is the
             // one in flight (a host reads its per-request state there). Past
             // the budget, the scheduler still settles the call, so the turn ends.
+            // What this call decided is set just before, and taken by the
+            // host inside the poll; cleared after it, whatever came of it.
+            call_args::set(decided);
             let mut context = std::task::Context::from_waker(std::task::Waker::noop());
             let polled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 call.as_mut().poll(&mut context)
             }));
+            call_args::clear();
 
             let result = match polled {
                 Ok(std::task::Poll::Ready(result)) if state.inline_calls.get() >= MAX_INLINE_CALLS => {

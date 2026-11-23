@@ -1,4 +1,5 @@
 pub mod bindings;
+pub mod call_args;
 pub mod callback_handlers;
 pub mod crypto;
 pub(crate) mod dispatch;

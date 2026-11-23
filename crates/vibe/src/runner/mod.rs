@@ -67,6 +67,11 @@ pub struct InFlight {
     /// them, and the signal of the request's end, on which a put still
     /// running is given up.
     pub bodies: Arc<Bodies>,
+    /// The host calls not yet answered of this request
+    /// (blackbox/CONTRACT.md, "A host call's arguments are bounded"):
+    /// their places, 16 MiB and 1,024 calls, against the program's
+    /// 256 MiB.
+    pub calls: Arc<crate::gateway::RequestCalls>,
     /// The request's stated `content-length`, when there was one: a put
     /// of the request's own body checks the file's bound against it
     /// before a byte is read.
@@ -470,6 +475,27 @@ impl Engine {
         // takes one) before the event, so a call made in it finds them.
         let stream_manager = worker.stream_manager();
         drop(host.in_flight.streams.set(Arc::clone(&stream_manager)));
+        // The request's precheck of a call's arguments
+        // (vendor/VENDORED.md, patch 17), attached before the event like
+        // the `asked` sender: asked by the invoke native with the call's
+        // binding and the UTF-8 length of its JSON text, within the call's
+        // own bound, before anything of the call is copied or parsed. The
+        // words it answers are the host's (crate::gateway::calls), read
+        // again by the host inside the call. Calls on the glue's own
+        // binding it says nothing of: the host answers them at once and
+        // keeps nothing of them, whoever made them (code that names that
+        // binding itself is held to the call's own bound by the native,
+        // as every call is).
+        {
+            let calls = Arc::clone(&host.in_flight.calls);
+            let program = self.gateway.held_calls();
+            stream_manager.set_call_precheck(Arc::new(move |binding, size| {
+                if binding == crate::runner::host::PLATFORM_BINDING {
+                    return None;
+                }
+                calls.would_refuse(program.as_ref(), size)
+            }));
+        }
         // The request's body is read only when the code (or the response)
         // asks for it (vendor/VENDORED.md, patch 9). Attached before the
         // event: a body asked for at its first read is seen.
