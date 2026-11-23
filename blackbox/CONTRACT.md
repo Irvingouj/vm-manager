@@ -90,6 +90,11 @@ Checked in this order:
 - An Application's code is its serving Version's bundle: a classic script that registers its handler by assigning `globalThis.default = { fetch(request, ctx) { ... } }`. `fetch` may be async and returns a `Response`.
 - Every request gets a fresh context. The script's top level runs again for each request, before the handler, **with no request in flight**. Nothing in memory survives from one request to another. The program may also run a script's top level when it starts, equally with no request in flight.
 - `request` is a standard `Request`: the method, `http://<host><path-and-query>`, the headers without any `x-vm-*`, and the body.
+- **The request's body is not read before the code asks for it or hands it on** (a Storage put can take it as its own, "Storage: Through the SDK"). Sign-in, sharing and every other check still come before the first byte is read. A request whose body the code never reads is answered as the code answers it; the unread body is dropped.
+- A request whose `content-length` is over 5,368,774,656 bytes (5 GiB and 64 KiB; exactly that is taken) is answered `413` before the code runs, under `vibe serve` and in the local run (`vibe dev`, and a request `vibe dev` passes on) alike. A body with no stated length that passes that bound, and a body from which no byte arrives for 10 seconds while it is being read, fail the stream the code (or the put) is reading, and the request is then answered by the platform with `413` when the body passed the bound and with `408` when no byte arrived, whatever the code does next. Such a request was given to the Application's code, so it has its log entry ("Logs") and its records.
+- **A response's body that is a body the host itself feeds and the code did not read** — the request's own body given back, a Storage file's body — **is sent by the host itself**: the bytes never enter the Application's memory, the sending goes on after the code has ended (the request's time and CPU limits bound the code, not the sending), and the platform sets `content-length` itself, whatever the code set: to the file's size for a file; for the request's own body given back, to the request's stated `content-length`, and when the request stated none, no `content-length` is set and the body is sent chunked. The request's record and the Application's log entry are written when the response's head is decided, as before: they do not wait for the body's end.
+- A body being sent is ended early, and the connection closed without a clean end (so the client can tell, by `content-length`), when the client takes no byte for 30 seconds, when the client goes away, when the Application is disabled ("Requests in flight", within its 1 second), or when the program stops ("Starting and stopping": nothing is promised then). The limit on one connection's life does not cut a body being sent.
+- Any other response body — one the code has begun to read and then gives back, or one the code itself makes (a `ReadableStream` of its own, a `TransformStream`'s output, a string, bytes) — is as before: whole, at most 8 MiB, collected within the request's time.
 - `ctx` is frozen. `ctx.user()` returns a frozen `{ id: string, groups: string[] }`: the User of the request in flight, as the host knows it. Called when the request is over, it throws an `Error` whose message starts with `no request in flight`.
 - What the Application prints with `console.log` / `info` / `warn` / `error` / `debug` appears as `printed` records.
 
@@ -1469,7 +1474,7 @@ The platform keeps, for each request an Application was given, what its code pri
   "next": "<cursor>" }
 ```
 
-- **One entry for each request the Application's code was given.** A request answered before that (the platform was busy, the body was too large or came too slowly, a method the platform does not hand on) has none. `version` is the Version that served it; `user` the signed-in User's id; `path` is without the query; `status` is what was answered. `printed` is what its code printed, in order, `level` the console method's name: the lines the script printed while it was loaded for this request first, with `"loading": true` (the program's log has those records with a null `request`, as before), then the lines of the request itself, with `"loading": false`. `uncaught` are its `uncaught` records' `error`, each the message and the stack as the program's log has it.
+- **One entry for each request the Application's code was given.** A request answered before that (the platform was busy, a body whose stated length is over the bound, a method the platform does not hand on) has none; a request whose body failed while it was being read (no length stated and past the bound, or no byte for 10 seconds) was given to the code and has one, whatever the platform answered in the end ("What an Application is handed"). `version` is the Version that served it; `user` the signed-in User's id; `path` is without the query; `status` is what was answered. `printed` is what its code printed, in order, `level` the console method's name: the lines the script printed while it was loaded for this request first, with `"loading": true` (the program's log has those records with a null `request`, as before), then the lines of the request itself, with `"loading": false`. `uncaught` are its `uncaught` records' `error`, each the message and the stack as the program's log has it.
 - **What code prints after its request ended** (work it left unawaited, if it runs at all) is in no entry: only the program's log has it. So every entry is a request's, and none of its fields is null.
 - **Order.** Entries are oldest first, in the order the requests ended. `id` is a cursor: text, not promised to be a number.
   - Without `after`: the newest `limit` entries (`?limit=<n>`, 1 to 1000, default 100).
@@ -2540,7 +2545,7 @@ In "Responses the program itself gives", after the `403` of "Contributors and sh
 
 A request is in flight from the moment its Application's code may be given it until its response is sent.
 
-- **Within 1 second of the `200` of a disable, every request in flight to that Application is answered** as a disabled Application answers ("What a disabled Application answers"), whatever its code was doing or had already returned, unless its response had already begun to be sent (then nothing more is promised of it). Its code is stopped. Requests waiting to be given to the code are answered the same and are never given to it. This holds whatever the program then knew of the Application: also when a write of its lists or of its serving Version had lost its answer just before ("A write whose answer is lost") and the program was finding it out.
+- **Within 1 second of the `200` of a disable, every request in flight to that Application is answered** as a disabled Application answers ("What a disabled Application answers"), whatever its code was doing or had already returned. A response whose body was already being sent is ended early and its connection closed without a clean end, as "What an Application is handed" says. Its code is stopped. Requests waiting to be given to the code are answered the same and are never given to it. This holds whatever the program then knew of the Application: also when a write of its lists or of its serving Version had lost its answer just before ("A write whose answer is lost") and the program was finding it out.
 - **Every transaction it left open is rolled back**, as when a request ends ("Transactions: What the host does on its own"), with a `rollback` entry whose `error` is `application-disabled`. A statement still running is cancelled; its Operation log entry is `failed` with `error` `application-disabled`. So nothing such a request had not committed when the `200` was answered is kept.
 - **No operation of the Application is allowed after that `200`**: an operation its code still calls (from a request in flight, at any moment after) is refused with the reason `application-disabled`, before every other check but `no-request`, nothing is sent to any database, and it has its Operation log entry like every refusal. `application-disabled` joins "Refusal reasons"; its `fix` says that a Platform administrator has disabled the Application and that nothing in the code is wrong. It is the host's, not the Authorization decision's: the `authz` crate is unchanged. The SDK's `Refusal` type has it: `{ readonly reason: "application-disabled" }`.
 - The entry of such a request in "Logs" is made as for any request its code was given: with `status` `503` and what its code printed until it was stopped. It is counted in `usage` (its code was given it).
@@ -2964,7 +2969,7 @@ export default defineApp(manifest, {
     const page = await files.list({ prefix: "reports/", delimiter: "/" });
     const info = await files.head("reports/q3.pdf");                     // FileInfo | null
     const file = await files.get("reports/q3.pdf");                      // StoredFile | null
-    await files.put("reports/q4.pdf", await request.arrayBuffer(), { contentType: "application/pdf" });
+    await files.put("reports/q4.pdf", request.body, { contentType: "application/pdf" });
     await files.delete("reports/old.pdf");
     return file ? new Response(file.body, { headers: { "content-type": file.contentType } }) : new Response("none", { status: 404 });
   },
@@ -2984,8 +2989,12 @@ export interface FileInfo {
   readonly lastModified: Date;      // whole seconds
 }
 export interface StoredFile extends FileInfo {
-  readonly body: Uint8Array<ArrayBuffer>;   // over an ArrayBuffer of its own: a Response's body as it is
-  text(): string;                   // body decoded as UTF-8 (malformed bytes become U+FFFD)
+  readonly body: ReadableStream<Uint8Array>;   // fed by the host as it is read, in chunks of at most 64 KiB
+  readonly bodyUsed: boolean;                  // true once the body began to be read
+  arrayBuffer(): Promise<ArrayBuffer>;         // each of these four reads the stream to its end, so each
+  bytes(): Promise<Uint8Array>;                // can be used once, and none after `body` was read: a second
+  text(): Promise<string>;                     // use rejects with a TypeError, as a Response's does.
+  json(): Promise<unknown>;                    // text() reads the body as UTF-8 (malformed bytes become U+FFFD).
 }
 export interface ListOptions {
   readonly prefix?: string;         // "" without it
@@ -2998,7 +3007,7 @@ export interface FileList {
   readonly folders: readonly string[];   // with delimiter "/" only; each ends with "/"
   readonly cursor: string | null;        // null when nothing follows
 }
-export type FileBody = string | Uint8Array | ArrayBuffer;   // a string is written as UTF-8
+export type FileBody = ReadableStream<Uint8Array> | string | ArrayBuffer | ArrayBufferView | Blob;   // a string is written as UTF-8
 export interface PutOptions { readonly contentType?: string }
 
 export interface ReadOnlyStorage<Name extends string = string> {   // Name: the Resource's name, so that a compile error can say it
@@ -3015,9 +3024,10 @@ export interface Storage<Name extends string = string> extends ReadOnlyStorage<N
 - `ctx.user().storage(name)`: a Storage Resource the Manifest declares, as the User: a `Storage<"<name>">` when declared at `write`, a `ReadOnlyStorage<"<name>">` when declared at `read` (each assignable to `Storage` and `ReadOnlyStorage` written without a name). A handle holds no identity; every call is one host operation decided from the request in flight, as for databases.
 - `ctx.user().db(name)` takes only names declared `postgres`, and `storage(name)` only names declared `storage`.
 - Besides the members above, `ReadOnlyStorage<Name>` carries `put` and `delete` typed so that no call of them compiles (their `this` is the message of "Compile errors" below, which is how the compiler comes to say it); `Storage<Name>` declares them as above.
-- Each call is exactly one host operation (below), and so one Operation log entry. `files`, `folders` and `cursor` are the host's answer; `lastModified` is a `Date` of the host's time.
+- Each call is exactly one host operation (below), and so one Operation log entry. `files`, `folders` and `cursor` are the host's answer; `lastModified` is a `Date` of the host's time. `get` resolves once the file is open and `put` once the file has landed whole; a body read afterwards, or one written while the put waits, is not part of the call's answer.
 - A refusal rejects with `Refused`, a failure with `OperationFailed` (`kind` the host's `error.kind`, `detail` its whole error), as for databases ("The SDK: Refusals and failures"). A `Refused` that escapes `fetch` is the `403` with `{ refusal, fix }`; an `OperationFailed` the fixed `500`.
-- A `body` that is none of the three, a `key` that is not a string, `options` of the wrong shape (not an object, or a member of the wrong type, such as `prefix: 5`): a `TypeError`, and nothing is sent to the host. Everything else (the key's rules, the bounds) is the host's to decide, so that it is logged.
+- A `put` whose `body` is none of the five, or whose stream is locked or already read, a `key` that is not a string, `options` of the wrong shape (not an object, or a member of the wrong type, such as `prefix: 5`): a `TypeError`, and nothing is sent to the host. Everything else (the key's rules, the bounds) is the host's to decide, so that it is logged.
+- **Nothing of a file is in the Application's memory until its code reads the stream.** A file of any size the bound allows is got and served as `new Response(file.body)` whatever the Application's own memory, and `put(key, request.body)` writes the request's body to the file the same way. `file.body` is the file as it was when it was opened (a put or a delete of the same key meanwhile changes nothing of it) and ends after exactly `file.size` bytes; the host feeds it in chunks of at most 64 KiB as the code reads it. A body given back unread as the response's body is sent by the host itself ("What an Application is handed"). Each of `arrayBuffer()`, `bytes()`, `text()` and `json()` reads the stream to its end, once; a second use, or one after `body` was read, rejects with a `TypeError`.
 
 **Compile errors**, asserted by the type tests in the compiler's words:
 
@@ -3061,7 +3071,7 @@ Five operations. Each takes `resource` (the Resource's name) and optionally `as`
 ```js
 env.VM.invoke("storage.head",   { resource: "marketing", key: "reports/q3.pdf" })
 env.VM.invoke("storage.get",    { resource: "marketing", key: "reports/q3.pdf" })
-env.VM.invoke("storage.put",    { resource: "marketing", key: "reports/q3.pdf", body: "<base64>", content_type: "application/pdf" })
+env.VM.invoke("storage.put",    { resource: "marketing", key: "reports/q3.pdf", body: <a ReadableStream, a string, an ArrayBuffer or an ArrayBufferView>, content_type: "application/pdf" })
 env.VM.invoke("storage.delete", { resource: "marketing", key: "reports/q3.pdf" })
 env.VM.invoke("storage.list",   { resource: "marketing", prefix: "reports/", delimiter: "/", limit: 100, cursor: "<cursor>" })
 ```
@@ -3071,32 +3081,33 @@ A file's metadata, in every answer: `{ "key", "size": <bytes>, "content_type", "
 | Operation | Needs | Answer |
 |---|---|---|
 | `storage.head` | `read` | `{ ok: <metadata> }`, or `{ ok: null }` when no file has the key |
-| `storage.get` | `read` | `{ ok: { ...<metadata>, "body": "<the bytes, base64 with padding>" } }`, or `{ ok: null }` |
+| `storage.get` | `read` | `{ ok: { ...<metadata>, "body": <a ReadableStream of the file's bytes, fed by the host as it is read> } }`, or `{ ok: null }` |
 | `storage.put` | `write` | `{ ok: <metadata of the file as written> }` |
 | `storage.delete` | `write` | `{ ok: {} }`, the same whether there was a file or not |
 | `storage.list` | `read` | `{ ok: { "files": [ <metadata>, ... ], "folders": [ "<prefix + segment + />", ... ], "cursor": "<opaque>" | null } }` |
 
-- **put** creates the file or replaces it whole: the last put to finish wins. A reader sees the file as it was before or as it is after, never in part; a put that fails leaves the file as it was. `body` is the bytes in standard base64 (with or without padding; anything else is `malformed`). `content_type` is optional: 1 to 255 bytes of printable ASCII (U+0020 to U+007E) holding a `/`, kept as given; anything else is `malformed`. Without it, the type is the one the key's extension gives (below).
-- **get** answers the file as one whole version of it. A file larger than the body bound is not read: `limit` `bytes` (its `head` answers, with its `size`).
+- **put** creates the file or replaces it whole: the last put to finish wins. A reader sees the file as it was before or as it is after, never in part; a put that fails leaves the file as it was. `body` is the bytes to write: a `ReadableStream`, a string (written as UTF-8), an `ArrayBuffer` or an `ArrayBufferView`. The host writes the body to its staging file as it arrives; **the file lands only when the body has ended cleanly** — a body that fails (`body-failed`, below), a request that ends first (its time, a disable), a body past the bound, a full disk: nothing lands, nothing is left in staging, and a file already at the key is untouched. The landing itself is as ever (fsync, rename, folders). A put is part of its request and ends with it; within that one write and the landing each have 10 seconds of their own, past which `limit` `time`. A source that stalls is bounded by the request's own end, and when the source is the request's body by the 10-seconds-without-a-byte rule of "What an Application is handed". `content_type` is optional: 1 to 255 bytes of printable ASCII (U+0020 to U+007E) holding a `/`, kept as given; anything else is `malformed`. Without it, the type is the one the key's extension gives (below).
+- **get** answers the file's metadata and its body as a `ReadableStream` of bytes. The body is the file as it was when it was opened: a put or a delete of the same key meanwhile changes nothing of it. It ends after exactly `size` bytes; a file found shorter while it is read (someone on the host changed it in place) fails the stream, and it is never ended as if whole. A file larger than the bound is not opened: `limit` `bytes` (its `head` answers, with its `size`).
 - **delete** of a file whose folders are then empty removes those folders too: a folder exists only while a file is in it.
 - **list** answers the keys that begin with `prefix`, **in the byte order of their UTF-8** (`Z` < `a-b` < `a.b/x` < `a/b` < `a0` < `é`), at most `limit` (an integer from 1 to 1,000; 100 without it). With `delimiter: "/"`, every key that holds a `/` after the prefix is rolled up into its folder (`prefix` up to and with that `/`), listed once in `folders`, folders and files together in byte order and each counting once against `limit`. `cursor` is null when nothing follows, and only then: **a page may hold fewer than `limit`, even nothing, and still have a cursor** (the list had more to look through than one operation should: folders that hold no file, names that are no keys), so a caller goes on with the cursor until it is null. A list spends at most 5 seconds looking, then answers what it has with the cursor of where it got to; names it passes over cost it no more than names it answers, so that a folder of many of them is paged through and never fails by itself (only a folder so large that reading its names once takes longer than the operation's time is `limit` `time`). Given back with the same `prefix` and `delimiter` the cursor answers the next page, also when files were put or deleted meanwhile (a page never repeats a key or a folder a page before it answered, and a key put meanwhile behind the cursor is not answered). A `cursor` that a list of this Resource with this `prefix` and `delimiter` did not answer: `malformed`. A `delimiter` other than `"/"`: `malformed`.
 - **Content type without one given**, by the key's last extension, in any letter case: `.txt` `text/plain; charset=utf-8`, `.html` `.htm` `text/html; charset=utf-8`, `.css` `text/css`, `.js` `text/javascript`, `.json` `application/json`, `.csv` `text/csv`, `.md` `text/markdown`, `.xml` `application/xml`, `.pdf` `application/pdf`, `.png` `image/png`, `.jpg` `.jpeg` `image/jpeg`, `.gif` `image/gif`, `.webp` `image/webp`, `.svg` `image/svg+xml`, `.zip` `application/zip`, `.docx` `application/vnd.openxmlformats-officedocument.wordprocessingml.document`, `.xlsx` `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`, `.pptx` `application/vnd.openxmlformats-officedocument.presentationml.presentation`; any other, `application/octet-stream`. The same table gives the type of a file placed in the directory by hand.
-- **Malformed** (`{ error: { kind: "malformed", message } }`, no Operation log entry, nothing touched): arguments that are not an object; `resource` missing or not a string; `own` given; `as` neither `"user"` nor `"application"`; `key` missing or not a string (head, get, put, delete); `body` missing, not a string, or not base64 (put; a text longer than a body of 8 MiB encodes to is not looked at: it is past the bound, `limit` `bytes`, in its place in the order below); `content_type` as above; `prefix` not a string; `delimiter`, `limit` or `cursor` as above.
+- **Malformed** (`{ error: { kind: "malformed", message } }`, no Operation log entry, nothing touched): arguments that are not an object; `resource` missing or not a string; `own` given; `as` neither `"user"` nor `"application"`; `key` missing or not a string (head, get, put, delete); a put's `body` missing, none of the four (a `ReadableStream`, a string, an `ArrayBuffer`, an `ArrayBufferView`), or a stream that is locked or already read; `content_type` as above; `prefix` not a string; `delimiter`, `limit` or `cursor` as above.
 
 **Failures** (`{ error: { kind, ... } }`, after the operation was allowed and its entry written):
 
 | `kind` | When | Entry's `error` |
 |---|---|---|
 | `invalid-key` (`rule`) | The key, or the prefix, breaks a rule of "Keys" | `invalid-key` |
-| `limit` (`limit: "bytes"`) | A put's body, or a file to get, is larger than 8 MiB | `bytes` |
-| `limit` (`limit: "time"`) | The operation did not end within 10 seconds | `time` |
+| `limit` (`limit: "bytes"`) | A put's body, or a file to get, is larger than 5 GiB (5,368,709,120 bytes; exactly that is taken) | `bytes` |
+| `limit` (`limit: "time"`) | Head, get, delete or list did not end within 10 seconds of its decision; for a put, one write or the landing did not end within its own 10 seconds (a put as a whole ends with its request instead) | `time` |
+| `body-failed` | A put's body failed before its end: a stream of the code's own errored or was cancelled, or the request's body failed while the put read it (past the request's bound, no byte for 10 seconds, the client gone) | `body-failed` |
 | `key-conflict` | A put where a file is a folder of the key, or a folder is the key | `key-conflict` |
 | `not-reachable` (`reason: "link" \| "not-a-file" \| "other-filesystem"`) | The key, or a folder on its way, is a symbolic link; the key is something other than a regular file (a folder, a FIFO, a device); a folder on its way is on another file system than the Resource's directory | `not-reachable` |
 | `full` | The disk or the quota of the Resource's directory is full | `full` |
 | `unavailable` | The directory cannot be used ("When the directory cannot be used"), any other error of the file system, or the program has no room for the operation now ("Bounds") | `unavailable` |
 
-- Order for every operation: malformed; who is allowed (a refusal); `invalid-key`; for a put, `limit` `bytes`; then the directory. A `get` of a key that is a folder answers `not-reachable` `not-a-file`, not `null`; a `head` the same.
-- A put that fails `limit` `time`, or that is given up because the Application was disabled meanwhile (`application-disabled`, "Requests in flight"), may still land after the answer (a system call cannot be stopped); it lands whole or not at all.
+- Order for every operation: `malformed`; who is allowed (a refusal); `invalid-key`; for a put, `limit` `bytes` in this place for a body whose length is known before it is read (a string, an `ArrayBuffer`, an `ArrayBufferView`, and the request's own body when the request stated a `content-length`); then the staging write, where a stream's `limit` `bytes` and any `body-failed` are met, with nothing landed and nothing left in staging when either fails; then the directory. A `get` of a key that is a folder answers `not-reachable` `not-a-file`, not `null`; a `head` the same.
+- A put still running when its request ends is given up, exactly as a statement still running then is cancelled: its Operation log entry is `failed` with `error` `request-ended` ("Transactions: What the host does on its own"), and one still running when its Application is disabled is given up the same, its entry `failed` with `error` `application-disabled` ("Requests in flight"). Nothing lands in either case, and nothing is left in staging: not on the word of a write that was in flight on a file thread (a system call cannot be stopped, but the landing is a step of its own, and it is not taken). What a crash leaves in `.vibe-staging/` is removed when the Resource is next loaded ("What is on the directory").
 
 ### Who is allowed
 
@@ -3108,19 +3119,23 @@ As "Who is allowed", in that order, with the level each operation needs (`read` 
 - A Version that declared the Resource at `read` is refused `declared-lower` (`declared` `read`, `needed` `write`) for put and delete. A User whose Groups hold `read` is refused `no-grant` (`held` `read`, `needed` `write`) for them, and one whose Groups hold nothing is refused `no-grant` (`held` null) for all five, with the Resource's `contact`.
 - A refused operation touches nothing: no file is read, made, changed or removed, and no folder is made.
 - The Authorization decision (`authz`) is unchanged: the host asks it with the level needed, after matching kinds.
+- A Grant withdrawn while a body is being sent does not cut it: the decision was taken at the get, as an operation under way is not cut.
 
 ### Bounds
 
-- **Body**: 8 MiB (8,388,608 bytes; exactly that is taken) for a put's body and a get's file. Past it, `limit` `bytes`; the program never decodes or reads more than the bound and one byte of it.
+- **Chunks**: the host feeds a body in chunks of at most 64 KiB (65,536 bytes); a chunk the Application's code writes to the host is at most 64 KiB (the platform's glue cuts larger writes; the native refuses a larger one).
+- **A file**: at most 5 GiB (5,368,709,120 bytes; exactly that is taken) for a put's body and a get's file. Past it, `limit` `bytes`; the program never writes or reads more than the bound and one byte of it. A test can show the bound without writing 5 GiB through the program: a put of a request whose stated `content-length` is 5,368,709,121 fails `limit` `bytes` in its place in the order, before a byte is read, and a `get` of a sparse file of that size placed in the directory by hand is refused the same (a file of exactly 5,368,709,120 bytes is opened).
+- **Files open at once** (a body being read or written, a body being sent included): 16 for one request, 512 in the program. An operation that would open one and finds none free waits up to 5 seconds, then fails `unavailable` and touches nothing. An open body stops counting when it was read to its end, when it was cancelled (`file.body.cancel()`), when its sending ended, and in any case when its request ends unless it is being sent as the response.
+- **Streams of its own** an Application's code may have open towards the host at once: 16 for one request (a put whose body the code makes holds one while it runs, a response body the code makes as a stream holds one); a put that would need a 17th fails `unavailable` at once, not waited for; code that reaches past the SDK and the raw interface for more gets an error thrown.
 - **Key**: 1,024 bytes; **prefix**: 1,023 bytes; **segments**: 64 of at most 255 bytes. **A list page**: 1 to 1,000. **Content type**: 255 bytes. **Cursor**: as the program made it (at most 2,048 bytes).
-- **Time**: 10 seconds an operation, from the moment it is decided; past it, `limit` `time`.
-- **At once** (no black-box test can provoke these in a test's time; they are read in the code at review, and measured there): file work runs on 8 threads of its own, with at most 64 operations waiting for them; an operation that finds no place among them within 5 seconds fails `unavailable` and touches nothing. Storage operations hold at most 256 MiB of bodies at once in the program, each body counted with its base64 text: a put's from the moment its arguments are read until its file is written or it is given up, a get's from before its file is read until its answer is handed to the Application. **A put is never kept waiting with its body**: one refused keeps none of it, and one that finds no room is answered `unavailable` at once, in its place in the order (after who is allowed, `invalid-key` and `limit` `bytes`; its entry `failed` `unavailable`), and touches nothing. A get waits up to 5 seconds for room, holding nothing meanwhile.
-- **A request to an Application** may now have a body of up to 8,454,144 bytes (8 MiB and 64 KiB), so that a file of the bound can be uploaded through a form; larger is `413`. `vibe request`'s `--data` and `--data-file` take the same.
-- Through the SDK an operation of 8 MiB holds the body and its base64 text in the Application's heap. One request may send the same body in many calls at once; the program then holds no more than the budget above, and the calls past it are `unavailable`.
+- **Time**: 10 seconds an operation (head, get, delete, list), from the moment it is decided; past it, `limit` `time`. A put is part of its request and ends with it (the request's 30 seconds); within that one write and the landing each have 10 seconds of their own, past which `limit` `time`. A source that stalls is bounded by the request's own end, and when the source is the request's body by the 10-seconds-without-a-byte rule of "What an Application is handed".
+- **Memory** (a test may measure the program's resident memory): about 4 MiB for one open body, whatever the Application's code does. A hostile Application that opens every stream it may and writes the largest chunks it can does not make the program's memory grow by more than 128 MiB a request in flight.
+- **The file threads and their waits** (no black-box test can provoke these in a test's time; they are read in the code at review, and measured there): file work runs on 8 threads of its own, with at most 64 jobs waiting for them; a job that finds no place among them within 5 seconds fails `unavailable` and touches nothing. A chunk read or written is one job.
+- **A request's body**, which a put can take as its own: at most 5,368,774,656 bytes (5 GiB and 64 KiB), under `vibe serve` and in the local run alike ("What an Application is handed"). `vibe request`'s `--data` and `--data-file` stay at most 1 MiB.
 
 ### The Operation log
 
-Every Storage operation, allowed, refused or failed, has one entry, written before the directory is touched and completed when the operation ends; one that cannot be written refuses the operation `log-unavailable` and nothing is touched ("The Operation log"). A malformed one has none.
+Every Storage operation, allowed, refused or failed, has one entry, written before the directory is touched and completed when the operation ends; one that cannot be written refuses the operation `log-unavailable` and nothing is touched ("The Operation log"). A malformed one has none. **When an operation ends**: a `get` when the file is open (the answer's metadata, the `size` included, is decided then; the entry does not say how much of the body was read afterwards); a `put` when it has landed or failed.
 
 | Field | For a Storage operation |
 |---|---|
@@ -3129,7 +3144,7 @@ Every Storage operation, allowed, refused or failed, has one entry, written befo
 | `statement` | the operation's word and its key, the key written as a JSON string: `get "reports/q3.pdf"`, `put "reports/q4.pdf"`, `head "..."`, `delete "..."`; for a list `list "<prefix>"`, and `list "<prefix>" delimiter "/"` with the delimiter. In that JSON string every character the rule `character` names (the controls U+0000 to U+001F and U+007F to U+009F, and the bidirectional marks; not `\`, which JSON writes `\\`) is written `\uXXXX` (four hex digits, lower case), so that an entry is safe to print. A key that breaks a rule is written the same, and one longer than 1,024 bytes is cut after its first 1,024 bytes (at a character's end) and `...` follows the closing quote: `put "<the first 1,024 bytes>"...`. |
 | `rows` | head and get: `1` when a file was answered, `0` for `null`; put: `1`; delete: null; list: the number of files and folders answered; null unless it ended |
 | `outcome`, `reason`, `error` | as for any operation; `error` as the table of failures says |
-| `duration_ms` | from when the operation was handed to the directory (its entry written), to its end, the wait for a file thread included; null when it ended before that (a refusal, `invalid-key`, a put's `limit` `bytes`) |
+| `duration_ms` | from when the operation was handed to the directory (its entry written), to its end — for a `get`, to the file's open; for a `put`, to its landing or its failure — the wait for a file thread included; null when it ended before that (a refusal, `invalid-key`, and a put whose body was over the bound before a byte of it was read) |
 
 - **No field holds a file's contents**, its content type or its size: only its key. The cursor is not recorded.
 - The program's `host-call` record names the operation (`storage.get`, ...) as for any call.
@@ -3157,7 +3172,7 @@ What a test shows, with a hostile fixture Application of its own that calls the 
 
 ### Durability
 
-- A put whose answer was received is on the disk: after the program is stopped (also killed with `SIGKILL`) and started again against the same platform database and storage root, the file has its bytes, its content type and its time of last change, and the Resource answers as before.
+- A put's answer is given only once the file has landed whole (the landing as ever: fsync, rename, folders), so **a put whose answer was received is on the disk**: after the program is stopped (also killed with `SIGKILL`) and started again against the same platform database and storage root, the file has its bytes, its content type and its time of last change, and the Resource answers as before. A put that was given up (its request ended first) has landed nothing and left nothing in staging; what a kill leaves in `.vibe-staging/` is removed when the Resource is next loaded ("What is on the directory").
 - The Grants, the Resource and its location are in the platform database like any Resource's.
 
 ### Pulling a Storage Resource, checking and deploying
@@ -3195,7 +3210,7 @@ What a test shows, with a hostile fixture Application of its own that calls the 
 
 ### The instruction file
 
-From this ticket on the template's `AGENTS.md` names `ctx.user().storage(name)` beside `ctx.user().db(name)`, says that a Storage Resource is declared with `kind: "storage"` and pulled with `vibe pull` like a database, that a file is named by a key (`/` between folders, no `..`, no leading `/`), that a file is at most 8 MiB, that `get` and `head` answer `null` when there is no file, and that in the local run files are in `.vibe/local/storage/<name>/`, where test files may be placed by hand.
+From this ticket on the template's `AGENTS.md` names `ctx.user().storage(name)` beside `ctx.user().db(name)`, says that a Storage Resource is declared with `kind: "storage"` and pulled with `vibe pull` like a database, that a file is named by a key (`/` between folders, no `..`, no leading `/`), that a file's body is a stream (`file.body`, or `await file.text()` / `json()` / `arrayBuffer()` for a small one), that a download is `new Response(file.body)` and an upload is `put(key, request.body)`, that a file is at most 5 GiB, that `get` and `head` answer `null` when there is no file, and that in the local run files are in `.vibe/local/storage/<name>/`, where test files may be placed by hand.
 
 ### What this does not close
 
@@ -3203,11 +3218,12 @@ From this ticket on the template's `AGENTS.md` names `ctx.user().storage(name)` 
 - **An Application's own storage** (as its own database is its own): only shared Storage Resources.
 - **Serving a stored file from an address without code**: a file reaches a User only through the Application's code ("Static files" is a Version's own files).
 - **Rules per folder or per file**: a Grant covers the whole Resource; a company that needs two rules registers two Resources.
-- **Bodies larger than 8 MiB**, ranges, streaming, appending, renaming, copying, and conditional writes (create only if absent, replace only if unchanged).
+- **Ranges** (reading part of a file), **resumable or multipart uploads**, **an upload that outlives its request** (a put is bounded by the request's 30 seconds), appending, renaming, and conditional writes (create only if absent, replace only if unchanged). A copy is now possible (`put(k2, (await get(k1)).body)`) but is not one atomic server-side operation: the second file can differ from the first if a put lands between the two calls.
+- **A response the Application's code generates as a stream** (a `ReadableStream` it makes, a `TransformStream`'s output): it stays whole and at most 8 MiB, as before ("What an Application is handed").
 - **Quotas** set by the platform: the disk's own and `full`.
 - Versions of a file, a recycle bin, or undoing a put or a delete: a put replaces and a delete removes, at once.
 - Showing a Storage Resource's location to a Platform administrator, changing it, or removing a Resource: the ticket "Resources and Grants in full".
 - Someone with write access to the host's folder can change or remove files the Applications then read; the platform guarantees only that it reads and writes nothing outside the folder, and that what it writes is whole.
 - Hard links planted on the host are read as files (ADR 0019).
-- A file someone on the host writes in place while an Application reads it may be answered in part. Files are placed whole by renaming them into the directory, as the platform itself does.
+- A file someone on the host writes in place while an Application reads it is outside the platform's promise: what the Application reads may be a mix of what was there, and if the file becomes shorter than it was when opened the stream fails — it is never ended as if whole. Files are placed whole by renaming them into the directory, as the platform itself does.
 - The local loop on Windows (keys with `:`, `*`, `?`, `"`, `<`, `>`, `|`, or ending with `.` or a space, which Windows cannot name): the ticket on the three systems.
