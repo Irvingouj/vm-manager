@@ -29,6 +29,18 @@
 //   /sleep-then-read-all?ms=<n>
 //                            waits n ms before it touches the body, then
 //                            reads it to its end and answers 200 { bytes }.
+//   /read-one-wait-made?ms=<n>
+//                            reads one chunk, waits n ms without reading
+//                            more (the platform's read-ahead fills meanwhile),
+//                            then answers 200 with a string it made.
+//   /read-one-wait-echo?ms=<n>
+//                            reads one chunk, releases the reader, waits n
+//                            ms, then gives the request's body back
+//                            (`new Response(request.body)`): a body the code
+//                            began to read, collected whole.
+//   /read-unawaited          starts a read of the body (`getReader().read()`)
+//                            and does not wait for it: answers 200 with a
+//                            string it made at once.
 //   /read-all                prints one line, then reads the body to its end
 //                            (or until the stream fails) and answers 200 with
 //                            { bytes, error }. A body the platform fails
@@ -81,6 +93,28 @@ globalThis.default = {
       return new Response(JSON.stringify({ bytes }), {
         headers: { "content-type": "application/json" },
       });
+    }
+
+    if (url.pathname === "/read-one-wait-made") {
+      const ms = Number(url.searchParams.get("ms") ?? "0") || 0;
+      const reader = request.body.getReader();
+      await reader.read();
+      await new Promise((resolve) => setTimeout(resolve, ms));
+      return new Response("made after waiting");
+    }
+
+    if (url.pathname === "/read-one-wait-echo") {
+      const ms = Number(url.searchParams.get("ms") ?? "0") || 0;
+      const reader = request.body.getReader();
+      await reader.read();
+      reader.releaseLock();
+      await new Promise((resolve) => setTimeout(resolve, ms));
+      return new Response(request.body);
+    }
+
+    if (url.pathname === "/read-unawaited") {
+      request.body.getReader().read();
+      return new Response("made at once");
     }
 
     if (url.pathname === "/first-bytes") {

@@ -164,7 +164,7 @@ fn four_mib_requests(vm: &Vm, path: &str, count: usize, threads: usize) -> Vec<S
                         // writer finish; one that does not has it let go.
                         let waited = Instant::now();
                         while !done.load(Ordering::Relaxed)
-                            && waited.elapsed() < Duration::from_secs(3)
+                            && waited.elapsed() < Duration::from_secs(1)
                         {
                             thread::sleep(Duration::from_millis(10));
                         }
@@ -191,21 +191,46 @@ fn four_mib_requests(vm: &Vm, path: &str, count: usize, threads: usize) -> Vec<S
 
 #[test]
 fn what_a_requests_body_held_is_given_back_when_the_request_ends() {
-    // About 20 to 40 seconds: 16 warm-up requests of 4 MiB per route, then
-    // 200 requests of 4 MiB per route (400 in all, 1.6 GB through loopback),
-    // 8 at a time. Memory is the program's resident memory after the
-    // requests and a short rest, against what it was after the warm-up.
+    // About 80 to 100 seconds. Six routes, each with 16 warm-up requests of
+    // 4 MiB and then 200 requests of 4 MiB, 8 at a time (the routes that
+    // answer at once) or 20 at a time (the three that hold the request 1.5
+    // seconds, so that the platform's read-ahead fills while the code waits:
+    // 10 rounds of 1.5 s each). That is 1,200 requests of 4 MiB, 5 GB
+    // through loopback. The routes:
+    //
+    // - `/never-reads`, `/read-one`: answer at once (the read-ahead never
+    //   fills);
+    // - `/read-one-wait-made`: reads one chunk, waits 1.5 s, answers a
+    //   string it made;
+    // - `/read-one-wait-echo`: reads one chunk, waits 1.5 s, gives the
+    //   request's body back (collected whole: 4 MiB is under the 8 MiB);
+    // - `/read-unawaited`: starts a read of the body, does not wait for it
+    //   and answers a string it made at once (the request may end with that
+    //   read still pending);
+    // - `/sleep`: never reads, waits 1.5 s, answers; the client keeps
+    //   writing meanwhile, from a thread, and lets go when the answer is in.
+    //
+    // Memory is the program's resident memory after each route's 200
+    // requests and a 2-second rest, against what it was after all the
+    // warm-ups.
     let vm = Vm::with_stand_in(&[(APP, "body-request.js")]);
     let pid = vm.pid();
-    let routes = ["/never-reads", "/read-one"];
-    for route in routes {
-        let failures = four_mib_requests(&vm, route, 16, 8);
+    let routes: [(&str, usize); 6] = [
+        ("/read-unawaited", 8),
+        ("/never-reads", 8),
+        ("/read-one", 8),
+        ("/read-one-wait-made?ms=1500", 20),
+        ("/read-one-wait-echo?ms=1500", 20),
+        ("/sleep?ms=1500", 20),
+    ];
+    for (route, threads) in routes {
+        let failures = four_mib_requests(&vm, route, 20, threads.min(20));
         assert!(failures.is_empty(), "warm-up: {failures:?}");
     }
     thread::sleep(Duration::from_secs(1));
     let before = memory_of(pid, "VmRSS");
-    for route in routes {
-        let failures = four_mib_requests(&vm, route, 200, 8);
+    for (route, threads) in routes {
+        let failures = four_mib_requests(&vm, route, 200, threads);
         assert!(
             failures.is_empty(),
             "{} request(s) of 200 to {route} failed, the first: {:?}",
@@ -502,3 +527,99 @@ fn vm_request() -> Vm {
 // found would depend on the machine. It is left until the contract says how
 // many requests run at once.
 // ---------------------------------------------------------------------
+
+// ---------------------------------------------------------------------
+// 6. The code cannot write into a stream the host feeds
+// ---------------------------------------------------------------------
+
+/// What `/write-into-host-stream` says it found, from the answer's head.
+fn assert_writes_threw(head: &blackbox::body::Head) {
+    assert_eq!(
+        head.header("x-has-write"),
+        Some("true"),
+        "the runtime's `__responseStreamWrite` is not there to call"
+    );
+    assert_eq!(
+        head.header("x-had-id"),
+        Some("true"),
+        "`request.body._nativeStreamId` is not a number in this runtime: the test cannot name the host's stream"
+    );
+    assert_eq!(
+        head.header("x-threw"),
+        Some("real,made-up"),
+        "expected both calls to throw: a write into the stream the host feeds (the request's body) and a write into an id the code never made"
+    );
+}
+
+#[test]
+fn the_code_cannot_write_into_the_stream_the_host_feeds_and_the_body_arrives_as_sent() {
+    // About 1 second. The code writes 1,000 bytes into the request body's
+    // own stream id and into a made-up id (999999), both must throw, and the
+    // body given back is exactly what the client sent, with the length the
+    // platform stated; on the same connection the next request is its own.
+    let vm = Vm::with_stand_in(&[(ECHO, "body-response.js")]);
+    let sent: Vec<u8> = (0..4096_u32)
+        .map(|i| u8::try_from((i * 7 + 3) % 256).expect("below 256"))
+        .collect();
+    let mut raw = Raw::connect_keep_alive(vm.address());
+    let (head, body, end) = raw.exchange(
+        "POST",
+        "/write-into-host-stream",
+        &vm.host_of(ECHO),
+        Some(&bob()),
+        Some(&sent),
+        Duration::from_secs(10),
+    );
+    assert_eq!(head.status, 200, "got {}", head.status);
+    assert_writes_threw(&head);
+    assert_eq!(end, BodyEnd::Whole);
+    assert_eq!(body, sent, "expected exactly the bytes the client sent");
+    assert_eq!(head.content_length(), Some(4096), "the stated length");
+
+    let (next, text, end) = raw.exchange(
+        "GET",
+        "/text?body=next",
+        &vm.host_of(ECHO),
+        Some(&bob()),
+        None,
+        Duration::from_secs(10),
+    );
+    assert_eq!((next.status, end), (200, BodyEnd::Whole));
+    assert_eq!(
+        text, b"next",
+        "expected the next request answered as its own"
+    );
+}
+
+#[test]
+fn the_code_cannot_write_into_the_stream_the_host_feeds_when_no_length_is_stated() {
+    // About 1 second. The same for a chunked request: the body given back is
+    // exactly what was sent and ends cleanly (chunked, with its last chunk).
+    let vm = Vm::with_stand_in(&[(ECHO, "body-response.js")]);
+    let sent: Vec<u8> = (0..4096_u32)
+        .map(|i| u8::try_from((i * 7 + 3) % 256).expect("below 256"))
+        .collect();
+    let mut raw = Raw::connect_keep_alive(vm.address());
+    raw.send_head(
+        "POST",
+        "/write-into-host-stream",
+        &vm.host_of(ECHO),
+        Some(&bob()),
+        Framing::Chunked,
+        &[],
+    );
+    raw.send_chunk(&sent).expect("a chunk is written");
+    raw.finish_chunks().expect("the end is written");
+    let head = raw.read_head(Duration::from_secs(10));
+    assert_eq!(head.status, 200, "got {}", head.status);
+    assert_writes_threw(&head);
+    assert_eq!(head.content_length(), None);
+    assert!(head.chunked(), "expected the body chunked");
+    let mut body = Vec::new();
+    assert_eq!(
+        raw.drain_body(Duration::from_secs(10), |b| body.extend_from_slice(b)),
+        BodyEnd::Whole,
+        "expected the body to end cleanly"
+    );
+    assert_eq!(body, sent, "expected exactly the bytes the client sent");
+}

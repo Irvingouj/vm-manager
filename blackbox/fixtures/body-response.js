@@ -24,6 +24,14 @@
 //                    the request's own body) whose `status` is then forced
 //                    to 204 or 304 with Object.defineProperty: a status a
 //                    Response cannot be built with.
+//   /write-into-host-stream
+//                    takes request.body._nativeStreamId, calls the runtime's
+//                    own __responseStreamWrite(id, 1000 bytes) with it and
+//                    with a made-up id (999999), each in a try/catch, and
+//                    gives the request's body back with headers saying what
+//                    it found: x-had-id (the id was a number), x-has-write
+//                    (the function is there) and x-threw (`real`,
+//                    `made-up`: which of the two calls threw).
 //   /text?body=<text>
 //                    the text, as a string
 
@@ -63,6 +71,28 @@ globalThis.default = {
       );
       Object.defineProperty(response, "status", { value: number("status", 204) });
       return response;
+    }
+
+    if (url.pathname === "/write-into-host-stream") {
+      const id = request.body ? request.body._nativeStreamId : undefined;
+      const threw = [];
+      const has = typeof globalThis.__responseStreamWrite === "function";
+      if (has) {
+        try {
+          globalThis.__responseStreamWrite(id, new Uint8Array(1000));
+        } catch (e) {
+          threw.push("real");
+        }
+        try {
+          globalThis.__responseStreamWrite(999999, new Uint8Array(1000));
+        } catch (e) {
+          threw.push("made-up");
+        }
+      }
+      headers.set("x-had-id", String(typeof id === "number"));
+      headers.set("x-has-write", String(has));
+      headers.set("x-threw", threw.join(","));
+      return new Response(request.body, { headers });
     }
 
     if (url.pathname === "/text") {
