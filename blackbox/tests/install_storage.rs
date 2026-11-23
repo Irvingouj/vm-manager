@@ -704,6 +704,39 @@ fn storage_mounted_read_write_the_file_a_request_puts_is_on_the_host_and_answere
     let project = copy_project("files");
     project.write("migrations/.gitkeep", "");
     pulled_by_hand(&project, DEVOPS);
+    // What a Builder does before a deploy: `vibe pull` of each Storage
+    // Resource the project declares, against the installed program with
+    // the walk's own Builder (their Group holds `write` on `marketing` and
+    // `read` on `archive`, so both pulls are allowed). `devops` is left as
+    // given by hand: the Builder holds no Grant on it, which the contract
+    // allows a deploy ("For a declared Resource the User holds no Grant on
+    // ... the deploy goes on with the definition of the project and
+    // warns"): its pull is refused, not tried here.
+    for resource in [MARKETING, ARCHIVE] {
+        let pulled = machine.run_with_env(
+            &[
+                "pull",
+                resource,
+                "--project",
+                project.dir.to_str().unwrap(),
+                "--json",
+            ],
+            &[("VIBE_CA_FILE", at.tool_ca_file())],
+        );
+        assert_eq!(
+            pulled.code,
+            Some(0),
+            "expected `vibe pull {resource}` of the fixture project, as the walk's Builder against the installed program, to end with 0\n{}",
+            blackbox::connection::hide(&pulled, &at.install.secrets()).describe()
+        );
+        assert!(
+            project
+                .dir
+                .join(format!("resources/{resource}/storage.json"))
+                .is_file(),
+            "expected resources/{resource}/storage.json written by the pull"
+        );
+    }
     init_repository(&project.dir);
     commit_all(&project.dir, "The fixture of Storage, as it is");
     let run = deploy_with_env(
@@ -771,7 +804,7 @@ fn storage_mounted_read_write_the_file_a_request_puts_is_on_the_host_and_answere
     let got = get_through(&at, &mut browser, key);
     assert_eq!(got["file"]["info"]["key"], json!(key), "{got}");
     assert_eq!(
-        got["file"]["bodyB64"],
+        got["file"]["bytesB64"],
         json!(b64(body.as_bytes())),
         "expected the Application's get to answer the bytes put: {got}"
     );
@@ -787,7 +820,7 @@ fn storage_mounted_read_write_the_file_a_request_puts_is_on_the_host_and_answere
         );
         let got = get_through(at, browser, key);
         assert_eq!(
-            got["file"]["bodyB64"],
+            got["file"]["bytesB64"],
             json!(b64(body.as_bytes())),
             "{what}: expected the Application's `get` to answer the file"
         );

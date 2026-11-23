@@ -960,10 +960,22 @@ impl StorageWork {
             return unavailable();
         };
         let ended = self.in_flight.bodies.ended();
+        let mut answer_rx = answer_rx;
         let answer = tokio::select! {
             biased;
             () = ended => None,
-            answer = answer_rx => Some(answer),
+            answer = &mut answer_rx => Some(answer),
+        };
+        // A put that had landed and answered when the end came is not given
+        // up: its file is there, and its entry says so. (The end and the
+        // answer can both be ready in one poll, and the end is looked at
+        // first.) Any other answer already there is the put given up.
+        let answer = match answer {
+            Some(answer) => Some(answer),
+            None => match answer_rx.try_recv() {
+                Ok(Ok(metadata)) => Some(Ok(Ok(metadata))),
+                _ => None,
+            },
         };
         let duration_ms = elapsed();
         let Some(answer) = answer else {
