@@ -28,7 +28,7 @@ use blackbox::User;
 use blackbox::admin::{self, IN_FLIGHT_ALLOWED, administrator};
 use blackbox::body::{BodyEnd, Framing, MIB, Raw, assert_framed_truly, memory_of, pattern_block};
 use blackbox::logs::wait_for_entry;
-use blackbox::{Vm, fixture_bundle};
+use blackbox::{INSTALLER, Vm, fixture_bundle};
 
 /// The fixture of the request-body routes.
 const APP: &str = "body-request";
@@ -540,22 +540,39 @@ fn vm_request() -> Vm {
 // 6. The code cannot write into a stream the host feeds
 // ---------------------------------------------------------------------
 
-/// What `/write-into-host-stream` says it found, from the answer's head.
+/// What `/write-into-host-stream` says it found, from the answer's head: it
+/// calls the runtime's own `__responseStreamWrite`, `__responseStreamEnd`,
+/// `__responseStreamError` and `__nativeScheduleWritable` (the last with the
+/// id alone and with the id and a function: its arguments are not known to
+/// this test) with a made-up id (999999) and with the request body's own id.
 fn assert_writes_threw(head: &blackbox::body::Head) {
-    assert_eq!(
-        head.header("x-has-write"),
-        Some("true"),
-        "the runtime's `__responseStreamWrite` is not there to call"
-    );
     assert_eq!(
         head.header("x-had-id"),
         Some("true"),
         "`request.body._nativeStreamId` is not a number in this runtime: the test cannot name the host's stream"
     );
     assert_eq!(
-        head.header("x-threw"),
-        Some("real,made-up"),
-        "expected both calls to throw: a write into the stream the host feeds (the request's body) and a write into an id the code never made"
+        head.header("x-missing"),
+        Some(""),
+        "a runtime call the test means to make is not there"
+    );
+    let mut threw: Vec<&str> = head
+        .header("x-threw")
+        .unwrap_or_default()
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .collect();
+    threw.sort_unstable();
+    let mut expected: Vec<String> = Vec::new();
+    for which in ["made-up", "real"] {
+        for name in ["write", "end", "error", "schedule", "schedule-fn"] {
+            expected.push(format!("{which}:{name}"));
+        }
+    }
+    expected.sort_unstable();
+    assert_eq!(
+        threw, expected,
+        "expected every call on a stream the code did not make to throw (the request's body, a made-up id): these did"
     );
 }
 
@@ -723,6 +740,144 @@ fn a_body_the_code_cancelled_is_never_sent_as_the_clients_bytes() {
                 }
             });
         }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} case(s) failed:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}
+
+// ---------------------------------------------------------------------
+// 8. A locked body cannot be given back
+// ---------------------------------------------------------------------
+
+#[test]
+fn a_body_the_code_still_holds_a_reader_on_is_the_fixed_500_and_a_released_one_is_given_back() {
+    // About 2 seconds. The client sends 1 MiB whole. A read started and not
+    // awaited, or one chunk read with the reader still held, leaves the
+    // stream locked: the request fails as code that throws does (the fixed
+    // `500`, as `errors.rs` recognises it: a short body that reveals
+    // nothing), with the entry's status `500`; never a `200` with an empty or
+    // partial body. The control reads one chunk and releases the lock: the
+    // rest comes whole.
+    let vm = Vm::with_stand_in(&[(ECHO, "body-response.js")]);
+    let block = pattern_block(usize::try_from(MIB).expect("fits"));
+    let mut failures = Vec::new();
+    for route in ["/locked-a", "/locked-b"] {
+        collect(&mut failures, route, || {
+            let mut raw = Raw::connect_keep_alive(vm.address());
+            let (head, body, end) = raw.exchange(
+                "POST",
+                route,
+                &vm.host_of(ECHO),
+                Some(&bob()),
+                Some(&block),
+                Duration::from_secs(10),
+            );
+            assert_eq!(
+                head.status,
+                500,
+                "{route}: expected the fixed 500 for a locked body given back, got {} with {} body bytes",
+                head.status,
+                body.len()
+            );
+            assert_eq!(end, BodyEnd::Whole, "{route}");
+            assert_framed_truly(&head, u64::try_from(body.len()).expect("fits"), route);
+            assert!(
+                body.len() < 1024
+                    && !body
+                        .windows(64)
+                        .any(|w| block.windows(64).next() == Some(w)),
+                "{route}: expected the fixed 500's body, got {} bytes",
+                body.len()
+            );
+            let (entry, _) =
+                wait_for_entry(&vm.api_as(&User::new(INSTALLER)), ECHO, &head.request_id());
+            assert_eq!(entry["status"], 500, "{route}: {entry}");
+        });
+    }
+    collect(
+        &mut failures,
+        "control: one chunk read, lock released",
+        || {
+            let mut raw = Raw::connect_keep_alive(vm.address());
+            let (head, body, end) = raw.exchange(
+                "POST",
+                "/echo-read-then-give-back",
+                &vm.host_of(ECHO),
+                Some(&bob()),
+                Some(&block),
+                Duration::from_secs(10),
+            );
+            assert_eq!(head.status, 200, "got {}", head.status);
+            assert_eq!(end, BodyEnd::Whole);
+            let first: usize = head
+                .header("x-first-chunk")
+                .expect("the code says how much it read")
+                .parse()
+                .expect("a number");
+            assert_eq!(
+                body.as_slice(),
+                block.get(first..).expect("within the body"),
+                "expected the rest of the body whole"
+            );
+            assert_framed_truly(&head, u64::try_from(body.len()).expect("fits"), "control");
+        },
+    );
+    assert!(
+        failures.is_empty(),
+        "{} case(s) failed:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}
+
+// ---------------------------------------------------------------------
+// 9. Cancelling does not ask for the body, and neither does a read after
+// ---------------------------------------------------------------------
+
+#[test]
+fn cancelling_the_body_and_reading_after_it_do_not_ask_the_client_to_send_it() {
+    // About 2 seconds. The client sent `Expect: 100-continue` and holds its
+    // body back. The code cancels (and, in the second route, then reads
+    // `request.text()` inside a try/catch) and answers a string it made: no
+    // `100 Continue` at all, the string with `200`, and the connection
+    // closed after the answer (the client had not sent its body).
+    let vm = Vm::with_stand_in(&[(ECHO, "body-response.js")]);
+    let mut failures = Vec::new();
+    for route in ["/cancel-made", "/cancel-then-text"] {
+        collect(&mut failures, route, || {
+            let mut raw = Raw::connect_keep_alive(vm.address());
+            raw.send_head(
+                "POST",
+                route,
+                &vm.host_of(ECHO),
+                Some(&bob()),
+                Framing::Length(MIB),
+                &[("Expect", "100-continue")],
+            );
+            let head = raw.read_head(Duration::from_secs(5));
+            assert_eq!(head.status, 200, "{route}: got {}", head.status);
+            let mut body = Vec::new();
+            assert_eq!(
+                raw.drain_body(Duration::from_secs(5), |b| body.extend_from_slice(b)),
+                BodyEnd::Whole,
+                "{route}"
+            );
+            assert_eq!(body, b"made after cancel", "{route}");
+            assert_eq!(
+                raw.interims(),
+                0,
+                "{route}: expected no `100 Continue`: cancelling does not ask for the body"
+            );
+            assert!(
+                raw.wait_closed_without_taking(Duration::from_secs(5))
+                    .is_some(),
+                "{route}: expected the connection closed after the answer: the client had not sent its body"
+            );
+        });
     }
     assert!(
         failures.is_empty(),

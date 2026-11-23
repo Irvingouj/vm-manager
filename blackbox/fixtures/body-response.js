@@ -37,6 +37,14 @@
 //                    lock, then gives the body back
 //   /cancel-made     `await request.body.cancel()`, then answers a string
 //                    it made (`made after cancel`)
+//   /locked-a        takes a reader and starts a read it does not await, the
+//                    reader not released, then gives the request's body back
+//   /locked-b        takes a reader, awaits one read, the reader still held,
+//                    then gives the request's body back
+//   /cancel-then-text
+//                    `await request.body.cancel()`, then `await
+//                    request.text()` in a try/catch, then answers a string it
+//                    made (`made after cancel`)
 //   /text?body=<text>
 //                    the text, as a string
 
@@ -80,22 +88,30 @@ globalThis.default = {
 
     if (url.pathname === "/write-into-host-stream") {
       const id = request.body ? request.body._nativeStreamId : undefined;
+      const calls = [
+        ["write", (i) => globalThis.__responseStreamWrite(i, new Uint8Array(1000)), "__responseStreamWrite"],
+        ["end", (i) => globalThis.__responseStreamEnd(i), "__responseStreamEnd"],
+        ["error", (i) => globalThis.__responseStreamError(i, "x"), "__responseStreamError"],
+        ["schedule", (i) => globalThis.__nativeScheduleWritable(i), "__nativeScheduleWritable"],
+        ["schedule-fn", (i) => globalThis.__nativeScheduleWritable(i, () => {}), "__nativeScheduleWritable"],
+      ];
       const threw = [];
-      const has = typeof globalThis.__responseStreamWrite === "function";
-      if (has) {
-        try {
-          globalThis.__responseStreamWrite(id, new Uint8Array(1000));
-        } catch (e) {
-          threw.push("real");
+      const missing = [];
+      for (const [name, call, fn] of calls) {
+        if (typeof globalThis[fn] !== "function") {
+          missing.push(fn);
+          continue;
         }
-        try {
-          globalThis.__responseStreamWrite(999999, new Uint8Array(1000));
-        } catch (e) {
-          threw.push("made-up");
+        for (const [which, target] of [["made-up", 999999], ["real", id]]) {
+          try {
+            call(target);
+          } catch (e) {
+            threw.push(`${which}:${name}`);
+          }
         }
       }
       headers.set("x-had-id", String(typeof id === "number"));
-      headers.set("x-has-write", String(has));
+      headers.set("x-missing", [...new Set(missing)].join(","));
       headers.set("x-threw", threw.join(","));
       return new Response(request.body, { headers });
     }
@@ -114,6 +130,28 @@ globalThis.default = {
 
     if (url.pathname === "/cancel-made") {
       await request.body.cancel();
+      return new Response("made after cancel", { headers });
+    }
+
+    if (url.pathname === "/locked-a") {
+      const reader = request.body.getReader();
+      reader.read();
+      return new Response(request.body, { headers });
+    }
+
+    if (url.pathname === "/locked-b") {
+      const reader = request.body.getReader();
+      await reader.read();
+      return new Response(request.body, { headers });
+    }
+
+    if (url.pathname === "/cancel-then-text") {
+      await request.body.cancel();
+      try {
+        await request.text();
+      } catch (e) {
+        // the read after a cancel may fail: the answer is the code's own
+      }
       return new Response("made after cancel", { headers });
     }
 
