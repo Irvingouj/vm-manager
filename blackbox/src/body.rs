@@ -233,6 +233,10 @@ pub struct Raw {
     /// Whether `send_head` leaves out `Connection: close`, so that the
     /// connection is kept for the next request (HTTP/1.1's default).
     keep_alive: bool,
+    /// How many interim (`1xx`, `101` aside) responses have come before the
+    /// answer's head, and when the first did.
+    interims: usize,
+    first_interim: Option<Instant>,
 }
 
 impl Raw {
@@ -262,6 +266,49 @@ impl Raw {
             taken: 0,
             chunked: Chunked::Size,
             keep_alive,
+            interims: 0,
+            first_interim: None,
+        }
+    }
+
+    /// How many interim responses (`100 Continue` and the like) arrived
+    /// before the answer's head: they are read and skipped, not taken for
+    /// the answer.
+    pub fn interims(&self) -> usize {
+        self.interims
+    }
+
+    /// Waits up to `within` for an interim response to arrive; how long it
+    /// took, or `None` when the answer's head (or the end of the
+    /// connection, or `within`) came first.
+    pub fn wait_interim(&mut self, within: Duration) -> Option<Duration> {
+        let began = Instant::now();
+        loop {
+            self.parse_head();
+            if self.interims > 0 {
+                return Some(began.elapsed());
+            }
+            if self.head.is_some() {
+                return None;
+            }
+            let left = within.saturating_sub(began.elapsed());
+            if left.is_zero() || self.fill(left) == Filled::Closed {
+                return None;
+            }
+        }
+    }
+
+    /// Takes whatever arrives within `within` into the buffer and says how
+    /// many bytes are buffered (unparsed) afterwards: a test that expects
+    /// nothing on the wire (no body after a head, no interim response yet)
+    /// asserts it is `0`.
+    pub fn bytes_within(&mut self, within: Duration) -> usize {
+        let deadline = Instant::now() + within;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() || self.fill(left) == Filled::Closed {
+                return self.buffer.len();
+            }
         }
     }
 
@@ -652,13 +699,20 @@ impl Raw {
         if self.head.is_some() {
             return true;
         }
-        let Some(head_end) = find_subsequence(&self.buffer, b"\r\n\r\n") else {
-            return false;
-        };
-        let head = parse_head(&self.buffer[..head_end]);
-        self.buffer.drain(..head_end + 4);
-        self.head = Some(head);
-        true
+        loop {
+            let Some(head_end) = find_subsequence(&self.buffer, b"\r\n\r\n") else {
+                return false;
+            };
+            let head = parse_head(&self.buffer[..head_end]);
+            self.buffer.drain(..head_end + 4);
+            if (100..200).contains(&head.status) && head.status != 101 {
+                self.interims += 1;
+                self.first_interim.get_or_insert_with(Instant::now);
+                continue;
+            }
+            self.head = Some(head);
+            return true;
+        }
     }
 }
 
@@ -818,6 +872,8 @@ mod tests {
             taken: 0,
             chunked: Chunked::Size,
             keep_alive: true,
+            interims: 0,
+            first_interim: None,
         };
         (fed, server)
     }
@@ -919,6 +975,15 @@ mod tests {
         let after = raw.wait_closed_without_taking(Duration::from_secs(2));
         assert!(after.is_some(), "a closed peer is seen from the table");
         assert_eq!(raw.peek(), Peeked::Data, "the bytes are still there");
+    }
+
+    #[test]
+    fn an_interim_response_is_skipped_and_counted() {
+        let (mut raw, _server) =
+            fed("HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+        assert!(raw.parse_head());
+        assert_eq!(raw.head().status, 200);
+        assert_eq!(raw.interims(), 1);
     }
 
     #[test]

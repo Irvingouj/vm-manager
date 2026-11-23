@@ -19,6 +19,11 @@
 //   /made?kind=<string|bytes|stream|transform>&size=<n>&chunk=<n>
 //                    a body the code makes: n bytes of `x` (a stream's
 //                    chunks are at most `chunk` bytes, 64 KiB without it)
+//   /forced?status=<204|304>&kind=<made|echo>
+//                    a Response with a body (a made string of 100 bytes, or
+//                    the request's own body) whose `status` is then forced
+//                    to 204 or 304 with Object.defineProperty: a status a
+//                    Response cannot be built with.
 //   /text?body=<text>
 //                    the text, as a string
 
@@ -48,6 +53,16 @@ globalThis.default = {
       const read = first.done ? 0 : first.value.length;
       headers.set("x-first-chunk", String(read));
       return new Response(request.body, { headers });
+    }
+
+    if (url.pathname === "/forced") {
+      const kind = url.searchParams.get("kind") ?? "made";
+      const response = new Response(
+        kind === "echo" ? request.body : "y".repeat(100),
+        { headers },
+      );
+      Object.defineProperty(response, "status", { value: number("status", 204) });
+      return response;
     }
 
     if (url.pathname === "/text") {

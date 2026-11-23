@@ -24,6 +24,11 @@
 //                            reading any more, prints `done waiting` and
 //                            answers 200 `slept`. A body that goes quiet
 //                            meanwhile is one the platform is waiting for.
+//   /read-one                reads one chunk of the body and answers 200 `read
+//                            <n>` (n bytes); the rest is never read.
+//   /sleep-then-read-all?ms=<n>
+//                            waits n ms before it touches the body, then
+//                            reads it to its end and answers 200 { bytes }.
 //   /read-all                prints one line, then reads the body to its end
 //                            (or until the stream fails) and answers 200 with
 //                            { bytes, error }. A body the platform fails
@@ -55,6 +60,27 @@ globalThis.default = {
       await new Promise((resolve) => setTimeout(resolve, ms));
       console.log("done waiting");
       return new Response("slept");
+    }
+
+    if (url.pathname === "/read-one") {
+      const reader = request.body.getReader();
+      const { done, value } = await reader.read();
+      return new Response(`read ${done ? 0 : value.length}`);
+    }
+
+    if (url.pathname === "/sleep-then-read-all") {
+      const ms = Number(url.searchParams.get("ms") ?? "0") || 0;
+      await new Promise((resolve) => setTimeout(resolve, ms));
+      const reader = request.body.getReader();
+      let bytes = 0;
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        bytes += value.length;
+      }
+      return new Response(JSON.stringify({ bytes }), {
+        headers: { "content-type": "application/json" },
+      });
     }
 
     if (url.pathname === "/first-bytes") {
