@@ -3192,6 +3192,7 @@ What a test shows, with a hostile fixture Application of its own that calls the 
 - `vibe resources`: the kind is said for each Resource (`marketing (storage)`). For a Storage Resource the access is said in its own words: `read` that files can be listed and read, `write` that they can also be put and deleted; no access, whom to ask, as for any. `--json` is unchanged (`kind` is `storage`).
 - `vibe admin applications`: the Declared access says each Resource's kind with its level.
 - The Dashboard's page of one Application: each declared Resource's element gains `data-vm-kind="postgres" | "storage"`; `data-vm-declared`, `data-vm-yours`, `data-vm-standing` and `data-vm-ask` are as for a database (`yours` is never `structure` for Storage). The list's `data-vm-attention` counts Storage Resources like any.
+- The Platform administrator's pages ("What Platform administrators see and stop"; "Resources and Grants" on the Dashboard): wherever a Resource is shown, its element (`data-vm-resource="<name>"`) has `data-vm-kind="postgres" | "storage"` for what it is registered as, and a Storage Resource is never said or marked to be a database: its mark is the one of files, and the text of its element does not have the word `database`.
 
 ### The local loop
 
