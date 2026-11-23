@@ -403,24 +403,44 @@ fn as_downloaded_only_the_proxy_is_published_on_loopback_443_and_vibe_serves_beh
         volumes.iter().any(|v| v["type"] == "volume"),
         "expected the bundled Postgres's data in a named volume, got {volumes:?}"
     );
-    // vibe has one mount: ca/ read-only at /etc/vibe/ca.
+    // vibe has two mounts: ca/ read-only at /etc/vibe/ca, and the storage
+    // folder (./storage without VIBE_STORAGE_DIR) read-write at
+    // /var/lib/vibe/storage (CONTRACT.md, "Storage: Installing").
     let mounts = config["services"]["vibe"]["volumes"]
         .as_array()
         .cloned()
         .unwrap_or_default();
     assert_eq!(
         mounts.len(),
-        1,
-        "expected one mount of vibe's, got {mounts:?}"
+        2,
+        "expected two mounts of vibe's, /etc/vibe/ca read-only and /var/lib/vibe/storage read-write, got {mounts:?}"
     );
-    assert_eq!(mounts[0]["type"], "bind");
-    assert_eq!(mounts[0]["target"], "/etc/vibe/ca");
-    assert_eq!(mounts[0]["read_only"], true);
-    let source = mounts[0]["source"].as_str().unwrap_or_default();
+    let mounted = |target: &str| {
+        mounts
+            .iter()
+            .find(|m| m["target"] == target)
+            .unwrap_or_else(|| panic!("expected a volume mounted at {target}"))
+    };
+    let ca = mounted("/etc/vibe/ca");
+    assert_eq!(ca["type"], "bind");
+    assert_eq!(ca["read_only"], true);
+    let source = ca["source"].as_str().unwrap_or_default();
     assert_eq!(
         std::path::Path::new(source),
         install.dir().join("ca"),
         "expected the folder ca/ beside the Compose file mounted"
+    );
+    let storage = mounted("/var/lib/vibe/storage");
+    assert_eq!(storage["type"], "bind");
+    assert_ne!(
+        storage["read_only"], true,
+        "expected the storage mount read-write"
+    );
+    let source = storage["source"].as_str().unwrap_or_default();
+    assert_eq!(
+        std::path::Path::new(source),
+        install.dir().join("storage"),
+        "expected the folder storage/ beside the Compose file mounted without VIBE_STORAGE_DIR"
     );
 }
 

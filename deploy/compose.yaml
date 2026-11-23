@@ -40,6 +40,12 @@
 #                      authority, trusted beside the public ones (for an
 #                      identity provider whose certificate it issued).
 #                      Without it: the public authorities alone.
+#   VIBE_STORAGE_DIR   the host's folder for Storage: the files of every
+#                      Storage Resource are kept here, one folder for each,
+#                      and backed up from here. ./storage beside this file
+#                      without it. Name a folder used only for Storage.
+#                      Make it and give it to the image's user before
+#                      registering a Storage Resource (README.md, "Storage").
 
 name: vibe
 
@@ -56,6 +62,8 @@ services:
       - https
       - --public-port
       - ${VIBE_HTTPS_PORT:-443}
+      - --storage-root
+      - /var/lib/vibe/storage
     environment:
       VIBE_SECRET_KEY: ${VIBE_SECRET_KEY:?VIBE_SECRET_KEY is required in .env, the installation's key, made with openssl rand -base64 32}
       # The platform database: the Postgres here, as the role vibe. With
@@ -71,8 +79,17 @@ services:
         source: ./ca
         target: /etc/vibe/ca
         read_only: true
-    # Hardened: nothing writable, no capability, no privilege to gain, the
-    # image's user (not root). The program writes its log to standard error.
+      # The Storage Resources' files, beneath the storage root (see
+      # VIBE_STORAGE_DIR above). Compose makes the folder when it is not
+      # there; it must be the image user's (README.md, "Storage").
+      - type: bind
+        source: ${VIBE_STORAGE_DIR:-./storage}
+        target: /var/lib/vibe/storage
+        read_only: false
+    # Hardened: a read-only root filesystem, no capability, no privilege to
+    # gain, the image's user (not root). Its one writable place is the
+    # Storage folder mounted above. The program writes its log to standard
+    # error.
     read_only: true
     cap_drop:
       - ALL

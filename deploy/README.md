@@ -217,6 +217,44 @@ docker compose up -d
 
 It is trusted beside the public authorities built into the program, read when the program starts. The tool takes the same variable: when the installation's own certificate is issued by such an authority, set `VIBE_CA_FILE=/path/to/company-ca.pem` in the tool's environment on each computer that uses it.
 
+## Storage
+
+A Storage Resource is a shared folder of files that Applications read and write through the SDK, as the User of the request. Each one is a folder on the host, beneath the one folder `vibe` sees at `/var/lib/vibe/storage`, so the files are yours to inspect and back up. The program writes them as its user `65532` (files mode `0640`, folders `0750`), so another user of the host reads them with `sudo`.
+
+`compose.yaml` mounts the host folder `VIBE_STORAGE_DIR` names, `./storage` beside `compose.yaml` without it, read-write at `/var/lib/vibe/storage`, and starts `vibe` with `--storage-root /var/lib/vibe/storage`. Compose makes that folder when it is not there, as root. `vibe` runs as the image's user `65532`, with every capability dropped, and writes only what that user owns. Make the folder and give it to the image's user:
+
+```sh
+mkdir -p storage && sudo chown 65532:65532 storage
+```
+
+Make one folder in it for each Storage Resource, as the image's user:
+
+```sh
+sudo -u '#65532' mkdir storage/marketing
+```
+
+That fails with `Permission denied` when the user `65532` cannot walk the path down to `storage/` (an install folder under a home directory of mode `0750` or `0700`, Ubuntu's default, for example); the other form, `mkdir storage/marketing && sudo chown 65532:65532 storage/marketing`, then makes the same folder, and it is `65532`'s and writable by it either way.
+
+A Platform administrator registers the folder as `/var/lib/vibe/storage/marketing`, the path as the container sees it, with `"kind": "storage"` and `"location": { "backend": "directory", "directory": "/var/lib/vibe/storage/marketing" }` at the platform's API (`POST /v1/resources`), then grants Groups `read` or `write` on it.
+
+Until the folder is made and given to the image's user, a Storage registration is refused: `directory-missing` when the folder is not there, and `directory-not-writable` while `storage/` is the wrong user's (root's with mode `0755`, made by a plain `mkdir`, for example). The installation comes up all the same, and its log says `storage-root-unusable` when `storage/` itself is not there (`docker compose logs vibe`).
+
+The Storage folder is the one place the `vibe` process can write. A process that escaped the Application sandbox (a risk the platform accepts) could read, change and remove the files of every Storage Resource without a Grant, because the Grants are enforced by that same process, and could fill the file system the folder is on. So name a folder used for nothing but Storage (never a parent such as `/srv` or a home directory: `vibe` gets the whole tree read-write), put it on a file system or under a quota of its own where filling it cannot stop Postgres or the host, and treat what is in it as untrusted when you handle it as root: `tar` keeps a link as a link, and a recursive copy or a `chown -R` over the folder acts on whatever is there.
+
+The files are at `storage/marketing/<key>` on the host, under the key the Application gave each one. Back the folder up with the host's own tools, as any folder of the host is backed up, while `vibe` runs or after `docker compose down` (which keeps it). For example:
+
+```sh
+sudo tar -czf storage-marketing-backup.tar.gz -C storage marketing
+```
+
+With another host folder, set it in `.env` and make it and give it to the image's user the same way:
+
+```sh
+echo "VIBE_STORAGE_DIR=/srv/vibe/storage" >> .env
+mkdir -p /srv/vibe/storage && sudo chown 65532:65532 /srv/vibe/storage
+docker compose up -d
+```
+
 ## If the first start was interrupted
 
 The first start of the bundled Postgres makes its data folder, then the role `vibe`, the platform database and the rest, and leaves a mark when it has finished. If the container was stopped or killed in between (the machine went down, `docker compose down` during the first `up`), Postgres starts again on what was made so far and skips the rest. It is then never healthy: `docker compose ps` shows `postgres` as `health: starting` for two minutes and as `unhealthy` after that, `vibe` is not started, and `docker compose up -d` ends with `dependency failed to start: container ... is unhealthy`. The health check says why:
@@ -268,11 +306,11 @@ stops and removes the containers and keeps the data; `docker compose up -d` brin
 docker compose down --volumes
 ```
 
-removes the bundled Postgres's data, every Application's included, for good.
+removes the bundled Postgres's data, every Application's included, for good. Neither command touches the Storage folder (see [Storage](#storage)): it is the host's, and only `rm` on the host removes it.
 
 ## How it is hardened
 
-- `vibe` runs with a read-only root filesystem, every capability dropped, `no-new-privileges`, as the image's user `65532` (not root), with no writable volume and no tmpfs; its one mount is `ca/`, read-only, at `/etc/vibe/ca` (with `compose.own-tls.yaml`, `certs/` too, read-only, at `/etc/vibe/certs`). The installation's key and the database's address are in its environment, in no command line.
+- `vibe` runs with a read-only root filesystem, every capability dropped, `no-new-privileges`, as the image's user `65532` (not root), and no tmpfs. Its mounts are `ca/`, read-only, at `/etc/vibe/ca`, and the Storage folder, read-write, at `/var/lib/vibe/storage` (with `compose.own-tls.yaml`, `certs/` too, read-only, at `/etc/vibe/certs`); the Storage folder is the one place it writes. The installation's key and the database's address are in its environment, in no command line.
 - `vibe` may open 65,536 files (`ulimits: nofile`, soft and hard), whatever the Docker daemon's default, so that it never runs out of files before its own bound of 1,024 connections at once; started elsewhere, the program raises its own soft limit towards the hard one and logs `open-files-limit-low` when even the hard limit is below 4,096.
 - `postgres` runs as its image's user `999` and `proxy` as `65532`, neither as root, each with every capability dropped and `no-new-privileges`.
 - Not possible: a read-only root filesystem for `postgres` and `proxy`. Each takes a file of `compose.yaml`'s `configs` (Postgres's first-start script, the proxy's configuration), and Compose cannot place such a file into a read-only container.

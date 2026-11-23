@@ -138,16 +138,37 @@ fn assert_hardened_and_published_on_loopback_only(at: &Installed) {
         "expected no tmpfs: {}",
         context()
     );
+    // No mount but /etc/vibe/ca read-only and /var/lib/vibe/storage
+    // read-write (CONTRACT.md, "Storage: Installing").
     let mounts = vibe["Mounts"].as_array().cloned().unwrap_or_default();
-    assert_eq!(mounts.len(), 1, "expected one mount: {}", context());
-    assert_eq!(mounts[0]["Destination"], "/etc/vibe/ca", "{}", context());
     assert_eq!(
-        mounts[0]["RW"],
+        mounts.len(),
+        2,
+        "expected two mounts, /etc/vibe/ca read-only and /var/lib/vibe/storage read-write: {}",
+        context()
+    );
+    let mounted = |destination: &str| {
+        mounts
+            .iter()
+            .find(|m| m["Destination"] == destination)
+            .unwrap_or_else(|| panic!("expected a mount at {destination}: {}", context()))
+    };
+    let ca = mounted("/etc/vibe/ca");
+    assert_eq!(ca["Type"], "bind", "{}", context());
+    assert_eq!(
+        ca["RW"],
         false,
         "expected /etc/vibe/ca read-only: {}",
         context()
     );
-    assert_eq!(mounts[0]["Type"], "bind", "{}", context());
+    let storage = mounted("/var/lib/vibe/storage");
+    assert_eq!(storage["Type"], "bind", "{}", context());
+    assert_eq!(
+        storage["RW"],
+        true,
+        "expected /var/lib/vibe/storage read-write: {}",
+        context()
+    );
     assert_eq!(
         host["RestartPolicy"]["Name"],
         "unless-stopped",

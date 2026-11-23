@@ -16,7 +16,7 @@ The Identity pass-through prototype confirmed the boundary (`docs/research/ident
 
 - Who may publish an Application is strictly internal: Builders are authenticated, accountable employees.
 - What the code contains is unreliable but assumed not hostile: it is AI-generated and carries npm dependencies, yet it broadly does what its Builder intended. We defend against accident and against a dependency overreaching, not against a Builder acting in bad faith.
-- A V8 sandbox escape is an accepted risk. It is mitigated by running the host in a tightly restricted container: read-only filesystem, no writable volumes, network limited to the ingress port and Postgres.
+- A V8 sandbox escape is an accepted risk. It is mitigated by running the host in a tightly restricted container: a read-only root filesystem, its one writable mount being the Storage directory (ADR 0019, "Consequences", the bullet on what a process that escapes reaches there), network limited to the ingress port and Postgres.
 
 ## Considered Options
 

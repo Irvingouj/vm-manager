@@ -9,7 +9,8 @@
 //!   with the wildcard certificate of `certs/`; OIDC is connected, a person
 //!   signs in, and the template's Application deployed with the tool
 //!   answers her at `https://<application>.<domain>/`; `docker inspect`
-//!   shows the same hardening and the two read-only mounts; the
+//!   shows the same hardening and the three mounts, two read-only and
+//!   `/var/lib/vibe/storage` read-write; the
 //!   certificate files replaced in `certs/` are served to a new connection
 //!   within 10 seconds with no container restarted.
 //! - Without the key readable by the image's user, `vibe` does not start
@@ -51,9 +52,10 @@ fn prepared() -> Installed {
 }
 
 /// What `docker inspect` says of the running `vibe` container: the same
-/// hardening as with the proxy, the two read-only mounts, and that `vibe`
-/// alone is published, on `127.0.0.1:VIBE_HTTPS_PORT`.
-fn assert_hardened_with_two_mounts_and_published_itself(at: &Installed) {
+/// hardening as with the proxy, the three mounts (`/etc/vibe/ca` and
+/// `/etc/vibe/certs` read-only, `/var/lib/vibe/storage` read-write), and
+/// that `vibe` alone is published, on `127.0.0.1:VIBE_HTTPS_PORT`.
+fn assert_hardened_with_three_mounts_and_published_itself(at: &Installed) {
     let install = &at.install;
     let vibe = install.inspect(&install.container("vibe"));
     let host = &vibe["HostConfig"];
@@ -127,8 +129,9 @@ fn assert_hardened_with_two_mounts_and_published_itself(at: &Installed) {
         vec![
             ("/etc/vibe/ca".to_owned(), true, "bind".to_owned()),
             ("/etc/vibe/certs".to_owned(), true, "bind".to_owned()),
+            ("/var/lib/vibe/storage".to_owned(), false, "bind".to_owned()),
         ],
-        "expected two mounts, /etc/vibe/ca and /etc/vibe/certs, both read-only binds: {context}"
+        "expected three mounts, /etc/vibe/ca and /etc/vibe/certs read-only binds and /var/lib/vibe/storage read-write: {context}"
     );
     let mut published = Vec::new();
     for (service, id) in install.containers() {
@@ -203,7 +206,7 @@ fn with_compose_own_tls_vibe_serves_https_itself_a_person_signs_in_and_a_replace
         fingerprint(at.wildcard.chain()[0].as_ref()),
         "expected the wildcard certificate of certs/"
     );
-    assert_hardened_with_two_mounts_and_published_itself(&at);
+    assert_hardened_with_three_mounts_and_published_itself(&at);
     let logs = at.install.logs();
     assert!(
         logs.contains("tls-certificate-loaded"),

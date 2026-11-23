@@ -212,7 +212,7 @@ fn the_two_variables_name_the_files_of_certs_mounted_read_only() {
         "expected {OWN_TLS} to mount ./certs read-only at /etc/vibe/certs, and nothing else"
     );
     // Merged after compose.yaml (lists are appended): /etc/vibe/ca and
-    // /etc/vibe/certs, both read-only.
+    // /etc/vibe/certs read-only, /var/lib/vibe/storage read-write.
     let compose = load("deploy/compose.yaml");
     let mut all = mounts(&compose["services"]["vibe"]);
     all.extend(own);
@@ -222,9 +222,10 @@ fn the_two_variables_name_the_files_of_certs_mounted_read_only() {
         targets,
         vec![
             ("/etc/vibe/ca".to_owned(), true),
-            ("/etc/vibe/certs".to_owned(), true)
+            ("/etc/vibe/certs".to_owned(), true),
+            ("/var/lib/vibe/storage".to_owned(), false)
         ],
-        "expected vibe's mounts, merged, to be /etc/vibe/ca and /etc/vibe/certs, both read-only"
+        "expected vibe's mounts, merged, to be /etc/vibe/ca and /etc/vibe/certs read-only and /var/lib/vibe/storage read-write"
     );
 }
 
