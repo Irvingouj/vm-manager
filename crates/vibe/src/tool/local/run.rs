@@ -58,7 +58,7 @@ use crate::origin::Public;
 use crate::own_db::OwnDatabases;
 use crate::platform::{Limits, Platform};
 use crate::platform_db::{Connection, DatabaseAddress, DbError, PlatformDatabase, PoolLimits};
-use crate::registry::{NewVersion, Registry, Sent};
+use crate::registry::{NewVersion, Registry, ResourceKind, Sent};
 use crate::resources::{self, Login, NewReach, NewResource, Resources};
 use crate::runner;
 use crate::sign_in::{ChosenTestUser, LocalSignIn};
@@ -158,6 +158,10 @@ pub(super) async fn lock_project(
     tried: Option<&control::Found>,
 ) -> Result<Option<control::Found>, Ending> {
     let name = base.who.command;
+    // Checked again just before anything is made: a link planted while the
+    // command started is not followed. (The window that is left: a link
+    // swapped in between this look and the creation.)
+    super::check_local_state(base.project, name)?;
     local.make().map_err(|why| local_state_failed(&why, name))?;
     progress.set(Stage::Waiting);
     let json = base.json;
@@ -182,11 +186,14 @@ pub(super) async fn lock_project(
     // The parts' own records go to .vibe/local/vibe.log, not the terminal;
     // started anew by every run, so that it does not grow from run to run
     // (and bounded while one runs: see crate::log).
+    let nofollow = super::nofollow().ok_or_else(|| super::no_flags(name))?;
     if let Ok(file) = OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(true)
         .mode(0o600)
+        // A link planted at `vibe.log` is not followed, even now.
+        .custom_flags(nofollow)
         .open(local.dir.join("vibe.log"))
     {
         crate::log::to_file(file);
@@ -232,6 +239,11 @@ pub(super) async fn start_server(
     fresh: bool,
 ) -> Result<Pg, Ending> {
     let name = base.who.command;
+    // Checked again before the private Postgres is started or reset: a link
+    // planted while the command ran is not followed, and a reset (also one
+    // a running `vibe dev` does) empties nothing through one
+    // (blackbox/CONTRACT.md, "Storage: The local loop").
+    super::check_local_state(base.project, name)?;
     progress.set(Stage::Starting);
     let local = Local::of(base.project);
     if fresh {
@@ -299,6 +311,23 @@ pub(super) struct Live {
     storage: Arc<Storage>,
 }
 
+/// The local Storage's root, from the project's path (passed as a path), the
+/// one its Storage Resources are beneath. Its failure is a `local-state`
+/// that says what is true (the project's path must be UTF-8), not a reading
+/// of the project's files that ended abnormally.
+fn local_storage_root(project: &Path, command: &str) -> Result<crate::storage::Root, Ending> {
+    let path = project.join(".vibe").join("local").join("storage");
+    crate::storage::Root::from_path(&path).map_err(|why| {
+        Ending::new(
+            1,
+            "local-state",
+            format!(
+                "The project's local Storage (.vibe/local/storage/) cannot be used: {why}. The local Storage is a folder of the project's own; run {command} from a project whose path is valid UTF-8, or give one with --project"
+            ),
+        )
+    })
+}
+
 /// How many requests the parts are made for.
 pub(super) struct Size {
     /// Connections of the platform database's pool.
@@ -307,7 +336,21 @@ pub(super) struct Size {
 }
 
 impl Live {
-    pub(super) async fn open(pg: &Pg, size: Size, who: &Who) -> Result<Self, Ending> {
+    pub(super) async fn open(
+        pg: &Pg,
+        project: &Path,
+        size: Size,
+        who: &Who,
+    ) -> Result<Self, Ending> {
+        // The local Storage's root, only when the project has a pulled
+        // Storage Resource: a project without one runs exactly as before
+        // Storage, its path included. The path is passed as a path: a
+        // project's path is not turned into a string that could alter it.
+        let root = if standins::has_storage_pull(project) {
+            Some(local_storage_root(project, who.command)?)
+        } else {
+            None
+        };
         let Platform {
             database,
             own,
@@ -333,8 +376,7 @@ impl Live {
                 runner: size.runner,
                 start: PLATFORM_WAIT,
             },
-            // The local loop's Storage is a later stage of the ticket.
-            None,
+            root,
         )
         .await
         .map_err(|error| open_failed(error, who.command))?;
@@ -446,6 +488,14 @@ pub(super) struct Brought {
     pub migrations_applied: Vec<String>,
     /// Every pulled Resource, and whether this bring-up made its stand-in.
     pub standins: Vec<(String, bool)>,
+    /// Every pulled Storage Resource, and whether this run made its folder
+    /// because it was not there (a reset that empties one that was there
+    /// says false).
+    pub storages: Vec<(String, bool)>,
+    /// The kind the Manifest declared for each Resource: the page
+    /// `/_vm/test-user` shows a Structure Grant as holding nothing on a
+    /// Storage Resource.
+    pub kinds: BTreeMap<String, String>,
     /// The files of test rows this bring-up loaded, in name order, and the
     /// rows each changed.
     pub test_rows: Vec<(String, u64)>,
@@ -457,6 +507,19 @@ impl Brought {
         self.standins
             .iter()
             .map(|(resource, made)| json!({ "resource": resource, "made": made }))
+            .collect()
+    }
+
+    pub(super) fn storages_json(&self) -> Vec<Value> {
+        self.storages
+            .iter()
+            .map(|(resource, made)| {
+                json!({
+                    "resource": resource,
+                    "directory": format!(".vibe/local/storage/{resource}"),
+                    "made": made,
+                })
+            })
             .collect()
     }
 
@@ -490,6 +553,14 @@ impl Brought {
                 .iter()
                 .map(|(resource, _)| (resource.clone(), false))
                 .collect(),
+            storages: self
+                .storages
+                .iter()
+                .map(|(resource, _)| (resource.clone(), false))
+                .collect(),
+            // Copied: a later request's page reads it; small, once a
+            // request that caused no bring-up.
+            kinds: self.kinds.clone(),
             test_rows: Vec::new(),
             said: Said {
                 warnings: again(&self.said.warnings),
@@ -559,11 +630,17 @@ pub(super) async fn packages(project: &Path, who: &Who) -> Result<Packages, Endi
 }
 
 /// The pulled Resources (`standins::pulled`), off the async worker.
-pub(super) async fn pulled(project: &Path, who: &Who) -> Result<standins::Pulled, Ending> {
+pub(super) async fn pulled(
+    project: &Path,
+    kinds: &std::collections::BTreeMap<String, String>,
+    who: &Who,
+) -> Result<standins::Pulled, Ending> {
     let command = who.command;
-    // Copied: the read owns its path on its own thread; once a read.
+    // Copied: the read owns its path and the Manifest's kinds on its own
+    // thread; once a read.
     let project = project.to_path_buf();
-    off_thread(move || standins::pulled(&project, command))
+    let kinds = kinds.clone();
+    off_thread(move || standins::pulled(&project, &kinds, command))
         .await
         .ok_or_else(|| read_failed(command))
 }
@@ -585,10 +662,11 @@ pub(super) fn no_such_test_user(file: &TestUsersFile, id: &str) -> Ending {
 
 /// Brings the project up on the private Postgres `pg` and its parts
 /// `live`: the stand-ins of the pulled Resources (made when their
-/// structure changed) with the Grants of `file`, the build, the local
-/// Version (a new one when the bundle, the Declared access or the
-/// migrations differ) with the migrations it adds, and the test rows that
-/// changed.
+/// structure changed) with the local Storage of each pulled Storage
+/// Resource and the Grants of `file`, the build, the local Version (a new
+/// one when the bundle, the Declared access or the migrations differ) with
+/// the migrations it adds, and the test rows that changed. `fresh` is a
+/// reset's: every local Storage folder is emptied, its marks kept.
 pub(super) async fn bring_up(
     base: &Base<'_>,
     pg: &Pg,
@@ -596,17 +674,32 @@ pub(super) async fn bring_up(
     file: &TestUsersFile,
     packages: &Packages,
     progress: &Progress,
+    fresh: bool,
 ) -> Result<Brought, Ending> {
     let who = base.who;
     let cx = Cx::new(base.project, base.own, who);
     let mut said = Said::default();
 
-    progress.set(Stage::Standins);
-    let standins = standins_of(base, pg, live, file, &mut said).await?;
-
+    // The Manifest's kinds are needed before the stand-ins, for the kind a
+    // folder holding both kinds' pulled files takes (blackbox/CONTRACT.md,
+    // "Storage: The local loop"). Its reading is reported where it was
+    // reported before Storage: after the stand-ins, so a database project
+    // sees the same refusals in the same order and the same `warnings` in
+    // the same order; a timeout in it says what it said before, "building
+    // the project".
     progress.set(Stage::Building);
     let mut found = Found::default();
     let manifest = check::manifest(&cx, packages, &mut found, who).await?;
+    // Copied: the stand-ins own the kinds on their own thread; once a
+    // bring-up.
+    let kinds = manifest
+        .as_ref()
+        .map(|manifest| manifest.kinds.clone())
+        .unwrap_or_default();
+
+    progress.set(Stage::Standins);
+    let (standins, storages) = standins_of(base, pg, live, file, &kinds, fresh, &mut said).await?;
+
     let manifest = match manifest {
         Some(manifest) if found.problems.is_empty() => manifest,
         _ => {
@@ -618,6 +711,8 @@ pub(super) async fn bring_up(
     };
     said.warnings.append(&mut found.warnings);
     said.notes.append(&mut found.notes);
+
+    progress.set(Stage::Building);
     let bundle = deploy::bundle(&cx, packages, who).await?;
     let migrations = {
         let who = *who;
@@ -668,6 +763,7 @@ pub(super) async fn bring_up(
             who,
         },
         &standins,
+        &manifest.kinds,
         &mut said,
     )
     .await?;
@@ -682,23 +778,31 @@ pub(super) async fn bring_up(
             .into_iter()
             .map(|standin| (standin.resource, standin.made))
             .collect(),
+        storages,
+        // Copied: the page that shows each pulled Resource's access reads
+        // it; once a bring-up.
+        kinds: kinds.clone(),
         test_rows: loaded.files,
         said,
     })
 }
 
-/// Makes and readies the stand-ins, then makes them the Resources of the
-/// run, with the Grants of `vibe.dev.json`: those of the file, all of them
-/// and no other.
+/// Makes and readies the stand-ins and the local Storage of the pulled
+/// Resources, then makes them the Resources of the run, with the Grants of
+/// `vibe.dev.json`: those of the file, all of them and no other. Answers
+/// the stand-ins and each Storage Resource with whether this bring-up made
+/// it.
 async fn standins_of(
     base: &Base<'_>,
     pg: &Pg,
     live: &Live,
     file: &TestUsersFile,
+    kinds: &std::collections::BTreeMap<String, String>,
+    fresh: bool,
     said: &mut Said,
-) -> Result<Vec<Standin>, Ending> {
+) -> Result<(Vec<Standin>, Vec<(String, bool)>), Ending> {
     let name = base.who.command;
-    let pulled = pulled(base.project, base.who).await?;
+    let pulled = pulled(base.project, kinds, base.who).await?;
     said.warnings.extend(pulled.warnings);
     let address = pg.superuser("postgres");
     let ready = {
@@ -772,16 +876,33 @@ async fn standins_of(
             .await
             .map_err(registering)?;
     }
+    // A local Storage for each pulled Storage Resource: its folder made by
+    // this run when it was not there (emptied, by a reset), one no longer
+    // pulled removed, and each registered as an installation registers one.
+    // The root is built when a Storage Resource is first pulled here: one
+    // pulled while `vibe dev` runs has its folder and its entry from the
+    // next rebuild on, as if `vibe dev` had been started after the pull.
+    let borrowed = live.storage.root.as_ref().map(Arc::clone);
+    let root = match borrowed {
+        Some(root) => Some(root),
+        None if pulled.storages.is_empty() => None,
+        None => Some(Arc::new(local_storage_root(base.project, name)?)),
+    };
+    let storages = standins::register_storages(
+        base.project,
+        root.as_ref(),
+        &live.storage,
+        resources,
+        &pulled.storages,
+        &pulled.unusable,
+        fresh,
+        name,
+    )
+    .await?;
     for grant in &file.grants {
         let level = resources::level_of(&grant.access);
-        match (resources.get(&grant.resource), level) {
-            (Some(_), Some(level)) => {
-                resources
-                    .grant(&grant.resource, &grant.group, level)
-                    .await
-                    .map_err(registering)?;
-            }
-            _ => said.notes.push(json!({
+        let Some(resource) = resources.get(&grant.resource) else {
+            said.notes.push(json!({
                 "reason": "grant-without-resource",
                 "resource": grant.resource,
                 "group": grant.group,
@@ -789,10 +910,44 @@ async fn standins_of(
                     "{} grants {} on {}, which has no stand-in here (it is not pulled): the Grant does nothing in the local run. Run vibe pull {} to have it",
                     test_users::FILE, grant.group, grant.resource, grant.resource
                 ),
-            })),
+            }));
+            continue;
+        };
+        let Some(level) = level else {
+            // The file's Grants are checked when it is read; not reached.
+            said.notes.push(json!({
+                "reason": "grant-without-resource",
+                "resource": grant.resource,
+                "group": grant.group,
+                "message": format!(
+                    "{} grants {} on {} at a level that is not one of structure, read and write: the Grant does nothing in the local run",
+                    test_users::FILE, grant.group, grant.resource
+                ),
+            }));
+            continue;
+        };
+        // A Storage Resource has read and write only: a Grant at
+        // `structure` is a note, and holds nothing (blackbox/CONTRACT.md,
+        // "Storage: The local loop").
+        if resource.kind == ResourceKind::Storage && level == authz::AccessLevel::Structure {
+            said.notes.push(json!({
+                "reason": "grant-level-not-for-kind",
+                "resource": grant.resource,
+                "group": grant.group,
+                "access": grant.access,
+                "message": format!(
+                    "{} grants {} the level structure on {}, which is a Storage Resource: its levels are read and write only, so this Grant holds nothing. Give it read or write instead",
+                    test_users::FILE, grant.group, grant.resource
+                ),
+            }));
+            continue;
         }
+        resources
+            .grant(&grant.resource, &grant.group, level)
+            .await
+            .map_err(registering)?;
     }
-    Ok(ready)
+    Ok((ready, storages))
 }
 
 /// The local Version: the latest one when the bundle, the Declared access

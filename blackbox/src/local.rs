@@ -49,7 +49,7 @@ pub const LOCAL_TIMEOUT: Duration = Duration::from_secs(240);
 /// The fields of what `vibe request --json` prints, sorted (`test_rows` from
 /// ticket "Local loop in the browser, with test rows, reset and working
 /// offline" on).
-pub const REQUESTED_KEYS: [&str; 19] = [
+pub const REQUESTED_KEYS: [&str; 20] = [
     "application",
     "as",
     "body",
@@ -65,6 +65,7 @@ pub const REQUESTED_KEYS: [&str; 19] = [
     "request_id",
     "standins",
     "status",
+    "storages",
     "test_rows",
     "uncaught",
     "version",

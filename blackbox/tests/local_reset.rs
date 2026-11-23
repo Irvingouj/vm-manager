@@ -31,12 +31,13 @@ const DEVOPS_ROWS: &str = "test-rows/devops.sql";
 const OWN_ROWS: &str = "test-rows/own-database.sql";
 
 /// The fields of what `vibe local reset --json` prints, sorted.
-const RESET_KEYS: [&str; 8] = [
+const RESET_KEYS: [&str; 9] = [
     "application",
     "migrations_applied",
     "notes",
     "reset",
     "standins",
+    "storages",
     "test_rows",
     "version",
     "warnings",

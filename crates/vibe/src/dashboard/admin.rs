@@ -195,6 +195,9 @@ impl Ingress {
     /// answers to the same filters with `limit=100`, from the same reading.
     async fn operation_log_page(&self, viewer: &Viewer<'_>, query: Option<&str>) -> Answer {
         let typed = typed(query);
+        // Each Resource's mark: a Storage Resource is never shown as a
+        // database.
+        let kinds = self.api.resource_kinds();
         let asked = match asked(query) {
             Ok(asked) => asked,
             Err(problem) => {
@@ -203,6 +206,7 @@ impl Ingress {
                     viewer,
                     &typed,
                     &LogShown::Malformed { field, words },
+                    &kinds,
                 );
             }
         };
@@ -215,10 +219,13 @@ impl Ingress {
                     entries: &entries,
                     earlier,
                 },
+                &kinds,
             ),
-            Err(AdminRead::Busy) => admin_pages::operation_log(viewer, &typed, &LogShown::Busy),
+            Err(AdminRead::Busy) => {
+                admin_pages::operation_log(viewer, &typed, &LogShown::Busy, &kinds)
+            }
             Err(AdminRead::TooLong(_)) => {
-                admin_pages::operation_log(viewer, &typed, &LogShown::TooLong)
+                admin_pages::operation_log(viewer, &typed, &LogShown::TooLong, &kinds)
             }
             Err(AdminRead::Failed(error)) => self.unavailable(viewer, &error),
         }

@@ -1130,7 +1130,17 @@ async fn resources() -> Result<Done, Ending> {
                 say!(text, "  Your access: no access: ask {}", r.contact);
             }
             Some(level) => {
-                let meaning = if level.is("structure") {
+                // A Storage Resource's levels are its own: files, not rows
+                // (blackbox/CONTRACT.md, "The tool and the Dashboard").
+                let meaning = if r.kind.is("storage") {
+                    if level.is("read") {
+                        " (files can be listed and read)"
+                    } else if level.is("write") {
+                        " (files can be listed, read, and also put and deleted)"
+                    } else {
+                        ""
+                    }
+                } else if level.is("structure") {
                     " (its structure only: rows cannot be read at this level)"
                 } else if level.is("read") {
                     " (rows can be read)"

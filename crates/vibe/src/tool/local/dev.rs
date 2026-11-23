@@ -218,6 +218,7 @@ fn dev_size() -> Size {
 pub(in super::super) async fn dev(args: &DevArgs) -> Result<Done, Ending> {
     let name = WHO_DEV.command;
     let project = super::project_path(args.project.as_deref(), name)?;
+    super::check_local_state(&project, name)?;
     run::test_users_of(&project, name)?;
     let local = Local::of(&project);
     if let Some(address) = control::address_of(&local) {
@@ -429,11 +430,11 @@ async fn start(base: &Base<'_>, progress: &Progress, held: &Held) -> Result<Star
         tried = Some(other);
     }
     let pg = run::start_server(base, &programs, progress, held, false).await?;
-    let live = Live::open(&pg, dev_size(), base.who).await?;
+    let live = Live::open(&pg, base.project, dev_size(), base.who).await?;
     let brought = async {
         let file = run::test_users(base.project, base.who).await?;
         let seen = look_at(base.project).await.look;
-        let brought = run::bring_up(base, &pg, &live, &file, &packages, progress).await?;
+        let brought = run::bring_up(base, &pg, &live, &file, &packages, progress, false).await?;
         Ok::<_, Ending>((brought, seen))
     }
     .await;
@@ -783,7 +784,7 @@ impl Front {
     /// failed half way).
     async fn session(&self, ctx: &Ctx<'_>, base: &Base<'_>) -> Result<Session, Ending> {
         let pg = run::start_server(base, ctx.programs, ctx.progress, ctx.held, false).await?;
-        let live = Live::open(&pg, dev_size(), base.who).await?;
+        let live = Live::open(&pg, base.project, dev_size(), base.who).await?;
         Ok(Session { pg, live })
     }
 
@@ -831,6 +832,7 @@ impl Front {
                 &file,
                 &packages,
                 ctx.progress,
+                false,
             )
             .await
         }
@@ -855,6 +857,7 @@ impl Front {
                         "version": brought.version,
                         "migrations_applied": brought.migrations_applied,
                         "standins": brought.standins_json(),
+                        "storages": brought.storages_json(),
                         "test_rows": brought.test_rows_json(),
                     }),
                     rebuilt_words(&brought, &url),
@@ -966,6 +969,11 @@ impl Front {
     /// `vibe local reset`, done here: the parts closed, the private Postgres
     /// stopped and made anew, the project brought up on it.
     async fn forwarded_reset(&self, ctx: &Ctx<'_>) -> Result<Done, Ending> {
+        // The state's links are checked again before anything is closed,
+        // stopped or emptied: a reset refused for one leaves this `vibe dev`
+        // as it was, answering requests with the databases and the local
+        // Storage it had (blackbox/CONTRACT.md, "Storage: The local loop").
+        super::check_local_state(&self.project, WHO_RESET.command)?;
         let Some(mut state) = self.write_state().await else {
             return Err(busy(&WHO_RESET));
         };
@@ -984,7 +992,7 @@ impl Front {
             let file = run::test_users(base.project, &WHO_RESET).await?;
             let packages = run::packages(base.project, &WHO_RESET).await?;
             let pg = run::start_server(&base, ctx.programs, ctx.progress, ctx.held, true).await?;
-            let live = Live::open(&pg, dev_size(), &WHO_RESET).await?;
+            let live = Live::open(&pg, base.project, dev_size(), &WHO_RESET).await?;
             let session = state.session.insert(Session { pg, live });
             run::bring_up(
                 &base,
@@ -993,6 +1001,7 @@ impl Front {
                 &file,
                 &packages,
                 ctx.progress,
+                true,
             )
             .await
         }
@@ -1167,21 +1176,41 @@ impl Front {
             .find_map(|value| page::percent_decode(std::str::from_utf8(value).ok()?, false))
     }
 
+    /// The kind the Manifest declared for each Resource, as the last
+    /// bring-up read it: the page shows a Grant at `structure` on a Storage
+    /// Resource as holding nothing. Empty before a bring-up.
+    async fn manifest_kinds(&self) -> std::collections::BTreeMap<String, String> {
+        match tokio::time::timeout(READ_WAIT, self.state.read()).await {
+            Ok(state) => state
+                .last
+                .as_ref()
+                .map(|brought| brought.kinds.clone())
+                .unwrap_or_default(),
+            Err(_) => std::collections::BTreeMap::new(),
+        }
+    }
+
     /// `vibe.dev.json` as it is now, and (for the page, `with_pulled`) the
-    /// pulled Resources, read off the async workers.
-    async fn users(&self, with_pulled: bool) -> Result<(TestUsersFile, Vec<String>), Ending> {
+    /// pulled Resources with the kind the Manifest declares, read off the
+    /// async workers.
+    async fn users(
+        &self,
+        with_pulled: bool,
+    ) -> Result<(TestUsersFile, Vec<(String, String)>), Ending> {
+        let kinds = if with_pulled {
+            self.manifest_kinds().await
+        } else {
+            std::collections::BTreeMap::new()
+        };
         let project = Arc::clone(&self.project);
         run::off_thread(move || {
             let file = run::test_users_of(&project, WHO.command)?;
-            let pulled = if with_pulled {
-                standins::pulled(&project, WHO.command)
-                    .files
-                    .into_iter()
-                    .map(|f| f.resource)
-                    .collect()
+            let mut pulled = if with_pulled {
+                standins::pulled_names(&project, &kinds)
             } else {
                 Vec::new()
             };
+            pulled.sort();
             Ok((file, pulled))
         })
         .await
@@ -1553,6 +1582,21 @@ fn rebuilt_words(brought: &Brought, url: &str) -> String {
         .collect();
     if !made.is_empty() {
         words.push_str(&format!("; stand-ins made: {}", made.join(", ")));
+    }
+    if !brought.storages.is_empty() {
+        let storages: Vec<String> = brought
+            .storages
+            .iter()
+            .map(|(resource, made)| {
+                let resource = Theirs::from(resource.as_str());
+                if *made {
+                    format!("{resource} (made, .vibe/local/storage/{resource})")
+                } else {
+                    format!("{resource} (.vibe/local/storage/{resource})")
+                }
+            })
+            .collect();
+        words.push_str(&format!("; local Storage: {}", storages.join(", ")));
     }
     let loaded: Vec<String> = brought
         .test_rows

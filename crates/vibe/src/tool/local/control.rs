@@ -37,7 +37,7 @@
 //! [`MAX_ANSWER_BYTES`]; the caller bounds the time.
 
 use std::fs::{self, OpenOptions};
-use std::io::{ErrorKind, Read, Write};
+use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::time::Duration;
 
@@ -170,7 +170,12 @@ pub(super) fn remove_left(local: &Local) {
 /// believed only while the project's lock is held.
 pub(super) fn running(local: &Local) -> Option<Found> {
     let found = read(local)?;
-    let lock = fs::File::open(local.dir.join("lock")).ok()?;
+    let lock = OpenOptions::new()
+        .read(true)
+        // A link at the lock is not followed.
+        .custom_flags(super::nofollow()?)
+        .open(local.dir.join("lock"))
+        .ok()?;
     match flock(&lock, FlockOperation::NonBlockingLockShared) {
         // Nobody holds it: the file is a killed `vibe dev`'s.
         Ok(()) => None,
@@ -198,13 +203,10 @@ pub(super) fn found_while_waiting(local: &Local, tried: Option<&Found>) -> Optio
 }
 
 fn read(local: &Local) -> Option<Found> {
-    let file = match fs::File::open(local.dir.join(FILE)) {
-        Ok(file) => file,
-        Err(error) if error.kind() == ErrorKind::NotFound => return None,
-        Err(_) => return None,
-    };
-    let mut bytes = Vec::new();
-    file.take(MAX_FILE_BYTES).read_to_end(&mut bytes).ok()?;
+    // A link at the control file is not followed, even if it replaced the
+    // file after the command's check; a pipe or a device is not waited on;
+    // only a regular file is read, at most its first `MAX_FILE_BYTES`.
+    let bytes = super::read_plain_file(&local.dir.join(FILE), MAX_FILE_BYTES).ok()??;
     let value: Value = serde_json::from_slice(&bytes).ok()?;
     let port = u16::try_from(value.get("port")?.as_u64()?).ok()?;
     let application = value.get("application")?.as_str()?.to_owned();

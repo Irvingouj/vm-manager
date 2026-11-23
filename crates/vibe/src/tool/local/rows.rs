@@ -151,16 +151,23 @@ struct Last {
 pub(super) async fn load(
     target: &Target<'_>,
     standins: &[Standin],
+    kinds: &std::collections::BTreeMap<String, String>,
     said: &mut Said,
 ) -> Result<Loaded, Ending> {
     let name = target.who.command;
     let (pulled, stems) = {
-        // Copied: the reads own their path on their own thread; once a
-        // loading.
+        // Copied: the reads own their path and the Manifest's kinds on
+        // their own thread; once a loading.
         let project = target.project.to_path_buf();
-        off_thread(move || (standins::pulled(&project, name), sql_files(&project)))
-            .await
-            .ok_or_else(|| read_failed(name))?
+        let kinds = kinds.clone();
+        off_thread(move || {
+            (
+                standins::pulled(&project, &kinds, name),
+                sql_files(&project),
+            )
+        })
+        .await
+        .ok_or_else(|| read_failed(name))?
     };
     let stems = stems.map_err(|file| {
         failed(

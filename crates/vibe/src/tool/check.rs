@@ -202,8 +202,15 @@ fn interrupted(signal: &str, stage: Stage) -> Ending {
 #[derive(Deserialize)]
 pub(super) struct Registered {
     name: String,
+    /// `postgres` or `storage`.
+    #[serde(default = "postgres_kind")]
+    kind: String,
     contact: String,
     your_access: Option<String>,
+}
+
+fn postgres_kind() -> String {
+    "postgres".to_owned()
 }
 
 #[derive(Deserialize)]
@@ -219,6 +226,15 @@ impl Registry {
             .iter()
             .find(|r| r.name == name)
             .map(|r| r.your_access.as_deref())
+    }
+
+    /// The kind the Resource `name` is registered with: `None` for one not
+    /// registered.
+    pub(super) fn kind_of(&self, name: &str) -> Option<&str> {
+        self.resources
+            .iter()
+            .find(|r| r.name == name)
+            .map(|r| r.kind.as_str())
     }
 }
 
@@ -250,6 +266,9 @@ pub(super) struct Manifest {
     pub description: Option<String>,
     /// The Resources it declares, by name, with the Access level of each.
     pub declared: BTreeMap<String, String>,
+    /// The kind each declared Resource is declared with, by name
+    /// (`postgres` or `storage`).
+    pub kinds: BTreeMap<String, String>,
     /// `{ "resources": { ... } }`, as the tooling answered it.
     pub declared_access: Value,
 }
@@ -270,7 +289,13 @@ async fn checked(project: &Path, own: &Path, stage: &Cell<Stage>) -> Result<Done
     let manifest = manifest(&cx, &packages, &mut found, &WHO).await?;
     if let Some(manifest) = &manifest {
         stage.set(Stage::Resources);
-        resources(project, &manifest.declared, &registry, &mut found);
+        resources(
+            project,
+            &manifest.declared,
+            &manifest.kinds,
+            &registry,
+            &mut found,
+        );
     }
     stage.set(Stage::Migrations);
     migrations(&cx, &packages, &mut found, &WHO).await?;
@@ -390,6 +415,7 @@ pub(super) async fn manifest(
     match (ran.status.code(), answer) {
         (Some(0), Some(mut answer)) => {
             let mut declared = BTreeMap::new();
+            let mut kinds = BTreeMap::new();
             if let Some(Value::Object(resources)) = answer.pointer("/declared_access/resources") {
                 for (name, resource) in resources {
                     let access = match resource.get("access") {
@@ -397,6 +423,11 @@ pub(super) async fn manifest(
                         _ => "read",
                     };
                     declared.insert(name.clone(), access.to_owned());
+                    let kind = match resource.get("kind") {
+                        Some(Value::String(kind)) => kind.as_str(),
+                        _ => "postgres",
+                    };
+                    kinds.insert(name.clone(), kind.to_owned());
                 }
             }
             let mut text = |key: &str| match answer.get_mut(key).map(Value::take) {
@@ -413,6 +444,7 @@ pub(super) async fn manifest(
                 name,
                 description,
                 declared,
+                kinds,
                 declared_access,
             }))
         }
@@ -464,10 +496,8 @@ enum FirstLine {
     Unreadable(io::Error),
 }
 
-/// Whether the file at `path` begins with `line` (followed by a line end,
-/// or nothing): only that much of it is read.
-/// Whether the declared Resource `name` is pulled: both its files there,
-/// each beginning with the first line `vibe pull` gives it.
+/// Whether the declared database Resource `name` is pulled: both its files
+/// there, each beginning with the first line `vibe pull` gives it.
 pub(super) fn is_pulled(project: &Path, name: &str) -> bool {
     let folder = project.join("resources").join(name);
     matches!(
@@ -477,6 +507,54 @@ pub(super) fn is_pulled(project: &Path, name: &str) -> bool {
         first_line(&folder.join("index.ts"), INDEX_FIRST_LINE),
         FirstLine::Generated
     )
+}
+
+/// Whether the declared Storage Resource `name` is pulled:
+/// `resources/<name>/storage.json` there, holding the `generated` the tool
+/// writes (blackbox/CONTRACT.md, "Pulling a Storage Resource, checking and
+/// deploying").
+pub(super) fn is_storage_pulled(project: &Path, name: &str) -> bool {
+    matches!(storage_file_state(project, name), FirstLine::Generated)
+}
+
+/// How the `storage.json` of `resources/<name>` stands: only a file the
+/// tool wrote, small enough to be one, holds its `generated`. A link is not
+/// one, and is never followed (blackbox/CONTRACT.md, "Storage: The local
+/// loop": "a linked `storage.json` is not a pulled one").
+fn storage_file_state(project: &Path, name: &str) -> FirstLine {
+    let path = project.join("resources").join(name).join("storage.json");
+    match fs::symlink_metadata(&path) {
+        Ok(meta) if meta.file_type().is_symlink() => return FirstLine::Other,
+        Ok(meta) if meta.is_file() => {}
+        Ok(_) => return FirstLine::Other,
+        Err(error) if error.kind() == ErrorKind::NotFound => return FirstLine::Missing,
+        Err(error) => return FirstLine::Unreadable(error),
+    }
+    let file = match File::open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == ErrorKind::NotFound => return FirstLine::Missing,
+        Err(error) => return FirstLine::Unreadable(error),
+    };
+    // The opened file's own type: a link swapped in between is not read.
+    match file.metadata() {
+        Ok(meta) if meta.is_file() => {}
+        Ok(_) => return FirstLine::Other,
+        Err(error) => return FirstLine::Unreadable(error),
+    }
+    let mut bytes = Vec::new();
+    if let Err(error) = file
+        .take(super::pull::STORAGE_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+    {
+        return FirstLine::Unreadable(error);
+    }
+    if u64::try_from(bytes.len()).is_ok_and(|n| n <= super::pull::STORAGE_FILE_BYTES)
+        && super::pull::storage_generated(&bytes)
+    {
+        FirstLine::Generated
+    } else {
+        FirstLine::Other
+    }
 }
 
 fn first_line(path: &Path, line: &str) -> FirstLine {
@@ -523,6 +601,7 @@ fn rank(level: Option<&str>) -> u8 {
 pub(super) fn resources(
     project: &Path,
     declared: &BTreeMap<String, String>,
+    kinds: &BTreeMap<String, String>,
     registry: &Registry,
     found: &mut Found,
 ) {
@@ -532,6 +611,7 @@ pub(super) fn resources(
         .map(|r| (r.name.as_str(), r))
         .collect();
     for (name, access) in declared {
+        let kind = kinds.get(name).map_or("postgres", String::as_str);
         let Some(resource) = registered.get(name.as_str()) else {
             let names: Vec<&str> = registered.keys().copied().collect();
             let those = if names.is_empty() {
@@ -547,8 +627,23 @@ pub(super) fn resources(
             }));
             continue;
         };
+        // The kind the Manifest declares must be the kind the installation
+        // registered (blackbox/CONTRACT.md, "Pulling a Storage Resource,
+        // checking and deploying"): one problem is enough, as for a
+        // Resource nothing of is registered.
+        if resource.kind != kind {
+            found.problems.push(json!({
+                "check": "resources",
+                "reason": "resource-kind-mismatch",
+                "resource": name,
+                "declared_kind": kind,
+                "registered_kind": resource.kind,
+                "message": format!("manifest.ts declares {name} with kind `{kind}`, and the Resource {name} registered on the installation is of kind `{}`: correct `kind` in manifest.ts, or choose another Resource, then run vibe check again", resource.kind),
+            }));
+            continue;
+        }
         if is_resource_name(name) {
-            pulled(project, name, found);
+            pulled(project, name, kind, found);
         }
         let held = resource.your_access.as_deref();
         if rank(held) < rank(Some(access.as_str())) {
@@ -582,7 +677,9 @@ pub(super) fn resources(
             continue;
         }
         let schema = project.join("resources").join(&name).join("schema.ts");
-        if matches!(first_line(&schema, SCHEMA_FIRST_LINE), FirstLine::Generated) {
+        let pulled_database =
+            matches!(first_line(&schema, SCHEMA_FIRST_LINE), FirstLine::Generated);
+        if pulled_database || matches!(storage_file_state(project, &name), FirstLine::Generated) {
             found.notes.push(json!({
                 "reason": "pulled-not-declared",
                 "resource": name,
@@ -592,27 +689,46 @@ pub(super) fn resources(
     }
 }
 
-/// That the declared Resource `name` is pulled: both files there, each
-/// written by `vibe pull`.
-fn pulled(project: &Path, name: &str, found: &mut Found) {
+/// That the declared Resource `name`, of `kind`, is pulled: a database's
+/// two files and a Storage Resource's `storage.json`, each written by
+/// `vibe pull`.
+fn pulled(project: &Path, name: &str, kind: &str, found: &mut Found) {
     let mut wrong = Vec::new();
     let mut by_hand = false;
-    for (file, line) in [
-        ("schema.ts", SCHEMA_FIRST_LINE),
-        ("index.ts", INDEX_FIRST_LINE),
-    ] {
-        let shown = format!("resources/{name}/{file}");
-        match first_line(&project.join("resources").join(name).join(file), line) {
+    if kind == "storage" {
+        let shown = format!("resources/{name}/storage.json");
+        match storage_file_state(project, name) {
             FirstLine::Generated => {}
             FirstLine::Missing => wrong.push(format!("{shown} is not there")),
             FirstLine::Other => {
                 by_hand = true;
                 wrong.push(format!(
-                    "{shown} was not written by vibe pull (it does not begin with `{line}`)"
+                    "{shown} was not written by vibe pull (it does not hold \"generated\": \"{}\")",
+                    super::pull::STORAGE_GENERATED
                 ));
             }
             FirstLine::Unreadable(error) => {
                 wrong.push(format!("{shown} cannot be read ({error})"));
+            }
+        }
+    } else {
+        for (file, line) in [
+            ("schema.ts", SCHEMA_FIRST_LINE),
+            ("index.ts", INDEX_FIRST_LINE),
+        ] {
+            let shown = format!("resources/{name}/{file}");
+            match first_line(&project.join("resources").join(name).join(file), line) {
+                FirstLine::Generated => {}
+                FirstLine::Missing => wrong.push(format!("{shown} is not there")),
+                FirstLine::Other => {
+                    by_hand = true;
+                    wrong.push(format!(
+                        "{shown} was not written by vibe pull (it does not begin with `{line}`)"
+                    ));
+                }
+                FirstLine::Unreadable(error) => {
+                    wrong.push(format!("{shown} cannot be read ({error})"));
+                }
             }
         }
     }

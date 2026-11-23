@@ -299,9 +299,11 @@ pub(super) fn failed(error: &serde_json::Value) -> Response<Full<Bytes>> {
     )
 }
 
-/// The access the Grants of `file` give `user` on `resource`: the highest
-/// of its Groups', or `none`.
-fn access(file: &TestUsersFile, user: &TestUser, resource: &str) -> &'static str {
+/// The access the Grants of `file` give `user` on `resource`, of `kind`:
+/// the highest of its Groups', or `none`. A Grant at `structure` holds
+/// nothing on a Storage Resource (blackbox/CONTRACT.md, "Storage: The local
+/// loop").
+fn access(file: &TestUsersFile, user: &TestUser, resource: &str, kind: &str) -> &'static str {
     let rank = |access: &str| match access {
         "structure" => 1,
         "read" => 2,
@@ -316,6 +318,7 @@ fn access(file: &TestUsersFile, user: &TestUser, resource: &str) -> &'static str
         .max()
         .unwrap_or(0);
     match best {
+        1 if kind == "storage" => "none",
         1 => "structure",
         2 => "read",
         3 => "write",
@@ -331,13 +334,14 @@ pub(super) enum Said<'a> {
 
 /// The page that chooses the test User of `application`: every User of
 /// `file`, each with its id, its name and email when it has them, its
-/// Groups, its access on each pulled Resource of `pulled`, and a button;
-/// `chosen` marked by its card's edge and a check.
+/// Groups, its access on each pulled Resource of `pulled` (with the kind
+/// the Manifest declares), and a button; `chosen` marked by its card's edge
+/// and a check.
 pub(super) fn chooser(
     status: StatusCode,
     application: &str,
     file: &TestUsersFile,
-    pulled: &[String],
+    pulled: &[(String, String)],
     chosen: Option<&str>,
     next: &str,
     said: &Said<'_>,
@@ -400,11 +404,11 @@ pub(super) fn chooser(
             body.push_str(&groups.join(", "));
         }
         body.push_str("</li>");
-        for resource in pulled {
+        for (resource, kind) in pulled {
             body.push_str(&format!(
                 "<li><code>{}</code> {}</li>",
                 escape(resource),
-                access(file, user, resource)
+                access(file, user, resource, kind)
             ));
         }
         body.push_str(&format!(

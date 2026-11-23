@@ -323,12 +323,19 @@ struct Ready {
 
 /// How a declared Resource was pulled again.
 enum Again {
-    /// Pulled: its fingerprint, and the files written.
-    Pulled(String, Vec<String>),
+    /// Pulled: its fingerprint (none for a Storage Resource, which has no
+    /// structure), and the files written.
+    Pulled {
+        fingerprint: Option<String>,
+        files: Vec<String>,
+    },
     /// Not pulled: the User holds no Grant on it.
     NoGrant,
     /// Not pulled: its shared database did not answer.
     Unavailable,
+    /// A Storage Resource not pulled again: its `storage.json` is used as
+    /// it is, with a warning of its own.
+    StorageNotPulled { no_grant: bool },
     /// Not registered or not pulled: left to the checks.
     Left,
 }
@@ -377,7 +384,13 @@ async fn prepared(
 
     if let Some(manifest) = &manifest {
         stage.set(Stage::Check(check::Stage::Resources));
-        check::resources(project, &manifest.declared, &registry, &mut found);
+        check::resources(
+            project,
+            &manifest.declared,
+            &manifest.kinds,
+            &registry,
+            &mut found,
+        );
     }
     stage.set(Stage::Check(check::Stage::Migrations));
     check::migrations(&cx, &packages, &mut found, &WHO).await?;
@@ -386,11 +399,19 @@ async fn prepared(
 
     let mut structures = BTreeMap::new();
     let mut pulled = Vec::new();
-    let mut changed = Vec::new();
+    let mut changed: Vec<(String, Vec<String>)> = Vec::new();
+    let mut storage_changed: BTreeSet<String> = BTreeSet::new();
     for (name, how) in again {
         let files = match how {
-            Again::Pulled(fingerprint, files) => {
-                structures.insert(name.to_owned(), fingerprint);
+            Again::Pulled { fingerprint, files } => {
+                if let Some(fingerprint) = fingerprint {
+                    structures.insert(name.to_owned(), fingerprint);
+                } else {
+                    // A Storage Resource's pull has no structure: it is
+                    // never in `structures` (blackbox/CONTRACT.md,
+                    // "Pulling a Storage Resource, checking and deploying").
+                    storage_changed.insert(name.to_owned());
+                }
                 files
             }
             Again::NoGrant | Again::Unavailable => {
@@ -404,6 +425,10 @@ async fn prepared(
                 not_pulled(name, matches!(how, Again::NoGrant), unread, &mut found);
                 Vec::new()
             }
+            Again::StorageNotPulled { no_grant } => {
+                storage_not_pulled(name, no_grant, &mut found);
+                Vec::new()
+            }
             Again::Left => Vec::new(),
         };
         pulled.push(json!({ "resource": name, "changed": !files.is_empty(), "files": files }));
@@ -412,19 +437,37 @@ async fn prepared(
         }
     }
     for (name, files) in &changed {
+        // A Storage Resource's file holds its name and contact, never a
+        // structure.
+        let said = if storage_changed.contains(name) {
+            format!(
+                "{} changed since it was pulled: {} updated to it, and this Version was built against it. Commit {}",
+                name,
+                files.join(" and "),
+                files.join(" and ")
+            )
+        } else {
+            format!(
+                "The structure of {name} changed since it was pulled: {} updated to it, and this Version was built against the new structure. Commit {}",
+                files.join(" and "),
+                files.join(" and ")
+            )
+        };
         found.notes.push(json!({
             "reason": "structure-updated",
             "resource": name,
             "files": files,
-            "message": format!("The structure of {name} changed since it was pulled: {} updated to it, and this Version was built against the new structure. Commit {}", files.join(" and "), files.join(" and ")),
+            "message": said,
         }));
     }
     if !found.problems.is_empty() {
         // The check's own ending, which a problem always makes.
-        return Err(match check::report(found, &changed_preface(&changed)) {
-            Err(ending) => ending,
-            Ok(_) => tool_failed("vibe deploy", "found problems and no ending", &WHO),
-        });
+        return Err(
+            match check::report(found, &changed_preface(&changed, &storage_changed)) {
+                Err(ending) => ending,
+                Ok(_) => tool_failed("vibe deploy", "found problems and no ending", &WHO),
+            },
+        );
     }
     let Some(manifest) = manifest else {
         // A Manifest that cannot be read is a problem of the check's.
@@ -478,26 +521,64 @@ async fn prepared(
     })
 }
 
-/// What the message of a failed deploy says first when structures changed.
-fn changed_preface(changed: &[(String, Vec<String>)]) -> String {
+/// What the message of a failed deploy says first when a pull changed
+/// files: the structures of the databases among them, and the files of the
+/// Storage Resources, whose pull has no structure.
+fn changed_preface(changed: &[(String, Vec<String>)], storages: &BTreeSet<String>) -> String {
     if changed.is_empty() {
         return String::new();
     }
-    let names: Vec<&str> = changed.iter().map(|(name, _)| name.as_str()).collect();
+    let databases: Vec<&str> = changed
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .filter(|name| !storages.contains(*name))
+        .collect();
+    let storage: Vec<&str> = changed
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .filter(|name| storages.contains(*name))
+        .collect();
     let files: Vec<&str> = changed
         .iter()
         .flat_map(|(_, files)| files.iter().map(String::as_str))
         .collect();
-    format!(
-        "The structure of {} changed since it was pulled: {} updated to it (commit them), and the project was checked against the new structure; ",
-        names.join(", "),
-        files.join(", ")
-    )
+    let mut said = String::new();
+    if !databases.is_empty() {
+        said.push_str(&format!(
+            "The structure of {} changed since it was pulled, and the project was checked against the new structure; ",
+            databases.join(", ")
+        ));
+    }
+    if !storage.is_empty() {
+        said.push_str(&format!(
+            "{} changed since it was pulled; ",
+            storage.join(", ")
+        ));
+    }
+    format!("{said}{} updated to it (commit them); ", files.join(", "))
 }
 
-/// The warning for a declared Resource that could not be pulled again:
-/// added to the check's `own-grant-below-declared` for it when the User
-/// holds no Grant, else `structure-not-pulled`.
+/// The warning for a declared Storage Resource that could not be pulled
+/// again: the project's `storage.json` is used as it is. It says nothing of
+/// a structure or of `schema.ts`, which the Resource has none of.
+fn storage_not_pulled(name: &str, no_grant: bool, found: &mut Found) {
+    let why = if no_grant {
+        "you hold no Grant on it"
+    } else {
+        "its pull did not answer"
+    };
+    found.warnings.push(json!({
+        "reason": "storage-not-pulled",
+        "resource": name,
+        "message": format!(
+            "The Storage Resource {name} could not be pulled again ({why}), so resources/{name}/storage.json was used as it is. Pull it again with `vibe pull {name}` when the installation takes it, and deploy again"
+        ),
+    }));
+}
+
+/// The warning for a declared database Resource that could not be pulled
+/// again: added to the check's `own-grant-below-declared` for it when the
+/// User holds no Grant, else `structure-not-pulled`.
 fn not_pulled(name: &str, no_grant: bool, unread: bool, found: &mut Found) {
     let why = if no_grant {
         "you hold no Grant on it"
@@ -532,29 +613,48 @@ fn not_pulled(name: &str, no_grant: bool, unread: bool, found: &mut Found) {
 
 /// Step 5 for one declared Resource: pulled again when it is registered and
 /// pulled; a refusal for want of a Grant, or a shared database that does
-/// not answer, leaves the definition as it is.
+/// not answer, leaves the definition as it is. A Storage Resource's pull
+/// writes `storage.json`, never a structure; one that is not pulled is left
+/// to the checks.
 async fn pull_again(
     project: &Path,
     name: &str,
     kept: &Kept,
     registry: &Registry,
 ) -> Result<Again, Ending> {
+    let Some(kind) = registry.kind_of(name) else {
+        return Ok(Again::Left);
+    };
+    let storage = kind == "storage";
     if !is_resource_name(name)
         || registry.access_of(name).is_none()
-        || !check::is_pulled(project, name)
+        || if storage {
+            !check::is_storage_pulled(project, name)
+        } else {
+            !check::is_pulled(project, name)
+        }
     {
         return Ok(Again::Left);
     }
     let pull = Pull::prepare(project, name, "vibe deploy", true)?;
     match pull.fetch(kept).await {
-        Ok(pulled) => Ok(Again::Pulled(
-            pulled.fingerprint,
-            pulled
+        Ok(pulled) => Ok(Again::Pulled {
+            fingerprint: pulled.fingerprint,
+            files: pulled
                 .files
                 .into_iter()
                 .filter_map(|(shown, written)| written.then_some(shown))
                 .collect(),
-        )),
+        }),
+        // A Storage Resource not pulled again uses the `storage.json` of the
+        // project, with a warning of its own: nothing of a structure, which
+        // it has none of.
+        Err(ending) if storage && ending.reason == json!("no-grant") => {
+            Ok(Again::StorageNotPulled { no_grant: true })
+        }
+        Err(ending) if storage && ending.reason == json!("structure-unavailable") => {
+            Ok(Again::StorageNotPulled { no_grant: false })
+        }
         Err(ending) if ending.reason == json!("no-grant") => Ok(Again::NoGrant),
         Err(ending) if ending.reason == json!("structure-unavailable") => Ok(Again::Unavailable),
         Err(ending) => Err(ending),

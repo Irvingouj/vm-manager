@@ -37,7 +37,7 @@ use hyper::{Response, StatusCode};
 
 use super::Seen;
 use crate::oidc::pages::{RETRY_AFTER_SECONDS, escape, own_headers};
-use crate::registry::{Declared, MAX_SHARED_WITH, Named};
+use crate::registry::{Declaration, Declared, MAX_SHARED_WITH, Named};
 use crate::resources::level_name;
 use crate::theme::{self, CHEVRON, Icon, Layout, Mark, Place};
 use crate::user::User;
@@ -610,7 +610,7 @@ fn whole(out: &mut String, block: &Block<'_>, people: &str, notice: Option<Notic
         );
         for (resource, level) in declared {
             if let Some(seen) = block.seen.get(resource.as_str()) {
-                resource_row(out, resource, level.level, seen);
+                resource_row(out, resource, level, seen);
             }
         }
         out.push_str("</tbody></table></section>");
@@ -654,17 +654,19 @@ fn admin_strip(out: &mut String, block: &Block<'_>, admin: &AdminSees<'_>, name:
 
 /// One declared Resource and the User's standing with it: a mark in the
 /// standing's colour (its name hidden beside it for a reader who hears
-/// it), what it needs, what they hold, and whom to ask where they hold
-/// too little.
-fn resource_row(out: &mut String, name: &str, declared: AccessLevel, seen: &Seen) {
+/// it), its kind, what it needs, what they hold, and whom to ask where they
+/// hold too little.
+fn resource_row(out: &mut String, name: &str, declaration: &Declaration, seen: &Seen) {
+    let declared = declaration.level;
     let declared_name = level_name(declared);
     let (yours, standing) = standing(declared, seen);
     let ask = match (&seen.resource, standing) {
         (Some(resource), "lower" | "none") => Some(resource.contact.as_str()),
         _ => None,
     };
-    out.push_str(&format!("<tr class=\"{standing}\" data-vm-resource=\"{}\" data-vm-declared=\"{declared_name}\" data-vm-yours=\"{yours}\" data-vm-standing=\"{standing}\"",
-        escape(name)
+    out.push_str(&format!("<tr class=\"{standing}\" data-vm-resource=\"{}\" data-vm-kind=\"{}\" data-vm-declared=\"{declared_name}\" data-vm-yours=\"{yours}\" data-vm-standing=\"{standing}\"",
+        escape(name),
+        declaration.kind.name()
     ));
     if let Some(ask) = ask {
         out.push_str(&format!(" data-vm-ask=\"{}\"", escape(ask)));

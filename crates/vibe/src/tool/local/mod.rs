@@ -59,6 +59,7 @@ pub(super) use dev::dev;
 
 use std::fs::{self, File};
 use std::io::Read;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -475,7 +476,262 @@ fn local_state_failed(why: &str, command: &str) -> Ending {
         1,
         "local-state",
         format!(
-            "The project's local state (.vibe/local/) cannot be used: {why}. Removing the folder .vibe/local/ starts the local databases anew (their test rows are lost); then run {command} again"
+            "The project's local state (.vibe/local/) cannot be used: {why}. Removing the folder .vibe/local/ starts the local databases and the local Storage over (their test rows and files are lost); then run {command} again"
+        ),
+    )
+}
+
+/// The bits of `ops` as `OpenOptions::custom_flags` takes them; `None` when
+/// one does not fit an `int` (it does not on any system this runs on), so
+/// that a caller fails closed rather than opening a link or a pipe.
+pub(super) fn flags(ops: &[rustix::fs::OFlags]) -> Option<i32> {
+    ops.iter().try_fold(0, |all, op| {
+        i32::try_from(op.bits()).ok().map(|bits| all | bits)
+    })
+}
+
+/// `O_NOFOLLOW` alone: a last component that is a symbolic link is not
+/// followed.
+pub(super) fn nofollow() -> Option<i32> {
+    flags(&[rustix::fs::OFlags::NOFOLLOW])
+}
+
+/// `O_NOFOLLOW` and `O_NONBLOCK`: a link is not followed, and opening a
+/// pipe or a device does not wait on it.
+pub(super) fn nofollow_nonblock() -> Option<i32> {
+    flags(&[rustix::fs::OFlags::NOFOLLOW, rustix::fs::OFlags::NONBLOCK])
+}
+
+/// `local-state` for a platform whose file flags cannot be expressed: it
+/// does not happen on the systems this runs on, and the run stops rather
+/// than open a link.
+pub(super) fn no_flags(command: &str) -> Ending {
+    Ending::new(
+        1,
+        "local-state",
+        format!(
+            "The platform's file flags cannot be used by {command} (O_NOFOLLOW does not fit an int), so the run stops rather than follow a link: run {command} on a system whose flags fit an int"
+        ),
+    )
+}
+
+/// `path`'s bytes (the caller decides what bytes that are not UTF-8 mean,
+/// as it did before), read only when it is a regular file, no link followed
+/// (`O_NOFOLLOW`), never waiting on a pipe or a device (`O_NONBLOCK`), at
+/// most `limit` bytes: what the files of the local state whose content
+/// drives an action are held to. `Ok(None)` when it is not there; `Err`
+/// when it cannot be read or is not a regular file.
+pub(super) fn read_plain_file(path: &Path, limit: u64) -> std::io::Result<Option<Vec<u8>>> {
+    let flags = nofollow_nonblock().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "the platform's O_NOFOLLOW does not fit an int",
+        )
+    })?;
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(flags)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "it is not a regular file",
+        ));
+    }
+    let mut bytes = Vec::new();
+    use std::io::Read as _;
+    file.take(limit).read_to_end(&mut bytes)?;
+    Ok(Some(bytes))
+}
+
+/// Whether `at` is a symbolic link now: looked at itself, never followed.
+pub(super) fn link_at(at: &Path) -> bool {
+    std::fs::symlink_metadata(at).is_ok_and(|meta| meta.file_type().is_symlink())
+}
+
+/// `path` relative to `project`, as the messages name it.
+pub(super) fn shown_path(project: &Path, path: &Path) -> String {
+    path.strip_prefix(project)
+        .unwrap_or(path)
+        .display()
+        .to_string()
+}
+
+/// `local-state` for a symbolic link in the local state: it names the link
+/// and says to remove it, and says nothing of starting the local databases
+/// anew (removing `.vibe/local/` does not remove a link above it).
+pub(super) fn link_in_local_state(link: &str, command: &str) -> Ending {
+    Ending::new(
+        1,
+        "local-state",
+        format!(
+            "The project's local state holds a symbolic link, {link}: {command} writes and removes nothing through a link, and has touched nothing. Remove {link} on the host (a link a clone brought is not the project's own), then run {command} again"
+        ),
+    )
+}
+
+/// The most entries of the local state's folders looked at: a project's
+/// local state holds the tool's own handful, and a Storage Resource's
+/// folder is one of them.
+const LOCAL_ENTRIES: usize = 1000;
+
+/// The names the tool itself uses directly in `.vibe/local/`: each is
+/// looked at by name as well as in the listing, whatever the listing said.
+const OWN_NAMES: [&str; 8] = [
+    "storage",
+    "postgres",
+    "lock",
+    "state.json",
+    ".state.json.partial",
+    "vibe.log",
+    "postgres.log",
+    "dev.json",
+];
+
+/// Checks the local state for a link before a command reads, makes,
+/// truncates or removes anything there (blackbox/CONTRACT.md, "Storage:
+/// The local loop": "No link is followed in the local state"): `.vibe`,
+/// `.vibe/local`, each name the tool itself uses in `.vibe/local/`,
+/// anything directly inside `.vibe/local/`, `.vibe/local/storage`, and
+/// anything directly inside it (whether or not a Resource of that name is
+/// pulled). Each is looked at itself with `symlink_metadata`. The first
+/// link ends the command `local-state`, naming it; a folder holding more
+/// than [`LOCAL_ENTRIES`] entries ends it too, naming the folder, because
+/// the tool does not go on past what it has not looked at. A `.vibe` or
+/// `.vibe/local` that is not a folder and not a link is left to the
+/// command's own handling of it, which says what is wrong as it did before
+/// Storage.
+pub(super) fn check_local_state(project: &Path, command: &str) -> Result<(), Ending> {
+    let state = project.join(".vibe");
+    let local = state.join("local");
+    for at in [&state, &local] {
+        match std::fs::symlink_metadata(at) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(link_in_local_state(&shown_path(project, at), command));
+            }
+            Ok(meta) if meta.is_dir() => {}
+            // Not there, or something else the commands already know how to
+            // refuse.
+            Ok(_) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(local_state_failed(
+                    &format!("{} cannot be read ({error})", shown_path(project, at)),
+                    command,
+                ));
+            }
+        }
+    }
+    // By name, the tool's own entries, whatever the listing below says.
+    for name in OWN_NAMES {
+        let at = local.join(name);
+        match std::fs::symlink_metadata(&at) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(link_in_local_state(&shown_path(project, &at), command));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(local_state_failed(
+                    &format!("{} cannot be read ({error})", shown_path(project, &at)),
+                    command,
+                ));
+            }
+        }
+    }
+    // Every name directly inside `.vibe/local/`: `storage`, `postgres`, the
+    // logs, `state.json`, the lock and control files, or any other.
+    if let Some(ending) = inspect_inside(project, &local, command)? {
+        return Err(ending);
+    }
+    // Every name directly inside `.vibe/local/storage/`, pulled or not.
+    let storage = local.join("storage");
+    match std::fs::symlink_metadata(&storage) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            return Err(link_in_local_state(&shown_path(project, &storage), command));
+        }
+        Ok(meta) if meta.is_dir() => {}
+        Ok(_) => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(local_state_failed(
+                &format!("{} cannot be read ({error})", shown_path(project, &storage)),
+                command,
+            ));
+        }
+    }
+    match inspect_inside(project, &storage, command)? {
+        Some(ending) => Err(ending),
+        None => Ok(()),
+    }
+}
+
+/// The first link directly inside `folder` (each entry looked at itself),
+/// or the folder holding more than [`LOCAL_ENTRIES`] entries, which is not
+/// looked through: `Ok(None)` when there is neither. An entry that cannot
+/// be read ends the command as a folder that cannot be read.
+fn inspect_inside(project: &Path, folder: &Path, command: &str) -> Result<Option<Ending>, Ending> {
+    let entries = match std::fs::read_dir(folder) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(local_state_failed(
+                &format!("{} cannot be read ({error})", shown_path(project, folder)),
+                command,
+            ));
+        }
+    };
+    let mut seen = 0usize;
+    for entry in entries {
+        seen = seen.saturating_add(1);
+        if seen > LOCAL_ENTRIES {
+            return Ok(Some(folder_too_full(project, folder, command)));
+        }
+        let entry = entry.map_err(|error| {
+            local_state_failed(
+                &format!("{} cannot be read ({error})", shown_path(project, folder)),
+                command,
+            )
+        })?;
+        let meta = match std::fs::symlink_metadata(entry.path()) {
+            Ok(meta) => meta,
+            // Gone between the listing and the look (another command of
+            // this project renaming its own temporary file into place): a
+            // name that is not there is not a link.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(local_state_failed(
+                    &format!("{} cannot be read ({error})", shown_path(project, folder)),
+                    command,
+                ));
+            }
+        };
+        if meta.file_type().is_symlink() {
+            return Ok(Some(link_in_local_state(
+                &shown_path(project, &entry.path()),
+                command,
+            )));
+        }
+    }
+    Ok(None)
+}
+
+/// `local-state` for a folder of the local state holding more than
+/// [`LOCAL_ENTRIES`] entries: the tool looks at no more than that and does
+/// not go on past what it has not looked at.
+fn folder_too_full(project: &Path, folder: &Path, command: &str) -> Ending {
+    Ending::new(
+        1,
+        "local-state",
+        format!(
+            "The project's local state folder {} holds more than the {} entries {command} looks through, and the tool does not go on past what it has not looked at: nothing there was read, made, emptied or removed. Remove what does not belong in it (or the folder .vibe/local/, which starts the local databases and the local Storage over); then run {command} again",
+            shown_path(project, folder),
+            LOCAL_ENTRIES
         ),
     )
 }
@@ -551,7 +807,7 @@ impl PgFailed {
             .map(|said| format!(" ({said})"))
             .unwrap_or_default();
         let message = format!(
-            "The private Postgres of the local run failed while {}: {cause}{said}. Its own words are in .vibe/local/postgres.log. Run {command} again; vibe local reset starts the local databases anew (their test rows are loaded again)",
+            "The private Postgres of the local run failed while {}: {cause}{said}. Its own words are in .vibe/local/postgres.log. Run {command} again; vibe local reset starts the local databases and the local Storage over (their test rows and files are lost)",
             self.what
         );
         let mut error = Map::new();
@@ -638,6 +894,7 @@ struct Wanted<'a> {
 /// else alone.
 pub(super) async fn request(args: &RequestArgs) -> Result<Done, Ending> {
     let project = project_path(args.project.as_deref(), WHO.command)?;
+    check_local_state(&project, WHO.command)?;
     let file = run::test_users_of(&project, WHO.command)?;
     if file.user(&args.user).is_none() {
         return Err(run::no_such_test_user(&file, &args.user));
@@ -769,9 +1026,9 @@ async fn request_alone(
         return Ok(Alone::Dev(dev));
     }
     let pg = run::start_server(base, &programs, progress, held, false).await?;
-    let live = Live::open(&pg, one_request(), base.who).await?;
+    let live = Live::open(&pg, base.project, one_request(), base.who).await?;
     let done = async {
-        let brought = run::bring_up(base, &pg, &live, file, &packages, progress).await?;
+        let brought = run::bring_up(base, &pg, &live, file, &packages, progress, false).await?;
         let Some(user) = file.user(wanted.user) else {
             return Err(run::no_such_test_user(file, wanted.user));
         };
@@ -826,6 +1083,7 @@ fn request_output(brought: &Brought, served: &Served, asked: &run::Asked<'_>) ->
         "operations": served.operations,
         "migrations_applied": brought.migrations_applied,
         "standins": brought.standins_json(),
+        "storages": brought.storages_json(),
         "test_rows": brought.test_rows_json(),
         "warnings": warnings,
         "notes": brought.said.notes,
@@ -899,6 +1157,7 @@ pub(super) async fn local(args: &LocalArgs) -> Result<Done, Ending> {
         ),
     };
     let project = project_path(project.as_deref(), WHO_LOCAL.command)?;
+    check_local_state(&project, WHO_LOCAL.command)?;
     let local = Local::of(&project);
     let limit = timeout.map_or(DEFAULT_TIMEOUT, Duration::from_secs);
     let command = Command {
@@ -1045,6 +1304,7 @@ async fn read_records(
 /// else alone.
 async fn reset(args: &ResetArgs) -> Result<Done, Ending> {
     let project = project_path(args.project.as_deref(), WHO_RESET.command)?;
+    check_local_state(&project, WHO_RESET.command)?;
     let local = Local::of(&project);
     let limit = args.timeout.map_or(DEFAULT_TIMEOUT, Duration::from_secs);
     let command = Command {
@@ -1084,8 +1344,8 @@ async fn reset_alone(
         return Ok(Alone::Dev(dev));
     }
     let pg = run::start_server(base, &programs, progress, held, true).await?;
-    let live = Live::open(&pg, one_request(), base.who).await?;
-    let brought = run::bring_up(base, &pg, &live, file, &packages, progress).await;
+    let live = Live::open(&pg, base.project, one_request(), base.who).await?;
+    let brought = run::bring_up(base, &pg, &live, file, &packages, progress, true).await;
     live.close().await;
     Ok(Alone::Did(reset_output(&brought?)))
 }
@@ -1098,6 +1358,7 @@ fn reset_output(brought: &Brought) -> Done {
         "version": brought.version,
         "migrations_applied": brought.migrations_applied,
         "standins": brought.standins_json(),
+        "storages": brought.storages_json(),
         "test_rows": brought.test_rows_json(),
         "warnings": brought.said.warnings,
         "notes": brought.said.notes,
@@ -1132,6 +1393,14 @@ fn brought_in_words(json: &Value) -> String {
                 one_line(&standin["resource"])
             );
         }
+    }
+    for storage in json["storages"].as_array().into_iter().flatten() {
+        say!(
+            text,
+            "The local Storage of {} is at {}.",
+            one_line(&storage["resource"]),
+            one_line(&storage["directory"])
+        );
     }
     for loaded in json["test_rows"].as_array().into_iter().flatten() {
         say!(

@@ -356,10 +356,17 @@ fn application_block(words: &mut String, application: &Value) {
                 if n > 0 {
                     declared.push_str(", ");
                 }
+                // A Declaration stored before Storage existed has no kind:
+                // it is a database's (crate::registry::declared_of).
+                let kind = resource
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .unwrap_or("postgres");
                 put!(
                     declared,
-                    "{} {}",
+                    "{} ({}) {}",
                     Theirs::from(name.as_str()),
+                    Theirs::from(kind),
                     text(resource, "access")
                 );
             }

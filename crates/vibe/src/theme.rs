@@ -416,6 +416,8 @@ pub enum Icon {
     Log,
     /// A cylinder: a database, a Resource.
     Database,
+    /// A sheet with a folded corner: files, a Storage Resource.
+    File,
     /// A stack of two boxes: the installation.
     Server,
     /// A circle with a bar across it: stop serving (disable).
@@ -490,6 +492,9 @@ impl Icon {
             }
             Self::Database => {
                 "<svg class=\"i\" viewBox=\"0 0 20 20\" aria-hidden=\"true\" focusable=\"false\"><ellipse cx=\"10\" cy=\"5\" rx=\"6\" ry=\"2.25\"/><path d=\"M4 5v10c0 1.25 2.7 2.25 6 2.25s6-1 6-2.25V5M4 10c0 1.25 2.7 2.25 6 2.25s6-1 6-2.25\"/></svg>"
+            }
+            Self::File => {
+                "<svg class=\"i\" viewBox=\"0 0 20 20\" aria-hidden=\"true\" focusable=\"false\"><path d=\"M5 2.75h6l4 4v10.5H5z\"/><path d=\"M11 2.75v4h4\"/></svg>"
             }
             Self::Server => {
                 "<svg class=\"i\" viewBox=\"0 0 20 20\" aria-hidden=\"true\" focusable=\"false\"><rect x=\"3\" y=\"3.5\" width=\"14\" height=\"5.5\" rx=\"1.25\"/><rect x=\"3\" y=\"11\" width=\"14\" height=\"5.5\" rx=\"1.25\"/><path d=\"M6 6.25h.01M6 13.75h.01\"/></svg>"

@@ -128,6 +128,11 @@
 //!   reads them slowly and sees a connection closed short of its
 //!   `content-length`, beside the program's resident memory from `/proc` and
 //!   a streaming SHA-256.
+//! - [`storage_tool`] is what the tests of Storage's other surfaces share:
+//!   the `storage.json` a pull writes and what pulling one prints, the
+//!   local loop's `storages` output, the Dashboard's `data-vm-kind`, and
+//!   the local project whose Application reads and writes a pulled Storage
+//!   Resource.
 //!
 //! Every wait has a timeout, so a failing test fails within seconds and
 //! never hangs. Each test starts its own program on its own port, so tests
@@ -189,6 +194,7 @@ pub mod shared_database;
 pub mod sharing;
 pub mod sql;
 pub mod storage;
+pub mod storage_tool;
 pub mod structure;
 pub mod tls;
 pub mod tool;

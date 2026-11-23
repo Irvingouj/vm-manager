@@ -301,7 +301,7 @@ impl CreateApplication {
 }
 
 /// `POST /v1/applications/<name>/versions`
-const VERSION_FORM: &str = r#"{ "bundle": "<the classic script>", "declared_access": { "resources": { "<name>": { "kind": "postgres", "access": "structure|read|write" } } }, "git_commit": "<40 hex characters>", "migrations": [ { "name": "<1 to 200 letters, digits, _ and ->", "sql": "<the file drizzle-kit generated>" } ] (optional), "structures": { "<a declared Resource>": "sha256:<64 lower-case hex>" } (optional) }"#;
+const VERSION_FORM: &str = r#"{ "bundle": "<the classic script>", "declared_access": { "resources": { "<name>": { "kind": "postgres" | "storage", "access": "structure|read|write" } } }, "git_commit": "<40 hex characters>", "migrations": [ { "name": "<1 to 200 letters, digits, _ and ->", "sql": "<the file drizzle-kit generated>" } ] (optional), "structures": { "<a declared Resource>": "sha256:<64 lower-case hex>" } (optional) }"#;
 
 /// The most characters a migration's name has.
 const MAX_MIGRATION_NAME: usize = 200;
@@ -420,7 +420,7 @@ pub(crate) fn read_version(body: &[u8]) -> Result<NewVersion, String> {
 }
 
 /// `POST /v1/resources`
-const RESOURCE_FORM: &str = r#"{ "name": "<name>", "kind": "postgres", "description": "<text>", "owner": "<text>", "contact": "<whom to ask for access>", "connection": { "host": "<host>", "port": <1 to 65535>, "database": "<database>", "read": { "role": "<role>", "password": "<password>" }, "write": { "role": "<role>", "password": "<password>" } (optional), "structure": { "role": "<role>", "password": "<password>" } (optional) } }"#;
+const RESOURCE_FORM: &str = r#"{ "name": "<name>", "kind": "postgres" | "storage", "description": "<text>", "owner": "<text>", "contact": "<whom to ask for access>", "connection": { "host": "<host>", "port": <1 to 65535>, "database": "<database>", "read": { "role": "<role>", "password": "<password>" }, "write": { "role": "<role>", "password": "<password>" } (optional), "structure": { "role": "<role>", "password": "<password>" } (optional) } (for kind "postgres"; a Storage Resource has "location": { "backend": "directory", "directory": "<an absolute path beneath the storage root>" } instead of "connection") }"#;
 
 /// A Resource to register, as the body asks.
 enum ToRegister {
@@ -892,6 +892,16 @@ const MAX_DECLARED_LISTED: usize = 200;
 pub(crate) const MAX_ADMIN_PAGE: u8 = 100;
 
 impl Api {
+    /// Each registered Resource's kind, by name: for the pages that show a
+    /// Resource's mark. From memory.
+    pub(crate) fn resource_kinds(&self) -> BTreeMap<String, &'static str> {
+        self.resources
+            .list()
+            .into_iter()
+            .map(|resource| (resource.name.clone(), resource.kind.name()))
+            .collect()
+    }
+
     #[expect(
         clippy::too_many_arguments,
         reason = "the parts the API answers from, each named, made once at start"
@@ -1847,10 +1857,12 @@ impl Api {
     }
 
     /// `GET /v1/resources/<name>/structure` (blackbox/CONTRACT.md, "Pulling
-    /// a Resource's structure"): the Authorization decision with
-    /// `structure` needed; the Operation log entry written before anything
-    /// is sent to the shared database, and completed after; the pull
-    /// (crate::structure) within its time and bytes.
+    /// a Resource's structure", "Pulling a Storage Resource, checking and
+    /// deploying"): the Authorization decision with `structure` needed; the
+    /// Operation log entry written before anything is sent to the shared
+    /// database, and completed after; the pull (crate::structure) within its
+    /// time and bytes. A Storage Resource answers what a pull needs of it:
+    /// its name, kind, the User's Grant and whom to ask, and no structure.
     async fn structure(&self, user: &User, request: &str, method: &Method, name: &str) -> Answer {
         let resource = match self.resources.find(name).await {
             Ok(Some(resource)) => resource,
@@ -1859,11 +1871,6 @@ impl Api {
         };
         if method != Method::GET {
             return Answer::method_not_allowed(method, "GET");
-        }
-        // A Storage Resource has no structure to pull (its answer here is
-        // the ticket's later stage): as no database of that name.
-        if resource.structure_pool().is_none() {
-            return no_resource();
         }
         self.resources
             .read_back(
@@ -1911,6 +1918,43 @@ impl Api {
                 } }),
             );
         }
+        // A Storage Resource has no structure to pull: the answer is the
+        // Resource and the User's Grant, and nothing of a database
+        // (blackbox/CONTRACT.md, "Pulling a Storage Resource, checking and
+        // deploying"). Its entry is the pull's.
+        if resource.kind == ResourceKind::Storage {
+            let id = match self.log.begin_structure(request, &user.id, name).await {
+                Ok(id) => id,
+                Err(error) => return Answer::unavailable(&error),
+            };
+            // From the entry written to the answer, as a database's pull is
+            // measured; there is no file work in it.
+            let started = tokio::time::Instant::now();
+            let answer = Answer::json(
+                StatusCode::OK,
+                &json!({
+                    "resource": name,
+                    "kind": "storage",
+                    "your_access": held.map(resources::level_name),
+                    "contact": &resource.contact,
+                }),
+            );
+            let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            let ending = Ending {
+                outcome: "allowed",
+                error: None,
+                rows: None,
+                duration_ms: Some(duration_ms),
+                began_nothing: false,
+            };
+            if let Err(error) = self.log.finish(id, &ending).await {
+                log::record(
+                    "operation-log-unwritten",
+                    json!({ "resource": name, "error": error.to_string() }),
+                );
+            }
+            return answer;
+        }
         // Taken before the entry is written and anything is sent; held to the
         // end of this function, or given back as its future is dropped.
         let pulling = resource.pulling();
@@ -1944,7 +1988,8 @@ impl Api {
         let started = tokio::time::Instant::now();
         let pulled = match resource.structure_pool() {
             Some(pool) => structure::pull(pool, name).await,
-            // Not reached: a Storage Resource was answered above.
+            // Not reached: every database has a read pool, and a Storage
+            // Resource was answered above.
             None => Err(structure::Failed::Unavailable),
         };
         let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -1953,6 +1998,7 @@ impl Api {
                 StatusCode::OK,
                 &StructureView {
                     resource: name,
+                    kind: "postgres",
                     fingerprint: &pulled.fingerprint,
                     your_access: held.map(resources::level_name),
                     schema_ts: &pulled.schema_ts,
@@ -2740,6 +2786,7 @@ struct GrantSet<'a> {
 #[derive(Serialize)]
 struct StructureView<'a> {
     resource: &'a str,
+    kind: &'static str,
     fingerprint: &'a str,
     your_access: Option<&'static str>,
     schema_ts: &'a str,

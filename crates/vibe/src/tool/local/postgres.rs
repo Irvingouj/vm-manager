@@ -51,6 +51,17 @@ pub(super) const MIRROR_VARIABLE: &str = "VIBE_LOCAL_POSTGRES_MIRROR";
 /// The superuser initdb makes.
 const SUPERUSER: &str = "vm_superuser";
 
+/// What is read of `state.json`: far above its few hundred bytes.
+const STATE_BYTES: u64 = 64 * 1024;
+
+/// What is read of `postmaster.pid`: its fields are in its first lines; the
+/// rest is never looked at.
+const PID_BYTES: u64 = 4 * 1024;
+
+/// What is read of `postgres.log` to explain a failed start: far above what
+/// Postgres writes there while it starts.
+const LOG_BYTES: u64 = 64 * 1024;
+
 /// The platform's role: what `VIBE_DATABASE_URL`'s role is in an
 /// installation.
 pub(super) const PLATFORM_ROLE: &str = "vm";
@@ -405,12 +416,20 @@ impl Local {
         mut other: impl FnMut() -> Option<T>,
     ) -> Result<Taken<T>, String> {
         let path = self.dir.join("lock");
+        let nofollow = super::nofollow().ok_or_else(|| {
+            format!(
+                "{} cannot be opened (the platform's O_NOFOLLOW does not fit an int)",
+                path.display()
+            )
+        })?;
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
             .mode(0o600)
+            // A link at the lock is not followed, nor its target made.
+            .custom_flags(nofollow)
             .open(&path)
             .map_err(|e| format!("{} cannot be opened ({e})", path.display()))?;
         let mut waiting = Some(waiting);
@@ -436,8 +455,12 @@ impl Local {
     /// The state, made (new passwords) when it is not there.
     pub(super) fn state(&self) -> Result<State, StateFailed> {
         let path = self.dir.join("state.json");
-        match fs::read(&path) {
-            Ok(bytes) => {
+        // A link at `state.json` is not followed, a pipe or a device is not
+        // waited on, only a regular file is read, and at most its few
+        // hundred bytes (far below `STATE_BYTES`).
+        let read = super::read_plain_file(&path, STATE_BYTES);
+        match read {
+            Ok(Some(bytes)) => {
                 let value: Value = serde_json::from_slice(&bytes)
                     .map_err(|_| StateFailed::State(self.broken()))?;
                 let text = |key: &str| {
@@ -453,7 +476,7 @@ impl Local {
                     ready: value.get("ready").and_then(Value::as_bool).unwrap_or(false),
                 })
             }
-            Err(error) if error.kind() == ErrorKind::NotFound => {
+            Ok(None) => {
                 if self.data().exists() {
                     return Err(StateFailed::State(self.broken()));
                 }
@@ -489,12 +512,21 @@ impl Local {
             "ready": state.ready,
         })
         .to_string();
+        let nofollow = super::nofollow().ok_or_else(|| {
+            format!(
+                "{} cannot be written (the platform's O_NOFOLLOW does not fit an int)",
+                path.display()
+            )
+        })?;
         let written = (|| {
             fs::remove_file(&partial).ok();
             let mut file = OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .mode(0o600)
+                // `create_new` refuses an existing name; the flag says so
+                // for a link too.
+                .custom_flags(nofollow)
                 .open(&partial)?;
             file.write_all(text.as_bytes())?;
             file.sync_all()?;
@@ -640,9 +672,6 @@ impl Local {
     /// no `postmaster.pid`.
     pub(super) async fn stop_leftover(&self, state: &State) -> Result<(), String> {
         let pid_file = self.data().join("postmaster.pid");
-        let Ok(text) = fs::read_to_string(&pid_file) else {
-            return Ok(());
-        };
         let not_believed = || {
             fs::remove_file(&pid_file)
                 .or_else(|e| {
@@ -653,6 +682,26 @@ impl Local {
                     }
                 })
                 .map_err(|e| format!("{} cannot be removed ({e})", pid_file.display()))
+        };
+        // Only a regular file, no link followed, at most its first 4 KiB,
+        // and never a wait on a pipe or a device. Not there: nothing to do.
+        // Anything else is not believed: it is removed, and the run goes on
+        // as with no such file.
+        let text = match super::read_plain_file(&pid_file, PID_BYTES) {
+            Ok(Some(bytes)) => match String::from_utf8(bytes) {
+                Ok(text) => text,
+                // Not text: left alone, as before this read was bounded.
+                Err(_) => return Ok(()),
+            },
+            Ok(None) => return Ok(()),
+            // A regular file that cannot be read, or a folder, is left
+            // alone, as before; a link, a pipe or a device there is not
+            // believed.
+            Err(_) => {
+                let left = fs::symlink_metadata(&pid_file)
+                    .is_ok_and(|meta| meta.is_file() || meta.is_dir());
+                return if left { Ok(()) } else { not_believed() };
+            }
         };
         let mut lines = text.lines();
         let pid = lines
@@ -750,6 +799,19 @@ impl Local {
 /// Removes everything inside `folder`, which stays; nothing when it is not
 /// there. No link is followed: a link inside is removed, not its target.
 fn empty_folder(folder: &Path) -> std::io::Result<()> {
+    // The folder itself is looked at, never followed: a link there is not a
+    // folder to empty. Not there is nothing to empty.
+    match fs::symlink_metadata(folder) {
+        Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidInput,
+                "it is not a folder of the project's own",
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    }
     let entries = match fs::read_dir(folder) {
         Ok(entries) => entries,
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
@@ -865,6 +927,12 @@ impl Server {
         const WHAT: &str = "starting";
         let ended = |said: String| PgFailed::new(STEP, WHAT, Cause::Ended).said(said);
         let log_path = local.dir.join("postgres.log");
+        let nofollow = super::nofollow().ok_or_else(|| {
+            StartFailed::State(format!(
+                "{} cannot be written (the platform's O_NOFOLLOW does not fit an int)",
+                log_path.display()
+            ))
+        })?;
         let mut last = ended(String::new());
         for _ in 0..PORT_ATTEMPTS {
             let port = free_port().map_err(StartFailed::Own)?;
@@ -880,6 +948,9 @@ impl Server {
                 .append(true)
                 .create(true)
                 .mode(0o600)
+                // A link at `postgres.log` is not followed, nor its target
+                // made or shortened.
+                .custom_flags(nofollow)
                 .open(&log_path)
                 .and_then(|file| file.set_len(0).map(|()| file))
                 .map_err(|e| {
@@ -933,7 +1004,11 @@ impl Server {
                 Ok(()) => return Ok(server),
                 Err(cause) => {
                     server.stop().await;
-                    let log = fs::read_to_string(&log_path).unwrap_or_default();
+                    let log = super::read_plain_file(&log_path, LOG_BYTES)
+                        .ok()
+                        .flatten()
+                        .and_then(|bytes| String::from_utf8(bytes).ok())
+                        .unwrap_or_default();
                     let in_use = log.contains("could not bind") || log.contains("in use");
                     let first: Vec<&str> = log
                         .lines()
@@ -969,9 +1044,13 @@ impl Server {
         let pid_file = local.data().join("postmaster.pid");
         let deadline = tokio::time::Instant::now() + READY_WAIT;
         loop {
-            let ready = fs::read_to_string(&pid_file)
+            // The same rule as the leftover's read: a regular file only, no
+            // link followed, never a wait on a pipe, its first 4 KiB.
+            let ready = super::read_plain_file(&pid_file, PID_BYTES)
                 .ok()
-                .and_then(|t| t.lines().nth(7).map(|l| l.trim() == "ready"))
+                .flatten()
+                .and_then(|bytes| String::from_utf8(bytes).ok())
+                .and_then(|text| text.lines().nth(7).map(|l| l.trim() == "ready"))
                 .unwrap_or(false);
             if ready {
                 return Ok(());
@@ -1030,7 +1109,17 @@ pub(super) fn trim_log(local: &Local) {
     let path = local.dir.join("postgres.log");
     let large = fs::symlink_metadata(&path)
         .is_ok_and(|meta| meta.is_file() && meta.len() > crate::log::MAX_FILE_BYTES);
-    if large && let Ok(file) = OpenOptions::new().write(true).open(&path) {
+    let Some(nofollow) = super::nofollow() else {
+        return;
+    };
+    if large
+        && let Ok(file) = OpenOptions::new()
+            .write(true)
+            // A link is not followed (a look above would have found it not a
+            // file; this also closes the gap).
+            .custom_flags(nofollow)
+            .open(&path)
+    {
         file.set_len(0).ok();
     }
 }

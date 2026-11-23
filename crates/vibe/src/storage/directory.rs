@@ -55,7 +55,7 @@
 use std::collections::BinaryHeap;
 use std::io::{Read as _, Write as _};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
@@ -1661,6 +1661,46 @@ impl Root {
         path.extend(&segments);
         Ok(Self {
             path,
+            segments,
+            claims: Mutex::new(Vec::new()),
+            next_claim: std::sync::atomic::AtomicU64::new(1),
+        })
+    }
+
+    /// The storage root `path`, as a path (never through a string that
+    /// could alter it): an absolute path written without `.`, `..` or an
+    /// empty segment, whose segments are UTF-8 as a Resource's directory
+    /// is named on the API, else a message. For the local run's own root.
+    pub fn from_path(path: &Path) -> Result<Self, String> {
+        if !path.is_absolute() {
+            return Err("the storage root must be an absolute path".to_owned());
+        }
+        let mut segments = Vec::new();
+        for component in path.components() {
+            match component {
+                Component::RootDir => {}
+                Component::Normal(segment) => match segment.to_str() {
+                    Some(segment) => segments.push(segment.to_owned()),
+                    None => {
+                        return Err(
+                            "the storage root's path is not valid UTF-8, which a Resource's directory must be named in"
+                                .to_owned(),
+                        );
+                    }
+                },
+                // `.`, `..` and a Windows prefix are not a storage root.
+                _ => {
+                    return Err(
+                        "the storage root must be an absolute path written without `.` or `..`"
+                            .to_owned(),
+                    );
+                }
+            }
+        }
+        let mut root = PathBuf::from("/");
+        root.extend(&segments);
+        Ok(Self {
+            path: root,
             segments,
             claims: Mutex::new(Vec::new()),
             next_claim: std::sync::atomic::AtomicU64::new(1),

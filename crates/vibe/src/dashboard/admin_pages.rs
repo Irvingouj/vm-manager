@@ -13,6 +13,7 @@
 //! six times that, at worst); every Resource with its Grants, as `GET
 //! /v1/resources` answers them all today.
 
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use hyper::StatusCode;
@@ -28,6 +29,24 @@ use crate::resources::{Resource, level_name};
 use crate::theme::{self, CHEVRON, Icon, Layout, Mark};
 
 type Answer = hyper::Response<http_body_util::Full<bytes::Bytes>>;
+
+/// The mark of a Resource of `kind`: a Storage Resource's is files', a
+/// database's a cylinder (blackbox/CONTRACT.md, "The tool and the
+/// Dashboard": a Storage Resource is never marked to be a database).
+fn kind_icon(kind: Option<&str>) -> Icon {
+    match kind {
+        Some("storage") => Icon::File,
+        _ => Icon::Database,
+    }
+}
+
+/// A Resource's kind in words, where a page says it.
+fn kind_words(kind: Option<&str>) -> &'static str {
+    match kind {
+        Some("storage") => "Storage",
+        _ => "Postgres",
+    }
+}
 
 /// The four sections of the pages of Platform administrators.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -445,12 +464,19 @@ fn admin_card(
             out.push_str("<ul class=\"tags\">");
             for (resource, said) in resources {
                 let access = said.get("access").and_then(Value::as_str).unwrap_or("");
+                // A Declaration stored before Storage existed has no kind:
+                // it is a database's (crate::registry::declared_of).
+                let kind = said
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .unwrap_or("postgres");
+                let icon = kind_icon(Some(kind));
                 let resource = escape(resource);
                 let access = escape(access);
                 write!(
                     out,
-                    "<li data-vm-declared-resource=\"{resource}\" data-vm-declared=\"{access}\">{}<code>{resource}</code> <span class=\"lv-pill\">{access}</span></li>",
-                    Icon::Database.svg()
+                    "<li data-vm-declared-resource=\"{resource}\" data-vm-kind=\"{kind}\" data-vm-declared=\"{access}\">{}<code>{resource}</code> <span class=\"lv-pill\">{access}</span></li>",
+                    icon.svg()
                 ).ok();
             }
             out.push_str("</ul>");
@@ -582,7 +608,12 @@ fn typed_filters(typed: &Typed) -> Vec<(&'static str, &str)> {
 }
 
 /// `GET /admin/operation-log`.
-pub(crate) fn operation_log(viewer: &Viewer<'_>, typed: &Typed, shown: &LogShown<'_>) -> Answer {
+pub(crate) fn operation_log(
+    viewer: &Viewer<'_>,
+    typed: &Typed,
+    shown: &LogShown<'_>,
+    kinds: &BTreeMap<String, &'static str>,
+) -> Answer {
     let mut main = String::from("<h1 class=\"page-title\">Operation log</h1>");
     let field_error = match shown {
         LogShown::Malformed { field, words } => Some((*field, words.as_str())),
@@ -596,7 +627,7 @@ pub(crate) fn operation_log(viewer: &Viewer<'_>, typed: &Typed, shown: &LogShown
             entries,
             earlier,
         } => {
-            entries_html(&mut main, asked, entries, *earlier);
+            entries_html(&mut main, asked, entries, *earlier, kinds);
             StatusCode::OK
         }
         LogShown::Malformed { field, words } => {
@@ -729,7 +760,13 @@ fn outcome_mark(outcome: &str) -> String {
 }
 
 /// The entries, newest first, with the links to older and newest ones.
-fn entries_html(out: &mut String, asked: &LogQuery, entries: &[Value], earlier: Option<i64>) {
+fn entries_html(
+    out: &mut String,
+    asked: &LogQuery,
+    entries: &[Value],
+    earlier: Option<i64>,
+    kinds: &BTreeMap<String, &'static str>,
+) {
     let filters = asked_filters(asked);
     if entries.is_empty() {
         let words = if filters.is_empty() && asked.before.is_none() {
@@ -761,7 +798,7 @@ fn entries_html(out: &mut String, asked: &LogQuery, entries: &[Value], earlier: 
     } else {
         out.push_str("<p class=\"over\">Newest first, times in UTC</p><ol class=\"entries\">");
         for entry in entries.iter().rev() {
-            entry_html(out, &filters, entry);
+            entry_html(out, &filters, entry, kinds);
         }
         out.push_str("</ol>");
     }
@@ -806,7 +843,12 @@ fn filter_link(filters: &[(&str, &str)], kind: &str, value: &str) -> String {
 }
 
 /// One entry: what is seen first, and the rest one step away.
-fn entry_html(out: &mut String, filters: &[(&str, &str)], entry: &Value) {
+fn entry_html(
+    out: &mut String,
+    filters: &[(&str, &str)],
+    entry: &Value,
+    kinds: &BTreeMap<String, &'static str>,
+) {
     let text = |name: &str| entry.get(name).and_then(Value::as_str);
     let id = entry.get("id").and_then(Value::as_i64).unwrap_or_default();
     let outcome = text("outcome").unwrap_or_default();
@@ -871,10 +913,17 @@ fn entry_html(out: &mut String, filters: &[(&str, &str)], entry: &Value) {
     }
     match text("resource") {
         Some(resource) => {
+            // Its registered kind; a Storage operation tells its own when the
+            // Resource is no longer registered.
+            let kind = kinds.get(resource).copied().or_else(|| {
+                text("operation")
+                    .filter(|operation| operation.starts_with("storage."))
+                    .map(|_| "storage")
+            });
             write!(
                 out,
                 "<span>{}{}</span>",
-                theme::icon(Icon::Database, "Resource"),
+                theme::icon(kind_icon(kind), "Resource"),
                 filter_link(filters, "resource", resource)
             )
             .ok();
@@ -1064,10 +1113,11 @@ pub(crate) fn resources(viewer: &Viewer<'_>, all: &[std::sync::Arc<Resource>]) -
 /// whose it is and its Operation log.
 fn resource_card(out: &mut String, resource: &Resource) {
     let name = escape(&resource.name);
+    let kind = resource.kind.name();
     write!(
         out,
-        "<li><article class=\"card res-card\" data-vm-resource=\"{name}\" data-vm-kind=\"postgres\"><h2>{}<code>{name}</code></h2>",
-        Icon::Database.svg()
+        "<li><article class=\"card res-card\" data-vm-resource=\"{name}\" data-vm-kind=\"{kind}\"><h2>{}<code>{name}</code></h2>",
+        kind_icon(Some(kind)).svg()
     ).ok();
     if !resource.description.is_empty() {
         write!(
@@ -1098,11 +1148,12 @@ fn resource_card(out: &mut String, resource: &Resource) {
     write!(
         out,
         "<details class=\"more\"><summary>Details<span class=\"vh\"> of {name}</span></summary><dl class=\"facts\">\
-         <dt>Owner</dt><dd data-vm-owner>{}</dd><dt>Ask</dt><dd data-vm-contact>{}</dd><dt>Kind</dt><dd>Postgres</dd>\
+         <dt>Owner</dt><dd data-vm-owner>{}</dd><dt>Ask</dt><dd data-vm-contact>{}</dd><dt>Kind</dt><dd>{}</dd>\
          <dt>Registered</dt><dd>by <code class=\"id\">{}</code> on <time datetime=\"{}\">{}</time></dd></dl>\
          <a data-vm-operation-log href=\"/admin/operation-log?resource={}\">{}Its Operation log</a></details></article></li>",
         escape(&resource.owner),
         escape(&resource.contact),
+        kind_words(Some(kind)),
         escape(&resource.created_by),
         escape(&resource.created_at),
         escape(&when(&resource.created_at)),

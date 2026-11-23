@@ -94,6 +94,7 @@ fn a_change_of_the_code_is_served_at_the_next_request_and_said_in_a_rebuilt_line
             "event",
             "migrations_applied",
             "standins",
+            "storages",
             "test_rows",
             "url",
             "version"
