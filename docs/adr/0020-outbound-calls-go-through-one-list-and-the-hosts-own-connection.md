@@ -6,7 +6,7 @@ status: proposed
 
 The spec (user stories 24 and 25) gives Platform administrators "one platform-wide list of hosts Applications may call, empty by default, so that data does not leave through an Application's code", and wants "every outbound call logged with the Application, the User and the destination host". The ticket "Outbound calls: one platform-wide list of hosts, every call logged" adds that loopback, private and link-local addresses and the platform itself are refused whatever the list says, also when a listed name resolves to one, and that a redirect to a host not on the list is refused. `blackbox/CONTRACT.md`, "Outbound calls", is the interface this decision led to.
 
-Status `proposed`: written by the driving session on 2026-11-23 before the implementation; the choices marked "chosen by the agent" are the product owner's to change.
+Status `proposed`: written by the driving session on 2026-11-23 before the implementation; the choices marked "chosen by the agent" are the product owner's to change, and are put to them in issue #92.
 
 ## The decision
 

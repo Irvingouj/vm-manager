@@ -6,7 +6,7 @@ status: proposed
 
 The spec (user story 16) gives Platform administrators "Resource credentials stored encrypted under a key that is not in the database, so that a database dump does not leak them". The ticket "Resources and Grants in full" asks that "a dump of the platform database contains no usable Resource credential; without the key the program says so and does not start serving that Resource". A comment on it, from the review of "An Application's own database", adds that the passwords of an own database's two roles are sent to the platform database as bind parameters, which a Postgres with statement logging writes to its server log (`docs/research/what-postgres-sees.md`, section 5). `blackbox/CONTRACT.md`, "Resources and Grants in full", is the interface this decision led to.
 
-Status `proposed`: written on 2026-11-23 with the first stage of the ticket (what is sealed, and what the program does at start); the choices marked "chosen by the agent" are the product owner's to change. Replacing a Resource's logins is the ticket's next stage; replacing the key is not decided here ("What was considered and not taken").
+Status `proposed`: written on 2026-11-23 with the first stage of the ticket (what is sealed, and what the program does at start); the choices marked "chosen by the agent" are the product owner's to change, and are put to them in issue #93 (encryption in transit: #94; replacing the key: #90). Replacing a Resource's logins is the ticket's next stage; replacing the key is not decided here ("What was considered and not taken").
 
 What already exists and constrains it (read in this session; "code" is `crates/vibe/src`, "contract" is `blackbox/CONTRACT.md`):
 

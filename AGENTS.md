@@ -12,7 +12,7 @@ Issues live in this repo's GitHub Issues, driven with the `gh` CLI. See `docs/ag
 
 ### Triage labels
 
-The five default triage labels, unchanged. See `docs/agents/triage-labels.md`.
+The five default triage labels, unchanged, and one of our own, `product-decision`. See `docs/agents/triage-labels.md`.
 
 ### Domain docs
 
@@ -37,10 +37,19 @@ The driving session orchestrates; one agent works at a time.
 5. **Fix what the review found.** Everything: a defect, a gap in what the ticket promises, a way round a security claim, a path with no test, a cost nobody measured. Each goes back through the loop (the contract if the outside changes, a red test, the implementation). A ticket is never closed over a list of things left open.
 6. **Green.** The driving session runs the checks itself: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, and the test files that touch what the ticket changed (its red tests and their neighbours). If one fails, back to the implementation agent until it is green. **The whole gate is not run for a ticket or before a push** until the product owner asks for it (the product owner's decision of 2026-11-21: nobody uses the product yet, the tests pin today's behaviour, and a full run before every push only slows the work).
 
-Then the ticket's commits are pushed and the issue is closed with what was run. A finding that cannot be fixed inside the ticket, because only the product owner can decide it, is put to the product owner at once and the ticket stays open until it is answered.
+Then the ticket's commits are pushed and the issue is closed with what was run. A finding that cannot be fixed inside the ticket, because only the product owner can decide it, is filed at once as an issue labelled `product-decision` ("Decisions for the product owner", below) and the ticket stays open until it is answered.
 
 - Black-box tests live in the `blackbox` crate. That crate depends on no product crate, so it cannot reach inside: it starts the real `vibe` binary beside a real Postgres, drives it with commands and HTTP as different Users, and asserts on what an outsider can observe (a response, a command's output and exit code, an Operation log entry, a Change history row, a refusal's reason). Fixture Applications, hostile ones included, live there too.
 - Tests below that seam are allowed only where the spec's Testing Decisions name one (the Authorization decision as a pure function, the Request runner with a scripted Application, the SDK's type tests). The test agent still writes them first.
+
+### Decisions for the product owner
+
+Whatever needs the product owner's decision is an issue labelled `product-decision`, and nowhere else: not a list in a status message, not a note at the end of a ticket (the product owner's decision of 2026-11-23: they pick decisions up from the tracker when they have time).
+
+- **Only product decisions are asked**: what the product does and for whom, what is in a milestone, the order of the work, when a release is made. A technical choice (a bound, a setting, a dependency, how something is built) is the agent's: it is made, and recorded as "chosen by the agent" in the ADR, the contract or the ticket.
+- **The issue stands on its own.** It says what the question is in one sentence, the background somebody needs who has not followed the work, the options and what each means for the people who use the product, the default the work goes on with meanwhile, and what would have to change if the answer is another. One decision an issue, or one issue for the choices of one ADR, each of them a line to tick.
+- **The work does not wait** where a default can be taken and changed later: the default is taken, the issue names it, and the ticket is closed as usual. Where the choice is hard to reverse, the ticket stays open (above).
+- An answered issue is closed with what was decided, and the ADR, contract or ticket it touches is changed in the same commit.
 
 ### Git
 
