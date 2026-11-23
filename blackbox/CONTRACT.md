@@ -3273,3 +3273,137 @@ A test may measure the program's resident memory.
 - **Other ways the Application's code reaches the host with a value of its own size** (a printed line, a response's headers, timers, the natives of the runtime the platform does not serve): the tickets "Limits per request" and "No argument and no native of the runtime lets an Application stop the program", where what was read of them for this ticket is recorded.
 - **A share for each Application of the program's 256 MiB**: it is first come, as the open files of Storage are; the ticket "Resources and Grants in full".
 - The bounds are fixed numbers of the program; making them settable is the ticket "Limits per request".
+
+## Outbound calls (ticket: Outbound calls: one platform-wide list of hosts, every call logged)
+
+ADR 0020. An Application's code calls the outside with `fetch`, as code written for Workers does. Every such call is an operation: the host decides it from one list of hosts that the Platform administrators keep, makes the connection itself, and writes an Operation log entry. The list is empty in a new installation, so nothing leaves until an administrator says where to. This section replaces "Outbound `fetch` from Application code is refused (it rejects) until the ticket on outbound calls" ("The raw host interface").
+
+### The list
+
+One list for the installation, kept in the platform database. An entry is a host an Application may call:
+
+| Entry | Means |
+|---|---|
+| `api.example.com` | that name, on port 443 |
+| `api.example.com:8443` | that name, on that port (1 to 65535) |
+| `*.example.com` | every name that ends with `.example.com` (one label or more before it; not `example.com` itself), on port 443; `*.example.com:8443` likewise |
+| `203.0.113.7`, `[2001:db8::7]`, with or without a port | that address, called by its address |
+
+- A name is given in any case and is kept in lower case; a name with letters outside ASCII is kept and answered in its ASCII form (`xn--`). It is 1 to 253 bytes, of labels of 1 to 63 letters, digits and `-` (not first or last). A wildcard has at least two labels after `*.` (`*.com` is not taken). An entry is compared with a call's host and port exactly as kept: `api.example.com` does not allow `api.example.com:8443`, nor a name beneath it.
+- At most 1,000 entries.
+- `GET /v1/outbound-hosts`, by **anyone signed in**: `{ "hosts": [ { "host": "api.example.com", "added_by": "<user id>", "added_at": "<RFC 3339>" }, ... ] }`, in the order of `host`. The list is no secret inside the company: a Builder's Coding agent reads it to know what may be called.
+- `PUT /v1/outbound-hosts/<entry>`, by a Platform administrator (the entry percent-encoded as a path segment; no body is looked at): `200` with `{ "host", "added_by", "added_at", "changed": true }`; an entry already there: the same with `changed` false and who added it first. A 1,001st: `409` `too-many`.
+- `DELETE /v1/outbound-hosts/<entry>`, by a Platform administrator: `200` with `{ "host", "changed": true | false }` (false when it was not there).
+- Refused: not signed in `401`; not a Platform administrator `403` `not-an-administrator` (for `PUT` and `DELETE`, before anything else is looked at, as "Who is refused" of the administrators' API has it); an entry that is none of the table's `400` `malformed`, the message saying what an entry is; any other method `405`.
+- **A change takes effect for every call decided after its `200`**, in every Application, with nothing deployed again; calls under way are not cut. The program's log has `{"event":"outbound-host-added" | "outbound-host-removed","host","by"}`.
+- Each of the three is bounded as the administrators' requests are (10 seconds in the platform database, then `503` `unavailable`; "A write whose answer is lost" holds for the two writes: sent again, they answer `changed` false).
+
+### What Application code does
+
+```js
+const answer = await fetch("https://api.example.com/v1/items?since=5", {
+  method: "POST", headers: { authorization: "Bearer ..." }, body: JSON.stringify(item) });
+```
+
+- `fetch(input, init)` as the standard has it, with `method`, `headers`, `body` and `redirect` (`"follow"`, `"manual"`, `"error"`); a `Request` given as `input` is read for the same. It resolves with a `Response`: `status`, `statusText`, `headers`, `url` (the last address called), `redirected`, and a `body` that is a stream the host feeds as it comes from the other side, in chunks of at most 64 KiB. Nothing of an answer is in the Application's memory until its code reads it: `return fetch(url)` and `new Response(answer.body, ...)` pass the bytes from the other side to the client natively, as a stored file's body is passed ("Storage", "A file is a handle").
+- `body` is a string, bytes (`ArrayBuffer`, a view), a `ReadableStream`, `URLSearchParams`, `FormData`, a `Blob`, or nothing. A stream is sent as it is produced (chunked); `request.body` and a stored file's `body` given as `body` go from their source to the other side natively. The others are sent with their `content-length`.
+- **A refusal rejects.** Without the SDK the rejection is an `Error` with a property `refused`: `{ refusal: { reason, host }, fix }`, the same shape `env.VM.invoke` answers. With the SDK (`@vm/sdk` imported, as every Application made by `vibe new` has it) it is a `Refused` with that `refusal` and `fix`; one that escapes the handler is the `403` with `{ refusal, fix }`, as for any operation.
+- **A failure rejects** with an `Error` with a property `failure`: `{ kind, ... }`; with the SDK an `OperationFailed` (`kind`, `detail`). The kinds are below.
+- An answer of any status is an answer, not a failure: a `404` or a `500` of the other side resolves.
+- Called with no request in flight: refused `no-request`.
+
+### Who may call what
+
+Decided by the host when the call is made, and again for every redirect it follows. Checked in this order; the first that applies refuses:
+
+| Reason | When |
+|---|---|
+| `no-request` | No request in flight |
+| `not-https` | The address is not `https:` (also `http:`), has a user or a password in it, or is not an address at all |
+| `platform-itself` | The host is the installation's domain or a name beneath it (an Application calls another, or the API, through the front door of its own platform), whatever port |
+| `host-not-listed` | No entry of the list allows the host and port |
+| `address-not-allowed` | The host is, or its name resolves to, an address that is not of the public Internet (below) |
+| `log-unavailable` | The Operation log entry cannot be written |
+
+- `refusal` holds `reason` and `host` (the host and, when it is not 443, the port, as an entry would be written); for a redirect also `redirected_from` (the host that sent it). `fix` is a sentence for a Coding agent: for `host-not-listed`, that only a Platform administrator can allow a host, the command they run (`vibe admin outbound add <host>`), and that `vibe outbound` shows what is allowed now; for `address-not-allowed`, that the platform does not call addresses inside the company's network or the machine itself, whatever the list says.
+- **Addresses that are never called**, whatever the list says and also when a listed name resolves to one: loopback (`127.0.0.0/8`, `::1`), private (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `fc00::/7`), link-local (`169.254.0.0/16`, which holds the cloud's metadata address, and `fe80::/10`), the shared range `100.64.0.0/10`, `0.0.0.0/8` and `::`, multicast and reserved (`224.0.0.0/3`, `ff00::/8`), the ranges for documentation and benchmarks (`192.0.0.0/24`, `192.0.2.0/24`, `198.18.0.0/15`, `198.51.100.0/24`, `203.0.113.0/24`, `2001:db8::/32`), and an IPv6 address that carries an IPv4 one (`::ffff:0:0/96`, `64:ff9b::/96`, `2002::/16`), which is judged by the address it carries.
+- **A name is resolved by the host, once for a connection, and the connection is made to an address that was checked**: a name whose answer changes between the check and the connection is not a way round. When any address a name resolves to is one that is never called, the call is refused, even if another of its addresses is not.
+- **What the operator of the machine may open**: `vibe serve --outbound-private <range>` (an address or a range in CIDR form; at most 16 times) names addresses of the kinds above that may be called all the same, when the list allows the host. It is for an installation whose "outside" is partly inside (a gateway of the company's on `10.9.0.0/24`), it is set where the program is started and not by a Platform administrator, and without it nothing of the kinds above is ever called. A range that is not one: the program does not start, and says why. The program's `listening` record gains `"outbound_private": [ ... ]`.
+- A redirect (`301`, `302`, `303`, `307`, `308` with a `location`) is followed by the host when `redirect` is `"follow"` (as without it): to an `https:` address, decided as a call of its own, with an Operation log entry of its own. At most 5 are followed, then failure `limit` `redirects`. One that is refused rejects the whole `fetch` with that refusal. `authorization`, `cookie` and `proxy-authorization` are not sent on to another host or port. `303`, and `301` or `302` after a `POST`, go on as `GET` with no body; `307` and `308` send the method and the body again, which a body that was a stream cannot do: failure `body-not-replayable`. With `"manual"` the `3xx` is the answer; with `"error"` it is a failure `redirect`.
+
+### What goes over the wire
+
+- HTTP/1.1 over TLS 1.2 or 1.3, to the port of the address (443 without one). The other side's certificate is checked against the public authorities and those of `VIBE_CA_FILE` ("A company's own certificate authority"), for the host's name or address; a certificate that does not hold is failure `unreachable` (`why: "tls"`). No connection is kept for another call.
+- The request has the method, the path and the query as given, `host`, the headers the code set, and the body with its framing. The platform adds `user-agent: vibe` when the code set none, and nothing else: nothing of the User, the Application, the request or the installation is sent unless the code sends it. `host`, `connection`, `content-length`, `transfer-encoding`, `upgrade`, `te`, `trailer`, `keep-alive`, `expect` and `proxy-*` are the platform's to set: given by the code, they are dropped. No `accept-encoding` is added, so an answer is as the other side sent it; code that asks for an encoding decodes it.
+- Methods: `GET`, `HEAD`, `POST`, `PUT`, `PATCH`, `DELETE`, `OPTIONS`. Another: failure `malformed`.
+- An answer's status and headers are given to the code as sent, but for the framing headers (`connection`, `transfer-encoding`, `keep-alive`), which are not. A `101` or any `1xx` as the final answer is failure `unreachable` (`why: "protocol"`).
+
+### Failures
+
+`{ kind, ... }`, after the call was allowed and its entry written:
+
+| `kind` | When | Entry's `error` |
+|---|---|---|
+| `malformed` | The method is not one of the seven; a header's name or value cannot be sent; the address is longer than 8 KiB; the headers are more than 100 or 64 KiB together | (no entry: decided before the call is) |
+| `unreachable` (`why: "dns" \| "connect" \| "tls" \| "protocol"`) | The name does not resolve; no connection within its time or it is refused; the certificate does not hold; the other side does not speak HTTP/1.1 | `unreachable` |
+| `limit` (`limit: "time"`) | No answer's headers within 30 seconds of the decision | `time` |
+| `limit` (`limit: "redirects"`) | A sixth redirect | `redirects` |
+| `limit` (`limit: "headers"`) | The answer's headers are more than 100 or 64 KiB together | `headers` |
+| `body-not-replayable` | A `307` or `308` to a call whose body was a stream | `body-not-replayable` |
+| `redirect` | A redirect with `redirect: "error"` | `redirect` |
+| `body-failed` | The call's own body failed before its end (a stream of the code's own errored, the request's body failed) | `body-failed` |
+| `unavailable` | No place for the call within 5 seconds (below) | `unavailable` |
+
+- An answer's body that stops before its end (the other side went away, sent less than its `content-length`, no byte for 30 seconds, more than the bound) fails the stream the code reads, and a client it was being passed to sees the connection end without a clean end, as for any body ("What an Application is handed"). It is never ended as if whole.
+- A call ends with its request: when the request ends (its time, a disable, the client gone when the answer was being passed on), the connection is closed and what the program held for it is given back.
+
+### The Operation log
+
+- Every call, **and every redirect followed**, has one entry, written before a name is resolved or a connection made (so `log-unavailable` refuses, and nothing leaves), and completed when the answer's headers have come or the call has failed: `operation` is `fetch`; `resource` is null and `own_database` false; `actor` is `user`; `statement` is null; `rows` is null; `duration_ms` is the time to the answer's headers. Every entry gains **`host`**: for a `fetch`, the host called and its port when not 443, in lower case, as an entry of the list would be written; null for every other operation. Refused calls have theirs, with the `reason`. A `malformed` call and one with no address at all have none (they have their `host-call` record).
+- **Nothing else of the call is recorded, anywhere**: not the path, not the query, not a header, not the body, not the answer's status or body. (A path may hold a secret as well as a query may: the address of an incoming webhook does.) The program's log has the `host-call` record with `operation` `fetch` and the decision, and no more of the address than `host`.
+- `GET /v1/operation-log` takes `host=<host>` (an entry whose `host` is exactly this; 1 to 260 bytes, what an entry of the list or a host could be), combined with the others, and is indexed as the other filters are. `vibe admin operation-log --host <host>` passes it. In words, wherever entries are shown (the tool's `admin operation-log` and `local operation-log`, the Dashboard's Operation log), a `fetch` entry shows `→ <host>` where another shows its Resource.
+
+### Bounds
+
+- **Calls under way at once**: 8 for one request; the next waits its turn (64 may wait; a 73rd is `unavailable` at once). 256 in the program; a call that finds none free waits up to 5 seconds, then `unavailable`. A call is under way from its decision until its answer's body has been read to its end, cancelled, or passed to the client and sent, and in any case until its request ends.
+- **Time**: 10 seconds to resolve the name and make the connection, TLS included (`unreachable`, `why: "dns"` or `"connect"`); 30 seconds from the decision to the answer's headers (`limit` `time`); a body, in either direction, on which no byte moves for 30 seconds is failed. Everything ends with the request.
+- **Size**: an address of at most 8 KiB; at most 100 headers and 64 KiB of them, each way; a body of at most 5 GiB each way (past it the stream fails, `limit` `bytes`), never held whole: about 4 MiB of the program's memory for one call under way, whatever its bodies' length.
+- **Names**: the host resolves a name with the machine's resolver, within the 10 seconds; at most 16 addresses of a name are looked at.
+- The bounds of "A host call's arguments are bounded" do not apply to a `fetch`: its body is a body, and its address and headers have the bounds above.
+
+### The tool
+
+```
+vibe outbound [--json]
+vibe admin outbound add <host> [--json]
+vibe admin outbound remove <host> [--json]
+```
+
+- All three need a sign-in (`4`) and keep "The tool: Every command". `vibe outbound` prints the list: with `--json` the API's answer; in words one line an entry (`<host>   added by <user id> on <date>`), or, with none, that no host may be called and that a Platform administrator allows one with `vibe admin outbound add <host>`. `vibe --help` names it; `vibe admin --help` names `outbound`.
+- `add` and `remove` print the API's answer with `--json`; in words that Applications may now call `<host>` (or might already), or may no longer (or could not before), and that it holds from the next call on. An entry the API would not take is the tool's own exit code `2` before anything is asked. `not-an-administrator`: exit code `3`.
+- `add` asks for no confirmation; it says in words, for a wildcard, that every name beneath it is allowed.
+
+### The Dashboard
+
+- `GET /admin/outbound`, for Platform administrators (as every page of "The Dashboard for Platform administrators": who may, the way in, the navigation, the theme): the list, one row an entry (`[data-vm-outbound-host="<host>"]`, with who added it and when), and with none an empty state that says nothing can be called and gives the command. It is read-only in this ticket: no form (the ticket "The Dashboard for Platform administrators: ... Resources and Grants, in the browser" holds the forms).
+- The Operation log page shows a `fetch` entry's host as above and takes `host` among its filters.
+
+### The local run
+
+- In `vibe dev` and `vibe request` the list is the project's own: `vibe.dev.json` may hold `"outbound": { "hosts": [ "<entry>", ... ], "private": [ "<range>", ... ] }` (both optional; entries and ranges as above; at most 1,000 and 16). Without it nothing may be called, and the refusal's `fix` says that locally the list is `outbound.hosts` in `vibe.dev.json`, and that in an installation it is the Platform administrators' (`vibe outbound`). A file whose `outbound` is not that shape: `test-users-file`, as any other fault of the file.
+- Everything else is the same: the decision and its order (`platform-itself` is the local run's own address), the addresses never called but for `private`, the entries in `vibe local operation-log` with their `host`, the bounds. A local run really calls the hosts its file allows: the file is the Builder's, on the Builder's machine.
+- `vibe pull` does not write `outbound`, and `vibe check` and `vibe deploy` say nothing of it: an Application does not declare the hosts it calls (the spec: one list for the platform in Milestone 1).
+
+### The instruction file
+
+`AGENTS.md` of a new project (`vibe new`) says, in one short paragraph: that `fetch` to the outside is allowed only to hosts the Platform administrators listed, over `https`; that `vibe outbound` shows them; that a call elsewhere rejects with `Refused` and the reason `host-not-listed`, which the agent reports to the Builder rather than works around; and how to allow a host for the local run.
+
+### What this does not close
+
+- **An egress proxy** (a company that lets nothing out but through one), **client certificates**, HTTP/2, WebSockets to the outside, and connections kept for a next call.
+- **Giving a call up from the code** (`signal`, `AbortController`): the runtime has neither. A call ends by its own bounds and with its request.
+- **Rules per Application** (this Application may call that host, another may not), **secrets** the platform keeps and adds to a call so that the code never holds them, and named HTTP clients: Milestone 2 (the spec, "Out of Scope"). In Milestone 1 a credential for the outside is in the Application's own code or database, which its Contributors can read.
+- **What is sent to a listed host** is the Application's affair: the list says where data may go, not which data. An administrator who lists a host that takes uploads from anyone has opened that door to every Application.
+- **A share for each Application** of the program's 256 calls: first come; the ticket "Resources and Grants in full".
+- A listed host that itself fetches an address given to it (an open relay) reaches where the platform would not: the list is the administrators' judgement of the host.
+- DNS answers are the resolver's: the platform checks the addresses it is given and connects to those, and does not validate DNSSEC.
