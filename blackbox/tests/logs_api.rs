@@ -375,15 +375,18 @@ fn a_nul_character_is_kept_as_the_replacement_character_and_the_programs_log_has
 fn a_request_the_platform_answers_before_the_code_is_given_it_has_no_entry() {
     let own = board(0);
     let api = own.vm.api_as(&alice());
-    // A body over the platform's 16 MiB.
-    let big = vec![b'x'; 16 * 1024 * 1024 + 1];
+    // A request whose stated content-length is over the platform's bound for
+    // a request's body (5,368,774,656 bytes: CONTRACT.md, "What an
+    // Application is handed"). Only the head is sent: 5 GiB of body is never
+    // sent, and a body whose stated length is over the bound is answered
+    // before a byte of it is read.
     let refused = own
         .vm
         .request("board", "/")
         .as_user(&bob())
         .method("POST")
         .header("content-type", "application/json")
-        .body(&big)
+        .declare_length(5_368_774_657)
         .timeout(Duration::from_secs(60))
         .send();
     refused.expect_status(413);

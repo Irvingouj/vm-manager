@@ -122,7 +122,12 @@
 //! - [`storage`] is what the tests of Storage share: a storage root of the
 //!   test's own, a program started on it, Storage Resources registered on
 //!   its directories, the five operations through the raw fixture, and the
-//!   host's directory looked at from outside the program.
+//!   host's directory looked at from outside the program;
+//! - [`body`] is what the tests of a request's and a response's body share:
+//!   a raw HTTP/1.1 client that holds bytes back, sends them late or never,
+//!   reads them slowly and sees a connection closed short of its
+//!   `content-length`, beside the program's resident memory from `/proc` and
+//!   a streaming SHA-256.
 //!
 //! Every wait has a timeout, so a failing test fails within seconds and
 //! never hangs. Each test starts its own program on its own port, so tests
@@ -138,6 +143,7 @@
 pub mod admin;
 pub mod admin_pages;
 pub mod api;
+pub mod body;
 pub mod browser;
 pub mod changed_outside;
 pub mod connection;
