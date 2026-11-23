@@ -350,6 +350,69 @@ fn a_307_and_a_308_send_the_method_and_the_body_again_when_it_can_be_sent_again(
             "{}",
             second.describe()
         );
+        // A string whose JSON text is well within 64 KiB travelled with the
+        // call and is sent again (the boundary itself, `65534` letters and
+        // the two quotes, is not pinned: how "JSON text" counts is the
+        // implementation's).
+        let text = "b".repeat(60 * 1024);
+        let before = b.requests().len();
+        let report = o.call(&json!({
+            "url": a.url("/first"), "method": "PUT",
+            "body": { "kind": "string", "text": text },
+        }));
+        assert_resolved(&report, 200, &format!("a {status} after a PUT with 60 KiB"));
+        let second = &b.wait_requests(before + 1, SOON)[before];
+        assert_eq!(second.method, "PUT", "{}", second.describe());
+        assert_eq!(
+            second.body_sha256,
+            sha256(text.as_bytes()),
+            "{status}: expected the 60 KiB string sent again whole: {}",
+            second.describe()
+        );
+    }
+}
+
+#[test]
+fn a_307_and_a_308_of_a_call_whose_body_was_bytes_or_a_string_over_64_kib_fail_body_not_replayable()
+{
+    let (o, a, b) = two();
+    let long = "c".repeat(100 * 1024);
+    let bodies = [
+        ("bytes of 1 KiB", json!({ "kind": "bytes", "length": 1024 })),
+        (
+            "an ArrayBuffer of 1 KiB",
+            json!({ "kind": "arraybuffer", "length": 1024 }),
+        ),
+        (
+            "a string of 100 KiB",
+            json!({ "kind": "string", "text": long }),
+        ),
+    ];
+    for status in [307, 308] {
+        a.always(Reply::redirect(status, &b.url("/second")));
+        for (what, body) in &bodies {
+            let before = b.requests().len();
+            let response = o.call_response(&json!({
+                "url": a.url("/first"), "method": "POST", "body": body,
+            }));
+            assert_failure(
+                &o.report(&response),
+                "body-not-replayable",
+                &format!("{status} after {what}"),
+            );
+            assert_eq!(
+                b.requests().len(),
+                before,
+                "{status} after {what}: expected nothing sent on"
+            );
+            let entries = o.entries_of(&response);
+            let last = entries.last().unwrap();
+            assert_eq!(
+                (last["outcome"].as_str(), last["error"].as_str()),
+                (Some("failed"), Some("body-not-replayable")),
+                "{status} after {what}: {entries:?}"
+            );
+        }
     }
 }
 

@@ -257,12 +257,44 @@ function refusedResponse(error) {
   });
 }
 
+// The mark of the wrapper below, so that a second `serve` (a bundle loaded
+// twice) does not wrap the wrapper.
+const FETCH_WRAPPED = Symbol.for("vm.sdk.fetch");
+
+/**
+ * `fetch` of the platform, its rejections made the SDK's: a refusal
+ * (`error.refused`, as the platform's glue leaves it) is a `Refused`, a
+ * failure (`error.failure`) an `OperationFailed`. Every other rejection, and
+ * the `Response` of an allowed call, is left as it is.
+ */
+function wrapFetch() {
+  const original = globalThis.fetch;
+  if (typeof original !== "function" || original[FETCH_WRAPPED] === true) return;
+  const wrapped = function fetch(input, init) {
+    return Reflect.apply(original, globalThis, [input, init]).then(undefined, (error) => {
+      if (error !== null && typeof error === "object") {
+        if (error.refused !== undefined && error.refused !== null) throw refusedOf(error.refused);
+        if (error.failure !== undefined && error.failure !== null) throw failedOf(error.failure);
+      }
+      throw error;
+    });
+  };
+  Object.defineProperty(wrapped, FETCH_WRAPPED, { value: true });
+  Object.defineProperty(globalThis, "fetch", {
+    value: wrapped,
+    writable: true,
+    enumerable: false,
+    configurable: true,
+  });
+}
+
 /**
  * The handler the platform runs: `app` is what `defineApp` gave (anything
  * with `fetch(request, ctx)`), `structures` the own database's schema and
  * each shared database's schema with its relations, by Resource name.
  */
 export function serve(app, structures) {
+  wrapFetch();
   const all = freeze({ own: structures?.own ?? {}, shared: structures?.shared ?? {} });
   // What manifest.ts declares, read once: a transaction through a handle
   // declared at `read` is begun read-only.

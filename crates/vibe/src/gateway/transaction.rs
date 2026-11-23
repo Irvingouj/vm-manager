@@ -397,7 +397,7 @@ impl Opened {
             resource: self.resource_name(),
             actor: actor_name(self.actor),
             operation,
-            statement: operation,
+            statement: Some(operation),
             transaction,
             host: None,
         }

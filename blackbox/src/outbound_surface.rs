@@ -289,6 +289,7 @@ struct ProxyState {
     first_bytes: std::sync::Mutex<Vec<String>>,
     held: std::sync::atomic::AtomicUsize,
     released: std::sync::atomic::AtomicBool,
+    failed: std::sync::atomic::AtomicBool,
     stopped: std::sync::atomic::AtomicBool,
 }
 
@@ -348,6 +349,14 @@ impl DbProxy {
     /// How many connections are being held.
     pub fn held(&self) -> usize {
         self.state.held.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Lets the held connection fail: what was held is never delivered, and
+    /// both ends of the connection to the database are closed.
+    pub fn fail(&self) {
+        self.state
+            .failed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Delivers what was held.
@@ -418,6 +427,11 @@ fn proxy_pair(
         let mut held: Option<Vec<u8>> = None;
         let mut ended = false;
         loop {
+            if held.is_some() && state.failed.load(SeqCst) {
+                state.held.fetch_sub(1, SeqCst);
+                drop(server_out.shutdown(Shutdown::Both));
+                return;
+            }
             if let Some(buffer) = held.as_mut() {
                 if state.released.load(SeqCst) {
                     drop(server_out.write_all(buffer));

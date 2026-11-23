@@ -22,7 +22,11 @@
 //   read (one the host itself feeds by its id, or one the glue pumps the
 //   code's own stream or bytes into, locked from the call on), and a get's
 //   answer names the stream the host feeds, which the glue turns into the
-//   ReadableStream the code reads.
+//   ReadableStream the code reads;
+// - makes `fetch` the platform's own (CONTRACT.md, "Outbound calls"): it
+//   hands the host the call (binding __vm_fetch) and turns the host's answer
+//   into the Response, or the rejection (`refused` or `failure`), the code
+//   sees; a body goes as a put's does.
 //
 // The identity is the host's: nothing here decides who is asking. A
 // hostile Application that breaks this glue fools only itself.
@@ -494,6 +498,205 @@ const __vm_platform_glue_5c1e = (function (global) {
     }
   };
   defineProperty(global, '__nativeBindingInvoke', { value: invokeThrough, writable: true, enumerable: false, configurable: true });
+  // Outbound calls (CONTRACT.md, "Outbound calls"): `fetch` is the
+  // platform's. The glue reads what the code gave, hands the host the
+  // address, the method, the headers and the body (a string within 64 KiB
+  // goes with the arguments; every other body is a stream the host reads,
+  // as a put's is), and turns the host's answer into the `Response` or the
+  // rejection the code sees. Nothing here decides who may call what: every
+  // call reaches the host, which decides and logs it.
+  const FETCH = '__vm_fetch';
+  const nativeNormalize = global.__normalizeFetchInput;
+  const nativeEncodeBody = global.__encodeFetchBody;
+  const RequestCtor = global.Request;
+  const URLSearchParamsCtor = global.URLSearchParams;
+  const FormDataCtor = global.FormData;
+  const BlobCtor = global.Blob;
+  const arrayIsArray = Array.isArray;
+  const objectKeys = Object.keys;
+  // The bytes of a string as UTF-8 (a lone surrogate is U+FFFD, three).
+  const utf8Length = function (text) {
+    let size = 0;
+    const length = text.length;
+    for (let i = 0; i < length; i++) {
+      const code = text.charCodeAt(i);
+      if (code < 0x80) {
+        size += 1;
+      } else if (code < 0x800) {
+        size += 2;
+      } else if (code >= 0xd800 && code <= 0xdbff) {
+        const next = i + 1 < length ? text.charCodeAt(i + 1) : 0;
+        if (next >= 0xdc00 && next <= 0xdfff) {
+          size += 4;
+          i += 1;
+        } else {
+          size += 3;
+        }
+      } else {
+        size += 3;
+      }
+    }
+    return size;
+  };
+  // The headers the code gave as the host takes them: a list of
+  // [name, value] strings.
+  const headerPairs = function (headers) {
+    const pairs = [];
+    if (headers === null || headers === undefined) return pairs;
+    if (arrayIsArray(headers)) {
+      for (let i = 0; i < headers.length; i++) {
+        const pair = headers[i];
+        pairs.push([StringCtor(pair[0]), StringCtor(pair[1])]);
+      }
+    } else if (typeof headers === 'object') {
+      const names = objectKeys(headers);
+      for (let i = 0; i < names.length; i++) {
+        pairs.push([names[i], StringCtor(headers[names[i]])]);
+      }
+    }
+    return pairs;
+  };
+  const refusedError = function (refused) {
+    let reason = 'refused';
+    try {
+      reason = refused.refusal.reason;
+    } catch (e) {
+      // The reason is what the host said, whatever shape it came in.
+    }
+    const error = new ErrorCtor('fetch refused: ' + reason);
+    error.refused = refused;
+    return error;
+  };
+  const failedError = function (failed) {
+    let kind = 'failed';
+    try {
+      kind = failed.kind;
+    } catch (e) {
+      // The kind is what the host said, whatever shape it came in.
+    }
+    const error = new ErrorCtor('fetch failed: ' + kind);
+    error.failure = failed;
+    return error;
+  };
+  // The `Response` an allowed call resolves with: the body is the stream
+  // the host feeds (none for a status or a method that has none).
+  const responseOf = function (ok) {
+    const body = ok.body !== null && typeof ok.body === 'object' && typeof ok.body.$stream === 'number' ? nativeCreateStream(ok.body.$stream) : null;
+    const response = new ResponseCtor(body, { status: ok.status, statusText: ok.statusText, headers: ok.headers });
+    defineProperty(response, 'url', { value: ok.url, writable: false, enumerable: true, configurable: true });
+    defineProperty(response, 'redirected', { value: ok.redirected === true, writable: false, enumerable: true, configurable: true });
+    return response;
+  };
+  const fetchBody = function (body, gate) {
+    const marked = putBody(body, gate);
+    if (typeof body === 'string' && marked !== null && typeof marked === 'object' && typeof marked.$pumped === 'number') {
+      marked.$length = utf8Length(body);
+    }
+    return marked;
+  };
+  // A call made with these arguments: answered by the host, once.
+  const fetchCall = function (spec, resolve, reject) {
+    const gate = { over: false, id: null, stream: null };
+    const args = { url: spec.url, method: spec.method, headers: spec.headers };
+    if (spec.redirect !== undefined) args.redirect = spec.redirect;
+    if (spec.body !== undefined && spec.body !== null) {
+      const marked = fetchBody(spec.body, gate);
+      if (marked === undefined) {
+        reject(new TypeErrorCtor('fetch: the body is none of a string, bytes, a stream, URLSearchParams, FormData or a Blob'));
+        return;
+      }
+      if (marked !== null && typeof marked === 'object' && (marked.$locked === true || marked.$closed === true)) {
+        reject(new TypeErrorCtor('fetch: the body is a stream that was read or is locked'));
+        return;
+      }
+      args.body = marked;
+    }
+    const answered = function (answer) {
+      if (answer !== null && typeof answer === 'object' && answer.ok !== null && typeof answer.ok === 'object') {
+        let response;
+        try {
+          response = responseOf(answer.ok);
+        } catch (e) {
+          release(gate);
+          reject(failedError({ kind: 'unreachable', why: 'protocol' }));
+          return;
+        }
+        resolve(response);
+        return;
+      }
+      release(gate);
+      if (answer !== null && typeof answer === 'object' && answer.refused !== undefined && answer.refused !== null) {
+        reject(refusedError(answer.refused));
+      } else if (answer !== null && typeof answer === 'object' && answer.error !== undefined && answer.error !== null) {
+        reject(failedError(answer.error));
+      } else {
+        reject(new ErrorCtor('fetch: the platform gave no answer'));
+      }
+    };
+    try {
+      nativeInvoke(FETCH, 'fetch', args, answered, function (error) {
+        release(gate);
+        reject(error);
+      });
+    } catch (error) {
+      release(gate);
+      reject(error);
+    }
+  };
+  const fetchThrough = function (input, init) {
+    return new PromiseCtor(function (resolve, reject) {
+      let spec;
+      try {
+        const options = init === undefined || init === null ? {} : init;
+        const normalized = nativeNormalize(input, options);
+        let redirect = options.redirect;
+        if (redirect === undefined && RequestCtor !== undefined && input instanceof RequestCtor) redirect = input.redirect;
+        let body = normalized.body;
+        if (body !== null && body !== undefined && typeof body !== 'object' && typeof body !== 'string') body = StringCtor(body);
+        spec = {
+          url: StringCtor(normalized.url),
+          method: StringCtor(normalized.method),
+          headers: headerPairs(normalized.headers),
+          redirect: redirect === undefined || redirect === null ? undefined : StringCtor(redirect),
+          body: body,
+        };
+      } catch (error) {
+        reject(error);
+        return;
+      }
+      const body = spec.body;
+      const encoded =
+        body !== null &&
+        typeof body === 'object' &&
+        ((URLSearchParamsCtor !== undefined && body instanceof URLSearchParamsCtor) ||
+          (FormDataCtor !== undefined && body instanceof FormDataCtor) ||
+          (BlobCtor !== undefined && body instanceof BlobCtor));
+      if (!encoded) {
+        fetchCall(spec, resolve, reject);
+        return;
+      }
+      // Bodies the runtime knows how to write as bytes, and the content
+      // type they imply when the code set none.
+      const given = {};
+      const names = spec.headers;
+      for (let i = 0; i < names.length; i++) given[names[i][0]] = names[i][1];
+      apply(promiseThen, apply(promiseResolve, PromiseCtor, [nativeEncodeBody(body, given)]), [
+        function (bytes) {
+          const type = given['Content-Type'];
+          let has = false;
+          for (let i = 0; i < names.length; i++) {
+            if (names[i][0].toLowerCase() === 'content-type') has = true;
+          }
+          if (!has && typeof type === 'string') names.push(['content-type', type]);
+          if (!has && typeof type !== 'string' && BlobCtor !== undefined && body instanceof BlobCtor && typeof body.type === 'string' && body.type !== '') names.push(['content-type', body.type]);
+          spec.body = bytes;
+          fetchCall(spec, resolve, reject);
+        },
+        reject,
+      ]);
+    });
+  };
+  defineProperty(global, 'fetch', { value: fetchThrough, writable: true, enumerable: false, configurable: true });
   const serve = function (request, runtimeContext) {
     return new PromiseCtor(function (resolve) {
       const fail = function (error) {

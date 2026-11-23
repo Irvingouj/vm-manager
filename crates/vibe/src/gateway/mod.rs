@@ -81,11 +81,13 @@ use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio::task::JoinSet;
 
 mod calls;
+mod fetch;
 mod storage;
 mod transaction;
 
 pub(crate) use calls::{Guard, Took};
 pub use calls::{ProgramCalls, RequestCalls, WORD_BYTES, WORD_CALLS, WORD_PROGRAM};
+pub use fetch::FetchDecision;
 pub use transaction::{CAP, PER_REQUEST, Transactions};
 
 use crate::check;
@@ -490,6 +492,21 @@ pub trait Gateway: Send + Sync {
     fn held_calls(&self) -> Option<Arc<ProgramCalls>> {
         None
     }
+
+    /// A `fetch` of Application code (blackbox/CONTRACT.md, "Outbound
+    /// calls"), decided now and run in a task. A gateway with no outbound
+    /// calls refuses it as an operation it does not know.
+    fn fetch(&self, _in_flight: &Arc<InFlight>, active: bool, _args: &Value) -> FetchDecision {
+        let refusal = if active {
+            Refusal::unknown_operation("fetch")
+        } else {
+            Refusal::no_request()
+        };
+        FetchDecision {
+            decision: Decision::refused(&refusal),
+            host: None,
+        }
+    }
 }
 
 /// Operations under way at once; past it an operation waits to start.
@@ -533,20 +550,9 @@ pub struct PlatformGateway {
     storage: Arc<crate::storage::Storage>,
     own: Arc<OwnDatabases>,
     log: Arc<OperationLog>,
-    /// The hosts Applications may call, from memory; the next stage's
-    /// `fetch` decides with it.
-    #[expect(
-        dead_code,
-        reason = "the fetch operation, the next stage, decides every call with it"
-    )]
-    outbound: Arc<crate::outbound::Outbound>,
-    /// The ranges the operator of the machine opened; the next stage's
-    /// `fetch` asks it about every address it would connect to.
-    #[expect(
-        dead_code,
-        reason = "the fetch operation, the next stage, answers addresses with it"
-    )]
-    outbound_private: crate::outbound::PrivateRanges,
+    /// What outbound calls are decided with: the list of hosts, from
+    /// memory, the ranges the operator opened, and the program's places.
+    calls: Arc<fetch::Calls>,
     operations: Arc<Operations>,
     /// The bytes of the host calls not yet answered of all requests
     /// (blackbox/CONTRACT.md, "A host call's arguments are bounded"): the
@@ -557,6 +563,10 @@ pub struct PlatformGateway {
 impl PlatformGateway {
     /// `runtime` is where operations run: the program's own, where the
     /// platform database's and the shared databases' connections live.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the parts of one gateway, each named: what it works on and what outbound calls are decided with"
+    )]
     pub fn new(
         resources: Arc<Resources>,
         storage: Arc<crate::storage::Storage>,
@@ -564,6 +574,7 @@ impl PlatformGateway {
         log: Arc<OperationLog>,
         outbound: Arc<crate::outbound::Outbound>,
         outbound_private: crate::outbound::PrivateRanges,
+        itself: crate::outbound::Itself,
         runtime: Handle,
     ) -> Self {
         Self {
@@ -571,8 +582,7 @@ impl PlatformGateway {
             storage,
             own,
             log,
-            outbound,
-            outbound_private,
+            calls: Arc::new(fetch::Calls::new(outbound, outbound_private, itself)),
             operations: Arc::new(Operations {
                 runtime,
                 tasks: Mutex::new(JoinSet::new()),
@@ -1171,6 +1181,10 @@ impl Gateway for PlatformGateway {
     fn held_calls(&self) -> Option<Arc<ProgramCalls>> {
         Some(Arc::clone(&self.held))
     }
+
+    fn fetch(&self, in_flight: &Arc<InFlight>, active: bool, args: &Value) -> FetchDecision {
+        self.fetch_call(in_flight, active, args)
+    }
 }
 
 /// An operation on a database.
@@ -1548,7 +1562,7 @@ impl Work {
             resource: self.resource_name(),
             actor: actor_name(self.actor),
             operation: self.kind.name(),
-            statement: &self.statement,
+            statement: Some(&self.statement),
             transaction: self.transaction.as_deref(),
             host: None,
         }

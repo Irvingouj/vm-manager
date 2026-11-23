@@ -17,11 +17,32 @@
 //! - [`PrivateRanges`]: the ranges `vibe serve --outbound-private` opens,
 //!   parsed once, asked with [`PrivateRanges::contains`].
 
+pub mod address;
 mod entry;
+pub mod limits;
 mod private;
+pub mod request;
+pub mod target;
+pub mod wire;
 
 pub use entry::{Entry, EntryProblem, MAX_FILTER_BYTES, problem_words};
+pub use limits::{Program, Turns};
 pub use private::PrivateRanges;
+
+/// What the installation's own address is, for the refusal
+/// `platform-itself`, and whose list this is.
+#[derive(Clone, Debug)]
+pub struct Itself {
+    /// The installation's domain: it and the names beneath it are the
+    /// platform's own.
+    pub domain: Arc<str>,
+    /// Whether the domain itself is the platform's own (not in the local
+    /// run, where only the names beneath `localhost` are).
+    pub bare: bool,
+    /// The local run: its list is `outbound` of `vibe.dev.json`, which the
+    /// refusal's `fix` says.
+    pub local: bool,
+}
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, PoisonError, RwLock};
@@ -163,6 +184,39 @@ pub struct Outbound {
     read_back: std::sync::Mutex<ReadBack>,
 }
 
+/// A write of the list that has not been settled: dropped before it was
+/// (the administrator's connection closed), it takes the entry out of memory
+/// and asks for the table to be read back, as a write whose outcome is not
+/// known does.
+struct Unsettled<'a> {
+    outbound: &'a Arc<Outbound>,
+    text: &'a str,
+    armed: bool,
+}
+
+impl<'a> Unsettled<'a> {
+    fn new(outbound: &'a Arc<Outbound>, text: &'a str) -> Self {
+        Self {
+            outbound,
+            text,
+            armed: true,
+        }
+    }
+
+    fn settled(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for Unsettled<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.outbound.forget(self.text);
+            self.outbound.read_back_later();
+        }
+    }
+}
+
 /// The read-back of the table after a write whose outcome is unknown: the
 /// request already made of it, and the task that serves every request.
 #[derive(Default)]
@@ -240,6 +294,11 @@ impl Outbound {
         // The statements below borrow the text while the transaction runs:
         // the entry itself is lent for this call only.
         let text = entry.text();
+        // Until the write is settled, a giving up (the 10 seconds, or the
+        // administrator's connection closing) takes the entry out of memory
+        // and has the table read back.
+        self.ensure_read_back();
+        let mut unsettled = Unsettled::new(self, text);
         let written = tokio::time::timeout(WRITE_TIME, async {
             let _turn = self.turn.lock().await;
             match self.insert_row(text, by).await {
@@ -284,16 +343,19 @@ impl Outbound {
                 if matches!(answered, Err(AddProblem::Database(_))) {
                     self.read_back_later();
                 }
+                unsettled.settled();
                 answered
             }
             Err(_) => {
                 // The future was dropped, its turn with it: whether the
-                // statement was sent, the entry is not allowed now.
-                {
-                    let _turn = self.turn.lock().await;
-                    self.forget(text);
-                }
+                // statement was sent, the entry is not allowed now. No
+                // turn is waited for here (a wait with no end): the entry
+                // is taken out of memory as it is, and the read-back,
+                // which does take the turn, makes memory what the table
+                // is, whatever a write that came meanwhile did.
+                self.forget(text);
                 self.read_back_later();
+                unsettled.settled();
                 Err(AddProblem::Database(DbError::timed_out(
                     "adding a host to the outbound list",
                     WRITE_TIME,
@@ -310,6 +372,8 @@ impl Outbound {
     /// memory and has the table read back, whichever way the `DELETE` went.
     pub async fn remove(self: &Arc<Self>, entry: &Entry) -> Result<Removed, DbError> {
         let text = entry.text();
+        self.ensure_read_back();
+        let mut unsettled = Unsettled::new(self, text);
         let written = tokio::time::timeout(WRITE_TIME, async {
             let _turn = self.turn.lock().await;
             // Out before the statement: a removal in doubt never allows it.
@@ -330,16 +394,16 @@ impl Outbound {
                 if answered.is_err() {
                     self.read_back_later();
                 }
+                unsettled.settled();
                 answered
             }
             Err(_) => {
                 // The future may have been dropped before the entry was
-                // taken out: take it out now, then read the table back.
-                {
-                    let _turn = self.turn.lock().await;
-                    self.forget(text);
-                }
+                // taken out: take it out now, with no wait for the turn,
+                // then read the table back (which takes it).
+                self.forget(text);
                 self.read_back_later();
+                unsettled.settled();
                 Err(DbError::timed_out(
                     "removing a host from the outbound list",
                     WRITE_TIME,
@@ -364,12 +428,12 @@ impl Outbound {
             .insert(kept);
     }
 
-    /// Asks the one read-back task to read the whole table into memory,
-    /// starting it the first time. Asked again while it runs, the task reads
-    /// once more after the attempt under way: a call to this made after an
-    /// entry was forgotten under the turn is served by a read that starts
-    /// after that (the read-back takes the turn too).
-    fn read_back_later(self: &Arc<Self>) {
+    /// Starts the one read-back task if it is not started yet. Called on
+    /// entering `add` and `remove` (inside the runtime), so that asking for
+    /// a read-back never spawns: a guard dropped anywhere only signals. The
+    /// task's handle is held in `read_back.task`, and ended when the
+    /// [`Outbound`] is dropped.
+    fn ensure_read_back(self: &Arc<Self>) {
         let mut read_back = self
             .read_back
             .lock()
@@ -395,6 +459,19 @@ impl Outbound {
             }));
             read_back.ask = Some(ask);
         }
+    }
+
+    /// Asks the one read-back task to read the whole table into memory.
+    /// Asked again while it runs, the task reads once more after the
+    /// attempt under way: a call to this made after an entry was forgotten
+    /// is served by a read that starts after that (the read-back takes the
+    /// turn too). It only signals (a channel of one): it spawns nothing and
+    /// may be called from a `Drop` in any context.
+    fn read_back_later(&self) {
+        let read_back = self
+            .read_back
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         if let Some(ask) = &read_back.ask {
             // A full channel already holds a request the task reads after
             // its attempt under way, which began after the last forget.

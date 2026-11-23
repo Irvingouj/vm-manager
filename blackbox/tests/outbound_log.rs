@@ -160,6 +160,11 @@ fn nothing_of_the_path_the_query_a_header_the_body_or_the_answer_is_recorded_any
     let other = o.origin();
     o.allow(&other.host());
     let landing = other.url("/redirect-landing-marker-LLL?q=landing-query-marker-MMM");
+    other.always(
+        Reply::new(418)
+            .header("x-answer", "answer-header-marker-XXX")
+            .body(b"answer-body-marker-AAA"),
+    );
     origin.script(move |seen| {
         if seen.path().contains("redirect") {
             Reply::redirect(307, &landing)

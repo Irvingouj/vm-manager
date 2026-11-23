@@ -566,7 +566,7 @@ impl StorageWork {
             resource: self.resource_name(),
             actor: actor_name(self.actor),
             operation: self.op.name(),
-            statement: &self.statement,
+            statement: Some(&self.statement),
             transaction: None,
             host: None,
         }

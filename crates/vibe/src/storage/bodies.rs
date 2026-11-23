@@ -237,6 +237,28 @@ impl Bodies {
         held.push((id, Held { task, length }));
     }
 
+    /// Whether the pump of the body `id` is still held here: the code holds
+    /// the body. A body given to a response to be sent is not (its pump was
+    /// taken over), nor one that ended.
+    pub fn holds(&self, id: u64) -> bool {
+        self.held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .any(|(held, _)| *held == id)
+    }
+
+    /// The size the pump of the body `id` was held with, when it is held
+    /// and one was given (a stored file's body: its size).
+    pub fn length_of(&self, id: u64) -> Option<u64> {
+        self.held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .find(|(held, _)| *held == id)
+            .and_then(|(_, held)| held.length)
+    }
+
     /// The pump of the body `id` has ended: its entry goes, and with it the
     /// handle of a task that has ended — dropping it ends a task that is
     /// returning in this very poll, and there is nothing left in it to end.

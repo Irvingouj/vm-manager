@@ -380,7 +380,18 @@ fn run(serve: &Serve) -> Result<(), String> {
             usage_writer,
             storage,
             ..
-        } = Platform::open(&address, limits, storage_root, outbound_private).await.map_err(|error| {
+        } = Platform::open(
+            &address,
+            limits,
+            storage_root,
+            outbound_private,
+            vibe::outbound::Itself {
+                domain: Arc::from(domain.as_str()),
+                bare: true,
+                local: false,
+            },
+        )
+        .await.map_err(|error| {
             if let Some(found) = &error.unsupported_version {
                 log::record(
                     "postgres-version-unsupported",

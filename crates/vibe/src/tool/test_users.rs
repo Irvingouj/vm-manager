@@ -179,6 +179,11 @@ pub struct TestUsersFile {
     pub whole: Json,
     pub users: Vec<TestUser>,
     pub grants: Vec<TestGrant>,
+    /// `outbound.hosts`: the hosts a local call may go to, as entries of
+    /// the list.
+    pub outbound_hosts: Vec<String>,
+    /// `outbound.private`: the ranges the local run opens, as given.
+    pub outbound_private: Vec<String>,
 }
 
 /// The file of `project`: `None` when it is not there, else the file as
@@ -356,11 +361,65 @@ fn checked(whole: Json) -> Result<TestUsersFile, String> {
             access: access.to_owned(),
         });
     }
+    let (outbound_hosts, outbound_private) = outbound_of(whole.get("outbound"))?;
     Ok(TestUsersFile {
         whole,
         users: read_users,
         grants: read_grants,
+        outbound_hosts,
+        outbound_private,
     })
+}
+
+/// `outbound` of the file (blackbox/CONTRACT.md, "Outbound calls: The local
+/// run"): `{ "hosts": [entries], "private": [ranges] }`, both optional, at
+/// most 1,000 entries and 16 ranges, each as the list and the option take
+/// them. What is wrong, where.
+fn outbound_of(value: Option<&Json>) -> Result<(Vec<String>, Vec<String>), String> {
+    let Some(value) = value else {
+        return Ok((Vec::new(), Vec::new()));
+    };
+    if !matches!(value, Json::Object(_)) {
+        return Err(
+            "has `outbound` that is not an object: { \"hosts\": [...], \"private\": [...] }".into(),
+        );
+    }
+    let list = |key: &str, most: usize| -> Result<Vec<String>, String> {
+        let items = match value.get(key) {
+            None => return Ok(Vec::new()),
+            Some(Json::Array(items)) => items,
+            Some(_) => return Err(format!("has `outbound.{key}` that is not a list of text")),
+        };
+        if items.len() > most {
+            return Err(format!(
+                "has `outbound.{key}` with more than {most} entries"
+            ));
+        }
+        let mut texts = Vec::with_capacity(items.len());
+        for (index, item) in items.iter().enumerate() {
+            match item {
+                Json::String(text) => texts.push(text.clone()),
+                _ => return Err(format!("has `outbound.{key}[{index}]` that is not text")),
+            }
+        }
+        Ok(texts)
+    };
+    let hosts = list("hosts", crate::outbound::MOST)?;
+    for (index, host) in hosts.iter().enumerate() {
+        if let Err(problem) = crate::outbound::Entry::parse(host) {
+            return Err(format!(
+                "has `outbound.hosts[{index}]` that is not a host the list takes ({})",
+                crate::outbound::problem_words(problem)
+            ));
+        }
+    }
+    let private = list("private", 16)?;
+    if let Err(problem) = crate::outbound::PrivateRanges::parse(&private) {
+        return Err(format!(
+            "has `outbound.private` that is not a list of ranges ({problem})"
+        ));
+    }
+    Ok((hosts, private))
 }
 
 impl TestUsersFile {

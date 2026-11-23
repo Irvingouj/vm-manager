@@ -74,6 +74,7 @@ impl Platform {
         limits: Limits,
         storage_root: Option<Root>,
         outbound_private: PrivateRanges,
+        itself: crate::outbound::Itself,
     ) -> Result<Self, OpenError> {
         let files = Files::start()
             .map_err(|e| OpenError::new(None, format!("cannot start the file threads: {e}")))?;
@@ -82,6 +83,7 @@ impl Platform {
             limits,
             storage_root,
             outbound_private,
+            itself,
             Arc::clone(&files),
         )
         .await;
@@ -96,6 +98,7 @@ impl Platform {
         limits: Limits,
         storage_root: Option<Root>,
         outbound_private: PrivateRanges,
+        itself: crate::outbound::Itself,
         files: Arc<Files>,
     ) -> Result<Self, OpenError> {
         let Limits {
@@ -183,6 +186,7 @@ impl Platform {
             Arc::clone(&log),
             Arc::clone(&outbound),
             outbound_private,
+            itself,
             tokio::runtime::Handle::current(),
         ));
         let as_gateway: Arc<dyn Gateway> = Arc::clone(&gateway) as Arc<dyn Gateway>;

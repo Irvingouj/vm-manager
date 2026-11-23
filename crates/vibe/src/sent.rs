@@ -108,6 +108,16 @@ pub struct SentStream {
     /// runtime's bound), each at most 64 KiB; an error ends the connection
     /// without a clean end.
     chunks: mpsc::Receiver<Result<Bytes, String>>,
+    /// A data frame was given to the connection and the body has not been
+    /// `Pending` since: the connection flushes what it holds (the head
+    /// with it) when the body is pending, and not before, so a failure is
+    /// given only after that.
+    unflushed: bool,
+    /// A failure was seen and is owed to the connection: given at the next
+    /// poll whatever the channel says then (it may say `Pending`, or a
+    /// closed end once its sender is gone, which must never read as a
+    /// clean end).
+    failed: bool,
     /// When the last chunk was handed to the connection's writes: the
     /// watchdog's clock (see [`NO_BYTE`]).
     progress: watch::Sender<Instant>,
@@ -140,6 +150,8 @@ impl SentStream {
         }
         Self {
             chunks,
+            unflushed: false,
+            failed: false,
             progress,
             control,
             owned,
@@ -156,17 +168,39 @@ impl Body for SentStream {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, io::Error>>> {
         let this = self.get_mut();
+        if this.failed {
+            return Poll::Ready(Some(Err(io::Error::other(
+                "the body being sent ended early",
+            ))));
+        }
         match this.chunks.poll_recv(cx) {
-            Poll::Pending => Poll::Pending,
+            Poll::Pending => {
+                this.unflushed = false;
+                Poll::Pending
+            }
             Poll::Ready(None) => Poll::Ready(None),
             Poll::Ready(Some(Ok(bytes))) => {
+                this.unflushed = true;
                 // A change the watchdog sees; nothing waits on the send.
                 let _ = this.progress.send_replace(Instant::now());
                 Poll::Ready(Some(Ok(Frame::data(bytes))))
             }
-            Poll::Ready(Some(Err(_))) => Poll::Ready(Some(Err(io::Error::other(
-                "the body being sent ended early",
-            )))),
+            Poll::Ready(Some(Err(_))) => {
+                if this.unflushed {
+                    // What came before the failure is in the connection's
+                    // buffer, the head with it, and a body that fails now
+                    // would lose them: be pending once, so the connection
+                    // flushes, and fail when polled again.
+                    this.unflushed = false;
+                    this.failed = true;
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
+                }
+                this.failed = true;
+                Poll::Ready(Some(Err(io::Error::other(
+                    "the body being sent ended early",
+                ))))
+            }
         }
     }
 
@@ -356,6 +390,19 @@ mod tests {
             .unwrap();
         let failed = body.frame().await.unwrap();
         assert!(failed.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_failure_right_behind_a_chunk_is_never_a_clean_end() {
+        let (tx, rx) = mpsc::channel(4);
+        let mut body = Sent::Stream(SentStream::new(rx, None, None, Vec::new()));
+        tx.send(Ok(Bytes::from_static(b"one"))).await.unwrap();
+        tx.send(Err("the source failed".to_owned())).await.unwrap();
+        // The source is gone at once, as a pump that ended is.
+        drop(tx);
+        assert!(body.frame().await.unwrap().unwrap().is_data());
+        assert!(body.frame().await.unwrap().is_err(), "not a clean end");
+        assert!(body.frame().await.unwrap().is_err(), "and still failed");
     }
 
     #[tokio::test]

@@ -351,6 +351,29 @@ impl Live {
         } else {
             None
         };
+        // The project's own list of hosts and ranges (blackbox/CONTRACT.md,
+        // "Outbound calls: The local run"): `outbound` of the file, which
+        // the command read and checked already; a file that is not there
+        // has none.
+        let (hosts, private) = {
+            let path = project.to_path_buf();
+            let command = who.command;
+            match off_thread(move || test_users::read(&path, command)).await {
+                Some(Ok(Some(file))) => (file.outbound_hosts, file.outbound_private),
+                _ => (Vec::new(), Vec::new()),
+            }
+        };
+        let private_ranges =
+            crate::outbound::PrivateRanges::parse(&private).map_err(|problem| {
+                Ending::new(
+                    1,
+                    "test-users-file",
+                    format!(
+                        "{} has `outbound.private` that is not a list of ranges ({problem})",
+                        test_users::FILE
+                    ),
+                )
+            })?;
         let Platform {
             database,
             own,
@@ -378,10 +401,56 @@ impl Live {
                 start: PLATFORM_WAIT,
             },
             root,
-            crate::outbound::PrivateRanges::none(),
+            private_ranges,
+            crate::outbound::Itself {
+                domain: Arc::from(DOMAIN),
+                bare: false,
+                local: true,
+            },
         )
         .await
         .map_err(|error| open_failed(error, who.command))?;
+        // The list a local call is decided with: the project's hosts, put
+        // into the local platform database as an administrator's would be.
+        // Whatever an earlier run of the project left there and the file no
+        // longer names goes: the file is the list.
+        let wanted: std::collections::BTreeSet<String> = hosts
+            .iter()
+            .filter_map(|host| crate::outbound::Entry::parse(host).ok())
+            .map(|entry| entry.text().to_owned())
+            .collect();
+        for kept in outbound.entries() {
+            if !wanted.contains(kept.host())
+                && let Ok(entry) = crate::outbound::Entry::parse(kept.host())
+                && outbound.remove(&entry).await.is_err()
+            {
+                return Err(Ending::new(
+                    1,
+                    "local-state",
+                    format!(
+                        "{} could not take {} out of the local list of outbound hosts: run {} again",
+                        test_users::FILE,
+                        kept.host(),
+                        who.command
+                    ),
+                ));
+            }
+        }
+        for host in &hosts {
+            if let Ok(entry) = crate::outbound::Entry::parse(host)
+                && outbound.add(&entry, "local").await.is_err()
+            {
+                return Err(Ending::new(
+                    1,
+                    "local-state",
+                    format!(
+                        "{} could not put outbound.hosts into the local platform database: run {} again",
+                        test_users::FILE,
+                        who.command
+                    ),
+                ));
+            }
+        }
         // The local run has no sign-in of the tool through the browser, so
         // no credential of it is ever renewed (the renewal is its lifetime).
         // Its program is never started with OIDC, and its own Postgres never

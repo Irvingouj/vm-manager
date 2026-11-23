@@ -1,7 +1,7 @@
 //! Bounds (CONTRACT.md, "Outbound calls: Bounds"): 8 calls under way at once
 //! for one request, the next waits its turn, 64 may wait and a 73rd is
 //! `unavailable` at once; 256 in the program, a call that finds none free
-//! waits up to 5 seconds and is then `unavailable`; the memory of about 4 MiB
+//! waits up to 5 seconds and is then `unavailable`; the memory of about 7 MiB
 //! a call under way, whatever its bodies' length. (Tests that wait for the
 //! 5 seconds, or run about 10 seconds, say so.)
 //!
@@ -106,17 +106,33 @@ fn up_to_64_calls_wait_their_turn_and_a_73rd_is_unavailable_at_once() {
     );
     assert_eq!(origin.max_in_flight(), 8);
     assert_eq!(origin.requests().len(), 72);
-    let entries: Vec<Value> = o
-        .entries_of(&response)
-        .into_iter()
-        .filter(|e| e["error"] == "unavailable")
-        .collect();
+    // The 73rd has no Operation log entry (nothing is kept for it) and one
+    // `host-call` record `refused` with reason `limit`; the 72 before it
+    // have theirs.
+    let entries = o.entries_of(&response);
     assert_eq!(
         entries.len(),
-        1,
-        "expected one entry `failed` with `error` `unavailable`, got {entries:?}"
+        72,
+        "expected an entry for each of the 72 calls decided and none for the 73rd, got {} (errors {:?})",
+        entries.len(),
+        entries
+            .iter()
+            .map(|e| e["error"].clone())
+            .collect::<Vec<_>>()
     );
-    assert_eq!(entries[0]["outcome"], "failed", "{}", entries[0]);
+    assert!(
+        entries.iter().all(|e| e["error"] != "unavailable"),
+        "expected no entry `unavailable` for the 73rd call, got {entries:?}"
+    );
+    let limited: Vec<Value> = blackbox::outbound::host_call_records(&o.vm, &response)
+        .into_iter()
+        .filter(|r| r["outcome"] == "refused" && r["reason"] == "limit")
+        .collect();
+    assert_eq!(
+        limited.len(),
+        1,
+        "expected one `host-call` record `refused` with reason `limit` for the 73rd call, got {limited:?}"
+    );
 }
 
 #[test]
@@ -169,7 +185,7 @@ fn the_program_has_256_calls_and_one_that_finds_none_free_waits_5_seconds_then_i
 }
 
 #[test]
-fn sixteen_calls_with_large_bodies_in_flight_hold_about_4_mib_each_not_their_bodies() {
+fn sixteen_calls_with_large_bodies_in_flight_hold_a_few_mib_each_not_their_bodies() {
     let (o, origin) = listed();
     let each = 48 * MIB;
     origin.script(move |seen| {
@@ -219,11 +235,17 @@ fn sixteen_calls_with_large_bodies_in_flight_hold_about_4_mib_each_not_their_bod
         assert_eq!(*total, each);
         assert_eq!(sha, &expected);
     }
-    // 16 calls of 4 MiB are 64 MiB; the bodies are 768 MiB.
+    // 16 requests of about 7 MiB are 112 MiB; the bodies are 768 MiB.
     let rise = peak.saturating_sub(before);
+    eprintln!(
+        "MEASURED sixteen calls of 48 MiB: the program's memory rose by {} bytes ({} MiB), {} MiB a call",
+        rise,
+        rise / MIB,
+        rise / MIB / 16
+    );
     assert!(
         rise < 160 * MIB,
-        "expected 16 calls under way to hold about 4 MiB each (not their 768 MiB of bodies), the memory rose by {} MiB",
+        "expected 16 calls under way to hold under 10 MiB each (not their 768 MiB of bodies), the memory rose by {} MiB",
         rise / MIB
     );
 }

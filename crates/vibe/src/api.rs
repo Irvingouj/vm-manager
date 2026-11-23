@@ -3350,8 +3350,10 @@ impl LogQuery {
             asked.resource = Some(resource);
         }
         if let Some(host) = found.remove("host") {
-            let usable = host.len() <= crate::outbound::MAX_FILTER_BYTES
-                && crate::outbound::Entry::parse(&host).is_ok();
+            // An entry whose `host` is exactly this text: whatever a call's
+            // host with its port could be, 1 to 260 bytes. (A host that is
+            // no entry matches nothing, and is no fault.)
+            let usable = !host.is_empty() && host.len() <= crate::outbound::MAX_FILTER_BYTES;
             if !usable {
                 return Err(LogProblem::Value("host"));
             }

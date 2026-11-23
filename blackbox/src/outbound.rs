@@ -384,6 +384,20 @@ impl Reply {
         self
     }
 
+    /// A chunked body of these pieces, sent one by one; then, after `wait`
+    /// (for the client to have them), the connection is closed without the
+    /// body's end.
+    #[must_use]
+    pub fn chunked_pieces_then_close(mut self, pieces: &[&[u8]], wait: Duration) -> Self {
+        self.frame = Frame::Chunked;
+        self.steps = pieces.iter().map(|p| Step::Chunk(p.to_vec())).collect();
+        if !wait.is_zero() {
+            self.steps.push(Step::Wait(wait));
+        }
+        self.steps.push(Step::Close);
+        self
+    }
+
     /// Waits this long before the head.
     #[must_use]
     pub fn after(mut self, wait: Duration) -> Self {

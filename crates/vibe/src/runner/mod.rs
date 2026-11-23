@@ -85,6 +85,13 @@ pub struct InFlight {
     /// Requests in flight"): the request is answered so at once, its code
     /// stopped, and its operations refused.
     pub stop: Arc<Stop>,
+    /// The outbound calls of this request: its 8 turns and its count of
+    /// calls waiting (blackbox/CONTRACT.md, "Outbound calls: Bounds").
+    pub fetches: crate::outbound::Turns,
+    /// When the request's own time ends, set when the engine starts it: an
+    /// outbound call that would outlast it ends a little before, so that
+    /// the code is told what happened (`limit` `time`).
+    pub ends: std::sync::OnceLock<tokio::time::Instant>,
 }
 
 impl std::fmt::Debug for InFlight {
@@ -412,6 +419,10 @@ impl Engine {
             Arc::clone(&self.gateway),
         ));
         let deadline = self.limits.deadline;
+        in_flight
+            .ends
+            .set(tokio::time::Instant::now() + deadline)
+            .ok();
         let served = tokio::select! {
             biased;
             // Disabled: the context, and all it holds, goes with the
@@ -490,7 +501,9 @@ impl Engine {
             let calls = Arc::clone(&host.in_flight.calls);
             let program = self.gateway.held_calls();
             stream_manager.set_call_precheck(Arc::new(move |binding, size| {
-                if binding == crate::runner::host::PLATFORM_BINDING {
+                if binding == crate::runner::host::PLATFORM_BINDING
+                    || binding == crate::runner::host::FETCH_BINDING
+                {
                     return None;
                 }
                 calls.would_refuse(program.as_ref(), size)

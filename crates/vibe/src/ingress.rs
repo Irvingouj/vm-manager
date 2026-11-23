@@ -551,6 +551,8 @@ impl Ingress {
             content_length: stated_length,
             streams: std::sync::OnceLock::new(),
             stop,
+            fetches: crate::outbound::Turns::default(),
+            ends: std::sync::OnceLock::new(),
         });
         let known = Known {
             user: Some(&in_flight.user.id),

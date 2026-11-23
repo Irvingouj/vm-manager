@@ -38,6 +38,13 @@
 //   GET /many?url=&n=      n calls at once, each read to its end:
 //       { results: [{ i, ok | failure | refused, ms }] } in the order made.
 //   GET /whoami            ctx.user().
+//   GET /flood?url=&n=&pad=&settle=
+//       n calls made in a loop, none awaited, each with a header of `pad`
+//       bytes; then every one awaited (or, with `settle` ms, only that long):
+//       { resolved, refused: { reason: n }, failed: { kind: n }, pending }.
+//   GET /hold-then-read?url=&ms=
+//       the answer's headers, then nothing for `ms`, then the body read:
+//       { status, readFailed?, length }.
 
 const enc = new TextEncoder();
 const message = (e) => String((e && e.message) || e);
@@ -141,6 +148,18 @@ function bodyOf(spec, request) {
     }
     case "blob":
       return new Blob([spec.text], { type: spec.type || "" });
+    case "stalling": {
+      // 1 KiB, then nothing for ever.
+      let sent = false;
+      return new ReadableStream({
+        pull(controller) {
+          if (sent) return new Promise(() => {});
+          sent = true;
+          controller.enqueue(pattern(1024, 0));
+          return undefined;
+        },
+      });
+    }
     case "request-body":
       return request.body;
     default:
@@ -205,6 +224,13 @@ async function call(spec, request) {
   const init = {};
   if (spec.method !== undefined) init.method = spec.method;
   if (spec.headers !== undefined) init.headers = spec.headers;
+  if (spec.gen) {
+    // `count` headers of `size` bytes each, made here.
+    const made = {};
+    const value = "h".repeat(spec.gen.size);
+    for (let i = 0; i < spec.gen.count; i++) made["x-gen-" + i] = value;
+    init.headers = made;
+  }
   if (spec.redirect !== undefined) init.redirect = spec.redirect;
   const body = bodyOf(spec.body, request);
   if (body !== undefined) init.body = body;
@@ -312,6 +338,242 @@ globalThis.default = {
           }),
         );
         return json({ results, totalMs: Date.now() - began });
+      }
+      case "/flood": {
+        const n = Number(q("n") || "1");
+        const pad = "a".repeat(Number(q("pad") || "0"));
+        const target = q("url");
+        const counts = { resolved: 0, refused: {}, failed: {}, other: 0, readFailed: 0, pending: 0 };
+        const bump = (m, k) => {
+          m[k] = (m[k] || 0) + 1;
+        };
+        let settled = 0;
+        const calls = [];
+        for (let i = 0; i < n; i++) {
+          const init = pad ? { headers: { "x-pad": pad } } : {};
+          calls.push(
+            fetch(target + "?i=" + i, init).then(
+              async (a) => {
+                try {
+                  await a.text();
+                  counts.resolved++;
+                } catch (e) {
+                  counts.readFailed++;
+                }
+                settled++;
+              },
+              (e) => {
+                if (e && e.refused) bump(counts.refused, e.refused.refusal.reason);
+                else if (e && e.failure) bump(counts.failed, e.failure.kind);
+                else counts.other++;
+                settled++;
+              },
+            ),
+          );
+        }
+        if (q("settle")) await Promise.race([Promise.all(calls), sleep(Number(q("settle")))]);
+        else await Promise.all(calls);
+        counts.pending = n - settled;
+        return json(counts);
+      }
+      case "/hold-then-read": {
+        try {
+          const answer = await fetch(q("url"));
+          await sleep(Number(q("ms") || "0"));
+          const out = { status: answer.status, length: 0 };
+          try {
+            const reader = answer.body.getReader();
+            for (;;) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              out.length += value.length;
+            }
+          } catch (e) {
+            out.readFailed = message(e);
+          }
+          return json(out);
+        } catch (e) {
+          return json({ rejected: rejection(e) });
+        }
+      }
+      case "/native-hand": {
+        // Steps in `?steps=<json>`; the request's own body is left unread so
+        // that its native stream can be named. Values are named: a string
+        // "@name" (or "@name.member") in an argument is replaced by it.
+        const steps = JSON.parse(q("steps"));
+        const env = {};
+        const outs = {};
+        const started = {};
+        const lookup = (ref) => ref.slice(1).split(".").reduce((v, k) => (v == null ? v : v[k]), env);
+        const resolveDeep = (v) => {
+          if (typeof v === "string" && v.startsWith("@")) return lookup(v);
+          if (Array.isArray(v)) return v.map(resolveDeep);
+          if (v && typeof v === "object") {
+            const o = {};
+            for (const k of Object.keys(v)) o[k] = resolveDeep(v[k]);
+            return o;
+          }
+          return v;
+        };
+        const call = (args) =>
+          new Promise((resolve) => {
+            const timer = setTimeout(() => resolve({ timeout: true }), 12000);
+            try {
+              globalThis.__nativeBindingInvoke(
+                "__vm_fetch",
+                "fetch",
+                args,
+                (v) => {
+                  clearTimeout(timer);
+                  resolve({ resolved: v });
+                },
+                (e) => {
+                  clearTimeout(timer);
+                  resolve({ rejected: message(e) });
+                },
+              );
+            } catch (e) {
+              clearTimeout(timer);
+              resolve({ threw: message(e) });
+            }
+          });
+        const note = (name, out) => {
+          outs[name] = out;
+          env[name] = out;
+          const body = out.resolved && out.resolved.ok && out.resolved.ok.body;
+          if (body && body.$stream !== undefined) env[name + "Body"] = body.$stream;
+        };
+        for (const step of steps) {
+          try {
+            if (step.create) env[step.create] = globalThis.__responseStreamCreate();
+            else if (step.reqbody) env[step.reqbody] = request.body._nativeStreamId;
+            else if (step.call) note(step.call, await call(resolveDeep(step.args)));
+            else if (step.start) started[step.start] = call(resolveDeep(step.args));
+            else if (step.await) note(step.await, await started[step.await]);
+            else if (step.write !== undefined) {
+              const bytes = step.text !== undefined ? enc.encode(step.text) : pattern(step.bytes || 0, 3);
+              const p = globalThis.__responseStreamWrite(resolveDeep(step.write), bytes);
+              if (!step.nowait) await p;
+            } else if (step.end !== undefined) globalThis.__responseStreamEnd(resolveDeep(step.end));
+            else if (step.sleep) await sleep(step.sleep);
+          } catch (e) {
+            outs["step-threw-" + Object.keys(step)[0]] = message(e);
+          }
+        }
+        return json({ outs });
+      }
+      case "/globals":
+        return json(Object.getOwnPropertyNames(globalThis).filter((n) => n.startsWith("__")));
+      case "/native-seq": {
+        // Several hand-made calls in one request; an argument object may
+        // hold the string "$prev-body" as its `body`, which is replaced by
+        // the body marker of the previous answer; "$request-body" by the
+        // marker of this request's body when it can be had.
+        const b = await request.json();
+        const call = (args) =>
+          new Promise((resolve) => {
+            const timer = setTimeout(() => resolve({ timeout: true }), 5000);
+            try {
+              globalThis.__nativeBindingInvoke(
+                "__vm_fetch",
+                "fetch",
+                args,
+                (v) => {
+                  clearTimeout(timer);
+                  resolve({ resolved: v });
+                },
+                (e) => {
+                  clearTimeout(timer);
+                  resolve({ rejected: message(e) });
+                },
+              );
+            } catch (e) {
+              clearTimeout(timer);
+              resolve({ threw: message(e) });
+            }
+          });
+        const outs = [];
+        let prev;
+        for (const args of b.calls) {
+          const made = { ...args };
+          if (made.body === "$prev-body") made.body = prev;
+          if (made.body === "$bytes") made.body = pattern(16, 1);
+          if (made.body === "$arraybuffer") made.body = pattern(16, 1).buffer;
+          if (made.body === "$stream") made.body = streamOf({ chunks: ["ab", "cd"] });
+          if (made.body === "$request-body") made.body = request.body;
+          if (made.body === "$params") made.body = new URLSearchParams([["a", "b"]]);
+          const out = await call(made);
+          outs.push(out);
+          prev = out.resolved && out.resolved.ok ? out.resolved.ok.body : undefined;
+        }
+        return json({ outs });
+      }
+      case "/native-flood": {
+        // `n` hand-made calls in a loop, none awaited, each with a header of
+        // `pad` bytes; the answers counted by their shape.
+        const n = Number(q("n") || "1");
+        const pad = "a".repeat(Number(q("pad") || "0"));
+        const target = q("url");
+        const counts = {};
+        let settled = 0;
+        const calls = [];
+        for (let i = 0; i < n; i++) {
+          calls.push(
+            new Promise((resolve) => {
+              const done = (key) => {
+                counts[key] = (counts[key] || 0) + 1;
+                settled++;
+                resolve();
+              };
+              try {
+                globalThis.__nativeBindingInvoke(
+                  "__vm_fetch",
+                  "fetch",
+                  { url: target + "?i=" + i, headers: pad ? [["x-pad", pad]] : [] },
+                  (v) => {
+                    if (v && v.ok) done("ok");
+                    else if (v && v.error) done("error:" + v.error.kind);
+                    else if (v && v.refused) done("refused:" + v.refused.refusal.reason);
+                    else done("other:" + Object.keys(v || {}).join(","));
+                  },
+                  (e) => done("rejected"),
+                );
+              } catch (e) {
+                done("threw");
+              }
+            }),
+          );
+        }
+        if (q("settle")) await Promise.race([Promise.all(calls), sleep(Number(q("settle")))]);
+        else await Promise.all(calls);
+        return json({ counts, pending: n - settled });
+      }
+      case "/native": {
+        // Calls the native binding by hand: { binding, command, args } from
+        // the request's JSON; the answer or the rejection, as it comes.
+        const b = await request.json();
+        const out = await new Promise((resolve) => {
+          const timer = setTimeout(() => resolve({ timeout: true }), b.waitMs || 5000);
+          try {
+            globalThis.__nativeBindingInvoke(
+              b.binding === undefined ? "__vm_fetch" : b.binding,
+              b.command === undefined ? "fetch" : b.command,
+              b.args,
+              (v) => {
+                clearTimeout(timer);
+                resolve({ resolved: v });
+              },
+              (e) => {
+                clearTimeout(timer);
+                resolve({ rejected: typeof e === "string" ? e : message(e), ctype: typeof e, detail: e && e.failure ? e.failure : undefined });
+              },
+            );
+          } catch (e) {
+            clearTimeout(timer);
+            resolve({ threw: message(e) });
+          }
+        });
+        return json(out);
       }
       case "/whoami":
         return json(ctx.user());

@@ -58,8 +58,9 @@ pub struct Entry<'a> {
     /// `user` or `application`.
     pub actor: &'a str,
     pub operation: &'a str,
-    /// Without its values. For `begin`, `commit` and `rollback`, that word.
-    pub statement: &'a str,
+    /// Without its values. For `begin`, `commit` and `rollback`, that word;
+    /// null for a `fetch` (nothing of its address is kept).
+    pub statement: Option<&'a str>,
     /// The transaction's id, for a statement in a transaction and for its
     /// `begin`, `commit` and `rollback`; `None` otherwise.
     pub transaction: Option<&'a str>,
@@ -87,6 +88,12 @@ pub struct OperationLog {
     database: Arc<PlatformDatabase>,
 }
 
+/// Whether an entry is of the Application's own database: it has no
+/// Resource and is not a `fetch`, which has none either.
+fn own_database(entry: &Entry<'_>) -> bool {
+    entry.resource.is_none() && entry.operation != "fetch"
+}
+
 impl OperationLog {
     pub fn new(database: Arc<PlatformDatabase>) -> Self {
         Self { database }
@@ -109,7 +116,7 @@ impl OperationLog {
                         &version,
                         &entry.resource,
                         &entry.actor,
-                        &entry.resource.is_none(),
+                        &own_database(entry),
                         &entry.operation,
                         &entry.statement,
                         &entry.transaction,
@@ -155,7 +162,7 @@ impl OperationLog {
                         &version,
                         &entry.resource,
                         &entry.actor,
-                        &entry.resource.is_none(),
+                        &own_database(entry),
                         &entry.operation,
                         &entry.statement,
                         &entry.transaction,
@@ -190,7 +197,7 @@ impl OperationLog {
                         &version,
                         &entry.resource,
                         &entry.actor,
-                        &entry.resource.is_none(),
+                        &own_database(entry),
                         &entry.operation,
                         &entry.statement,
                         &entry.transaction,
@@ -231,6 +238,34 @@ impl OperationLog {
                         &duration,
                         &ending.began_nothing,
                     ],
+                )
+                .await
+                .map_err(DbError::from)?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Completes the entry `id` as refused for `reason`: a `fetch` whose
+    /// name resolved to an address that is never called, found after its
+    /// entry was written (blackbox/CONTRACT.md, "Outbound calls").
+    pub async fn finish_refused(
+        &self,
+        id: i64,
+        reason: &str,
+        duration_ms: Option<u64>,
+    ) -> Result<(), DbError> {
+        let duration = duration_ms
+            .map(i64::try_from)
+            .transpose()
+            .map_err(too_large)?;
+        self.write(async |client: &mut Client| {
+            client
+                .execute(
+                    "UPDATE operation_log
+                     SET outcome = 'refused', reason = $2, duration_ms = $3
+                     WHERE id = $1",
+                    &[&id, &reason, &duration],
                 )
                 .await
                 .map_err(DbError::from)?;

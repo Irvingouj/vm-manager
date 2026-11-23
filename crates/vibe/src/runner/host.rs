@@ -23,8 +23,8 @@ use serde_json::{Value, json};
 
 use super::InFlight;
 use crate::gateway::{
-    Decision, Gateway, LIMIT, Refusal, UNAVAILABLE, WORD_BYTES, WORD_CALLS, WORD_PROGRAM,
-    ok_to_wire,
+    Decision, FetchDecision, Gateway, LIMIT, Refusal, UNAVAILABLE, WORD_BYTES, WORD_CALLS,
+    WORD_PROGRAM, ok_to_wire,
 };
 use crate::log;
 
@@ -34,6 +34,12 @@ pub const APPLICATION_BINDING: &str = "VM";
 /// The binding the platform's own glue (`prelude.js`) uses. Its calls are
 /// the platform talking to itself, so they are not `host-call` records.
 pub const PLATFORM_BINDING: &str = "__vm_platform";
+
+/// The binding through which the platform's glue makes the Application's
+/// `fetch` calls. Its calls are the Application's (they are `host-call`
+/// records and Operation log entries), with their own bounds
+/// ([`crate::outbound`]) in place of a host call's arguments'.
+pub const FETCH_BINDING: &str = "__vm_fetch";
 
 pub struct HostOps {
     pub(super) in_flight: Arc<InFlight>,
@@ -104,6 +110,12 @@ impl HostOps {
     }
 
     fn host_call(&self, operation: &str, refused: Option<&str>) {
+        self.host_call_to(operation, refused, None);
+    }
+
+    /// A `host-call` record; `host` is the host of an outbound call, and
+    /// no more of its address.
+    fn host_call_to(&self, operation: &str, refused: Option<&str>, host: Option<&str>) {
         let in_flight = self.is_active().then_some(&*self.in_flight);
         let mut record = json!({
             "request": in_flight.map(|f| &*f.request),
@@ -114,6 +126,9 @@ impl HostOps {
         });
         if let (Some(reason), Some(object)) = (refused, record.as_object_mut()) {
             object.insert("reason".into(), reason.into());
+        }
+        if let (Some(host), Some(object)) = (host, record.as_object_mut()) {
+            object.insert("host".into(), host.into());
         }
         log::record("host-call", record);
     }
@@ -230,6 +245,16 @@ impl OperationsHandler for HostOps {
             _ => {}
         }
         let active = self.is_active();
+        if binding == FETCH_BINDING && name == "fetch" {
+            // The call's own bounds are the outbound ones: the arguments
+            // are read by the gateway, which holds them to them.
+            let FetchDecision {
+                decision: Decision { refused, answer },
+                host,
+            } = self.gateway.fetch(&self.in_flight, active, &args);
+            self.host_call_to("fetch", refused, host.as_deref());
+            return Box::pin(async move { InvokeResult::Value(answer.await) });
+        }
         if binding != APPLICATION_BINDING {
             let refusal = if active {
                 Refusal::unknown_operation(name)

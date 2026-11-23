@@ -103,6 +103,12 @@ fn an_answer_of_64_mib_given_back_as_the_response_arrives_whole_without_entering
             pattern_sha256(BIG),
             "{route}: expected the bytes as the other side sent them"
         );
+        eprintln!(
+            "MEASURED streams {}: the program's memory rose by {} bytes ({} MiB)",
+            std::thread::current().name().unwrap_or("test"),
+            peak.saturating_sub(before),
+            peak.saturating_sub(before) / MIB
+        );
         assert!(
             peak.saturating_sub(before) < MEMORY_SLACK,
             "{route}: expected the program's memory to rise by far less than 64 MiB, it rose from {before} to {peak} bytes"
@@ -130,7 +136,10 @@ fn request_body_of_64_mib_given_as_a_calls_body_arrives_whole_whatever_the_clien
         let mut raw = Raw::connect(o.vm.address());
         raw.send_head(
             "POST",
-            &format!("/send-request-body?url={}&method=PUT", origin.url("/up")),
+            &format!(
+                "/send-request-body?url={}&method=PUT&type=application/octet-stream",
+                origin.url("/up")
+            ),
             &o.vm.host_of(APP),
             Some(&bob()),
             if chunked {
@@ -170,6 +179,12 @@ fn request_body_of_64_mib_given_as_a_calls_body_arrives_whole_whatever_the_clien
         assert_eq!(
             seen.header("content-type"),
             Some("application/octet-stream")
+        );
+        eprintln!(
+            "MEASURED streams {}: the program's memory rose by {} bytes ({} MiB)",
+            std::thread::current().name().unwrap_or("test"),
+            peak.saturating_sub(before),
+            peak.saturating_sub(before) / MIB
         );
         assert!(
             peak.saturating_sub(before) < MEMORY_SLACK,
@@ -243,6 +258,12 @@ fn a_stored_files_body_given_as_a_calls_body_goes_from_the_directory_to_the_othe
         "{}",
         seen.describe()
     );
+    eprintln!(
+        "MEASURED streams {}: the program's memory rose by {} bytes ({} MiB)",
+        std::thread::current().name().unwrap_or("test"),
+        peak.saturating_sub(before),
+        peak.saturating_sub(before) / MIB
+    );
     assert!(
         peak.saturating_sub(before) < MEMORY_SLACK,
         "expected the file not to enter the memory: it rose from {before} to {peak} bytes"
@@ -278,6 +299,12 @@ fn an_answers_body_put_into_storage_lands_as_it_came_without_entering_the_memory
         blackbox::outbound::sha256(&landed),
         pattern_sha256(len),
         "expected the file to hold the answer's bytes"
+    );
+    eprintln!(
+        "MEASURED streams {}: the program's memory rose by {} bytes ({} MiB)",
+        std::thread::current().name().unwrap_or("test"),
+        peak.saturating_sub(before),
+        peak.saturating_sub(before) / MIB
     );
     assert!(
         peak.saturating_sub(before) < MEMORY_SLACK,
