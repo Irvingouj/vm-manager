@@ -289,6 +289,14 @@ fn a_disable_while_a_body_is_being_sent_closes_the_connection_within_a_second_sh
         let answer = admin::disable(&vm, &administrator(), APP);
         assert_eq!(answer.status, 200, "{}", answer.describe());
         let disabled_at = Instant::now();
+        // The close is a reset: a client that takes no byte sees the end as
+        // soon as one that reads ("a body being sent is ended early ..."),
+        // within the same second.
+        let seen_without_taking = raw.wait_closed_without_taking(IN_FLIGHT_ALLOWED);
+        assert!(
+            seen_without_taking.is_some(),
+            "expected a client that takes no byte to see the connection closed within {IN_FLIGHT_ALLOWED:?} of the disable's 200"
+        );
         let mut received: u64 = 0;
         let end = raw.drain_body(Duration::from_secs(15), |bytes| {
             received += u64::try_from(bytes.len()).expect("a piece below usize");

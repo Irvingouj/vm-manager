@@ -145,3 +145,31 @@ The forwarder between the StreamManager and the host (`read_response_object`) tu
 | `src/execution_helpers.rs` (`read_response_object`, the forwarder's `chunks.recv()` arm) | `None` without a `Done` now sends `Err("the body's source ended without its end")` on the channel instead of breaking silently: the sending ends early and the connection is closed without a clean end. `Some(Done)` is still a clean end and `Some(Error)` still forwards its error. |
 
 Measured with the cancel tests: a cancelled body given back is `200` with an empty body and `content-length: 0` (or the fixed `500`), never the client's bytes, and never a clean end short of a stated length.
+
+### Patch 14: the response's host-fed stream is named, not only described
+
+A Storage file's body is a host-fed stream like the request's own body, given back unread as `new Response(file.body)` and sent by the host itself. The file is read by a pump the *request* owns (blackbox/CONTRACT.md, "Storage: Bounds": the request's 16 open bodies); for a body being sent the pump must go on past the request's code and end with the *sending*, so the runner takes the pump over — for which it must know which stream the response's body is, not only that it is a host-fed one nobody read (patch 6).
+
+| File | Change |
+|---|---|
+| `src/runtime/stream_manager.rs` (`HostResponse`, `note_host_response`) | `HostResponse` gains `id: StreamId`, set from the stream `note_host_response` was called for. The runner reads it after the event and takes that stream's pump over from the request's open bodies (`crates/vibe/src/runner/mod.rs`, `collect`), so a file's body being sent is fed to the connection's end however long the client takes, and the place it holds among the open bodies is given back when the sending ends. |
+
+### Patch 15: only the request's own body is "asked for" when read or taken
+
+`read_chunk` and `take_receiver` marked `asked` (patch 9) for *any* host-fed stream, and the host now feeds a second kind: a Storage file's body. Reading a file, or giving one back as the response's body, must not make the platform read the request's unread body from the client — "a body nobody has asked for yet is not read and not timed, however long the code runs" (CONTRACT.md, "What an Application is handed"); only the request's own body, read by the code or taken by a put or the response, is asking for it. The manager now knows which stream that is, and the host asks it (a put of the request's own body checks the file bound against the request's stated `content-length` before a byte is read, which needs to know the named stream is that body).
+
+| File | Change |
+|---|---|
+| `src/runtime/stream_manager.rs` | A `request_body: Mutex<Option<StreamId>>` slot, set by `pump_request_body` (the one stream the host feeds as the request's body) and cleared by `clear()` with the rest; `pub fn request_body() -> Option<StreamId>` for the host to ask. `read_chunk` marks a read (patch 6) for any host-fed stream but marks `asked` only when the stream is the request's body; `take_receiver` marks `asked` only for the request's body as well (patch 9's "a host-fed stream taken for the response's body is one the host is about to send" keeps its meaning, and a *put* taking the request's body is the code asking for it in the same way). |
+
+Measured with the stream fixtures: `put(key, request.body)` sends `100 Continue` and reads the client's bytes; getting a file and reading its body, or serving it as a response, reads nothing of an unread request body and sends no `100 Continue`.
+
+### Patch 16: a stream closed for good is forgotten by the manager
+
+CONTRACT.md, "Storage: Bounds": "What the program held for a body (its descriptor, its buffers, its place in every list the program keeps) is given back when the body stops counting, not only when the request ends: a request that gets a small file and reads it to its end many thousand times holds no more for it at its end than at its start." A get's body is a host-fed stream; when it was read to its end, cancelled, failed or sent to its end, the manager kept its `host_fed` mark and its `taken` mark (and, until the pump's own close, its sender, receiver and metadata) until the context dropped — a few hundred bytes and a channel an id, for every get of a request. `close_stream` now removes the `host_fed` and `taken` marks too: the caller that knows the stream is over (the host's pump for a get, `read_response_object` when a sending ends or an answer has no body, patch 12's cancel, `close_unread_host_fed` at the request's end) closes it for good, and the manager keeps nothing for its id. The id counter still advances; nothing else does.
+
+| File | Change |
+|---|---|
+| `src/runtime/stream_manager.rs` (`close_stream`) | Removes the id from `host_fed` and `taken` with its sender, its receiver and its metadata. Every existing caller is a stream that is over (a cancel, a sending's end, an answer with no body, the request's end, or the host's pump once its body was read to its end and the guest took every chunk), so no later read, cancel or response depends on the marks being there. |
+
+Measured with the host's own counters (temporary, since removed): after 20 requests of 5,000 gets-and-reads of a 100-byte file (100,000 gets), each request's end held 0 pumps in the request's registry and 0 live stream managers, and the program's resident memory was 11 MiB above its baseline and flat from 30,000 gets on.

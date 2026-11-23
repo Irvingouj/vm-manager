@@ -14,13 +14,22 @@
 //!   link anywhere on the way is refused (`not-reachable` `link`), and one
 //!   swapped in between two steps is refused at the next step. Everything
 //!   is `rustix::fs`, safe Rust.
+//! - **A get opens the file and answers its metadata and a
+//!   [`Reader`](super::Reader)**: the file as it was when it was opened —
+//!   a rename never changes what an open descriptor reads — each chunk a
+//!   `pread` job on the file threads, ending after exactly `size` bytes; a
+//!   file found shorter while it is read fails the read. A file larger
+//!   than [`FILE_BYTES`](super::FILE_BYTES) is not opened.
 //! - **A put** writes a new file in `.vibe-staging/` (`O_CREAT | O_EXCL`,
-//!   mode `0640`, a random name), sets the content type on it, `fsync`s
-//!   it, makes the folders of the key that are missing (mode `0750`),
-//!   renames it onto the key and `fsync`s the folders it changed. A reader
-//!   sees the file before or after, never in part; a put that fails
-//!   removes its staging file. A put racing a delete that removes one of
-//!   its folders walks again (at most [`PUT_TRIES`] times).
+//!   mode `0640`, a random name) as its body arrives — one `pwrite` job a
+//!   chunk — then, when the body has ended cleanly, sets the content type
+//!   on it, `fsync`s it, makes the folders of the key that are missing
+//!   (mode `0750`), renames it onto the key and `fsync`s the folders it
+//!   changed. A reader sees the file before or after, never in part; a
+//!   put that fails — the body failed, the bound, a full disk, a request
+//!   that ended first — removes its staging file and lands nothing. A put
+//!   racing a delete that removes one of its folders walks again (at most
+//!   [`PUT_TRIES`] times).
 //! - **A delete** unlinks the file, then removes each folder of the key
 //!   that is left empty, deepest first.
 //! - **A list** reads one folder at a time, keeping only the names that can
@@ -67,11 +76,15 @@ use serde_json::json;
 use super::files::Files;
 use super::key::{self, KEY_BYTES, Key, SEGMENTS};
 use super::{
-    BODY_BYTES, Backend, Bodies, Body, CONTENT_TYPE_ATTRIBUTE, CONTENT_TYPE_BYTES, Failure, Got,
-    ListQuery, Metadata, Op, PAGE, Page, Position, Unreachable, Until, content_type_of, encode,
-    is_content_type,
+    Backend, CHUNK, CONTENT_TYPE_ATTRIBUTE, CONTENT_TYPE_BYTES, FILE_BYTES, Failure, GivenUp,
+    ListQuery, Metadata, OPERATION_TIME, Op, PAGE, Page, Position, Source, Unreachable, Until,
+    content_type_of, is_content_type,
 };
 use crate::log;
+use bytes::{Bytes, BytesMut};
+use openworkers_runtime_v8::runtime::stream_manager::StreamChunk;
+use rustix::io::{pread, pwrite};
+use tokio::sync::mpsc::error::TryRecvError;
 
 /// The marker a Resource's directory holds, naming the Resource.
 pub const MARKER: &str = ".vibe-resource";
@@ -640,10 +653,6 @@ fn failure(e: Errno) -> Failure {
     }
 }
 
-fn io_failure(e: &std::io::Error) -> Failure {
-    Errno::from_io_error(e).map_or(Failure::Unavailable, failure)
-}
-
 fn is_regular(stat: &Stat) -> bool {
     FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile
 }
@@ -747,10 +756,11 @@ impl Backend for Directory {
         }))
     }
 
-    fn get(&self, key: Key, bodies: Arc<Bodies>, until: Until) -> Op<'_, Option<Got>> {
+    fn get(&self, key: Key, until: Until) -> Op<'_, Option<super::Opened>> {
+        let files = Arc::clone(&self.files);
         Box::pin(async move {
             let found = self
-                .on_files(until.clone(), move |opened| {
+                .on_files(until, move |opened| {
                     let Some((chain, last)) = folders_of(opened, &key)? else {
                         return Ok(None);
                     };
@@ -759,68 +769,174 @@ impl Backend for Directory {
                         return Ok(None);
                     };
                     let metadata = metadata(key.into_string(), fd.as_fd(), &stat);
-                    if metadata.size > u64::try_from(BODY_BYTES).unwrap_or(u64::MAX) {
+                    if metadata.size > FILE_BYTES {
                         return Err(Failure::Bytes);
                     }
                     Ok(Some((fd, metadata)))
                 })
                 .await?;
-            let Some((fd, mut metadata)) = found else {
+            let Some((fd, metadata)) = found else {
                 return Ok(None);
             };
-            let size = usize::try_from(metadata.size).unwrap_or(BODY_BYTES);
-            let room = bodies.take(size).await.ok_or(Failure::Unavailable)?;
-            self.on_files(until.clone(), move |_| {
-                // Into a buffer of the size `fstat` gave and one byte, which
-                // never grows (so never past the room taken): one byte more
-                // than that size means the file grew while it was read; it
-                // is not answered as if whole. `limit` `bytes` when that is
-                // past the bound, else `unavailable`.
-                let mut bytes = vec![0_u8; size.saturating_add(1)];
-                let mut file = std::fs::File::from(fd);
-                let mut filled = 0;
-                while let Some(rest) = bytes.get_mut(filled..)
-                    && !rest.is_empty()
-                {
-                    match file.read(rest) {
-                        Ok(0) => break,
-                        Ok(n) => filled += n,
-                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                        Err(e) => return Err(io_failure(&e)),
-                    }
-                }
-                drop(file);
-                if filled > size {
-                    return Err(if filled > BODY_BYTES {
-                        Failure::Bytes
-                    } else {
-                        Failure::Unavailable
-                    });
-                }
-                bytes.truncate(filled);
-                metadata.size = u64::try_from(bytes.len()).unwrap_or(0);
-                let body = encode(&bytes);
-                Ok(Some(Got {
-                    metadata,
-                    body,
-                    room,
-                }))
-            })
-            .await
+            // The file is opened; the get has ended. The reader gives the
+            // file as it was when it was opened — a rename never changes
+            // what an open descriptor reads — a chunk at a time.
+            let size = metadata.size;
+            Ok(Some(super::Opened {
+                metadata,
+                reader: Arc::new(FileReader {
+                    file: Arc::new(fd),
+                    size,
+                    at: Mutex::new(0),
+                    files,
+                }),
+            }))
         })
     }
 
     fn put(
         &self,
         key: Key,
-        body: Body,
+        body: Source,
         content_type: Option<String>,
-        until: Until,
+        mut given_up: GivenUp,
     ) -> Op<'_, Metadata> {
-        let job_until = until.clone();
-        Box::pin(self.on_files(until, move |opened| {
-            put(opened, key, body, content_type, &job_until)
-        }))
+        Box::pin(async move {
+            // The staging file, made on a file thread.
+            let staged = self.open_staging().await?;
+            let answer = async {
+                let mut written = 0_u64;
+                match body {
+                    Source::Whole(bytes) => {
+                        // A whole body's length is known before it is read.
+                        let length = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+                        if length > FILE_BYTES {
+                            return Err(Failure::Bytes);
+                        }
+                        if *given_up.borrow_and_update() {
+                            return Err(Failure::Stopped);
+                        }
+                        write(&staged.file, bytes, 0, &self.files).await?;
+                    }
+                    Source::Stream { chunks, length } => {
+                        // A known length is checked before a byte is read;
+                        // an unknown one as the body is written.
+                        if length.is_some_and(|length| length > FILE_BYTES) {
+                            return Err(Failure::Bytes);
+                        }
+                        let mut chunks = chunks;
+                        loop {
+                            // No time of its own: a source that stalls is
+                            // bounded by the request's end (`given_up`), and
+                            // by the request body's own rules when it is the
+                            // request's.
+                            let chunk = tokio::select! {
+                                biased;
+                                _ = given_up.wait_for(|over| *over) => {
+                                    // The put is given up: nothing lands,
+                                    // and the staging file is removed by
+                                    // this future's own end below.
+                                    return Err(Failure::Stopped);
+                                }
+                                chunk = chunks.recv() => chunk,
+                            };
+                            match chunk {
+                                Some(StreamChunk::Data(first)) => {
+                                    // What has already arrived is gathered,
+                                    // up to one chunk's worth, before the
+                                    // write: a body arriving in very small
+                                    // pieces (a client's tiny frames, a
+                                    // stream of a hundred bytes) costs one
+                                    // write job a [`CHUNK`] rather than one
+                                    // a piece. It never waits for a piece
+                                    // that has not arrived: what is there
+                                    // when the source has nothing ready is
+                                    // written.
+                                    let mut batch = first;
+                                    let mut ended = false;
+                                    while batch.len() < CHUNK {
+                                        match chunks.try_recv() {
+                                            Ok(StreamChunk::Data(more)) => {
+                                                // Copied into the batch for
+                                                // the one write job — at most
+                                                // [`CHUNK`] bytes, once, in
+                                                // place of a job a piece on
+                                                // the file threads (rule 2).
+                                                let mut joined = BytesMut::with_capacity(
+                                                    batch.len().saturating_add(more.len()),
+                                                );
+                                                joined.extend_from_slice(&batch);
+                                                joined.extend_from_slice(&more);
+                                                batch = joined.freeze();
+                                            }
+                                            Ok(StreamChunk::Done) => {
+                                                ended = true;
+                                                break;
+                                            }
+                                            // A stream of the code's own
+                                            // errored, or the request's body
+                                            // failed under the put: nothing
+                                            // lands.
+                                            Ok(StreamChunk::Error(_))
+                                            | Err(TryRecvError::Disconnected) => {
+                                                return Err(Failure::BodyFailed);
+                                            }
+                                            Err(TryRecvError::Empty) => break,
+                                        }
+                                    }
+                                    let length = u64::try_from(batch.len()).unwrap_or(u64::MAX);
+                                    let at = written;
+                                    written = written.checked_add(length).ok_or(Failure::Bytes)?;
+                                    if written > FILE_BYTES {
+                                        return Err(Failure::Bytes);
+                                    }
+                                    write(&staged.file, batch, at, &self.files).await?;
+                                    // The body ended cleanly: the landing,
+                                    // its own [`OPERATION_TIME`].
+                                    if ended {
+                                        break;
+                                    }
+                                }
+                                Some(StreamChunk::Done) => break,
+                                // A stream of the code's own errored, or the
+                                // request's body failed under the put; the
+                                // source ended without its end. Nothing
+                                // lands.
+                                Some(StreamChunk::Error(_)) | None => {
+                                    return Err(Failure::BodyFailed);
+                                }
+                            }
+                        }
+                    }
+                }
+                // The landing is not taken once the put is given up; one
+                // already on a file thread is told the same, and does not
+                // rename (its own job removes its staging file).
+                if *given_up.borrow_and_update() {
+                    return Err(Failure::Stopped);
+                }
+                land(
+                    &self.inner,
+                    staged.clone(),
+                    key,
+                    content_type,
+                    given_up.clone(),
+                    &self.files,
+                )
+                .await
+            }
+            .await;
+            if answer.is_err() {
+                // A put that fails lands nothing and leaves nothing in
+                // staging (a write in flight on the file ends harmlessly
+                // into the unlinked file). A removal that fails itself is
+                // what the next load of the Resource clears
+                // (blackbox/CONTRACT.md, "What is on the directory"); the
+                // put's own failure is the answer either way.
+                let _removed = remove(&staged, &self.files).await;
+            }
+            answer
+        })
     }
 
     fn delete(&self, key: Key, until: Until) -> Op<'_, ()> {
@@ -844,88 +960,203 @@ fn over(until: &Until) -> Failure {
     }
 }
 
-/// A file in `.vibe-staging/`, removed when dropped unless it landed.
+/// A file in `.vibe-staging/` that a put writes into: the staging folder
+/// and the file's name there (removed when the put fails), and the file
+/// itself, written one `pwrite` job a chunk. Cloned cheaply for the jobs
+/// that touch it.
+#[derive(Clone)]
 struct Staged {
-    staging: OwnedFd,
+    staging: Arc<OwnedFd>,
     name: String,
-    file: std::fs::File,
-    landed: bool,
+    file: Arc<OwnedFd>,
 }
 
-impl Drop for Staged {
-    fn drop(&mut self) {
-        if !self.landed {
-            rustix::fs::unlinkat(&self.staging, self.name.as_str(), AtFlags::empty()).ok();
+impl Directory {
+    /// The staging file, opened on a file thread: `.vibe-staging/` (made
+    /// when it is not there), a fresh name, `O_CREAT | O_EXCL`, mode
+    /// `0640` whatever the program's umask.
+    async fn open_staging(&self) -> Result<Staged, Failure> {
+        let inner = Arc::clone(&self.inner);
+        in_time(&self.files, move || {
+            let opened = inner.opened()?;
+            let staging = staging(&opened)?;
+            let name = format!("{}{}", this_run(), uuid::Uuid::new_v4().simple());
+            let fd = rustix::fs::openat(
+                &staging,
+                name.as_str(),
+                OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::from_raw_mode(FILE_MODE),
+            )
+            .map_err(failure)?;
+            // The mode whatever the program's umask.
+            rustix::fs::fchmod(&fd, Mode::from_raw_mode(FILE_MODE)).map_err(failure)?;
+            Ok(Staged {
+                staging: Arc::new(staging),
+                name,
+                file: Arc::new(fd),
+            })
+        })
+        .await
+    }
+}
+
+/// Runs `job` on a file thread, its answer waited for within
+/// [`OPERATION_TIME`] in all — the place among the waiting jobs included
+/// (the pool's own wait is under it).
+async fn in_time<T: Send + 'static>(
+    files: &Files,
+    job: impl FnOnce() -> Result<T, Failure> + Send + 'static,
+) -> Result<T, Failure> {
+    let placed = tokio::time::timeout(OPERATION_TIME, files.run(job)).await;
+    let answer = match placed {
+        Err(_) => return Err(Failure::Time),
+        Ok(None) => return Err(Failure::Unavailable),
+        Ok(Some(answer)) => answer,
+    };
+    match tokio::time::timeout(OPERATION_TIME, answer).await {
+        Ok(Ok(answer)) => answer,
+        Ok(Err(_)) => Err(Failure::Unavailable),
+        Err(_) => Err(Failure::Time),
+    }
+}
+
+/// [`in_time`] for a job that must know when it is answered `limit`
+/// `time`: `timed_out` is set as the answer is `Time`, so that a job still
+/// running (a landing) does not do what that answer says did not happen.
+async fn in_time_until<T: Send + 'static>(
+    files: &Files,
+    timed_out: &Arc<AtomicBool>,
+    job: impl FnOnce() -> Result<T, Failure> + Send + 'static,
+) -> Result<T, Failure> {
+    let placed = tokio::time::timeout(OPERATION_TIME, files.run(job)).await;
+    let answer = match placed {
+        Err(_) => return Err(Failure::Time),
+        Ok(None) => return Err(Failure::Unavailable),
+        Ok(Some(answer)) => answer,
+    };
+    match tokio::time::timeout(OPERATION_TIME, answer).await {
+        Ok(Ok(answer)) => answer,
+        Ok(Err(_)) => Err(Failure::Unavailable),
+        Err(_) => {
+            timed_out.store(true, Ordering::SeqCst);
+            Err(Failure::Time)
         }
     }
 }
 
-fn put(
-    opened: &Opened,
+/// Writes `bytes` at `at` in the staging `file`: one `pwrite` job, its
+/// own [`OPERATION_TIME`]. A disk that is full fails `full`.
+async fn write(file: &Arc<OwnedFd>, bytes: Bytes, at: u64, files: &Files) -> Result<(), Failure> {
+    let file = Arc::clone(file);
+    in_time(files, move || {
+        let mut written = 0_usize;
+        while let Some(rest) = bytes.get(written..)
+            && !rest.is_empty()
+        {
+            let place = at + u64::try_from(written).unwrap_or(u64::MAX);
+            match pwrite(&file, rest, place) {
+                // A write of nothing on a regular file is not a write.
+                Ok(0) => return Err(Failure::Full),
+                Ok(n) => written += n,
+                Err(Errno::INTR) => {}
+                Err(e) => return Err(failure(e)),
+            }
+        }
+        Ok(())
+    })
+    .await
+}
+
+/// Removes the staging file `staged` names: a put that fails lands
+/// nothing and leaves nothing in staging. A write still in flight on the
+/// file ends harmlessly into the unlinked file.
+async fn remove(staged: &Staged, files: &Files) -> Result<(), Failure> {
+    let staged = staged.clone();
+    in_time(files, move || {
+        rustix::fs::unlinkat(&staged.staging, staged.name.as_str(), AtFlags::empty())
+            .map_err(failure)
+    })
+    .await
+}
+
+/// Lands the staged file, one job on a file thread, its own
+/// [`OPERATION_TIME`]: the content type on it, `fsync`, the folders of
+/// the key that are missing made, the rename onto the key, the folders
+/// `fsync`ed. Answers the metadata of the file as written.
+///
+/// The job is told when the put is given up (`given_up`) and when the
+/// landing has passed its own time (`timed_out` is set by
+/// [`in_time_until`] as it answers `limit` `time`), and looks at both
+/// immediately before the rename: a landing whose answer was already
+/// written `failed` does not land, and removes its staging file itself —
+/// the window left is the rename system call itself.
+async fn land(
+    inner: &Arc<Inner>,
+    staged: Staged,
     key: Key,
-    body: Body,
     content_type: Option<String>,
-    until: &Until,
+    given_up: GivenUp,
+    files: &Files,
 ) -> Result<Metadata, Failure> {
-    // The text is dropped as it is decoded; the room is kept until the
-    // bytes are gone too.
-    let (bytes, room) = body.decode().ok_or(Failure::Unavailable)?;
-    let staging = staging(opened)?;
-    let name = format!("{}{}", this_run(), uuid::Uuid::new_v4().simple());
-    let fd = rustix::fs::openat(
-        &staging,
-        name.as_str(),
-        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::from_raw_mode(FILE_MODE),
-    )
-    .map_err(failure)?;
-    let mut staged = Staged {
+    let inner = Arc::clone(inner);
+    let timed_out = Arc::new(AtomicBool::new(false));
+    let job_timed_out = Arc::clone(&timed_out);
+    in_time_until(files, &timed_out, move || {
+        land_now(&inner, staged, key, content_type, &given_up, &job_timed_out)
+    })
+    .await
+}
+
+fn land_now(
+    inner: &Arc<Inner>,
+    staged: Staged,
+    key: Key,
+    content_type: Option<String>,
+    given_up: &GivenUp,
+    timed_out: &AtomicBool,
+) -> Result<Metadata, Failure> {
+    let opened = inner.opened()?;
+    let Staged {
         staging,
         name,
-        file: std::fs::File::from(fd),
-        landed: false,
-    };
-    // The mode whatever the program's umask.
-    rustix::fs::fchmod(&staged.file, Mode::from_raw_mode(FILE_MODE)).map_err(failure)?;
-    staged.file.write_all(&bytes).map_err(|e| io_failure(&e))?;
-    drop(bytes);
-    drop(room);
+        file,
+    } = staged;
     if let Some(content_type) = &content_type {
         rustix::fs::fsetxattr(
-            &staged.file,
+            &file,
             CONTENT_TYPE_ATTRIBUTE,
             content_type.as_bytes(),
             XattrFlags::empty(),
         )
         .map_err(failure)?;
     }
-    rustix::fs::fsync(&staged.file).map_err(failure)?;
+    rustix::fs::fsync(&file).map_err(failure)?;
     let mut segments: Vec<&str> = key.segments().collect();
     let last = segments.pop().ok_or(Failure::Unavailable)?;
     for _ in 0..PUT_TRIES {
-        let (chain, made) = make_folders(opened, &segments)?;
+        let (chain, made) = make_folders(&opened, &segments)?;
         let parent = chain.last().map_or(opened.fd.as_fd(), AsFd::as_fd);
-        match land(&mut staged, parent, last, until) {
+        match rename_onto(&staging, &name, parent, last, given_up, timed_out) {
             Ok(true) => {}
             // A folder of it was removed meanwhile (a delete of its last
             // file): walked again.
             Ok(false) => {
-                unmake(opened, &chain, &segments, &made);
+                unmake(&opened, &chain, &segments, &made);
                 continue;
             }
-            Err(failure) => {
-                unmake(opened, &chain, &segments, &made);
-                return Err(failure);
+            Err(failed) => {
+                unmake(&opened, &chain, &segments, &made);
+                return Err(failed);
             }
         }
         rustix::fs::fsync(parent).map_err(failure)?;
         // Each folder made, in the folder that holds it.
         for index in made {
-            if let Some(holder) = holder_of(opened, &chain, index) {
+            if let Some(holder) = holder_of(&opened, &chain, index) {
                 rustix::fs::fsync(holder).map_err(failure)?;
             }
         }
-        let stat = rustix::fs::fstat(&staged.file).map_err(failure)?;
+        let stat = rustix::fs::fstat(&file).map_err(failure)?;
         return Ok(Metadata {
             content_type: content_type.unwrap_or_else(|| content_type_of(key.as_str()).to_owned()),
             key: key.into_string(),
@@ -936,13 +1167,19 @@ fn put(
     Err(Failure::Unavailable)
 }
 
-/// Renames the staged file onto `last` in `parent`: `true` once it landed,
-/// `false` when a folder of its key was removed meanwhile.
-fn land(
-    staged: &mut Staged,
+/// Renames the staged file onto `last` in `parent`: `true` once it
+/// landed, `false` when a folder of its key was removed meanwhile.
+///
+/// A put given up, or a landing past its time, is looked at once more here,
+/// immediately before the rename, and then the staging file is removed by
+/// this same job: the only window left is the rename system call itself.
+fn rename_onto(
+    staging: &OwnedFd,
+    name: &str,
     parent: BorrowedFd<'_>,
     last: &str,
-    until: &Until,
+    given_up: &GivenUp,
+    timed_out: &AtomicBool,
 ) -> Result<bool, Failure> {
     match rustix::fs::statat(parent, last, AtFlags::SYMLINK_NOFOLLOW) {
         Ok(stat) => match FileType::from_raw_mode(stat.st_mode) {
@@ -954,17 +1191,97 @@ fn land(
         Err(Errno::NOENT) => {}
         Err(e) => return Err(failure(e)),
     }
-    if until.over() {
-        return Err(over(until));
+    let timed_out = timed_out.load(Ordering::SeqCst);
+    if timed_out || *given_up.borrow() {
+        // The put does not land: nothing is left in staging, removed here,
+        // in the landing's own job (the caller's answer — `failed`
+        // `request-ended` or `limit` `time` — was already written).
+        rustix::fs::unlinkat(staging, name, AtFlags::empty()).ok();
+        return Err(if timed_out {
+            Failure::Time
+        } else {
+            Failure::Stopped
+        });
     }
-    match rustix::fs::renameat(&staged.staging, staged.name.as_str(), parent, last) {
-        Ok(()) => {
-            staged.landed = true;
-            Ok(true)
-        }
+    match rustix::fs::renameat(staging, name, parent, last) {
+        Ok(()) => Ok(true),
         Err(Errno::NOENT) => Ok(false),
         Err(Errno::ISDIR | Errno::NOTEMPTY | Errno::EXIST) => Err(Failure::KeyConflict),
         Err(e) => Err(failure(e)),
+    }
+}
+
+/// A file opened by a get, as the host reads its body: each read one
+/// `pread` job on the file threads, at the reader's own place (never the
+/// descriptor's), a chunk of at most [`CHUNK`]. Ends after exactly the
+/// size the file was opened with; a file found shorter while it is read
+/// fails, never ended as if whole.
+struct FileReader {
+    file: Arc<OwnedFd>,
+    size: u64,
+    at: Mutex<u64>,
+    files: Arc<Files>,
+}
+
+impl super::Reader for FileReader {
+    fn read(&self) -> Op<'_, super::Read> {
+        let file = Arc::clone(&self.file);
+        let files = Arc::clone(&self.files);
+        // Taken under the lock and given back after the job answers: the
+        // body's pump is the only reader, so the place is this reader's
+        // alone.
+        let at = *self
+            .at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let size = self.size;
+        Box::pin(async move {
+            let room = size.saturating_sub(at);
+            if room == 0 {
+                // The whole file was read: its exact end.
+                return Ok(super::Read::End);
+            }
+            let room = room.min(u64::try_from(CHUNK).unwrap_or(u64::MAX));
+            let room = usize::try_from(room).unwrap_or(CHUNK);
+            // One chunk, one job, its answer waited for within
+            // [`OPERATION_TIME`].
+            let read = in_time(&files, move || {
+                let mut buffer = vec![0_u8; room];
+                let mut filled = 0_usize;
+                while let Some(rest) = buffer.get_mut(filled..)
+                    && !rest.is_empty()
+                {
+                    let place = at + u64::try_from(filled).unwrap_or(u64::MAX);
+                    match pread(&file, rest, place) {
+                        // The file was shortened while it was read: it
+                        // fails, never ended as if whole.
+                        Ok(0) => return Err(Failure::Unavailable),
+                        Ok(n) => filled += n,
+                        Err(Errno::INTR) => {}
+                        Err(e) => return Err(failure(e)),
+                    }
+                }
+                Ok(Bytes::from(buffer))
+            })
+            .await;
+            let step = match read {
+                Ok(bytes) => {
+                    // The place the next read starts from. The lock is
+                    // taken again after the job, never held across the
+                    // await.
+                    *self
+                        .at
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        at + u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+                    super::Read::Chunk(bytes)
+                }
+                // The file was found shorter while it was read, or the
+                // read did not end within its time: the body fails.
+                Err(_) => super::Read::Failed,
+            };
+            Ok(step)
+        })
     }
 }
 

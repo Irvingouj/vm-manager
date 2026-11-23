@@ -527,6 +527,15 @@ impl Ingress {
                 }
             }
         }
+        // The request's stated length, read here for the request: a put of
+        // its own body checks the file's bound against it before a byte is
+        // read ("Storage: Bounds"). The `413` it may call for is answered
+        // after every other check, the method's `405` included (below).
+        let stated_length = parts
+            .headers
+            .get(CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|text| text.trim().parse::<u64>().ok());
         let in_flight = Arc::new(InFlight {
             request: Arc::clone(&id),
             user,
@@ -535,6 +544,11 @@ impl Ingress {
             declared: Arc::clone(&serving.declared),
             transactions: Transactions::default(),
             collected: Collected::default(),
+            bodies: std::sync::Arc::new(crate::storage::bodies::Bodies::default()),
+            // The request's stated length: a put of its own body checks
+            // the file's bound against it before a byte is read.
+            content_length: stated_length,
+            streams: std::sync::OnceLock::new(),
             stop,
         });
         let known = Known {
@@ -551,15 +565,14 @@ impl Ingress {
             );
         };
         // A stated length over the bound is `413` before the code runs
-        // (blackbox/CONTRACT.md, "What an Application is handed"). A body
-        // that states none has its bound checked as it is read, by the
-        // pump: it fails the stream, and the request is answered `413` when
-        // the answer has not been decided yet.
-        let stated_length = parts
-            .headers
-            .get(CONTENT_LENGTH)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|text| text.trim().parse::<u64>().ok());
+        // (blackbox/CONTRACT.md, "What an Application is handed"), after
+        // every other check: a request that is not signed in, not shared
+        // with its User, to an Application that is disabled or not there,
+        // or with a method the platform does not hand on, is answered as
+        // that, whatever length it states. A body that states none has its
+        // bound checked as it is read, by the pump: it fails the stream,
+        // and the request is answered `413` when the answer has not been
+        // decided yet.
         if stated_length.is_some_and(|stated| {
             stated > u64::try_from(MAX_REQUEST_BODY_BYTES).unwrap_or(u64::MAX)
         }) {
@@ -649,25 +662,35 @@ impl Ingress {
                 // handed"): nothing is sent, a `204` carries no
                 // `content-length`, and a body given back is not asked for.
                 let bodiless = parts.method == Method::HEAD || matches!(answer.status, 204 | 304);
+                // The length the platform states for a body it sends
+                // itself: a file's size; `None` for the request's own body
+                // given back (its stated one, or none and the body is sent
+                // chunked).
+                let answer_length = match &answer.body {
+                    AnswerBody::Streamed { length, .. } => *length,
+                    AnswerBody::Whole(_) => None,
+                };
                 let mut response = match answer.body {
                     AnswerBody::Whole(_) if bodiless => {
                         Response::new(Sent::Whole(Full::new(Bytes::new())))
                     }
                     AnswerBody::Whole(body) => Response::new(Sent::Whole(Full::new(body))),
-                    AnswerBody::Streamed { chunks } if bodiless => {
+                    AnswerBody::Streamed { .. } if bodiless => {
                         // Not asked for: the runtime closed the stream, and
                         // the pump (not moved into the response) is dropped
                         // with the request, so nothing is read from the
                         // client.
-                        drop(chunks);
                         Response::new(Sent::Whole(Full::new(Bytes::new())))
                     }
-                    AnswerBody::Streamed { chunks } => {
+                    AnswerBody::Streamed { chunks, held, .. } => {
                         // A body the host itself feeds, which the code did
-                        // not read: the host sends it, and its pump ends with
-                        // it. The connection watches the sending (see
-                        // crate::sent).
-                        let mut owned = Vec::new();
+                        // not read: the host sends it, and what feeds it
+                        // goes on past the request's code — the connection's
+                        // own pump for the request's body given back, the
+                        // file's pump taken over by the answer for a
+                        // Storage file's. The connection watches the sending
+                        // (see crate::sent).
+                        let mut owned = held;
                         if let Some(task) = pump.as_mut().and_then(Pump::take_task) {
                             owned.push(task);
                         }
@@ -689,9 +712,12 @@ impl Ingress {
                     response.headers_mut().remove(CONTENT_LENGTH);
                     response.headers_mut().remove(TRANSFER_ENCODING);
                 } else if matches!(response.body(), Sent::Stream(_)) {
-                    // The host sets `content-length` itself: the request's
-                    // stated one, or none — and the body is sent chunked.
-                    match stated_length {
+                    // The host sets `content-length` itself: the file's
+                    // size for a file, whatever the code set; for the
+                    // request's own body given back, the request's stated
+                    // one, and when the request stated none, none — and
+                    // the body is sent chunked.
+                    match answer_length.or(stated_length) {
                         Some(length) => {
                             if let Ok(value) = HeaderValue::from_str(&length.to_string()) {
                                 response.headers_mut().insert(CONTENT_LENGTH, value);

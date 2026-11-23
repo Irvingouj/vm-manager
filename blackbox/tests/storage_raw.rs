@@ -29,7 +29,7 @@ fn put_head_get_and_delete_answer_as_the_contract_says() {
     let s = Storage::ready_streams();
     let bytes = binary_with("every byte");
     let written = s.put_hex_ok("reports/q3.pdf", &bytes, None);
-    assert_ok_metadata(
+    assert_metadata(
         &written,
         "reports/q3.pdf",
         bytes.len(),

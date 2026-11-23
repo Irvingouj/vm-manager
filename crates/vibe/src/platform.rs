@@ -22,7 +22,7 @@ use crate::platform_db::{self, Cause, DatabaseAddress, OpenError, PlatformDataba
 use crate::registry::Registry;
 use crate::resources::Resources;
 use crate::runner::{self, RequestRunner};
-use crate::storage::{self, Bodies, Files, Root, Storage};
+use crate::storage::{self, Files, Root, Storage};
 use crate::usage::{self, Usage};
 
 /// The bounds the parts are made with.
@@ -155,7 +155,7 @@ impl Platform {
         let log = Arc::new(OperationLog::new(Arc::clone(&database)));
         let storage = Arc::new(Storage {
             files,
-            bodies: Arc::new(Bodies::default()),
+            open: Arc::new(storage::Open::default()),
             cursors,
             root,
         });

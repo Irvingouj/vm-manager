@@ -356,12 +356,28 @@ export interface FileInfo {
   readonly lastModified: Date;
 }
 
-/** A file read whole. */
+/**
+ * A file the host opened, as `get` answers it. `body` is the stream the
+ * host feeds as the code reads it, in chunks of at most 64 KiB: the file
+ * never enters the Application's memory whole unless the code reads it
+ * so. It is the file as it was when it was opened, and ends after
+ * exactly `size` bytes.
+ */
 export interface StoredFile extends FileInfo {
-  /** Its bytes, over an ArrayBuffer of their own: a Response's body as it is. */
-  readonly body: Uint8Array<ArrayBuffer>;
-  /** The body decoded as UTF-8 (malformed bytes become U+FFFD). */
-  text(): string;
+  /** The file's bytes, fed by the host as it is read: a Response's body as it is. */
+  readonly body: ReadableStream<Uint8Array>;
+  /** True once the body began to be read. */
+  readonly bodyUsed: boolean;
+  /**
+   * Each of these four reads the stream to its end, so each can be used
+   * once, and none after `body` was read: a second use rejects with a
+   * TypeError, as a Response's does. `text()` reads the body as UTF-8
+   * (malformed bytes become U+FFFD).
+   */
+  arrayBuffer(): Promise<ArrayBuffer>;
+  bytes(): Promise<Uint8Array>;
+  text(): Promise<string>;
+  json(): Promise<unknown>;
 }
 
 export interface ListOptions {
@@ -389,8 +405,18 @@ export interface FileList {
   readonly cursor: string | null;
 }
 
-/** What a put writes: a string is written as UTF-8. */
-export type FileBody = string | Uint8Array | ArrayBuffer;
+/**
+ * What a put writes: a stream (fed to the host as it is read), a string
+ * (written as UTF-8), an ArrayBuffer, an ArrayBufferView, a Blob, or null
+ * (an empty file — a request with no body has `request.body` null).
+ */
+export type FileBody =
+  | ReadableStream<Uint8Array>
+  | string
+  | ArrayBuffer
+  | ArrayBufferView
+  | Blob
+  | null;
 
 export interface PutOptions {
   /** 1 to 255 printable ASCII characters holding a `/`; without it, the key's extension gives it. */

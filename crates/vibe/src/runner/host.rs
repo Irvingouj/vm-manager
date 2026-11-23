@@ -32,7 +32,7 @@ pub const APPLICATION_BINDING: &str = "VM";
 pub const PLATFORM_BINDING: &str = "__vm_platform";
 
 pub struct HostOps {
-    in_flight: Arc<InFlight>,
+    pub(super) in_flight: Arc<InFlight>,
     gateway: Arc<dyn Gateway>,
     /// The request is in flight: its event has started and not ended.
     active: AtomicBool,
@@ -64,11 +64,15 @@ impl HostOps {
     }
 
     /// The request is over: from now on this context speaks for no one,
-    /// and every transaction it left open is rolled back.
+    /// every transaction it left open is rolled back, and its open
+    /// bodies end — a put still running is given up, the pumps of bodies
+    /// nobody reads any more are ended (a body being sent as the response
+    /// had its pump taken by the answer, and goes on).
     pub fn end(&self) {
         self.ended.store(true, Ordering::SeqCst);
         self.active.store(false, Ordering::SeqCst);
         self.in_flight.transactions.end();
+        self.in_flight.bodies.end();
     }
 
     pub fn failed(&self) -> bool {

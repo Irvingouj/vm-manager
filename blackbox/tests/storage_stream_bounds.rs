@@ -110,8 +110,8 @@ fn a_put_of_a_request_stating_more_than_5_gib_fails_limit_bytes_before_a_byte_is
     std::os::unix::fs::symlink(s.place.outside(), dir.join("etc")).unwrap();
     for (key, expected) in [
         ("../x", "invalid-key"),
-        ("etc/x", "limit"),
-        ("fine.bin", "limit"),
+        ("etc/x", "bytes"),
+        ("fine.bin", "bytes"),
     ] {
         let mut raw = stated(&s, STREAM_PUT, Some(&wanda()), key, Framing::Length(over));
         let began = Instant::now();
@@ -619,14 +619,32 @@ fn the_runtimes_own_globals_throw_on_a_17th_stream_and_on_a_chunk_over_64_kib() 
 
 #[test]
 fn a_hostile_application_opens_every_stream_and_writes_the_largest_chunks_within_128_mib() {
+    // About 12 seconds. The worst one request may hold, within the two
+    // bounds of "Storage: Bounds": files open at once are 16 for one request
+    // (a body being read or written counts), streams of its own 16. A put
+    // of a stream of its own holds one of each, an unread get only a file;
+    // so 16 puts would hold 16 files and 16 streams, 16 gets only 16 files.
+    // The mix is 8 unread gets of a 16 MiB file (the bodies open, nothing
+    // read) and 8 puts of streams of its own, started together, each
+    // writing 4 MiB in chunks of 64 KiB (the largest the glue lets
+    // through): 16 files, the whole of that bound, with the program holding
+    // the 8 files being written, their staging and their reading ahead at
+    // the same time as the 8 reads. One more get and one more put are tried
+    // while all of it is open: each finds no place, waits about 5 seconds
+    // and fails `unavailable`, as "Files open at once" says (a 17th of
+    // either is the bound met, not an error of the test). The program's
+    // resident memory, sampled every 20 ms, must stay under 128 MiB above
+    // its baseline. One such request is made; the bounds of the whole
+    // program (8 threads, 64 waiting, 256 MiB of bodies) are not provoked
+    // (see `storage_bounds.rs`).
     let s = Storage::ready_streams();
     let pid = s.vm.pid();
-    let held: Vec<u8> = (0..1024 * 1024)
+    let held: Vec<u8> = (0..16 * 1024 * 1024)
         .map(|n| u8::try_from(n % 239).unwrap_or(0))
         .collect();
     place(&s.dir(MARKETING).join("flood/held.bin"), &held);
     let bytes_each: usize = 4 * 1024 * 1024;
-    let flood = |count: usize, bytes_each: usize| {
+    let flood = |gets: usize, puts: usize, bytes_each: usize| {
         s.post(
             &wanda(),
             STREAM_HOSTILE,
@@ -635,20 +653,46 @@ fn a_hostile_application_opens_every_stream_and_writes_the_largest_chunks_within
                 "resource": MARKETING,
                 "key": "flood/held.bin",
                 "keyPrefix": "flood",
-                "count": count,
+                "gets": gets,
+                "puts": puts,
                 "bytesEach": bytes_each,
             }),
         )
         .1
     };
     // Once small first: what the program allocates the first time is in the
-    // baseline.
-    flood(1, 64 * 1024);
+    // baseline. (It also waits for the extras once: about 5 seconds.)
+    flood(1, 1, 64 * 1024);
+    // (Its extra put found a place and landed: not the refused one's.)
+    std::fs::remove_file(s.dir(MARKETING).join("flood/extra.bin")).unwrap();
     let before = memory_of(pid, "VmRSS");
-    let (answer, peak) = sampled(pid, || flood(16, bytes_each));
+    let (answer, peak) = sampled(pid, || flood(8, 8, bytes_each));
     let empty = Vec::new();
+    let gets = answer["gets"].as_array().unwrap_or(&empty);
+    assert_eq!(gets.len(), 8, "{answer}");
+    assert!(
+        gets.iter().all(|g| g["ok"] == json!(true)),
+        "expected all 8 gets of the hostile fixture to open: {answer}"
+    );
+    assert_eq!(
+        answer["together"],
+        json!(true),
+        "expected all 8 puts to be open and being written at once: {answer}"
+    );
+    for (what, extra) in [("get", &answer["extraGet"]), ("put", &answer["extraPut"])] {
+        assert_eq!(
+            extra["answer"]["error"]["kind"].as_str(),
+            Some("unavailable"),
+            "expected the 17th file of one request (an extra {what}) `unavailable`, got {extra}"
+        );
+        let waited = extra["ms"].as_u64().unwrap_or(0);
+        assert!(
+            (4_000..=9_000).contains(&waited),
+            "expected the extra {what} to wait about 5 seconds for a place, it waited {waited} ms"
+        );
+    }
     let puts = answer["puts"].as_array().unwrap_or(&empty);
-    assert_eq!(puts.len(), 16, "{answer}");
+    assert_eq!(puts.len(), 8, "{answer}");
     for (n, put) in puts.iter().enumerate() {
         assert!(
             put["ok"].is_object(),
@@ -663,6 +707,10 @@ fn a_hostile_application_opens_every_stream_and_writes_the_largest_chunks_within
             "put {n}: expected the bytes the code's stream wrote"
         );
     }
+    assert!(
+        !s.dir(MARKETING).join("flood/extra.bin").exists(),
+        "expected the refused extra put to have landed nothing"
+    );
     let rose = peak.saturating_sub(before);
     assert!(
         rose <= 128 * MIB,

@@ -46,6 +46,10 @@ postgres-protocol = "0.6"
 # How postgres-protocol hands over the fields of a message.
 fallible-iterator = "0.2"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "sync", "macros", "time", "io-util", "process", "signal"] }
+# A connection's own handle on its socket, for ending it early with a reset
+# when a body being sent is cut (crates/vibe/src/server.rs): already in the
+# tree through tokio.
+socket2 = "0.6"
 # Stopping a whole process group (`vibe check` runs each of the project's
 # tools in a group of its own), behind a safe interface; and `fs`, to tell
 # whether standard output was closed when the tool started (`vibe logs

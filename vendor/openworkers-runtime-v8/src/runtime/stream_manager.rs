@@ -35,11 +35,14 @@ pub enum StreamChunk {
 
 /// A response body that was a stream the host itself feeds: whether the
 /// guest had read from it before the response was read (vendor/VENDORED.md,
-/// patch 6). A body the guest did not read is the host's to send itself; one
-/// it began to read is not.
+/// patch 6), and which stream it is, so the host can take over what feeds
+/// it for a body it sends itself (patch 14). A body the guest did not read
+/// is the host's to send itself; one it began to read is not.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HostResponse {
     pub read: bool,
+    /// The host-fed stream the response's body is.
+    pub id: StreamId,
 }
 
 /// Manages all active streams and their communication channels
@@ -65,6 +68,11 @@ pub struct StreamManager {
     /// Host-fed streams the response took to send (patch 11): their sending
     /// goes on after the event, so they are not closed with the request.
     taken: Arc<Mutex<HashSet<StreamId>>>,
+    /// The request's own body's stream, when it has one: the only stream
+    /// whose reads (or the response taking it, or a put) tell the host to
+    /// read the body from the client (patch 15). A file's body the host
+    /// feeds is not it — reading one asks for nothing.
+    request_body: Arc<Mutex<Option<StreamId>>>,
     /// Whether the guest (or the response) has asked for the host-fed body:
     /// the host reads it only then (patch 9). The channel says once, and
     /// stays said.
@@ -94,6 +102,7 @@ impl StreamManager {
             host_response: Arc::new(Mutex::new(None)),
             guest_streams: Arc::new(Mutex::new(HashSet::new())),
             taken: Arc::new(Mutex::new(HashSet::new())),
+            request_body: Arc::new(Mutex::new(None)),
             asked: Arc::new(Mutex::new(None)),
             next_id: Arc::new(Mutex::new(1)),
             high_water_mark,
@@ -206,10 +215,11 @@ impl StreamManager {
             ));
         };
 
-        // A read of a host-fed body is noted for the response the guest may
-        // give back (patch 6), and it is the guest asking for the body,
-        // which the host reads only then (patch 9).
-        let host_fed_stream = {
+        // A read of the request's own body is the guest asking for it,
+        // which the host reads only then (patch 9). Only that one marks
+        // it (patch 15): a file's body the host feeds is not the
+        // request's, and reading it asks for nothing.
+        let is_request_body = {
             let mut host_fed = self.host_fed.lock().unwrap();
             match host_fed.get_mut(&stream_id) {
                 Some(read) => {
@@ -219,7 +229,7 @@ impl StreamManager {
                 None => false,
             }
         };
-        if host_fed_stream {
+        if is_request_body && self.request_body() == Some(stream_id) {
             self.mark_asked();
         }
 
@@ -269,16 +279,14 @@ impl StreamManager {
         // Nothing was there to take (the guest closed it, or a read holds it
         // right now): nothing is asked for and nothing is the host's.
         let receiver = receiver?;
-        // A host-fed stream taken for the response's body is one the host is
-        // about to send: it asked for it, and the host reads it from then on
-        // (patch 9). A stream the guest cancelled was closed, so nothing is
-        // taken here and the cancel's "do not ask" stands (patch 12).
-        if self
-            .host_fed
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .contains_key(&stream_id)
-        {
+        // The request's own body taken for the response (or a put) is one
+        // the host is about to send or write: it asked for it, and the
+        // host reads it from then on (patch 9). Only that one marks it
+        // (patch 15): a file's body taken is not the request's, and taking
+        // it asks for nothing. A stream the guest cancelled was closed, so
+        // nothing is taken here and the cancel's "do not ask" stands
+        // (patch 12).
+        if self.request_body() == Some(stream_id) {
             self.mark_asked();
         }
         self.taken
@@ -329,6 +337,13 @@ impl StreamManager {
     /// receiver in the map for a stream with no sender. Every lock here is
     /// poison-safe because this is reached from `RequestContext::drop`
     /// (Rust rule 4: no panic on the way out).
+    ///
+    /// A stream closed for good is forgotten by the manager: its `host_fed`
+    /// mark and its `taken` mark go with its sender, its receiver and its
+    /// metadata (patch 16). A body read to its end, cancelled, failed or
+    /// sent to its end therefore leaves nothing in the manager — a request
+    /// that gets a small file and reads it a thousand times holds a
+    /// thousand ids' worth of nothing.
     pub fn close_stream(&self, stream_id: StreamId) {
         let mut senders = self
             .senders
@@ -341,6 +356,14 @@ impl StreamManager {
             .remove(&stream_id);
         drop(senders);
         self.metadata
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&stream_id);
+        self.host_fed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&stream_id);
+        self.taken
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&stream_id);
@@ -362,6 +385,9 @@ impl StreamManager {
         *self.host_response.lock().unwrap() = None;
         self.guest_streams.lock().unwrap().clear();
         self.taken.lock().unwrap().clear();
+        // The request's body went with its streams; a reused context has
+        // none until the host pumps the next request's (patch 15).
+        *self.request_body.lock().unwrap() = None;
         // `asked` is not cleared here: it belongs to the request the host is
         // running (the host attaches one per request), and dropping it at a
         // reset would tell the host's body pump that nobody asked.
@@ -437,6 +463,13 @@ impl StreamManager {
         self.guest_streams.lock().unwrap().contains(&stream_id)
     }
 
+    /// The request's own body's stream, when it has one (patch 15): the
+    /// one stream whose reads and takings tell the host to read the body
+    /// from the client. A file's body is not it.
+    pub fn request_body(&self) -> Option<StreamId> {
+        *self.request_body.lock().unwrap()
+    }
+
     /// Whether `stream_id` is a stream the host feeds (patch 6).
     pub fn is_host_fed(&self, stream_id: StreamId) -> bool {
         self.host_fed.lock().unwrap().contains_key(&stream_id)
@@ -460,7 +493,8 @@ impl StreamManager {
     /// event. Any other body leaves it `None`.
     pub fn note_host_response(&self, stream_id: StreamId) {
         let read = self.host_fed_read(stream_id);
-        *self.host_response.lock().unwrap() = read.map(|read| HostResponse { read });
+        *self.host_response.lock().unwrap() =
+            read.map(|read| HostResponse { read, id: stream_id });
     }
 
     /// The response's body, when it was a host-fed stream (patch 6).
@@ -494,8 +528,11 @@ impl StreamManager {
     ) -> StreamId {
         let stream_id = self.create_stream("request_body".to_string());
         // The request's body is the host's, not the guest's: a response that
-        // gives it back unread is the host's to send (patch 6).
+        // gives it back unread is the host's to send (patch 6), and it is
+        // the one stream whose reads and takings tell the host to read the
+        // body from the client (patch 15).
         self.mark_host_fed(stream_id);
+        *self.request_body.lock().unwrap() = Some(stream_id);
         let stream_manager = self.clone();
 
         tokio::spawn(async move {

@@ -41,12 +41,12 @@ use tokio::task::JoinSet;
 use crate::app_logs::Collected;
 use crate::gateway::{Gateway, Transactions};
 use crate::registry::{Declared, Serving, Stop};
+use crate::storage::bodies::Bodies;
 use crate::user::User;
 use host::{APPLICATION_BINDING, HostOps};
 
 /// Whose request is in flight, for which Application. Fixed when the
 /// request's context is made; the host speaks for it, and for nothing else.
-#[derive(Debug)]
 pub struct InFlight {
     /// The request's id, as in `x-vm-request-id` and the log.
     pub request: Arc<str>,
@@ -62,11 +62,38 @@ pub struct InFlight {
     /// What its context printed and did not catch, for its log entry
     /// (crate::app_logs).
     pub collected: Collected,
+    /// The bodies this request holds open (blackbox/CONTRACT.md,
+    /// "Storage: Bounds"): their places, the pumps and put tasks that feed
+    /// them, and the signal of the request's end, on which a put still
+    /// running is given up.
+    pub bodies: Arc<Bodies>,
+    /// The request's stated `content-length`, when there was one: a put
+    /// of the request's own body checks the file's bound against it
+    /// before a byte is read.
+    pub content_length: Option<u64>,
+    /// The streams of this request's context, filled once the context
+    /// exists ([`Engine::serve_in`]). A storage get answers a body as a
+    /// stream the host feeds through it; a put takes one.
+    pub streams: std::sync::OnceLock<Arc<StreamManager>>,
     /// Fired when a Platform administrator disables the Application
     /// (blackbox/CONTRACT.md, "What Platform administrators see and stop:
     /// Requests in flight"): the request is answered so at once, its code
     /// stopped, and its operations refused.
     pub stop: Arc<Stop>,
+}
+
+impl std::fmt::Debug for InFlight {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Nothing below names a body or a stream: what they hold is the
+        // request's own.
+        f.debug_struct("InFlight")
+            .field("request", &self.request)
+            .field("user", &self.user)
+            .field("application", &self.application)
+            .field("version", &self.version)
+            .field("declared", &self.declared)
+            .finish_non_exhaustive()
+    }
 }
 
 /// What the Application answered.
@@ -83,13 +110,23 @@ pub enum AnswerBody {
     /// The whole body, at most `Limits::max_body_bytes`: every body the code
     /// made, and one it began to read before giving back.
     Whole(Bytes),
-    /// The request's own body, given back unread: a stream the host itself
-    /// feeds, which the host sends itself, after the code has ended if need
-    /// be (blackbox/CONTRACT.md, "What an Application is handed"). Never
+    /// A body the host itself feeds, given back unread: a stream the host
+    /// sends itself, after the code has ended if need be
+    /// (blackbox/CONTRACT.md, "What an Application is handed"). Never
     /// collected here; at most 16 chunks of 64 KiB are in flight in the
     /// runtime's channel, and the platform sets `content-length`.
     Streamed {
         chunks: mpsc::Receiver<Result<Bytes, String>>,
+        /// What feeds the body and must outlive the request's code: the
+        /// pump of a Storage file's body, taken over from the request's
+        /// open bodies. The request's own body given back holds nothing
+        /// here (the connection owns its pump).
+        held: Vec<crate::sent::OwnedTask>,
+        /// The length the platform states, when it knows one: a file's
+        /// size; `None` for the request's own body given back, whose
+        /// `content-length` the request stated (or none, and the body is
+        /// sent chunked).
+        length: Option<u64>,
     },
 }
 
@@ -428,17 +465,26 @@ impl Engine {
         // The runtime's streams, read after the event for the one thing the
         // host needs to know of them: which host-fed stream became the
         // response's body, and whether the code read it
-        // (vendor/VENDORED.md, patch 6).
+        // (vendor/VENDORED.md, patch 6). Named for the host's operations
+        // (a storage get answers a body as a stream through them, a put
+        // takes one) before the event, so a call made in it finds them.
         let stream_manager = worker.stream_manager();
+        drop(host.in_flight.streams.set(Arc::clone(&stream_manager)));
         // The request's body is read only when the code (or the response)
         // asks for it (vendor/VENDORED.md, patch 9). Attached before the
         // event: a body asked for at its first read is seen.
         stream_manager.watch_asked(asked);
         let (event, response) = Event::fetch(request);
         host.begin();
+        let in_flight = Arc::clone(&host.in_flight);
         let (ran, answer) = tokio::join!(
             worker.exec(event),
-            collect(stream_manager, response, self.limits.max_body_bytes)
+            collect(
+                &in_flight,
+                stream_manager,
+                response,
+                self.limits.max_body_bytes
+            )
         );
         host.end();
         // The context, and all it holds, goes now.
@@ -474,11 +520,12 @@ fn describe(reason: &TerminationReason) -> String {
 ///
 /// The one body not read here is a stream the runtime says the host itself
 /// feeds and the Application's code did not read (the request's own body
-/// given back): it is handed on as it is, to be sent by the connection. A
-/// body the code began to read is no longer the host's to vouch for, and is
-/// read whole as every other body is (blackbox/CONTRACT.md, "What an
-/// Application is handed").
+/// given back, a Storage file's): it is handed on as it is, to be sent by
+/// the connection. A body the code began to read is no longer the host's
+/// to vouch for, and is read whole as every other body is
+/// (blackbox/CONTRACT.md, "What an Application is handed").
 async fn collect(
+    in_flight: &Arc<InFlight>,
     stream_manager: Arc<StreamManager>,
     response: oneshot::Receiver<HttpResponse>,
     max_body_bytes: usize,
@@ -487,8 +534,8 @@ async fn collect(
         .await
         .map_err(|_| "the Application gave no response".to_owned())?;
     // Told by the runtime before the response was sent (vendor/VENDORED.md,
-    // patch 6): `Some(read)` when the response's body is a host-fed stream,
-    // and whether the code had read from it.
+    // patch 6): `Some(read)` when the response's body is a host-fed
+    // stream, and whether the code had read from it.
     let host_fed = stream_manager.host_response();
     let body = match response.body {
         ResponseBody::None => AnswerBody::Whole(Bytes::new()),
@@ -504,10 +551,24 @@ async fn collect(
             if let Some(host_fed) = host_fed
                 && !host_fed.read
             {
+                // A body the host sends itself. A Storage file's body is
+                // fed by the request's own pump: the sending goes on
+                // after the code has ended, so the answer takes the pump
+                // over (with the file's size, the `content-length` the
+                // platform states); the request's own body given back is
+                // fed by the connection's own pump.
+                let (held, length) = match in_flight.bodies.take_for_sending(host_fed.id) {
+                    Some((pump, length)) => (vec![pump], length),
+                    None => (Vec::new(), None),
+                };
                 return Ok(Answer {
                     status: response.status,
                     headers: response.headers,
-                    body: AnswerBody::Streamed { chunks },
+                    body: AnswerBody::Streamed {
+                        chunks,
+                        held,
+                        length,
+                    },
                 });
             }
             let mut body = BytesMut::new();

@@ -253,17 +253,29 @@ impl SentControl {
 /// A task with an owner: dropped (and so aborted) with the value that holds
 /// it (Rust rules, "Every spawned task has an owner").
 #[derive(Debug)]
-pub struct OwnedTask(tokio::task::JoinHandle<()>);
+pub struct OwnedTask(Option<tokio::task::JoinHandle<()>>);
 
 impl OwnedTask {
     pub fn new(handle: tokio::task::JoinHandle<()>) -> Self {
-        Self(handle)
+        Self(Some(handle))
+    }
+
+    /// Waits for the task to end, at most `wait`; a task still running then,
+    /// or when this wait is itself dropped, is aborted. The handle stays in
+    /// `self` for that: a `JoinHandle` that is merely dropped detaches its
+    /// task, it does not end it, so the abort is `Drop`'s, below.
+    pub async fn wait(mut self, wait: std::time::Duration) {
+        if let Some(handle) = self.0.as_mut() {
+            drop(tokio::time::timeout(wait, handle).await);
+        }
     }
 }
 
 impl Drop for OwnedTask {
     fn drop(&mut self) {
-        self.0.abort();
+        if let Some(handle) = &self.0 {
+            handle.abort();
+        }
     }
 }
 
@@ -344,5 +356,23 @@ mod tests {
             .unwrap();
         let failed = body.frame().await.unwrap();
         assert!(failed.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_task_still_running_when_its_wait_ends_is_aborted() {
+        // A `JoinHandle` merely dropped detaches its task: the wait keeps
+        // the handle so that `Drop` aborts a task that outlived the bound.
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::clone(&ran);
+        let task = OwnedTask::new(tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        }));
+        task.wait(Duration::from_millis(1)).await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            !ran.load(std::sync::atomic::Ordering::SeqCst),
+            "a task still running when its owner's wait ended was aborted, not left detached"
+        );
     }
 }

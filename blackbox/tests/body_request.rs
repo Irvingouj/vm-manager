@@ -168,6 +168,55 @@ fn sign_in_sharing_and_not_there_are_answered_as_that_whatever_length_is_stated_
 }
 
 #[test]
+fn a_method_the_platform_does_not_hand_on_is_405_whatever_length_is_stated() {
+    // "... or with a method the platform does not hand on (`405`) is
+    // answered as that, whatever length it states": a `PURGE` stating one
+    // byte over the bound, its body never sent, is `405` and not `413`, and
+    // no code ran for it.
+    let vm = vm();
+    let mut raw = Raw::connect(vm.address());
+    raw.send_head(
+        "PURGE",
+        "/never-reads",
+        &vm.host_of(APP),
+        Some(&bob()),
+        Framing::Length(REQUEST_BODY_BOUND + 1),
+        &[],
+    );
+    let head = raw.read_head(ANSWER_WAIT);
+    assert_eq!(
+        head.status,
+        405,
+        "expected 405 for a method the platform does not hand on stating {} bytes, got {}",
+        REQUEST_BODY_BOUND + 1,
+        head.status
+    );
+    assert_eq!(
+        code_records(&vm, &head.request_id()),
+        Vec::<Value>::new(),
+        "expected no code to have run"
+    );
+}
+
+#[test]
+fn a_method_the_platform_does_not_hand_on_is_405_before_413_in_the_local_run_too() {
+    // About the start of `vibe dev` (the slow part), then a request.
+    let local = Local::new();
+    let project = local_project(&local.machine, "body-dev-405", &[]);
+    let dev = Dev::start(&local, &project.dir, "body-dev-405");
+    let cookie = format!("vm_test_user={OUTSIDER}");
+    let over_bound = usize::try_from(REQUEST_BODY_BOUND + 1).expect("fits in usize");
+    let answer = dev
+        .request("/")
+        .method("PURGE")
+        .header("cookie", &cookie)
+        .declare_length(over_bound)
+        .send();
+    answer.expect_status(405);
+    dev.stop("INT").expect_code(0);
+}
+
+#[test]
 fn a_disabled_application_answers_as_disabled_whatever_length_is_stated() {
     // Needs the administrators' Group to disable: its own program.
     let vm = Vm::start(&admin::options());

@@ -11,9 +11,12 @@
 //!   this trait, not a second feature.
 //! - [`key`]: the rules of a key, the same for every backend, and how a key
 //!   is written in the Operation log.
-//! - [`Body`], a put's body as the raw interface carries it (base64 text),
-//!   looked at without being decoded; [`Bodies`], the program's one budget
-//!   of bodies held at once; [`content_type_of`] and [`is_content_type`].
+//! - [`Source`] and [`Reader`]: a body as the interface carries it — a
+//!   put's body is chunks as they arrive (a stream in is what S3 offers:
+//!   a multipart upload), and a get answers the file's bytes as chunks
+//!   (a response body), so no backend is asked to hold a file whole.
+//!   [`bodies`]: the bounds on bodies open at once, 16 a request and 512
+//!   the program. [`content_type_of`] and [`is_content_type`].
 //! - [`cursor`]: a list's cursor, sealed so that only one this program
 //!   answered for the same Resource, prefix and delimiter is taken.
 //! - [`Root`] (crate::storage::directory): the installation's storage root
@@ -29,37 +32,40 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use base64::Engine as _;
-use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use bytes::Bytes;
+use openworkers_runtime_v8::runtime::stream_manager::StreamChunk;
+use tokio::sync::{mpsc, watch};
 
+pub mod bodies;
 pub mod cursor;
 pub mod directory;
 pub mod files;
 pub mod key;
 
+pub use bodies::{Bodies, Guard, Open};
 pub use directory::{Directory, Root};
 pub use files::Files;
 pub use key::Key;
 
-/// The most bytes a put's body or a get's file has: 8 MiB, exactly that
+/// The most bytes a put's body or a get's file has: 5 GiB (5,368,709,120
+/// bytes), exactly that taken. Past it, `limit` `bytes`.
+pub const FILE_BYTES: u64 = 5 * 1024 * 1024 * 1024;
+
+/// A chunk of a body, fed to the code or written to the staging file: at
+/// most 64 KiB (blackbox/CONTRACT.md, "Storage: Bounds"); exactly that is
 /// taken.
-pub const BODY_BYTES: usize = 8 * 1024 * 1024;
+pub const CHUNK: usize = 64 * 1024;
 
-/// The length of the base64 text (with padding) of [`BODY_BYTES`]: a text
-/// longer than this is past the bound whatever it holds, and is not looked
-/// at.
-pub const BODY_TEXT: usize = BODY_BYTES.div_ceil(3) * 4;
-
-/// The most bytes of bodies storage operations hold at once in the
-/// program.
-pub const BODIES_AT_ONCE: usize = 256 * 1024 * 1024;
-
-/// How long an operation waits for room among [`BODIES_AT_ONCE`].
-pub const ROOM_WAIT: Duration = Duration::from_secs(5);
-
-/// The time an operation has from the moment it is decided.
+/// The time an operation has from the moment it is decided (head, get,
+/// delete, list; a put ends with its request instead, its one writes and
+/// its landing each having their own [`OPERATION_TIME`]).
 pub const OPERATION_TIME: Duration = Duration::from_secs(10);
+
+/// What the code's read of a body sees when the file it is reading
+/// failed: the stream fails with these words — a file found shorter than
+/// it was when it was opened is never ended as if whole.
+pub const BODY_FAILED: &str =
+    "the file's body failed: it is shorter than it was when it was opened, or could not be read";
 
 /// How long a list looks before it answers what it has, with the cursor
 /// of where it got to: a page may hold fewer than `limit`, even nothing.
@@ -86,17 +92,41 @@ pub struct Metadata {
     pub modified: i64,
 }
 
-/// A file read whole.
-#[derive(Debug)]
-pub struct Got {
+/// A file opened by a get, as the host reads its bytes: its metadata,
+/// and a [`Reader`] the host feeds the code's stream from. The reader is
+/// the file as it was when it was opened.
+pub struct Opened {
     pub metadata: Metadata,
-    /// Its bytes in standard base64 with padding: the only form the raw
-    /// interface carries a body in, made where the bytes were read so that
-    /// no async worker encodes 8 MiB.
-    pub body: String,
-    /// The room its body holds among [`BODIES_AT_ONCE`], until the answer is
-    /// handed on.
-    pub room: Room,
+    pub reader: Arc<dyn Reader>,
+}
+
+impl std::fmt::Debug for Opened {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Opened")
+            .field("metadata", &self.metadata)
+            .finish_non_exhaustive()
+    }
+}
+
+/// One step of reading a get's body: the next chunk, its whole end, or
+/// its failure.
+#[derive(Debug)]
+pub enum Read {
+    /// The next bytes: at most [`CHUNK`].
+    Chunk(Bytes),
+    /// The body's end, after exactly the size the file was opened with.
+    End,
+    /// The body failed — the file was found shorter while it was read,
+    /// or could not be read: the stream the code reads fails with
+    /// [`BODY_FAILED`], never ended as if whole.
+    Failed,
+}
+
+/// A file opened by a get, as the host reads its body: one chunk at a
+/// time, each read a job on the file threads (a response body for S3
+/// later, fetched as it is read). See [`Read`] for what a read answers.
+pub trait Reader: Send + Sync {
+    fn read(&self) -> Op<'_, Read>;
 }
 
 /// Where a list goes on from: after `last`, and when `folder`, after
@@ -160,10 +190,14 @@ impl Unreachable {
 /// How an operation failed after it was allowed and its key taken.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Failure {
-    /// A body, or a file to get, is larger than [`BODY_BYTES`].
+    /// A body, or a file to get, is larger than [`FILE_BYTES`].
     Bytes,
     /// The operation did not end within its time.
     Time,
+    /// A put's body failed before its end: a stream of the code's own
+    /// errored, or the request's body failed while the put read it (past
+    /// its bound, no byte for 10 seconds, the client gone).
+    BodyFailed,
     /// A put where a file is a folder of the key, or a folder is the key.
     KeyConflict,
     NotReachable(Unreachable),
@@ -172,10 +206,10 @@ pub enum Failure {
     /// The place of files cannot be used now, any other error of it, or no
     /// room for the operation now.
     Unavailable,
-    /// Given up by the host (a disable). Looked at before anything is
-    /// changed and once more before a put lands; a put given up while its
-    /// last system calls run (the rename, the `fsync`s) may have landed,
-    /// whole, as one past its time may.
+    /// Given up: its request ended or its Application was disabled. Looked
+    /// at before a put's landing step, and by the put's own body loop; a
+    /// put given up while its last system calls run (the rename, the
+    /// `fsync`s) may have landed, whole, as one past its time may.
     Stopped,
 }
 
@@ -221,23 +255,43 @@ pub type Op<'a, T> = Pin<Box<dyn Future<Output = Result<T, Failure>> + Send + 'a
 /// "One interface, five operations, flat keys"). Keys are checked by the
 /// host before they reach a backend; a backend answers only what the
 /// table of failures says, and nothing of where it keeps the files.
+///
+/// A body crosses as chunks, never whole: a put's [`Source`] arrives as it
+/// is read and the file lands only when it has ended cleanly; a get
+/// answers an [`Opened`] whose [`Reader`] gives the file's bytes to the
+/// host a chunk at a time. Nothing in the trait names a directory, so an
+/// S3 backend keeps it (a put of unknown length a multipart upload, a
+/// get a response body).
 pub trait Backend: Send + Sync {
     /// The file's metadata, or `None` when no file has the key.
     fn head(&self, key: Key, until: Until) -> Op<'_, Option<Metadata>>;
 
-    /// The file read whole, one version of it, or `None`. A file larger
-    /// than [`BODY_BYTES`] is not read ([`Failure::Bytes`]); room for its
-    /// body is taken from `bodies` before it is read.
-    fn get(&self, key: Key, bodies: Arc<Bodies>, until: Until) -> Op<'_, Option<Got>>;
+    /// The file opened — its metadata and a [`Reader`] of its bytes, the
+    /// file as it was when it was opened, ending after exactly `size`
+    /// bytes — or `None`. A file larger than [`FILE_BYTES`] is not opened
+    /// ([`Failure::Bytes`]); its `head` still answers.
+    fn get(&self, key: Key, until: Until) -> Op<'_, Option<Opened>>;
 
     /// Creates the file or replaces it whole, atomically; `content_type`
-    /// kept when given. Answers the metadata of the file as written.
+    /// kept when given. The body is written to the staging file as it
+    /// arrives; the file lands — fsync, rename, folders — only when the
+    /// body has ended cleanly, and answers the metadata of the file as
+    /// written.
+    ///
+    /// A put is part of its request and ends with it: `given_up` is the
+    /// request's end, and a put that sees it fired ends its body itself —
+    /// staging removed, nothing landed — so the caller never has to drop
+    /// a put mid-flight (a write already on a file thread ends, the
+    /// landing in flight may land whole, a landing not started is not
+    /// taken). One write and the landing each have
+    /// [`OPERATION_TIME`] of their own, and a source that stalls is
+    /// bounded by `given_up`, not by a time of its own.
     fn put(
         &self,
         key: Key,
-        body: Body,
+        body: Source,
         content_type: Option<String>,
-        until: Until,
+        given_up: GivenUp,
     ) -> Op<'_, Metadata>;
 
     /// Removes the file if there is one, and every folder it leaves empty.
@@ -248,187 +302,23 @@ pub trait Backend: Send + Sync {
     fn list(&self, query: ListQuery, until: Until) -> Op<'_, Page>;
 }
 
-/// The engine the raw interface's bodies are read with: standard base64,
-/// with or without padding, no bits left over.
-const ENGINE: GeneralPurpose = GeneralPurpose::new(
-    &base64::alphabet::STANDARD,
-    GeneralPurposeConfig::new().with_decode_padding_mode(DecodePaddingMode::Indifferent),
-);
-
-/// Standard base64 with padding, as a get's body is answered.
-pub fn encode(bytes: &[u8]) -> String {
-    base64::engine::general_purpose::STANDARD.encode(bytes)
-}
-
-/// The length of the base64 text with padding of `bytes` bytes.
-pub fn encoded_len(bytes: usize) -> usize {
-    bytes.div_ceil(3).saturating_mul(4)
-}
-
-/// A put's body as the raw interface carries it: base64 text, looked at
-/// but not decoded; and, once the put is allowed, its room among
-/// [`BODIES_AT_ONCE`], which goes wherever the body goes (into the file
-/// job) and is given back only when the body and its bytes are gone.
+/// A put's body, as a backend takes it: the bytes in hand (a string as
+/// UTF-8), or chunks as they arrive — the request's own body, another
+/// file's, or a stream the code pumps — with the body's length when it
+/// is known before it is read.
 #[derive(Debug)]
-pub struct Body {
-    text: String,
-    bytes: usize,
-    room: Option<Room>,
+pub enum Source {
+    Whole(Bytes),
+    Stream {
+        chunks: mpsc::Receiver<StreamChunk>,
+        length: Option<u64>,
+    },
 }
 
-/// What a put's `body` text is.
-#[derive(Debug)]
-pub enum BodyText {
-    /// Standard base64 of at most [`BODY_TEXT`] characters.
-    Within(Body),
-    /// Longer than [`BODY_TEXT`]: past the bound whatever it holds.
-    Past,
-    /// Within the bound, but there was no room for it among
-    /// [`BODIES_AT_ONCE`] when the put was decided: its text was dropped
-    /// then, and the put fails `unavailable` in its place in the order.
-    NoRoom,
-    /// The put was refused: its text was dropped at the decision, and is
-    /// never looked at.
-    Dropped,
-}
-
-impl Body {
-    /// Looks at `text` without decoding it: [`BodyText::Past`] when it is
-    /// longer than [`BODY_TEXT`]; otherwise standard base64, with or
-    /// without padding, or `Err` (malformed).
-    pub fn read(text: String) -> Result<BodyText, &'static str> {
-        const NOT_BASE64: &str = "`body` must be the bytes in standard base64 (A-Z, a-z, 0-9, + and /, with or without = padding)";
-        if text.len() > BODY_TEXT {
-            return Ok(BodyText::Past);
-        }
-        let all = text.as_bytes();
-        let pads = all.iter().rev().take_while(|b| **b == b'=').count();
-        if pads > 2 {
-            return Err(NOT_BASE64);
-        }
-        let data = all.get(..all.len() - pads).unwrap_or_default();
-        if !data.iter().all(|b| sextet(*b).is_some()) {
-            return Err(NOT_BASE64);
-        }
-        let last = data.last().and_then(|b| sextet(*b)).unwrap_or(0);
-        let bytes = match (data.len() % 4, pads) {
-            (0, 0) => data.len() / 4 * 3,
-            // Two characters give one byte: the last one's low four bits
-            // are left over and must be zero.
-            (2, 0 | 2) if last & 0x0f == 0 => data.len() / 4 * 3 + 1,
-            (3, 0 | 1) if last & 0x03 == 0 => data.len() / 4 * 3 + 2,
-            _ => return Err(NOT_BASE64),
-        };
-        Ok(BodyText::Within(Self {
-            text,
-            bytes,
-            room: None,
-        }))
-    }
-
-    /// The number of bytes it decodes to.
-    pub fn len(&self) -> usize {
-        self.bytes
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.bytes == 0
-    }
-
-    /// The length of its text.
-    pub fn text_len(&self) -> usize {
-        self.text.len()
-    }
-
-    /// The body holding `room`, taken for it.
-    pub fn with_room(self, room: Room) -> Self {
-        Self {
-            room: Some(room),
-            ..self
-        }
-    }
-
-    /// The bytes, the text dropped; and the room the body held, for the
-    /// caller to keep until the bytes are gone. `None` only if
-    /// [`Body::read`] and the decoder disagree, which they do not.
-    pub fn decode(self) -> Option<(Vec<u8>, Option<Room>)> {
-        let Self { text, bytes, room } = self;
-        let mut decoded = Vec::with_capacity(bytes);
-        ENGINE.decode_vec(text.as_bytes(), &mut decoded).ok()?;
-        drop(text);
-        (decoded.len() == bytes).then_some((decoded, room))
-    }
-}
-
-/// The value of a base64 character, `None` for anything else.
-fn sextet(b: u8) -> Option<u8> {
-    match b {
-        b'A'..=b'Z' => Some(b - b'A'),
-        b'a'..=b'z' => Some(b - b'a' + 26),
-        b'0'..=b'9' => Some(b - b'0' + 52),
-        b'+' => Some(62),
-        b'/' => Some(63),
-        _ => None,
-    }
-}
-
-/// The program's one budget of bodies held at once ([`BODIES_AT_ONCE`]):
-/// a put takes room for its bytes and its text when it is decided, without
-/// waiting ([`Bodies::try_take`]); a get for its file and its text before
-/// it reads, waiting up to [`ROOM_WAIT`] with nothing held
-/// ([`Bodies::take`]).
-pub struct Bodies {
-    room: Arc<Semaphore>,
-}
-
-/// Room taken among [`BODIES_AT_ONCE`], given back when dropped.
-#[derive(Debug)]
-pub struct Room(#[expect(dead_code, reason = "held for its drop")] Option<OwnedSemaphorePermit>);
-
-impl Default for Bodies {
-    fn default() -> Self {
-        Self {
-            room: Arc::new(Semaphore::new(BODIES_AT_ONCE)),
-        }
-    }
-}
-
-impl Bodies {
-    /// The permits a body of `bytes` bytes and its base64 text takes;
-    /// `None` for none.
-    fn wanted(bytes: usize) -> Option<u32> {
-        let wanted = bytes.saturating_add(encoded_len(bytes));
-        if wanted == 0 {
-            return None;
-        }
-        u32::try_from(wanted.min(BODIES_AT_ONCE)).ok()
-    }
-
-    /// Room for a body of `bytes` bytes and its base64 text, now, without
-    /// waiting; `None` when there is none.
-    pub fn try_take(&self, bytes: usize) -> Option<Room> {
-        let Some(wanted) = Self::wanted(bytes) else {
-            return Some(Room(None));
-        };
-        Arc::clone(&self.room)
-            .try_acquire_many_owned(wanted)
-            .ok()
-            .map(|permit| Room(Some(permit)))
-    }
-
-    /// Room for a body of `bytes` bytes and its base64 text, waiting up to
-    /// [`ROOM_WAIT`]; `None` when there was none.
-    pub async fn take(&self, bytes: usize) -> Option<Room> {
-        let Some(wanted) = Self::wanted(bytes) else {
-            return Some(Room(None));
-        };
-        let room = Arc::clone(&self.room);
-        match tokio::time::timeout(ROOM_WAIT, room.acquire_many_owned(wanted)).await {
-            Ok(Ok(permit)) => Some(Room(Some(permit))),
-            Ok(Err(_)) | Err(_) => None,
-        }
-    }
-}
+/// What ends a put when its request does: fires once, stays fired (the
+/// request's end, from the backend's point of view; a disable ends the
+/// request too). See [`Backend::put`].
+pub type GivenUp = watch::Receiver<bool>;
 
 /// Whether `text` can be a content type given to a put: 1 to 255 bytes of
 /// printable ASCII (U+0020 to U+007E) holding a `/`.
@@ -487,11 +377,11 @@ impl std::fmt::Debug for Location {
 }
 
 /// What the program needs to reach Storage Resources: the file threads,
-/// the budget of bodies, the key of cursors, and the storage root (when
-/// `--storage-root` was given). One for the program.
+/// the program's places for bodies open at once, the key of cursors, and
+/// the storage root (when `--storage-root` was given). One for the program.
 pub struct Storage {
     pub files: Arc<Files>,
-    pub bodies: Arc<Bodies>,
+    pub open: Arc<Open>,
     pub cursors: cursor::Sealer,
     pub root: Option<Arc<Root>>,
 }

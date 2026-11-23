@@ -13,6 +13,7 @@ This folder is one Application for the company's internal platform. The person y
 - `manifest.ts` gives the Application's `name` (it becomes the address), a one-sentence `description`, and every Resource it uses, at `"read"` or `"write"`. The Application reaches only what the Manifest declares. Keep it a plain literal: no variables, imports, calls or spreads, because the platform reads it without running it.
 - `src/db/schema.ts` defines the own database's tables in Drizzle. `migrations/` is generated from it by `vibe generate`; never write or edit a migration by hand (the one exception is below).
 - `resources/<name>/` is written by `vibe pull <name>`. Read it, import its tables from `resources/<name>/schema.ts`, never edit it. You may add `resources/<name>/relations.ts` with Drizzle relations of your own; pull again after adding it.
+- Storage: a Resource with `kind: "storage"` in `manifest.ts`, pulled with `vibe pull` like a database. Its files are reached with `ctx.user().storage("<name>")`: `get` and `head` answer `null` when there is no file. A file is named by a key — `/` between folders, no `..`, no leading `/` — and a file's body is a stream: `file.body`, or `await file.text()` / `json()` / `arrayBuffer()` for a small one. A download is `new Response(file.body)`; an upload is `put(key, request.body)`. A file is at most 5 GiB. In the local run, files are in `.vibe/local/storage/<name>/`, where test files may be placed by hand.
 
 ## Commands
 

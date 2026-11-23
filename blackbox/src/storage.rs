@@ -332,7 +332,36 @@ impl Storage {
         ] {
             s.install(name, file, &[(MARKETING, "storage", "write")]);
         }
+        s.wait_until_usable();
         s
+    }
+
+    /// Waits, at most 30 seconds, until [`MARKETING`] answers a `get` of a
+    /// file that is not there with `null` and not `unavailable`. The
+    /// contract lets a Resource whose directory the program could not open
+    /// in time (at its start, with many programs starting on a loaded
+    /// machine: "When the directory cannot be used") answer `unavailable`
+    /// until its next try, at most 10 seconds later; a test that is not
+    /// about that waits that out here, through [`STREAM_READ`]'s `/get-unread`.
+    fn wait_until_usable(&self) {
+        let began = Instant::now();
+        loop {
+            let (_, answer) = self.post(
+                &wanda(),
+                STREAM_READ,
+                "/get-unread",
+                &json!({ "resource": MARKETING, "key": "ready-probe" }),
+            );
+            if answer["answer"]["error"]["kind"].as_str() != Some("unavailable") {
+                return;
+            }
+            if began.elapsed() > Duration::from_secs(30) {
+                self.vm.fail(&format!(
+                    "expected {MARKETING} to answer within 30 s of being installed, it still says {answer}"
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
     }
 
     /// The storage root.

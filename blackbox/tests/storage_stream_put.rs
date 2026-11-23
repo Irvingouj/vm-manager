@@ -619,8 +619,9 @@ fn every_body_kind_a_put_takes_through_the_sdk_and_every_one_it_refuses() {
         "/own-stream?key=sdk/stream.bin&chunks=4&chunkSize=1048576",
         &json!({}),
     );
+    // The fixture's `caught` wraps a success as `{ resolved: <value> }`.
     assert!(
-        answer["info"].is_object(),
+        answer["resolved"]["info"].is_object(),
         "a stream the code makes: expected a FileInfo, got {answer}"
     );
     let mut expected = Vec::new();

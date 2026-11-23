@@ -5,11 +5,18 @@
 // write chunks of 64 KiB; more is what this Application asks for.
 //
 // Routes (POST, JSON):
-//   /flood { resource, key, count, bytesEach }
-//       `count` gets of `key` whose bodies are never read (the bodies stay
-//       open), then `count` puts of streams of the code's own each writing
-//       `bytesEach` bytes in chunks of 64 KiB, all in this one request:
-//       { gets: [<ok or answer>], puts: [<answer>] }
+//   /flood { resource, key, keyPrefix, gets, puts, bytesEach }
+//       as much as one request may hold open at once: `gets` gets of `key`
+//       whose bodies are never read (the bodies stay open), and `puts` puts
+//       of streams of the code's own, started together, each writing
+//       `bytesEach` bytes in chunks of 64 KiB. Every put's stream gives its
+//       first chunk (the file is open and being written) and then waits
+//       until all of them have, so that all the places are held at the same
+//       time. With gets + puts = 16 files (the bound for one request), one
+//       more get and one more put are tried meanwhile: each finds no place,
+//       waits and fails. Then the puts are let go:
+//       { gets: [<ok or answer>], puts: [<answer>], together: <bool>,
+//         extraGet: { answer, ms }, extraPut: { answer, ms } }
 //   /put-oversized { resource, key, chunk }
 //       a put of a stream of the code's own whose one chunk is `chunk`
 //       bytes: { answer }; the platform's glue cuts it, the put lands
@@ -23,6 +30,8 @@
 //         write: { over, exact } }
 
 const CHUNK = 64 * 1024;
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 const message = (e) => String((e && e.message) || e);
 
@@ -89,25 +98,88 @@ globalThis.default = {
     const b = await request.json().catch(() => ({}));
     switch (url.pathname) {
       case "/flood": {
-        const count = Number(b.count || 16);
+        const nGets = Number(b.gets || 8);
+        const nPuts = Number(b.puts || 8);
         const bytesEach = Number(b.bytesEach || 1024 * 1024);
         const gets = [];
-        for (let i = 0; i < count; i++) {
+        for (let i = 0; i < nGets; i++) {
           const answer = await call("storage.get", { resource: b.resource, key: b.key });
           // Nothing reads it: the body stays open until this request ends.
           gets.push(answer && answer.ok ? { ok: true } : answer);
         }
-        const puts = [];
-        for (let i = 0; i < count; i++) {
-          puts.push(
-            await call("storage.put", {
+        let started = 0;
+        let release;
+        const gate = new Promise((resolve) => {
+          release = resolve;
+        });
+        const allStarted = new Promise((resolve) => {
+          const watch = setInterval(() => {
+            if (started >= nPuts) {
+              clearInterval(watch);
+              resolve(true);
+            }
+          }, 20);
+          setTimeout(() => {
+            clearInterval(watch);
+            resolve(false);
+          }, 15000);
+        });
+        const gated = (total, seed) => {
+          let sent = 0;
+          let n = seed >>> 0;
+          let first = true;
+          return new ReadableStream({
+            async pull(controller) {
+              if (sent >= total) {
+                controller.close();
+                return;
+              }
+              if (first) {
+                first = false;
+                started += 1;
+              } else {
+                await gate;
+              }
+              const length = Math.min(CHUNK, total - sent);
+              const bytes = new Uint8Array(length);
+              for (let i = 0; i < length; i++) {
+                n = (Math.imul(n, 1664525) + 1013904223) >>> 0;
+                bytes[i] = n >>> 24;
+              }
+              sent += length;
+              controller.enqueue(bytes);
+            },
+          });
+        };
+        const running = [];
+        for (let i = 0; i < nPuts; i++) {
+          running.push(
+            call("storage.put", {
               resource: b.resource,
               key: `${b.keyPrefix || "flood"}/${i}.bin`,
-              body: chunked(bytesEach, CHUNK, i + 1),
+              body: gated(bytesEach, i + 1),
             }),
           );
         }
-        return json({ gets, puts });
+        const together = await allStarted;
+        const timed = async (fn) => {
+          const began = Date.now();
+          const answer = await fn();
+          return { answer: answer && answer.ok ? { ok: true } : answer, ms: Date.now() - began };
+        };
+        const [extraGet, extraPut] = await Promise.all([
+          timed(() => call("storage.get", { resource: b.resource, key: b.key })),
+          timed(() =>
+            call("storage.put", {
+              resource: b.resource,
+              key: `${b.keyPrefix || "flood"}/extra.bin`,
+              body: chunked(CHUNK, CHUNK, 99),
+            }),
+          ),
+        ]);
+        release();
+        const puts = await Promise.all(running);
+        return json({ gets, puts, together, extraGet, extraPut });
       }
       case "/put-sizes":
         return json({

@@ -28,6 +28,7 @@
 use std::convert::Infallible;
 use std::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use hyper::body::Incoming;
@@ -176,9 +177,19 @@ pub async fn serve_until<H: Handler>(
                 let stopped = stopped.clone();
                 let tls = tls.as_ref().map(Arc::clone);
                 connections.spawn(async move {
+                    // The connection's own flag for the one ending that
+                    // must not wait: a body being sent that is cut is closed
+                    // with a reset (see [`ResetOnCut`]).
+                    let cut = Arc::new(AtomicBool::new(false));
                     let served = Connection { handler, header_read, connection_limit, stopped };
                     match tls {
-                        None => served.serve(stream).await,
+                        None => {
+                            let io = ResetOnCut {
+                                io: stream,
+                                cut: Arc::clone(&cut),
+                            };
+                            served.serve(io, cut).await;
+                        }
                         Some(tls) => {
                             // A handshake not finished in time, or that
                             // fails, ends the connection: the stream is
@@ -186,7 +197,11 @@ pub async fn serve_until<H: Handler>(
                             if let Ok(Ok(stream)) =
                                 tokio::time::timeout(tls.handshake, tls.acceptor.accept(stream)).await
                             {
-                                served.serve(stream).await;
+                                let io = ResetOnCut {
+                                    io: stream,
+                                    cut: Arc::clone(&cut),
+                                };
+                                served.serve(io, cut).await;
                             }
                         }
                     }
@@ -218,10 +233,108 @@ struct Connection<H> {
     stopped: watch::Receiver<bool>,
 }
 
+/// A connection's stream, with the platform's own handle on its socket for
+/// the one ending that must not wait.
+///
+/// When a body being sent is cut — a disable, a client that takes no byte
+/// for 30 seconds, a client gone — the connection's task sets `cut`, and
+/// this wrapper's `Drop` then sets `SO_LINGER` of zero on the socket (a
+/// borrow through `socket2::SockRef`, never a second descriptor) before
+/// the stream closes, so the close is a **reset**: the bytes the client's
+/// window never took are discarded, and a client taking no byte sees the
+/// end as soon as one that reads (blackbox/CONTRACT.md, "What an
+/// Application is handed"). Every other ending is an ordinary close. A
+/// `SO_LINGER` that cannot be set is that same ordinary close and nothing
+/// more.
+struct ResetOnCut<IO: SocketOf> {
+    io: IO,
+    cut: Arc<AtomicBool>,
+}
+
+/// A stream that wraps one TCP socket: the socket the cut's linger is set
+/// on (through a borrow; no descriptor is duplicated).
+trait SocketOf {
+    fn socket(&self) -> &TcpStream;
+}
+
+impl SocketOf for TcpStream {
+    fn socket(&self) -> &TcpStream {
+        self
+    }
+}
+
+impl<IO: SocketOf> SocketOf for tokio_rustls::server::TlsStream<IO> {
+    fn socket(&self) -> &TcpStream {
+        self.get_ref().0.socket()
+    }
+}
+
+impl<IO: SocketOf> Drop for ResetOnCut<IO> {
+    fn drop(&mut self) {
+        if self.cut.load(Ordering::SeqCst) {
+            socket2::SockRef::from(self.io.socket())
+                .set_linger(Some(Duration::ZERO))
+                .ok();
+        }
+    }
+}
+
+impl<IO: AsyncRead + Unpin + SocketOf> AsyncRead for ResetOnCut<IO> {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().io).poll_read(cx, buf)
+    }
+}
+
+impl<IO: AsyncWrite + Unpin + SocketOf> AsyncWrite for ResetOnCut<IO> {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.get_mut().io).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().io).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().io).poll_shutdown(cx)
+    }
+
+    fn poll_write_vectored(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.get_mut().io).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.io.is_write_vectored()
+    }
+}
+
 impl<H: Handler> Connection<H> {
     /// Serves HTTP/1.1 on `io` until the client is done, the connection's
     /// time is over, the server stops, or a body being sent is ended early.
-    async fn serve<S>(mut self, io: S)
+    ///
+    /// `cut` is the connection's own flag for the one ending that must not
+    /// wait: a body being sent that is cut (a disable, a client that takes
+    /// no byte, a client gone) is closed with a **reset**
+    /// ([`ResetOnCut`]), which reaches the client at once. Every other
+    /// ending is as it was.
+    async fn serve<S>(mut self, io: S, cut: Arc<AtomicBool>)
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
@@ -254,7 +367,7 @@ impl<H: Handler> Connection<H> {
         let mut sending = false;
         let mut stream_begins = watch.streaming.clone();
         let mut stream_ends = watch.streaming.clone();
-        let mut cut = watch.cut;
+        let mut cuts = watch.cut;
         loop {
             let mut stopping = false;
             tokio::select! {
@@ -264,7 +377,17 @@ impl<H: Handler> Connection<H> {
                 _ = self.stopped.wait_for(|stopped| *stopped) => {
                     stopping = true;
                 }
-                _ = cut.changed() => return,
+                _ = cuts.changed() => {
+                    // A body being sent is ended early: the connection is
+                    // closed now, and with a reset — the flag makes this
+                    // wrapper's drop set `SO_LINGER` of zero before the
+                    // socket closes, discarding the bytes the client's
+                    // window never took (blackbox/CONTRACT.md, "What an
+                    // Application is handed"). A graceful close would leave
+                    // its end behind those bytes.
+                    cut.store(true, Ordering::SeqCst);
+                    return;
+                }
                 _ = stream_begins.wait_for(|streaming| *streaming), if !sending => {
                     sending = true;
                 }

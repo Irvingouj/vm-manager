@@ -225,6 +225,10 @@ globalThis.default = {
       }
       case "/get-one": {
         const answer = await call("storage.get", { resource: b.resource, key: b.key });
+        // The body (a ReadableStream) cannot be written as JSON: its metadata
+        // is. The body stays open, unread, until the request ends, as the
+        // places it holds are what the tests probe.
+        if (answer && answer.ok) return json({ answer: { ok: metadataOf(answer.ok) } });
         return json({ answer });
       }
     }
