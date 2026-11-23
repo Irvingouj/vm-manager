@@ -32,6 +32,11 @@
 //                    it found: x-had-id (the id was a number), x-has-write
 //                    (the function is there) and x-threw (`real`,
 //                    `made-up`: which of the two calls threw).
+//   /cancel-a        `await request.body.cancel()`, then gives the body back
+//   /cancel-b        takes a reader, `await reader.cancel()`, releases the
+//                    lock, then gives the body back
+//   /cancel-made     `await request.body.cancel()`, then answers a string
+//                    it made (`made after cancel`)
 //   /text?body=<text>
 //                    the text, as a string
 
@@ -93,6 +98,23 @@ globalThis.default = {
       headers.set("x-has-write", String(has));
       headers.set("x-threw", threw.join(","));
       return new Response(request.body, { headers });
+    }
+
+    if (url.pathname === "/cancel-a") {
+      await request.body.cancel();
+      return new Response(request.body, { headers });
+    }
+
+    if (url.pathname === "/cancel-b") {
+      const reader = request.body.getReader();
+      await reader.cancel();
+      reader.releaseLock();
+      return new Response(request.body, { headers });
+    }
+
+    if (url.pathname === "/cancel-made") {
+      await request.body.cancel();
+      return new Response("made after cancel", { headers });
     }
 
     if (url.pathname === "/text") {

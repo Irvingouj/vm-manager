@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 
 use blackbox::User;
 use blackbox::admin::{self, IN_FLIGHT_ALLOWED, administrator};
-use blackbox::body::{BodyEnd, Framing, MIB, Raw, memory_of, pattern_block};
+use blackbox::body::{BodyEnd, Framing, MIB, Raw, assert_framed_truly, memory_of, pattern_block};
 use blackbox::logs::wait_for_entry;
 use blackbox::{Vm, fixture_bundle};
 
@@ -191,11 +191,11 @@ fn four_mib_requests(vm: &Vm, path: &str, count: usize, threads: usize) -> Vec<S
 
 #[test]
 fn what_a_requests_body_held_is_given_back_when_the_request_ends() {
-    // About 80 to 100 seconds. Six routes, each with 16 warm-up requests of
-    // 4 MiB and then 200 requests of 4 MiB, 8 at a time (the routes that
+    // About 2 minutes. Six routes, each with 200 requests of 4 MiB to warm
+    // it and then 200 more of 4 MiB, 8 at a time (the routes that
     // answer at once) or 20 at a time (the three that hold the request 1.5
     // seconds, so that the platform's read-ahead fills while the code waits:
-    // 10 rounds of 1.5 s each). That is 1,200 requests of 4 MiB, 5 GB
+    // 10 rounds of 1.5 s each). That is 2,400 requests of 4 MiB, 10 GB
     // through loopback. The routes:
     //
     // - `/never-reads`, `/read-one`: answer at once (the read-ahead never
@@ -210,9 +210,10 @@ fn what_a_requests_body_held_is_given_back_when_the_request_ends() {
     // - `/sleep`: never reads, waits 1.5 s, answers; the client keeps
     //   writing meanwhile, from a thread, and lets go when the answer is in.
     //
-    // Memory is the program's resident memory after each route's 200
-    // requests and a 2-second rest, against what it was after all the
-    // warm-ups.
+    // Memory is the program's resident memory: for each route, 200
+    // requests warm it to its working set, the level after a 2-second rest
+    // is the baseline, and after 200 more and a rest it must be less than
+    // 64 MiB above that baseline.
     let vm = Vm::with_stand_in(&[(APP, "body-request.js")]);
     let pid = vm.pid();
     let routes: [(&str, usize); 6] = [
@@ -224,16 +225,23 @@ fn what_a_requests_body_held_is_given_back_when_the_request_ends() {
         ("/sleep?ms=1500", 20),
     ];
     for (route, threads) in routes {
-        let failures = four_mib_requests(&vm, route, 20, threads.min(20));
-        assert!(failures.is_empty(), "warm-up: {failures:?}");
-    }
-    thread::sleep(Duration::from_secs(1));
-    let before = memory_of(pid, "VmRSS");
-    for (route, threads) in routes {
+        // The first 200 take the route to its working set (20 collected
+        // bodies of 4 MiB at once are more than 80 MiB held, and the
+        // allocator keeps what it took); the baseline is taken after them
+        // and a rest, and the second 200 are what is measured.
         let failures = four_mib_requests(&vm, route, 200, threads);
         assert!(
             failures.is_empty(),
-            "{} request(s) of 200 to {route} failed, the first: {:?}",
+            "{} request(s) of the first 200 to {route} failed, the first: {:?}",
+            failures.len(),
+            failures.first()
+        );
+        thread::sleep(Duration::from_secs(2));
+        let before = memory_of(pid, "VmRSS");
+        let failures = four_mib_requests(&vm, route, 200, threads);
+        assert!(
+            failures.is_empty(),
+            "{} request(s) of the second 200 to {route} failed, the first: {:?}",
             failures.len(),
             failures.first()
         );
@@ -242,7 +250,7 @@ fn what_a_requests_body_held_is_given_back_when_the_request_ends() {
         let grew = after.saturating_sub(before);
         assert!(
             grew < 64 * MIB,
-            "expected the program's resident memory less than 64 MiB above where it was after 200 requests of 4 MiB to {route}, it is {} MiB above ({} MiB to {} MiB)",
+            "expected the program's resident memory less than 64 MiB above where it was after 200 more requests of 4 MiB to {route}, it is {} MiB above ({} MiB to {} MiB)",
             grew / MIB,
             before / MIB,
             after / MIB
@@ -622,4 +630,104 @@ fn the_code_cannot_write_into_the_stream_the_host_feeds_when_no_length_is_stated
         "expected the body to end cleanly"
     );
     assert_eq!(body, sent, "expected exactly the bytes the client sent");
+}
+
+// ---------------------------------------------------------------------
+// 7. A body the code cancelled
+// ---------------------------------------------------------------------
+
+#[test]
+fn a_body_the_code_cancelled_is_never_sent_as_the_clients_bytes() {
+    // About 3 seconds. The code cancels the request's body (on the stream,
+    // or through a reader it releases) and gives it back, or answers a
+    // string it made. Allowed for a body given back: `200` with an empty
+    // body, or the fixed `500`; never the client's bytes; the framing is
+    // true; where the client sent its whole body the next request on the
+    // connection is answered as its own. Each outcome is printed (see them
+    // with `--nocapture`).
+    let vm = Vm::with_stand_in(&[(ECHO, "body-response.js")]);
+    let sent: Vec<u8> = (0..4096_u32)
+        .map(|i| u8::try_from((i * 7 + 3) % 256).expect("below 256"))
+        .collect();
+    let mut failures = Vec::new();
+    for route in ["/cancel-a", "/cancel-b", "/cancel-made"] {
+        for whole in [true, false] {
+            let what = format!(
+                "{route}, client {}",
+                if whole {
+                    "sent all 4096 bytes"
+                } else {
+                    "stated 1 MiB and sent none"
+                }
+            );
+            collect(&mut failures, &what, || {
+                let mut raw = Raw::connect_keep_alive(vm.address());
+                let framing = if whole {
+                    Framing::Length(4096)
+                } else {
+                    Framing::Length(MIB)
+                };
+                raw.send_head("POST", route, &vm.host_of(ECHO), Some(&bob()), framing, &[]);
+                if whole {
+                    raw.write(&sent).expect("the body is written");
+                }
+                let head = raw.read_head(Duration::from_secs(10));
+                let mut body = Vec::new();
+                let end = raw.drain_body(Duration::from_secs(10), |b| body.extend_from_slice(b));
+                eprintln!(
+                    "OUTCOME {what}: status {}, content-length {:?}, chunked {}, {} body bytes, end {end:?}",
+                    head.status,
+                    head.content_length(),
+                    head.chunked(),
+                    body.len()
+                );
+                // Framing is the platform's: the answer is whole as it states,
+                // or the connection is closed without a clean end short of a
+                // stated length (the client can tell); never a clean end
+                // short of it.
+                match end {
+                    BodyEnd::Whole => {
+                        assert_framed_truly(&head, u64::try_from(body.len()).expect("fits"), &what)
+                    }
+                    BodyEnd::ClosedShort => assert!(
+                        head.content_length()
+                            .is_some_and(|l| l > u64::try_from(body.len()).expect("fits")),
+                        "closed short of nothing stated"
+                    ),
+                    BodyEnd::StillOpen => panic!("the answer never ended"),
+                }
+                assert!(
+                    !body.windows(64).any(|w| sent.windows(64).any(|s| s == w)),
+                    "the client's own bytes were sent back after the code cancelled them"
+                );
+                if route == "/cancel-made" {
+                    assert_eq!(head.status, 200, "got {}", head.status);
+                    assert_eq!(body, b"made after cancel");
+                } else if head.status == 200 {
+                    assert!(body.is_empty(), "a 200 with {} body bytes", body.len());
+                } else {
+                    assert_eq!(head.status, 500, "expected 200 empty or the fixed 500");
+                    assert!(body.len() < 1024, "the fixed 500's body");
+                }
+                if whole && end == BodyEnd::Whole {
+                    let (next, text, end) = raw.exchange(
+                        "GET",
+                        "/text?body=next",
+                        &vm.host_of(ECHO),
+                        Some(&bob()),
+                        None,
+                        Duration::from_secs(10),
+                    );
+                    assert_eq!((next.status, end), (200, BodyEnd::Whole));
+                    assert_eq!(text, b"next", "the next request answered as its own");
+                }
+            });
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} case(s) failed:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
 }
