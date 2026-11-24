@@ -3863,3 +3863,61 @@ Appended to "Bounds":
 - Stage four. "Outbound calls: Bounds": "256 under way in the program; a call that finds none free waits up to 5 seconds, then `unavailable`" gains "and 64 for one Application, waited for the same". Its "What this does not close": "**A share for each Application** of the program's 256 calls ..." is struck. The lookups' share (16 of 64 for one Application) is unchanged.
 - The black-box harness, as a promise to the test agent: **every test that registers a database Resource registers it with logins that connect** (a registration whose login cannot connect is now `422` `login-failed`). A test that registers one to test something else uses a real shared database ("How the tests get a Postgres": `SharedDatabase`) and its roles; a test that needs a Resource nobody can reach (a database that is down) registers it with real logins and then stops or drops what it connects to, or replaces its logins, and does not register it unreachable. The harness gains helpers that make a role limited to some tables and a role that can write, for the probe's warnings and for the limited login's test. The helpers through which tests register a database Resource today, and which of them use logins that cannot connect, are listed in the ticket's notes, not here.
 - `deploy/README.md` says how to register a Resource with the tool (`vibe admin resource register`), that passwords are given in the environment, that a Resource's logins are checked when they are supplied, and that a pull lists the tables the read or write login holds a privilege on.
+
+## No argument and no native of the runtime lets an Application stop the program (ticket: No argument and no native of the runtime lets an Application stop the program)
+
+One program serves every Application of an installation (ADR 0015). Whatever the code of one Application does in a request, with whatever function it can reach and whatever it passes to it, **the program goes on serving**: that request ends in the code's own answer, in the fixed `500`, or at one of its limits; every other request, of this Application and of the others, in flight then or sent later, is answered as if the first had never been made. The program does not exit, is not ended by the system, and its log has no record of a panic.
+
+A test of this section always ends the same way: after the hostile request, **a request of another User to another Application is answered normally by the same program** (the same process: it was not started again), and so is a next request to the hostile Application.
+
+### What Application code can reach
+
+The runtime the platform builds on has natives for kinds of operation the platform does not serve: its own key-value, storage, database and SQL bindings, bindings to other workers and to durable objects, WebSockets, and a `fetch` of its own. **They are not there.** At load and in a request, none of these is a property of `globalThis`, and no object the code can reach has one of them:
+
+`__nativeFetchStreaming`, `__nativeBindingFetch`, `__nativeBindingStorage`, `__nativeBindingKv`, `__nativeBindingDatabase`, `__nativeBindingD1`, `__nativeBindingWorker`, `__nativeBindingDurableObject`, `__nativeDurableObjectId`, `__nativeObjectStorage`, `__nativeObjectSocketId`, `__nativeObjectSocketAccept`, `__nativeObjectSocketSend`, `__nativeObjectSocketClose`, `__nativeObjectSocketAttachment`, `__nativeObjectSockets`, `__nativeWebSocketConnect`, `__nativeWebSocketPair`, `__nativeWebSocketAccept`, `__nativeWebSocketSend`, `__nativeWebSocketClose`, and the classes built on them: `WebSocket`, `WebSocketPair`, `DurableObject`.
+
+- `typeof` each is `"undefined"`; no own property of `globalThis` has a name that begins `__nativeBinding` (but `__nativeBindingInvoke`, which is the platform's own way to its host and is the glue's function, "The raw interface"), `__nativeObject`, `__nativeDurableObject` or `__nativeWebSocket`.
+- They are absent, not hidden: nothing the code does (deleting, redefining, a new realm made with what it can reach, a function's `constructor`) brings one back.
+- What the platform serves is unchanged and still works without them: the platform's host calls, `fetch` to listed hosts, the request and the response with their streams, timers, `console`, `crypto`, text encoding, `URL`, `URLPattern`, compression streams and the other standard interfaces. An Application that used none of the removed names is served exactly as before.
+
+### Arguments
+
+For **every function the code can reach** — every function that is an own property (enumerable or not, by name or by symbol) of `globalThis`, of an object reachable from it through own properties down to three levels (`crypto.subtle`, `__ow` and its operations, a constructor's static methods, a `prototype`'s methods), the platform's glue included — called as a function and, where it can be, with `new`, with each of these as each of its first four arguments and with none at all:
+
+- nothing, `undefined`, `null`, a number (`0`, `-1`, `NaN`, `Infinity`, `2**53`, `2**64`), a BigInt, a string (empty, short, 16 MiB), a symbol, a boolean, a function, a plain object, an array, a typed array (empty, 1 MiB, one whose buffer was detached), an `ArrayBuffer`, a `Date`, a `RegExp`, a `Promise`;
+- an object whose property read throws: a getter that throws for every name the function could read (through a `Proxy` whose `get`, `has`, `ownKeys`, `getOwnPropertyDescriptor` and `getPrototypeOf` each throw), and one whose getter throws only on its second read;
+- a `String`, `Number` and `Boolean` object whose `toString`, `valueOf` and `Symbol.toPrimitive` throw; an array whose index getter throws; an object whose `toJSON` throws; an iterable whose iterator throws;
+- a value that refers to itself (an object in its own property, an array in itself), a value nested 100,000 levels deep, an array of length `2**32 - 1` with nothing in it, an object with 1,000,000 properties;
+- an argument that, when read, calls the same function again (a getter that re-enters), and one that makes the request's answer or ends a stream while it is read.
+
+the program goes on serving. The call itself may return, throw (a getter's own error is thrown as it is, or a `TypeError` takes its place), never return within the request's limits (the request then ends at its limit with the fixed `500`), or end the request; none of that is specified, only that it is this request's affair.
+
+This holds for the standard built-ins too (they are the engine's and are called the same way), so that the test does not depend on a list of the runtime's natives: it finds the functions by walking.
+
+### Bounds decided before the allocation
+
+A native that makes the host allocate, or work without being interrupted, by a size the code chooses decides the bound before it allocates or starts:
+
+- **`crypto.subtle.deriveBits` with PBKDF2**: `length` at most 4,096 bits (a multiple of 8, as the standard asks), and `iterations` times the number of hash blocks derived (`length` in bytes divided by the hash's output length, rounded up) at most 2,000,000. Past either, the promise rejects with an `OperationError` and nothing is allocated or derived. Within them it derives what the standard says (a derivation of 600,000 iterations of SHA-256 for 256 bits is taken). The native of the same name on `crypto.subtle`, called directly, has the same bounds.
+- **Compression** (`CompressionStream`, `DecompressionStream`, and the operations of `__ow` under them): **what one chunk becomes is at most 16 MiB** (16,777,216 bytes; chosen by the agent). A chunk whose output would pass it errors the stream (its `readable` fails and its `writable` rejects, with a `TypeError` or `RangeError` whose message names the bound); the host has not built more than the bound. A chunk of 64 KiB of ordinary text or JSON is far within it; a chunk of zeros compressed a thousandfold is the case it stops. **At most 16 codecs open at once for one request** (as it has 16 streams of its own, "Storage: Bounds"); a 17th throws; a codec ended, errored or whose stream was cancelled is given back.
+- **A buffer the host makes for the code counts as one the code makes.** The request's buffers (`ArrayBuffer`s and typed arrays) are bounded together at 64 MiB, as before; from this ticket on that includes the ones a native returns (a `TextEncoder`'s bytes, a codec's output, a digest, a signature, random bytes): the call that would pass the bound throws a `RangeError` and makes nothing, so code that keeps what `TextEncoder.encode` returns for a 8 MiB string ten times over is refused, not served from memory nobody counts.
+- A test may measure the program's resident memory: none of the three makes it grow by more than 128 MiB for one request, whatever the code asks for.
+
+### A failure the code cannot catch
+
+Each of these ends **that request** with the fixed `500` and nothing else: the program serves on, requests of other Users in flight at that moment (on other Applications and on the same one) are answered normally, and the next request to the same Application starts clean.
+
+- **Out of memory.** Code that fills its heap (64 MiB): in small pieces (an array that grows for ever, strings kept in a list), in one piece (`"x".repeat(2**29 - 24)`; `new Array(2**27).fill(0)`; `Array.from({ length: 1e8 })`; a `JSON.stringify` whose result is larger than the heap; `"a".padEnd(2**28).split("")`), and in a `catch` that goes on allocating after the first failure. The request is ended within its time limit.
+- **Stack.** Recursion without end in the code is a `RangeError` the code may catch (then it goes on and its answer is its own) or not (the fixed `500`). Recursion through the engine and the natives does not end the program either: a getter that calls the function reading it, a `toJSON` that stringifies itself, a `Proxy` whose trap reads the proxy, `JSON.parse` of 1,000,000 opening brackets, a regular expression nested 100,000 deep, `structuredClone` of a value nested 100,000 deep, a `Promise` chain of 1,000,000, and recursion that fills the stack and then calls each native once from the deepest frame.
+- **Termination.** Code that never yields (a loop; a loop in a microtask; a loop in a timer's callback; a loop in a `finally` and in a `catch` of the error that ended the first loop; a regular expression that backtracks for ever; a comparator of `sort` that loops) is ended at its CPU limit, and code that never answers at its time limit ("What an Application is handed"), each with the fixed `500`. Code cannot catch the end, and nothing it registered (a `finally`, a timer, a promise's reaction, a stream's callback) runs after it.
+
+### Every change to the runtime is listed
+
+`vendor/VENDORED.md` lists every change made to the vendored runtime and to any other crate vendored for this (with the reason, the files, and the test that holds it), as it does for the earlier patches.
+
+### What this does not close
+
+- **A native the code cannot interrupt** still runs to its own end: a derivation within the PBKDF2 bound (about a second), a digest of a 64 MiB buffer. One engine thread serves several requests, and they wait while it runs. The bounds above keep each such call short; a limit on what one request may take of a thread in all is the ticket "Limits per request".
+- **Memory the engine does not count**: a `WebAssembly.Memory` (up to what the engine allows for one, and any number of them), what the engine keeps outside its heap for compiled code and regular expressions, and what the host queues for timers a loop sets without yielding. These are bounded by the request's CPU and time limits only; the ticket "Limits per request" ("allocates without bound").
+- **The limits themselves** (64 MiB of heap, the CPU and time limits) are fixed numbers of the program, as before; setting them is the ticket "Limits per request".
+- A bug in the engine itself (V8) that an argument can reach is outside what this section can promise; the walk above would find one that a plain call provokes.
