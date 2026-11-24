@@ -29,6 +29,7 @@
 use std::os::unix::fs::{FileExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
@@ -40,6 +41,7 @@ use crate::body::{Framing, Raw};
 use crate::http::{Response, User};
 use crate::program::run_to_exit;
 use crate::scenario::{ADMINISTRATORS, Expected, administrator, assert_entry, lines};
+use crate::shared_database::SharedDatabase;
 use crate::shared_database::token;
 use crate::vm::{INSTALLER, Vm, VmOptions, fixture_bundle};
 
@@ -199,19 +201,26 @@ pub fn storage_body(name: &str, directory: &str) -> Value {
     })
 }
 
+/// The shared database of a test binary's Storage tests that register a
+/// database Resource beside a Storage one: one for the whole binary, made
+/// when first needed, read only.
+fn database_for_resources() -> &'static SharedDatabase {
+    static DATABASE: OnceLock<SharedDatabase> = OnceLock::new();
+    DATABASE.get_or_init(SharedDatabase::create)
+}
+
 /// The body that registers a Resource of kind `postgres` named `name`, on
-/// a database that is never reached (registering does not connect).
+/// a shared database of the binary's own with its reader as the read login
+/// (registering connects: the logins must work).
 pub fn postgres_body(name: &str) -> Value {
+    let db = database_for_resources();
     json!({
         "name": name,
         "kind": "postgres",
         "description": format!("The {name} database"),
         "owner": "The DevOps team",
         "contact": "Dana Ops",
-        "connection": {
-            "host": "127.0.0.1", "port": 1, "database": "nowhere",
-            "read": { "role": "nobody_reads", "password": "never-used" }
-        },
+        "connection": db.connection(&db.reader),
     })
 }
 
@@ -407,7 +416,7 @@ impl Storage {
         self.admin().create_resource(&storage_body(name, directory))
     }
 
-    /// Registers a Resource of kind `postgres` (never reached), failing the
+    /// Registers a Resource of kind `postgres` (on a database that connects), failing the
     /// test unless it is `201`.
     pub fn register_postgres(&self, name: &str) {
         let answer = self.admin().create_resource(&postgres_body(name));

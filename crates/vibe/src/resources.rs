@@ -87,6 +87,7 @@ use crate::executor::{self, Level, Levels, Password, Source, Target};
 use crate::log;
 use crate::platform_db::{DbError, PlatformDatabase, rfc3339};
 use crate::registry::ResourceKind;
+use crate::storage::directory::HeldPath;
 use crate::storage::{Directory, Files, Location};
 
 /// The name of an Access level, as the API and the Operation log write it.
@@ -120,7 +121,7 @@ pub fn is_resource_name(name: &str) -> bool {
 /// Where a Resource's database is and its logins, as the Platform
 /// administrator gave them: the read login, and optionally the write login
 /// and the structure login. Never printed: its `Debug` shows nothing.
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct Connection {
     host: String,
     port: u16,
@@ -137,7 +138,7 @@ pub struct Connection {
 
 /// A login to a shared database. Never printed: it has no `Debug` of its
 /// own, and the [`Connection`] that holds it shows nothing.
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct Login {
     role: String,
     password: String,
@@ -147,6 +148,16 @@ impl Login {
     pub fn new(role: String, password: String) -> Self {
         Self { role, password }
     }
+
+    /// The role's name, where a check needs it.
+    pub fn role(&self) -> &str {
+        &self.role
+    }
+
+    /// The password, where a check connects with it. Never printed.
+    pub fn password(&self) -> &str {
+        &self.password
+    }
 }
 
 impl fmt::Debug for Connection {
@@ -155,7 +166,51 @@ impl fmt::Debug for Connection {
     }
 }
 
+mod check;
+pub use check::{Checked, Failure, Warning, Which};
+
 impl Connection {
+    /// Checks the logins this connection gives, or only `only` of them.
+    pub async fn check_logins(&self, only: &[check::Which]) -> Checked {
+        check::check(self, only).await
+    }
+
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    pub fn database(&self) -> &str {
+        &self.database
+    }
+
+    pub fn read_login(&self) -> &Login {
+        &self.read
+    }
+
+    pub fn write_login(&self) -> Option<&Login> {
+        self.write.as_ref()
+    }
+
+    pub fn structure_login(&self) -> Option<&Login> {
+        self.structure.as_ref()
+    }
+
+    /// Which logins it gives, in the order read, write, structure.
+    pub fn logins(&self) -> Vec<check::Which> {
+        let mut logins = vec![check::Which::Read];
+        if self.write.is_some() {
+            logins.push(check::Which::Write);
+        }
+        if self.structure.is_some() {
+            logins.push(check::Which::Structure);
+        }
+        logins
+    }
+
     pub fn new(
         host: String,
         port: u16,
@@ -191,22 +246,32 @@ impl Connection {
             // the Resource is registered or loaded.
             let target = target(login, self.host.clone(), self.database.clone());
             let source = Source::Resource(resource.to_owned());
-            executor::Pool::new(source, Levels::Only(Level::Write), target, limits.clone())
+            Arc::new(executor::Pool::new(
+                source,
+                Levels::Only(Level::Write),
+                target,
+                limits.clone(),
+            ))
         });
         let structure = self.structure.map(|login| {
             // Copied, as the write login's target is.
             let target = target(login, self.host.clone(), self.database.clone());
             let source = Source::Resource(resource.to_owned());
-            executor::Pool::new(source, Levels::Only(Level::Read), target, limits.clone())
+            Arc::new(executor::Pool::new(
+                source,
+                Levels::Only(Level::Read),
+                target,
+                limits.clone(),
+            ))
         });
         let read = target(self.read, self.host, self.database);
         Pools {
-            read: executor::Pool::new(
+            read: Arc::new(executor::Pool::new(
                 Source::Resource(resource.to_owned()),
                 Levels::Only(Level::Read),
                 read,
                 limits.clone(),
-            ),
+            )),
             write,
             structure,
         }
@@ -214,13 +279,23 @@ impl Connection {
 }
 
 /// A Resource's pools, one per login. Their `Debug` names the Resource
-/// and the level only.
+/// and the level only. Each is shared: an operation holds the pool it was
+/// sent with to its end, so that the logins can be replaced under it and
+/// the old pool closes when its last operation lets it go.
 #[derive(Debug)]
 struct Pools {
-    read: executor::Pool,
-    write: Option<executor::Pool>,
+    read: Arc<executor::Pool>,
+    write: Option<Arc<executor::Pool>>,
     /// The structure login's, which reads in read-only transactions only.
-    structure: Option<executor::Pool>,
+    structure: Option<Arc<executor::Pool>>,
+}
+
+/// The pools of a served Resource, shared with the operations that take
+/// them.
+struct HeldPools {
+    read: Arc<executor::Pool>,
+    write: Option<Arc<executor::Pool>>,
+    structure: Option<Arc<executor::Pool>>,
 }
 
 /// The stored form of a [`Connection`] (and of a Storage Resource's
@@ -299,12 +374,36 @@ pub enum NewReach {
     reason = "one per Resource, inside its Arc, never moved after it is made"
 )]
 enum Reach {
-    Database(Pools),
-    /// A database Resource whose connection is not served now: no key, a
-    /// value that does not open, or a clear value that could not be sealed
-    /// in time. Its name and what everyone may see are as any Resource's.
+    /// Its pools, or why it is not served. Held only for a lookup or a
+    /// change of its logins, never across an await.
+    Database(RwLock<Database>),
+    /// A place of files. Swapped whole by a change of location: an
+    /// operation already under way keeps the one it took and finishes
+    /// there.
+    Storage(RwLock<Directory>),
+}
+
+/// A database Resource as memory holds it now.
+#[derive(Debug)]
+enum Database {
+    Served {
+        pools: Pools,
+        /// The logins as memory holds them, for a replacement that leaves
+        /// some out: copied once per registration, load or replacement.
+        connection: Connection,
+    },
+    /// Its connection is not served now: no key, a value that does not
+    /// open, or a clear value that could not be sealed. Its name and what
+    /// everyone may see are as any Resource's.
     Unserved(Unserved),
-    Storage(Directory),
+}
+
+/// A database Resource that is not served, for this problem.
+fn unserved(problem: &'static str) -> Reach {
+    Reach::Database(RwLock::new(Database::Unserved(Unserved {
+        problem,
+        said: std::sync::Mutex::new(None),
+    })))
 }
 
 /// Why a database Resource is not served, and when its problem was last
@@ -358,9 +457,9 @@ impl Grants {
 pub struct Resource {
     id: i64,
     pub name: String,
-    pub description: String,
-    pub owner: String,
-    pub contact: String,
+    /// Its description, owner and contact: changed in place, so that the
+    /// very next refusal names the new contact.
+    texts: RwLock<Texts>,
     pub created_by: String,
     /// RFC 3339, UTC.
     pub created_at: String,
@@ -370,8 +469,35 @@ pub struct Resource {
     reach: Reach,
     /// Held only for a lookup or a change, never across an await.
     grants: RwLock<Grants>,
+    /// One turn for the writes of what the Resource is reached by and its
+    /// texts, from before the row's transaction until memory is what was
+    /// written, so that memory never ends older than the row.
+    writes: tokio::sync::Mutex<()>,
     /// The pulls of its structure running now: at most [`PULLS_AT_ONCE`].
     pulls: Semaphore,
+    /// Who asked for its removal whose answer was lost, until a reading
+    /// finds the row gone and the record `resource-removed` is written.
+    removal: std::sync::Mutex<Option<String>>,
+    /// Who asked for a change of its location whose answer was lost, and
+    /// where it was to, until a reading finds what became of it.
+    location_change: std::sync::Mutex<Option<PendingLocation>>,
+}
+
+/// What of a Resource a Platform administrator may change without touching
+/// its logins.
+#[derive(Debug)]
+struct Texts {
+    description: Arc<str>,
+    owner: Arc<str>,
+    contact: Arc<str>,
+}
+
+/// Which logins a Resource that is served has, and nothing else of them.
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct Logins {
+    pub read: bool,
+    pub write: bool,
+    pub structure: bool,
 }
 
 /// At most this many pulls of one Resource's structure run at once
@@ -381,19 +507,64 @@ pub struct Resource {
 pub const PULLS_AT_ONCE: usize = 2;
 
 impl Resource {
-    fn pools(&self) -> Option<&Pools> {
-        match &self.reach {
-            Reach::Database(pools) => Some(pools),
-            Reach::Unserved(_) | Reach::Storage(_) => None,
-        }
+    /// Its row's id, which every write of it locks and changes by.
+    pub fn id(&self) -> i64 {
+        self.id
+    }
+
+    /// Its description, as memory holds it now.
+    pub fn description(&self) -> Arc<str> {
+        Arc::clone(
+            &self
+                .texts
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .description,
+        )
+    }
+
+    /// Its owner, as memory holds it now.
+    pub fn owner(&self) -> Arc<str> {
+        Arc::clone(
+            &self
+                .texts
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .owner,
+        )
+    }
+
+    /// Whom to ask for access, as memory holds it now.
+    pub fn contact(&self) -> Arc<str> {
+        Arc::clone(
+            &self
+                .texts
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .contact,
+        )
+    }
+
+    /// Takes new texts, as a change of them committed.
+    pub fn set_texts(&self, description: Arc<str>, owner: Arc<str>, contact: Arc<str>) {
+        *self.texts.write().unwrap_or_else(PoisonError::into_inner) = Texts {
+            description,
+            owner,
+            contact,
+        };
     }
 
     /// Why this database Resource is not served now; `None` for one that
     /// is, and for a Storage Resource.
     pub fn unserved(&self) -> Option<&'static str> {
         match &self.reach {
-            Reach::Unserved(unserved) => Some(unserved.problem),
-            Reach::Database(_) | Reach::Storage(_) => None,
+            Reach::Database(state) => {
+                match &*state.read().unwrap_or_else(PoisonError::into_inner) {
+                    Database::Unserved(unserved) => Some(unserved.problem),
+                    Database::Served { .. } => None,
+                }
+            }
+            Reach::Storage(_) => None,
         }
     }
 
@@ -401,9 +572,14 @@ impl Resource {
     /// it was written less than a minute ago; and `force` writes it
     /// whatever was written before (the start's record, for each).
     pub fn mention_unserved(&self, force: bool) {
-        let Reach::Unserved(unserved) = &self.reach else {
+        let Reach::Database(state) = &self.reach else {
             return;
         };
+        let state = state.read().unwrap_or_else(PoisonError::into_inner);
+        let Database::Unserved(unserved) = &*state else {
+            return;
+        };
+        let problem = unserved.problem;
         {
             let mut said = unserved.said.lock().unwrap_or_else(PoisonError::into_inner);
             if !force && said.is_some_and(|at| at.elapsed() < MENTION_EVERY) {
@@ -411,38 +587,222 @@ impl Resource {
             }
             *said = Some(Instant::now());
         }
+        drop(state);
         log::record(
             "resource-unusable",
-            serde_json::json!({ "resource": &self.name, "problem": unserved.problem }),
+            serde_json::json!({ "resource": &self.name, "problem": problem }),
         );
     }
 
-    /// The pool of the read login; `None` for a Resource that is no
-    /// database.
-    pub fn read_pool(&self) -> Option<&executor::Pool> {
-        self.pools().map(|pools| &pools.read)
+    /// The pool of the read login; `None` for a Resource that is not
+    /// served, and for one that is no database. Shared with the operation
+    /// that takes it, so that replacing the logins does not take it away.
+    pub fn read_pool(&self) -> Option<Arc<executor::Pool>> {
+        self.served().map(|pools| pools.read)
     }
 
     /// The pool of the write login, if the Resource is a database and has
     /// one.
-    pub fn write_pool(&self) -> Option<&executor::Pool> {
-        self.pools().and_then(|pools| pools.write.as_ref())
+    pub fn write_pool(&self) -> Option<Arc<executor::Pool>> {
+        self.served().and_then(|pools| pools.write)
     }
 
     /// The pool the Structure puller reads the catalogs with: the structure
     /// login's when the Resource has one, else the read login's. Never the
     /// write login's. `None` for a Resource that is no database.
-    pub fn structure_pool(&self) -> Option<&executor::Pool> {
-        self.pools()
-            .map(|pools| pools.structure.as_ref().unwrap_or(&pools.read))
+    pub fn structure_pool(&self) -> Option<Arc<executor::Pool>> {
+        self.served()
+            .map(|pools| pools.structure.unwrap_or(pools.read))
+    }
+
+    /// The pools of a Resource that is served now (its read, write and
+    /// structure login's); the guard is let go before this returns, and
+    /// each pool is shared.
+    fn served(&self) -> Option<HeldPools> {
+        let Reach::Database(state) = &self.reach else {
+            return None;
+        };
+        let state = state.read().unwrap_or_else(PoisonError::into_inner);
+        match &*state {
+            Database::Served { pools, .. } => Some(HeldPools {
+                read: Arc::clone(&pools.read),
+                write: pools.write.as_ref().map(Arc::clone),
+                structure: pools.structure.as_ref().map(Arc::clone),
+            }),
+            Database::Unserved(_) => None,
+        }
+    }
+
+    /// The pool a pull uses (the structure login's, else the read login's),
+    /// and the read and write role names the pull asks Postgres about, in
+    /// one look under the Resource's lock; nothing of the connection but
+    /// the two names is copied.
+    pub fn structure_and_roles(&self) -> Option<(Arc<executor::Pool>, String, Option<String>)> {
+        let Reach::Database(state) = &self.reach else {
+            return None;
+        };
+        let state = state.read().unwrap_or_else(PoisonError::into_inner);
+        match &*state {
+            Database::Served { pools, connection } => {
+                let pool = pools.structure.as_ref().unwrap_or(&pools.read);
+                Some((
+                    Arc::clone(pool),
+                    connection.read_login().role().to_owned(),
+                    connection
+                        .write_login()
+                        .map(|login| login.role().to_owned()),
+                ))
+            }
+            Database::Unserved(_) => None,
+        }
+    }
+
+    /// The logins memory holds now, if it serves it.
+    pub(crate) fn connection(&self) -> Option<Connection> {
+        let Reach::Database(state) = &self.reach else {
+            return None;
+        };
+        let state = state.read().unwrap_or_else(PoisonError::into_inner);
+        match &*state {
+            Database::Served { connection, .. } => Some(connection.clone()),
+            Database::Unserved(_) => None,
+        }
+    }
+
+    /// Whether memory holds what a reading of the row found: the same
+    /// connection served (`Ok`), or the same reason for not serving it
+    /// (`Err`). Compared where it is held: nothing is copied.
+    fn reached_as(&self, read: Result<&Connection, &'static str>) -> bool {
+        let Reach::Database(state) = &self.reach else {
+            return false;
+        };
+        let state = state.read().unwrap_or_else(PoisonError::into_inner);
+        match (&*state, read) {
+            (Database::Served { connection, .. }, Ok(read)) => connection == read,
+            (Database::Unserved(unserved), Err(problem)) => unserved.problem == problem,
+            _ => false,
+        }
+    }
+
+    /// Which logins it has, for a Platform administrator: `None` for a
+    /// Resource that is not served, and for a Storage Resource.
+    pub fn logins(&self) -> Option<Logins> {
+        self.served().map(|pools| Logins {
+            read: true,
+            write: pools.write.is_some(),
+            structure: pools.structure.is_some(),
+        })
+    }
+
+    /// Takes these pools as the Resource's from now on: every operation
+    /// sent after this takes them, and the old ones close as their last
+    /// operation lets go.
+    fn replace_pools(&self, pools: Pools, connection: Connection) {
+        let Reach::Database(state) = &self.reach else {
+            return;
+        };
+        *state.write().unwrap_or_else(PoisonError::into_inner) =
+            Database::Served { pools, connection };
     }
 
     /// The backend of a Storage Resource; `None` for a database.
-    pub fn storage(&self) -> Option<&Directory> {
+    pub fn storage(&self) -> Option<Directory> {
         match &self.reach {
-            Reach::Storage(backend) => Some(backend),
-            Reach::Database(_) | Reach::Unserved(_) => None,
+            Reach::Storage(backend) => Some(
+                backend
+                    .read()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone(),
+            ),
+            Reach::Database(_) => None,
         }
+    }
+
+    /// Takes a new place of files, as a change of location committed.
+    pub(crate) fn install_location(&self, backend: Directory) {
+        if let Reach::Storage(state) = &self.reach {
+            *state.write().unwrap_or_else(PoisonError::into_inner) = backend;
+        }
+    }
+
+    /// A removal of this Resource was asked for and its answer lost: when
+    /// a reading finds the row gone, `resource-removed` names `by`.
+    pub(crate) fn expect_removal(&self, by: &str) {
+        *self.removal.lock().unwrap_or_else(PoisonError::into_inner) = Some(by.to_owned());
+    }
+
+    /// A removal whose answer is certain: no record is owed by a reading.
+    pub(crate) fn clear_removal(&self) {
+        *self.removal.lock().unwrap_or_else(PoisonError::into_inner) = None;
+    }
+
+    fn take_removal(&self) -> Option<String> {
+        self.removal
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+    }
+
+    /// Sets this change's pending only when none is pending for the same
+    /// place: a request asking again what an earlier lost request asked
+    /// keeps that request's `by` and what it made. Answers whether this
+    /// request's own was set.
+    pub(crate) fn expect_location_change_if_none_for(
+        &self,
+        by: &str,
+        path: std::path::PathBuf,
+        made_marker: bool,
+        made_staging: bool,
+    ) -> bool {
+        let mut pending = self
+            .location_change
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if pending
+            .as_ref()
+            .is_some_and(|existing| existing.path == path)
+        {
+            return false;
+        }
+        *pending = Some(PendingLocation {
+            by: by.to_owned(),
+            path,
+            made_marker,
+            made_staging,
+        });
+        true
+    }
+
+    /// A change whose answer is certain: no record is owed by a reading.
+    pub(crate) fn clear_location_change(&self) {
+        *self
+            .location_change
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = None;
+    }
+
+    pub(crate) fn take_location_change(&self) -> Option<PendingLocation> {
+        self.location_change
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+    }
+
+    fn pending_location(&self) -> Option<PendingLocation> {
+        self.location_change
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// This Resource's turn for a write: held from before its row's
+    /// transaction until memory is what was written, within `within`;
+    /// `None` when another write holds it that long.
+    pub(crate) async fn writing(
+        &self,
+        within: Duration,
+    ) -> Option<tokio::sync::MutexGuard<'_, ()>> {
+        tokio::time::timeout(within, self.writes.lock()).await.ok()
     }
 
     /// A place among the pulls of this Resource running now, held until it
@@ -478,6 +838,25 @@ impl Resource {
             *self.grants.read().unwrap_or_else(PoisonError::into_inner),
             Grants::Known(_) | Grants::LetGo
         )
+    }
+
+    /// At most `limit` Grants, by Group in byte order, and how many more;
+    /// only that many are copied. `None` while memory does not know them.
+    pub fn grants_page(&self, limit: usize) -> Option<(Vec<(String, AccessLevel)>, usize)> {
+        let grants = self.grants.read().unwrap_or_else(PoisonError::into_inner);
+        match &*grants {
+            Grants::Known(grants) => {
+                let mut page: Vec<(String, AccessLevel)> =
+                    Vec::with_capacity(limit.min(grants.len()));
+                for (group, granted) in grants.iter().take(limit) {
+                    page.push((group.clone(), granted.level));
+                }
+                let more = grants.len().saturating_sub(page.len());
+                Some((page, more))
+            }
+            Grants::LetGo => Some((Vec::new(), 0)),
+            Grants::Unknown { .. } => None,
+        }
     }
 
     /// Each Group's Access level, by Group; `None` while memory does not
@@ -558,16 +937,149 @@ impl Resource {
     /// if memory is still in that forgetting, and it holds every revision
     /// reported since.
     /// `unknown` is one less when they become known, under the same lock.
-    fn install_read(&self, read: BTreeMap<String, Granted>, began: u64, unknown: &AtomicUsize) {
+    fn install_read(
+        &self,
+        read: BTreeMap<String, Granted>,
+        texts: (String, String, String),
+        reach: Option<ReachRead>,
+        began: u64,
+        unknown: &AtomicUsize,
+    ) -> bool {
         let mut grants = self.grants.write().unwrap_or_else(PoisonError::into_inner);
-        if let Grants::Unknown { seen, epoch } = &*grants
-            && *epoch == began
-            && *seen <= Grants::newest(&read)
-        {
-            *grants = Grants::Known(read);
-            unknown.fetch_sub(1, Ordering::SeqCst);
+        if !reading_wins(&grants, began, &read) {
+            return false;
+        }
+        *grants = Grants::Known(read);
+        unknown.fetch_sub(1, Ordering::SeqCst);
+        // The row whole, taken together with its Grants: its texts, and its
+        // logins (the pools of its opened connection, or why it is not
+        // served).
+        let (description, owner, contact) = texts;
+        *self.texts.write().unwrap_or_else(PoisonError::into_inner) = Texts {
+            description: Arc::from(description),
+            owner: Arc::from(owner),
+            contact: Arc::from(contact),
+        };
+        let storage_changed = matches!(reach, Some(ReachRead::Storage(_)));
+        match (&self.reach, reach) {
+            (Reach::Database(state), Some(ReachRead::Database(database))) => {
+                *state.write().unwrap_or_else(PoisonError::into_inner) = database;
+            }
+            (Reach::Storage(state), Some(ReachRead::Storage(directory))) => {
+                *state.write().unwrap_or_else(PoisonError::into_inner) = directory;
+            }
+            _ => {}
+        }
+        if storage_changed && let Some(pending) = self.take_location_change() {
+            log::record(
+                "resource-location-changed",
+                serde_json::json!({ "resource": &self.name, "by": pending.by }),
+            );
+        }
+        true
+    }
+}
+
+/// Whether a reading begun in the forgetting `began` is taken: only while
+/// memory is still in that forgetting, and it holds every revision reported
+/// since. The one place that decides which of two readings wins.
+fn reading_wins(grants: &Grants, began: u64, read: &BTreeMap<String, Granted>) -> bool {
+    match grants {
+        Grants::Unknown { seen, epoch } => *epoch == began && *seen <= Grants::newest(read),
+        Grants::Known(_) | Grants::LetGo => false,
+    }
+}
+
+/// What a reading of a Resource's row found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadBack {
+    /// Its Grants (and the rest of the row) are known now.
+    Known,
+    /// No row: the Resource was removed. It is let go from memory.
+    Removed,
+    /// It still cannot be told (a write on its way, or no time).
+    Unknown,
+}
+
+/// A write of a Resource's row whose answer may be lost: armed before the
+/// statement is sent, disarmed once memory is what the database has. A
+/// future dropped while armed (the administrator's connection closed, the
+/// request given up, a timeout) forgets what memory knows of the Resource,
+/// so that nothing is sent through a login or a text it may no longer
+/// have; the existing read-back then finds the row whole. It only
+/// signals: it spawns nothing.
+pub struct Unsettled<'a> {
+    resources: &'a Resources,
+    resource: &'a Resource,
+    armed: bool,
+}
+
+impl<'a> Unsettled<'a> {
+    pub fn new(resources: &'a Resources, resource: &'a Resource) -> Self {
+        Self {
+            resources,
+            resource,
+            armed: true,
         }
     }
+
+    pub fn settled(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for Unsettled<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.resources.write_failed(self.resource);
+        }
+    }
+}
+
+/// A change of a Storage Resource's location whose answer was lost: who
+/// asked, and the place it was to.
+#[derive(Clone, Debug)]
+pub(crate) struct PendingLocation {
+    pub by: String,
+    pub path: std::path::PathBuf,
+    /// What the change made in the new directory: its marker and its
+    /// staging folder. A change found not to have landed removes exactly
+    /// those, and nothing that was there before it.
+    pub made_marker: bool,
+    pub made_staging: bool,
+}
+
+/// What changing a Storage Resource's location came to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LocationChanged {
+    Changed,
+    /// The row already holds this place: nothing was written.
+    Same,
+    /// The row holds another place than the one memory found: nothing was
+    /// written.
+    ChangedMeanwhile,
+    NoSuchResource,
+}
+
+/// What removing a Resource came to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Removed {
+    /// The row and its Grants are gone; `grants` went with it.
+    Removed {
+        grants: u64,
+    },
+    NoSuchResource,
+}
+
+/// What replacing a Resource's logins came to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Replaced {
+    /// Stored: the Resource serves by the new logins from now on.
+    Replaced,
+    NoSuchResource,
+    /// The logins found when the request began are not the ones the row
+    /// holds: nothing was changed.
+    ChangedMeanwhile,
 }
 
 /// What registering came to.
@@ -575,6 +1087,18 @@ impl Resource {
 pub enum Registered {
     Registered(Arc<Resource>),
     NameTaken,
+    /// The installation holds the 1,000 Resources it may hold.
+    TooMany,
+}
+
+/// At most this many Resources are registered.
+pub const MAX_RESOURCES: usize = 1_000;
+
+/// What one registration's transaction came to.
+enum Inserted {
+    /// The row, or none when the name was taken.
+    One(Option<Row>),
+    TooMany,
 }
 
 /// What writing a Grant came to.
@@ -777,7 +1301,7 @@ impl Resources {
                         &self.files,
                     ),
                 };
-                (ResourceKind::Storage, Reach::Storage(backend))
+                (ResourceKind::Storage, Reach::Storage(RwLock::new(backend)))
             }
             _ => {
                 let stored: Vec<u8> = get(row, 5)?;
@@ -787,24 +1311,22 @@ impl Resources {
                         // did not reach in time: not served until a later
                         // start seals it (blackbox/CONTRACT.md, "Resources
                         // and Grants in full: At start").
-                        Reach::Unserved(Unserved {
-                            problem: "not-sealed",
-                            said: std::sync::Mutex::new(None),
-                        })
+                        unserved("not-sealed")
                     }
                     Some(vault) => match sealed::open(&stored, vault, id, &name) {
                         Some(connection) => {
-                            Reach::Database(connection.into_pools(&name, &self.limits))
+                            // Copied once, as the Resource is loaded: the
+                            // logins memory holds beside the pools.
+                            let kept = connection.clone();
+                            let pools = connection.into_pools(&name, &self.limits);
+                            Reach::Database(RwLock::new(Database::Served {
+                                pools,
+                                connection: kept,
+                            }))
                         }
-                        None => Reach::Unserved(Unserved {
-                            problem: "does-not-open",
-                            said: std::sync::Mutex::new(None),
-                        }),
+                        None => unserved("does-not-open"),
                     },
-                    None => Reach::Unserved(Unserved {
-                        problem: "no-secret-key",
-                        said: std::sync::Mutex::new(None),
-                    }),
+                    None => unserved("no-secret-key"),
                 };
                 (ResourceKind::Postgres, reach)
             }
@@ -814,13 +1336,18 @@ impl Resources {
             kind,
             reach,
             name,
-            description: get(row, 2)?,
-            owner: get(row, 3)?,
-            contact: get(row, 4)?,
+            texts: RwLock::new(Texts {
+                description: Arc::from(get::<String>(row, 2)?),
+                owner: Arc::from(get::<String>(row, 3)?),
+                contact: Arc::from(get::<String>(row, 4)?),
+            }),
             created_by: get(row, 6)?,
             created_at: get(row, 7)?,
             grants: RwLock::new(Grants::Known(BTreeMap::new())),
+            writes: tokio::sync::Mutex::new(()),
             pulls: Semaphore::new(PULLS_AT_ONCE),
+            removal: std::sync::Mutex::new(None),
+            location_change: std::sync::Mutex::new(None),
         })
     }
 
@@ -841,7 +1368,7 @@ impl Resources {
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .values()
-            .filter_map(|resource| resource.storage().map(Directory::taken))
+            .filter_map(|resource| resource.storage().map(|directory| directory.taken()))
             .collect()
     }
 
@@ -882,6 +1409,21 @@ impl Resources {
             .pool()
             .run(async |client: &mut Client| {
                 let transaction = client.transaction().await.map_err(DbError::from)?;
+                // The cap is decided under the table's own lock, so two
+                // registrations at the 999th cannot both pass; ACCESS SHARE
+                // readers (the start's load) are not blocked.
+                transaction
+                    .batch_execute("LOCK TABLE resources IN SHARE ROW EXCLUSIVE MODE")
+                    .await
+                    .map_err(DbError::from)?;
+                let count: i64 = transaction
+                    .query_one("SELECT count(*) FROM resources", &[])
+                    .await
+                    .and_then(|row| row.try_get(0))
+                    .map_err(DbError::from)?;
+                if usize::try_from(count).unwrap_or(usize::MAX) >= MAX_RESOURCES {
+                    return Ok(Inserted::TooMany);
+                }
                 let row = match &new.reach {
                     NewReach::Database(connection) => {
                         let vault = self.vault.as_ref().ok_or_else(|| {
@@ -954,12 +1496,13 @@ impl Resources {
                 }
                 .map_err(DbError::from)?;
                 transaction.commit().await.map_err(DbError::from)?;
-                Ok(row)
+                Ok(Inserted::One(row))
             })
             .await;
         let row = match inserted {
-            Ok(Some(row)) => row,
-            Ok(None) => {
+            Ok(Inserted::TooMany) => return Ok(Registered::TooMany),
+            Ok(Inserted::One(Some(row))) => row,
+            Ok(Inserted::One(None)) => {
                 // Registered before, perhaps by a registration whose answer
                 // was lost: known from this answer on.
                 if let Err(error) = self.find(&new.name).await {
@@ -978,17 +1521,28 @@ impl Resources {
             kind,
             reach: match new.reach {
                 NewReach::Database(connection) => {
-                    Reach::Database(connection.into_pools(&new.name, &self.limits))
+                    // Copied once, as the Resource is registered.
+                    let kept = connection.clone();
+                    let pools = connection.into_pools(&new.name, &self.limits);
+                    Reach::Database(RwLock::new(Database::Served {
+                        pools,
+                        connection: kept,
+                    }))
                 }
-                NewReach::Storage { backend, .. } => Reach::Storage(backend),
+                NewReach::Storage { backend, .. } => Reach::Storage(RwLock::new(backend)),
             },
             name: new.name,
-            description: new.description,
-            owner: new.owner,
-            contact: new.contact,
+            texts: RwLock::new(Texts {
+                description: Arc::from(new.description),
+                owner: Arc::from(new.owner),
+                contact: Arc::from(new.contact),
+            }),
             created_by: by.to_owned(),
             grants: RwLock::new(Grants::Known(BTreeMap::new())),
+            writes: tokio::sync::Mutex::new(()),
             pulls: Semaphore::new(PULLS_AT_ONCE),
+            removal: std::sync::Mutex::new(None),
+            location_change: std::sync::Mutex::new(None),
         });
         self.all
             .write()
@@ -996,6 +1550,240 @@ impl Resources {
             .entry(resource.name.clone())
             .or_insert_with(|| Arc::clone(&resource));
         Ok(Registered::Registered(resource))
+    }
+
+    /// Takes new description, owner and contact for `name`, in one
+    /// transaction that takes the row's lock first; `None` when the row is
+    /// not there. Answers the row's whole texts afterwards.
+    pub async fn change_texts(
+        &self,
+        id: i64,
+        resource_name: &str,
+        description: Option<&str>,
+        owner: Option<&str>,
+        contact: Option<&str>,
+    ) -> Result<Option<(String, String, String)>, DbError> {
+        self.database
+            .pool()
+            .run(async |client: &mut Client| {
+                let transaction = client.transaction().await.map_err(DbError::from)?;
+                let found = transaction
+                    .query_opt(
+                        "SELECT description, owner, contact FROM resources
+                          WHERE id = $1 AND name = $2 FOR NO KEY UPDATE",
+                        &[&id, &resource_name],
+                    )
+                    .await
+                    .map_err(DbError::from)?;
+                let Some(row) = found else {
+                    transaction.commit().await.map_err(DbError::from)?;
+                    return Ok(None);
+                };
+                let read = |at: usize| row.try_get::<_, String>(at).map_err(DbError::from);
+                let description = match description {
+                    Some(text) => text.to_owned(),
+                    None => read(0)?,
+                };
+                let owner = match owner {
+                    Some(text) => text.to_owned(),
+                    None => read(1)?,
+                };
+                let contact = match contact {
+                    Some(text) => text.to_owned(),
+                    None => read(2)?,
+                };
+                transaction
+                    .execute(
+                        "UPDATE resources
+                            SET description = $2, owner = $3, contact = $4
+                          WHERE id = $1 AND name = $5",
+                        &[&id, &description, &owner, &contact, &resource_name],
+                    )
+                    .await
+                    .map_err(DbError::from)?;
+                transaction.commit().await.map_err(DbError::from)?;
+                Ok(Some((description, owner, contact)))
+            })
+            .await
+    }
+
+    /// A write of a Resource's row whose answer was lost: its Grants, and
+    /// the row whole, are not known until they are read back.
+    pub fn write_failed(&self, resource: &Resource) {
+        let epoch = self.forgotten.fetch_add(1, Ordering::Relaxed);
+        resource.forget(epoch, &self.unknown);
+        log::record(
+            "grants-unknown",
+            serde_json::json!({ "resource": &resource.name }),
+        );
+    }
+
+    /// What replacing a Resource's logins came to.
+    pub async fn replace_connection(
+        &self,
+        id: i64,
+        resource_name: &str,
+        expected: Option<&Connection>,
+        new: &Connection,
+    ) -> Result<Replaced, DbError> {
+        let vault = self.vault.as_ref().ok_or_else(|| {
+            DbError::unexpected("a Resource's logins cannot be sealed without the key")
+        })?;
+        self.database
+            .pool()
+            .run(async |client: &mut Client| {
+                let transaction = client.transaction().await.map_err(DbError::from)?;
+                let found = transaction
+                    .query_opt(
+                        "SELECT connection FROM resources
+                          WHERE id = $1 AND name = $2 FOR NO KEY UPDATE",
+                        &[&id, &resource_name],
+                    )
+                    .await
+                    .map_err(DbError::from)?;
+                let Some(row) = found else {
+                    transaction.commit().await.map_err(DbError::from)?;
+                    return Ok(Replaced::NoSuchResource);
+                };
+                let stored: Vec<u8> = row.try_get(0).map_err(DbError::from)?;
+                if let Some(expected) = expected {
+                    // The logins as written: another replacement between the
+                    // finding and this write is `changed-meanwhile`. The row
+                    // is the very Resource held, by its id, so the seal is
+                    // bound to that id and name.
+                    let current = sealed::open(&stored, vault, id, resource_name);
+                    if current.as_ref() != Some(expected) {
+                        transaction.commit().await.map_err(DbError::from)?;
+                        return Ok(Replaced::ChangedMeanwhile);
+                    }
+                }
+                let sealed = sealed::seal(new, vault, id, resource_name).ok_or_else(|| {
+                    DbError::unexpected("a Resource's connection cannot be sealed")
+                })?;
+                transaction
+                    .execute(
+                        "UPDATE resources SET connection = $2 WHERE id = $1",
+                        &[&id, &sealed],
+                    )
+                    .await
+                    .map_err(DbError::from)?;
+                transaction.commit().await.map_err(DbError::from)?;
+                Ok(Replaced::Replaced)
+            })
+            .await
+    }
+
+    /// Serves `resource` with `connection` from now on: every operation
+    /// sent after this takes the new pools; the old pools close when their
+    /// last operation lets go.
+    pub(crate) fn install_connection(&self, resource: &Resource, connection: Connection) {
+        let pools = connection.clone().into_pools(&resource.name, &self.limits);
+        resource.replace_pools(pools, connection);
+    }
+
+    /// Changes `name`'s stored place to `new`, in one transaction that
+    /// takes the row's lock first, when the row still holds `expected`'s
+    /// place; `Same` when it already holds `new`. The caller installs the
+    /// opened directory in memory once the row is certainly written.
+    pub async fn change_location(
+        &self,
+        id: i64,
+        resource_name: &str,
+        expected: &std::path::Path,
+        new: &Location,
+    ) -> Result<LocationChanged, DbError> {
+        let stored_new = sealed::seal_location(new)
+            .ok_or_else(|| DbError::unexpected("a Resource's location cannot be stored"))?;
+        let new_path = match new {
+            Location::Directory { directory } => std::path::PathBuf::from(directory),
+        };
+        self.database
+            .pool()
+            .run(async |client: &mut Client| {
+                let transaction = client.transaction().await.map_err(DbError::from)?;
+                let found = transaction
+                    .query_opt(
+                        "SELECT connection FROM resources WHERE id = $1 AND name = $2 FOR NO KEY UPDATE",
+                        &[&id, &resource_name],
+                    )
+                    .await
+                    .map_err(DbError::from)?;
+                let Some(row) = found else {
+                    transaction.commit().await.map_err(DbError::from)?;
+                    return Ok(LocationChanged::NoSuchResource);
+                };
+                let stored: Vec<u8> = row.try_get(0).map_err(DbError::from)?;
+                let current = sealed::open_location(&stored).ok_or_else(|| {
+                    DbError::unexpected("a Resource's stored location cannot be read")
+                })?;
+                let current_path = match current {
+                    Location::Directory { directory } => std::path::PathBuf::from(directory),
+                };
+                if current_path == new_path {
+                    transaction.commit().await.map_err(DbError::from)?;
+                    return Ok(LocationChanged::Same);
+                }
+                if current_path != expected {
+                    transaction.commit().await.map_err(DbError::from)?;
+                    return Ok(LocationChanged::ChangedMeanwhile);
+                }
+                transaction
+                    .execute(
+                        "UPDATE resources SET connection = $2 WHERE id = $1 AND name = $3",
+                        &[&id, &stored_new, &resource_name],
+                    )
+                    .await
+                    .map_err(DbError::from)?;
+                transaction.commit().await.map_err(DbError::from)?;
+                Ok(LocationChanged::Changed)
+            })
+            .await
+    }
+
+    /// Removes `name`'s row and its Grants, in one transaction that takes
+    /// the row's lock first; the caller lets the Resource go from memory
+    /// once this says the row is certainly gone (`forget_removed`). Its
+    /// pools close once the last request holding it lets go.
+    pub async fn remove(&self, id: i64, resource_name: &str) -> Result<Removed, DbError> {
+        let removed = self
+            .database
+            .pool()
+            .run(async |client: &mut Client| {
+                let transaction = client.transaction().await.map_err(DbError::from)?;
+                let found = transaction
+                    .query_opt(
+                        "SELECT 1 FROM resources WHERE id = $1 AND name = $2 FOR NO KEY UPDATE",
+                        &[&id, &resource_name],
+                    )
+                    .await
+                    .map_err(DbError::from)?;
+                let Some(_row) = found else {
+                    transaction.commit().await.map_err(DbError::from)?;
+                    return Ok(None);
+                };
+                let grants: i64 = transaction
+                    .query_one("SELECT count(*) FROM grants WHERE resource_id = $1", &[&id])
+                    .await
+                    .and_then(|row| row.try_get(0))
+                    .map_err(DbError::from)?;
+                transaction
+                    .execute("DELETE FROM grants WHERE resource_id = $1", &[&id])
+                    .await
+                    .map_err(DbError::from)?;
+                transaction
+                    .execute("DELETE FROM resources WHERE id = $1", &[&id])
+                    .await
+                    .map_err(DbError::from)?;
+                transaction.commit().await.map_err(DbError::from)?;
+                Ok(Some(grants))
+            })
+            .await?;
+        Ok(match removed {
+            Some(grants) => Removed::Removed {
+                grants: u64::try_from(grants).unwrap_or(0),
+            },
+            None => Removed::NoSuchResource,
+        })
     }
 
     /// Removes the Resource `name` and its Grants, in the database and then
@@ -1035,6 +1823,54 @@ impl Resources {
         Ok(removed)
     }
 
+    /// Lets `resource` go from memory because its row is certainly gone:
+    /// removed from the map (only the very Resource, never one registered
+    /// under its name meanwhile), its Grants `LetGo`, and the count of
+    /// unknown Resources down by one exactly. Its pools close when the
+    /// last request or operation holding it lets go. `false` when memory
+    /// did not hold this one.
+    pub fn forget_removed(&self, resource: &Resource) -> Option<HeldPath> {
+        // The directory is held before the Resource leaves the map, and
+        // until the caller's cleaning ends: at no moment is it neither a
+        // Resource's nor held, so a registration of that name and directory
+        // meanwhile never takes a marker that is about to be removed.
+        let held = resource
+            .storage()
+            .and_then(|directory| self.root.as_ref()?.hold(directory.path()));
+        let removed = {
+            let mut all = self.all.write().unwrap_or_else(PoisonError::into_inner);
+            match all.get(&resource.name) {
+                Some(held) if held.id == resource.id => {
+                    all.remove(&resource.name);
+                    true
+                }
+                _ => false,
+            }
+        };
+        if removed {
+            resource.let_go(&self.unknown);
+            if let Some(by) = resource.take_removal() {
+                log::record(
+                    "resource-removed",
+                    serde_json::json!({ "resource": &resource.name, "by": by }),
+                );
+            }
+            held
+        } else {
+            None
+        }
+    }
+
+    /// Whether memory holds this very Resource now (the same row, not one
+    /// registered under its name since).
+    pub fn is_registered(&self, resource: &Resource) -> bool {
+        self.all
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&resource.name)
+            .is_some_and(|held| held.id == resource.id)
+    }
+
     /// Sets `group`'s Grant on `resource` to `level`, in the database and
     /// then in memory, before this returns. One transaction: the
     /// Resource's row lock first (`FOR NO KEY UPDATE`, held until the
@@ -1050,6 +1886,9 @@ impl Resources {
             return Ok(GrantWritten::NoSuchResource);
         };
         let access = level_name(level);
+        // Armed before the statement is sent: a future given up, or an
+        // answer lost, forgets what memory knows of the Resource.
+        let mut unsettled = Unsettled::new(self, &found);
         let written = self
             .database
             .pool()
@@ -1057,8 +1896,8 @@ impl Resources {
                 let transaction = client.transaction().await.map_err(DbError::from)?;
                 let locked = transaction
                     .query_opt(
-                        "SELECT 1 FROM resources WHERE id = $1 FOR NO KEY UPDATE",
-                        &[&found.id],
+                        "SELECT 1 FROM resources WHERE id = $1 AND name = $2 FOR NO KEY UPDATE",
+                        &[&found.id, &found.name],
                     )
                     .await
                     .map_err(DbError::from)?;
@@ -1084,20 +1923,19 @@ impl Resources {
             Ok(Some(row)) => {
                 let revision = get(&row, 0)?;
                 found.install(group, Granted { level, revision });
+                unsettled.settled();
                 Ok(GrantWritten::Written)
             }
-            Ok(None) => Ok(GrantWritten::NoSuchResource),
-            Err(error) => {
-                // The commit may land after this answer: nothing is read
-                // now, which could be earlier than it.
-                let epoch = self.forgotten.fetch_add(1, Ordering::Relaxed);
-                found.forget(epoch, &self.unknown);
-                log::record(
-                    "grants-unknown",
-                    serde_json::json!({ "resource": &found.name }),
-                );
-                Err(error)
+            Ok(None) => {
+                // Certain: the row is not there. Memory lets it go, and the
+                // guard is disarmed (nothing is unknown).
+                self.forget_removed(&found);
+                unsettled.settled();
+                Ok(GrantWritten::NoSuchResource)
             }
+            // Its guard forgets what memory knows: nothing is read now,
+            // which could be earlier than a commit on its way.
+            Err(error) => Err(error),
         }
     }
 
@@ -1186,27 +2024,151 @@ impl Resources {
     /// (one more is not made), done by `deadline` (the caller's, shared by
     /// all its readings), and not made while a write of a Grant is on its
     /// way (the row is locked).
-    pub async fn read_back(&self, resource: &Resource, deadline: Instant) -> bool {
+    pub async fn read_back(&self, resource: &Resource, deadline: Instant) -> ReadBack {
+        if resource.forgotten_at().is_none() {
+            return ReadBack::Known;
+        }
+        if Instant::now() >= deadline {
+            return ReadBack::Unknown;
+        }
+        // The Resource's write turn: a reading never installs while a write
+        // of its row is between the database and memory, and never before a
+        // reading that began earlier. Taken before the program's place for a
+        // reading, so that readings waiting for one Resource's write do not
+        // hold the places the other Resources' readings need.
+        let Ok(_turn) = tokio::time::timeout_at(deadline, resource.writes.lock()).await else {
+            return ReadBack::Unknown;
+        };
+        let Ok(_permit) = self.reading_back.try_acquire() else {
+            return ReadBack::Unknown;
+        };
+        self.read_back_locked(resource, deadline).await
+    }
+
+    /// The reading and the install, for a caller that already holds the
+    /// Resource's write turn: a write's own answer, read after it wrote and
+    /// before the turn is given back, so memory is never older than the row.
+    pub async fn read_back_locked(&self, resource: &Resource, deadline: Instant) -> ReadBack {
         let Some(began) = resource.forgotten_at() else {
-            return true;
+            return ReadBack::Known;
         };
         if Instant::now() >= deadline {
-            return false;
+            return ReadBack::Unknown;
         }
-        let Ok(_permit) = self.reading_back.try_acquire() else {
-            return false;
-        };
-        let read = tokio::time::timeout_at(deadline, self.grants_of(resource.id))
+        let read = tokio::time::timeout_at(deadline, self.row_of(resource.id))
             .await
             .unwrap_or_else(|_| {
                 Err(DbError::timed_out(
-                    "reading a Resource's Grants back",
+                    "reading a Resource's row back",
                     READ_BACK_WAIT,
                 ))
             });
         match read {
-            Ok(Some(grants)) => resource.install_read(grants, began, &self.unknown),
-            Ok(None) => {}
+            Ok(Some(row)) => {
+                // The row whole, prepared before the one lock that decides
+                // whether the reading is taken: its texts, and for a
+                // database its stored connection opened or not.
+                let texts = (
+                    row.description.clone(),
+                    row.owner.clone(),
+                    row.contact.clone(),
+                );
+                let storage_before = resource.storage();
+                let pending = resource.pending_location();
+                let row_location: Option<std::path::PathBuf> =
+                    if row.kind == ResourceKind::Storage.name() {
+                        sealed::open_location(&row.connection).map(|location| {
+                            let Location::Directory { directory } = location;
+                            std::path::PathBuf::from(directory)
+                        })
+                    } else {
+                        None
+                    };
+                // A location change whose answer was lost: when the row
+                // holds another place than the one it was to, the change
+                // did not land, and exactly what it made there is undone
+                // (never a marker or staging that was there before).
+                let stale = pending.as_ref().and_then(|pending| {
+                    row_location
+                        .as_ref()
+                        .filter(|path| **path != pending.path)
+                        .map(|_| {
+                            (
+                                pending.path.clone(),
+                                pending.made_marker,
+                                pending.made_staging,
+                            )
+                        })
+                });
+                // A reading that finds the row forgets who asked for a
+                // removal: it did not land.
+                resource.clear_removal();
+                let reach = self.reach_of(resource, &row);
+                let storage_changed = matches!(reach, Some(ReachRead::Storage(_)));
+                let installed =
+                    resource.install_read(row.grants, texts, reach, began, &self.unknown);
+                if installed {
+                    if storage_changed && let Some(directory) = resource.storage() {
+                        // The new place is opened now, as `find` opens a
+                        // Storage Resource it reads, in the reading's time;
+                        // past it, the first operation opens it.
+                        directory.opening(deadline).await;
+                    }
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    if storage_changed {
+                        // The change landed: its record is written (by the
+                        // install, before this), and the old directory's
+                        // marker and empty staging go, in the time the
+                        // reading has left.
+                        if let (Some(old), Some(path)) = (&storage_before, &row_location)
+                            && old.path() != path.as_path()
+                        {
+                            old.clean(left).await;
+                        }
+                    } else if let (Some(pending), Some(path)) = (&pending, &row_location)
+                        && pending.path == *path
+                        && let Some(pending) = resource.take_location_change()
+                    {
+                        // Memory already held the place the row has: the
+                        // change is in force and its record is owed.
+                        log::record(
+                            "resource-location-changed",
+                            serde_json::json!({ "resource": &resource.name, "by": pending.by }),
+                        );
+                    }
+                }
+                if let Some((path, marker, staging)) = stale {
+                    resource.clear_location_change();
+                    if let Some(root) = &self.root {
+                        let backend = Directory::new(
+                            &resource.name,
+                            &path,
+                            Some(Arc::clone(root)),
+                            &self.files,
+                        );
+                        let left = deadline.saturating_duration_since(Instant::now());
+                        backend.undo_made(marker, staging, left).await;
+                    }
+                }
+            }
+            // A reading that finds no row means the Resource was removed:
+            // it is let go from memory, at once and for good.
+            Ok(None) => {
+                // A removal found out: its record is written (by the let
+                // go, before this), and its directory is cleaned as an
+                // answered removal would, in the time left.
+                let storage = resource.storage();
+                let held = self.forget_removed(resource);
+                // Cleaned only while the directory is held: without the
+                // hold (the claims are full) it is left, as one that could
+                // not be cleaned in time.
+                if let (Some(directory), Some(_held)) = (storage, &held) {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    directory.clean(left).await;
+                }
+                drop(held);
+                return ReadBack::Removed;
+            }
             Err(error) => {
                 // A write on its way is no failure: it is waited out by
                 // trying again later.
@@ -1215,17 +2177,79 @@ impl Resources {
                 }
             }
         }
-        resource.grants_known()
+        if resource.grants_known() {
+            ReadBack::Known
+        } else {
+            ReadBack::Unknown
+        }
     }
 
-    /// The Grants of the Resource `id`, never earlier than a write of
-    /// them: in one transaction, its row's share lock taken without
-    /// waiting (`NOWAIT`: a write holds the row's lock until its commit is
-    /// done, so while one is on its way this fails at once with
-    /// `lock_not_available`), then, in a second statement whose snapshot is
-    /// after the lock was got, the Grants. `None` for no such Resource.
-    async fn grants_of(&self, id: i64) -> Result<Option<BTreeMap<String, Granted>>, DbError> {
-        let rows = self
+    /// What a reading of the row says a database Resource is reached by
+    /// now, when that is not what memory holds: its opened connection with
+    /// new pools, or why it is not served. `None` for a row sealed as memory
+    /// has it (taken as it is: its pools and their connections stay, and a
+    /// problem already said is not said again), and for a Storage Resource
+    /// (its location is pass B's). The caller holds the Resource's write
+    /// turn, so what memory holds does not change between this and the
+    /// install.
+    fn reach_of(&self, resource: &Resource, row: &StoredRow) -> Option<ReachRead> {
+        if row.kind == ResourceKind::Storage.name() {
+            let location = sealed::open_location(&row.connection)?;
+            let Location::Directory { directory } = location;
+            let path = std::path::PathBuf::from(directory);
+            if resource
+                .storage()
+                .is_some_and(|held| held.path() == path.as_path())
+            {
+                return None;
+            }
+            let backend = Directory::new(
+                &resource.name,
+                &path,
+                self.root.as_ref().map(Arc::clone),
+                &self.files,
+            );
+            return Some(ReachRead::Storage(backend));
+        }
+        if row.kind != ResourceKind::Postgres.name() {
+            return None;
+        }
+        let unserved = |problem: &'static str| {
+            (!resource.reached_as(Err(problem))).then(|| {
+                Database::Unserved(Unserved {
+                    problem,
+                    said: std::sync::Mutex::new(None),
+                })
+            })
+        };
+        let Some(vault) = &self.vault else {
+            return Some(ReachRead::Database(unserved("no-secret-key")?));
+        };
+        if !crate::oidc::seal::is_sealed(&row.connection) {
+            return Some(ReachRead::Database(unserved("not-sealed")?));
+        }
+        match sealed::open(&row.connection, vault, resource.id, &resource.name) {
+            Some(connection) => {
+                if resource.reached_as(Ok(&connection)) {
+                    return None;
+                }
+                // Copied once, for a Resource whose logins changed.
+                let pools = connection.clone().into_pools(&resource.name, &self.limits);
+                Some(ReachRead::Database(Database::Served { pools, connection }))
+            }
+            None => Some(ReachRead::Database(unserved("does-not-open")?)),
+        }
+    }
+
+    /// The Resource's row whole (its stored connection, texts and kind) and
+    /// its Grants, never earlier than a write of them: in one transaction,
+    /// its row's share lock taken without waiting (`NOWAIT`: a write holds
+    /// the row's lock until its commit is done, so while one is on its way
+    /// this fails at once with `lock_not_available`), then, in statements
+    /// whose snapshot is after the lock was got, the Grants. `None` for no
+    /// such Resource.
+    async fn row_of(&self, id: i64) -> Result<Option<StoredRow>, DbError> {
+        let row = self
             .database
             .pool()
             .run(async |client: &mut Client| {
@@ -1238,14 +2262,15 @@ impl Resources {
                     .map_err(DbError::from)?;
                 let found = transaction
                     .query_opt(
-                        "SELECT 1 FROM resources WHERE id = $1 FOR SHARE NOWAIT",
+                        "SELECT connection, description, owner, contact, kind
+                           FROM resources WHERE id = $1 FOR SHARE NOWAIT",
                         &[&id],
                     )
                     .await
                     .map_err(DbError::from)?;
-                if found.is_none() {
+                let Some(found) = found else {
                     return Ok(None);
-                }
+                };
                 let rows = transaction
                     .query(
                         "SELECT group_name, access, revision FROM grants WHERE resource_id = $1",
@@ -1254,13 +2279,44 @@ impl Resources {
                     .await
                     .map_err(DbError::from)?;
                 transaction.commit().await.map_err(DbError::from)?;
-                Ok(Some(rows))
+                Ok(Some(StoredRow {
+                    connection: found.try_get(0).map_err(DbError::from)?,
+                    description: found.try_get(1).map_err(DbError::from)?,
+                    owner: found.try_get(2).map_err(DbError::from)?,
+                    contact: found.try_get(3).map_err(DbError::from)?,
+                    kind: found.try_get(4).map_err(DbError::from)?,
+                    grants: grants_of(&rows)?,
+                }))
             })
             .await?;
-        rows.as_deref().map(grants_of).transpose()
+        Ok(row)
     }
 }
 
+/// What a reading of a Resource's row says it is reached by now: a
+/// database's opened connection or why not, or a Storage Resource's place.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "one per read-back, moved into memory at once, never held in a collection"
+)]
+enum ReachRead {
+    Database(Database),
+    Storage(Directory),
+}
+
+/// A Resource's row as the read-back finds it.
+#[derive(Debug)]
+struct StoredRow {
+    connection: Vec<u8>,
+    description: String,
+    owner: String,
+    contact: String,
+    kind: String,
+    grants: BTreeMap<String, Granted>,
+}
+
+/// A record of something that could not be read back, without the
+/// database's own words (which could name a role).
 fn unknown(event: &str, resource: &str, error: &DbError) {
     log::record(
         event,
@@ -1315,6 +2371,28 @@ mod tests {
         ] {
             assert!(!is_resource_name(name), "{name}");
         }
+    }
+
+    #[test]
+    fn a_reading_is_taken_only_in_its_forgetting_and_with_every_revision_since() {
+        let read = |revision| {
+            let mut grants = BTreeMap::new();
+            grants.insert(
+                "sre".to_owned(),
+                Granted {
+                    level: AccessLevel::Read,
+                    revision,
+                },
+            );
+            grants
+        };
+        let unknown = Grants::Unknown { seen: 3, epoch: 7 };
+        assert!(reading_wins(&unknown, 7, &read(3)));
+        assert!(reading_wins(&unknown, 7, &read(4)));
+        assert!(!reading_wins(&unknown, 7, &read(2)));
+        assert!(!reading_wins(&unknown, 8, &read(4)));
+        assert!(!reading_wins(&Grants::Known(BTreeMap::new()), 7, &read(4)));
+        assert!(!reading_wins(&Grants::LetGo, 7, &read(4)));
     }
 
     #[test]

@@ -19,6 +19,8 @@
 
 use std::thread;
 
+use blackbox::shared_database::{SharedDatabase, token};
+
 use blackbox::admin_pages::{OPERATION_LOG, RESOURCES, query_pairs};
 use blackbox::dashboard::{Dashboard, Page, administrator, stand_in_options, start};
 use blackbox::lost_answer::{HeldPostgres, LOST_WRITE_TIMEOUT, quickly};
@@ -27,50 +29,67 @@ use blackbox::scenario::Scenario;
 use blackbox::{Response, assert_api_error};
 use serde_json::{Value, json};
 
-/// A body registering `name` whose connection holds only recognisable
-/// strings.
-fn body(name: &str) -> Value {
+/// A body registering `name` over `db` whose connection holds only
+/// recognisable strings: roles named after the marker, passwords the same
+/// (registering connects, so they are real roles of the shared database).
+fn body(db: &SharedDatabase, name: &str) -> Value {
+    let read = blackbox::resources::named_login(
+        db,
+        &format!("role_marker_read_{name}_{}", token()),
+        &format!("password-marker-read-{name}-{}", token()),
+    );
+    let write = blackbox::resources::named_login(
+        db,
+        &format!("role_marker_write_{name}_{}", token()),
+        &format!("password-marker-write-{name}-{}", token()),
+    );
     json!({
         "name": name,
         "kind": "postgres",
         "description": format!("The {name} database of the incident team"),
         "owner": format!("The {name} owners"),
         "contact": format!("ask-{name}@example.test"),
-        "connection": {
-            "host": format!("host-marker-{name}.internal"),
-            "port": 54_329,
-            "database": format!("database_marker_{name}"),
-            "read": { "role": format!("role_marker_read_{name}"), "password": format!("password-marker-read-{name}") },
-            "write": { "role": format!("role_marker_write_{name}"), "password": format!("password-marker-write-{name}") },
-        }
+        "connection": blackbox::resources::connection(db, &read, Some(&write), None),
     })
 }
 
-/// The markers of `name`'s connection.
-fn markers(name: &str) -> Vec<String> {
-    vec![
-        format!("host-marker-{name}"),
-        "54329".to_owned(),
-        format!("database_marker_{name}"),
-        format!("role_marker_read_{name}"),
-        format!("password-marker-read-{name}"),
-        format!("role_marker_write_{name}"),
-        format!("password-marker-write-{name}"),
-    ]
+/// The markers of a body's connection: its database, roles and passwords,
+/// and the host when it is unmistakable.
+fn markers(body: &Value) -> Vec<String> {
+    let c = &body["connection"];
+    let mut all = vec![
+        c["database"].as_str().unwrap().to_owned(),
+        c["read"]["role"].as_str().unwrap().to_owned(),
+        c["read"]["password"].as_str().unwrap().to_owned(),
+        c["write"]["role"].as_str().unwrap().to_owned(),
+        c["write"]["password"].as_str().unwrap().to_owned(),
+    ];
+    if c["host"].as_str() != Some("127.0.0.1") {
+        all.push(c["host"].as_str().unwrap().to_owned());
+    }
+    all
 }
 
 /// Three Resources (registered out of order): `alpha` with Grants to ops
 /// (write) and staff (read), `beta` with none, `gamma` with finance
 /// (structure).
 fn world() -> Scenario {
+    world_with_markers().0
+}
+
+/// [`world`], and the markers of each Resource's connection.
+fn world_with_markers() -> (Scenario, Vec<(&'static str, Vec<String>)>) {
     let s = Scenario::start_with(&stand_in_options());
+    let mut all = Vec::new();
     for name in ["gamma", "alpha", "beta"] {
-        s.register_body(name, &body(name));
+        let registered = body(&s.db, name);
+        s.register_body(name, &registered);
+        all.push((name, markers(&registered)));
     }
     s.grant("alpha", "staff", "read");
     s.grant("alpha", "ops", "write");
     s.grant("gamma", "finance", "structure");
-    s
+    (s, all)
 }
 
 fn whole(response: &Response) -> String {
@@ -239,7 +258,7 @@ fn every_resource_with_its_grants_as_the_api_answers_them() {
 
 #[test]
 fn nothing_of_a_connection_no_form_and_no_your_access() {
-    let s = world();
+    let (s, all_markers) = world_with_markers();
     // The administrator holds a Grant through a Group of theirs: still not
     // shown.
     s.grant("beta", blackbox::scenario::ADMINISTRATORS, "write");
@@ -247,10 +266,10 @@ fn nothing_of_a_connection_no_form_and_no_your_access() {
     let answer = dashboard.get(RESOURCES);
     assert_eq!(answer.status, 200, "{}", answer.describe());
     let text = whole(&answer);
-    for name in ["alpha", "beta", "gamma"] {
-        for marker in markers(name) {
+    for (name, found) in &all_markers {
+        for marker in found {
             assert!(
-                !text.contains(&marker),
+                !text.contains(marker.as_str()),
                 "expected nothing of {name}'s connection in the answer, found {marker:?}"
             );
         }
@@ -287,7 +306,7 @@ fn while_the_grants_on_a_resource_cannot_be_told_the_page_is_503_naming_it() {
     let postgres = HeldPostgres::start();
     let platform = postgres.platform("vm_platform_dashboard_lost_grants");
     let s = Scenario::start_with(&stand_in_options().platform(&platform));
-    s.register_body("crewdb", &body("crewdb"));
+    s.register_body("crewdb", &body(&s.db, "crewdb"));
     s.grant("crewdb", "crew", "read");
     let vm = &s.vm;
     let dashboard = Dashboard::new(vm, &administrator());

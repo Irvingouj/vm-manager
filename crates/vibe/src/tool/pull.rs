@@ -106,6 +106,10 @@ struct Answered {
     /// A database's; never printed. Absent on a Storage Resource.
     #[serde(default)]
     standin_sql: Vec<String>,
+    /// A database's: the relations not shown because no login of the
+    /// Resource reaches them. Absent on a Storage Resource.
+    #[serde(default)]
+    hidden: Option<u64>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -169,6 +173,10 @@ pub(super) struct Pulled {
     pub fingerprint: Option<String>,
     /// Whether the Resource is a Storage Resource (its words say so).
     pub storage: bool,
+    /// A database's `hidden`: relations no login of the Resource reaches.
+    hidden: Option<u64>,
+    /// Whom to ask, as the Resource's answer names them.
+    contact: Theirs,
     your_access: Theirs,
     unsupported: Vec<UnsupportedColumn>,
     /// Each file, by its path relative to the project, and whether it was
@@ -286,6 +294,7 @@ impl<'a> Pull<'a> {
             schema_ts,
             unsupported,
             standin_sql,
+            hidden,
             ..
         } = answered;
         let (Some(fingerprint), Some(schema_ts)) = (fingerprint, schema_ts) else {
@@ -371,6 +380,8 @@ impl<'a> Pull<'a> {
         Ok(Pulled {
             fingerprint: Some(fingerprint),
             storage: false,
+            hidden: Some(hidden.unwrap_or(0)),
+            contact: Theirs::from(contact.as_str()),
             your_access,
             unsupported,
             files: written,
@@ -454,6 +465,8 @@ impl<'a> Pull<'a> {
         Ok(Pulled {
             fingerprint: None,
             storage: true,
+            hidden: None,
+            contact: Theirs::from(contact.as_str()),
             your_access,
             unsupported: Vec::new(),
             files: vec![(file.shown, changed)],
@@ -525,6 +538,14 @@ pub(super) async fn pull(args: &PullArgs) -> Result<Done, Ending> {
         let what = if *flag { "written" } else { "unchanged" };
         text.push_str(&format!("  {shown}: {what}\n"));
     }
+    if let Some(hidden) = pulled.hidden
+        && hidden > 0
+    {
+        text.push_str(&format!(
+            "{hidden} relations are not shown because none of the Resource's logins can reach them; code written against one of them will not type-check. To have one shown, ask the Builder to ask the Resource's contact ({}) whether the Resource's logins should be given a privilege on it.\n",
+            pulled.contact
+        ));
+    }
     if !pulled.unsupported.is_empty() {
         text.push_str("Columns of a type the definition cannot express, typed unknown:\n");
     }
@@ -539,17 +560,20 @@ pub(super) async fn pull(args: &PullArgs) -> Result<Done, Ending> {
         .iter()
         .map(|(shown, flag)| json!({ "path": shown, "changed": flag }))
         .collect();
-    Ok(Done {
-        json: json!({
-            "resource": name,
-            "fingerprint": pulled.fingerprint,
-            "your_access": pulled.your_access,
-            "files": listed,
-            "unsupported": pulled.unsupported,
-            "test_users": pulled.test_users,
-        }),
-        text,
-    })
+    let mut json = json!({
+        "resource": name,
+        "fingerprint": pulled.fingerprint,
+        "your_access": pulled.your_access,
+        "files": listed,
+        "unsupported": pulled.unsupported,
+        "test_users": pulled.test_users,
+    });
+    if let Some(hidden) = pulled.hidden
+        && let Some(object) = json.as_object_mut()
+    {
+        object.insert("hidden".into(), json!(hidden));
+    }
+    Ok(Done { json, text })
 }
 
 /// The generated link of `name` (blackbox/CONTRACT.md, "A project"), with

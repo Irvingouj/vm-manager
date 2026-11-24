@@ -30,10 +30,10 @@ use blackbox::deploy::{
 use blackbox::project::{
     INDEX_TS, Report, check, checked_project, manifest_ts, pulled_by_hand, squashed,
 };
-use blackbox::scenario::{CONTACT, Scenario, resource_body};
+use blackbox::scenario::{CONTACT, Scenario};
 use blackbox::sdk::TempProject;
 use blackbox::structure::pull;
-use blackbox::tool::{Machine, closed_address};
+use blackbox::tool::Machine;
 use serde_json::{Value, json};
 
 fn rita() -> User {
@@ -539,9 +539,8 @@ fn a_grant_below_the_declared_level_warns_as_the_check_does_and_goes_on() {
 #[test]
 fn a_shared_database_that_does_not_answer_is_used_as_pulled_with_a_warning() {
     let scenario = Scenario::start();
-    let mut body = resource_body("offline", &scenario.db, &scenario.db.reader);
-    body["connection"]["port"] = json!(closed_address().port());
-    scenario.register_body("offline", &body);
+    // Registered while its database answers, then the database is dropped.
+    blackbox::resources::register_gone(&scenario, "offline");
     scenario.grant("offline", BUILDERS, "read");
     let machine = signed_in(&scenario.vm);
     let project = checked_project("deploy-offline");

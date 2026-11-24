@@ -280,7 +280,8 @@ impl Refusal {
                 refusal
             }
             authz::Reason::NoGrant { held, needed } => {
-                let contact = resource.map_or("", |r| r.contact.as_str());
+                let contact = resource.map(|r| r.contact());
+                let contact = contact.as_deref().unwrap_or("");
                 let holds = held.map_or_else(
                     || "no Grant".to_owned(),
                     |level| format!("only {:?}", level_name(level)),
@@ -1576,7 +1577,7 @@ impl Work {
             return refusal.to_wire();
         }
         let own_pool;
-        let pool: &Pool = match &self.target {
+        let pool: Arc<Pool> = match &self.target {
             On::Resource { resource: None, .. } => {
                 // Allowed means registered; this is not reached.
                 return error_to_wire(json!({ "kind": "unavailable" }));
@@ -1622,7 +1623,7 @@ impl Work {
                     )
                     .await;
                 match &own_pool {
-                    Some(pool) => pool,
+                    Some(pool) => Arc::clone(pool),
                     // A serving Version means a ready own database: reached
                     // only when its keys could not be read (logged).
                     None => {
@@ -1633,7 +1634,7 @@ impl Work {
             }
         };
         if let Some(read) = &self.history {
-            return self.read_history(pool, read).await;
+            return self.read_history(&pool, read).await;
         }
         if let Err(refused) = check::check(&self.sql) {
             let answer = error_to_wire(json!({

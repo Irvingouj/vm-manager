@@ -141,6 +141,7 @@ fn pull_writes_the_definition_and_the_link_and_prints_what_it_did() {
         [
             "files",
             "fingerprint",
+            "hidden",
             "resource",
             "test_users",
             "unsupported",

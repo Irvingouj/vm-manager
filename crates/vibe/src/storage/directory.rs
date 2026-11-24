@@ -196,6 +196,18 @@ pub struct Directory {
     files: Arc<Files>,
 }
 
+impl Clone for Directory {
+    /// A handle on the same directory: a change of location gives new
+    /// operations a new handle, and one already under way keeps this one,
+    /// finishing there.
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+            files: Arc::clone(&self.files),
+        }
+    }
+}
+
 impl std::fmt::Debug for Directory {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Directory")
@@ -236,7 +248,12 @@ impl Directory {
                 root,
                 state: Mutex::new(State::Closed {
                     problem: Problem::NoAnswer,
-                    tried: Instant::now(),
+                    // A newly loaded Resource's first use looks at it (the
+                    // start opens them together, but a Resource read back
+                    // after a change is opened by its first operation).
+                    tried: Instant::now()
+                        .checked_sub(RETRY)
+                        .unwrap_or_else(Instant::now),
                     said: None,
                 }),
                 opening: AtomicBool::new(false),
@@ -298,7 +315,12 @@ impl Directory {
                 root,
                 state: Mutex::new(State::Open {
                     opened,
-                    checked: Instant::now(),
+                    // The first use looks whether the path still names it:
+                    // a directory removed since the registration is found
+                    // out then, not ten seconds later.
+                    checked: Instant::now()
+                        .checked_sub(RETRY)
+                        .unwrap_or_else(Instant::now),
                 }),
                 opening: AtomicBool::new(false),
             }),
@@ -310,6 +332,109 @@ impl Directory {
     /// inside it or holding it. Never printed.
     pub fn path(&self) -> &Path {
         &self.inner.path
+    }
+
+    /// Opens the directory if it is not open, within the deadline, and
+    /// answers what is held now.
+    async fn ensure_open(&self, deadline: tokio::time::Instant) -> Option<Arc<Opened>> {
+        if let Some(opened) = self.identity() {
+            return Some(opened);
+        }
+        self.opening(deadline).await;
+        loop {
+            if let Some(opened) = self.identity() {
+                return Some(opened);
+            }
+            // An opening that has ended and left the directory closed has
+            // failed: there is nothing to wait for.
+            if !self.inner.opening.load(Ordering::Acquire) {
+                return None;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return None;
+            }
+            // Another opening is under way: it settles the state itself.
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// Removes the marker and an empty `.vibe-staging/` from this
+    /// directory, never a file of the Resource, within `within` in all;
+    /// `true` when `.vibe-resource` is gone. A `.vibe-staging/` that holds
+    /// something is left and does not make it false. A directory that is
+    /// not open is opened first, within the same time.
+    pub async fn clean(&self, within: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + within;
+        let Some(opened) = self.ensure_open(deadline).await else {
+            return false;
+        };
+        let files = Arc::clone(&self.files);
+        let placed = files.run(move || {
+            let marker = matches!(
+                rustix::fs::unlinkat(&opened.fd, MARKER, AtFlags::empty()),
+                Ok(()) | Err(Errno::NOENT)
+            );
+            // Never a file: only the folder itself, when it is empty.
+            rustix::fs::unlinkat(&opened.fd, STAGING, AtFlags::REMOVEDIR).ok();
+            rustix::fs::fsync(&opened.fd).ok();
+            marker
+        });
+        let Ok(Some(answer)) = tokio::time::timeout_at(deadline, placed).await else {
+            return false;
+        };
+        tokio::time::timeout_at(deadline, answer)
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or(false)
+    }
+
+    /// Removes from this directory exactly what a change made there: the
+    /// marker when `marker`, the staging folder when `staging` (only when
+    /// it is empty). Never a file that was there before. At most `within`
+    /// in all, opening the directory first when it is not open.
+    pub async fn undo_made(&self, marker: bool, staging: bool, within: Duration) -> bool {
+        if !marker && !staging {
+            return true;
+        }
+        let deadline = tokio::time::Instant::now() + within;
+        let Some(opened) = self.ensure_open(deadline).await else {
+            return false;
+        };
+        let files = Arc::clone(&self.files);
+        let placed = files.run(move || {
+            if marker {
+                rustix::fs::unlinkat(&opened.fd, MARKER, AtFlags::empty()).ok();
+            }
+            if staging {
+                rustix::fs::unlinkat(&opened.fd, STAGING, AtFlags::REMOVEDIR).ok();
+            }
+            rustix::fs::fsync(&opened.fd).ok();
+            true
+        });
+        let Ok(Some(answer)) = tokio::time::timeout_at(deadline, placed).await else {
+            return false;
+        };
+        tokio::time::timeout_at(deadline, answer)
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or(false)
+    }
+
+    /// Why the directory cannot be used as the program last found it;
+    /// `None` when it was usable at the last look (one that has not been
+    /// looked at yet is not usable until its opening).
+    pub fn problem(&self) -> Option<&'static str> {
+        let state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        match &*state {
+            State::Open { .. } => None,
+            State::Closed { problem, .. } => Some(problem.name()),
+        }
     }
 
     /// The directory's identity while it is open.
@@ -1899,11 +2024,85 @@ impl Prepared {
     pub fn claim(&self) -> u64 {
         self.claim
     }
+
+    /// What the check made in the directory: the marker, the staging
+    /// folder, or neither, so that a change that did not land removes
+    /// exactly those and nothing that was there before.
+    pub fn made(&self) -> (bool, bool) {
+        (self.made_marker, self.made_staging)
+    }
 }
 
 impl std::fmt::Debug for Prepared {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("Prepared(<hidden>)")
+    }
+}
+
+/// A claim held while a registration or a change of location is under way:
+/// dropped (the request given up, an early return) it gives the claim back,
+/// so the directory is not held for the change any longer. Releasing twice
+/// is harmless.
+pub struct ClaimGuard {
+    root: Arc<Root>,
+    claim: u64,
+}
+
+impl Drop for ClaimGuard {
+    fn drop(&mut self) {
+        self.root.release(self.claim);
+    }
+}
+
+/// A directory held for registrations and changes of location while a
+/// removal's cleaning is under way: dropped, it is free again.
+pub struct HeldPath {
+    root: Arc<Root>,
+    id: u64,
+}
+
+impl Drop for HeldPath {
+    fn drop(&mut self) {
+        self.root.release(self.id);
+    }
+}
+
+impl Root {
+    /// Holds `path` taken until the guard is dropped: a claim on its
+    /// segments, so that a registration or a change of location of that
+    /// directory, or one holding or inside it, is `directory-in-use`
+    /// meanwhile. `None` when the path is not beneath the root or the
+    /// claims are full (bounded by [`CLAIMS`]).
+    pub fn hold(self: &Arc<Self>, path: &Path) -> Option<HeldPath> {
+        let segments = segments_of(path.to_str()?)?;
+        // Held only for a directory beneath the root; kept as the path's
+        // whole segments, which is what a check compares claims by.
+        self.beneath(&segments)?;
+        let mut claims = self.claims.lock().unwrap_or_else(PoisonError::into_inner);
+        if claims.len() >= CLAIMS {
+            return None;
+        }
+        let id = self
+            .next_claim
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        claims.push(Claim {
+            id,
+            segments,
+            dev: 0,
+            ino: 0,
+        });
+        Some(HeldPath {
+            root: Arc::clone(self),
+            id,
+        })
+    }
+
+    /// The claim `claim`, given back when the guard is dropped.
+    pub fn claim_guard(self: &Arc<Self>, claim: u64) -> ClaimGuard {
+        ClaimGuard {
+            root: Arc::clone(self),
+            claim,
+        }
     }
 }
 
@@ -1933,7 +2132,7 @@ impl Directory {
 
 /// The segments of an absolute path written without `.`, `..` or an empty
 /// segment, one `/` at its end dropped; `None` otherwise.
-fn segments_of(text: &str) -> Option<Vec<String>> {
+pub(crate) fn segments_of(text: &str) -> Option<Vec<String>> {
     let text = text.strip_suffix('/').unwrap_or(text);
     let rest = text.strip_prefix('/')?;
     if rest.is_empty() {
@@ -2050,17 +2249,19 @@ impl Root {
         files: &Files,
         name: &str,
         directory: &str,
+        own: Option<&Path>,
         taken: impl Fn() -> Vec<Taken> + Send + 'static,
     ) -> Result<Prepared, Refused> {
         let root = Arc::clone(self);
         let undoing = Arc::clone(self);
         let name = name.to_owned();
         let directory = directory.to_owned();
+        let own = own.and_then(|path| path.to_str().and_then(segments_of));
         let deadline = Instant::now() + CHECK_TIME;
         let until = Until::new(deadline);
         let mut answer = files
             .run_or_undo(
-                move || root.check_and_mark(&name, &directory, &taken, &until),
+                move || root.check_and_mark(&name, &directory, own.as_deref(), &taken, &until),
                 move |answer| {
                     if let Ok(prepared) = answer {
                         undoing.undo_now(prepared);
@@ -2090,9 +2291,25 @@ impl Root {
     /// the marker and `.vibe-staging/` it wrote are removed. Releases the
     /// claim.
     pub async fn undo(self: &Arc<Self>, files: &Files, prepared: Prepared) {
-        let root = Arc::clone(self);
         let claim = prepared.claim;
-        let undone = files.run(move || root.undo_now(prepared)).await;
+        // Handed to a file thread before anything is awaited, so that a
+        // request given up here still has it undone. Only when no place is
+        // free at once is a place waited for (bounded, as every file job):
+        // a request given up in that wait leaves what was made, and the
+        // claim is given back by its guard.
+        let slot = Arc::new(Mutex::new(Some(prepared)));
+        let job = |root: Arc<Self>, slot: Arc<Mutex<Option<Prepared>>>| {
+            move || {
+                let prepared = slot.lock().unwrap_or_else(PoisonError::into_inner).take();
+                if let Some(prepared) = prepared {
+                    root.undo_now(prepared);
+                }
+            }
+        };
+        let undone = match files.hand_off(job(Arc::clone(self), Arc::clone(&slot))) {
+            Some(answer) => Some(answer),
+            None => files.run(job(Arc::clone(self), slot)).await,
+        };
         match undone {
             Some(answer) => {
                 tokio::time::timeout(CHECK_TIME, answer).await.ok();
@@ -2132,10 +2349,16 @@ impl Root {
         &self,
         name: &str,
         directory: &str,
+        own: Option<&[String]>,
         taken: &dyn Fn() -> Vec<Taken>,
         until: &Until,
     ) -> Result<Prepared, Refused> {
         let segments = segments_of(directory).ok_or(Refused::Outside)?;
+        // The program's own names are never a Resource's directory, at any
+        // depth.
+        if segments.iter().any(|s| s == MARKER || s == STAGING) {
+            return Err(Refused::Outside);
+        }
         let beneath = self.beneath(&segments).ok_or(Refused::Outside)?;
         let mut path = self.path.clone();
         path.extend(beneath);
@@ -2167,6 +2390,9 @@ impl Root {
                 .to_str()
                 .and_then(segments_of)
                 .unwrap_or_default();
+            if own.is_some_and(|own| other_segments == own) {
+                continue;
+            }
             if in_use_by_path(&other_segments)
                 || other
                     .identity()
@@ -2191,7 +2417,9 @@ impl Root {
                 return Err(Refused::InUse);
             }
         }
-        if marked_above {
+        // A marker above is another Resource's, unless it is the Resource's
+        // own directory (a move inside it, or a move of it).
+        if marked_above && !own.is_some_and(|own| segments.starts_with(own)) {
             return Err(Refused::InUse);
         }
         // Nobody waits for it any more: nothing is written.

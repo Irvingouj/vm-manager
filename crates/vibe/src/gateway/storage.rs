@@ -675,7 +675,7 @@ impl StorageWork {
                         .await;
                     return unavailable();
                 };
-                self.run_open(backend, checked, id, elapsed, guard).await
+                self.run_open(&backend, checked, id, elapsed, guard).await
             }
         }
     }

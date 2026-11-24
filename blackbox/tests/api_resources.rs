@@ -11,10 +11,7 @@
     reason = "test code: a failed expectation is a failing test"
 )]
 
-use std::time::{Duration, Instant};
-
 use blackbox::api::{assert_json_content_type, assert_recent_rfc3339};
-use blackbox::postgres;
 use blackbox::scenario::{ADMINISTRATORS, CONTACT, Scenario, administrator, resource_body};
 use blackbox::{User, Vm, VmOptions, assert_api_error};
 use serde_json::{Value, json};
@@ -65,11 +62,18 @@ fn an_administrator_registers_a_resource_and_every_signed_in_user_reads_its_publ
     created.expect_status(201);
     assert_json_content_type(&created);
     let resource = created.json();
+    // The registration's answer: the public face and `warnings`, always.
+    let mut with_warnings: Vec<String> = PUBLIC_FACE.iter().map(|k| (*k).to_owned()).collect();
+    with_warnings.push("warnings".to_owned());
+    with_warnings.sort();
     assert_eq!(
         keys(&resource),
-        PUBLIC_FACE,
-        "expected the Resource answered as {{ name, kind, description, owner, contact, created_by, created_at }} and nothing else, got {resource}"
+        with_warnings,
+        "expected the Resource answered as {{ name, kind, description, owner, contact, created_by, created_at, warnings }} and nothing else, got {resource}"
     );
+    // What GET answers is the Resource without the registration's `warnings`.
+    let mut resource = resource;
+    resource.as_object_mut().unwrap().remove("warnings");
     assert_eq!(resource["name"], "devops");
     assert_eq!(resource["kind"], "postgres");
     assert_eq!(resource["description"], body["description"]);
@@ -534,34 +538,4 @@ fn every_required_field_is_required_and_typed() {
         answer.describe()
     );
     assert_api_error(&s.admin().get_resource("devops"), 404, "not-found");
-}
-
-#[test]
-fn registering_does_not_connect_to_the_database() {
-    let s = Scenario::start();
-    // Nothing listens on this port, and the database and login do not exist.
-    let port = postgres::free_port().unwrap();
-    let body = json!({
-        "name": "unreachable",
-        "kind": "postgres",
-        "description": "Not there yet",
-        "owner": "Nobody",
-        "contact": "Nobody",
-        "connection": {
-            "host": "127.0.0.1",
-            "port": port,
-            "database": "no_such_database",
-            "read": { "role": "no_such_role", "password": "no such password" },
-        },
-    });
-    let began = Instant::now();
-    s.admin().create_resource(&body).expect_status(201);
-    assert!(
-        began.elapsed() < Duration::from_secs(5),
-        "expected registering to answer at once, without trying the database; it took {:?}",
-        began.elapsed()
-    );
-    s.vm.api_as(&alice())
-        .get_resource("unreachable")
-        .expect_status(200);
 }

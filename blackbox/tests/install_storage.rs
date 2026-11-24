@@ -665,7 +665,7 @@ fn storage_mounted_read_write_the_file_a_request_puts_is_on_the_host_and_answere
         blackbox::connection::masked(&marketing.describe(), &[&admin])
     );
     // `archive`, the fixture's other Storage Resource, and `devops`, its
-    // database Resource (never reached: registering connects to nothing),
+    // database Resource (the Compose file's own Postgres, which registering connects to),
     // so that the deploy has every Resource the fixture declares.
     let archive = register(
         &at,
@@ -678,11 +678,26 @@ fn storage_mounted_read_write_the_file_a_request_puts_is_on_the_host_and_answere
         "expected `201` registering {ARCHIVE} over HTTPS\n{}",
         blackbox::connection::masked(&archive.describe(), &[&admin])
     );
-    let devops = register(&at, &admin, &postgres_body(DEVOPS));
+    // Registering connects: `devops` is a database the program in the
+    // container reaches, a role and a database the test makes in the
+    // Compose file's own `postgres` service (reached by its service name).
+    let password = format!("pw-devops-{}", blackbox::shared_database::token());
+    at.install.psql(
+        "postgres",
+        &format!(
+            "CREATE ROLE devops_reader LOGIN PASSWORD '{password}'; CREATE DATABASE devops_db"
+        ),
+    );
+    let mut devops_body = postgres_body(DEVOPS);
+    devops_body["connection"] = json!({
+        "host": "postgres", "port": 5432, "database": "devops_db",
+        "read": { "role": "devops_reader", "password": password },
+    });
+    let devops = register(&at, &admin, &devops_body);
     assert_eq!(
         devops.status,
         201,
-        "expected `201` registering {DEVOPS} (a database never reached) over HTTPS\n{}",
+        "expected `201` registering {DEVOPS} (a database of the Compose file's own Postgres) over HTTPS\n{}",
         blackbox::connection::masked(&devops.describe(), &[&admin])
     );
     // The Group of the fixture's Users is granted `write` on it (and what

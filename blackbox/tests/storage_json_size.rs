@@ -20,7 +20,7 @@ use std::path::Path;
 
 use blackbox::deploy::{BUILDERS, Deployed, commit_all, dana, deploy, init_repository};
 use blackbox::project::{Report, check, checked_project};
-use blackbox::storage::{MARKETING, Storage, storage_body};
+use blackbox::storage::{MARKETING, Storage};
 use blackbox::tool::Machine;
 use serde_json::{Value, json};
 
@@ -29,24 +29,23 @@ use serde_json::{Value, json};
 const LONG_CONTACT: usize = 65_000;
 
 fn start(contact: Option<&str>) -> (Storage, Machine) {
-    let s = Storage::start();
+    let mut s = Storage::start();
     match contact {
         None => {
             s.register(MARKETING);
         }
         Some(contact) => {
-            let dir = s.dir(MARKETING);
-            fs::create_dir_all(&dir).unwrap();
-            let mut body = storage_body(MARKETING, &dir.to_string_lossy());
-            body["contact"] = json!(contact);
-            let answer = s.admin().create_resource(&body);
-            assert_eq!(
-                answer.status,
-                201,
-                "the harness's own check: a contact of {} bytes is taken\n{}",
-                contact.len(),
-                answer.describe()
-            );
+            // The bounds of "Registering a database, checked" refuse a
+            // contact this long at registration; a Resource registered
+            // earlier holds it, so it is put in the row by hand and the
+            // program started again to hold that row.
+            s.register(MARKETING);
+            blackbox::admin::set_resource_text_by_hand(&s.vm, MARKETING, "contact", contact);
+            let Storage { vm, place } = s;
+            s = Storage {
+                vm: blackbox::storage::terminate(vm).start(),
+                place,
+            };
         }
     }
     s.grant(MARKETING, BUILDERS, "write");

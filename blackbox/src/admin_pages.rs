@@ -610,7 +610,7 @@ pub struct PreparedSite {
 /// provider, and in [`SITE_GROUP`]): [`SITE_DISABLED`] made with a
 /// Version and disabled, [`SITE_DRAFT`] made with none, [`SITE_RESOURCE`]
 /// registered over a shared database of the test's own and
-/// [`SITE_GONE_RESOURCE`] over an address nothing serves, both granted
+/// [`SITE_GONE_RESOURCE`] over a database that was dropped after it was registered, both granted
 /// `read` to [`SITE_GROUP`]; and Operation log entries of three outcomes,
 /// each a pull of a Resource's structure: allowed (`admin`'s, on
 /// [`SITE_RESOURCE`]), refused (`other`'s, who holds no Grant) and failed
@@ -634,14 +634,14 @@ pub fn prepare_site(site: &crate::walks::Site, admin: &str, other: &str) -> Prep
     .expect_status(200);
     post("/v1/applications", &json!({ "name": SITE_DRAFT })).expect_status(201);
     let db = crate::shared_database::SharedDatabase::create();
-    let mut body = crate::scenario::resource_body(SITE_RESOURCE, &db, &db.reader);
+    let body = crate::scenario::resource_body(SITE_RESOURCE, &db, &db.reader);
     post("/v1/resources", &body).expect_status(201);
-    body["name"] = json!(SITE_GONE_RESOURCE);
-    let port =
-        crate::postgres::free_port().unwrap_or_else(|e| panic!("cannot find a free port: {e}"));
-    body["connection"]["host"] = json!("127.0.0.1");
-    body["connection"]["port"] = json!(port);
-    post("/v1/resources", &body).expect_status(201);
+    // Registered while it connects (registering checks the logins), then
+    // its database is dropped: nothing serves it.
+    let gone = crate::shared_database::SharedDatabase::create();
+    let gone_body = crate::scenario::resource_body(SITE_GONE_RESOURCE, &gone, &gone.reader);
+    post("/v1/resources", &gone_body).expect_status(201);
+    crate::resources::drop_database(&gone);
     for resource in [SITE_RESOURCE, SITE_GONE_RESOURCE] {
         post(
             &format!("/v1/resources/{resource}/grants"),

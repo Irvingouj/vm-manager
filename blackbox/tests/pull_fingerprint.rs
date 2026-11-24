@@ -21,8 +21,8 @@
 use blackbox::User;
 use blackbox::scenario::{READERS, Scenario};
 use blackbox::structure::{
-    IN_ANOTHER_ORDER, PROBE, PROBE_AGAIN, STOCK, Stock, assert_fingerprint, body_with_structure,
-    build_stock, structure_login, without_second_line,
+    IN_ANOTHER_ORDER, PROBE_AGAIN, STOCK, Stock, assert_fingerprint, body_with_structure,
+    build_stock, probe, structure_login, without_second_line,
 };
 use serde_json::Value;
 
@@ -252,7 +252,7 @@ const MORE_CHANGES: [(&str, &str); 4] = [
 #[test]
 fn each_kind_of_change_gives_another_fingerprint_and_undoing_it_gives_the_first_back() {
     let scenario = Scenario::start();
-    scenario.db.superuser().batch(PROBE);
+    scenario.db.superuser().batch(&probe(&scenario.db));
     let login = structure_login(&scenario.db);
     scenario.register_body(
         "probed",
@@ -281,7 +281,7 @@ fn each_kind_of_change_gives_another_fingerprint_and_undoing_it_gives_the_first_
             ));
         }
         scenario.db.superuser().batch(PROBE_AGAIN);
-        scenario.db.superuser().batch(PROBE);
+        scenario.db.superuser().batch(&probe(&scenario.db));
         let (undone, undone_ts) = pulled();
         if undone != base || undone_ts != base_ts {
             wrong.push(format!(
@@ -298,7 +298,7 @@ fn each_kind_of_change_gives_another_fingerprint_and_undoing_it_gives_the_first_
 
 /// What CONTRACT.md says is not in the structure, applied one after
 /// another. `%READER%` is the read login.
-const NOT_IN_THE_STRUCTURE: [(&str, &str); 16] = [
+const NOT_IN_THE_STRUCTURE: [(&str, &str); 17] = [
     (
         "an index",
         "CREATE INDEX child_note_idx ON probe.child (note)",
@@ -320,8 +320,12 @@ const NOT_IN_THE_STRUCTURE: [(&str, &str); 16] = [
         "COMMENT ON COLUMN probe.child.note IS 'free text'",
     ),
     (
-        "a privilege",
-        "GRANT SELECT, INSERT ON probe.child TO %READER%; GRANT USAGE ON SCHEMA probe TO %READER%",
+        "a further privilege of the read login on a table already listed",
+        "GRANT INSERT, UPDATE, DELETE ON probe.child TO %READER%; GRANT UPDATE (code) ON probe.parent TO %READER%",
+    ),
+    (
+        "a privilege of the write login on a table already listed",
+        "GRANT SELECT, INSERT ON probe.child TO %WRITER%; GRANT USAGE ON SCHEMA probe TO %WRITER%",
     ),
     (
         "a trigger and its function",
@@ -360,7 +364,7 @@ const NOT_IN_THE_STRUCTURE: [(&str, &str); 16] = [
 #[test]
 fn what_is_not_in_the_structure_changes_neither_the_definition_nor_the_fingerprint() {
     let scenario = Scenario::start();
-    scenario.db.superuser().batch(PROBE);
+    scenario.db.superuser().batch(&probe(&scenario.db));
     let login = structure_login(&scenario.db);
     scenario.register_body(
         "probed",
@@ -381,10 +385,11 @@ fn what_is_not_in_the_structure_changes_neither_the_definition_nor_the_fingerpri
     let (base, base_ts) = pulled();
     let mut wrong = Vec::new();
     for (what, change) in NOT_IN_THE_STRUCTURE {
-        scenario
-            .db
-            .superuser()
-            .batch(&change.replace("%READER%", &scenario.db.reader.role));
+        scenario.db.superuser().batch(
+            &change
+                .replace("%READER%", &scenario.db.reader.role)
+                .replace("%WRITER%", &scenario.db.writer.role),
+        );
         let (after, after_ts) = pulled();
         if after != base {
             wrong.push(format!("  {what}: the fingerprint changed to {after}"));
@@ -410,5 +415,125 @@ fn what_is_not_in_the_structure_changes_neither_the_definition_nor_the_fingerpri
         wrong.is_empty(),
         "expected what is not in the structure to change neither the definition nor the fingerprint:\n{}",
         wrong.join("\n")
+    );
+}
+
+/// "A login limited to some tables": what decides the fingerprint is what
+/// the Resource's read or write login reaches. A privilege of the login
+/// that pulls changes nothing; a further privilege of the read or write
+/// login on a table already listed changes nothing; a first privilege of
+/// either on a table not listed lists it and changes the fingerprint.
+#[test]
+fn a_first_privilege_of_the_read_or_write_login_on_a_table_lists_it_and_changes_the_fingerprint_and_nothing_else_does()
+ {
+    let scenario = Scenario::start();
+    let db = &scenario.db;
+    db.superuser().batch(&probe(db));
+    // A table no login of the Resource reaches (the default privileges of
+    // the probe schema gave the read login one; it is taken away).
+    db.superuser().batch(&format!(
+        "CREATE TABLE probe.sealed (id integer PRIMARY KEY, note text); \
+         CREATE TABLE probe.sealed_too (id integer PRIMARY KEY); \
+         REVOKE ALL ON probe.sealed, probe.sealed_too FROM {}",
+        db.reader.role
+    ));
+    let login = structure_login(db);
+    scenario.register_body("probed", &body_with_structure("probed", db, &login));
+    scenario.grant("probed", READERS, "structure");
+    let api = scenario.vm.api_as(&rita());
+    let pulled = || {
+        let answer = blackbox::structure::pull(&api, "probed");
+        if answer.status != 200 {
+            scenario.vm.fail(&format!(
+                "expected `200` pulling, got\n{}",
+                answer.describe()
+            ));
+        }
+        let body = answer.json();
+        let (fingerprint, schema_ts) = both(&body);
+        (fingerprint, schema_ts, body["hidden"].as_u64())
+    };
+    let (base, base_ts, base_hidden) = pulled();
+    assert_eq!(
+        base_hidden,
+        Some(3),
+        "expected the two tables no login reaches, and the shared database's own `staff_only`, to be counted as hidden"
+    );
+    for table in ["sealed", "sealed_too"] {
+        assert!(
+            !base_ts.contains(&format!("\"{table}\"")),
+            "expected `{table}`, which no login of the Resource reaches, not to be listed"
+        );
+    }
+
+    // The pulling (structure) login's own privilege changes nothing, on a
+    // table listed and on one that is not.
+    db.superuser().batch(&format!(
+        "GRANT USAGE ON SCHEMA probe TO {role}; GRANT SELECT, INSERT ON probe.sealed, probe.child TO {role}; \
+         GRANT SELECT (note) ON probe.sealed TO {role}",
+        role = login.role
+    ));
+    let (after, after_ts, hidden) = pulled();
+    assert_eq!(
+        (after, after_ts, hidden),
+        (base.clone(), base_ts.clone(), base_hidden),
+        "expected a privilege of the structure login to change nothing"
+    );
+
+    // A further privilege of the read or the write login on a table
+    // already listed changes nothing.
+    db.superuser().batch(&format!(
+        "GRANT INSERT ON probe.child TO {}; GRANT UPDATE ON probe.parent TO {}",
+        db.reader.role, db.writer.role
+    ));
+    let (after, after_ts, hidden) = pulled();
+    assert_eq!(
+        (after, after_ts, hidden),
+        (base.clone(), base_ts.clone(), base_hidden),
+        "expected a further privilege of the read or write login on a table already listed to change nothing"
+    );
+
+    // A first privilege of the read login on a table not listed lists it.
+    db.superuser().batch(&format!(
+        "GRANT SELECT ON probe.sealed TO {}",
+        db.reader.role
+    ));
+    let (by_read, by_read_ts, hidden) = pulled();
+    assert_ne!(
+        by_read, base,
+        "expected a first privilege of the read login on a table not listed to change the fingerprint"
+    );
+    assert!(
+        by_read_ts.contains("\"sealed\""),
+        "expected the table to be listed, got\n{by_read_ts}"
+    );
+    assert_eq!(hidden, Some(2), "expected one table fewer hidden");
+
+    // So does a first privilege of the write login, on a column.
+    db.superuser().batch(&format!(
+        "GRANT UPDATE (id) ON probe.sealed_too TO {}",
+        db.writer.role
+    ));
+    let (by_write, by_write_ts, hidden) = pulled();
+    assert_ne!(
+        by_write, by_read,
+        "expected a first privilege of the write login on a column of a table not listed to change the fingerprint"
+    );
+    assert!(
+        by_write_ts.contains("\"sealed_too\""),
+        "expected the table to be listed, got\n{by_write_ts}"
+    );
+    assert_eq!(hidden, Some(1), "expected only `staff_only` hidden");
+
+    // Taking them away gives the first fingerprint back.
+    db.superuser().batch(&format!(
+        "REVOKE ALL ON probe.sealed FROM {}; REVOKE ALL ON probe.sealed_too FROM {}",
+        db.reader.role, db.writer.role
+    ));
+    let (back, back_ts, hidden) = pulled();
+    assert_eq!(
+        (back, back_ts, hidden),
+        (base, base_ts, base_hidden),
+        "expected the first fingerprint, definition and count back"
     );
 }

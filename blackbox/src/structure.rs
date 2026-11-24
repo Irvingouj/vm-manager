@@ -272,12 +272,17 @@ REFRESH MATERIALIZED VIEW site_totals;
 "#;
 
 /// What the read and write logins may read and write. `%READER%` and
-/// `%WRITER%` are replaced. Nothing is granted on `restricted`, and nothing
-/// at all to the structure login.
+/// `%WRITER%` are replaced. A pull lists what the Resource's read or write
+/// login holds a privilege on ("A login limited to some tables"), so both
+/// logins may read every relation of the fixture's two schemas, those made
+/// later by a test too (default privileges), and nothing at all goes to
+/// the structure login. The one exception is `restricted`, which no login
+/// of the Resource reaches: it is not listed, and counts in `hidden`.
 pub const GRANTS: &str = "
 GRANT USAGE ON SCHEMA crm TO %READER%, %WRITER%;
-GRANT SELECT ON sites, items, movements, stock_checks, stock_levels, \"stockLevels\", \"case\", \"2fa codes\",
-  open_items, site_totals, readings, crm.accounts TO %READER%, %WRITER%;
+GRANT SELECT ON ALL TABLES IN SCHEMA public, crm TO %READER%, %WRITER%;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public, crm GRANT SELECT ON TABLES TO %READER%, %WRITER%;
+REVOKE ALL ON restricted FROM %READER%, %WRITER%;
 GRANT INSERT, UPDATE, DELETE ON sites, items, movements, crm.accounts TO %WRITER%;
 ";
 
@@ -294,6 +299,8 @@ pub const UNSUPPORTED: [(&str, &str, &str, &str); 4] = [
 /// built again (after `DROP SCHEMA probe CASCADE`) to undo it.
 pub const PROBE: &str = "
 CREATE SCHEMA probe;
+ALTER DEFAULT PRIVILEGES IN SCHEMA probe GRANT SELECT ON TABLES TO %READER%;
+GRANT USAGE ON SCHEMA probe TO %READER%;
 CREATE TYPE probe.mood AS ENUM ('calm', 'busy');
 CREATE TABLE probe.parent (
   id integer PRIMARY KEY,
@@ -314,6 +321,14 @@ CREATE TABLE probe.child (
 CREATE TABLE probe.loose (a integer NOT NULL, b text);
 CREATE VIEW probe.child_notes AS SELECT id, note FROM probe.child;
 ";
+
+/// [`PROBE`] with the read login filled in: a pull lists what the Resource's
+/// read or write login holds a privilege on, so the read login may read
+/// every relation of the schema, those a change makes too (default
+/// privileges).
+pub fn probe(db: &SharedDatabase) -> String {
+    PROBE.replace("%READER%", &db.reader.role)
+}
 
 /// Undoes any change of [`PROBE`]'s and builds it again.
 pub const PROBE_AGAIN: &str =
@@ -739,8 +754,34 @@ const STATISTICS: [&str; 8] = [
 /// read-only transaction, and that no setting is changed but the session's
 /// own (no `SET ROLE`, no `SET SESSION AUTHORIZATION`).
 pub fn catalog_reads(db: &SharedDatabase, role: &str, own_names: &[String]) -> CatalogReads {
+    catalog_reads_since(db, role, own_names, 0)
+}
+
+/// How many entries the shared database server's log holds now: a mark to
+/// give to [`catalog_reads_since`] and [`statements_sent_since`], so that
+/// what follows a registration (which connects every login and probes the
+/// read and the structure login) can be told from what it sent.
+pub fn log_mark(db: &SharedDatabase) -> usize {
+    entries(db.server()).len()
+}
+
+/// How many statements `role` sent to `db` after the log held `mark`
+/// entries.
+pub fn statements_sent_since(db: &SharedDatabase, role: &str, mark: usize) -> usize {
     let all = entries(db.server());
-    let sent = sent_by(&all, db.name(), role);
+    sent_by(all.get(mark..).unwrap_or_default(), db.name(), role).len()
+}
+
+/// As [`catalog_reads`], of the statements sent after the log held `mark`
+/// entries ([`log_mark`]).
+pub fn catalog_reads_since(
+    db: &SharedDatabase,
+    role: &str,
+    own_names: &[String],
+    mark: usize,
+) -> CatalogReads {
+    let all = entries(db.server());
+    let sent = sent_by(all.get(mark..).unwrap_or_default(), db.name(), role);
     let mut found = CatalogReads::default();
     let superuser = db.superuser();
     let mut pids: Vec<&str> = sent.iter().map(|s| s.pid.as_str()).collect();

@@ -140,6 +140,13 @@
 //!   must not hold, the stored values read and written from outside, and a
 //!   restart with another key or none.
 //!
+//! - [`resources`] is what the tests of what a Platform administrator does
+//!   with a Resource share: roles of a shared database made for one purpose
+//!   (limited to some tables, able to write by each kind of evidence, holding
+//!   nothing), a listener that accepts and never answers, a role's sessions
+//!   and statements as the server saw them, and a Resource that was
+//!   registered with logins that connected and then lost what it connects to.
+//!
 //! Every wait has a timeout, so a failing test fails within seconds and
 //! never hangs. Each test starts its own program on its own port, so tests
 //! run in parallel.
@@ -194,6 +201,7 @@ pub mod program;
 pub mod project;
 pub mod records;
 pub mod release;
+pub mod resources;
 pub mod scenario;
 pub mod sdk;
 pub mod sdk_history;

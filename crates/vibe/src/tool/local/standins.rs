@@ -792,9 +792,13 @@ pub(super) async fn register_storages(
         let directory = folder.to_string_lossy().into_owned();
         let taken = Arc::clone(resources);
         let prepared = match root
-            .prepare(&storage.files, &file.resource, &directory, move || {
-                taken.storage_taken()
-            })
+            .prepare(
+                &storage.files,
+                &file.resource,
+                &directory,
+                None,
+                move || taken.storage_taken(),
+            )
             .await
         {
             Ok(prepared) => prepared,

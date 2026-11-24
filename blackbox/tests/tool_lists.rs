@@ -359,11 +359,21 @@ fn without_json_no_control_character_of_the_installations_reaches_the_terminal()
     let description = format!("Invoices{escape}\nfake line\r\tend");
     let owner = "Finance\u{1b}]0;title\u{7}team";
     let contact = "Ask\u{8}\u{8}\u{8}Fiona\u{7f}\u{9b}31m";
-    let mut body = resource_body("billing", &s.db, &s.db.reader);
-    body["description"] = json!(description);
-    body["owner"] = json!(owner);
-    body["contact"] = json!(contact);
+    // The bounds of "Registering a database, checked" refuse these control
+    // characters at registration; a Resource registered earlier holds them,
+    // so they are put in the row by hand and the program started again.
+    let body = resource_body("billing", &s.db, &s.db.reader);
     s.register_body("billing", &body);
+    for (column, text) in [
+        ("description", &description),
+        ("owner", &owner.to_owned()),
+        ("contact", &contact.to_owned()),
+    ] {
+        blackbox::admin::set_resource_text_by_hand(&s.vm, "billing", column, text);
+    }
+    let Scenario { vm, db } = s;
+    let vm = blackbox::storage::terminate(vm).start();
+    let s = Scenario { vm, db };
     let alice = User::new("alice");
     let app_description = format!("Board{escape}\nsecond line");
     s.vm.api_as(&alice)

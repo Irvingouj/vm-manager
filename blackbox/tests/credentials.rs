@@ -20,7 +20,6 @@
 )]
 
 use blackbox::scenario::{READERS, Scenario, resource_body};
-use blackbox::shared_database::token;
 use blackbox::{Response, User};
 use serde_json::{Value, json};
 
@@ -34,22 +33,28 @@ fn no_answer_and_no_log_record_ever_holds_a_resources_connection() {
     let db = &s.db;
     let admin = s.admin();
     let mut answers: Vec<Response> = Vec::new();
-    let wrong_password = format!("pw-wrong-{}", token());
-    let missing_database = format!("missing_db_{}", token());
 
     // Registering, as it should be and with bodies that are refused.
     let devops = resource_body("devops", db, &db.reader);
     answers.push(admin.create_resource(&devops));
     answers.push(admin.create_resource(&resource_body("loose", db, &db.careless)));
-    let mut wrong = resource_body("wrongpw", db, &db.reader);
-    wrong["connection"]["read"]["password"] = json!(wrong_password);
-    answers.push(admin.create_resource(&wrong));
-    let mut nodb = resource_body("nodb", db, &db.reader);
-    nodb["connection"]["database"] = json!(missing_database);
-    answers.push(admin.create_resource(&nodb));
-    let mut closed = resource_body("closed", db, &db.reader);
-    closed["connection"]["port"] = json!(blackbox::postgres::free_port().unwrap());
-    answers.push(admin.create_resource(&closed));
+    // A login whose password was changed, a database that was dropped and a
+    // second one: registered while they connected (a registration whose
+    // login cannot connect is `422`), unusable by the queries below.
+    let own = blackbox::resources::reader_of_its_own(db);
+    answers.push(admin.create_resource(&blackbox::resources::body(
+        "wrongpw",
+        &blackbox::resources::connection(db, &own, None, None),
+    )));
+    blackbox::resources::change_password(db, &own);
+    let wrong_password = own.password().to_owned();
+    let gone = blackbox::shared_database::SharedDatabase::create();
+    answers.push(admin.create_resource(&blackbox::resources::reader_body("nodb", &gone)));
+    blackbox::resources::drop_database(&gone);
+    let missing_database = gone.name().to_owned();
+    let gone_too = blackbox::shared_database::SharedDatabase::create();
+    answers.push(admin.create_resource(&blackbox::resources::reader_body("closed", &gone_too)));
+    blackbox::resources::drop_database(&gone_too);
     for answer in &answers {
         answer.expect_status(201);
     }

@@ -20,9 +20,8 @@
 
 use std::time::{Duration, Instant};
 
-use blackbox::postgres::{Platform, PrivatePostgres, free_port};
+use blackbox::postgres::{Platform, PrivatePostgres};
 use blackbox::scenario::{CONTACT, READERS, Scenario, administrator, resource_body};
-use blackbox::shared_database::token;
 use blackbox::sql::Sql;
 use blackbox::structure::{
     FIRST_LINE, STOCK, Stock, UNSUPPORTED, assert_fingerprint, assert_no_grant_error,
@@ -117,6 +116,7 @@ fn the_answer_holds_the_resource_its_fingerprint_the_users_access_the_definition
         [
             "contact",
             "fingerprint",
+            "hidden",
             "kind",
             "resource",
             "schema_ts",
@@ -225,6 +225,22 @@ fn without_a_grant_the_pull_is_refused_with_whom_to_ask_and_nothing_is_sent() {
     let stock = Stock::start();
     stock.register(STOCK);
     stock.scenario.grant(STOCK, READERS, "read");
+    // What the registration made the shared database see: the connections
+    // and the probe of `pg_catalog`, and nothing else.
+    let roles = [
+        stock.structure.role.as_str(),
+        stock.db().reader.role.as_str(),
+        stock.db().writer.role.as_str(),
+    ];
+    let registered = statements_from(&stock, &roles);
+    for statement in &registered {
+        for table in ["incidents", "kinds", "notes", "staff_only"] {
+            assert!(
+                !statement.contains(table),
+                "expected the registration to send only the probe, found {table:?} in {statement}"
+            );
+        }
+    }
     let refused = stock.pull(&nora(), STOCK);
     assert_api_error(&refused, 403, "no-grant");
     let body = refused.json();
@@ -235,17 +251,11 @@ fn without_a_grant_the_pull_is_refused_with_whom_to_ask_and_nothing_is_sent() {
         "expected `resource` and `contact` beside `reason` and `message`, got {body}"
     );
     std::thread::sleep(Duration::from_millis(300));
-    let sent = statements_from(
-        &stock,
-        &[
-            &stock.structure.role,
-            &stock.db().reader.role,
-            &stock.db().writer.role,
-        ],
-    );
-    assert!(
-        sent.is_empty(),
-        "expected nothing sent to the shared database for a refused pull, but its server log shows:\n{}",
+    let sent = statements_from(&stock, &roles);
+    assert_eq!(
+        sent,
+        registered,
+        "expected nothing more sent to the shared database for a refused pull than the registration's own, but its server log shows:\n{}",
         sent.join("\n")
     );
 }
@@ -265,23 +275,42 @@ fn a_resource_that_does_not_exist_is_not_found() {
 fn a_database_that_cannot_be_reached_or_refuses_the_login_is_structure_unavailable() {
     let stock = Stock::start();
     let db = stock.db();
-    let missing_database = format!("missing_db_{}", token());
-    let wrong_password = format!("pw-wrong-{}", token());
-    let mut nodb = body_with_structure("nodb", db, &stock.structure);
-    nodb["connection"]["database"] = json!(missing_database);
-    let mut wrongpw = body_with_structure("wrongpw", db, &stock.structure);
-    wrongpw["connection"]["structure"]["password"] = json!(wrong_password);
-    let mut wrongread = resource_body("wrongread", db, &db.reader);
-    wrongread["connection"]["read"]["password"] = json!(wrong_password);
-    let mut closed = body_with_structure("closed", db, &stock.structure);
-    closed["connection"]["port"] = json!(free_port().unwrap());
-    for (name, body) in [
-        ("nodb", &nodb),
-        ("wrongpw", &wrongpw),
-        ("wrongread", &wrongread),
-        ("closed", &closed),
-    ] {
-        stock.scenario.register_body(name, body);
+    // Registered while they connect (a registration whose login cannot
+    // connect is `422`), then made unusable at the shared database: a
+    // database dropped, a password changed.
+    let admin = stock.scenario.admin();
+    let gone = blackbox::shared_database::SharedDatabase::create();
+    let gone_structure = blackbox::resources::login_holding_nothing(&gone);
+    admin
+        .create_resource(&body_with_structure("nodb", &gone, &gone_structure))
+        .expect_status(201);
+    let missing_database = gone.name().to_owned();
+    let gone_too = blackbox::shared_database::SharedDatabase::create();
+    let gone_too_structure = blackbox::resources::login_holding_nothing(&gone_too);
+    admin
+        .create_resource(&body_with_structure(
+            "closed",
+            &gone_too,
+            &gone_too_structure,
+        ))
+        .expect_status(201);
+    let structure = blackbox::resources::login_holding_nothing(db);
+    admin
+        .create_resource(&body_with_structure("wrongpw", db, &structure))
+        .expect_status(201);
+    let own = blackbox::resources::reader_of_its_own(db);
+    admin
+        .create_resource(&blackbox::resources::body(
+            "wrongread",
+            &blackbox::resources::connection(db, &own, None, None),
+        ))
+        .expect_status(201);
+    blackbox::resources::drop_database(&gone);
+    blackbox::resources::drop_database(&gone_too);
+    blackbox::resources::change_password(db, &structure);
+    blackbox::resources::change_password(db, &own);
+    let wrong_password = structure.password().to_owned();
+    for name in ["nodb", "wrongpw", "wrongread", "closed"] {
         stock.scenario.grant(name, READERS, "structure");
     }
     let mut markers = stock.markers();
@@ -318,9 +347,7 @@ fn a_database_that_cannot_be_reached_or_refuses_the_login_is_structure_unavailab
 #[test]
 fn every_pull_allowed_refused_or_failed_has_one_operation_log_entry() {
     let stock = Stock::ready();
-    let mut missing = body_with_structure("gone", stock.db(), &stock.structure);
-    missing["connection"]["database"] = json!(format!("missing_db_{}", token()));
-    stock.scenario.register_body("gone", &missing);
+    blackbox::resources::register_gone(&stock.scenario, "gone");
     stock.scenario.grant("gone", READERS, "read");
 
     let allowed = stock.pull(&rita(), STOCK);
@@ -364,10 +391,12 @@ fn the_structure_login_is_in_no_answer_and_no_log_record() {
     answers.push(admin.create_resource(&body_with_structure(STOCK, stock.db(), &stock.structure)));
     answers[0].expect_status(201);
     stock.scenario.grant(STOCK, READERS, "structure");
-    let mut wrong = body_with_structure("wrongpw", stock.db(), &stock.structure);
-    wrong["connection"]["structure"]["password"] =
-        json!(format!("{}-not", stock.structure.password()));
-    answers.push(admin.create_resource(&wrong));
+    // A structure login registered while it works, whose password is then
+    // changed at the shared database (a wrong one is `422` now).
+    let wrong_login = blackbox::resources::login_holding_nothing(stock.db());
+    answers.push(admin.create_resource(&body_with_structure("wrongpw", stock.db(), &wrong_login)));
+    answers[1].expect_status(201);
+    blackbox::resources::change_password(stock.db(), &wrong_login);
     stock.scenario.grant("wrongpw", READERS, "structure");
     // Refused bodies with the structure login in them.
     answers.push(admin.create_resource(&body_with_structure(STOCK, stock.db(), &stock.structure)));
@@ -402,8 +431,13 @@ fn the_structure_login_is_in_no_answer_and_no_log_record() {
             .map(|l| ("the program's log".to_owned(), l.raw)),
     );
     let mut found = Vec::new();
+    let mut markers = stock.markers();
+    markers.push((
+        "the password of a structure login",
+        wrong_login.password().to_owned(),
+    ));
     for (whence, text) in &texts {
-        for (what, marker) in stock.markers() {
+        for (what, marker) in &markers {
             if text.contains(marker.as_str()) {
                 found.push(format!("{what} in {whence}:\n    {text}"));
             }
@@ -447,27 +481,33 @@ fn when_the_entry_cannot_be_written_the_pull_is_unavailable_and_nothing_is_sent(
     let structure = blackbox::structure::build_stock(&scenario.db, &blackbox::structure::IN_ORDER);
     scenario.register_body(STOCK, &body_with_structure(STOCK, &scenario.db, &structure));
     scenario.grant(STOCK, READERS, "read");
+    let sent_by = |scenario: &Scenario| -> Vec<String> {
+        scenario
+            .db
+            .statements_by_login()
+            .into_iter()
+            .filter(|(by, _)| {
+                [
+                    &structure.role,
+                    &scenario.db.reader.role,
+                    &scenario.db.writer.role,
+                ]
+                .contains(&by)
+            })
+            .map(|(_, e)| e)
+            .collect()
+    };
+    // The registration's own: the connections and the probe.
+    let registered = sent_by(&scenario);
     platform_postgres.stop();
     let answer = pull(&scenario.vm.api_as(&rita()), STOCK);
     assert_api_error(&answer, 503, "unavailable");
     std::thread::sleep(Duration::from_millis(300));
-    let sent: Vec<String> = scenario
-        .db
-        .statements_by_login()
-        .into_iter()
-        .filter(|(by, _)| {
-            [
-                &structure.role,
-                &scenario.db.reader.role,
-                &scenario.db.writer.role,
-            ]
-            .contains(&by)
-        })
-        .map(|(_, e)| e)
-        .collect();
-    assert!(
-        sent.is_empty(),
-        "expected nothing sent to the shared database when the Operation log entry cannot be written, but:\n{}",
+    let sent = sent_by(&scenario);
+    assert_eq!(
+        sent,
+        registered,
+        "expected nothing more sent to the shared database when the Operation log entry cannot be written, but:\n{}",
         sent.join("\n")
     );
 }
@@ -476,7 +516,8 @@ fn when_the_entry_cannot_be_written_the_pull_is_unavailable_and_nothing_is_sent(
 fn a_structure_larger_than_4_mib_is_structure_too_large() {
     let stock = Stock::start();
     // 48 tables of 1600 columns with names of 60 characters: more than
-    // 4 MiB of catalogs, and of definition, whichever is measured.
+    // 4 MiB of catalogs, and of definition, whichever is measured; the read
+    // login holds a privilege on each, or they would not be listed.
     let superuser = stock.db().superuser();
     for t in 0..48 {
         let columns: Vec<String> = (0..1600)
@@ -484,9 +525,10 @@ fn a_structure_larger_than_4_mib_is_structure_too_large() {
             .map(|name| format!("{name} text"))
             .collect();
         superuser.batch(&format!(
-            "CREATE TABLE wide_{t:02}_{} ({})",
-            "w".repeat(40),
-            columns.join(", ")
+            "CREATE TABLE wide_{t:02}_{name} ({columns}); GRANT SELECT ON wide_{t:02}_{name} TO {reader}",
+            name = "w".repeat(40),
+            columns = columns.join(", "),
+            reader = stock.db().reader.role
         ));
     }
     stock.register(STOCK);
@@ -545,10 +587,6 @@ fn every_kind_of_relation_of_every_schema_but_postgress_own_is_in_the_structure(
     for (what, needle) in [
         ("an ordinary table", "pgTable(\"sites\""),
         ("a table of another schema", "crmSchema.table(\"accounts\""),
-        (
-            "a table no login of the Resource may read",
-            "pgTable(\"restricted\"",
-        ),
         ("a partitioned table", "pgTable(\"readings\""),
         ("a view", "pgView(\"open_items\""),
         ("a materialized view", "pgMaterializedView(\"site_totals\""),
@@ -566,6 +604,10 @@ fn every_kind_of_relation_of_every_schema_but_postgress_own_is_in_the_structure(
         );
     }
     for (what, needle) in [
+        (
+            "a table no login of the Resource reaches (counted in `hidden`)",
+            "restricted",
+        ),
         ("a partition", "readings_2025"),
         ("a partition", "readings_2026"),
         ("Postgres's own schema", "pg_catalog"),
@@ -580,6 +622,11 @@ fn every_kind_of_relation_of_every_schema_but_postgress_own_is_in_the_structure(
             "expected no {what} ({needle}) in the definition, got\n{ts}"
         );
     }
+    assert_eq!(
+        answer["hidden"],
+        json!(1),
+        "expected `hidden` to count `restricted`, which neither the read nor the write login holds a privilege on, and nothing else (partitions are not counted), got {answer}"
+    );
     let views = ts.matches(".existing()").count();
     assert!(
         views >= 2,
@@ -604,7 +651,8 @@ fn a_resource_registered_with_a_structure_login_of_its_own_answers_its_registrat
             "description",
             "kind",
             "name",
-            "owner"
+            "owner",
+            "warnings"
         ],
         "{created}"
     );

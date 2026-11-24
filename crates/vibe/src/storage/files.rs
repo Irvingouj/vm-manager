@@ -102,6 +102,34 @@ impl Files {
         self.run_or_undo(job, drop).await
     }
 
+    /// Hands `job` to a file thread now, without waiting for a place: the
+    /// job runs even when the caller's future is dropped. `None` when no
+    /// place is free now (bounded by [`WAITING`]) or the threads are
+    /// stopped; then the job never runs.
+    pub fn hand_off<T: Send + 'static>(
+        &self,
+        job: impl FnOnce() -> T + Send + 'static,
+    ) -> Option<tokio::sync::oneshot::Receiver<T>> {
+        let places = Arc::clone(&self.places);
+        let place = places.try_acquire_owned().ok()?;
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        let handed = Handed {
+            job: Box::new(move || {
+                drop(reply.send(job()));
+            }),
+            place,
+        };
+        let sender = self
+            .sender
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()?;
+        match sender.try_send(handed) {
+            Ok(()) => Some(answer),
+            Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => None,
+        }
+    }
+
     /// As [`Files::run`], but when the job's answer cannot be delivered
     /// (nobody waits for it any more), `undelivered` is given it, on the
     /// file thread: to undo what the job made.

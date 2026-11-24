@@ -65,15 +65,34 @@ use crate::log;
 const SESSION: &str = "SELECT pg_catalog.set_config('search_path', '', true), \
      pg_catalog.set_config('statement_timeout', $1, true)";
 
+/// Whether the Resource's read login (`$2`) or write login (`$3`, null
+/// when it has none) holds a privilege on the relation `c` or one of its
+/// columns. The roles are looked up in `pg_roles` first: a role the server
+/// no longer has is no row, so the `EXISTS` is false (not NULL, and never
+/// everything). `c` is `pg_class`.
+macro_rules! can_reach {
+    () => {
+        "(EXISTS (SELECT 1 FROM pg_catalog.pg_roles r \
+                   WHERE r.rolname OPERATOR(pg_catalog.=) $2::pg_catalog.name \
+                     AND (pg_catalog.has_table_privilege(r.oid, c.oid, 'SELECT,INSERT,UPDATE,DELETE,TRUNCATE') \
+                          OR pg_catalog.has_any_column_privilege(r.oid, c.oid, 'SELECT,INSERT,UPDATE'))) \
+          OR EXISTS (SELECT 1 FROM pg_catalog.pg_roles r \
+                      WHERE r.rolname OPERATOR(pg_catalog.=) $3::pg_catalog.name \
+                        AND (pg_catalog.has_table_privilege(r.oid, c.oid, 'SELECT,INSERT,UPDATE,DELETE,TRUNCATE') \
+                             OR pg_catalog.has_any_column_privilege(r.oid, c.oid, 'SELECT,INSERT,UPDATE'))))"
+    };
+}
+
 /// Which relations are listed: ordinary and partitioned tables, views and
 /// materialized views, not a partition, outside Postgres's own schemas
-/// (`$1` is `information_schema`). `c` is `pg_class`, `n` its
-/// `pg_namespace`.
+/// (`$1` is `information_schema`), and one the read or write login reaches.
+/// `c` is `pg_class`, `n` its `pg_namespace`.
 macro_rules! listed {
     () => {
         "c.relkind IN ('r', 'p', 'v', 'm') AND NOT c.relispartition \
          AND n.nspname OPERATOR(pg_catalog.<>) $1::pg_catalog.name \
-         AND n.nspname::pg_catalog.text NOT LIKE 'pg\\_%'"
+         AND n.nspname::pg_catalog.text NOT LIKE 'pg\\_%' \
+         AND "
     };
 }
 
@@ -85,15 +104,15 @@ const RELATIONS: &str = concat!(
        FROM pg_catalog.pg_class c \
        JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) c.relnamespace \
       WHERE ",
-    listed!()
+    listed!(),
+    can_reach!()
 );
 
 /// Each column of a listed relation: its relation's OID, number, name, type
 /// as printed, the type's OID, modifier and kind, the element type's OID
 /// and kind when the type is an array, not null, identity, generation, and
 /// the default's or generation's expression as text.
-const COLUMNS: &str = concat!(
-    "SELECT a.attrelid::pg_catalog.text, a.attnum::pg_catalog.text, a.attname::pg_catalog.text, \
+const COLUMNS: &str = "SELECT a.attrelid::pg_catalog.text, a.attnum::pg_catalog.text, a.attname::pg_catalog.text, \
             pg_catalog.format_type(a.atttypid, a.atttypmod), \
             a.atttypid::pg_catalog.text, a.atttypmod::pg_catalog.text, t.typtype::pg_catalog.text, \
             e.oid::pg_catalog.text, e.typtype::pg_catalog.text, \
@@ -107,9 +126,8 @@ const COLUMNS: &str = concat!(
                                      AND e.typarray OPERATOR(pg_catalog.=) t.oid \
        LEFT JOIN pg_catalog.pg_attrdef d ON d.adrelid OPERATOR(pg_catalog.=) a.attrelid \
                                         AND d.adnum OPERATOR(pg_catalog.=) a.attnum \
-      WHERE a.attnum OPERATOR(pg_catalog.>) 0 AND NOT a.attisdropped AND ",
-    listed!()
-);
+      WHERE a.attnum OPERATOR(pg_catalog.>) 0 AND NOT a.attisdropped \
+        AND c.oid OPERATOR(pg_catalog.=) ANY ($1::pg_catalog.oid[])";
 
 /// The enums of `$1` (their OIDs, as the columns gave them): OID, schema,
 /// name, and the labels in order as a JSON array.
@@ -129,8 +147,7 @@ const ENUMS: &str = "SELECT t.oid::pg_catalog.text, n.nspname::pg_catalog.text, 
 /// relation's OID, name, kind, the columns' names in order as a JSON
 /// array, and for a foreign key the schema and name of the table referred
 /// to, its columns likewise, and the actions on update and on delete.
-const CONSTRAINTS: &str = concat!(
-    "SELECT k.conrelid::pg_catalog.text, k.conname::pg_catalog.text, k.contype::pg_catalog.text, \
+const CONSTRAINTS: &str = "SELECT k.conrelid::pg_catalog.text, k.conname::pg_catalog.text, k.contype::pg_catalog.text, \
             pg_catalog.to_json(ARRAY(SELECT a.attname::pg_catalog.text \
                  FROM pg_catalog.unnest(k.conkey) WITH ORDINALITY u(attnum, i) \
                  JOIN pg_catalog.pg_attribute a ON a.attrelid OPERATOR(pg_catalog.=) k.conrelid \
@@ -142,15 +159,28 @@ const CONSTRAINTS: &str = concat!(
                  JOIN pg_catalog.pg_attribute a ON a.attrelid OPERATOR(pg_catalog.=) k.confrelid \
                                                AND a.attnum OPERATOR(pg_catalog.=) u.attnum \
                 ORDER BY u.i))::pg_catalog.text, \
-            k.confupdtype::pg_catalog.text, k.confdeltype::pg_catalog.text \
+            k.confupdtype::pg_catalog.text, k.confdeltype::pg_catalog.text, \
+            k.confrelid::pg_catalog.text, COALESCE(fc.relispartition::pg_catalog.text, 'false') \
        FROM pg_catalog.pg_constraint k \
        JOIN pg_catalog.pg_class c ON c.oid OPERATOR(pg_catalog.=) k.conrelid \
        JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) c.relnamespace \
        LEFT JOIN pg_catalog.pg_class fc ON fc.oid OPERATOR(pg_catalog.=) k.confrelid \
        LEFT JOIN pg_catalog.pg_namespace fn ON fn.oid OPERATOR(pg_catalog.=) fc.relnamespace \
       WHERE k.contype OPERATOR(pg_catalog.=) ANY ('{p,u,f}'::pg_catalog.\"char\"[]) \
-        AND k.conparentid OPERATOR(pg_catalog.=) 0::pg_catalog.oid AND ",
-    listed!()
+        AND k.conparentid OPERATOR(pg_catalog.=) 0::pg_catalog.oid \
+        AND c.oid OPERATOR(pg_catalog.=) ANY ($1::pg_catalog.oid[])";
+
+/// How many relations outside Postgres's own schemas (partitions not
+/// counted) the logins reach nothing of: not listed, and only counted.
+const HIDDEN: &str = concat!(
+    "SELECT pg_catalog.count(*)::pg_catalog.text \
+       FROM pg_catalog.pg_class c \
+       JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) c.relnamespace \
+      WHERE c.relkind IN ('r', 'p', 'v', 'm') AND NOT c.relispartition \
+        AND n.nspname OPERATOR(pg_catalog.<>) $1::pg_catalog.name \
+        AND n.nspname::pg_catalog.text NOT LIKE 'pg\\_%' \
+        AND NOT ",
+    can_reach!()
 );
 
 /// The `statement_timeout` ends a statement this long before the pull's
@@ -162,6 +192,8 @@ const SERVER_MARGIN_MS: u128 = 250;
 pub(super) async fn read(
     pool: &Pool,
     resource: &str,
+    read_role: &str,
+    write_role: Option<&str>,
     deadline: Instant,
 ) -> Result<Structure, Failed> {
     let mut held = pool
@@ -176,6 +208,8 @@ pub(super) async fn read(
         deadline,
         left: MAX_BYTES,
         resource,
+        read_role,
+        write_role,
     };
     let read = reading.structure().await;
     // Read-only: nothing to keep. Back to the pool only shown clean.
@@ -190,6 +224,8 @@ struct Reading<'h, 'p> {
     /// What is left of [`MAX_BYTES`] for the rows still to come.
     left: usize,
     resource: &'h str,
+    read_role: &'h str,
+    write_role: Option<&'h str>,
 }
 
 impl Reading<'_, '_> {
@@ -202,19 +238,34 @@ impl Reading<'_, '_> {
             .max(1);
         self.run(SESSION, &[Param::Text(left_ms.to_string())])
             .await?;
-        let schemas = [Param::Text("information_schema".to_owned())];
+        let schemas = [
+            Param::Text("information_schema".to_owned()),
+            Param::Text(self.read_role.to_owned()),
+            match self.write_role {
+                Some(role) => Param::Text(role.to_owned()),
+                None => Param::Null,
+            },
+        ];
         let relations = self.run(RELATIONS, &schemas).await?;
-        let columns = self.run(COLUMNS, &schemas).await?;
         let mut built = Built::relations(&relations)?;
+        let listed = format!("{{{}}}", built.oids().join(","));
+        let columns = self.run(COLUMNS, &[Param::Text(listed.clone())]).await?;
         let enum_oids = built.columns(&columns)?;
         let oids: Vec<String> = enum_oids.iter().map(u32::to_string).collect();
         let enums = self
             .run(ENUMS, &[Param::Text(format!("{{{}}}", oids.join(",")))])
             .await?;
         built.enums(&enums)?;
-        let constraints = self.run(CONSTRAINTS, &schemas).await?;
+        let constraints = self.run(CONSTRAINTS, &[Param::Text(listed)]).await?;
         built.constraints(&constraints)?;
-        Ok(built.finish())
+        let hidden = self.run(HIDDEN, &schemas).await?;
+        let hidden = hidden
+            .rows
+            .first()
+            .map(|row| number::<u64>(row, 0))
+            .transpose()?
+            .unwrap_or(0);
+        Ok(built.finish(hidden))
     }
 
     /// Runs one statement within the deadline and what is left of the
@@ -347,6 +398,11 @@ impl Built {
         })
     }
 
+    /// The OIDs of the listed relations, sorted.
+    fn oids(&self) -> Vec<String> {
+        self.by_oid.keys().map(u32::to_string).collect()
+    }
+
     /// Takes the columns; answers the OIDs of the enums they use.
     fn columns(&mut self, rows: &Rows) -> Result<Vec<u32>, Failed> {
         let mut enums: Vec<u32> = Vec::new();
@@ -426,6 +482,17 @@ impl Built {
     fn constraints(&mut self, rows: &Rows) -> Result<(), Failed> {
         for row in &rows.rows {
             let relation: u32 = number(row, 0)?;
+            let kind = text(row, 2)?;
+            if kind == "f" {
+                // A foreign key to a relation no login reaches is left out
+                // of the definition and the fingerprint. A partition is
+                // kept as before (it is not listed itself).
+                let confrelid: u32 = number(row, 9)?;
+                let partition = matches!(cell(row, 10)?, Some("true" | "t"));
+                if !partition && !self.by_oid.contains_key(&confrelid) {
+                    continue;
+                }
+            }
             let Some(found) = self
                 .by_oid
                 .get(&relation)
@@ -435,7 +502,7 @@ impl Built {
             };
             let name = text(row, 1)?.to_owned();
             let columns = texts(row, 3)?;
-            match text(row, 2)? {
+            match kind {
                 "p" => found.primary_key = Some(Key { name, columns }),
                 "u" => found.uniques.push(Key { name, columns }),
                 "f" => found.foreign_keys.push(ForeignKey {
@@ -455,7 +522,7 @@ impl Built {
 
     /// Puts it in the order the contract gives: enums by schema then name,
     /// columns by number, constraints by name.
-    fn finish(self) -> Structure {
+    fn finish(self, hidden: u64) -> Structure {
         let mut enums: Vec<(u32, Enum)> = self.enums.into_iter().collect();
         enums.sort_by(|(_, a), (_, b)| (&a.schema, &a.name).cmp(&(&b.schema, &b.name)));
         let index_of: BTreeMap<u32, usize> = enums
@@ -495,6 +562,7 @@ impl Built {
         Structure {
             relations,
             enums: enums.into_iter().map(|(_, e)| e).collect(),
+            hidden,
         }
     }
 }

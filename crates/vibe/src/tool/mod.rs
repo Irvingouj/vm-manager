@@ -474,8 +474,11 @@ pub fn run(command: Command) -> ExitCode {
             (0, written)
         }
         Err(ending) => {
+            // A wrong command line is the usage text on standard error,
+            // whatever `--json` asks: nothing was asked of the installation.
+            let usage = ending.reason == json!("usage");
             let (code, report) = ending.printed();
-            let written = if json {
+            let written = if json && !usage {
                 write_to(&mut io::stdout().lock(), &json_line(&report.json))
             } else {
                 write_to(&mut io::stderr().lock(), &report.text)

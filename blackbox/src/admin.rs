@@ -279,6 +279,30 @@ pub fn platform_sql(vm: &Vm) -> Sql {
     })
 }
 
+/// Writes `text` into `column` (`description`, `owner` or `contact`) of the
+/// Resource `name`'s row at the platform database, as the harness's
+/// superuser, as a Resource registered before the bounds on a Resource's
+/// text would hold it. The program serves Resources from memory: stop it
+/// and start it again on the same platform database to have it hold the row.
+pub fn set_resource_text_by_hand(vm: &Vm, name: &str, column: &str, text: &str) {
+    assert!(
+        matches!(column, "description" | "owner" | "contact"),
+        "the harness's own check: {column:?} is not a text column of a Resource"
+    );
+    let hex: String = text.bytes().map(|b| format!("{b:02x}")).collect();
+    let platform = platform_sql(vm);
+    platform.batch(&format!(
+        "UPDATE resources SET {column} = convert_from(decode('{hex}', 'hex'), 'UTF8') WHERE name = '{name}'"
+    ));
+    assert_eq!(
+        platform.value(&format!(
+            "SELECT count(*)::text FROM resources WHERE name = '{name}' AND {column} = convert_from(decode('{hex}', 'hex'), 'UTF8')"
+        )),
+        Some("1".to_owned()),
+        "the harness's own check: the row of {name:?} holds the text written by hand"
+    );
+}
+
 /// The UTC day `days_ago` days before today's, as `YYYY-MM-DD`, as the
 /// platform database's clock says it.
 pub fn utc_day(sql: &Sql, days_ago: u32) -> String {

@@ -541,9 +541,11 @@ impl Pool {
                 match error {
                     WireError::Io => Cause::Connection,
                     WireError::TimedOut => Cause::TimedOut(self.limits.connect),
-                    WireError::Protocol | WireError::Refused | WireError::Unsupported => {
-                        Cause::Server(None)
-                    }
+                    WireError::Protocol
+                    | WireError::Refused
+                    | WireError::NotNow
+                    | WireError::NoSuchDatabase
+                    | WireError::Unsupported => Cause::Server(None),
                 }
             })
     }
@@ -886,4 +888,121 @@ mod tests {
         );
         assert!(!format!("{pool:?}").contains("secret"));
     }
+}
+
+/// The catalogue path the pull's statements set: no schema of the shared
+/// database's own is searched, so no operator or function of it is found.
+const CATALOG_PATH: &str = "SET LOCAL search_path = pg_catalog, pg_temp";
+
+/// Why a check of a Resource's login could not use it (blackbox/CONTRACT.md,
+/// "Resources and Grants in full: Registering a database, checked").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProbeFailure {
+    /// The name does not resolve, nothing answers, the connection is refused
+    /// or cut, or the server answered in another way.
+    Unreachable,
+    /// The server refused the role or its password, or the role may not
+    /// connect.
+    Refused,
+    /// The server has no database of that name.
+    NoSuchDatabase,
+    /// No answer within the connection's time.
+    TimedOut,
+    /// The login connected; the probe did not finish.
+    Incomplete,
+}
+
+impl ProbeFailure {
+    /// The word the check's answer and log use.
+    pub fn why(self) -> &'static str {
+        match self {
+            Self::Unreachable => "unreachable",
+            Self::Refused => "refused",
+            Self::NoSuchDatabase => "no-such-database",
+            Self::TimedOut => "timed-out",
+            Self::Incomplete => "timed-out",
+        }
+    }
+}
+
+fn probe_failure(error: WireError) -> ProbeFailure {
+    match error {
+        WireError::Io | WireError::Protocol | WireError::Unsupported | WireError::NotNow => {
+            ProbeFailure::Unreachable
+        }
+        WireError::Refused => ProbeFailure::Refused,
+        WireError::NoSuchDatabase => ProbeFailure::NoSuchDatabase,
+        WireError::TimedOut => ProbeFailure::TimedOut,
+    }
+}
+
+/// Connects as `target` and closes: the check of a write login, which is
+/// asked nothing. The socket is read only by the wire's bounded parser.
+pub async fn reach(target: &Target, limit: Duration) -> Result<(), ProbeFailure> {
+    Connection::open(target, limit)
+        .await
+        .map(|_| ())
+        .map_err(probe_failure)
+}
+
+/// Connects as `target`, begins a read-only transaction with the catalogue
+/// search path alone, runs one statement, and rolls back: the check's probe.
+/// The socket is read only by the wire's bounded parser, which refuses a
+/// message past its bound from its header; no message of the server's is
+/// kept or reported.
+pub async fn probe(
+    target: &Target,
+    sql: &str,
+    params: &[Param],
+    connect: Duration,
+    statement: Duration,
+    by: Instant,
+) -> Result<Rows, ProbeFailure> {
+    let limits = Limits {
+        connect,
+        statement,
+        ..Limits::default()
+    };
+    let mut connection = Connection::open(target, connect)
+        .await
+        .map_err(probe_failure)?;
+    // The probe's time runs from when the login connected, and is one time
+    // for the transaction's start, its search path and the statement; it
+    // ends at `by` at the latest, the caller's time for the whole check.
+    let deadline = (Instant::now() + statement).min(by);
+    let remaining = || deadline.saturating_duration_since(Instant::now());
+    connection
+        .begin_plain(Level::Read, None, remaining())
+        .await
+        .map_err(|_| ProbeFailure::Incomplete)?;
+    let path = connection
+        .statement(
+            &wire::Statement {
+                sql: CATALOG_PATH,
+                params: &[],
+                values: Values::Typed,
+            },
+            &limits,
+            deadline,
+        )
+        .await;
+    if path.result.is_err() {
+        let _ended = tokio::time::timeout(remaining(), connection.simple("ROLLBACK")).await;
+        return Err(ProbeFailure::Incomplete);
+    }
+    let run = connection
+        .statement(
+            &wire::Statement {
+                sql,
+                params,
+                values: Values::Typed,
+            },
+            &limits,
+            deadline,
+        )
+        .await;
+    // A read-only transaction ends with ROLLBACK, and the connection is
+    // dropped: nothing is kept, so no DISCARD ALL is needed.
+    let _ended = tokio::time::timeout(remaining(), connection.simple("ROLLBACK")).await;
+    run.result.map_err(|_| ProbeFailure::Incomplete)
 }

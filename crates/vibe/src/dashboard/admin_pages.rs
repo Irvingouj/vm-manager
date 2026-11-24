@@ -1179,11 +1179,11 @@ fn resource_card(out: &mut String, resource: &Resource) {
         "<li><article class=\"card res-card\" data-vm-resource=\"{name}\" data-vm-kind=\"{kind}\"><h2>{}<code>{name}</code></h2>",
         kind_icon(Some(kind)).svg()
     ).ok();
-    if !resource.description.is_empty() {
+    if !resource.description().is_empty() {
         write!(
             out,
             "<p class=\"desc\">{}</p>",
-            escape(&resource.description)
+            escape(&resource.description())
         )
         .ok();
     }
@@ -1211,8 +1211,8 @@ fn resource_card(out: &mut String, resource: &Resource) {
          <dt>Owner</dt><dd data-vm-owner>{}</dd><dt>Ask</dt><dd data-vm-contact>{}</dd><dt>Kind</dt><dd>{}</dd>\
          <dt>Registered</dt><dd>by <code class=\"id\">{}</code> on <time datetime=\"{}\">{}</time></dd></dl>\
          <a data-vm-operation-log href=\"/admin/operation-log?resource={}\">{}Its Operation log</a></details></article></li>",
-        escape(&resource.owner),
-        escape(&resource.contact),
+        escape(&resource.owner()),
+        escape(&resource.contact()),
         kind_words(Some(kind)),
         escape(&resource.created_by),
         escape(&resource.created_at),

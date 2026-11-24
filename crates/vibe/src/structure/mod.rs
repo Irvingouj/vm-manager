@@ -90,6 +90,9 @@ pub struct Pulled {
     /// The statements that make an empty stand-in of the structure, each
     /// ending with `;` ([`standin`]).
     pub standin_sql: Vec<String>,
+    /// The relations not shown because no login of the Resource reaches
+    /// them (not in the fingerprint).
+    pub hidden: u64,
 }
 
 /// A column of a type the definition cannot express: there as a custom
@@ -128,11 +131,19 @@ impl Failed {
 }
 
 /// Pulls the structure of `resource` through `pool`, within [`PULL_TIME`].
-pub async fn pull(pool: &Pool, resource: &str) -> Result<Pulled, Failed> {
+pub async fn pull(
+    pool: &Pool,
+    resource: &str,
+    read_role: &str,
+    write_role: Option<&str>,
+) -> Result<Pulled, Failed> {
     let deadline = Instant::now() + PULL_TIME;
-    let structure = tokio::time::timeout_at(deadline, catalogs::read(pool, resource, deadline))
-        .await
-        .map_err(|_| Failed::Time)??;
+    let structure = tokio::time::timeout_at(
+        deadline,
+        catalogs::read(pool, resource, read_role, write_role, deadline),
+    )
+    .await
+    .map_err(|_| Failed::Time)??;
     // Building is work that does not wait (at the largest structure the
     // bounds let through, tens of milliseconds in a release build, some
     // hundreds in a debug one), so it is done off the async workers, and
@@ -164,6 +175,7 @@ fn build(structure: &Structure, resource: &str, deadline: Instant) -> Result<Pul
         schema_ts,
         unsupported,
         standin_sql,
+        hidden: structure.hidden,
     })
 }
 
@@ -176,6 +188,10 @@ struct Structure {
     relations: Vec<Relation>,
     /// The enums a listed column uses, by schema, then name.
     enums: Vec<Enum>,
+    /// How many tables, views and materialized views outside Postgres's own
+    /// schemas (partitions not counted) are not listed because neither the
+    /// read nor the write login reaches them. Not in the fingerprint.
+    hidden: u64,
 }
 
 #[derive(Debug)]

@@ -7,6 +7,7 @@
 //! owned by the client, with a timeout. Values come back as the text
 //! Postgres prints for them (the simple query protocol).
 
+use std::sync::Mutex;
 use std::time::Duration;
 
 use tokio::runtime::Runtime;
@@ -15,6 +16,58 @@ use tokio_postgres::{Client, NoTls, SimpleQueryMessage};
 
 /// How long connecting, or one call, may take.
 pub const SQL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Statements that change what a role is or what it may do, in a database
+/// or schema that several tests of one process share, are made one at a
+/// time in the process: Postgres itself fails two of them at the same
+/// moment on the same object with `tuple concurrently updated` (`XX000`).
+static PRIVILEGES: Mutex<()> = Mutex::new(());
+
+/// How many times such a statement is tried again when Postgres says so,
+/// and the pause between tries.
+const PRIVILEGE_TRIES: u32 = 5;
+const PRIVILEGE_PAUSE: Duration = Duration::from_millis(100);
+
+/// Whether `sql` changes roles or privileges (`GRANT`, `REVOKE`, `CREATE`,
+/// `ALTER` or `DROP ROLE`, `DROP OWNED`, `ALTER DEFAULT PRIVILEGES`, and
+/// the databases' own settings).
+fn changes_privileges(sql: &str) -> bool {
+    let upper = sql.to_ascii_uppercase();
+    [
+        "GRANT ",
+        "REVOKE ",
+        "CREATE ROLE",
+        "ALTER ROLE",
+        "DROP ROLE",
+        "DROP OWNED",
+        "ALTER DEFAULT PRIVILEGES",
+        "ALTER DATABASE",
+        "CREATE DATABASE",
+        "DROP DATABASE",
+    ]
+    .iter()
+    .any(|word| upper.contains(word))
+}
+
+/// `sql` with the text of every `PASSWORD '...'` replaced by `'***'`, so
+/// that a failure never prints a password into a test log.
+pub fn masked(sql: &str) -> String {
+    const KEY: &str = "PASSWORD '";
+    let upper = sql.to_ascii_uppercase();
+    let mut out = String::new();
+    let mut at = 0;
+    while let Some(found) = upper.get(at..).and_then(|rest| rest.find(KEY)) {
+        let start = at + found + KEY.len();
+        out.push_str(sql.get(at..start).unwrap_or_default());
+        out.push_str("***");
+        match sql.get(start..).and_then(|rest| rest.find('\'')) {
+            Some(end) => at = start + end,
+            None => return out,
+        }
+    }
+    out.push_str(sql.get(at..).unwrap_or_default());
+    out
+}
 
 /// One connection.
 pub struct Sql {
@@ -103,17 +156,38 @@ impl Sql {
 
     /// Runs one or more statements; an error says which and why.
     pub fn try_batch(&self, sql: &str) -> Result<Vec<Vec<Option<String>>>, String> {
+        if !changes_privileges(sql) {
+            return self.try_batch_once(sql);
+        }
+        let _one_at_a_time = PRIVILEGES.lock().unwrap_or_else(|e| e.into_inner());
+        let mut tries = 1;
+        loop {
+            let result = self.try_batch_once(sql);
+            match &result {
+                Err(problem)
+                    if problem.contains("tuple concurrently updated")
+                        && tries < PRIVILEGE_TRIES =>
+                {
+                    tries += 1;
+                    std::thread::sleep(PRIVILEGE_PAUSE);
+                }
+                _ => return result,
+            }
+        }
+    }
+
+    fn try_batch_once(&self, sql: &str) -> Result<Vec<Vec<Option<String>>>, String> {
         let client = self.client();
         let messages = self
             .runtime
             .block_on(async { tokio::time::timeout(SQL_TIMEOUT, client.simple_query(sql)).await })
-            .map_err(|_| format!("`{sql}` took longer than {SQL_TIMEOUT:?}"))?
+            .map_err(|_| format!("`{}` took longer than {SQL_TIMEOUT:?}", masked(sql)))?
             .map_err(|e| {
                 let detail = e
                     .as_db_error()
                     .map(|d| format!("{} ({})", d.message(), d.code().code()))
                     .unwrap_or_else(|| e.to_string());
-                format!("`{sql}` failed: {detail}")
+                format!("`{}` failed: {detail}", masked(sql))
             })?;
         Ok(messages
             .into_iter()
@@ -131,11 +205,37 @@ impl Sql {
     /// Runs one or more statements; an error is Postgres's SQLSTATE and
     /// message.
     pub fn try_coded(&self, sql: &str) -> Result<Vec<Vec<Option<String>>>, DbError> {
+        if !changes_privileges(sql) {
+            return self.try_coded_once(sql);
+        }
+        let _one_at_a_time = PRIVILEGES.lock().unwrap_or_else(|e| e.into_inner());
+        let mut tries = 1;
+        loop {
+            let result = self.try_coded_once(sql);
+            match &result {
+                Err(e)
+                    if e.message.contains("tuple concurrently updated")
+                        && tries < PRIVILEGE_TRIES =>
+                {
+                    tries += 1;
+                    std::thread::sleep(PRIVILEGE_PAUSE);
+                }
+                _ => return result,
+            }
+        }
+    }
+
+    fn try_coded_once(&self, sql: &str) -> Result<Vec<Vec<Option<String>>>, DbError> {
         let client = self.client();
         let messages = self
             .runtime
             .block_on(async { tokio::time::timeout(SQL_TIMEOUT, client.simple_query(sql)).await })
-            .map_err(|_| DbError::other(format!("`{sql}` took longer than {SQL_TIMEOUT:?}")))?
+            .map_err(|_| {
+                DbError::other(format!(
+                    "`{}` took longer than {SQL_TIMEOUT:?}",
+                    masked(sql)
+                ))
+            })?
             .map_err(|e| DbError::of(&e))?;
         Ok(messages
             .into_iter()
@@ -162,8 +262,8 @@ impl Sql {
         let rows = self
             .runtime
             .block_on(async { tokio::time::timeout(SQL_TIMEOUT, client.query(sql, &params)).await })
-            .map_err(|_| format!("`{sql}` took longer than {SQL_TIMEOUT:?}"))?
-            .map_err(|e| format!("`{sql}` failed: {e}"))?;
+            .map_err(|_| format!("`{}` took longer than {SQL_TIMEOUT:?}", masked(sql)))?
+            .map_err(|e| format!("`{}` failed: {e}", masked(sql)))?;
         Ok(rows.len())
     }
 

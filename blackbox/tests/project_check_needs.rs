@@ -287,14 +287,20 @@ fn assert_no_raw_control(text: &str, context: &str) {
 fn the_installations_text_is_printed_as_any_text_not_the_tools_own() {
     let scenario = Scenario::start();
     let contact = "Dana\u{1b}[2J\u{1b}[31m Ops\u{202e}\nfake line";
-    let mut body = resource_body_with_write(
+    let body = resource_body_with_write(
         "devops",
         &scenario.db,
         &scenario.db.reader,
         &scenario.db.writer,
     );
-    body["contact"] = json!(contact);
+    // The bounds of "Registering a database, checked" refuse this text at
+    // registration; a Resource registered earlier holds it, so it is put in
+    // the row by hand and the program started again to hold that row.
     scenario.register_body("devops", &body);
+    blackbox::admin::set_resource_text_by_hand(&scenario.vm, "devops", "contact", contact);
+    let Scenario { vm, db } = scenario;
+    let vm = blackbox::storage::terminate(vm).start();
+    let scenario = Scenario { vm, db };
     let machine = Machine::new();
     machine.sign_in(&scenario.vm, &bea());
     let project = checked_project("needs-escaped-contact");

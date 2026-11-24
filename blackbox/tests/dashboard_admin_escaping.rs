@@ -75,10 +75,7 @@ fn every_text_of_an_application_an_entry_and_a_resource_is_escaped_on_every_page
         "description": RESOURCE_DESCRIPTION,
         "owner": OWNER,
         "contact": CONTACT,
-        "connection": {
-            "host": "127.0.0.1", "port": 5432, "database": "nowhere",
-            "read": { "role": "r", "password": "p" },
-        }
+        "connection": s.db.connection(&s.db.reader),
     });
     let body = s.register_body("hostile_res", &registered);
     assert_eq!(body["name"], "hostile_res", "the harness's own check");

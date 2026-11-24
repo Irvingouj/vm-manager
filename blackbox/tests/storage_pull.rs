@@ -244,6 +244,7 @@ fn on_a_database_the_structure_answer_gains_kind_postgres_and_nothing_else_chang
         [
             "contact",
             "fingerprint",
+            "hidden",
             "kind",
             "resource",
             "schema_ts",
@@ -251,7 +252,7 @@ fn on_a_database_the_structure_answer_gains_kind_postgres_and_nothing_else_chang
             "unsupported",
             "your_access"
         ],
-        "expected the answer of a database's pull with `kind` gained and nothing else changed, got {answer}"
+        "expected the answer of a database's pull with `kind` and `hidden` gained and nothing else changed, got {answer}"
     );
     assert_eq!(answer["kind"], json!("postgres"), "{answer}");
     assert_fingerprint(&answer["fingerprint"], "the fingerprint as ever");

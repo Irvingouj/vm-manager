@@ -62,9 +62,14 @@ pub(super) enum WireError {
     TimedOut,
     /// The server sent what the protocol does not allow here.
     Protocol,
-    /// The server refused the login: a wrong password, a role or database
-    /// that does not exist, too many connections. The SQLSTATE's class.
+    /// The server refused the role or its password, or the role may not
+    /// connect to the database (SQLSTATE class 28, and 42501).
     Refused,
+    /// The server answered the login with another error: too many
+    /// connections, a server that is starting or stopping.
+    NotNow,
+    /// The database of the connection does not exist (SQLSTATE 3D000).
+    NoSuchDatabase,
     /// The server asked for a way of signing in this client does not have.
     Unsupported,
 }
@@ -77,6 +82,8 @@ impl WireError {
             Self::TimedOut => "the shared database did not answer in time",
             Self::Protocol => "the shared database sent something unexpected",
             Self::Refused => "the shared database refused the Resource's login",
+            Self::NotNow => "the shared database did not take the connection now",
+            Self::NoSuchDatabase => "the shared database has no database of that name",
             Self::Unsupported => {
                 "the shared database asks for a way of signing in the platform does not support"
             }
@@ -277,7 +284,18 @@ impl Connection {
                     connection.secret_key = body.secret_key();
                 }
                 Message::ReadyForQuery(_) => return Ok(connection),
-                Message::ErrorResponse(_) => return Err(WireError::Refused),
+                Message::ErrorResponse(body) => {
+                    return Err(match error_code(&body).as_deref() {
+                        Some("3D000") => WireError::NoSuchDatabase,
+                        // invalid_authorization_specification and
+                        // invalid_password; insufficient_privilege is a
+                        // role without CONNECT on the database.
+                        Some(code) if code.starts_with("28") || code == "42501" => {
+                            WireError::Refused
+                        }
+                        _ => WireError::NotNow,
+                    });
+                }
                 Message::AuthenticationGss
                 | Message::AuthenticationKerberosV5
                 | Message::AuthenticationScmCredential
@@ -1232,6 +1250,17 @@ fn columns_of(body: &RowDescriptionBody) -> Result<Vec<(String, u32)>, std::io::
     body.fields()
         .map(|field| Ok((field.name().to_owned(), field.type_oid())))
         .collect()
+}
+
+/// The SQLSTATE of an error answer, and nothing else of it.
+fn error_code(body: &ErrorResponseBody) -> Option<String> {
+    let mut fields = body.fields();
+    while let Ok(Some(field)) = fields.next() {
+        if field.type_() == b'C' {
+            return Some(String::from_utf8_lossy(field.value_bytes()).into_owned());
+        }
+    }
+    None
 }
 
 /// Postgres's SQLSTATE and primary message. Its detail, hint and the rest

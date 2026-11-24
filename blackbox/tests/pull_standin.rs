@@ -26,6 +26,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use blackbox::User;
+use blackbox::api::assert_api_error;
 use blackbox::local::{
     STANDIN_FIRST_LINE, standin_body, standin_file, standin_statements, statements_in_text,
 };
@@ -116,7 +117,8 @@ fn run_each(sql: &Sql, statements: &[String]) {
 }
 
 /// The columns of every table, partitioned table, view and materialized
-/// view outside Postgres's own schemas (no partition), in order: (relation,
+/// view (but the fixture's `restricted`, which no login of the Resource
+/// reaches, so no pull lists it) outside Postgres's own schemas (no partition), in order: (relation,
 /// column, type, not null, identity, generated).
 const COLUMNS: &str = r#"
 SELECT n.nspname || '.' || c.relname, a.attname, format_type(a.atttypid, a.atttypmod),
@@ -126,6 +128,7 @@ SELECT n.nspname || '.' || c.relname, a.attname, format_type(a.atttypid, a.attty
   JOIN pg_namespace n ON n.oid = c.relnamespace
  WHERE c.relkind IN ('r', 'p', 'v', 'm') AND NOT c.relispartition
    AND n.nspname NOT LIKE 'pg\_%' AND n.nspname <> 'information_schema'
+   AND c.relname <> 'restricted'
    AND a.attnum > 0 AND NOT a.attisdropped
  ORDER BY (n.nspname || '.' || c.relname) COLLATE "C", a.attnum"#;
 
@@ -135,6 +138,7 @@ SELECT n.nspname || '.' || c.relname, c.relkind::text
   FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
  WHERE c.relkind IN ('r', 'p', 'v', 'm') AND NOT c.relispartition
    AND n.nspname NOT LIKE 'pg\_%' AND n.nspname <> 'information_schema'
+   AND c.relname <> 'restricted'
  ORDER BY (n.nspname || '.' || c.relname) COLLATE "C""#;
 
 /// Every enum with its labels in order.
@@ -151,7 +155,7 @@ SELECT n.nspname || '.' || c.relname, a.attname, pg_get_expr(d.adbin, d.adrelid)
   JOIN pg_class c ON c.oid = d.adrelid
   JOIN pg_namespace n ON n.oid = c.relnamespace
   JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum
- WHERE NOT c.relispartition AND n.nspname NOT LIKE 'pg\_%'
+ WHERE NOT c.relispartition AND n.nspname NOT LIKE 'pg\_%' AND c.relname <> 'restricted'
  ORDER BY (n.nspname || '.' || c.relname) COLLATE "C", a.attname::text COLLATE "C""#;
 
 /// Every primary key, unique constraint and foreign key of a relation that
@@ -162,6 +166,7 @@ SELECT n.nspname || '.' || c.relname, k.contype::text, pg_get_constraintdef(k.oi
   JOIN pg_class c ON c.oid = k.conrelid
   JOIN pg_namespace n ON n.oid = c.relnamespace
  WHERE k.contype IN ('p', 'u', 'f') AND NOT c.relispartition AND n.nspname NOT LIKE 'pg\_%'
+   AND c.relname <> 'restricted'
  ORDER BY (n.nspname || '.' || c.relname) COLLATE "C", k.contype, pg_get_constraintdef(k.oid) COLLATE "C""#;
 
 fn rows(sql: &Sql, query: &str) -> Vec<Vec<String>> {
@@ -443,18 +448,54 @@ fn the_pull_writes_standin_sql_with_its_three_first_lines_and_the_statements() {
     );
 }
 
+/// "What the fields take": `owner` and `contact` take no control character,
+/// a line end included; a line end is allowed in `description` only. So no
+/// contact of several lines is ever registered, and the third line of
+/// `standin.sql` (the contact's, "on one line") cannot be broken by one.
 #[test]
-fn a_contact_of_several_lines_is_written_on_one_line() {
+fn a_contact_with_a_line_end_or_another_control_character_is_refused_and_registers_nothing() {
+    let stock = Stock::start();
+    for (what, contact) in [
+        ("a line feed", "The stock desk\nroom 4, second floor"),
+        ("a carriage return", "The stock desk\rroom 4"),
+        ("a tab", "The stock desk\troom 4"),
+    ] {
+        let mut body = body_with_structure("stock", stock.db(), &stock.structure);
+        body["contact"] = json!(contact);
+        let answer = stock.scenario.admin().create_resource(&body);
+        assert_api_error(&answer, 400, "malformed");
+        assert!(
+            answer.text().contains("contact"),
+            "expected the message to name the field `contact` ({what}), got {}",
+            answer.describe()
+        );
+        assert!(
+            !answer.text().contains("room 4"),
+            "expected the message never to hold what was sent ({what}), got {}",
+            answer.describe()
+        );
+    }
+    let listed = stock.scenario.admin().list_resources();
+    assert!(
+        !listed.text().contains("\"stock\""),
+        "expected nothing registered by the refused bodies, got {}",
+        listed.describe()
+    );
+}
+
+/// What the test above used to hold, kept where it can still be reached: a
+/// `description` of several lines (the one field that takes a line end)
+/// registers, and breaks nothing of what a pull writes: the contact is on
+/// the third line, and the statements follow as answered.
+#[test]
+fn a_description_of_several_lines_breaks_nothing_in_what_a_pull_writes() {
     let stock = Stock::start();
     let mut body = body_with_structure("stock", stock.db(), &stock.structure);
-    body["contact"] = json!("The stock desk\nroom 4, second floor");
+    body["description"] =
+        json!("The stock desk\nroom 4\n-- not a comment of the file;\nsecond floor");
     stock.scenario.register_body("stock", &body);
     stock.scenario.grant("stock", READERS, "read");
     let answer = stock.pull_ok(&rita(), STOCK);
-    assert_eq!(
-        answer["contact"],
-        json!("The stock desk\nroom 4, second floor")
-    );
     let machine = Machine::new();
     machine.sign_in(&stock.scenario.vm, &rita());
     let dir = project(&machine, "board");
@@ -462,16 +503,18 @@ fn a_contact_of_several_lines_is_written_on_one_line() {
     let text = fs::read_to_string(dir.join("resources/stock/standin.sql")).unwrap();
     let third = text.lines().nth(2).unwrap_or_default();
     assert!(
-        third.starts_with("-- Contact: ")
-            && third.contains("The stock desk")
-            && third.contains("room 4, second floor"),
-        "expected the whole contact on the third line, got {third:?}\n{text}"
+        third.starts_with("-- Contact: "),
+        "expected the contact on the third line, got {third:?}\n{text}"
+    );
+    assert!(
+        !text.contains("not a comment of the file"),
+        "expected nothing of a description of several lines to be written into the stand-in's file\n{text}"
     );
     let after_three: String = text.split_inclusive('\n').skip(3).collect();
     assert_eq!(
         after_three,
         standin_body(&standin_statements(&answer["standin_sql"])),
-        "expected the contact's line end to break no statement: after the third line, the statements as answered"
+        "expected the description's line ends to break no statement: after the third line, the statements as answered"
     );
 }
 

@@ -85,6 +85,21 @@ curl https://api.vibe.example.com/v1/installation
 
 The answer is `{"domain":"vibe.example.com","sign_in":"none","sign_in_address":null}`: no sign-in is connected yet. The program's log is the `vibe` container's: `docker compose logs vibe`.
 
+## Resources
+
+A Platform administrator registers the company's shared databases and Storage folders with the tool, signed in as a Platform administrator:
+
+```sh
+read -rs VIBE_RESOURCE_READ_PASSWORD && export VIBE_RESOURCE_READ_PASSWORD   # typed, not echoed, not in the shell's history
+vibe admin resource register devops --kind postgres --description "The DevOps incident database" \
+    --owner "The DevOps team" --contact "Dana Ops, #devops-access on chat" \
+    --host db.example.com --port 5432 --database devops --read-role devops_reader
+```
+
+Each login's password is given in the environment: `VIBE_RESOURCE_READ_PASSWORD`, `VIBE_RESOURCE_WRITE_PASSWORD` and `VIBE_RESOURCE_STRUCTURE_PASSWORD`, each beside its `--read-role`, `--write-role` or `--structure-role`; a password never goes on the command line. The Resource's logins are checked when they are supplied: the program connects as each one, and a login that does not connect refuses the registration, naming which failed and why. `vibe admin resource logins` replaces them, `vibe admin resource edit` changes the description, owner or contact, `vibe admin resource location` moves a Storage Resource's folder (files are not moved), and `vibe admin resource remove` removes it.
+
+A pull lists the tables the Resource's read login or write login holds a privilege on; a table neither reaches is not in the definition the Builder builds against. `vibe pull` says how many are hidden, and `vibe check` and `vibe deploy` fail to type-check code that uses one.
+
 ## 5. The setup credential
 
 ```sh

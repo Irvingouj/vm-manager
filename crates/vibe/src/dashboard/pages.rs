@@ -661,14 +661,14 @@ fn resource_row(out: &mut String, name: &str, declaration: &Declaration, seen: &
     let declared_name = level_name(declared);
     let (yours, standing) = standing(declared, seen);
     let ask = match (&seen.resource, standing) {
-        (Some(resource), "lower" | "none") => Some(resource.contact.as_str()),
+        (Some(resource), "lower" | "none") => Some(resource.contact().to_string()),
         _ => None,
     };
     out.push_str(&format!("<tr class=\"{standing}\" data-vm-resource=\"{}\" data-vm-kind=\"{}\" data-vm-declared=\"{declared_name}\" data-vm-yours=\"{yours}\" data-vm-standing=\"{standing}\"",
         escape(name),
         declaration.kind.name()
     ));
-    if let Some(ask) = ask {
+    if let Some(ask) = &ask {
         out.push_str(&format!(" data-vm-ask=\"{}\"", escape(ask)));
     }
     let (icon, said, held) = match standing {
@@ -695,7 +695,7 @@ fn resource_row(out: &mut String, name: &str, declaration: &Declaration, seen: &
         theme::icon(icon, said),
         escape(name)
     ));
-    if let Some(ask) = ask {
+    if let Some(ask) = &ask {
         out.push_str(&format!("<p class=\"ask\">Ask {}.</p>", escape(ask)));
     }
     out.push_str(&format!(

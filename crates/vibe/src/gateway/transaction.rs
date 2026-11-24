@@ -271,7 +271,7 @@ pub(super) async fn run(
     began: oneshot::Sender<Value>,
 ) {
     let own_pool;
-    let pool: &Pool = match &opened.target {
+    let pool: Arc<Pool> = match &opened.target {
         On::Resource {
             resource: Some(resource),
             ..
@@ -311,7 +311,7 @@ pub(super) async fn run(
                 .pool(&opened.in_flight.application, opened.level == Level::Write)
                 .await;
             if let Some(pool) = &own_pool {
-                pool
+                Arc::clone(pool)
             } else {
                 began
                     .send(opened.failed("unavailable", unavailable()).await)
@@ -320,7 +320,7 @@ pub(super) async fn run(
             }
         }
     };
-    let mut held = match opened.begin(pool).await {
+    let mut held = match opened.begin(&pool).await {
         Ok(held) => held,
         Err(answer) => {
             began.send(answer).ok();

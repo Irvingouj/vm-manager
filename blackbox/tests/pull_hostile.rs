@@ -76,6 +76,17 @@ fn listed(schema: &std::path::Path) -> Value {
 fn hostile_names_do_not_break_out_of_the_definition_and_stay_intact_as_data() {
     let scenario = Scenario::start();
     scenario.db.superuser().batch(&hostile_setup());
+    // A pull lists what the read or write login reaches: the read login
+    // may read each of the hostile tables.
+    let tables: Vec<String> = HOSTILE_NAMES
+        .iter()
+        .map(|name| blackbox::structure::ident(name))
+        .collect();
+    scenario.db.superuser().batch(&format!(
+        "GRANT SELECT ON {} TO {}",
+        tables.join(", "),
+        scenario.db.reader.role
+    ));
     let login = structure_login(&scenario.db);
     scenario.register_body("odd", &body_with_structure("odd", &scenario.db, &login));
     scenario.grant("odd", READERS, "structure");

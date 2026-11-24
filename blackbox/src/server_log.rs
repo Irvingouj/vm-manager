@@ -36,6 +36,7 @@ pub fn log_everything(postgres: &PrivatePostgres) {
         "ALTER SYSTEM SET log_parameter_max_length = -1",
         "ALTER SYSTEM SET log_parameter_max_length_on_error = -1",
         "ALTER SYSTEM SET log_min_error_statement = 'error'",
+        "ALTER SYSTEM SET log_connections = 'authorization'",
         "SELECT pg_reload_conf()",
     ] {
         superuser.batch(setting);

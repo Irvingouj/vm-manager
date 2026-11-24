@@ -34,6 +34,11 @@ use crate::resources::is_resource_name;
 /// The variable that holds the client secret.
 const CLIENT_SECRET_VARIABLE: &str = "VIBE_OIDC_CLIENT_SECRET";
 
+/// The variables that hold a Resource login's password, one for each role.
+const READ_PASSWORD: &str = "VIBE_RESOURCE_READ_PASSWORD";
+const WRITE_PASSWORD: &str = "VIBE_RESOURCE_WRITE_PASSWORD";
+const STRUCTURE_PASSWORD: &str = "VIBE_RESOURCE_STRUCTURE_PASSWORD";
+
 /// The variable that holds the setup credential.
 const SETUP_VARIABLE: &str = "VIBE_SETUP_CREDENTIAL";
 
@@ -72,6 +77,180 @@ pub enum AdminCommand {
     /// Allow Applications to call a host, or stop allowing it: add,
     /// remove.
     Outbound(super::outbound::OutboundAdminArgs),
+    /// Every Resource of the installation, a page at a time, or one by
+    /// name: its logins (never their values), whether it is served, its
+    /// Grants and its place.
+    Resources(ResourcesArgs),
+    /// Register a Resource, replace its logins, or change its description,
+    /// owner and contact.
+    Resource(ResourceArgs),
+}
+
+/// `vibe admin resources [<name>]`.
+#[derive(clap::Args)]
+pub struct ResourcesArgs {
+    /// One Resource by name, instead of the page of them.
+    #[arg(value_parser = a_resource_name)]
+    pub name: Option<String>,
+    /// Only the Resources whose name comes after this one.
+    #[arg(long, value_parser = a_resource_name)]
+    pub after: Option<String>,
+    /// How many at most (1 to 100; 100 without it).
+    #[arg(long, value_parser = clap::value_parser!(u8).range(1..=100))]
+    pub limit: Option<u8>,
+    #[command(flatten)]
+    pub output: Output,
+}
+
+/// `vibe admin resource`.
+#[derive(clap::Args)]
+pub struct ResourceArgs {
+    #[command(subcommand)]
+    pub command: ResourceCommand,
+}
+
+/// What `vibe admin resource` does.
+#[derive(clap::Subcommand)]
+pub enum ResourceCommand {
+    /// Register a Resource, its logins checked first. A database's
+    /// passwords come from VIBE_RESOURCE_READ_PASSWORD,
+    /// VIBE_RESOURCE_WRITE_PASSWORD and VIBE_RESOURCE_STRUCTURE_PASSWORD,
+    /// never from the command line.
+    Register(RegisterArgs),
+    /// Replace a Resource's logins: each member optional, `--no-write` and
+    /// `--no-structure` remove one. Passwords come from the environment, as
+    /// for `register`.
+    Logins(LoginsArgs),
+    /// Change a Resource's description, owner or contact.
+    Edit(EditArgs),
+    /// Change a Storage Resource's directory: files are not moved, and the
+    /// old directory's files stay where they are.
+    Location(LocationArgs),
+    /// Remove a Resource, with its Grants: `--yes` is needed.
+    Remove(RemoveArgs),
+}
+
+/// `vibe admin resource register <name>`.
+#[derive(clap::Args)]
+#[command(
+    after_help = "A database's passwords are read from VIBE_RESOURCE_READ_PASSWORD, VIBE_RESOURCE_WRITE_PASSWORD and VIBE_RESOURCE_STRUCTURE_PASSWORD, each beside its role, and are never printed."
+)]
+pub struct RegisterArgs {
+    #[arg(value_parser = a_resource_name)]
+    pub name: String,
+    /// postgres or storage.
+    #[arg(long, value_parser = kind)]
+    pub kind: String,
+    /// What it is for.
+    #[arg(long)]
+    pub description: String,
+    /// Whose it is.
+    #[arg(long)]
+    pub owner: String,
+    /// Whom to ask for access.
+    #[arg(long)]
+    pub contact: String,
+    /// The database's host (postgres).
+    #[arg(long)]
+    pub host: Option<String>,
+    /// The database's port (postgres).
+    #[arg(long, value_parser = clap::value_parser!(u16).range(1..=65535))]
+    pub port: Option<u16>,
+    /// The database's name (postgres).
+    #[arg(long)]
+    pub database: Option<String>,
+    /// The login the platform reads with (postgres).
+    #[arg(long)]
+    pub read_role: Option<String>,
+    /// The login the platform writes with (postgres).
+    #[arg(long)]
+    pub write_role: Option<String>,
+    /// The login the platform reads the structure with (postgres).
+    #[arg(long)]
+    pub structure_role: Option<String>,
+    /// The directory, beneath the storage root (storage).
+    #[arg(long, value_parser = absolute_path)]
+    pub directory: Option<String>,
+    #[command(flatten)]
+    pub output: Output,
+}
+
+/// `vibe admin resource logins <name>`.
+#[derive(clap::Args)]
+#[command(
+    after_help = "A role's password is read from its variable (VIBE_RESOURCE_READ_PASSWORD, VIBE_RESOURCE_WRITE_PASSWORD, VIBE_RESOURCE_STRUCTURE_PASSWORD), never printed."
+)]
+pub struct LoginsArgs {
+    #[arg(value_parser = a_resource_name)]
+    pub name: String,
+    /// The new host (an address change connects every login).
+    #[arg(long)]
+    pub host: Option<String>,
+    /// The new port.
+    #[arg(long, value_parser = clap::value_parser!(u16).range(1..=65535))]
+    pub port: Option<u16>,
+    /// The new database name.
+    #[arg(long)]
+    pub database: Option<String>,
+    /// A new read login, with its password in its variable.
+    #[arg(long)]
+    pub read_role: Option<String>,
+    /// A new write login, with its password in its variable.
+    #[arg(long, conflicts_with = "no_write")]
+    pub write_role: Option<String>,
+    /// Remove the write login.
+    #[arg(long)]
+    pub no_write: bool,
+    /// A new structure login, with its password in its variable.
+    #[arg(long, conflicts_with = "no_structure")]
+    pub structure_role: Option<String>,
+    /// Remove the structure login.
+    #[arg(long)]
+    pub no_structure: bool,
+    #[command(flatten)]
+    pub output: Output,
+}
+
+/// `vibe admin resource edit <name>`.
+#[derive(clap::Args)]
+pub struct EditArgs {
+    #[arg(value_parser = a_resource_name)]
+    pub name: String,
+    /// The new description.
+    #[arg(long)]
+    pub description: Option<String>,
+    /// The new owner.
+    #[arg(long)]
+    pub owner: Option<String>,
+    /// The new contact.
+    #[arg(long)]
+    pub contact: Option<String>,
+    #[command(flatten)]
+    pub output: Output,
+}
+
+/// `vibe admin resource location <name>`.
+#[derive(clap::Args)]
+pub struct LocationArgs {
+    #[arg(value_parser = a_resource_name)]
+    pub name: String,
+    /// The new directory, beneath the storage root.
+    #[arg(long, value_parser = absolute_path)]
+    pub directory: String,
+    #[command(flatten)]
+    pub output: Output,
+}
+
+/// `vibe admin resource remove <name>`.
+#[derive(clap::Args)]
+pub struct RemoveArgs {
+    #[arg(value_parser = a_resource_name)]
+    pub name: String,
+    /// Remove it: without this, nothing is asked.
+    #[arg(long, action = clap::ArgAction::Count)]
+    pub yes: u8,
+    #[command(flatten)]
+    pub output: Output,
 }
 
 /// `vibe admin applications`.
@@ -107,7 +286,7 @@ pub struct OperationLogArgs {
     #[arg(long, value_parser = any_application_name)]
     pub application: Option<String>,
     /// Only the entries on this Resource.
-    #[arg(long, value_parser = resource_name)]
+    #[arg(long, value_parser = a_resource_name)]
     pub resource: Option<String>,
     /// Only the entries whose host is exactly this: a fetch's host, as the
     /// list writes it.
@@ -143,7 +322,7 @@ fn any_application_name(text: &str) -> Result<String, String> {
     }
 }
 
-fn resource_name(text: &str) -> Result<String, String> {
+fn a_resource_name(text: &str) -> Result<String, String> {
     if is_resource_name(text) {
         Ok(text.to_owned())
     } else {
@@ -219,6 +398,14 @@ impl AdminArgs {
                 super::outbound::OutboundAdminCommand::Add(args) => args.output.json,
                 super::outbound::OutboundAdminCommand::Remove(args) => args.output.json,
             },
+            AdminCommand::Resources(args) => args.output.json,
+            AdminCommand::Resource(args) => match &args.command {
+                ResourceCommand::Register(args) => args.output.json,
+                ResourceCommand::Logins(args) => args.output.json,
+                ResourceCommand::Edit(args) => args.output.json,
+                ResourceCommand::Location(args) => args.output.json,
+                ResourceCommand::Remove(args) => args.output.json,
+            },
         }
     }
 }
@@ -237,6 +424,14 @@ pub async fn admin(args: &AdminArgs) -> Result<Done, Ending> {
             super::outbound::OutboundAdminCommand::Remove(args) => {
                 super::outbound::change(super::outbound::Change::Remove, args).await
             }
+        },
+        AdminCommand::Resources(args) => resources(args).await,
+        AdminCommand::Resource(args) => match &args.command {
+            ResourceCommand::Register(args) => register(args).await,
+            ResourceCommand::Logins(args) => logins(args).await,
+            ResourceCommand::Edit(args) => edit(args).await,
+            ResourceCommand::Location(args) => location(args).await,
+            ResourceCommand::Remove(args) => remove(args).await,
         },
     }
 }
@@ -792,5 +987,625 @@ async fn connect_oidc(args: &ConnectOidcArgs) -> Result<Done, Ending> {
     Ok(Done {
         json: connection,
         text,
+    })
+}
+
+/// `--kind`: the two kinds of Resource.
+fn kind(text: &str) -> Result<String, String> {
+    match text {
+        "postgres" | "storage" => Ok(text.to_owned()),
+        _ => Err("a Resource's kind is `postgres` or `storage`".to_owned()),
+    }
+}
+
+/// `--directory`: an absolute path, as a storage registration needs.
+fn absolute_path(text: &str) -> Result<String, String> {
+    if std::path::Path::new(text).is_absolute() {
+        Ok(text.to_owned())
+    } else {
+        Err("--directory is an absolute path".to_owned())
+    }
+}
+
+/// A password of the environment: set and not empty, else exit code 2
+/// naming the variable and never a value.
+fn password(variable: &str) -> Result<String, Ending> {
+    match std::env::var_os(variable) {
+        Some(value) if !value.is_empty() => value.into_string().map_err(|_| {
+            Ending::new(
+                2,
+                "usage",
+                format!("{variable} does not hold UTF-8: put the login's password in it as text, then run the command again"),
+            )
+        }),
+        _ => Err(Ending::new(
+            2,
+            "usage",
+            format!("a login is given without its password: put it in {variable}, then run the command again"),
+        )),
+    }
+}
+
+/// One login of a body: its role, and its password from `variable`.
+fn login_of(role: &Option<String>, variable: &str) -> Result<Option<Value>, Ending> {
+    match role {
+        None => Ok(None),
+        Some(role) => Ok(Some(
+            json!({ "role": role, "password": password(variable)? }),
+        )),
+    }
+}
+
+/// A signed-in request with a JSON body; its answer must be `200` or `201`.
+async fn send_signed_in(
+    kept: &Kept,
+    method: Method,
+    path: &str,
+    body: Value,
+) -> Result<Value, Ending> {
+    let bytes = Bytes::from(serde_json::to_vec(&body).map_err(|_| {
+        Ending::new(
+            1,
+            "unexpected-answer",
+            "the request could not be written: run the command again".to_owned(),
+        )
+    })?);
+    let reply = client::send(
+        &super::installation(kept),
+        method,
+        path,
+        Sign::Credential(&kept.credential),
+        Some(bytes),
+    )
+    .await
+    .map_err(|f| failed(kept.at(), f))?;
+    match reply.status {
+        StatusCode::OK | StatusCode::CREATED => reply
+            .json
+            .ok_or_else(|| unexpected(kept.at(), "its answer is not JSON")),
+        StatusCode::UNAUTHORIZED => Err(sign_in_expired(kept)),
+        _ => Err(reply_ending(kept, &reply)),
+    }
+}
+
+/// A refusal of the installation: `login-failed` in words, one line for
+/// each login that failed, and the API's answer as it is with `--json`;
+/// every other as the tool says them everywhere.
+fn reply_ending(kept: &Kept, reply: &client::Reply) -> Ending {
+    let Some(body) = reply.json.clone() else {
+        return not_success(kept.at(), reply);
+    };
+    let error = body.get("error");
+    if error
+        .and_then(|error| error.get("reason"))
+        .and_then(Value::as_str)
+        != Some("login-failed")
+    {
+        return not_success(kept.at(), reply);
+    }
+    let mut text = String::new();
+    if let Some(failed) = error
+        .and_then(|error| error.get("failed"))
+        .and_then(Value::as_array)
+    {
+        for failure in failed {
+            say!(
+                text,
+                "the {} login failed: {}",
+                text_of(failure, "login"),
+                text_of(failure, "why")
+            );
+        }
+    }
+    text.push_str(
+        "Look at the role and its password at the shared database, and at the host and port; then run the command again.\n",
+    );
+    let message = error
+        .and_then(|error| error.get("message"))
+        .and_then(Value::as_str)
+        .unwrap_or("a login of the Resource cannot be used")
+        .to_owned();
+    Ending::detailed(3, "login-failed", &message, Done { json: body, text })
+}
+
+/// A member of a body, set without indexing.
+fn set(body: &mut Value, name: &str, value: Value) {
+    if let Some(object) = body.as_object_mut() {
+        object.insert(name.to_owned(), value);
+    }
+}
+
+/// `vibe admin resources [<name>]`.
+async fn resources(args: &ResourcesArgs) -> Result<Done, Ending> {
+    let kept = signed_in()?;
+    let page = match &args.name {
+        Some(name) => get_signed_in(&kept, &format!("/v1/admin/resources/{name}")).await?,
+        None => {
+            let asked = [
+                ("limit", args.limit.map(|n| n.to_string())),
+                ("after", args.after.clone()),
+            ];
+            get_signed_in(&kept, &format!("/v1/admin/resources{}", query_of(&asked))).await?
+        }
+    };
+    let mut words = String::new();
+    match &args.name {
+        Some(_) => resource_block(&mut words, &page),
+        None => {
+            let listed = page
+                .get("resources")
+                .and_then(Value::as_array)
+                .ok_or_else(|| unexpected(kept.at(), "its answer has no list of Resources"))?;
+            if listed.is_empty() {
+                match &args.after {
+                    Some(after) => say!(words, "No Resource comes after {after}."),
+                    None => say!(
+                        words,
+                        "No Resource is registered on the installation yet. A Platform administrator registers them: vibe admin resource register <name> ..."
+                    ),
+                }
+            }
+            for resource in listed {
+                resource_block(&mut words, resource);
+                words.push('\n');
+            }
+            if let Some(next) = page.get("next").and_then(Value::as_str) {
+                say!(
+                    words,
+                    "More Resources follow: vibe admin resources --after {}",
+                    shell_word(next)
+                );
+            }
+        }
+    }
+    Ok(Done {
+        json: page,
+        text: words,
+    })
+}
+
+/// One Resource in words: its face, its logins, whether it is served, its
+/// place and its Grants. Nothing of a login's value.
+fn resource_block(words: &mut String, resource: &Value) {
+    let name = text(resource, "name");
+    let kind = text(resource, "kind");
+    say!(words, "{name} ({kind})");
+    let description = text(resource, "description");
+    if !description.to_string().is_empty() {
+        say!(words, "  {description}");
+    }
+    say!(words, "  Owner: {}", text(resource, "owner"));
+    say!(words, "  For access, ask: {}", text(resource, "contact"));
+    if let Some(logins) = resource.get("logins").and_then(Value::as_object) {
+        let mut held: Vec<&str> = Vec::new();
+        for (member, shown) in [
+            ("read", "read"),
+            ("write", "write"),
+            ("structure", "structure"),
+        ] {
+            if logins.get(member).and_then(Value::as_bool) == Some(true) {
+                held.push(shown);
+            }
+        }
+        say!(words, "  logins: {}", held.join(", "));
+    }
+    if let Some(directory) = resource
+        .get("location")
+        .and_then(|location| location.get("directory"))
+        .and_then(Value::as_str)
+    {
+        say!(words, "  location: {}", Theirs::from(directory));
+    }
+    if resource.get("usable").and_then(Value::as_bool) == Some(false) {
+        let problem = resource
+            .get("problem")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        say!(words, "  not usable: {problem}");
+        let remedy = match problem {
+            "no-secret-key" => {
+                "start the program with VIBE_SECRET_KEY, then it is served".to_owned()
+            }
+            "does-not-open" | "not-sealed" => {
+                "supply its logins again with vibe admin resource logins".to_owned()
+            }
+            _ => "look at its directory: the problem is the directory's, and a Platform administrator fixes it there".to_owned(),
+        };
+        say!(words, "  what to do: {remedy}");
+    }
+    let grants = resource
+        .get("grants")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if grants.is_empty() {
+        say!(words, "  no Group holds a Grant");
+    } else {
+        for grant in &grants {
+            say!(
+                words,
+                "  {}  {}",
+                text(grant, "group"),
+                text(grant, "access")
+            );
+        }
+        let more = resource
+            .get("grants_more")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        if more > 0 {
+            say!(words, "  and {more} more");
+        }
+    }
+}
+
+/// `vibe admin resource register`.
+async fn register(args: &RegisterArgs) -> Result<Done, Ending> {
+    let mut body = json!({
+        "name": args.name,
+        "kind": args.kind,
+        "description": args.description,
+        "owner": args.owner,
+        "contact": args.contact,
+    });
+    match args.kind.as_str() {
+        "postgres" => {
+            let usage = |what: &str| {
+                Ending::new(
+                    2,
+                    "usage",
+                    format!(
+                        "a database Resource registers with {what}: give it, and the login's password in its variable, then run the command again"
+                    ),
+                )
+            };
+            let host = args.host.clone().ok_or_else(|| usage("--host"))?;
+            let port = args.port.ok_or_else(|| usage("--port"))?;
+            let database = args.database.clone().ok_or_else(|| usage("--database"))?;
+            let read = args.read_role.clone().ok_or_else(|| usage("--read-role"))?;
+            if args.directory.is_some() {
+                return Err(Ending::new(
+                    2,
+                    "usage",
+                    "a database Resource registers with --host, --port, --database and --read-role, not --directory: leave it out".to_owned(),
+                ));
+            }
+            let mut connection = json!({
+                "host": host,
+                "port": port,
+                "database": database,
+                "read": { "role": read, "password": password(READ_PASSWORD)? },
+            });
+            if let Some(write) = login_of(&args.write_role, WRITE_PASSWORD)? {
+                set(&mut connection, "write", write);
+            }
+            if let Some(structure) = login_of(&args.structure_role, STRUCTURE_PASSWORD)? {
+                set(&mut connection, "structure", structure);
+            }
+            set(&mut body, "connection", connection);
+        }
+        _ => {
+            let forbidden = [
+                ("--host", args.host.is_some()),
+                ("--port", args.port.is_some()),
+                ("--database", args.database.is_some()),
+                ("--read-role", args.read_role.is_some()),
+                ("--write-role", args.write_role.is_some()),
+                ("--structure-role", args.structure_role.is_some()),
+            ];
+            if let Some((what, _)) = forbidden.iter().find(|(_, given)| *given) {
+                return Err(Ending::new(
+                    2,
+                    "usage",
+                    format!(
+                        "a storage Resource registers with --directory, not {what}: leave it out"
+                    ),
+                ));
+            }
+            let directory = args.directory.clone().ok_or_else(|| {
+                Ending::new(
+                    2,
+                    "usage",
+                    "a storage Resource registers with --directory: give it, then run the command again"
+                        .to_owned(),
+                )
+            })?;
+            set(
+                &mut body,
+                "location",
+                json!({ "backend": "directory", "directory": directory }),
+            );
+        }
+    }
+    let kept = signed_in()?;
+    let answer = send_signed_in(&kept, Method::POST, "/v1/resources", body).await?;
+    let mut words = String::new();
+    say!(
+        words,
+        "Registered {}. Every login connected.",
+        text(&answer, "name")
+    );
+    say_warnings(&mut words, &answer);
+    say!(
+        words,
+        "No Group has access until a Platform administrator gives a Grant, on the API at /v1/resources/{}/grants.",
+        text(&answer, "name")
+    );
+    Ok(Done {
+        json: answer,
+        text: words,
+    })
+}
+
+/// A member of a JSON object, as the installation's text.
+fn text_of(value: &Value, name: &str) -> Theirs {
+    text(value, name)
+}
+
+/// The warnings of a registration or a replacement, one line each.
+fn say_warnings(words: &mut String, answer: &Value) {
+    let warnings = answer
+        .get("warnings")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    for warning in &warnings {
+        let login = text_of(warning, "login");
+        let reason = warning
+            .get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let evidence = warning
+            .get("evidence")
+            .and_then(Value::as_array)
+            .map(|kinds| {
+                kinds
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default();
+        let said = match reason {
+            "read-login-can-write" => format!(
+                "the {login} login can write ({}): query still runs in a read-only transaction, and a login that cannot write is what the platform asks for",
+                Theirs::from(evidence.as_str())
+            ),
+            "login-sees-no-table" => format!(
+                "the {login} login holds a privilege on no table: nothing is listed in a pull"
+            ),
+            "structure-login-can-read" => format!(
+                "the {login} login can read rows ({}): it is there so that pulls never use a login that can read rows",
+                Theirs::from(evidence.as_str())
+            ),
+            "probe-incomplete" => format!(
+                "the probe of the {login} login did not finish: the login connected, and its warning is not known until the next change of the logins"
+            ),
+            _ => format!("the {login} login gave a warning"),
+        };
+        let message = warning
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        say!(words, "warning: {said}. {}", Theirs::from(message));
+    }
+}
+
+/// `vibe admin resource logins`.
+async fn logins(args: &LoginsArgs) -> Result<Done, Ending> {
+    let mut body = serde_json::Map::new();
+    if let Some(host) = &args.host {
+        body.insert("host".into(), json!(host));
+    }
+    if let Some(port) = args.port {
+        body.insert("port".into(), json!(port));
+    }
+    if let Some(database) = &args.database {
+        body.insert("database".into(), json!(database));
+    }
+    if let Some(read) = login_of(&args.read_role, READ_PASSWORD)? {
+        body.insert("read".into(), read);
+    }
+    if let Some(write) = login_of(&args.write_role, WRITE_PASSWORD)? {
+        body.insert("write".into(), write);
+    }
+    if args.no_write {
+        body.insert("write".into(), Value::Null);
+    }
+    if let Some(structure) = login_of(&args.structure_role, STRUCTURE_PASSWORD)? {
+        body.insert("structure".into(), structure);
+    }
+    if args.no_structure {
+        body.insert("structure".into(), Value::Null);
+    }
+    if body.is_empty() {
+        return Err(Ending::new(
+            2,
+            "usage",
+            "a replacement gives at least one member: --host, --port, --database, --read-role, --write-role, --no-write, --structure-role or --no-structure".to_owned(),
+        ));
+    }
+    let kept = signed_in()?;
+    let path = format!("/v1/admin/resources/{}", args.name);
+    let before = get_signed_in(&kept, &path).await.ok();
+    let was_not_served = before
+        .as_ref()
+        .and_then(|view| view.get("usable"))
+        .and_then(Value::as_bool)
+        != Some(true);
+    let answer = send_signed_in(
+        &kept,
+        Method::PUT,
+        &format!("/v1/resources/{}/connection", args.name),
+        Value::Object(body),
+    )
+    .await?;
+    let mut words = String::new();
+    say_warnings(&mut words, &answer);
+    say!(
+        words,
+        "The new logins hold from the next operation on, in every Application; no Application is deployed again."
+    );
+    if was_not_served && answer.get("usable").and_then(Value::as_bool) == Some(true) {
+        say!(words, "The Resource is served now.");
+    }
+    Ok(Done {
+        json: answer,
+        text: words,
+    })
+}
+
+/// `vibe admin resource edit`.
+async fn edit(args: &EditArgs) -> Result<Done, Ending> {
+    let mut body = serde_json::Map::new();
+    for (name, value) in [
+        ("description", &args.description),
+        ("owner", &args.owner),
+        ("contact", &args.contact),
+    ] {
+        if let Some(value) = value {
+            body.insert(name.into(), json!(value));
+        }
+    }
+    if body.is_empty() {
+        return Err(Ending::new(
+            2,
+            "usage",
+            "an edit gives at least one of --description, --owner or --contact".to_owned(),
+        ));
+    }
+    let kept = signed_in()?;
+    let answer = send_signed_in(
+        &kept,
+        Method::PATCH,
+        &format!("/v1/resources/{}", args.name),
+        Value::Object(body),
+    )
+    .await?;
+    let mut changed: Vec<&str> = Vec::new();
+    if args.description.is_some() {
+        changed.push("description");
+    }
+    if args.owner.is_some() {
+        changed.push("owner");
+    }
+    if args.contact.is_some() {
+        changed.push("contact");
+    }
+    let mut words = String::new();
+    say!(
+        words,
+        "{}: {} changed.",
+        text(&answer, "name"),
+        changed.join(", ")
+    );
+    Ok(Done {
+        json: answer,
+        text: words,
+    })
+}
+
+/// `vibe admin resource location`.
+async fn location(args: &LocationArgs) -> Result<Done, Ending> {
+    let kept = signed_in()?;
+    let answer = send_signed_in(
+        &kept,
+        Method::PUT,
+        &format!("/v1/resources/{}/location", args.name),
+        json!({ "backend": "directory", "directory": args.directory }),
+    )
+    .await?;
+    let directory = answer
+        .get("location")
+        .and_then(|location| location.get("directory"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let changed = answer.get("changed").and_then(Value::as_bool) == Some(true);
+    let mut words = String::new();
+    if changed {
+        say!(
+            words,
+            "{}: its location is now {}; its files were not moved, and the old directory's files stay where they are.",
+            text(&answer, "resource"),
+            Theirs::from(directory)
+        );
+    } else {
+        say!(
+            words,
+            "{}: it is already on {}; nothing was changed, and its files stay where they are.",
+            text(&answer, "resource"),
+            Theirs::from(directory)
+        );
+    }
+    Ok(Done {
+        json: answer,
+        text: words,
+    })
+}
+
+/// `vibe admin resource remove`.
+async fn remove(args: &RemoveArgs) -> Result<Done, Ending> {
+    if args.yes != 1 {
+        return Err(Ending::new(
+            2,
+            "usage",
+            "remove needs --yes: it removes the Resource and its Grants, and nothing can undo it"
+                .to_owned(),
+        ));
+    }
+    let kept = signed_in()?;
+    let answer = send_signed_in(
+        &kept,
+        Method::DELETE,
+        &format!("/v1/resources/{}", args.name),
+        Value::Null,
+    )
+    .await?;
+    let name = text(&answer, "name");
+    let grants = answer
+        .get("grants_removed")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let mut words = String::new();
+    say!(
+        words,
+        "{name} removed; {grants} {} went with it.",
+        if grants == 1 { "Grant" } else { "Grants" }
+    );
+    if let Some(declared) = answer.get("declared_by").and_then(Value::as_array) {
+        for entry in declared {
+            say!(
+                words,
+                "  {} (Version {}, declared at {}) is stopped: operations on {name} are refused, and nothing is deployed again.",
+                text(entry, "application"),
+                entry.get("version").and_then(Value::as_u64).unwrap_or(0),
+                text(entry, "access")
+            );
+        }
+    }
+    if let Some(more) = answer.get("declared_by_more").and_then(Value::as_u64)
+        && more > 0
+    {
+        say!(
+            words,
+            "  and {more} more Applications declare it and are stopped."
+        );
+    }
+    if answer.get("kind").and_then(Value::as_str) == Some("storage") {
+        match answer.get("directory_cleaned").and_then(Value::as_bool) {
+            Some(true) => say!(
+                words,
+                "  Its files were not touched; the directory's `.vibe-resource` and an empty `.vibe-staging/` were removed."
+            ),
+            Some(false) => say!(
+                words,
+                "  Its files were not touched; `.vibe-resource` and an empty `.vibe-staging/` were left where they were, so another name sees the directory in use until `.vibe-resource` is removed by hand."
+            ),
+            None => {}
+        }
+    }
+    Ok(Done {
+        json: answer,
+        text: words,
     })
 }

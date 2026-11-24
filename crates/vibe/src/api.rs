@@ -206,6 +206,14 @@ enum Route<'a> {
     Grants(&'a str),
     /// `/v1/resources/<name>/structure`
     Structure(&'a str),
+    /// `/v1/resources/<name>/connection`
+    Connection(&'a str),
+    /// `/v1/resources/<name>/location`
+    Location(&'a str),
+    /// `/v1/admin/resources`
+    AdminResources,
+    /// `/v1/admin/resources/<name>`
+    AdminResource(&'a str),
     /// `/v1/outbound-hosts`
     OutboundHosts,
     /// `/v1/outbound-hosts/<entry>`, the entry as it was written in the
@@ -232,7 +240,14 @@ impl Route<'_> {
     fn for_administrators(&self, method: &Method) -> bool {
         match self {
             Self::Resources => method != Method::GET,
+            // One path, two kinds of request: `GET` is for every signed-in
+            // User, and `PATCH` and `DELETE` are the administrators'.
+            Self::Resource(_) => matches!(*method, Method::PATCH | Method::DELETE),
             Self::Grants(_)
+            | Self::Connection(_)
+            | Self::Location(_)
+            | Self::AdminResources
+            | Self::AdminResource(_)
             | Self::OperationLog
             | Self::Oidc
             | Self::Disable(..)
@@ -268,6 +283,10 @@ impl<'a> Route<'a> {
             ["resources", name] => Some(Self::Resource(name)),
             ["resources", name, "grants"] => Some(Self::Grants(name)),
             ["resources", name, "structure"] => Some(Self::Structure(name)),
+            ["resources", name, "connection"] => Some(Self::Connection(name)),
+            ["resources", name, "location"] => Some(Self::Location(name)),
+            ["admin", "resources"] => Some(Self::AdminResources),
+            ["admin", "resources", name] => Some(Self::AdminResource(name)),
             ["outbound-hosts"] => Some(Self::OutboundHosts),
             ["outbound-hosts", entry] => Some(Self::OutboundEntry(entry)),
             ["operation-log"] => Some(Self::OperationLog),
@@ -443,6 +462,22 @@ enum ToRegister {
     },
 }
 
+/// `PUT /v1/resources/<name>/location`
+const LOCATION_FORM: &str =
+    r#"{ "backend": "directory", "directory": "<an absolute path beneath the storage root>" }"#;
+
+/// The directory of a change of location. Its problems are fixed words that
+/// never name what was sent.
+fn read_location(body: &[u8]) -> Result<String, &'static str> {
+    const LOCATION: &str = "the body is not an object { backend: \"directory\", directory: <a string> } with each key once";
+    let object = Object::read(body).map_err(|_| LOCATION)?;
+    let backend: String = object.fixed("backend", LOCATION)?;
+    if backend != "directory" {
+        return Err("backend is not \"directory\", the one backend there is");
+    }
+    object.fixed("directory", LOCATION)
+}
+
 /// Reads a Resource to register. Its problems are told in fixed words that
 /// name a field, never anything the body holds.
 fn read_resource(body: &[u8]) -> Result<ToRegister, &'static str> {
@@ -451,9 +486,45 @@ fn read_resource(body: &[u8]) -> Result<ToRegister, &'static str> {
         Object::read(body).map_err(|_| "the body is not a JSON object with each key once")?;
     let kind: String = object.fixed("kind", "kind is missing or not a string")?;
     let name = object.fixed("name", "name is missing or not a string")?;
-    let description = object.fixed("description", "description is missing or not a string")?;
-    let owner = object.fixed("owner", "owner is missing or not a string")?;
-    let contact = object.fixed("contact", "contact is missing or not a string")?;
+    let description: String =
+        object.fixed("description", "description is missing or not a string")?;
+    let owner: String = object.fixed("owner", "owner is missing or not a string")?;
+    let contact: String = object.fixed("contact", "contact is missing or not a string")?;
+    /// Bounds of a text of a Resource, as "Registering a database,
+    /// checked: What the fields take" gives them.
+    fn text_bounds(
+        value: &str,
+        min: usize,
+        max: usize,
+        line_ends: bool,
+        field: &'static str,
+    ) -> Result<(), &'static str> {
+        const SIZE: &str = " is not within its bounds";
+        const CONTROL: &str = " has a control character it may not have";
+        if value.len() < min || value.len() > max || value.contains('\0') {
+            return Err(match field {
+                "description" => "description is 2,048 bytes at most, with no NUL",
+                "owner" => "owner is 1 to 256 bytes, with no NUL",
+                "contact" => "contact is 1 to 256 bytes, with no NUL",
+                _ => SIZE,
+            });
+        }
+        if value
+            .chars()
+            .any(|c| c.is_control() && !(line_ends && (c == '\n' || c == '\r')))
+        {
+            return Err(match field {
+                "description" => "description has a control character other than a line end",
+                "owner" => "owner has a control character",
+                "contact" => "contact has a control character",
+                _ => CONTROL,
+            });
+        }
+        Ok(())
+    }
+    text_bounds(&description, 0, 2_048, true, "description")?;
+    text_bounds(&owner, 1, 256, false, "owner")?;
+    text_bounds(&contact, 1, 256, false, "contact")?;
     match kind.as_str() {
         "postgres" => {
             if object.0.contains_key("location") {
@@ -484,15 +555,26 @@ fn read_resource(body: &[u8]) -> Result<ToRegister, &'static str> {
     let connection = object
         .object("connection")
         .map_err(|_| "connection is missing or not an object with each key once")?;
-    let host = connection.fixed("host", "connection.host is missing or not a string")?;
+    let host: String = connection.fixed("host", "connection.host is missing or not a string")?;
     let port: u16 = connection.fixed("port", PORT)?;
-    let database =
+    let database: String =
         connection.fixed("database", "connection.database is missing or not a string")?;
+    const HOST: &str = "connection.host is 1 to 253 bytes, with no NUL";
+    const DATABASE: &str = "connection.database is 1 to 63 bytes, with no NUL";
+    const ROLE: &str = "a login's role is 1 to 63 bytes, with no NUL";
+    const PASSWORD: &str = "a login's password is 1 to 1,024 bytes, with no NUL";
+    let bounded = |value: &str, min: usize, max: usize, message: &'static str| {
+        if value.len() < min || value.len() > max || value.contains('\0') {
+            Err(message)
+        } else {
+            Ok(())
+        }
+    };
     let read = connection
         .object("read")
         .map_err(|_| "connection.read is missing or not an object with each key once")?;
-    let role = read.fixed("role", "connection.read.role is missing or not a string")?;
-    let password = read.fixed(
+    let role: String = read.fixed("role", "connection.read.role is missing or not a string")?;
+    let password: String = read.fixed(
         "password",
         "connection.read.password is missing or not a string",
     )?;
@@ -522,6 +604,14 @@ fn read_resource(body: &[u8]) -> Result<ToRegister, &'static str> {
             ))
         }
     };
+    bounded(&host, 1, 253, HOST)?;
+    bounded(&database, 1, 63, DATABASE)?;
+    bounded(&role, 1, 63, ROLE)?;
+    bounded(&password, 1, 1_024, PASSWORD)?;
+    for login in [write.as_ref(), structure.as_ref()].into_iter().flatten() {
+        bounded(login.role(), 1, 63, ROLE)?;
+        bounded(login.password(), 1, 1_024, PASSWORD)?;
+    }
     if port == 0 {
         return Err(PORT);
     }
@@ -881,10 +971,359 @@ pub struct Api {
     /// /v1/admin/applications`, `GET /v1/operation-log`): at most
     /// [`ADMIN_READINGS`]; one more is answered `503` at once.
     readings: tokio::sync::Semaphore,
+    /// The checks of logins running now: at most [`CHECKS_AT_ONCE`].
+    checks: tokio::sync::Semaphore,
 }
+
+/// At most this many checks of logins run at once in the program; a third
+/// registration or replacement is `503 busy` at once.
+pub const CHECKS_AT_ONCE: usize = 2;
 
 /// Readings for Platform administrators at once in the program.
 const ADMIN_READINGS: usize = 2;
+
+/// The whole check of a registration's or a replacement's logins: 10
+/// seconds (blackbox/CONTRACT.md, "Resources and Grants in full: Bounds").
+const CHECK_WHOLE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The longest a write waits for the Resource's turn: the bound of a write
+/// to the platform database.
+const WRITE_TURN_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The whole of a write of a Resource's row: the 10 seconds of "What
+/// Platform administrators see and stop: Bounds and costs".
+const WRITE_ROW_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// `409 too-many`: a 1,001st Resource.
+fn too_many() -> Answer {
+    Answer::error(
+        StatusCode::CONFLICT,
+        "too-many",
+        "the installation holds the 1,000 Resources it may hold: remove one before registering another",
+    )
+}
+
+/// `503 busy`: two checks are running already.
+fn checks_busy() -> Answer {
+    Answer::error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "busy",
+        "two checks of a Resource's logins are running now: nothing was connected or stored; try again shortly",
+    )
+}
+
+/// `422 login-failed`: every login that failed, in the order read, write,
+/// structure, and nothing of what it holds.
+fn login_failed(failures: &[resources::Failure]) -> Answer {
+    let failed: Vec<Value> = failures
+        .iter()
+        .map(|failure| {
+            json!({
+                "login": failure.login.word(),
+                "why": failure.why,
+            })
+        })
+        .collect();
+    let named: Vec<&str> = failures.iter().map(|f| f.login.word()).collect();
+    let message = format!(
+        "the {} login of the Resource cannot be used: nothing was stored. Look at the role and its password at the shared database, and at the host and port; then register the Resource again",
+        named.join(", ")
+    );
+    Answer::json(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        &json!({
+            "error": { "reason": "login-failed", "message": message, "failed": failed },
+        }),
+    )
+}
+
+/// The answer of a registration: the Resource, and the warnings of its
+/// check (always there).
+#[derive(Serialize)]
+struct RegisteredView<'a> {
+    #[serde(flatten)]
+    resource: ResourceView<'a>,
+    warnings: &'a [Value],
+}
+
+/// The most Grants a Resource's administrator view shows.
+const MAX_GRANTS_SHOWN: usize = 200;
+
+/// The most one page of `GET /v1/admin/resources` may hold.
+const MAX_ADMIN_LIST_BYTES: usize = 4 * 1024 * 1024;
+
+const ADMIN_RESOURCES_FORM: &str = "?limit=<1 to 100>&after=<a Resource's name>";
+
+const PATCH_FORM: &str =
+    r#"{ "description"?: "<text>", "owner"?: "<text>", "contact"?: "<text>" } (at least one)"#;
+
+/// `PATCH /v1/resources/<name>`: the fields given, each checked as a
+/// registration's.
+struct TextChange {
+    description: Option<String>,
+    owner: Option<String>,
+    contact: Option<String>,
+}
+
+impl TextChange {
+    fn fields(&self) -> Vec<&'static str> {
+        let mut fields = Vec::new();
+        if self.description.is_some() {
+            fields.push("description");
+        }
+        if self.owner.is_some() {
+            fields.push("owner");
+        }
+        if self.contact.is_some() {
+            fields.push("contact");
+        }
+        fields
+    }
+}
+
+const LOGINS_FORM: &str = r#"{ "host"?: "<host>", "port"?: <1 to 65535>, "database"?: "<database>", "read"?: { "role", "password" }, "write"?: { "role", "password" } | null, "structure"?: { "role", "password" } | null } (at least one)"#;
+
+/// `PUT .../connection`: the members given, each checked as a
+/// registration's.
+#[derive(Default)]
+struct LoginsChange {
+    host: Option<String>,
+    port: Option<u16>,
+    database: Option<String>,
+    read: Option<resources::Login>,
+    write: Option<Option<resources::Login>>,
+    structure: Option<Option<resources::Login>>,
+    members: Vec<&'static str>,
+}
+
+fn read_logins_change(body: &[u8]) -> Result<LoginsChange, &'static str> {
+    const HOST: &str = "host is 1 to 253 bytes, with no NUL";
+    const DATABASE: &str = "database is 1 to 63 bytes, with no NUL";
+    const ROLE: &str = "a login's role is 1 to 63 bytes, with no NUL";
+    const PASSWORD: &str = "a login's password is 1 to 1,024 bytes, with no NUL";
+    let object =
+        Object::read(body).map_err(|_| "the body is not a JSON object with each key once")?;
+    let bounded = |value: &str, min: usize, max: usize, message: &'static str| {
+        if value.len() < min || value.len() > max || value.contains('\0') {
+            Err(message)
+        } else {
+            Ok(())
+        }
+    };
+    let login = |value: &RawValue| -> Result<resources::Login, &'static str> {
+        let login = Object::read_value(value)
+            .map_err(|_| "a login is not an object { role, password } with each key once")?;
+        let role: String = login.fixed("role", "a login's role is missing or not a string")?;
+        let password: String =
+            login.fixed("password", "a login's password is missing or not a string")?;
+        bounded(&role, 1, 63, ROLE)?;
+        bounded(&password, 1, 1_024, PASSWORD)?;
+        Ok(resources::Login::new(role, password))
+    };
+    let mut change = LoginsChange::default();
+    if let Some(value) = object.0.get("host") {
+        let host: String = serde_json::from_str(value.get()).map_err(|_| "host is not a string")?;
+        bounded(&host, 1, 253, HOST)?;
+        change.host = Some(host);
+        change.members.push("host");
+    }
+    if let Some(value) = object.0.get("port") {
+        let port: u16 = serde_json::from_str(value.get())
+            .map_err(|_| "port is not a number from 1 to 65535")?;
+        if port == 0 {
+            return Err("port is not a number from 1 to 65535");
+        }
+        change.port = Some(port);
+        change.members.push("port");
+    }
+    if let Some(value) = object.0.get("database") {
+        let database: String =
+            serde_json::from_str(value.get()).map_err(|_| "database is not a string")?;
+        bounded(&database, 1, 63, DATABASE)?;
+        change.database = Some(database);
+        change.members.push("database");
+    }
+    if let Some(value) = object.0.get("read") {
+        if value.get() == "null" {
+            return Err("read cannot be removed: a Resource always has its read login");
+        }
+        change.read = Some(login(value)?);
+        change.members.push("read");
+    }
+    for (member, slot) in [
+        ("write", &mut change.write),
+        ("structure", &mut change.structure),
+    ] {
+        let Some(value) = object.0.get(member) else {
+            continue;
+        };
+        *slot = if value.get() == "null" {
+            Some(None)
+        } else {
+            Some(Some(login(value)?))
+        };
+        change.members.push(member);
+    }
+    if change.members.is_empty() {
+        return Err("at least one member of the connection must be given");
+    }
+    Ok(change)
+}
+
+fn read_text_change(body: &[u8]) -> Result<TextChange, &'static str> {
+    let object =
+        Object::read(body).map_err(|_| "the body is not a JSON object with each key once")?;
+    let mut change = TextChange {
+        description: None,
+        owner: None,
+        contact: None,
+    };
+    for (field, slot) in [
+        ("description", &mut change.description),
+        ("owner", &mut change.owner),
+        ("contact", &mut change.contact),
+    ] {
+        let Some(value) = object.0.get(field) else {
+            continue;
+        };
+        let text: String = serde_json::from_str(value.get()).map_err(|_| match field {
+            "description" => "description is not a string",
+            "owner" => "owner is not a string",
+            _ => "contact is not a string",
+        })?;
+        let (min, max, line_ends) = match field {
+            "description" => (0, 2_048, true),
+            _ => (1, 256, false),
+        };
+        if text.len() < min || text.len() > max || text.contains('\0') {
+            return Err(match field {
+                "description" => "description is 2,048 bytes at most, with no NUL",
+                "owner" => "owner is 1 to 256 bytes, with no NUL",
+                _ => "contact is 1 to 256 bytes, with no NUL",
+            });
+        }
+        if text
+            .chars()
+            .any(|c| c.is_control() && !(line_ends && (c == '\n' || c == '\r')))
+        {
+            return Err(match field {
+                "description" => "description has a control character other than a line end",
+                "owner" => "owner has a control character",
+                _ => "contact has a control character",
+            });
+        }
+        *slot = Some(text);
+    }
+    if change.description.is_none() && change.owner.is_none() && change.contact.is_none() {
+        return Err("at least one of description, owner or contact is needed");
+    }
+    Ok(change)
+}
+
+/// `?after` and `?limit` of `GET /v1/admin/resources`.
+fn resource_list_query(query: Option<&str>) -> Result<(Option<String>, usize), String> {
+    let mut found = query_parameters(query, &["after", "limit"])
+        .map_err(|name| format!("?{name} is given twice or is not percent-encoded"))?;
+    let limit = match found.get("limit") {
+        None => 100,
+        Some(text) => plain_number(text)
+            .and_then(|n| usize::try_from(n).ok())
+            .filter(|n| (1..=100).contains(n))
+            .ok_or_else(|| {
+                "?limit must be a whole number from 1 to 100, written plainly".to_owned()
+            })?,
+    };
+    let after = found.remove("after");
+    if let Some(after) = &after
+        && !is_resource_name(after)
+    {
+        return Err("?after must be a name a Resource could have: 1 to 63 lower-case letters, digits and underscores, starting with a letter".into());
+    }
+    Ok((after, limit))
+}
+
+#[derive(Serialize)]
+struct RemovedDeclaredBy {
+    application: String,
+    version: u64,
+    access: &'static str,
+}
+
+#[derive(Serialize)]
+struct LocationChangedView<'a> {
+    resource: &'a str,
+    location: AdminLocation,
+    changed: bool,
+    files_moved: bool,
+    message: &'a str,
+}
+
+#[derive(Serialize)]
+struct RemoveView<'a> {
+    name: &'a str,
+    kind: &'static str,
+    grants_removed: u64,
+    declared_by: Vec<RemovedDeclaredBy>,
+    declared_by_more: u64,
+    directory_cleaned: Option<bool>,
+}
+
+#[derive(Serialize)]
+struct AdminResourcesView {
+    resources: Vec<AdminResourceView>,
+    next: Option<String>,
+}
+
+#[derive(Serialize)]
+struct AdminResourceView {
+    name: String,
+    kind: &'static str,
+    description: String,
+    owner: String,
+    contact: String,
+    created_by: String,
+    created_at: String,
+    usable: bool,
+    problem: Option<&'static str>,
+    logins: Option<resources::Logins>,
+    location: Option<AdminLocation>,
+    grants: Vec<AdminGrant>,
+    grants_more: usize,
+}
+
+#[derive(Serialize)]
+struct AdminLocation {
+    backend: &'static str,
+    directory: String,
+}
+
+#[derive(Serialize)]
+struct AdminGrant {
+    group: String,
+    access: &'static str,
+}
+
+/// The answer of a replacement: the administrators' view and the warnings
+/// of the check.
+#[derive(Serialize)]
+struct AdminChangedView {
+    #[serde(flatten)]
+    resource: AdminResourceView,
+    warnings: Vec<Value>,
+}
+
+/// A Storage Resource's problem as "Storage: When the directory cannot be
+/// used" names it in an administrator's answer.
+fn directory_problem_word(problem: &'static str) -> &'static str {
+    match problem {
+        "missing" => "directory-missing",
+        "link" => "directory-link",
+        "outside-storage-root" => "outside-storage-root",
+        "not-a-directory" => "not-a-directory",
+        "not-marked" | "marked-for-another" => "directory-in-use",
+        _ => "directory-unusable",
+    }
+}
 
 /// The longest a request for Platform administrators reads or writes the
 /// platform database (blackbox/CONTRACT.md, "What Platform administrators
@@ -945,6 +1384,7 @@ impl Api {
             domain,
             signing,
             readings: tokio::sync::Semaphore::new(ADMIN_READINGS),
+            checks: tokio::sync::Semaphore::new(CHECKS_AT_ONCE),
         }
     }
 
@@ -984,17 +1424,24 @@ impl Api {
         {
             return oidc_connection::setup_refused();
         }
-        // Someone not signed in sends a short body, or none.
+        // Someone not signed in sends a short body, or none. The requests of
+        // "Resources and Grants in full" take 64 KiB whoever sends them,
+        // which is checked before the administrators' (CONTRACT.md, "Who
+        // may"), so it comes before the caller is known too.
         let signed_in = matches!(caller, Caller::User(..));
-        let limit = if signed_in {
-            MAX_BODY_BYTES
-        } else {
+        let small = matches!(
+            route,
+            Some(Route::Resources | Route::Resource(_) | Route::Connection(_) | Route::Location(_))
+        );
+        let limit = if small || !signed_in {
             MAX_BODY_BYTES_NOT_SIGNED_IN
+        } else {
+            MAX_BODY_BYTES
         };
         let read = Limited::new(body, limit).collect();
         let body = match tokio::time::timeout(BODY_READ_TIMEOUT, read).await {
             Ok(Ok(collected)) => collected.to_bytes(),
-            Ok(Err(_)) if !signed_in => {
+            Ok(Err(_)) if small || !signed_in => {
                 return Answer::error(
                     StatusCode::PAYLOAD_TOO_LARGE,
                     "too-large",
@@ -1018,7 +1465,7 @@ impl Api {
         };
         let Some(route) = route else {
             return Answer::not_found(
-                "the API has no such path: its paths are /v1/me, /v1/installation, /v1/tool-credentials, /v1/tool-credentials/current, /v1/tool-sign-ins, /v1/oidc, /v1/applications, /v1/applications/<name>, /v1/applications/<name>/versions, /v1/applications/<name>/versions/<number>, /v1/applications/<name>/go-back, /v1/applications/<name>/logs, /v1/applications/<name>/contributors, /v1/applications/<name>/sharing, /v1/applications/<name>/disable, /v1/applications/<name>/enable, /v1/admin/applications, /v1/resources, /v1/resources/<name>, /v1/resources/<name>/grants, /v1/resources/<name>/structure, /v1/outbound-hosts, /v1/outbound-hosts/<entry> and /v1/operation-log",
+                "the API has no such path: its paths are /v1/me, /v1/installation, /v1/tool-credentials, /v1/tool-credentials/current, /v1/tool-sign-ins, /v1/oidc, /v1/applications, /v1/applications/<name>, /v1/applications/<name>/versions, /v1/applications/<name>/versions/<number>, /v1/applications/<name>/go-back, /v1/applications/<name>/logs, /v1/applications/<name>/contributors, /v1/applications/<name>/sharing, /v1/applications/<name>/disable, /v1/applications/<name>/enable, /v1/admin/applications, /v1/admin/resources, /v1/admin/resources/<name>, /v1/resources, /v1/resources/<name>, /v1/resources/<name>/grants, /v1/resources/<name>/structure, /v1/resources/<name>/connection, /v1/outbound-hosts, /v1/outbound-hosts/<entry> and /v1/operation-log",
             );
         };
         match route {
@@ -1040,7 +1487,11 @@ impl Api {
         }
         let answer = match route {
             Route::Resources => self.resources_route(user, method, &body).await,
-            Route::Resource(name) => self.resource(user, method, name).await,
+            Route::Resource(name) => self.resource(user, method, name, &body).await,
+            Route::Connection(name) => self.connection(user, method, name, &body).await,
+            Route::Location(name) => self.location(user, method, name, &body).await,
+            Route::AdminResources => Ok(self.admin_resources(method, query).await),
+            Route::AdminResource(name) => self.admin_resource(method, name).await,
             Route::OutboundHosts => Ok(self.outbound_hosts(method)),
             Route::OutboundEntry(entry) => Ok(self.outbound_entry(user, method, entry).await),
             Route::Me => Ok(self.me(user, method)),
@@ -1821,6 +2272,15 @@ impl Api {
                         "a database Resource's logins are sealed under the installation's key, and this program was started without it: start the program with VIBE_SECRET_KEY (32 random bytes in base64, as `openssl rand -base64 32` makes them), then register the Resource again",
                     ));
                 }
+                // Name taken and too many, from memory, before any check
+                // (CONTRACT.md, "Registering a database, checked: Order of
+                // refusals").
+                if self.resources.get(&new.name).is_some() {
+                    return Ok(name_taken());
+                }
+                if self.resources.list().len() >= resources::MAX_RESOURCES {
+                    return Ok(too_many());
+                }
                 new
             }
             ToRegister::Storage {
@@ -1835,11 +2295,82 @@ impl Api {
                     .await;
             }
         };
+        // Every login is connected before anything is stored, and no check
+        // runs while another two do (CONTRACT.md, "Registering a database,
+        // checked"; "Bounds").
+        let Ok(_checking) = self.checks.try_acquire() else {
+            return Ok(checks_busy());
+        };
+        let checked = match &new.reach {
+            NewReach::Database(connection) => match tokio::time::timeout(
+                CHECK_WHOLE,
+                connection.check_logins(&connection.logins()),
+            )
+            .await
+            {
+                Ok(checked) => checked,
+                Err(_) => resources::Checked {
+                    failures: connection
+                        .logins()
+                        .into_iter()
+                        .map(|login| resources::Failure {
+                            login,
+                            why: "timed-out",
+                        })
+                        .collect(),
+                    warnings: Vec::new(),
+                },
+            },
+            NewReach::Storage { .. } => resources::Checked::default(),
+        };
+        if !checked.failures.is_empty() {
+            for failure in &checked.failures {
+                log::record(
+                    "resource-login-failed",
+                    json!({
+                        "resource": &new.name,
+                        "login": failure.login.word(),
+                        "why": failure.why,
+                    }),
+                );
+            }
+            return Ok(login_failed(&checked.failures));
+        }
+        let warnings: Vec<Value> = checked
+            .warnings
+            .iter()
+            .map(resources::Warning::json)
+            .collect();
         Ok(match self.resources.register(new, &user.id).await? {
             Registered::Registered(resource) => {
-                Answer::json(StatusCode::CREATED, &ResourceView::of(&resource))
+                log::record(
+                    "resource-registered",
+                    json!({
+                        "resource": &resource.name,
+                        "kind": resource.kind.name(),
+                        "by": &user.id,
+                    }),
+                );
+                for warning in &checked.warnings {
+                    log::record(
+                        "resource-login-warning",
+                        json!({
+                            "resource": &resource.name,
+                            "login": warning.login.word(),
+                            "reason": warning.reason,
+                        }),
+                    );
+                }
+                Answer::json(
+                    StatusCode::CREATED,
+                    &RegisteredView {
+                        resource: ResourceView::of(&resource),
+                        warnings: &warnings,
+                    },
+                )
             }
             Registered::NameTaken => name_taken(),
+            Registered::TooMany => too_many(),
         })
     }
 
@@ -1860,6 +2391,9 @@ impl Api {
         if self.resources.find(&name).await?.is_some() {
             return Ok(name_taken());
         }
+        if self.resources.list().len() >= resources::MAX_RESOURCES {
+            return Ok(too_many());
+        }
         let Some(root) = &self.storage.root else {
             return Ok(storage_refused(storage::directory::Refused::NotConfigured));
         };
@@ -1867,7 +2401,7 @@ impl Api {
         // now, before another registration is in memory.
         let resources = Arc::clone(&self.resources);
         let prepared = match root
-            .prepare(&self.storage.files, &name, directory, move || {
+            .prepare(&self.storage.files, &name, directory, None, move || {
                 resources.storage_taken()
             })
             .await
@@ -1875,6 +2409,9 @@ impl Api {
             Ok(prepared) => prepared,
             Err(refused) => return Ok(storage_refused(refused)),
         };
+        // Given back when this function ends, or when the request is given
+        // up while the insert is on its way: no claim is held for it.
+        let _claim = root.claim_guard(prepared.claim());
         let backend = storage::Directory::registered(
             &name,
             &prepared.directory,
@@ -1902,12 +2439,19 @@ impl Api {
                 root.release(prepared.claim());
                 Ok(Answer::json(
                     StatusCode::CREATED,
-                    &ResourceView::of(&resource),
+                    &RegisteredView {
+                        resource: ResourceView::of(&resource),
+                        warnings: &[],
+                    },
                 ))
             }
             Ok(Registered::NameTaken) => {
                 root.undo(&self.storage.files, prepared).await;
                 Ok(name_taken())
+            }
+            Ok(Registered::TooMany) => {
+                root.undo(&self.storage.files, prepared).await;
+                Ok(too_many())
             }
             Err(error) => {
                 // The insert may still land. Read it back: the claim is
@@ -1931,36 +2475,951 @@ impl Api {
         }
     }
 
-    async fn resource(&self, user: &User, method: &Method, name: &str) -> Result<Answer, DbError> {
+    async fn resource(
+        &self,
+        user: &User,
+        method: &Method,
+        name: &str,
+        body: &[u8],
+    ) -> Result<Answer, DbError> {
         let Some(resource) = self.resources.find(name).await? else {
             return Ok(no_resource());
         };
-        if method != Method::GET {
-            return Ok(Answer::method_not_allowed(method, "GET"));
+        match *method {
+            Method::GET => {}
+            Method::PATCH => return self.patch_resource(user, &resource, body).await,
+            Method::DELETE => return self.remove_resource(user, &resource).await,
+            _ => return Ok(Answer::method_not_allowed(method, "GET, PATCH or DELETE")),
         }
-        self.resources
+        match self
+            .resources
             .read_back(
                 &resource,
                 tokio::time::Instant::now() + resources::READ_BACK_WAIT,
             )
-            .await;
+            .await
+        {
+            resources::ReadBack::Known => {}
+            resources::ReadBack::Removed => return Ok(no_resource()),
+            resources::ReadBack::Unknown => return Ok(grants_unknown(name)),
+        }
         Ok(match ResourceRead::of(&resource, &groups_of(user)) {
             Some(read) => Answer::json(StatusCode::OK, &read),
             None => grants_unknown(name),
         })
     }
 
+    /// `DELETE /v1/resources/<name>` (blackbox/CONTRACT.md, "Resources and
+    /// Grants in full: Removing a Resource"): one transaction that takes
+    /// the row's lock first, its Grants counted and removed with it; the
+    /// Applications that declare it, from memory; then memory lets it go,
+    /// its pools close as they finish, and a Storage directory's marker and
+    /// empty staging are removed (never a file).
+    async fn remove_resource(
+        &self,
+        user: &User,
+        resource: &resources::Resource,
+    ) -> Result<Answer, DbError> {
+        let mut declared: Vec<RemovedDeclaredBy> = Vec::new();
+        let mut declaring: u64 = 0;
+        for name in self.registry.serving_names() {
+            if let crate::registry::Found::Known(kept) = self.registry.find(&name)
+                && let Some(serving) = kept.serving()
+                && let Some(declaration) = serving.declared.get(&resource.name)
+            {
+                declaring = declaring.saturating_add(1);
+                // Only the first 100 are copied; the rest are counted.
+                if declared.len() < 100 {
+                    declared.push(RemovedDeclaredBy {
+                        application: name.to_string(),
+                        version: serving.version,
+                        access: resources::level_name(declaration.level),
+                    });
+                }
+            }
+        }
+        let declared_by_more =
+            declaring.saturating_sub(u64::try_from(declared.len()).unwrap_or(u64::MAX));
+        let Some(_turn) = resource.writing(WRITE_TURN_WAIT).await else {
+            return Ok(Answer::error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "unavailable",
+                "another change of this Resource is running now: nothing was removed; try again shortly",
+            ));
+        };
+        if resource.grants().is_none() {
+            match self
+                .resources
+                .read_back_locked(
+                    resource,
+                    tokio::time::Instant::now() + resources::READ_BACK_WAIT,
+                )
+                .await
+            {
+                resources::ReadBack::Known => {}
+                resources::ReadBack::Removed => return Ok(no_resource()),
+                resources::ReadBack::Unknown => return Ok(grants_unknown(&resource.name)),
+            }
+        }
+        // Recorded before the statement is sent: a request given up while
+        // the removal is on its way owes the same record as one whose
+        // answer is lost.
+        resource.expect_removal(&user.id);
+        let mut unsettled = resources::Unsettled::new(&self.resources, resource);
+        let removed = match tokio::time::timeout(
+            WRITE_ROW_WAIT,
+            self.resources.remove(resource.id(), &resource.name),
+        )
+        .await
+        {
+            Ok(removed) => removed,
+            Err(_) => Err(DbError::timed_out(
+                "the removal of the Resource",
+                WRITE_ROW_WAIT,
+            )),
+        };
+        let grants_removed = match removed {
+            Ok(resources::Removed::Removed { grants }) => grants,
+            Ok(resources::Removed::NoSuchResource) => {
+                // Certain: no row. Memory lets it go; the guard is disarmed
+                // and no record is owed.
+                resource.clear_removal();
+                self.resources.forget_removed(resource);
+                unsettled.settled();
+                return Ok(no_resource());
+            }
+            // The guard forgets what memory knows: the commit may land. If
+            // it does, a reading finds no row and owes the record.
+            Err(error) => return Ok(Answer::unavailable(&error)),
+        };
+        resource.clear_removal();
+        let held = self.resources.forget_removed(resource);
+        unsettled.settled();
+        // The record is written once the removal is in force, before the
+        // cleaning: a request given up meanwhile still has it.
+        log::record(
+            "resource-removed",
+            json!({ "resource": &resource.name, "by": &user.id }),
+        );
+        let directory_cleaned = match resource.kind {
+            // Cleaned only while the directory is held (`forget_removed`):
+            // without the hold it is left, and the answer says so.
+            ResourceKind::Storage => Some(match (resource.storage(), &held) {
+                (Some(directory), Some(_held)) => {
+                    directory.clean(std::time::Duration::from_secs(5)).await
+                }
+                _ => false,
+            }),
+            ResourceKind::Postgres => None,
+        };
+        drop(held);
+        Ok(Answer::json(
+            StatusCode::OK,
+            &RemoveView {
+                name: &resource.name,
+                kind: resource.kind.name(),
+                grants_removed,
+                declared_by: declared,
+                declared_by_more,
+                directory_cleaned,
+            },
+        ))
+    }
+
+    /// `PATCH /v1/resources/<name>` (blackbox/CONTRACT.md, "Resources and
+    /// Grants in full: Changing a Resource's description, owner and
+    /// contact"): at least one of the three, each as registration takes it,
+    /// other members ignored; one transaction that takes the row's lock
+    /// first; the answer is the administrators' view; the record
+    /// `resource-changed`.
+    async fn patch_resource(
+        &self,
+        user: &User,
+        resource: &resources::Resource,
+        body: &[u8],
+    ) -> Result<Answer, DbError> {
+        let change = match read_text_change(body) {
+            Ok(change) => change,
+            Err(problem) => return Ok(Answer::malformed(problem, PATCH_FORM)),
+        };
+        // One write of this Resource at a time, from before the row's
+        // transaction to memory; a future given up here forgets what memory
+        // knows (H1's guard). The check that the program knows it is made
+        // under this turn.
+        let Some(_turn) = resource.writing(WRITE_TURN_WAIT).await else {
+            return Ok(Answer::error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "unavailable",
+                "another change of this Resource is running now: nothing was changed; try again shortly",
+            ));
+        };
+        if resource.grants().is_none() {
+            match self
+                .resources
+                .read_back_locked(
+                    resource,
+                    tokio::time::Instant::now() + resources::READ_BACK_WAIT,
+                )
+                .await
+            {
+                resources::ReadBack::Known => {}
+                resources::ReadBack::Removed => return Ok(no_resource()),
+                resources::ReadBack::Unknown => return Ok(grants_unknown(&resource.name)),
+            }
+        }
+        let mut unsettled = resources::Unsettled::new(&self.resources, resource);
+        let written = match tokio::time::timeout(
+            WRITE_ROW_WAIT,
+            self.resources.change_texts(
+                resource.id(),
+                &resource.name,
+                change.description.as_deref(),
+                change.owner.as_deref(),
+                change.contact.as_deref(),
+            ),
+        )
+        .await
+        {
+            Ok(written) => written,
+            Err(_) => Err(DbError::timed_out(
+                "the change of the Resource's row",
+                WRITE_ROW_WAIT,
+            )),
+        };
+        let (description, owner, contact) = match written {
+            Ok(Some(texts)) => texts,
+            Ok(None) => {
+                // Certain: no row. Memory lets it go; the guard is disarmed.
+                self.resources.forget_removed(resource);
+                unsettled.settled();
+                return Ok(no_resource());
+            }
+            // The guard forgets what memory knows: the commit may land
+            // after this answer.
+            Err(error) => return Ok(Answer::unavailable(&error)),
+        };
+        resource.set_texts(
+            std::sync::Arc::from(description),
+            std::sync::Arc::from(owner),
+            std::sync::Arc::from(contact),
+        );
+        unsettled.settled();
+        let fields: Vec<&str> = change.fields();
+        log::record(
+            "resource-changed",
+            json!({ "resource": &resource.name, "fields": fields, "by": &user.id }),
+        );
+        // The answer is the view, as it is now; the Grants, if memory did
+        // not know them, are read back within the request's bound, under
+        // the turn this write still holds.
+        match self
+            .resources
+            .read_back_locked(
+                resource,
+                tokio::time::Instant::now() + resources::READ_BACK_WAIT,
+            )
+            .await
+        {
+            resources::ReadBack::Known => {}
+            resources::ReadBack::Removed => return Ok(no_resource()),
+            resources::ReadBack::Unknown => return Ok(grants_unknown(&resource.name)),
+        }
+        Ok(match self.admin_resource_view(resource) {
+            Some(view) => Answer::json(StatusCode::OK, &view),
+            None => grants_unknown(&resource.name),
+        })
+    }
+
+    /// `PUT /v1/resources/<name>/connection`: the checks on the logins
+    /// given (and on every login when the address changes), then one
+    /// transaction that takes the row's lock first, seals the new
+    /// connection for the row and swaps the pools (blackbox/CONTRACT.md,
+    /// "Resources and Grants in full: Replacing a Resource's logins").
+    async fn replace_logins(
+        &self,
+        user: &User,
+        resource: &resources::Resource,
+        body: &[u8],
+    ) -> Result<Answer, DbError> {
+        let change = match read_logins_change(body) {
+            Ok(change) => change,
+            Err(problem) => return Ok(Answer::malformed(problem, LOGINS_FORM)),
+        };
+        if !self.resources.has_vault() {
+            return Ok(Answer::error(
+                StatusCode::CONFLICT,
+                "no-secret-key",
+                "a database Resource's logins are sealed under the installation's key, and this program was started without it: start the program with VIBE_SECRET_KEY, then replace its logins",
+            ));
+        }
+        // A replacement of a Resource the program is still finding out reads
+        // its row back first, within the contract's 1 second; when it still
+        // does not know, nothing is written and it is asked again.
+        if resource.grants().is_none() {
+            match self
+                .resources
+                .read_back(
+                    resource,
+                    tokio::time::Instant::now() + resources::READ_BACK_WAIT,
+                )
+                .await
+            {
+                resources::ReadBack::Known => {}
+                resources::ReadBack::Removed => return Ok(no_resource()),
+                resources::ReadBack::Unknown => return Ok(grants_unknown(&resource.name)),
+            }
+        }
+        let current = resource.connection();
+        let new = match &current {
+            Some(current) => resources::Connection::new(
+                change
+                    .host
+                    .clone()
+                    .unwrap_or_else(|| current.host().to_owned()),
+                change.port.unwrap_or_else(|| current.port()),
+                change
+                    .database
+                    .clone()
+                    .unwrap_or_else(|| current.database().to_owned()),
+                change
+                    .read
+                    .clone()
+                    .unwrap_or_else(|| current.read_login().clone()),
+                match &change.write {
+                    Some(write) => write.clone(),
+                    None => current.write_login().cloned(),
+                },
+                match &change.structure {
+                    Some(structure) => structure.clone(),
+                    None => current.structure_login().cloned(),
+                },
+            ),
+            None => {
+                // Not served: a whole connection and nothing less.
+                let mut missing: Vec<&str> = Vec::new();
+                if change.host.is_none() {
+                    missing.push("host");
+                }
+                if change.port.is_none() {
+                    missing.push("port");
+                }
+                if change.database.is_none() {
+                    missing.push("database");
+                }
+                if change.read.is_none() {
+                    missing.push("read");
+                }
+                if !missing.is_empty() {
+                    return Ok(Answer::error(
+                        StatusCode::CONFLICT,
+                        "connection-incomplete",
+                        &format!(
+                            "the Resource is not served, so a whole connection is needed: {} {} missing. Give the host, the port, the database and the read login, and the write and structure logins it should have",
+                            missing.join(", "),
+                            if missing.len() == 1 { "is" } else { "are" },
+                        ),
+                    ));
+                }
+                resources::Connection::new(
+                    change.host.clone().unwrap_or_default(),
+                    change.port.unwrap_or_default(),
+                    change.database.clone().unwrap_or_default(),
+                    change
+                        .read
+                        .clone()
+                        .unwrap_or_else(|| resources::Login::new(String::new(), String::new())),
+                    change.write.clone().unwrap_or_default(),
+                    change.structure.clone().unwrap_or_default(),
+                )
+            }
+        };
+        // The logins connected: the given ones, or every one when the
+        // address changes (or when a whole connection is given).
+        let address_changed =
+            change.host.is_some() || change.port.is_some() || change.database.is_some();
+        let only: Vec<resources::Which> = if current.is_none() || address_changed {
+            new.logins()
+        } else {
+            let mut only = Vec::new();
+            if change.read.is_some() {
+                only.push(resources::Which::Read);
+            }
+            if change.write.is_some() && new.write_login().is_some() {
+                only.push(resources::Which::Write);
+            }
+            if change.structure.is_some() && new.structure_login().is_some() {
+                only.push(resources::Which::Structure);
+            }
+            only
+        };
+        let Ok(_checking) = self.checks.try_acquire() else {
+            return Ok(checks_busy());
+        };
+        let checked = match tokio::time::timeout(CHECK_WHOLE, new.check_logins(&only)).await {
+            Ok(checked) => checked,
+            Err(_) => resources::Checked {
+                failures: only
+                    .iter()
+                    .map(|login| resources::Failure {
+                        login: *login,
+                        why: "timed-out",
+                    })
+                    .collect(),
+                warnings: Vec::new(),
+            },
+        };
+        if !checked.failures.is_empty() {
+            for failure in &checked.failures {
+                log::record(
+                    "resource-login-failed",
+                    json!({
+                        "resource": &resource.name,
+                        "login": failure.login.word(),
+                        "why": failure.why,
+                    }),
+                );
+            }
+            return Ok(login_failed(&checked.failures));
+        }
+        // The check holds no lock; the turn is taken after it, before the
+        // row's transaction, and held until memory is what was written. The
+        // check that the program knows the Resource is repeated under it.
+        let Some(_turn) = resource.writing(WRITE_TURN_WAIT).await else {
+            return Ok(Answer::error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "unavailable",
+                "another change of this Resource is running now: nothing was changed; try again shortly",
+            ));
+        };
+        if resource.grants().is_none() {
+            // The logins were checked on what memory held before the
+            // program found the Resource out: nothing is written, whichever
+            // the reading found (a row gone is the write that finds no row).
+            let reading = self
+                .resources
+                .read_back_locked(
+                    resource,
+                    tokio::time::Instant::now() + resources::READ_BACK_WAIT,
+                )
+                .await;
+            if reading == resources::ReadBack::Removed {
+                return Ok(no_resource());
+            }
+            return Ok(Answer::error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "unavailable",
+                "the Resource's logins changed while they were being checked: nothing was changed; ask again",
+            ));
+        }
+        let mut unsettled = resources::Unsettled::new(&self.resources, resource);
+        let written = match tokio::time::timeout(
+            WRITE_ROW_WAIT,
+            self.resources.replace_connection(
+                resource.id(),
+                &resource.name,
+                current.as_ref(),
+                &new,
+            ),
+        )
+        .await
+        {
+            Ok(written) => written,
+            Err(_) => Err(DbError::timed_out(
+                "the replacement of the Resource's logins",
+                WRITE_ROW_WAIT,
+            )),
+        };
+        match written {
+            Ok(resources::Replaced::Replaced) => {}
+            Ok(resources::Replaced::NoSuchResource) => {
+                self.resources.forget_removed(resource);
+                unsettled.settled();
+                return Ok(no_resource());
+            }
+            Ok(resources::Replaced::ChangedMeanwhile) => {
+                // Certain: another write's logins are the ones the row has;
+                // nothing of this one was written.
+                unsettled.settled();
+                return Ok(Answer::error(
+                    StatusCode::CONFLICT,
+                    "changed-meanwhile",
+                    "the Resource's logins changed between this replacement's check and its write: nothing was changed; ask again",
+                ));
+            }
+            // The guard forgets what memory knows: the commit may land
+            // after this answer.
+            Err(error) => return Ok(Answer::unavailable(&error)),
+        }
+        self.resources.install_connection(resource, new);
+        unsettled.settled();
+        log::record(
+            "resource-logins-replaced",
+            json!({
+                "resource": &resource.name,
+                "members": change.members,
+                "by": &user.id,
+            }),
+        );
+        for warning in &checked.warnings {
+            log::record(
+                "resource-login-warning",
+                json!({
+                    "resource": &resource.name,
+                    "login": warning.login.word(),
+                    "reason": warning.reason,
+                }),
+            );
+        }
+        let warnings: Vec<Value> = checked
+            .warnings
+            .iter()
+            .map(resources::Warning::json)
+            .collect();
+        match self
+            .resources
+            .read_back_locked(
+                resource,
+                tokio::time::Instant::now() + resources::READ_BACK_WAIT,
+            )
+            .await
+        {
+            resources::ReadBack::Known => {}
+            resources::ReadBack::Removed => return Ok(no_resource()),
+            resources::ReadBack::Unknown => return Ok(grants_unknown(&resource.name)),
+        }
+        Ok(match self.admin_resource_view(resource) {
+            Some(view) => Answer::json(
+                StatusCode::OK,
+                &AdminChangedView {
+                    resource: view,
+                    warnings,
+                },
+            ),
+            None => grants_unknown(&resource.name),
+        })
+    }
+
+    /// `PUT /v1/resources/<name>/connection` (blackbox/CONTRACT.md,
+    /// "Resources and Grants in full: Replacing a Resource's logins").
+    async fn connection(
+        &self,
+        user: &User,
+        method: &Method,
+        name: &str,
+        body: &[u8],
+    ) -> Result<Answer, DbError> {
+        if *method != Method::PUT {
+            return Ok(Answer::method_not_allowed(method, "PUT"));
+        }
+        let Some(resource) = self.resources.find(name).await? else {
+            return Ok(no_resource());
+        };
+        if resource.kind == ResourceKind::Storage {
+            return Ok(Answer::error(
+                StatusCode::CONFLICT,
+                "wrong-kind",
+                "this is a Storage Resource: its place is changed with `vibe admin resource location`",
+            ));
+        }
+        self.replace_logins(user, &resource, body).await
+    }
+
+    /// `PUT /v1/resources/<name>/location` (blackbox/CONTRACT.md,
+    /// "Resources and Grants in full: A Storage Resource's location"): the
+    /// registration's directory checks in the same order, save that the
+    /// Resource's own directory is not another's; one transaction that
+    /// takes the row's lock first; memory takes the new directory once the
+    /// row is written; the old directory's marker and empty staging are
+    /// removed, never a file.
+    async fn location(
+        &self,
+        user: &User,
+        method: &Method,
+        name: &str,
+        body: &[u8],
+    ) -> Result<Answer, DbError> {
+        if *method != Method::PUT {
+            return Ok(Answer::method_not_allowed(method, "PUT"));
+        }
+        let Some(resource) = self.resources.find(name).await? else {
+            return Ok(no_resource());
+        };
+        if resource.kind != ResourceKind::Storage {
+            return Ok(Answer::error(
+                StatusCode::CONFLICT,
+                "wrong-kind",
+                "this is a database Resource, which has no location: its logins are replaced with PUT /v1/resources/<name>/connection",
+            ));
+        }
+        let directory = match read_location(body) {
+            Ok(directory) => directory,
+            Err(problem) => return Ok(Answer::malformed(problem, LOCATION_FORM)),
+        };
+        let Some(root) = &self.storage.root else {
+            return Ok(storage_refused(storage::directory::Refused::NotConfigured));
+        };
+        // One write of this Resource at a time; the check that the program
+        // knows it is made under that turn, in the reading this write is.
+        let Some(_turn) = resource.writing(WRITE_TURN_WAIT).await else {
+            return Ok(Answer::error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "unavailable",
+                "another change of this Resource is running now: nothing was changed; try again shortly",
+            ));
+        };
+        if resource.grants().is_none() {
+            match self
+                .resources
+                .read_back_locked(
+                    &resource,
+                    tokio::time::Instant::now() + resources::READ_BACK_WAIT,
+                )
+                .await
+            {
+                resources::ReadBack::Known => {}
+                resources::ReadBack::Removed => return Ok(no_resource()),
+                resources::ReadBack::Unknown => return Ok(grants_unknown(name)),
+            }
+        }
+        let Some(current) = resource.storage() else {
+            return Ok(no_resource());
+        };
+        let location_now = AdminLocation {
+            backend: "directory",
+            directory: current.path().to_string_lossy().into_owned(),
+        };
+        // The same directory again, as a registration takes it (one `/` at
+        // its end dropped, and no more): nothing is written at all.
+        let same = crate::storage::directory::segments_of(&directory).is_some_and(|asked| {
+            crate::storage::directory::segments_of(&current.path().to_string_lossy())
+                .is_some_and(|own| asked == own)
+        });
+        if same {
+            if let Some(pending) = resource.take_location_change() {
+                log::record(
+                    "resource-location-changed",
+                    json!({ "resource": name, "by": pending.by }),
+                );
+            }
+            return Ok(Answer::json(
+                StatusCode::OK,
+                &LocationChangedView {
+                    resource: name,
+                    location: location_now,
+                    changed: false,
+                    files_moved: false,
+                    message: "the Resource is already on this directory: nothing was written; its files stay where they are",
+                },
+            ));
+        }
+        let resources = Arc::clone(&self.resources);
+        let own = current.path().to_path_buf();
+        let prepared = match root
+            .prepare(
+                &self.storage.files,
+                name,
+                &directory,
+                Some(current.path()),
+                move || {
+                    resources
+                        .storage_taken()
+                        .into_iter()
+                        .filter(|taken| taken.path != own)
+                        .collect()
+                },
+            )
+            .await
+        {
+            Ok(prepared) => prepared,
+            Err(refused) => return Ok(storage_refused(refused)),
+        };
+        let new = storage::Location::Directory {
+            directory: prepared.directory.to_string_lossy().into_owned(),
+        };
+        let new_path = prepared.directory.clone();
+        let (made_marker, made_staging) = prepared.made();
+        // Recorded before the statement is sent: a request its sender gives
+        // up owes the same record and cleaning as one whose answer is lost.
+        let ours = resource.expect_location_change_if_none_for(
+            &user.id,
+            new_path.clone(),
+            made_marker,
+            made_staging,
+        );
+        // Given back when this function ends, or when the request is given
+        // up while the write is on its way.
+        let _claim = root.claim_guard(prepared.claim());
+        let mut unsettled = resources::Unsettled::new(&self.resources, &resource);
+        let written = match tokio::time::timeout(
+            WRITE_ROW_WAIT,
+            self.resources
+                .change_location(resource.id(), &resource.name, current.path(), &new),
+        )
+        .await
+        {
+            Ok(written) => written,
+            Err(_) => Err(DbError::timed_out(
+                "the change of the Resource's location",
+                WRITE_ROW_WAIT,
+            )),
+        };
+        match written {
+            Ok(resources::LocationChanged::Changed) => {
+                unsettled.settled();
+                resource.clear_location_change();
+                let backend = storage::Directory::registered(
+                    name,
+                    &prepared.directory,
+                    Arc::clone(&prepared.opened),
+                    self.storage.root.clone(),
+                    &self.storage.files,
+                );
+                resource.install_location(backend);
+                // The record is written before the cleaning: a request given
+                // up meanwhile still has the record of the change in force.
+                log::record(
+                    "resource-location-changed",
+                    json!({ "resource": name, "by": &user.id }),
+                );
+                current.clean(std::time::Duration::from_secs(5)).await;
+                Ok(Answer::json(
+                    StatusCode::OK,
+                    &LocationChangedView {
+                        resource: name,
+                        location: AdminLocation {
+                            backend: "directory",
+                            directory: new_path.to_string_lossy().into_owned(),
+                        },
+                        changed: true,
+                        files_moved: false,
+                        message: "the files of the old directory stay where they are, and the new directory must hold the files the Resource is to have; nothing was moved",
+                    },
+                ))
+            }
+            Ok(resources::LocationChanged::Same) => {
+                unsettled.settled();
+                let backend = storage::Directory::registered(
+                    name,
+                    &prepared.directory,
+                    Arc::clone(&prepared.opened),
+                    self.storage.root.clone(),
+                    &self.storage.files,
+                );
+                resource.install_location(backend);
+                // Only a pending an earlier request left owes a record; this
+                // request's own is cleared without one, as it wrote nothing.
+                let pending = resource.take_location_change();
+                if !ours && let Some(pending) = pending {
+                    log::record(
+                        "resource-location-changed",
+                        json!({ "resource": name, "by": pending.by }),
+                    );
+                }
+                current.clean(std::time::Duration::from_secs(5)).await;
+                Ok(Answer::json(
+                    StatusCode::OK,
+                    &LocationChangedView {
+                        resource: name,
+                        location: AdminLocation {
+                            backend: "directory",
+                            directory: new_path.to_string_lossy().into_owned(),
+                        },
+                        changed: false,
+                        files_moved: false,
+                        message: "the Resource is already on this directory: nothing was changed; its files stay where they are",
+                    },
+                ))
+            }
+            Ok(resources::LocationChanged::ChangedMeanwhile) => {
+                unsettled.settled();
+                // Only this request's own: one an earlier request left is
+                // settled by the reading that finds it out.
+                if ours {
+                    resource.clear_location_change();
+                }
+                root.undo(&self.storage.files, prepared).await;
+                Ok(Answer::error(
+                    StatusCode::CONFLICT,
+                    "changed-meanwhile",
+                    "the Resource's location changed between this change's finding and its write: nothing was changed; ask again",
+                ))
+            }
+            Ok(resources::LocationChanged::NoSuchResource) => {
+                unsettled.settled();
+                resource.clear_location_change();
+                root.undo(&self.storage.files, prepared).await;
+                self.resources.forget_removed(&resource);
+                Ok(no_resource())
+            }
+            Err(error) => {
+                // The answer is lost: memory forgets, and the row is read
+                // back to know whether the change landed. What the change
+                // made in the new directory is undone when it did not; the
+                // record and the old directory's cleaning happen in that
+                // reading, before this answer.
+                unsettled.settled();
+                self.resources.write_failed(&resource);
+                let state = self
+                    .resources
+                    .read_back_locked(
+                        &resource,
+                        tokio::time::Instant::now() + resources::READ_BACK_WAIT,
+                    )
+                    .await;
+                if state == resources::ReadBack::Removed {
+                    // The row is gone: the new directory is not the
+                    // Resource's; what the change made there goes.
+                    root.undo(&self.storage.files, prepared).await;
+                }
+                Ok(Answer::unavailable(&error))
+            }
+        }
+    }
+
+    /// `GET /v1/admin/resources` (blackbox/CONTRACT.md, "Resources and
+    /// Grants in full: Listing, for administrators").
+    async fn admin_resources(&self, method: &Method, query: Option<&str>) -> Answer {
+        if *method != Method::GET {
+            return Answer::method_not_allowed(method, "GET");
+        }
+        let (after, limit) = match resource_list_query(query) {
+            Ok(query) => query,
+            Err(problem) => return Answer::malformed(&problem, ADMIN_RESOURCES_FORM),
+        };
+        let all: Vec<_> = self
+            .resources
+            .list()
+            .into_iter()
+            .filter(|r| after.as_deref().is_none_or(|after| r.name.as_str() > after))
+            .collect();
+        // Grants are never guessed; read back what memory does not know,
+        // within the bound of a request's readings.
+        let deadline = tokio::time::Instant::now() + resources::READ_BACK_WAIT;
+        let mut remaining = all.into_iter().peekable();
+        let mut views: Vec<AdminResourceView> = Vec::new();
+        // The envelope's own bytes, and one comma between Resources.
+        let budget = MAX_ADMIN_LIST_BYTES.saturating_sub(256);
+        let mut used = 0usize;
+        let mut stopped_early = false;
+        while views.len() < limit {
+            let Some(resource) = remaining.next() else {
+                break;
+            };
+            match self.resources.read_back(&resource, deadline).await {
+                resources::ReadBack::Known => {}
+                resources::ReadBack::Removed => continue,
+                resources::ReadBack::Unknown => return grants_unknown(&resource.name),
+            }
+            let Some(view) = self.admin_resource_view(&resource) else {
+                return grants_unknown(&resource.name);
+            };
+            // Measured once here, and dropped from the end by that size.
+            let size = serde_json::to_vec(&view).map_or(0, |body| body.len()) + 1;
+            if !views.is_empty() && used.saturating_add(size) > budget {
+                stopped_early = true;
+                break;
+            }
+            used = used.saturating_add(size);
+            views.push(view);
+        }
+        let next = if stopped_early || remaining.peek().is_some() {
+            views.last().map(|view| view.name.clone())
+        } else {
+            None
+        };
+        Answer::json(
+            StatusCode::OK,
+            &AdminResourcesView {
+                resources: views,
+                next,
+            },
+        )
+    }
+
+    /// `GET /v1/admin/resources/<name>`.
+    async fn admin_resource(&self, method: &Method, name: &str) -> Result<Answer, DbError> {
+        if *method != Method::GET {
+            return Ok(Answer::method_not_allowed(method, "GET"));
+        }
+        let Some(resource) = self.resources.find(name).await? else {
+            return Ok(no_resource());
+        };
+        match self
+            .resources
+            .read_back(
+                &resource,
+                tokio::time::Instant::now() + resources::READ_BACK_WAIT,
+            )
+            .await
+        {
+            resources::ReadBack::Known => {}
+            resources::ReadBack::Removed => return Ok(no_resource()),
+            resources::ReadBack::Unknown => return Ok(grants_unknown(name)),
+        }
+        Ok(match self.admin_resource_view(&resource) {
+            Some(view) => Answer::json(StatusCode::OK, &view),
+            None => grants_unknown(name),
+        })
+    }
+
+    /// A Resource as a Platform administrator sees it; `None` while its
+    /// Grants are not known.
+    fn admin_resource_view(&self, resource: &resources::Resource) -> Option<AdminResourceView> {
+        let (grants, grants_more) = resource.grants_page(MAX_GRANTS_SHOWN)?;
+        let (usable, problem) = match resource.kind {
+            ResourceKind::Storage => {
+                let problem = resource
+                    .storage()
+                    .and_then(|directory| directory.problem())
+                    .map(directory_problem_word);
+                (problem.is_none(), problem)
+            }
+            ResourceKind::Postgres => (resource.unserved().is_none(), resource.unserved()),
+        };
+        let location = resource.storage().map(|directory| AdminLocation {
+            backend: "directory",
+            directory: directory.path().to_string_lossy().into_owned(),
+        });
+        let grants = grants
+            .into_iter()
+            .map(|(group, level)| AdminGrant {
+                group,
+                access: resources::level_name(level),
+            })
+            .collect();
+        Some(AdminResourceView {
+            name: resource.name.clone(),
+            kind: resource.kind.name(),
+            description: resource.description().to_string(),
+            owner: resource.owner().to_string(),
+            contact: resource.contact().to_string(),
+            created_by: resource.created_by.clone(),
+            created_at: resource.created_at.clone(),
+            usable,
+            problem,
+            logins: resource.logins(),
+            location,
+            grants,
+            grants_more,
+        })
+    }
     async fn grants(&self, method: &Method, name: &str, body: &[u8]) -> Result<Answer, DbError> {
         let Some(resource) = self.resources.find(name).await? else {
             return Ok(no_resource());
         };
         if method == Method::GET {
-            self.resources
+            match self
+                .resources
                 .read_back(
                     &resource,
                     tokio::time::Instant::now() + resources::READ_BACK_WAIT,
                 )
-                .await;
+                .await
+            {
+                resources::ReadBack::Known => {}
+                resources::ReadBack::Removed => return Ok(no_resource()),
+                resources::ReadBack::Unknown => return Ok(grants_unknown(name)),
+            }
             let Some(grants) = resource.grants() else {
                 return Ok(grants_unknown(name));
             };
@@ -1988,7 +3447,19 @@ impl Api {
                 GRANT_FORM,
             ));
         }
-        Ok(match self.resources.grant(name, &group, level).await? {
+        let granted =
+            match tokio::time::timeout(WRITE_ROW_WAIT, self.resources.grant(name, &group, level))
+                .await
+            {
+                Ok(granted) => granted?,
+                Err(_) => {
+                    return Ok(Answer::unavailable(&DbError::timed_out(
+                        "the write of the Grant",
+                        WRITE_ROW_WAIT,
+                    )));
+                }
+            };
+        Ok(match granted {
             GrantWritten::Written => Answer::json(
                 StatusCode::OK,
                 &GrantSet {
@@ -2017,12 +3488,18 @@ impl Api {
         if method != Method::GET {
             return Answer::method_not_allowed(method, "GET");
         }
-        self.resources
+        match self
+            .resources
             .read_back(
                 &resource,
                 tokio::time::Instant::now() + resources::READ_BACK_WAIT,
             )
-            .await;
+            .await
+        {
+            resources::ReadBack::Known => {}
+            resources::ReadBack::Removed => return no_resource(),
+            resources::ReadBack::Unknown => return grants_unknown(name),
+        }
         let groups = groups_of(user);
         let decided = resource.with_grants(|grants| {
             let decision = authz::decide(&authz::Question {
@@ -2050,16 +3527,16 @@ impl Api {
             {
                 return Answer::unavailable(&error);
             }
+            let contact = resource.contact();
             return Answer::json(
                 StatusCode::FORBIDDEN,
                 &json!({ "error": {
                     "reason": "no-grant",
                     "message": format!(
-                        "you hold no Grant on the Resource {name}: ask {} for one, and do not build against {name} until you have it",
-                        resource.contact
+                        "you hold no Grant on the Resource {name}: ask {contact} for one, and do not build against {name} until you have it"
                     ),
                     "resource": name,
-                    "contact": &resource.contact,
+                    "contact": contact.as_ref(),
                 } }),
             );
         }
@@ -2081,7 +3558,7 @@ impl Api {
                     "resource": name,
                     "kind": "storage",
                     "your_access": held.map(resources::level_name),
-                    "contact": &resource.contact,
+                    "contact": resource.contact().as_ref(),
                 }),
             );
             let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -2131,9 +3608,11 @@ impl Api {
             );
         };
         let started = tokio::time::Instant::now();
-        let pulled = match resource.structure_pool() {
-            Some(pool) => structure::pull(pool, name).await,
-            // Not reached: every database has a read pool, and a Storage
+        let pulled = match resource.structure_and_roles() {
+            Some((pool, read_role, write_role)) => {
+                structure::pull(&pool, name, &read_role, write_role.as_deref()).await
+            }
+            // Not reached: every served database has both, and a Storage
             // Resource was answered above.
             None => Err(structure::Failed::Unavailable),
         };
@@ -2149,7 +3628,8 @@ impl Api {
                     schema_ts: &pulled.schema_ts,
                     unsupported: &pulled.unsupported,
                     standin_sql: &pulled.standin_sql,
-                    contact: &resource.contact,
+                    contact: &resource.contact(),
+                    hidden: pulled.hidden,
                 },
             );
             if answer.body.len() > structure::MAX_BYTES {
@@ -2589,13 +4069,15 @@ impl Api {
     pub(crate) async fn known_resources(&self) -> Result<Vec<Arc<resources::Resource>>, String> {
         let all = self.resources.list();
         let deadline = tokio::time::Instant::now() + resources::READ_BACK_WAIT;
-        for resource in &all {
-            self.resources.read_back(resource, deadline).await;
-            if !resource.grants_known() {
-                return Err(resource.name.clone());
+        let mut known = Vec::with_capacity(all.len());
+        for resource in all {
+            match self.resources.read_back(&resource, deadline).await {
+                resources::ReadBack::Known => known.push(resource),
+                resources::ReadBack::Removed => {}
+                resources::ReadBack::Unknown => return Err(resource.name.clone()),
             }
         }
-        Ok(all)
+        Ok(known)
     }
 
     /// The Application `name`; `None` also for a name no Application can
@@ -2789,9 +4271,11 @@ struct VersionsView<'a> {
 struct ResourceView<'a> {
     name: &'a str,
     kind: &'static str,
-    description: &'a str,
-    owner: &'a str,
-    contact: &'a str,
+    // Copied once per answer a request makes: a few bytes on the API's
+    // path, which reads no database for it.
+    description: String,
+    owner: String,
+    contact: String,
     created_by: &'a str,
     created_at: &'a str,
 }
@@ -2801,9 +4285,9 @@ impl<'a> ResourceView<'a> {
         Self {
             name: &resource.name,
             kind: resource.kind.name(),
-            description: &resource.description,
-            owner: &resource.owner,
-            contact: &resource.contact,
+            description: resource.description().to_string(),
+            owner: resource.owner().to_string(),
+            contact: resource.contact().to_string(),
             created_by: &resource.created_by,
             created_at: &resource.created_at,
         }
@@ -2938,6 +4422,7 @@ struct StructureView<'a> {
     unsupported: &'a [structure::Unsupported],
     standin_sql: &'a [String],
     contact: &'a str,
+    hidden: u64,
 }
 
 #[derive(Serialize)]

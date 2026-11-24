@@ -86,11 +86,17 @@ fn an_administrator_registers_a_storage_resource_and_everyone_reads_its_face_wit
     created.expect_status(201);
     assert_json_content_type(&created);
     let resource = created.json();
+    let mut with_warnings: Vec<String> = PUBLIC_FACE.iter().map(|k| (*k).to_owned()).collect();
+    with_warnings.push("warnings".to_owned());
+    with_warnings.sort();
     assert_eq!(
         keys(&resource),
-        PUBLIC_FACE,
-        "expected {{ name, kind, description, owner, contact, created_by, created_at }} and nothing of `location`, got {resource}"
+        with_warnings,
+        "expected {{ name, kind, description, owner, contact, created_by, created_at, warnings }} and nothing of `location`, got {resource}"
     );
+    // What GET answers is the Resource without the registration's `warnings`.
+    let mut resource = resource;
+    resource.as_object_mut().unwrap().remove("warnings");
     assert_eq!(resource["name"], MARKETING);
     assert_eq!(resource["kind"], "storage");
     assert_eq!(resource["description"], body["description"]);
@@ -342,6 +348,51 @@ fn a_directory_outside_the_storage_root_is_refused_in_every_form() {
             &s,
             MARKETING,
             directory,
+            422,
+            "outside-storage-root",
+            &s.place.base,
+            what,
+        );
+    }
+}
+
+/// "Registering a Storage Resource": a segment that is one of the program's
+/// own names, `.vibe-resource` or `.vibe-staging`, is not taken: the
+/// directory is `outside-storage-root`, and nothing is left on disk.
+#[test]
+fn a_directory_with_one_of_the_programs_own_names_as_a_segment_is_outside_the_storage_root() {
+    let s = Storage::start();
+    let root = s.root();
+    for made in [
+        root.join("x/.vibe-staging"),
+        root.join("x/.vibe-resource"),
+        root.join(".vibe-resource/z"),
+        root.join(".vibe-staging/y/z"),
+    ] {
+        std::fs::create_dir_all(made).unwrap();
+    }
+    for (directory, what) in [
+        (
+            root.join("x/.vibe-staging"),
+            "`.vibe-staging` as the last segment",
+        ),
+        (
+            root.join("x/.vibe-resource"),
+            "`.vibe-resource` as the last segment",
+        ),
+        (
+            root.join(".vibe-resource/z"),
+            "`.vibe-resource` in the middle",
+        ),
+        (
+            root.join(".vibe-staging/y/z"),
+            "`.vibe-staging` in the middle",
+        ),
+    ] {
+        assert_refused(
+            &s,
+            MARKETING,
+            &directory.to_string_lossy(),
             422,
             "outside-storage-root",
             &s.place.base,
