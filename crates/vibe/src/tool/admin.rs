@@ -29,7 +29,7 @@ use super::{
 use crate::api::{MAX_ENTRY_BYTES, rfc3339_micros};
 use crate::oidc::secret::ClientSecret;
 use crate::registry::{NameProblem, check_name};
-use crate::resources::is_resource_name;
+use crate::resources::{is_group, is_resource_name};
 
 /// The variable that holds the client secret.
 const CLIENT_SECRET_VARIABLE: &str = "VIBE_OIDC_CLIENT_SECRET";
@@ -84,6 +84,52 @@ pub enum AdminCommand {
     /// Register a Resource, replace its logins, or change its description,
     /// owner and contact.
     Resource(ResourceArgs),
+    /// Give a Group access to a Resource, or change its level.
+    Grant(GrantArgs),
+    /// Take a Group's access to a Resource away.
+    Revoke(RevokeArgs),
+    /// The Grants of a Resource, or the Resources a Group can reach.
+    Grants(GrantsArgs),
+}
+
+/// `vibe admin grant <resource> --group <group> --access <level>`.
+#[derive(clap::Args)]
+pub struct GrantArgs {
+    #[arg(value_parser = a_resource_name)]
+    pub resource: String,
+    /// The Group, exactly as the company's directory names it.
+    #[arg(long, value_parser = group_name)]
+    pub group: String,
+    /// `structure`, `read` or `write`.
+    #[arg(long)]
+    pub access: String,
+    #[command(flatten)]
+    pub output: Output,
+}
+
+/// `vibe admin revoke <resource> --group <group>`.
+#[derive(clap::Args)]
+pub struct RevokeArgs {
+    #[arg(value_parser = a_resource_name)]
+    pub resource: String,
+    /// The Group whose Grant is revoked, exactly as it was given.
+    #[arg(long, value_parser = group_name)]
+    pub group: String,
+    #[command(flatten)]
+    pub output: Output,
+}
+
+/// `vibe admin grants (--resource <name> | --group <group>)`.
+#[derive(clap::Args)]
+pub struct GrantsArgs {
+    /// The Resource whose Grants are listed.
+    #[arg(long, value_parser = a_resource_name, conflicts_with = "group")]
+    pub resource: Option<String>,
+    /// The Group whose Grants are listed.
+    #[arg(long, value_parser = group_name, conflicts_with = "resource")]
+    pub group: Option<String>,
+    #[command(flatten)]
+    pub output: Output,
 }
 
 /// `vibe admin resources [<name>]`.
@@ -330,6 +376,14 @@ fn a_resource_name(text: &str) -> Result<String, String> {
     }
 }
 
+fn group_name(text: &str) -> Result<String, String> {
+    if is_group(text) {
+        Ok(text.to_owned())
+    } else {
+        Err("not a Group: 1 to 256 bytes without control characters".into())
+    }
+}
+
 fn user_id(text: &str) -> Result<String, String> {
     if text.is_empty() || text.len() > MAX_ENTRY_BYTES || text.chars().any(char::is_control) {
         Err("not a user id: 1 to 256 bytes without control characters".into())
@@ -406,6 +460,9 @@ impl AdminArgs {
                 ResourceCommand::Location(args) => args.output.json,
                 ResourceCommand::Remove(args) => args.output.json,
             },
+            AdminCommand::Grant(args) => args.output.json,
+            AdminCommand::Revoke(args) => args.output.json,
+            AdminCommand::Grants(args) => args.output.json,
         }
     }
 }
@@ -433,6 +490,9 @@ pub async fn admin(args: &AdminArgs) -> Result<Done, Ending> {
             ResourceCommand::Location(args) => location(args).await,
             ResourceCommand::Remove(args) => remove(args).await,
         },
+        AdminCommand::Grant(args) => grant(args).await,
+        AdminCommand::Revoke(args) => revoke(args).await,
+        AdminCommand::Grants(args) => grants(args).await,
     }
 }
 
@@ -1328,7 +1388,7 @@ async fn register(args: &RegisterArgs) -> Result<Done, Ending> {
     say_warnings(&mut words, &answer);
     say!(
         words,
-        "No Group has access until a Platform administrator gives a Grant, on the API at /v1/resources/{}/grants.",
+        "No Group has access until a Platform administrator gives a Grant: vibe admin grant {} --group <group> --access <level>.",
         text(&answer, "name")
     );
     Ok(Done {
@@ -1608,4 +1668,203 @@ async fn remove(args: &RemoveArgs) -> Result<Done, Ending> {
         json: answer,
         text: words,
     })
+}
+
+/// The day of an RFC 3339 time: its first ten bytes when it has them.
+fn day_of(time: &str) -> &str {
+    time.get(..10).unwrap_or(time)
+}
+
+/// `vibe admin grant <resource> --group <group> --access <level>`.
+async fn grant(args: &GrantArgs) -> Result<Done, Ending> {
+    if crate::resources::level_of(&args.access).is_none() {
+        return Err(Ending::new(
+            2,
+            "usage",
+            "access is not one of structure, read and write: give one of those".to_owned(),
+        ));
+    }
+    let kept = signed_in()?;
+    let answer = send_signed_in(
+        &kept,
+        Method::POST,
+        &format!("/v1/resources/{}/grants", args.resource),
+        json!({ "group": args.group, "access": args.access }),
+    )
+    .await?;
+    let resource = text(&answer, "resource");
+    let group = text(&answer, "group");
+    let access = text(&answer, "access");
+    let was = answer.get("was").and_then(Value::as_str);
+    let changed = answer.get("changed").and_then(Value::as_bool) == Some(true);
+    let mut words = String::new();
+    match (changed, was) {
+        (true, Some(was)) => say!(
+            words,
+            "The Group {group} held {was} on {resource} and holds {access} from now on, in every Application."
+        ),
+        (true, None) => say!(
+            words,
+            "The Group {group} holds {access} on {resource} from now on, in every Application."
+        ),
+        _ => say!(
+            words,
+            "The Group {group} already held {access} on {resource}: nothing changed."
+        ),
+    }
+    Ok(Done {
+        json: answer,
+        text: words,
+    })
+}
+
+/// `vibe admin revoke <resource> --group <group>`.
+async fn revoke(args: &RevokeArgs) -> Result<Done, Ending> {
+    let kept = signed_in()?;
+    let answer = send_signed_in(
+        &kept,
+        Method::DELETE,
+        &format!(
+            "/v1/resources/{}/grants/{}",
+            args.resource,
+            query_value(&args.group)
+        ),
+        Value::Null,
+    )
+    .await?;
+    let resource = text(&answer, "resource");
+    let group = text(&answer, "group");
+    let changed = answer.get("changed").and_then(Value::as_bool) == Some(true);
+    let mut words = String::new();
+    if changed {
+        let was = text(&answer, "was");
+        say!(
+            words,
+            "The Group {group} no longer holds a Grant on {resource}: it held {was}. This holds from now on in every Application; vibe admin grant gives it again."
+        );
+    } else {
+        say!(
+            words,
+            "The Group {group} held none on {resource}: nothing changed."
+        );
+    }
+    Ok(Done {
+        json: answer,
+        text: words,
+    })
+}
+
+/// A Grant in words: who set it and when, or `not recorded` for one from
+/// before stage three.
+fn grant_line(words: &mut String, group: &Theirs, access: &Theirs, grant: &Value) {
+    let by = grant.get("granted_by").and_then(Value::as_str);
+    let at = grant.get("granted_at").and_then(Value::as_str);
+    match (by, at) {
+        (Some(by), Some(at)) => say!(
+            words,
+            "  {group}  {access}  set by {} on {}",
+            Theirs::from(by),
+            Theirs::from(day_of(at))
+        ),
+        _ => say!(words, "  {group}  {access}  not recorded"),
+    }
+}
+
+/// `vibe admin grants (--resource <name> | --group <group>)`.
+async fn grants(args: &GrantsArgs) -> Result<Done, Ending> {
+    let asked = match (&args.resource, &args.group) {
+        (Some(resource), None) => Ok(Either::Resource(resource)),
+        (None, Some(group)) => Ok(Either::Group(group)),
+        _ => Err(Ending::new(
+            2,
+            "usage",
+            "grants lists one Resource's or one Group's: give exactly one of --resource and --group"
+                .to_owned(),
+        )),
+    };
+    // What the tool checks itself comes before the sign-in is looked for.
+    let asked = asked?;
+    let kept = signed_in()?;
+    let mut words = String::new();
+    let answer = match asked {
+        Either::Resource(resource) => {
+            let answer = get_signed_in(&kept, &format!("/v1/resources/{resource}/grants")).await?;
+            let listed = answer
+                .get("grants")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            if listed.is_empty() {
+                say!(
+                    words,
+                    "No Group holds a Grant on {resource}: a Platform administrator gives one with vibe admin grant {resource} --group <group> --access <level>."
+                );
+            } else {
+                for grant in &listed {
+                    grant_line(
+                        &mut words,
+                        &text(grant, "group"),
+                        &text(grant, "access"),
+                        grant,
+                    );
+                }
+                let more = answer
+                    .get("grants_more")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                if more > 0 {
+                    say!(words, "  and {more} more");
+                }
+            }
+            answer
+        }
+        Either::Group(group) => {
+            let answer = get_signed_in(
+                &kept,
+                &format!("/v1/admin/grants?group={}", query_value(group)),
+            )
+            .await?;
+            let listed = answer
+                .get("grants")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            if listed.is_empty() {
+                say!(
+                    words,
+                    "The Group {} holds none: a Platform administrator gives one with vibe admin grant <resource> --group {} --access <level>.",
+                    Theirs::from(group),
+                    Theirs::from(group)
+                );
+            } else {
+                for grant in &listed {
+                    let resource = text(grant, "resource");
+                    let kind = text(grant, "kind");
+                    let access = text(grant, "access");
+                    let by = grant.get("granted_by").and_then(Value::as_str);
+                    let at = grant.get("granted_at").and_then(Value::as_str);
+                    match (by, at) {
+                        (Some(by), Some(at)) => say!(
+                            words,
+                            "  {resource} ({kind})  {access}  set by {} on {}",
+                            Theirs::from(by),
+                            Theirs::from(day_of(at))
+                        ),
+                        _ => say!(words, "  {resource} ({kind})  {access}  not recorded"),
+                    }
+                }
+            }
+            answer
+        }
+    };
+    Ok(Done {
+        json: answer,
+        text: words,
+    })
+}
+
+/// Which of `grants`' two lists was asked for.
+enum Either<'a> {
+    Resource(&'a str),
+    Group(&'a str),
 }

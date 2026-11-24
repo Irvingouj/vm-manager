@@ -644,8 +644,11 @@ fn register_in_words_says_it_is_registered_each_warning_and_that_no_group_has_ac
         run.describe()
     );
     assert!(
-        lower.contains("no group") && words.contains("/v1/resources/devops/grants"),
-        "expected that no Group has access until a Grant is given, with the API's path\n{}",
+        lower.contains("no group")
+            && words.contains("vibe admin grant devops")
+            && words.contains("--group")
+            && words.contains("--access"),
+        "expected that no Group has access until a Grant is given, with the command `vibe admin grant devops --group <group> --access <level>`\n{}",
         run.describe()
     );
     for secret in [careless.password(), careless.role.as_str(), db.name()] {

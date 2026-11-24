@@ -581,6 +581,27 @@ pub const STEPS: &[Step] = &[
         CREATE INDEX operation_log_host ON operation_log (host, id) WHERE host IS NOT NULL;
     ",
     },
+    Step {
+        number: 19,
+        name: "who set a Grant and when, and a Resource's Grants' revision",
+        sql: "
+        -- Who set each Grant last and when, in the platform database's time
+        -- (blackbox/CONTRACT.md, \"Resources and Grants in full: Grants in
+        -- full\"); both NULL for a Grant set before this step.
+        ALTER TABLE grants ADD COLUMN granted_by text;
+        ALTER TABLE grants ADD COLUMN granted_at timestamptz;
+        -- The highest revision of the Resource's Grants' writes, raised by
+        -- every write of them under the row's lock, a revoke included, from
+        -- the same sequence as the Grants' revisions (crate::resources): a
+        -- reading of the row is taken only when its counter is at least
+        -- every revision memory saw, so a revoke that removed the Grant
+        -- written last does not leave the Resource unknown.
+        ALTER TABLE resources ADD COLUMN grants_revision bigint NOT NULL DEFAULT 0;
+        UPDATE resources r
+           SET grants_revision = coalesce(
+               (SELECT max(g.revision) FROM grants g WHERE g.resource_id = r.id), 0);
+    ",
+    },
 ];
 
 /// The advisory lock every step's transaction takes first: "vm steps".

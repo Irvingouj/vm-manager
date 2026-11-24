@@ -338,3 +338,31 @@ fn an_administrator_is_405_on_the_methods_a_path_does_not_take() {
     let in_group = User::new("someone").in_groups(&["staff", ADMINISTRATORS]);
     send(&s.vm, Some(&in_group), "/v1/admin/resources", "GET", None).expect_status(200);
 }
+
+#[test]
+fn past_64_kib_is_413_for_everyone_on_the_administrators_listings_too() {
+    let s = world();
+    let over = " ".repeat(64 * 1024 + 1);
+    let at = " ".repeat(64 * 1024);
+    for path in [
+        "/v1/admin/resources".to_owned(),
+        format!("/v1/admin/resources/{RESOURCE}"),
+    ] {
+        for user in [alice(), administrator()] {
+            let answer = send(&s.vm, Some(&user), &path, "GET", Some(&over));
+            assert_api_error(&answer, 413, "too-large");
+        }
+        assert_api_error(
+            &send(&s.vm, Some(&alice()), &path, "GET", Some(&at)),
+            403,
+            "not-an-administrator",
+        );
+        let answer = send(&s.vm, Some(&administrator()), &path, "GET", Some(&at));
+        assert_ne!(
+            answer.status,
+            413,
+            "a body of exactly 64 KiB is not too large\n{}",
+            answer.describe()
+        );
+    }
+}

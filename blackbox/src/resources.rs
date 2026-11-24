@@ -583,3 +583,189 @@ pub fn location_body(directory: &str) -> Value {
 pub fn delete_resource(api: &crate::api::Api<'_>, name: &str) -> crate::http::Response {
     call(api, "DELETE", &format!("/v1/resources/{name}"), None)
 }
+
+// ---------------------------------------------------------------------------
+// Stage three: Grants in full (CONTRACT.md, "Resources and Grants in full:
+// Grants in full")
+// ---------------------------------------------------------------------------
+
+/// `text` as one path segment or one query value: every byte but letters,
+/// digits, `-`, `.`, `_` and `~` as `%XX` (so a `/` is `%2F`, a space `%20`
+/// and a plus `%2B`), as the tool encodes a Group.
+pub fn encode_segment(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for byte in text.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            out.push(char::from(byte));
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
+/// `DELETE /v1/resources/<resource>/grants/<group>`, the Group
+/// percent-encoded as a path segment, no body.
+pub fn revoke(api: &crate::api::Api<'_>, resource: &str, group: &str) -> crate::http::Response {
+    revoke_raw(api, resource, &encode_segment(group))
+}
+
+/// `DELETE /v1/resources/<resource>/grants/<segment>`, the segment as
+/// given, no body.
+pub fn revoke_raw(
+    api: &crate::api::Api<'_>,
+    resource: &str,
+    segment: &str,
+) -> crate::http::Response {
+    call(
+        api,
+        "DELETE",
+        &format!("/v1/resources/{resource}/grants/{segment}"),
+        None,
+    )
+}
+
+/// `GET /v1/admin/grants?group=<group>`, the Group percent-encoded.
+pub fn grants_of_group(api: &crate::api::Api<'_>, group: &str) -> crate::http::Response {
+    grants_of_group_query(api, &format!("?group={}", encode_segment(group)))
+}
+
+/// `GET /v1/admin/grants` with this query as given (`?group=sre`, or
+/// `""`).
+pub fn grants_of_group_query(api: &crate::api::Api<'_>, query: &str) -> crate::http::Response {
+    call(api, "GET", &format!("/v1/admin/grants{query}"), None)
+}
+
+/// The members of an object, sorted.
+pub fn member_names(value: &Value) -> Vec<String> {
+    let mut names: Vec<String> = value
+        .as_object()
+        .map(|o| o.keys().cloned().collect())
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
+/// A list of Grants as `GET /v1/resources/<name>/grants` answers them
+/// (`{ group, access, granted_by, granted_at }`), as the earlier stage's
+/// `{ group, access }`: fails unless each entry has exactly those four
+/// members.
+pub fn without_who_and_when(grants: &Value) -> Value {
+    let entries = grants
+        .as_array()
+        .unwrap_or_else(|| panic!("expected a list of Grants, got {grants}"));
+    Value::Array(
+        entries
+            .iter()
+            .map(|entry| {
+                assert_eq!(
+                    member_names(entry),
+                    ["access", "granted_at", "granted_by", "group"],
+                    "expected each Grant to say who set it and when, beside its Group and level, got {entry}"
+                );
+                json!({ "group": entry["group"], "access": entry["access"] })
+            })
+            .collect(),
+    )
+}
+
+/// The answer of `POST .../grants` as the earlier stage gave it
+/// (`{ resource, group, access }`): fails unless it also has `changed` and
+/// `was`, and takes them away.
+pub fn without_changed_and_was(answer: &Value) -> Value {
+    assert!(
+        answer.get("changed").is_some() && answer.get("was").is_some(),
+        "expected the answer of a Grant set to say `changed` and `was`, got {answer}"
+    );
+    json!({
+        "resource": answer["resource"],
+        "group": answer["group"],
+        "access": answer["access"],
+    })
+}
+
+/// Gives `count` Groups, `group0000` from number `from` on, `level` on
+/// `resource`, from a few connections at once, within a minute (the test
+/// fails otherwise: "the harness's own check").
+pub fn fill_grants(vm: &crate::vm::Vm, resource: &str, from: usize, count: usize, level: &str) {
+    const CONNECTIONS: usize = 8;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let failures: Vec<String> = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..CONNECTIONS)
+            .map(|_| {
+                scope.spawn(|| {
+                    let api = vm.api_as(&crate::scenario::administrator());
+                    loop {
+                        let n = next.fetch_add(1, Ordering::SeqCst);
+                        if n >= count {
+                            return None;
+                        }
+                        if Instant::now() >= deadline {
+                            return Some(format!(
+                                "the harness's own check: expected {count} Grants to be given within a minute, the time is out"
+                            ));
+                        }
+                        let group = format!("group{:04}", from + n);
+                        let answer = api.grant(resource, &group, level);
+                        if answer.status != 200 {
+                            return Some(format!(
+                                "expected `200` giving {group:?} {level:?} on {resource:?}, got\n{}",
+                                answer.describe()
+                            ));
+                        }
+                    }
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .filter_map(|w| {
+                w.join()
+                    .unwrap_or_else(|_| Some("a worker failed".to_owned()))
+            })
+            .collect()
+    });
+    if let Some(first) = failures.first() {
+        vm.fail(first);
+    }
+}
+
+/// Makes every Grant in the platform database one that an earlier program
+/// wrote: every column of `grants` that may be NULL is set to NULL (a Grant
+/// from before stage three has no one who set it and no time; the four
+/// columns an earlier program had are not nullable, so the columns that
+/// say who and when are the ones that are). The program serves Grants from
+/// memory: stop it and start it again on the same platform database to
+/// have it hold the rows.
+pub fn forget_who_and_when(vm: &crate::vm::Vm) {
+    let platform = crate::admin::platform_sql(vm);
+    let columns: Vec<String> = platform
+        .batch(
+            "SELECT column_name FROM information_schema.columns
+             WHERE table_name = 'grants'
+               AND table_schema NOT IN ('pg_catalog', 'information_schema')
+               AND is_nullable = 'YES'",
+        )
+        .into_iter()
+        .filter_map(|row| row.into_iter().next().flatten())
+        .collect();
+    assert!(
+        !columns.is_empty(),
+        "expected the platform database's table `grants` to have columns, that may be NULL, for who set a Grant and when (a Grant from before this stage has neither); it has none"
+    );
+    let set: Vec<String> = columns.iter().map(|c| format!("\"{c}\" = NULL")).collect();
+    platform.batch(&format!("UPDATE grants SET {}", set.join(", ")));
+}
+
+/// Fails unless `text` is an RFC 3339 time in UTC (`Z`, or `+00:00`).
+pub fn assert_utc_time(value: &Value, context: &str) {
+    let text = value
+        .as_str()
+        .unwrap_or_else(|| panic!("{context}: expected an RFC 3339 time as a string, got {value}"));
+    assert!(
+        crate::api::parse_rfc3339(text).is_some()
+            && (text.ends_with('Z') || text.ends_with("+00:00")),
+        "{context}: expected an RFC 3339 time in UTC, got {text:?}"
+    );
+}

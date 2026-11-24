@@ -163,7 +163,7 @@ fn grants(vm: &Vm, resource: &str) -> Value {
             answer.describe()
         ));
     }
-    answer.json()["grants"].clone()
+    blackbox::resources::without_who_and_when(&answer.json()["grants"])
 }
 
 /// `[{ group: CREW, access }]`.
@@ -367,7 +367,10 @@ fn a_grant_changed_whose_answer_is_lost_never_leaves_the_old_level_deciding() {
         "GET the Grants on the untouched Resource meanwhile",
     );
     assert_eq!(
-        (answer.status, answer.json()["grants"].clone()),
+        (
+            answer.status,
+            blackbox::resources::without_who_and_when(&answer.json()["grants"]),
+        ),
         (200, crew_holds("write")),
         "the untouched Resource's Grants are answered as ever meanwhile, got\n{}",
         answer.describe()

@@ -100,6 +100,8 @@ Each login's password is given in the environment: `VIBE_RESOURCE_READ_PASSWORD`
 
 A pull lists the tables the Resource's read login or write login holds a privilege on; a table neither reaches is not in the definition the Builder builds against. `vibe pull` says how many are hidden, and `vibe check` and `vibe deploy` fail to type-check code that uses one.
 
+A Group is given access with `vibe admin grant <resource> --group <group> --access <level>`, or on the Dashboard's page of the Resource. `vibe admin revoke` takes a Grant away at once in every Application. `vibe admin grants` lists who can reach what.
+
 ## 5. The setup credential
 
 ```sh

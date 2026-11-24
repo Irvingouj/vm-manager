@@ -265,7 +265,7 @@ fn only_an_administrator_may_write_or_read_grants_even_of_a_resource_that_does_n
     // Nothing was granted by those attempts.
     let grants = s.admin().list_grants("devops");
     grants.expect_status(200);
-    assert_eq!(grants.json(), json!({ "grants": [] }));
+    assert_eq!(grants.json(), json!({ "grants": [], "grants_more": 0 }));
     // For the administrator, a Resource that does not exist is not found.
     assert_api_error(
         &s.admin().grant("ghost", "readers", "read"),
@@ -285,8 +285,8 @@ fn grants_are_set_replaced_and_listed_by_group() {
     assert_json_content_type(&set);
     assert_eq!(
         set.json(),
-        json!({ "resource": "devops", "group": "readers", "access": "read" }),
-        "expected the Grant answered as {{ resource, group, access }}"
+        json!({ "resource": "devops", "group": "readers", "access": "read", "changed": true, "was": null }),
+        "expected the Grant answered as {{ resource, group, access, changed, was }}"
     );
     admin.grant("devops", "writers", "write").expect_status(200);
     admin
@@ -295,12 +295,17 @@ fn grants_are_set_replaced_and_listed_by_group() {
     let listed = admin.list_grants("devops");
     listed.expect_status(200);
     assert_eq!(
-        listed.json(),
-        json!({ "grants": [
+        blackbox::resources::member_names(&listed.json()),
+        ["grants", "grants_more"],
+        "expected the Grants and how many more"
+    );
+    assert_eq!(
+        blackbox::resources::without_who_and_when(&listed.json()["grants"]),
+        json!([
             { "group": "auditors", "access": "structure" },
             { "group": "readers", "access": "read" },
             { "group": "writers", "access": "write" },
-        ] }),
+        ]),
         "expected the Grants by Group"
     );
     // A later Grant for the same Group replaces the level.
@@ -308,16 +313,16 @@ fn grants_are_set_replaced_and_listed_by_group() {
     replaced.expect_status(200);
     assert_eq!(
         replaced.json(),
-        json!({ "resource": "devops", "group": "readers", "access": "structure" })
+        json!({ "resource": "devops", "group": "readers", "access": "structure", "changed": true, "was": "read" })
     );
     admin.grant("devops", "writers", "read").expect_status(200);
     assert_eq!(
-        admin.list_grants("devops").json(),
-        json!({ "grants": [
+        blackbox::resources::without_who_and_when(&admin.list_grants("devops").json()["grants"]),
+        json!([
             { "group": "auditors", "access": "structure" },
             { "group": "readers", "access": "structure" },
             { "group": "writers", "access": "read" },
-        ] }),
+        ]),
         "expected each Group once, at its latest level"
     );
 }
@@ -405,7 +410,7 @@ fn a_grant_needs_a_group_of_1_to_256_bytes_without_control_characters_and_a_know
     }
     assert_eq!(
         admin.list_grants("devops").json(),
-        json!({ "grants": [] }),
+        json!({ "grants": [], "grants_more": 0 }),
         "expected none of those to set a Grant"
     );
 }

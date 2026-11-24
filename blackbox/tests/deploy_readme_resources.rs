@@ -98,3 +98,50 @@ fn the_readme_still_says_what_the_key_seals_and_what_losing_it_means() {
         "expected deploy/README.md to say that losing the key means supplying every Resource's logins again"
     );
 }
+
+// Stage three ("Resources and Grants in full: What changes in earlier
+// sections").
+
+#[test]
+fn the_readme_says_a_group_is_given_access_with_vibe_admin_grant_or_on_the_dashboards_page_of_the_resource()
+ {
+    let text = readme();
+    // `vibe admin grant`, and not only `vibe admin grants`.
+    let names_grant = text
+        .match_indices("vibe admin grant")
+        .any(|(at, found)| text.as_bytes().get(at + found.len()) != Some(&b's'));
+    assert!(
+        names_grant,
+        "expected deploy/README.md to name `vibe admin grant` (not only `vibe admin grants`)"
+    );
+    let found = sentences_with(&text, &["vibe admin grant", "group", "dashboard"]);
+    assert!(
+        found
+            .iter()
+            .any(|s| s.contains("page") && s.contains("resource")),
+        "expected a sentence of deploy/README.md saying that a Group is given access with `vibe admin grant` or on the Dashboard's page of the Resource, got {found:?}"
+    );
+}
+
+#[test]
+fn the_readme_says_vibe_admin_revoke_takes_access_away_at_once_in_every_application() {
+    let text = readme();
+    let found = sentences_with(
+        &text,
+        &["vibe admin revoke", "at once", "every application"],
+    );
+    assert!(
+        !found.is_empty(),
+        "expected a sentence of deploy/README.md saying that `vibe admin revoke` takes access away at once in every Application"
+    );
+}
+
+#[test]
+fn the_readme_says_vibe_admin_grants_lists_who_can_reach_what() {
+    let text = readme();
+    let found = sentences_with(&text, &["vibe admin grants", "who can reach"]);
+    assert!(
+        !found.is_empty(),
+        "expected a sentence of deploy/README.md saying that `vibe admin grants` lists who can reach what"
+    );
+}

@@ -204,6 +204,9 @@ enum Route<'a> {
     Resource(&'a str),
     /// `/v1/resources/<name>/grants`
     Grants(&'a str),
+    /// `/v1/resources/<name>/grants/<group>`, the Group as it was written
+    /// in the path (percent-encoded), not decoded yet.
+    GrantRevoke(&'a str, &'a str),
     /// `/v1/resources/<name>/structure`
     Structure(&'a str),
     /// `/v1/resources/<name>/connection`
@@ -214,6 +217,8 @@ enum Route<'a> {
     AdminResources,
     /// `/v1/admin/resources/<name>`
     AdminResource(&'a str),
+    /// `/v1/admin/grants`
+    AdminGrants,
     /// `/v1/outbound-hosts`
     OutboundHosts,
     /// `/v1/outbound-hosts/<entry>`, the entry as it was written in the
@@ -244,10 +249,12 @@ impl Route<'_> {
             // User, and `PATCH` and `DELETE` are the administrators'.
             Self::Resource(_) => matches!(*method, Method::PATCH | Method::DELETE),
             Self::Grants(_)
+            | Self::GrantRevoke(..)
             | Self::Connection(_)
             | Self::Location(_)
             | Self::AdminResources
             | Self::AdminResource(_)
+            | Self::AdminGrants
             | Self::OperationLog
             | Self::Oidc
             | Self::Disable(..)
@@ -282,11 +289,13 @@ impl<'a> Route<'a> {
             ["resources"] => Some(Self::Resources),
             ["resources", name] => Some(Self::Resource(name)),
             ["resources", name, "grants"] => Some(Self::Grants(name)),
+            ["resources", name, "grants", group] => Some(Self::GrantRevoke(name, group)),
             ["resources", name, "structure"] => Some(Self::Structure(name)),
             ["resources", name, "connection"] => Some(Self::Connection(name)),
             ["resources", name, "location"] => Some(Self::Location(name)),
             ["admin", "resources"] => Some(Self::AdminResources),
             ["admin", "resources", name] => Some(Self::AdminResource(name)),
+            ["admin", "grants"] => Some(Self::AdminGrants),
             ["outbound-hosts"] => Some(Self::OutboundHosts),
             ["outbound-hosts", entry] => Some(Self::OutboundEntry(entry)),
             ["operation-log"] => Some(Self::OperationLog),
@@ -638,7 +647,7 @@ fn read_grant(body: &[u8]) -> Result<(String, authz::AccessLevel), String> {
     let object = Object::read(body)?;
     let group: String = object.required("group")?;
     let access: String = object.required("access")?;
-    if group.is_empty() || group.len() > 256 || group.chars().any(char::is_control) {
+    if !resources::is_group(&group) {
         return Err("group is not 1 to 256 bytes without control characters".into());
     }
     let level = level_of(&access)
@@ -1049,6 +1058,18 @@ struct RegisteredView<'a> {
 /// The most Grants a Resource's administrator view shows.
 const MAX_GRANTS_SHOWN: usize = 200;
 
+/// The most Grants `GET /v1/resources/<name>/grants` answers.
+const MAX_GRANTS_LISTED: usize = resources::MAX_GRANTS;
+
+/// `409 too-many`: a 1,001st Grant for a Group that held none.
+fn too_many_grants() -> Answer {
+    Answer::error(
+        StatusCode::CONFLICT,
+        "too-many",
+        "the Resource holds the 1,000 Grants it may hold: revoke one that is no longer needed before giving another",
+    )
+}
+
 /// The most one page of `GET /v1/admin/resources` may hold.
 const MAX_ADMIN_LIST_BYTES: usize = 4 * 1024 * 1024;
 
@@ -1301,6 +1322,8 @@ struct AdminLocation {
 struct AdminGrant {
     group: String,
     access: &'static str,
+    granted_by: Option<String>,
+    granted_at: Option<String>,
 }
 
 /// The answer of a replacement: the administrators' view and the warnings
@@ -1431,7 +1454,17 @@ impl Api {
         let signed_in = matches!(caller, Caller::User(..));
         let small = matches!(
             route,
-            Some(Route::Resources | Route::Resource(_) | Route::Connection(_) | Route::Location(_))
+            Some(
+                Route::Resources
+                    | Route::Resource(_)
+                    | Route::Connection(_)
+                    | Route::Location(_)
+                    | Route::Grants(_)
+                    | Route::GrantRevoke(..)
+                    | Route::AdminGrants
+                    | Route::AdminResources
+                    | Route::AdminResource(_)
+            )
         );
         let limit = if small || !signed_in {
             MAX_BODY_BYTES_NOT_SIGNED_IN
@@ -1465,7 +1498,7 @@ impl Api {
         };
         let Some(route) = route else {
             return Answer::not_found(
-                "the API has no such path: its paths are /v1/me, /v1/installation, /v1/tool-credentials, /v1/tool-credentials/current, /v1/tool-sign-ins, /v1/oidc, /v1/applications, /v1/applications/<name>, /v1/applications/<name>/versions, /v1/applications/<name>/versions/<number>, /v1/applications/<name>/go-back, /v1/applications/<name>/logs, /v1/applications/<name>/contributors, /v1/applications/<name>/sharing, /v1/applications/<name>/disable, /v1/applications/<name>/enable, /v1/admin/applications, /v1/admin/resources, /v1/admin/resources/<name>, /v1/resources, /v1/resources/<name>, /v1/resources/<name>/grants, /v1/resources/<name>/structure, /v1/resources/<name>/connection, /v1/outbound-hosts, /v1/outbound-hosts/<entry> and /v1/operation-log",
+                "the API has no such path: its paths are /v1/me, /v1/installation, /v1/tool-credentials, /v1/tool-credentials/current, /v1/tool-sign-ins, /v1/oidc, /v1/applications, /v1/applications/<name>, /v1/applications/<name>/versions, /v1/applications/<name>/versions/<number>, /v1/applications/<name>/go-back, /v1/applications/<name>/logs, /v1/applications/<name>/contributors, /v1/applications/<name>/sharing, /v1/applications/<name>/disable, /v1/applications/<name>/enable, /v1/admin/applications, /v1/admin/resources, /v1/admin/resources/<name>, /v1/resources, /v1/resources/<name>, /v1/resources/<name>/grants, /v1/resources/<name>/grants/<group>, /v1/admin/grants, /v1/resources/<name>/structure, /v1/resources/<name>/connection, /v1/outbound-hosts, /v1/outbound-hosts/<entry> and /v1/operation-log",
             );
         };
         match route {
@@ -1492,12 +1525,16 @@ impl Api {
             Route::Location(name) => self.location(user, method, name, &body).await,
             Route::AdminResources => Ok(self.admin_resources(method, query).await),
             Route::AdminResource(name) => self.admin_resource(method, name).await,
+            Route::AdminGrants => Ok(self.admin_grants(method, query).await),
             Route::OutboundHosts => Ok(self.outbound_hosts(method)),
             Route::OutboundEntry(entry) => Ok(self.outbound_entry(user, method, entry).await),
             Route::Me => Ok(self.me(user, method)),
             Route::ToolCredentials => Ok(self.make_credential(user, with, method, &body).await),
             Route::CurrentToolCredential => self.end_credential(with, method).await,
-            Route::Grants(name) => self.grants(method, name, &body).await,
+            Route::Grants(name) => self.grants(user, method, name, &body).await,
+            Route::GrantRevoke(name, group) => {
+                Ok(self.revoke_grant(user, method, name, group, &body).await)
+            }
             Route::Structure(name) => Ok(self.structure(user, request, method, name).await),
             Route::OperationLog => Ok(self.operation_log(method, query).await),
             Route::AdminApplications => Ok(self.every_application(method, query).await),
@@ -2547,7 +2584,7 @@ impl Api {
                 "another change of this Resource is running now: nothing was removed; try again shortly",
             ));
         };
-        if resource.grants().is_none() {
+        if !resource.grants_known() {
             match self
                 .resources
                 .read_back_locked(
@@ -2653,7 +2690,7 @@ impl Api {
                 "another change of this Resource is running now: nothing was changed; try again shortly",
             ));
         };
-        if resource.grants().is_none() {
+        if !resource.grants_known() {
             match self
                 .resources
                 .read_back_locked(
@@ -2755,7 +2792,7 @@ impl Api {
         // A replacement of a Resource the program is still finding out reads
         // its row back first, within the contract's 1 second; when it still
         // does not know, nothing is written and it is asked again.
-        if resource.grants().is_none() {
+        if !resource.grants_known() {
             match self
                 .resources
                 .read_back(
@@ -2891,7 +2928,7 @@ impl Api {
                 "another change of this Resource is running now: nothing was changed; try again shortly",
             ));
         };
-        if resource.grants().is_none() {
+        if !resource.grants_known() {
             // The logins were checked on what memory held before the
             // program found the Resource out: nothing is written, whichever
             // the reading found (a row gone is the write that finds no row).
@@ -3067,7 +3104,7 @@ impl Api {
                 "another change of this Resource is running now: nothing was changed; try again shortly",
             ));
         };
-        if resource.grants().is_none() {
+        if !resource.grants_known() {
             match self
                 .resources
                 .read_back_locked(
@@ -3382,9 +3419,11 @@ impl Api {
         });
         let grants = grants
             .into_iter()
-            .map(|(group, level)| AdminGrant {
-                group,
-                access: resources::level_name(level),
+            .map(|entry| AdminGrant {
+                group: entry.group,
+                access: resources::level_name(entry.level),
+                granted_by: entry.granted_by.map(|who| who.to_string()),
+                granted_at: entry.granted_at.map(|when| when.to_string()),
             })
             .collect();
         Some(AdminResourceView {
@@ -3403,7 +3442,13 @@ impl Api {
             grants_more,
         })
     }
-    async fn grants(&self, method: &Method, name: &str, body: &[u8]) -> Result<Answer, DbError> {
+    async fn grants(
+        &self,
+        user: &User,
+        method: &Method,
+        name: &str,
+        body: &[u8],
+    ) -> Result<Answer, DbError> {
         let Some(resource) = self.resources.find(name).await? else {
             return Ok(no_resource());
         };
@@ -3420,17 +3465,20 @@ impl Api {
                 resources::ReadBack::Removed => return Ok(no_resource()),
                 resources::ReadBack::Unknown => return Ok(grants_unknown(name)),
             }
-            let Some(grants) = resource.grants() else {
+            let Some((grants, grants_more)) = resource.grants_page(MAX_GRANTS_LISTED) else {
                 return Ok(grants_unknown(name));
             };
             let view = GrantsView {
                 grants: grants
                     .iter()
-                    .map(|(group, level)| GrantView {
-                        group,
-                        access: resources::level_name(*level),
+                    .map(|entry| GrantView {
+                        group: &entry.group,
+                        access: resources::level_name(entry.level),
+                        granted_by: entry.granted_by.as_deref(),
+                        granted_at: entry.granted_at.as_deref(),
                     })
                     .collect(),
+                grants_more,
             };
             return Ok(Answer::json(StatusCode::OK, &view));
         }
@@ -3447,29 +3495,209 @@ impl Api {
                 GRANT_FORM,
             ));
         }
-        let granted =
-            match tokio::time::timeout(WRITE_ROW_WAIT, self.resources.grant(name, &group, level))
+        // A write of a Grant is a write of the Resource: the turn first,
+        // then the check that the program knows it, read back under the
+        // turn, and `503` when it still does not (blackbox/CONTRACT.md, "A
+        // write whose answer is lost").
+        let Some(_turn) = resource.writing(WRITE_TURN_WAIT).await else {
+            return Ok(Answer::error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "unavailable",
+                "another change of this Resource is running now: nothing was changed; try again shortly",
+            ));
+        };
+        if !resource.grants_known() {
+            match self
+                .resources
+                .read_back_locked(
+                    &resource,
+                    tokio::time::Instant::now() + resources::READ_BACK_WAIT,
+                )
                 .await
             {
-                Ok(granted) => granted?,
-                Err(_) => {
-                    return Ok(Answer::unavailable(&DbError::timed_out(
-                        "the write of the Grant",
-                        WRITE_ROW_WAIT,
-                    )));
-                }
-            };
+                resources::ReadBack::Known => {}
+                resources::ReadBack::Removed => return Ok(no_resource()),
+                resources::ReadBack::Unknown => return Ok(grants_unknown(&resource.name)),
+            }
+        }
+        let granted = match tokio::time::timeout(
+            WRITE_ROW_WAIT,
+            self.resources
+                .set_grant(&resource, &group, level, Some(&user.id)),
+        )
+        .await
+        {
+            Ok(granted) => granted?,
+            Err(_) => {
+                return Ok(Answer::unavailable(&DbError::timed_out(
+                    "the write of the Grant",
+                    WRITE_ROW_WAIT,
+                )));
+            }
+        };
         Ok(match granted {
-            GrantWritten::Written => Answer::json(
+            GrantWritten::Written(change) => Answer::json(
                 StatusCode::OK,
                 &GrantSet {
                     resource: &resource.name,
                     group: &group,
                     access: resources::level_name(level),
+                    changed: change.changed,
+                    was: change.was.map(resources::level_name),
                 },
             ),
+            GrantWritten::TooMany => too_many_grants(),
             GrantWritten::NoSuchResource => no_resource(),
+            GrantWritten::Unknown => grants_unknown(&resource.name),
         })
+    }
+
+    /// `DELETE /v1/resources/<name>/grants/<group>`
+    /// (blackbox/CONTRACT.md, "Resources and Grants in full: Revoking a
+    /// Grant"): the Group decoded after the path is split (so a `%2F` is
+    /// one segment), `404` before it is looked at, then one transaction
+    /// under the Resource's write turn that answers what it held.
+    async fn revoke_grant(
+        &self,
+        user: &User,
+        method: &Method,
+        name: &str,
+        written: &str,
+        _body: &[u8],
+    ) -> Answer {
+        if *method != Method::DELETE {
+            return Answer::method_not_allowed(method, "DELETE");
+        }
+        let Some(resource) = (match self.resources.find(name).await {
+            Ok(found) => found,
+            Err(error) => return Answer::unavailable(&error),
+        }) else {
+            return no_resource();
+        };
+        let group = match percent_decoded(written) {
+            Some(group) if resources::is_group(&group) => group,
+            Some(_) => {
+                return Answer::error(
+                    StatusCode::BAD_REQUEST,
+                    "malformed",
+                    "the Group in the path is not 1 to 256 bytes of UTF-8 without a control character: send the Group percent-encoded as one path segment",
+                );
+            }
+            None => {
+                return Answer::error(
+                    StatusCode::BAD_REQUEST,
+                    "malformed",
+                    "the Group in the path is not percent-encoded UTF-8: send it percent-encoded as one path segment",
+                );
+            }
+        };
+        let Some(_turn) = resource.writing(WRITE_TURN_WAIT).await else {
+            return Answer::error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "unavailable",
+                "another change of this Resource is running now: nothing was changed; try again shortly",
+            );
+        };
+        if !resource.grants_known() {
+            match self
+                .resources
+                .read_back_locked(
+                    &resource,
+                    tokio::time::Instant::now() + resources::READ_BACK_WAIT,
+                )
+                .await
+            {
+                resources::ReadBack::Known => {}
+                resources::ReadBack::Removed => return no_resource(),
+                resources::ReadBack::Unknown => return grants_unknown(&resource.name),
+            }
+        }
+        let revoked = match tokio::time::timeout(
+            WRITE_ROW_WAIT,
+            self.resources
+                .revoke_grant(&resource, &group, Some(&user.id)),
+        )
+        .await
+        {
+            Ok(revoked) => revoked,
+            Err(_) => {
+                return Answer::unavailable(&DbError::timed_out(
+                    "the revoke of the Grant",
+                    WRITE_ROW_WAIT,
+                ));
+            }
+        };
+        match revoked {
+            Ok(GrantWritten::Written(change)) => Answer::json(
+                StatusCode::OK,
+                &GrantRevoked {
+                    resource: &resource.name,
+                    group: &group,
+                    changed: change.changed,
+                    was: change.was.map(resources::level_name),
+                },
+            ),
+            Ok(GrantWritten::TooMany) => too_many_grants(),
+            Ok(GrantWritten::NoSuchResource) => no_resource(),
+            Ok(GrantWritten::Unknown) => grants_unknown(&resource.name),
+            Err(error) => Answer::unavailable(&error),
+        }
+    }
+
+    /// `GET /v1/admin/grants?group=<group>` (blackbox/CONTRACT.md,
+    /// "Resources and Grants in full: The Grants of a Group"): every Grant
+    /// the Group holds, by Resource's name, from memory; a Resource whose
+    /// Grants are not known is read back, and `503` while it still is not.
+    async fn admin_grants(&self, method: &Method, query: Option<&str>) -> Answer {
+        if *method != Method::GET {
+            return Answer::method_not_allowed(method, "GET");
+        }
+        let named = match query_parameters(query, &["group"]) {
+            Ok(found) => found,
+            Err(_) => {
+                return Answer::error(
+                    StatusCode::BAD_REQUEST,
+                    "malformed",
+                    "?group is given twice or is not percent-encoded: send one Group, percent-encoded",
+                );
+            }
+        };
+        let Some(group) = named.get("group") else {
+            return Answer::error(
+                StatusCode::BAD_REQUEST,
+                "malformed",
+                "?group is missing: give one Group, percent-encoded",
+            );
+        };
+        if !resources::is_group(group) {
+            return Answer::error(
+                StatusCode::BAD_REQUEST,
+                "malformed",
+                "?group is not 1 to 256 bytes of UTF-8 without a control character: give one Group",
+            );
+        }
+        let deadline = tokio::time::Instant::now() + resources::READ_BACK_WAIT;
+        let mut grants = Vec::new();
+        for resource in self.resources.list() {
+            match self.resources.read_back(&resource, deadline).await {
+                resources::ReadBack::Known => {}
+                resources::ReadBack::Removed => continue,
+                resources::ReadBack::Unknown => return grants_unknown(&resource.name),
+            }
+            let Some(entry) = resource.grant_named(group) else {
+                return grants_unknown(&resource.name);
+            };
+            if let Some(entry) = entry {
+                grants.push(GroupGrantView {
+                    resource: resource.name.clone(),
+                    kind: resource.kind.name(),
+                    access: resources::level_name(entry.level),
+                    granted_by: entry.granted_by.map(|who| who.to_string()),
+                    granted_at: entry.granted_at.map(|when| when.to_string()),
+                });
+            }
+        }
+        Answer::json(StatusCode::OK, &GroupGrantsView { group, grants })
     }
 
     /// `GET /v1/resources/<name>/structure` (blackbox/CONTRACT.md, "Pulling
@@ -4397,11 +4625,14 @@ struct ListedApplicationsView<'a> {
 struct GrantView<'a> {
     group: &'a str,
     access: &'static str,
+    granted_by: Option<&'a str>,
+    granted_at: Option<&'a str>,
 }
 
 #[derive(Serialize)]
 struct GrantsView<'a> {
     grants: Vec<GrantView<'a>>,
+    grants_more: usize,
 }
 
 #[derive(Serialize)]
@@ -4409,6 +4640,32 @@ struct GrantSet<'a> {
     resource: &'a str,
     group: &'a str,
     access: &'static str,
+    changed: bool,
+    was: Option<&'static str>,
+}
+
+#[derive(Serialize)]
+struct GrantRevoked<'a> {
+    resource: &'a str,
+    group: &'a str,
+    changed: bool,
+    was: Option<&'static str>,
+}
+
+/// One Grant in `GET /v1/admin/grants`.
+#[derive(Serialize)]
+struct GroupGrantView {
+    resource: String,
+    kind: &'static str,
+    access: &'static str,
+    granted_by: Option<String>,
+    granted_at: Option<String>,
+}
+
+#[derive(Serialize)]
+struct GroupGrantsView<'a> {
+    group: &'a str,
+    grants: Vec<GroupGrantView>,
 }
 
 /// `GET /v1/resources/<name>/structure`.

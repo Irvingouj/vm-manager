@@ -18,7 +18,12 @@
 //! turns, and each takes its revision (from one sequence) under that lock,
 //! so a Resource's revisions grow in the order its writes commit. Memory
 //! keeps the higher revision of each Group's Grant, so two writes leave
-//! memory as the database whatever order they report back in.
+//! memory as the database whatever order they report back in. Every write
+//! of a Resource's Grants, a revoke included, also raises the Resource's
+//! counter (`resources.grants_revision`) from the same sequence under that
+//! lock, and memory keeps the latest: a reading of the row is ordered by
+//! the counter, not by the Grants it finds, so a revoke that removed the
+//! Grant written last does not leave the Resource unknown.
 //!
 //! A write of a Grant whose answer is lost may still be made after that
 //! answer (its commit on its way): its COMMIT is sent only once the row's
@@ -32,9 +37,9 @@
 //! while the write is on its way this fails at once), then the Grants read
 //! in a second statement, whose snapshot is after the lock. The API's paths
 //! that show Grants try the same, and are `503` while it fails. A read-back
-//! begun before a forgetting (`epoch`) or that misses a revision reported
-//! since (`seen`) is not taken. At a start, Resources whose row a write
-//! holds are skipped and their Grants held as not known.
+//! begun before a forgetting (`epoch`) or whose row's counter is below a
+//! revision reported since (`seen`) is not taken. At a start, Resources
+//! whose row a write holds are skipped and their Grants held as not known.
 //!
 //! A Resource registered whose answer is lost may be registered after
 //! that answer: nothing is kept of it. An API request that names a Resource
@@ -421,34 +426,58 @@ struct Unserved {
 /// again while it lasts.
 const MENTION_EVERY: Duration = Duration::from_secs(60);
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct Granted {
     level: AccessLevel,
     revision: i64,
+    /// The Platform administrator whose write last changed it, and when
+    /// (blackbox/CONTRACT.md, "Resources and Grants in full: Grants in
+    /// full"); `None` for a Grant from before that stage.
+    granted_by: Option<Arc<str>>,
+    granted_at: Option<Arc<str>>,
+}
+
+/// One Grant as the API shows it: its Group, level, who set it last and
+/// when.
+#[derive(Clone, Debug)]
+pub struct GrantEntry {
+    pub group: String,
+    pub level: AccessLevel,
+    pub granted_by: Option<Arc<str>>,
+    pub granted_at: Option<Arc<str>>,
+}
+
+impl GrantEntry {
+    fn of(group: &str, granted: &Granted) -> Self {
+        Self {
+            group: group.to_owned(),
+            level: granted.level,
+            granted_by: granted.granted_by.as_ref().map(Arc::clone),
+            granted_at: granted.granted_at.as_ref().map(Arc::clone),
+        }
+    }
 }
 
 /// What memory holds of a Resource's Grants.
 #[derive(Debug)]
 enum Grants {
-    /// By Group.
-    Known(BTreeMap<String, Granted>),
+    /// By Group, and the Resource's counter after the last write of them
+    /// memory saw: the row's `grants_revision`, raised by every write of
+    /// its Grants, a revoke included.
+    Known {
+        grants: BTreeMap<String, Granted>,
+        revision: i64,
+    },
     /// Forgotten: a write of a Grant whose answer was lost may still land.
-    /// `seen` is the highest revision memory held or a write reported
-    /// since; `epoch` tells a read-back begun before this forgetting from
-    /// one begun after.
+    /// `seen` is the highest revision of the Resource's counter memory
+    /// held or a write reported since; `epoch` tells a read-back begun
+    /// before this forgetting from one begun after.
     Unknown { seen: i64, epoch: u64 },
     /// Taken out of memory ([`Resources::unregister`]): no Grant, and
     /// final. Nothing forgets it, makes it known or installs into it, so a
     /// write or a read-back that still holds it cannot bring it back into
     /// [`Resources::unknown`].
     LetGo,
-}
-
-impl Grants {
-    /// The highest revision of `grants`, 0 for none.
-    fn newest(grants: &BTreeMap<String, Granted>) -> i64 {
-        grants.values().map(|g| g.revision).max().unwrap_or(0)
-    }
 }
 
 /// A registered Resource. Its public face is what every signed-in User may
@@ -818,7 +847,7 @@ impl Resource {
     pub fn with_grants<T>(&self, decide: impl FnOnce(&[authz::Grant<'_>]) -> T) -> Option<T> {
         let grants = self.grants.read().unwrap_or_else(PoisonError::into_inner);
         let grants = match &*grants {
-            Grants::Known(grants) => grants,
+            Grants::Known { grants, .. } => grants,
             Grants::LetGo => return Some(decide(&[])),
             Grants::Unknown { .. } => return None,
         };
@@ -836,20 +865,19 @@ impl Resource {
     pub fn grants_known(&self) -> bool {
         matches!(
             *self.grants.read().unwrap_or_else(PoisonError::into_inner),
-            Grants::Known(_) | Grants::LetGo
+            Grants::Known { .. } | Grants::LetGo
         )
     }
 
     /// At most `limit` Grants, by Group in byte order, and how many more;
     /// only that many are copied. `None` while memory does not know them.
-    pub fn grants_page(&self, limit: usize) -> Option<(Vec<(String, AccessLevel)>, usize)> {
+    pub fn grants_page(&self, limit: usize) -> Option<(Vec<GrantEntry>, usize)> {
         let grants = self.grants.read().unwrap_or_else(PoisonError::into_inner);
         match &*grants {
-            Grants::Known(grants) => {
-                let mut page: Vec<(String, AccessLevel)> =
-                    Vec::with_capacity(limit.min(grants.len()));
+            Grants::Known { grants, .. } => {
+                let mut page: Vec<GrantEntry> = Vec::with_capacity(limit.min(grants.len()));
                 for (group, granted) in grants.iter().take(limit) {
-                    page.push((group.clone(), granted.level));
+                    page.push(GrantEntry::of(group, granted));
                 }
                 let more = grants.len().saturating_sub(page.len());
                 Some((page, more))
@@ -859,16 +887,15 @@ impl Resource {
         }
     }
 
-    /// Each Group's Access level, by Group; `None` while memory does not
-    /// know them.
-    pub fn grants(&self) -> Option<Vec<(String, AccessLevel)>> {
+    /// Each Grant, by Group; `None` while memory does not know them.
+    pub fn grants(&self) -> Option<Vec<GrantEntry>> {
         // Copied out so that the lock is not held while the answer is
         // written.
         match &*self.grants.read().unwrap_or_else(PoisonError::into_inner) {
-            Grants::Known(grants) => Some(
+            Grants::Known { grants, .. } => Some(
                 grants
                     .iter()
-                    .map(|(group, granted)| (group.clone(), granted.level))
+                    .map(|(g, granted)| GrantEntry::of(g, granted))
                     .collect(),
             ),
             Grants::LetGo => Some(Vec::new()),
@@ -876,21 +903,68 @@ impl Resource {
         }
     }
 
+    /// The Grant `group` holds, if any; `None` while memory does not know
+    /// them.
+    pub fn grant_named(&self, group: &str) -> Option<Option<GrantEntry>> {
+        match &*self.grants.read().unwrap_or_else(PoisonError::into_inner) {
+            Grants::Known { grants, .. } => Some(
+                grants
+                    .get(group)
+                    .map(|granted| GrantEntry::of(group, granted)),
+            ),
+            Grants::LetGo => Some(None),
+            Grants::Unknown { .. } => None,
+        }
+    }
+
     /// Takes what a write committed: `level` for `group` unless memory
-    /// already has a later write; over forgotten Grants it only raises
-    /// `seen`, since a lost write may have gone further.
-    fn install(&self, group: &str, granted: Granted) {
+    /// already has a later revision for it, and the Resource's counter
+    /// `revision`; over forgotten Grants it only raises `seen`, since a
+    /// lost write may have gone further.
+    fn install(&self, group: &str, granted: Granted, revision: i64) {
         let mut grants = self.grants.write().unwrap_or_else(PoisonError::into_inner);
         match &mut *grants {
-            Grants::Known(grants) => match grants.get_mut(group) {
-                Some(current) if current.revision >= granted.revision => {}
-                Some(current) => *current = granted,
-                None => {
-                    grants.insert(group.to_owned(), granted);
+            Grants::Known {
+                grants,
+                revision: known,
+            } => {
+                match grants.get_mut(group) {
+                    Some(current) if current.revision >= granted.revision => {}
+                    Some(current) => *current = granted,
+                    None => {
+                        grants.insert(group.to_owned(), granted);
+                    }
                 }
-            },
-            Grants::Unknown { seen, .. } => *seen = (*seen).max(granted.revision),
+                *known = (*known).max(revision);
+            }
+            Grants::Unknown { seen, .. } => *seen = (*seen).max(revision),
             Grants::LetGo => {}
+        }
+    }
+
+    /// Takes what a revoke committed: `group` is gone, and the Resource's
+    /// counter is `revision`; over forgotten Grants it only raises `seen`.
+    fn uninstall(&self, group: &str, revision: i64) {
+        let mut grants = self.grants.write().unwrap_or_else(PoisonError::into_inner);
+        match &mut *grants {
+            Grants::Known {
+                grants,
+                revision: known,
+            } => {
+                grants.remove(group);
+                *known = (*known).max(revision);
+            }
+            Grants::Unknown { seen, .. } => *seen = (*seen).max(revision),
+            Grants::LetGo => {}
+        }
+    }
+
+    /// The Resource's counter as memory last saw it, 0 when it knows none.
+    fn known_revision(&self) -> i64 {
+        match &*self.grants.read().unwrap_or_else(PoisonError::into_inner) {
+            Grants::Known { revision, .. } => *revision,
+            Grants::Unknown { seen, .. } => *seen,
+            Grants::LetGo => 0,
         }
     }
 
@@ -904,9 +978,9 @@ impl Resource {
     fn forget(&self, epoch: u64, unknown: &AtomicUsize) {
         let mut grants = self.grants.write().unwrap_or_else(PoisonError::into_inner);
         let seen = match &*grants {
-            Grants::Known(known) => {
+            Grants::Known { revision, .. } => {
                 unknown.fetch_add(1, Ordering::SeqCst);
-                Grants::newest(known)
+                *revision
             }
             Grants::Unknown { seen, .. } => *seen,
             Grants::LetGo => return,
@@ -928,28 +1002,32 @@ impl Resource {
     /// Grants.
     fn forgotten_at(&self) -> Option<u64> {
         match &*self.grants.read().unwrap_or_else(PoisonError::into_inner) {
-            Grants::Known(_) | Grants::LetGo => None,
+            Grants::Known { .. } | Grants::LetGo => None,
             Grants::Unknown { epoch, .. } => Some(*epoch),
         }
     }
 
     /// Takes what a read-back begun in the forgetting `epoch` read: only
-    /// if memory is still in that forgetting, and it holds every revision
-    /// reported since.
+    /// if memory is still in that forgetting, and the row's counter
+    /// `revision` is at least every revision reported since.
     /// `unknown` is one less when they become known, under the same lock.
     fn install_read(
         &self,
         read: BTreeMap<String, Granted>,
         texts: (String, String, String),
         reach: Option<ReachRead>,
+        revision: i64,
         began: u64,
         unknown: &AtomicUsize,
     ) -> bool {
         let mut grants = self.grants.write().unwrap_or_else(PoisonError::into_inner);
-        if !reading_wins(&grants, began, &read) {
+        if !reading_wins(&grants, began, revision) {
             return false;
         }
-        *grants = Grants::Known(read);
+        *grants = Grants::Known {
+            grants: read,
+            revision,
+        };
         unknown.fetch_sub(1, Ordering::SeqCst);
         // The row whole, taken together with its Grants: its texts, and its
         // logins (the pools of its opened connection, or why it is not
@@ -981,12 +1059,13 @@ impl Resource {
 }
 
 /// Whether a reading begun in the forgetting `began` is taken: only while
-/// memory is still in that forgetting, and it holds every revision reported
-/// since. The one place that decides which of two readings wins.
-fn reading_wins(grants: &Grants, began: u64, read: &BTreeMap<String, Granted>) -> bool {
+/// memory is still in that forgetting, and the row's counter is at least
+/// every revision reported since. The one place that decides which of two
+/// readings wins.
+fn reading_wins(grants: &Grants, began: u64, revision: i64) -> bool {
     match grants {
-        Grants::Unknown { seen, epoch } => *epoch == began && *seen <= Grants::newest(read),
-        Grants::Known(_) | Grants::LetGo => false,
+        Grants::Unknown { seen, epoch } => *epoch == began && *seen <= revision,
+        Grants::Known { .. } | Grants::LetGo => false,
     }
 }
 
@@ -1032,6 +1111,76 @@ impl Drop for Unsettled<'_> {
     fn drop(&mut self) {
         if self.armed {
             self.resources.write_failed(self.resource);
+        }
+    }
+}
+
+/// A write of a Grant whose outcome the program does not know: a future
+/// dropped while the statement was on its way (a timeout, the answer lost,
+/// the sender gone). It forgets what memory knows of the Resource and
+/// writes the record `grant-unsettled` with who asked, once, at once;
+/// nothing more is written when the program finds out
+/// (blackbox/CONTRACT.md, "A write whose answer is lost"). It only
+/// signals: it spawns nothing.
+struct GrantUnsettled<'a> {
+    resources: &'a Resources,
+    resource: &'a Resource,
+    group: &'a str,
+    /// `set` or `revoke`.
+    asked: &'static str,
+    access: Option<&'static str>,
+    by: Option<&'a str>,
+    armed: bool,
+}
+
+impl<'a> GrantUnsettled<'a> {
+    fn new(
+        resources: &'a Resources,
+        resource: &'a Resource,
+        group: &'a str,
+        asked: &'static str,
+        access: Option<&'static str>,
+        by: Option<&'a str>,
+    ) -> Self {
+        Self {
+            resources,
+            resource,
+            group,
+            asked,
+            access,
+            by,
+            // Armed by the write itself, once its transaction is open and
+            // just before its statement: a connection that fails before
+            // that sent nothing, and writes no record.
+            armed: false,
+        }
+    }
+
+    /// The statement is about to be sent: from here an answer lost is the
+    /// outcome not known.
+    fn arm(&mut self) {
+        self.armed = true;
+    }
+
+    fn settled(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for GrantUnsettled<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.resources.write_failed(self.resource);
+            log::record(
+                "grant-unsettled",
+                serde_json::json!({
+                    "resource": &self.resource.name,
+                    "group": self.group,
+                    "asked": self.asked,
+                    "access": self.access,
+                    "by": self.by,
+                }),
+            );
         }
     }
 }
@@ -1101,11 +1250,56 @@ enum Inserted {
     TooMany,
 }
 
+/// At most this many Grants are held on one Resource
+/// (blackbox/CONTRACT.md, "Resources and Grants in full: Grants in full").
+pub const MAX_GRANTS: usize = 1_000;
+
+/// The longest a write of a Grant waits for the Resource's write turn.
+const WRITE_TURN_WAIT: Duration = Duration::from_secs(10);
+
+/// What setting or revoking a Grant changed: `was` is the level the Group
+/// held just before, `None` for none.
+#[derive(Debug, PartialEq, Eq)]
+pub struct GrantChange {
+    pub changed: bool,
+    pub was: Option<AccessLevel>,
+}
+
 /// What writing a Grant came to.
 #[derive(Debug, PartialEq, Eq)]
 pub enum GrantWritten {
-    Written,
+    /// The write is certainly made (or certainly changed nothing).
+    Written(GrantChange),
+    /// A Grant for a Group that held none, on a Resource that holds
+    /// [`MAX_GRANTS`]: nothing was written.
+    TooMany,
     NoSuchResource,
+    /// The program is still finding the Resource out: nothing was sent.
+    Unknown,
+}
+
+/// What one write of a Grant's transaction came to.
+enum WrittenGrant {
+    Changed {
+        was: Option<AccessLevel>,
+        revision: i64,
+        granted_at: String,
+    },
+    Unchanged {
+        was: Option<AccessLevel>,
+    },
+    Revoked {
+        was: Option<AccessLevel>,
+        revision: i64,
+    },
+    TooMany,
+    NoSuchResource,
+}
+
+/// Whether `text` can be a Grant's Group: 1 to 256 bytes, no control
+/// character.
+pub fn is_group(text: &str) -> bool {
+    !text.is_empty() && text.len() <= 256 && !text.chars().any(char::is_control)
 }
 
 pub struct Resources {
@@ -1157,7 +1351,7 @@ pub fn read_backs() -> Arc<Semaphore> {
 const RESOURCE_COLUMNS: &str = concat!(
     "r.id, r.name, r.description, r.owner, r.contact, r.connection, r.created_by, ",
     rfc3339!("r.created_at"),
-    ", r.kind"
+    ", r.kind, r.grants_revision"
 );
 
 impl Resources {
@@ -1202,7 +1396,12 @@ impl Resources {
                     .map_err(DbError::from)?;
                 let grants = transaction
                     .query(
-                        "SELECT g.resource_id, g.group_name, g.access, g.revision FROM grants g",
+                        &format!(
+                            "SELECT g.resource_id, g.group_name, g.access, g.revision,
+                                    g.granted_by, {}
+                               FROM grants g",
+                            rfc3339!("g.granted_at")
+                        ),
                         &[],
                     )
                     .await
@@ -1251,7 +1450,10 @@ impl Resources {
                 *resource
                     .grants
                     .write()
-                    .unwrap_or_else(PoisonError::into_inner) = Grants::Known(grants);
+                    .unwrap_or_else(PoisonError::into_inner) = Grants::Known {
+                    grants,
+                    revision: resource.known_revision(),
+                };
             } else {
                 let epoch = this.forgotten.fetch_add(1, Ordering::Relaxed);
                 resource.forget(epoch, &this.unknown);
@@ -1331,6 +1533,7 @@ impl Resources {
                 (ResourceKind::Postgres, reach)
             }
         };
+        let grants_revision: i64 = get(row, 9)?;
         Ok(Resource {
             id,
             kind,
@@ -1343,7 +1546,10 @@ impl Resources {
             }),
             created_by: get(row, 6)?,
             created_at: get(row, 7)?,
-            grants: RwLock::new(Grants::Known(BTreeMap::new())),
+            grants: RwLock::new(Grants::Known {
+                grants: BTreeMap::new(),
+                revision: grants_revision,
+            }),
             writes: tokio::sync::Mutex::new(()),
             pulls: Semaphore::new(PULLS_AT_ONCE),
             removal: std::sync::Mutex::new(None),
@@ -1538,7 +1744,10 @@ impl Resources {
                 contact: Arc::from(new.contact),
             }),
             created_by: by.to_owned(),
-            grants: RwLock::new(Grants::Known(BTreeMap::new())),
+            grants: RwLock::new(Grants::Known {
+                grants: BTreeMap::new(),
+                revision: 0,
+            }),
             writes: tokio::sync::Mutex::new(()),
             pulls: Semaphore::new(PULLS_AT_ONCE),
             removal: std::sync::Mutex::new(None),
@@ -1871,11 +2080,11 @@ impl Resources {
             .is_some_and(|held| held.id == resource.id)
     }
 
-    /// Sets `group`'s Grant on `resource` to `level`, in the database and
-    /// then in memory, before this returns. One transaction: the
-    /// Resource's row lock first (`FOR NO KEY UPDATE`, held until the
-    /// commit is done), then the Grant and its revision. When its answer
-    /// is lost the Resource's Grants are forgotten at once.
+    /// Sets `group`'s Grant on `resource` to `level` for the local run,
+    /// whose Grants come from `vibe.dev.json` rather than a Platform
+    /// administrator's request. Takes the Resource's write turn first, as a
+    /// write of a Grant does; the installation's API takes it itself and
+    /// calls [`Resources::set_grant`].
     pub async fn grant(
         &self,
         resource: &str,
@@ -1885,56 +2094,306 @@ impl Resources {
         let Some(found) = self.get(resource) else {
             return Ok(GrantWritten::NoSuchResource);
         };
+        let Some(_turn) = found.writing(WRITE_TURN_WAIT).await else {
+            return Ok(GrantWritten::Unknown);
+        };
+        if !found.grants_known() {
+            match self
+                .read_back_locked(&found, tokio::time::Instant::now() + READ_BACK_WAIT)
+                .await
+            {
+                ReadBack::Known => {}
+                ReadBack::Removed => return Ok(GrantWritten::NoSuchResource),
+                ReadBack::Unknown => return Ok(GrantWritten::Unknown),
+            }
+        }
+        self.set_grant(&found, group, level, None).await
+    }
+
+    /// Sets `group`'s Grant on `resource` to `level` as `by`, in the
+    /// database and then in memory, before this returns. The caller holds
+    /// the Resource's write turn and knows its Grants (the API checks both,
+    /// as for every write of a Resource). One transaction: the Resource's
+    /// row lock first (`FOR NO KEY UPDATE`, held until the commit is done),
+    /// then the Grant read for `was`, its revision, who set it and when, and
+    /// the Resource's counter. When its answer is lost the Resource's Grants
+    /// are forgotten at once, and `grant-unsettled` says who asked.
+    pub async fn set_grant(
+        &self,
+        resource: &Resource,
+        group: &str,
+        level: AccessLevel,
+        by: Option<&str>,
+    ) -> Result<GrantWritten, DbError> {
         let access = level_name(level);
         // Armed before the statement is sent: a future given up, or an
-        // answer lost, forgets what memory knows of the Resource.
-        let mut unsettled = Unsettled::new(self, &found);
+        // answer lost, forgets what memory knows of the Resource and writes
+        // the record of who asked.
+        let mut unsettled = GrantUnsettled::new(self, resource, group, "set", Some(access), by);
         let written = self
             .database
             .pool()
             .run(async |client: &mut Client| {
                 let transaction = client.transaction().await.map_err(DbError::from)?;
+                // From the first statement on, an answer lost leaves the
+                // outcome unknown.
+                unsettled.arm();
                 let locked = transaction
                     .query_opt(
-                        "SELECT 1 FROM resources WHERE id = $1 AND name = $2 FOR NO KEY UPDATE",
-                        &[&found.id, &found.name],
+                        "SELECT grants_revision FROM resources
+                          WHERE id = $1 AND name = $2 FOR NO KEY UPDATE",
+                        &[&resource.id, &resource.name],
                     )
                     .await
                     .map_err(DbError::from)?;
                 if locked.is_none() {
-                    return Ok(None);
+                    return Ok(WrittenGrant::NoSuchResource);
                 }
+                let was: Option<String> = transaction
+                    .query_opt(
+                        "SELECT access FROM grants
+                          WHERE resource_id = $1 AND group_name = $2",
+                        &[&resource.id, &group],
+                    )
+                    .await
+                    .map_err(DbError::from)?
+                    .map(|row| row.try_get(0))
+                    .transpose()
+                    .map_err(DbError::from)?;
+                let was = match was {
+                    Some(text) => Some(level_of(&text).ok_or_else(|| {
+                        DbError::unexpected("a Grant of an unknown Access level")
+                    })?),
+                    None => None,
+                };
+                if was == Some(level) {
+                    // The same level again writes nothing: no row, no
+                    // counter, no record.
+                    transaction.commit().await.map_err(DbError::from)?;
+                    return Ok(WrittenGrant::Unchanged { was });
+                }
+                if was.is_none() {
+                    // Under the row's lock every write of this Resource's
+                    // Grants takes its turn, so the count is exact: no two
+                    // new Groups can both find room at 1,000.
+                    let count: i64 = transaction
+                        .query_one(
+                            "SELECT count(*) FROM grants WHERE resource_id = $1",
+                            &[&resource.id],
+                        )
+                        .await
+                        .and_then(|row| row.try_get(0))
+                        .map_err(DbError::from)?;
+                    if usize::try_from(count).unwrap_or(usize::MAX) >= MAX_GRANTS {
+                        transaction.commit().await.map_err(DbError::from)?;
+                        return Ok(WrittenGrant::TooMany);
+                    }
+                }
+                let revision: i64 = transaction
+                    .query_one("SELECT nextval('grant_revisions')", &[])
+                    .await
+                    .and_then(|row| row.try_get(0))
+                    .map_err(DbError::from)?;
                 let row = transaction
                     .query_one(
-                        "INSERT INTO grants (resource_id, group_name, access, revision)
-                         VALUES ($1, $2, $3, nextval('grant_revisions'))
-                         ON CONFLICT (resource_id, group_name) DO UPDATE
-                         SET access = EXCLUDED.access, revision = nextval('grant_revisions')
-                         RETURNING revision",
-                        &[&found.id, &group, &access],
+                        &format!(
+                            "INSERT INTO grants
+                                 (resource_id, group_name, access, revision, granted_by, granted_at)
+                             VALUES ($1, $2, $3, $4, $5, now())
+                             ON CONFLICT (resource_id, group_name) DO UPDATE
+                             SET access = EXCLUDED.access, revision = EXCLUDED.revision,
+                                 granted_by = EXCLUDED.granted_by,
+                                 granted_at = EXCLUDED.granted_at
+                             RETURNING {}",
+                            rfc3339!("granted_at")
+                        ),
+                        &[&resource.id, &group, &access, &revision, &by],
+                    )
+                    .await
+                    .map_err(DbError::from)?;
+                let granted_at: String = row.try_get(0).map_err(DbError::from)?;
+                transaction
+                    .execute(
+                        "UPDATE resources SET grants_revision = $2 WHERE id = $1",
+                        &[&resource.id, &revision],
                     )
                     .await
                     .map_err(DbError::from)?;
                 transaction.commit().await.map_err(DbError::from)?;
-                Ok(Some(row))
+                Ok(WrittenGrant::Changed {
+                    was,
+                    revision,
+                    granted_at,
+                })
             })
             .await;
         match written {
-            Ok(Some(row)) => {
-                let revision = get(&row, 0)?;
-                found.install(group, Granted { level, revision });
+            Ok(WrittenGrant::Changed {
+                was,
+                revision,
+                granted_at,
+            }) => {
+                // Certain from here: nothing may write `grant-unsettled`.
                 unsettled.settled();
-                Ok(GrantWritten::Written)
+                resource.install(
+                    group,
+                    Granted {
+                        level,
+                        revision,
+                        granted_by: by.map(Arc::from),
+                        granted_at: Some(Arc::from(granted_at)),
+                    },
+                    revision,
+                );
+                log::record(
+                    "grant-set",
+                    serde_json::json!({
+                        "resource": &resource.name,
+                        "group": group,
+                        "access": access,
+                        "was": was.map(level_name),
+                        "by": by,
+                    }),
+                );
+                Ok(GrantWritten::Written(GrantChange { changed: true, was }))
             }
-            Ok(None) => {
+            Ok(WrittenGrant::Unchanged { was }) => {
+                unsettled.settled();
+                Ok(GrantWritten::Written(GrantChange {
+                    changed: false,
+                    was,
+                }))
+            }
+            Ok(WrittenGrant::TooMany) => {
+                unsettled.settled();
+                Ok(GrantWritten::TooMany)
+            }
+            Ok(WrittenGrant::NoSuchResource) => {
                 // Certain: the row is not there. Memory lets it go, and the
                 // guard is disarmed (nothing is unknown).
-                self.forget_removed(&found);
                 unsettled.settled();
+                self.forget_removed(resource);
                 Ok(GrantWritten::NoSuchResource)
             }
+            Ok(WrittenGrant::Revoked { .. }) => Err(DbError::unexpected(
+                "a setting's answer is not what a revoke writes",
+            )),
             // Its guard forgets what memory knows: nothing is read now,
             // which could be earlier than a commit on its way.
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Revokes `group`'s Grant on `resource` as `by`, in the database and
+    /// then in memory. The caller holds the Resource's write turn and knows
+    /// its Grants. One transaction: the Resource's row lock first, then the
+    /// Grant read and deleted, the Resource's counter raised (a revoke
+    /// raises it too, so a reading is taken after the Grant written last is
+    /// gone), and the record when something changed.
+    pub async fn revoke_grant(
+        &self,
+        resource: &Resource,
+        group: &str,
+        by: Option<&str>,
+    ) -> Result<GrantWritten, DbError> {
+        let mut unsettled = GrantUnsettled::new(self, resource, group, "revoke", None, by);
+        let written = self
+            .database
+            .pool()
+            .run(async |client: &mut Client| {
+                let transaction = client.transaction().await.map_err(DbError::from)?;
+                // From the first statement on, an answer lost leaves the
+                // outcome unknown.
+                unsettled.arm();
+                let locked = transaction
+                    .query_opt(
+                        "SELECT grants_revision FROM resources
+                          WHERE id = $1 AND name = $2 FOR NO KEY UPDATE",
+                        &[&resource.id, &resource.name],
+                    )
+                    .await
+                    .map_err(DbError::from)?;
+                if locked.is_none() {
+                    return Ok(WrittenGrant::NoSuchResource);
+                }
+                let removed = transaction
+                    .query_opt(
+                        "DELETE FROM grants
+                          WHERE resource_id = $1 AND group_name = $2
+                          RETURNING access",
+                        &[&resource.id, &group],
+                    )
+                    .await
+                    .map_err(DbError::from)?;
+                let Some(row) = removed else {
+                    // A Group that held none: nothing written, no counter,
+                    // no record.
+                    transaction.commit().await.map_err(DbError::from)?;
+                    return Ok(WrittenGrant::Revoked {
+                        was: None,
+                        revision: 0,
+                    });
+                };
+                let text: String = row.try_get(0).map_err(DbError::from)?;
+                let was = level_of(&text)
+                    .ok_or_else(|| DbError::unexpected("a Grant of an unknown Access level"))?;
+                let revision: i64 = transaction
+                    .query_one("SELECT nextval('grant_revisions')", &[])
+                    .await
+                    .and_then(|row| row.try_get(0))
+                    .map_err(DbError::from)?;
+                transaction
+                    .execute(
+                        "UPDATE resources SET grants_revision = $2 WHERE id = $1",
+                        &[&resource.id, &revision],
+                    )
+                    .await
+                    .map_err(DbError::from)?;
+                transaction.commit().await.map_err(DbError::from)?;
+                Ok(WrittenGrant::Revoked {
+                    was: Some(was),
+                    revision,
+                })
+            })
+            .await;
+        match written {
+            Ok(WrittenGrant::Revoked { was, revision }) => {
+                unsettled.settled();
+                match was {
+                    Some(was) => {
+                        resource.uninstall(group, revision);
+                        log::record(
+                            "grant-revoked",
+                            serde_json::json!({
+                                "resource": &resource.name,
+                                "group": group,
+                                "was": level_name(was),
+                                "by": by,
+                            }),
+                        );
+                        Ok(GrantWritten::Written(GrantChange {
+                            changed: true,
+                            was: Some(was),
+                        }))
+                    }
+                    None => Ok(GrantWritten::Written(GrantChange {
+                        changed: false,
+                        was: None,
+                    })),
+                }
+            }
+            Ok(WrittenGrant::NoSuchResource) => {
+                unsettled.settled();
+                self.forget_removed(resource);
+                Ok(GrantWritten::NoSuchResource)
+            }
+            Ok(
+                WrittenGrant::Changed { .. }
+                | WrittenGrant::Unchanged { .. }
+                | WrittenGrant::TooMany,
+            ) => Err(DbError::unexpected(
+                "a revoke's answer is not what a revoke writes",
+            )),
             Err(error) => Err(error),
         }
     }
@@ -1976,7 +2435,11 @@ impl Resources {
                 let id: i64 = get(&found, 0)?;
                 let grants = transaction
                     .query(
-                        "SELECT group_name, access, revision FROM grants WHERE resource_id = $1",
+                        &format!(
+                            "SELECT group_name, access, revision, granted_by, {}
+                               FROM grants WHERE resource_id = $1",
+                            rfc3339!("granted_at")
+                        ),
                         &[&id],
                     )
                     .await
@@ -1997,10 +2460,14 @@ impl Resources {
                 .opening(tokio::time::Instant::now() + crate::storage::OPERATION_TIME)
                 .await;
         }
+        let revision = resource.known_revision();
         *resource
             .grants
             .write()
-            .unwrap_or_else(PoisonError::into_inner) = Grants::Known(grants_of(&grants)?);
+            .unwrap_or_else(PoisonError::into_inner) = Grants::Known {
+            grants: grants_of(&grants)?,
+            revision,
+        };
         let resource = Arc::new(resource);
         let held = Arc::clone(
             self.all
@@ -2105,8 +2572,14 @@ impl Resources {
                 resource.clear_removal();
                 let reach = self.reach_of(resource, &row);
                 let storage_changed = matches!(reach, Some(ReachRead::Storage(_)));
-                let installed =
-                    resource.install_read(row.grants, texts, reach, began, &self.unknown);
+                let installed = resource.install_read(
+                    row.grants,
+                    texts,
+                    reach,
+                    row.grants_revision,
+                    began,
+                    &self.unknown,
+                );
                 if installed {
                     if storage_changed && let Some(directory) = resource.storage() {
                         // The new place is opened now, as `find` opens a
@@ -2262,7 +2735,7 @@ impl Resources {
                     .map_err(DbError::from)?;
                 let found = transaction
                     .query_opt(
-                        "SELECT connection, description, owner, contact, kind
+                        "SELECT connection, description, owner, contact, kind, grants_revision
                            FROM resources WHERE id = $1 FOR SHARE NOWAIT",
                         &[&id],
                     )
@@ -2273,7 +2746,11 @@ impl Resources {
                 };
                 let rows = transaction
                     .query(
-                        "SELECT group_name, access, revision FROM grants WHERE resource_id = $1",
+                        &format!(
+                            "SELECT group_name, access, revision, granted_by, {}
+                               FROM grants WHERE resource_id = $1",
+                            rfc3339!("granted_at")
+                        ),
                         &[&id],
                     )
                     .await
@@ -2285,6 +2762,7 @@ impl Resources {
                     owner: found.try_get(2).map_err(DbError::from)?,
                     contact: found.try_get(3).map_err(DbError::from)?,
                     kind: found.try_get(4).map_err(DbError::from)?,
+                    grants_revision: found.try_get(5).map_err(DbError::from)?,
                     grants: grants_of(&rows)?,
                 }))
             })
@@ -2312,6 +2790,7 @@ struct StoredRow {
     owner: String,
     contact: String,
     kind: String,
+    grants_revision: i64,
     grants: BTreeMap<String, Granted>,
 }
 
@@ -2335,13 +2814,24 @@ fn grants_of(rows: &[Row]) -> Result<BTreeMap<String, Granted>, DbError> {
     Ok(grants)
 }
 
-/// A Grant read from a row: group, access and revision from column `at` on.
+/// A Grant read from a row: group, access, revision, who and when from
+/// column `at` on.
 fn granted_of(row: &Row, at: usize) -> Result<(&str, Granted), DbError> {
     let group: &str = get(row, at)?;
     let level = level_of(get(row, at + 1)?)
         .ok_or_else(|| DbError::unexpected("a Grant of an unknown Access level"))?;
     let revision = get(row, at + 2)?;
-    Ok((group, Granted { level, revision }))
+    let granted_by: Option<String> = get(row, at + 3)?;
+    let granted_at: Option<String> = get(row, at + 4)?;
+    Ok((
+        group,
+        Granted {
+            level,
+            revision,
+            granted_by: granted_by.map(Arc::from),
+            granted_at: granted_at.map(Arc::from),
+        },
+    ))
 }
 
 fn get<'a, T: FromSql<'a>>(row: &'a Row, index: usize) -> Result<T, DbError> {
@@ -2375,24 +2865,17 @@ mod tests {
 
     #[test]
     fn a_reading_is_taken_only_in_its_forgetting_and_with_every_revision_since() {
-        let read = |revision| {
-            let mut grants = BTreeMap::new();
-            grants.insert(
-                "sre".to_owned(),
-                Granted {
-                    level: AccessLevel::Read,
-                    revision,
-                },
-            );
-            grants
-        };
         let unknown = Grants::Unknown { seen: 3, epoch: 7 };
-        assert!(reading_wins(&unknown, 7, &read(3)));
-        assert!(reading_wins(&unknown, 7, &read(4)));
-        assert!(!reading_wins(&unknown, 7, &read(2)));
-        assert!(!reading_wins(&unknown, 8, &read(4)));
-        assert!(!reading_wins(&Grants::Known(BTreeMap::new()), 7, &read(4)));
-        assert!(!reading_wins(&Grants::LetGo, 7, &read(4)));
+        assert!(reading_wins(&unknown, 7, 3));
+        assert!(reading_wins(&unknown, 7, 4));
+        assert!(!reading_wins(&unknown, 7, 2));
+        assert!(!reading_wins(&unknown, 8, 4));
+        let known = Grants::Known {
+            grants: BTreeMap::new(),
+            revision: 9,
+        };
+        assert!(!reading_wins(&known, 7, 4));
+        assert!(!reading_wins(&Grants::LetGo, 7, 4));
     }
 
     #[test]

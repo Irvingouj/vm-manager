@@ -242,9 +242,9 @@ fn grant(at: &Installed, credential: &str, resource: &str, group: &str, access: 
         "expected `200` granting {group:?} {access:?} on {resource:?} over HTTPS\n{masked}"
     );
     assert_eq!(
-        answer.json(),
+        blackbox::resources::without_changed_and_was(&answer.json()),
         json!({ "resource": resource, "group": group, "access": access }),
-        "expected the answer of a Grant to be {{ resource, group, access }}\n{masked}"
+        "expected the answer of a Grant to be {{ resource, group, access, changed, was }}\n{masked}"
     );
 }
 

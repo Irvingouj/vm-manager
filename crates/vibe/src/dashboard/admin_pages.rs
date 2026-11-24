@@ -1194,9 +1194,9 @@ fn resource_card(out: &mut String, resource: &Resource) {
         );
     } else {
         out.push_str("<ul class=\"grants\" aria-label=\"Grants\">");
-        for (group, level) in &grants {
-            let group = escape(group);
-            let level = level_name(*level);
+        for entry in &grants {
+            let group = escape(&entry.group);
+            let level = level_name(entry.level);
             write!(
                 out,
                 "<li data-vm-grant=\"{group}\" data-vm-access=\"{level}\">{}<span class=\"g\">{group}</span> <span class=\"lv-pill\">{level}</span></li>",

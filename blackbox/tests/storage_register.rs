@@ -157,7 +157,7 @@ fn a_grant_on_storage_is_read_or_write_and_structure_is_malformed() {
         answer.expect_status(200);
         assert_eq!(
             answer.json(),
-            json!({ "resource": MARKETING, "group": "team", "access": access })
+            json!({ "resource": MARKETING, "group": "team", "access": access, "changed": true, "was": if access == "write" { json!("read") } else { Value::Null } })
         );
     }
     let refused = s.admin().grant(MARKETING, "others", "structure");
@@ -173,8 +173,8 @@ fn a_grant_on_storage_is_read_or_write_and_structure_is_malformed() {
     let grants = s.admin().list_grants(MARKETING);
     grants.expect_status(200);
     assert_eq!(
-        grants.json(),
-        json!({ "grants": [ { "group": "team", "access": "write" } ] }),
+        blackbox::resources::without_who_and_when(&grants.json()["grants"]),
+        json!([ { "group": "team", "access": "write" } ]),
         "expected the refused Grant not written, and the list as for a database"
     );
     // A User holds the highest level of their Groups' Grants.

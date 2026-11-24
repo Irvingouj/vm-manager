@@ -109,7 +109,7 @@ fn a_database_resource_is_listed_with_its_logins_grants_and_no_location() {
     );
     assert_eq!(devops["location"], Value::Null);
     assert_eq!(
-        devops["grants"],
+        blackbox::resources::without_who_and_when(&devops["grants"]),
         json!([
             { "group": "auditors", "access": "read" },
             { "group": "sre", "access": "structure" },
@@ -153,7 +153,7 @@ fn a_storage_resource_is_listed_with_its_location_and_no_logins() {
         "{storage}"
     );
     assert_eq!(
-        storage["grants"],
+        blackbox::resources::without_who_and_when(&storage["grants"]),
         json!([{ "group": "designers", "access": "write" }])
     );
     let database = &page["resources"][0];
@@ -371,7 +371,7 @@ fn a_resource_that_is_not_served_says_why_in_the_list() {
         assert_eq!(one["location"], Value::Null);
         assert_eq!(one["name"], DEVOPS);
         assert_eq!(
-            one["grants"],
+            blackbox::resources::without_who_and_when(&one["grants"]),
             json!([{ "group": READERS, "access": "read" }])
         );
         let listed = admin_resources(&s.admin(), "").json();
