@@ -73,7 +73,7 @@ pub async fn connect(
     target: &Target,
     private: &PrivateRanges,
     program: &Program,
-    application: &str,
+    application: &Arc<str>,
     tls: &Arc<ClientConfig>,
     overall: Instant,
 ) -> Result<TlsStream<TcpStream>, NotConnected> {

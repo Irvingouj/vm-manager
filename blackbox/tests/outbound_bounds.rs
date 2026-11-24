@@ -21,7 +21,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use blackbox::body::{BodyEnd, Checksum, Framing, MIB, Raw, memory_of, peak_rss_during};
-use blackbox::outbound::{APP, Origin, Outbound, Reply, bob, pattern_sha256};
+use blackbox::outbound::{APP, OPEN_LOOPBACK, Origin, Outbound, Reply, bob, pattern_sha256};
 use serde_json::Value;
 
 fn listed() -> (Outbound, Origin) {
@@ -137,50 +137,86 @@ fn up_to_64_calls_wait_their_turn_and_a_73rd_is_unavailable_at_once() {
 
 #[test]
 fn the_program_has_256_calls_and_one_that_finds_none_free_waits_5_seconds_then_is_unavailable() {
-    // About 25 seconds: 33 requests of 8 calls each, every answer held for
-    // 9 seconds; the 257th call waits 5 seconds for a place.
-    let (o, origin) = listed();
-    holding(&origin, Duration::from_secs(9));
-    let started = Instant::now();
-    let results: Vec<Vec<Value>> = thread::scope(|scope| {
-        let handles: Vec<_> = (0..33)
-            .map(|_| scope.spawn(|| many(&o, &origin, 8)))
-            .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
-    });
-    let all: Vec<&Value> = results.iter().flatten().collect();
-    assert_eq!(all.len(), 33 * 8);
-    let unavailable: Vec<&&Value> = all
-        .iter()
-        .filter(|r| r["rejected"]["failure"]["kind"] == "unavailable")
-        .collect();
-    assert!(
-        !unavailable.is_empty(),
-        "expected the calls past the program's 256 to be `unavailable`, got none in {:?}",
-        started.elapsed()
+    // About 20 seconds: four Applications of the same fixture each have 64
+    // calls under way (8 requests of 8 each, every answer held for 12
+    // seconds), the whole of an Application's share and 256 in the program;
+    // a fifth Application's call waits 5 seconds for a place.
+    let applications = ["outbound-2", "outbound-3", "outbound-4", "outbound-5"];
+    let o = Outbound::start_with(
+        &OPEN_LOOPBACK,
+        &[
+            (applications[0], "outbound.js"),
+            (applications[1], "outbound.js"),
+            (applications[2], "outbound.js"),
+            (applications[3], "outbound.js"),
+        ],
     );
-    for r in &unavailable {
-        let ms = r["ms"].as_u64().unwrap();
+    let origin = o.origin();
+    o.allow(&origin.host());
+    holding(&origin, Duration::from_secs(12));
+    let holding_apps = [APP, applications[0], applications[1], applications[2]];
+    let fifth = applications[3];
+    let url = origin.url("/hold");
+    let many_of = |application: &str, n: usize| -> Vec<Value> {
+        let response =
+            o.vm.request(application, &format!("/many?url={url}&n={n}"))
+                .as_user(&bob())
+                .timeout(Duration::from_secs(120))
+                .send();
+        assert_eq!(response.status, 200, "{}", response.describe());
+        response.json()["results"].as_array().unwrap().clone()
+    };
+    let (held, probe) = thread::scope(|scope| {
+        let handles: Vec<_> = holding_apps
+            .iter()
+            .flat_map(|application| std::iter::repeat_n(*application, 8))
+            .map(|application| scope.spawn(move || many_of(application, 8)))
+            .collect();
+        // The program's 256 are all under way.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while origin.max_in_flight() < 256 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(
+            origin.max_in_flight(),
+            256,
+            "expected the program's calls to reach its 256 with four Applications at 64"
+        );
+        let began = Instant::now();
+        let probe = many_of(fifth, 1);
+        let took = began.elapsed();
+        let ms = probe[0]["ms"].as_u64().unwrap();
         assert!(
-            (4000..8500).contains(&ms),
-            "expected a call that finds none free to wait about 5 seconds, it waited {ms} ms: {r}"
+            (4000..8500).contains(&ms) && took < Duration::from_secs(9),
+            "expected a call that finds none free to wait about 5 seconds, it waited {ms} ms: {}",
+            probe[0]
+        );
+        let held: Vec<Vec<Value>> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        (held, probe)
+    });
+    assert_eq!(
+        probe[0]["rejected"]["failure"]["kind"], "unavailable",
+        "expected the fifth Application's call past the program's 256 `unavailable`, got {}",
+        probe[0]
+    );
+    assert_eq!(held.len(), 32);
+    for r in held.iter().flatten() {
+        assert_eq!(
+            r["ok"], 200,
+            "expected each of the four Applications' 64 calls served, got {r}"
         );
     }
-    let served = all.iter().filter(|r| r["ok"] == 200).count();
-    assert_eq!(
-        served + unavailable.len(),
-        33 * 8,
-        "expected every call served or `unavailable`"
-    );
     assert!(
         origin.max_in_flight() <= 256,
         "expected at most 256 calls under way in the program, got {}",
         origin.max_in_flight()
     );
+    // The program's bound is full, no Application's share: no `share-full`.
     assert!(
-        origin.max_in_flight() >= 240,
-        "expected the program's calls to reach its 256, got {}",
-        origin.max_in_flight()
+        o.vm.records()
+            .iter()
+            .all(|r| blackbox::records::event(r) != "share-full"),
+        "expected no `share-full` record for a refusal because the program's bound is full"
     );
 }
 

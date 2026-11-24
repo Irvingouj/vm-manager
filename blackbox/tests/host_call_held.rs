@@ -293,9 +293,16 @@ fn a_request_may_make_any_number_of_calls_of_8_mib_one_after_another() {
     }
 }
 
+/// The Applications that hold, four of them (each at 63 MiB of its 64 MiB
+/// share), and the fifth that probes: the program's bound is reached
+/// because four Applications fill it, as one Application stops at its
+/// share ("An Application's share of what the program holds").
+const HOLDING: [&str; 4] = [blackbox::host_call::APP, "caller-2", "caller-3", "caller-4"];
+const PROBING: &str = "caller-5";
+
 /// The sleepers a holder request makes: 4 calls, 15.75 MiB in all (under
-/// the request's 16 MiB). Sixteen holders hold 252 MiB, which leaves 4 MiB
-/// of the program's 256 MiB.
+/// the request's 16 MiB). Four holders of an Application hold 63 MiB, four
+/// Applications 252 MiB, which leaves 4 MiB of the program's 256 MiB.
 const HOLD_SLEEP: u32 = 8;
 
 fn holder_body() -> Value {
@@ -309,8 +316,9 @@ fn holder_body() -> Value {
     })
 }
 
-/// The program-wide scenario: sixteen requests hold 252 MiB of calls that
-/// wait; probes of 4 MiB exactly are taken, one byte more is `unavailable`;
+/// The program-wide scenario: sixteen requests (four for each of four
+/// Applications) hold 252 MiB of calls that wait; a fifth Application's
+/// call is the probe; probes of 4 MiB exactly are taken, one byte more is `unavailable`;
 /// after the holders end the large call is served. The same answers whatever
 /// happened to the program before.
 fn program_scenario(h: &Calls) {
@@ -323,7 +331,7 @@ fn program_scenario(h: &Calls) {
                 let h = &h;
                 scope.spawn(move || {
                     let user = blackbox::User::new(&format!("holder-{i}"));
-                    h.post_as(&user, "/hold", body).1
+                    h.post_to(HOLDING[i / 4], &user, "/hold", body).1
                 })
             })
             .collect();
@@ -344,15 +352,18 @@ fn program_scenario(h: &Calls) {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
-        let (response, results) = h.seq(&[
-            // Small: fits. 4 MiB exactly: fits (252 + 4 = 256). One byte
-            // more: does not. An unknown operation too, and `whoami`.
-            sized("nonesuch", 1024),
-            sized("nonesuch", 4 * MIB),
-            sized("nonesuch", 4 * MIB + 1),
-            sized("nonesuch", CALL_BOUND),
-            call("whoami", json!({ "undefined": true })),
-        ]);
+        let (response, results) = h.seq_on(
+            PROBING,
+            &[
+                // Small: fits. 4 MiB exactly: fits (252 + 4 = 256). One byte
+                // more: does not. An unknown operation too, and `whoami`.
+                sized("nonesuch", 1024),
+                sized("nonesuch", 4 * MIB),
+                sized("nonesuch", 4 * MIB + 1),
+                sized("nonesuch", CALL_BOUND),
+                call("whoami", json!({ "undefined": true })),
+            ],
+        );
         let to = epoch_ms();
         let holders: Vec<Value> = handles.into_iter().map(|t| t.join().unwrap()).collect();
         (holders, to, results, response)
@@ -399,9 +410,22 @@ fn program_scenario(h: &Calls) {
         2,
         "expected two `host-call` records `refused` with reason `unavailable`, got {refused:?}"
     );
+    // The program's bound is full, no Application's share: no `share-full`.
+    assert!(
+        h.own
+            .vm
+            .records()
+            .iter()
+            .skip(before)
+            .all(|r| event(r) != "share-full"),
+        "expected no `share-full` record for a refusal because the program's bound is full"
+    );
     // The holders ended: the call that was refused is served, and an Operation
     // log entry is made for a call of a known operation that is.
-    let (response, results) = h.seq(&[sized("nonesuch", 4 * MIB + 1), quick(CALL_BOUND)]);
+    let (response, results) = h.seq_on(
+        PROBING,
+        &[sized("nonesuch", 4 * MIB + 1), quick(CALL_BOUND)],
+    );
     assert_taken(
         &results[0],
         "nonesuch",
@@ -418,7 +442,7 @@ fn program_scenario(h: &Calls) {
 #[test]
 fn a_call_that_would_pass_the_256_mib_of_the_program_is_unavailable_at_once_until_the_holders_end()
 {
-    let h = Calls::start();
+    let h = Calls::start_with(&[HOLDING[1], HOLDING[2], HOLDING[3], PROBING]);
     program_scenario(&h);
 }
 
@@ -426,7 +450,13 @@ fn a_call_that_would_pass_the_256_mib_of_the_program_is_unavailable_at_once_unti
 const SLEEP_LEFT: u32 = 1;
 
 fn wait_until_the_sleepers_are_gone(h: &Calls) {
-    let own_database = h.own.own_database(blackbox::host_call::APP);
+    for application in HOLDING.iter().chain([&PROBING]) {
+        wait_until_the_sleepers_of_are_gone(h, application);
+    }
+}
+
+fn wait_until_the_sleepers_of_are_gone(h: &Calls, application: &str) {
+    let own_database = h.own.own_database(application);
     let sql = own_database.superuser();
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
     let mut quiet = 0;
@@ -447,7 +477,10 @@ fn wait_until_the_sleepers_are_gone(h: &Calls) {
     );
 }
 
-/// Twenty requests one after another, each starting calls that wait with
+/// Twenty requests one after another, four for each of the five
+/// Applications (63 MiB each: within an Application's share, 315 MiB in
+/// the program: more than its 256 MiB if they were not given back), each
+/// starting calls that wait with
 /// close to 16 MiB of arguments (15.75 MiB) and answering at once without
 /// awaiting them: the calls are left behind. With `tx`, inside a
 /// transaction the request leaves open.
@@ -459,8 +492,9 @@ fn leave_calls_behind(h: &Calls, tx: bool) {
             sleeper(SLEEP_LEFT, 4 * MIB - 256 * 1024),
         ],
     });
+    let applications: Vec<&str> = HOLDING.iter().copied().chain([PROBING]).collect();
     for n in 0..20 {
-        let (_, answer) = h.post("/abandon", &body);
+        let (_, answer) = h.post_to(applications[n % 5], &Calls::user(), "/abandon", &body);
         assert_eq!(
             answer["abandoned"],
             json!(true),
@@ -473,14 +507,14 @@ fn leave_calls_behind(h: &Calls, tx: bool) {
 
 #[test]
 fn calls_left_behind_by_requests_that_ended_are_given_back() {
-    let h = Calls::start();
+    let h = Calls::start_with(&[HOLDING[1], HOLDING[2], HOLDING[3], PROBING]);
     leave_calls_behind(&h, false);
     program_scenario(&h);
 }
 
 #[test]
 fn calls_left_behind_in_an_open_transaction_by_requests_that_ended_are_given_back() {
-    let h = Calls::start();
+    let h = Calls::start_with(&[HOLDING[1], HOLDING[2], HOLDING[3], PROBING]);
     leave_calls_behind(&h, true);
     program_scenario(&h);
 }

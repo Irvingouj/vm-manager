@@ -1,7 +1,8 @@
 //! Bounds of a file's body as a stream (CONTRACT.md, "Storage: Bounds";
 //! "What an Application is handed"; ADR 0019, "Bodies: a handle and a
 //! stream"). A file is at most 5 GiB, a request's body at most 5 GiB and 64
-//! KiB, 16 bodies may be open for one request (512 in the program) and 16
+//! KiB, 16 bodies may be open for one request (128 for one Application, 512
+//! in the program) and 16
 //! streams of the code's own; chunks are 64 KiB.
 //!
 //! The file bound is shown without writing 5 GiB through the program: a put
@@ -11,7 +12,7 @@
 //! answering; one of exactly 5,368,709,120 bytes is opened.
 //!
 //! Time: `sixteen_bodies...` about 15 seconds (its 17th body waits 5), the
-//! program-wide 512 about 15, the others a few seconds each. The 5 GiB
+//! program-wide 512 (four Applications at their 128 and a fifth) about 15, the others a few seconds each. The 5 GiB
 //! files are sparse (`place_sparse`).
 #![allow(
     clippy::unwrap_used,
@@ -395,15 +396,34 @@ fn sixteen_bodies_are_open_at_once_for_a_request_and_the_seventeenth_waits_5_sec
 #[test]
 fn five_hundred_and_twelve_bodies_are_open_in_the_program_and_one_more_waits_then_fails_unavailable()
  {
-    // About 15 seconds: 32 requests of 16 open bodies each, then a get that
-    // waits its 5 seconds for a place that is not there.
+    // About 15 seconds: four Applications of the same fixture each hold 128
+    // bodies (8 requests of 16, the whole of an Application's share), which
+    // is 512 in the program; a fifth Application's get waits its 5 seconds
+    // for a place that is not there. (One Application stops at its 128:
+    // "An Application's share of what the program holds".)
     let s = Storage::ready_streams();
+    let holding = ["stream-read-2", "stream-read-3", "stream-read-4"];
+    for name in holding {
+        s.install(
+            name,
+            "storage-stream-read.js",
+            &[(MARKETING, "storage", "write")],
+        );
+    }
+    let fifth = "stream-read-5";
+    s.install(
+        fifth,
+        "storage-stream-read.js",
+        &[(MARKETING, "storage", "write")],
+    );
     place(&s.dir(MARKETING).join("held.txt"), b"held");
     let keys: Vec<&str> = std::iter::repeat_n("held.txt", 16).collect();
-    let holders: Vec<_> = (0..32)
-        .map(|_| {
+    let holders: Vec<_> = std::iter::once(STREAM_READ)
+        .chain(holding)
+        .flat_map(|application| std::iter::repeat_n(application, 8))
+        .map(|application| {
             let request =
-                s.vm.request(STREAM_READ, "/hold-bodies")
+                s.vm.request(application, "/hold-bodies")
                     .as_user(&wanda())
                     .method("POST")
                     .json(&json!({ "resource": MARKETING, "keys": keys, "holdMs": 12_000 }))
@@ -411,6 +431,7 @@ fn five_hundred_and_twelve_bodies_are_open_in_the_program_and_one_more_waits_the
             std::thread::spawn(move || request.try_send())
         })
         .collect();
+    assert_eq!(holders.len(), 32);
     // Every holder has opened its 16 bodies: 512 gets are in the log, none
     // unfinished (a get is complete when its file is open).
     let statement = json!("get \"held.txt\"");
@@ -427,9 +448,9 @@ fn five_hundred_and_twelve_bodies_are_open_in_the_program_and_one_more_waits_the
     });
     assert!(all_open, "expected 512 bodies opened within 10 seconds");
     let began = Instant::now();
-    let (_, answer) = s.post(
+    let (response, answer) = s.post(
         &wanda(),
-        STREAM_READ,
+        fifth,
         "/get-one",
         &json!({ "resource": MARKETING, "key": "held.txt" }),
     );
@@ -440,8 +461,21 @@ fn five_hundred_and_twelve_bodies_are_open_in_the_program_and_one_more_waits_the
         "expected a 513th body in the program `unavailable`, got {answer}"
     );
     assert!(
-        took >= Duration::from_millis(4_000),
+        (Duration::from_millis(4_000)..=Duration::from_millis(9_000)).contains(&took),
         "expected it to wait about 5 seconds for a place, it answered after {took:?}"
+    );
+    let entry = s.entry_of(&response);
+    assert_eq!(
+        (entry["outcome"].as_str(), entry["error"].as_str()),
+        (Some("failed"), Some("unavailable")),
+        "{entry}"
+    );
+    // The program's bound is full, no Application's share: no `share-full`.
+    assert!(
+        s.vm.records()
+            .iter()
+            .all(|r| blackbox::records::event(r) != "share-full"),
+        "expected no `share-full` record for a refusal because the program's bound is full"
     );
     let mut held = 0;
     for holder in holders {
@@ -452,11 +486,14 @@ fn five_hundred_and_twelve_bodies_are_open_in_the_program_and_one_more_waits_the
         assert_eq!(response.status, 200, "{}", response.describe());
         held += response.json()["held"].as_u64().unwrap_or(0);
     }
-    assert_eq!(held, 512, "expected 32 requests each holding 16 bodies");
+    assert_eq!(
+        held, 512,
+        "expected 32 requests each holding 16 bodies, four Applications' 128 each"
+    );
     // The places are free again once the holders' requests ended.
     let (_, answer) = s.post(
         &wanda(),
-        STREAM_READ,
+        fifth,
         "/get-one",
         &json!({ "resource": MARKETING, "key": "held.txt" }),
     );
@@ -469,7 +506,9 @@ fn five_hundred_and_twelve_bodies_are_open_in_the_program_and_one_more_waits_the
 #[test]
 fn a_body_whose_sending_ended_early_gives_back_its_place_so_more_than_512_may_be_sent_in_turn() {
     // 520 files of 300 MiB are each sent as a response and given up after
-    // the head: a place that was not given back would be gone by the 513th.
+    // the head: a place that was not given back would be gone by the 513th
+    // (and, for one Application, by the 129th: no more than 8 are sent at
+    // once, so the test stays within one Application's share).
     let s = Storage::ready_streams();
     place_sparse(&s.dir(MARKETING).join("big/dropped.bin"), 300 * MIB);
     let threads: Vec<_> = (0..8)

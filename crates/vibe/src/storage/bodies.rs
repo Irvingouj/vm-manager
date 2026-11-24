@@ -1,26 +1,28 @@
 //! The bounds on bodies open at once (blackbox/CONTRACT.md, "Storage:
-//! Bounds"): **16 for one request, 512 in the program**, a body being
-//! read, written or sent holding one of each.
+//! Bounds"): **16 for one request, 128 for one Application and 512 in the
+//! program**, a body being read, written or sent holding one of each ("An
+//! Application's share of what the program holds").
 //!
 //! [`Bodies`] is the one request's: its 16 places, the body pumps it owns
 //! (a get's answer feeding the stream the host hands the code), the put
 //! tasks it owns, and the signal of the request's end — a put still
 //! running then is given up (`request-ended`, or `application-disabled`
 //! at a disable), and the pumps of bodies nobody is reading any more are
-//! ended. [`Open`] is the program's 512. Both live with the request
-//! ([`crate::runner::InFlight`] holds the one, [`Storage`](super::Storage)
-//! the other).
+//! ended. [`Open`] is the program's 512 and each Application's 128. Both
+//! live with the request ([`crate::runner::InFlight`] holds the one,
+//! [`Storage`](super::Storage) the other).
 //!
 //! An operation that would open a body and finds no place takes one now
 //! ([`Bodies::try_guard`], which is what a put does at its decision, before
 //! its first byte) or waits up to [`WAIT`] ([`Bodies::guard`]), then fails
 //! `unavailable` and touches nothing — unless its request ends or its
 //! Application is disabled meanwhile, when it is given up at once
-//! ([`Place::Ended`]). A place is given back when its [`Guard`] is: a body
-//! read to its end, cancelled, or failed frees its own (the pump that feeds
-//! it ends and takes its entry out of [`Bodies`]), and in any case the
-//! request's end frees the rest — unless the body is being sent as the
-//! response, whose pump the answer takes over
+//! ([`Place::Ended`]). The Application's place is taken before the
+//! program's, and one wait covers both. A place is given back when its
+//! [`Guard`] is: a body read to its end, cancelled, or failed frees its own
+//! (the pump that feeds it ends and takes its entry out of [`Bodies`]), and
+//! in any case the request's end frees the rest — unless the body is being
+//! sent as the response, whose pump the answer takes over
 //! ([`Bodies::take_for_sending`]) so the sending goes on after the code
 //! has ended. Nothing the request held for a finished body stays in
 //! [`Bodies`]: a request of a thousand gets holds one entry per get still
@@ -33,12 +35,17 @@ use std::time::{Duration, Instant};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 
 use crate::sent::OwnedTask;
+use crate::shares::{Kind, Mentions, Place as Shared};
 
 /// Bodies one request may hold open at once.
 pub const PER_REQUEST: usize = 16;
 
 /// Bodies the whole program may hold open at once.
 pub const IN_PROGRAM: usize = 512;
+
+/// Bodies one Application may hold open at once, all its requests
+/// together ("An Application's share of what the program holds").
+pub const PER_APPLICATION: usize = 128;
 
 /// How long an operation that would open a body waits for a place, then
 /// fails `unavailable`.
@@ -48,26 +55,31 @@ pub const WAIT: Duration = Duration::from_secs(5);
 /// staging file removed — before its task is ended.
 pub const PUT_REAP: Duration = Duration::from_secs(30);
 
-/// The program's [`IN_PROGRAM`] places. One for the program
-/// ([`Storage`](super::Storage)).
+/// The program's [`IN_PROGRAM`] places, and its [`PER_APPLICATION`] for
+/// each Application. One for the program ([`Storage`](super::Storage)).
 #[derive(Debug)]
 pub struct Open {
     places: Arc<Semaphore>,
+    share: crate::shares::Places,
 }
 
-impl Default for Open {
-    fn default() -> Self {
+impl Open {
+    /// The program's places, sharing out `mentions` for `storage-bodies`.
+    pub fn new(mentions: Arc<Mentions>) -> Self {
         Self {
             places: Arc::new(Semaphore::new(IN_PROGRAM)),
+            share: crate::shares::Places::shared(PER_APPLICATION, mentions, Kind::StorageBodies),
         }
     }
 }
 
-/// One open body's two places, given back when the guard drops: by the
-/// body's pump (a get), the put work, or the request's registry.
+/// One open body's places — its request's, its Application's and the
+/// program's — given back when the guard drops: by the body's pump (a
+/// get), the put work, or the request's registry.
 #[derive(Debug)]
 pub struct Guard {
     _request: OwnedSemaphorePermit,
+    _share: Shared,
     _program: OwnedSemaphorePermit,
 }
 
@@ -130,37 +142,49 @@ impl Default for Bodies {
 }
 
 impl Bodies {
-    /// A place now, without waiting: the request's and the program's, or
-    /// `None` when either has none free (or the request is over). This is
-    /// how a put takes its place at its decision, before its first byte.
-    pub fn try_guard(&self, program: &Open) -> Option<Guard> {
+    /// A place now, without waiting: the request's, the Application's and
+    /// the program's, or `None` when any has none free (or the request is
+    /// over). This is how a put takes its place at its decision, before its
+    /// first byte. No record is written: the put goes on to wait for a
+    /// place, and is refused only when that wait ends.
+    pub fn try_guard(&self, program: &Open, application: &Arc<str>) -> Option<Guard> {
         if self.is_ended() {
             return None;
         }
         let request = Arc::clone(&self.places).try_acquire_owned().ok()?;
+        // The Application's place before the program's: one at its share
+        // takes nothing from the others.
+        let Some(share) = program.share.try_place(application) else {
+            drop(request);
+            return None;
+        };
         match Arc::clone(&program.places).try_acquire_owned() {
             Ok(place) => Some(Guard {
                 _request: request,
+                _share: share,
                 _program: place,
             }),
             Err(_) => {
+                drop(share);
                 drop(request);
                 None
             }
         }
     }
 
-    /// A place for one more open body, waiting up to [`WAIT`] for both
-    /// the request's and the program's — and ended at once when the
-    /// request does (or its Application is disabled), so that an
-    /// operation waiting for a place is given up with its request, not
-    /// answered `unavailable` five seconds later.
-    pub async fn guard(&self, program: &Open) -> Place {
+    /// A place for one more open body, waiting up to [`WAIT`] for the
+    /// request's, the Application's and the program's — one deadline for
+    /// them all — and ended at once when the request does (or its
+    /// Application is disabled), so that an operation waiting for a place
+    /// is given up with its request, not answered `unavailable` five
+    /// seconds later.
+    pub async fn guard(&self, program: &Open, application: &Arc<str>) -> Place {
         let deadline = Instant::now() + WAIT;
+        let deadline = tokio::time::Instant::from_std(deadline);
         let request = tokio::select! {
             biased;
             () = self.ended() => return Place::Ended,
-            waited = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), {
+            waited = tokio::time::timeout_at(deadline, {
                 let places = Arc::clone(&self.places);
                 async move { places.acquire_owned().await }
             }) => match waited {
@@ -168,24 +192,42 @@ impl Bodies {
                 Ok(Err(_)) | Err(_) => return Place::Waited,
             },
         };
-        let program = tokio::select! {
+        let share = tokio::select! {
             biased;
             () = self.ended() => {
                 drop(request);
                 return Place::Ended;
             }
-            waited = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), {
+            waited = program.share.place(application, deadline) => match waited {
+                Some(place) => place,
+                None => {
+                    drop(request);
+                    return Place::Waited;
+                }
+            },
+        };
+        let program = tokio::select! {
+            biased;
+            () = self.ended() => {
+                drop(share);
+                drop(request);
+                return Place::Ended;
+            }
+            waited = tokio::time::timeout_at(deadline, {
                 let places = Arc::clone(&program.places);
                 async move { places.acquire_owned().await }
             }) => match waited {
                 Ok(Ok(place)) => place,
                 Ok(Err(_)) => {
+                    drop(share);
                     drop(request);
                     return Place::Waited;
                 }
                 Err(_) => {
-                    // The request's place is given back at once; the
-                    // operation failed `unavailable` and touched nothing.
+                    // The request's and the Application's places are given
+                    // back at once; the operation failed `unavailable` and
+                    // touched nothing.
+                    drop(share);
                     drop(request);
                     return Place::Waited;
                 }
@@ -193,6 +235,7 @@ impl Bodies {
         };
         Place::Made(Guard {
             _request: request,
+            _share: share,
             _program: program,
         })
     }
@@ -396,6 +439,14 @@ impl Drop for Bodies {
 mod tests {
     use super::*;
 
+    fn app(name: &str) -> Arc<str> {
+        Arc::from(name)
+    }
+
+    fn open() -> Open {
+        Open::new(Arc::new(Mentions::default()))
+    }
+
     /// A task that never ends by itself: only its owner's drop does.
     fn forever() -> OwnedTask {
         OwnedTask::new(tokio::spawn(std::future::pending::<()>()))
@@ -404,28 +455,28 @@ mod tests {
     #[tokio::test]
     async fn a_guard_takes_one_place_of_the_request_and_one_of_the_program() {
         let bodies = Bodies::default();
-        let program = Open::default();
+        let program = open();
         let guards: Vec<Guard> = {
             let mut guards = Vec::new();
             for index in 0..PER_REQUEST {
                 let guard = bodies
-                    .try_guard(&program)
+                    .try_guard(&program, &app("a"))
                     .unwrap_or_else(|| panic!("place {index} of this request's own"));
                 guards.push(guard);
             }
             guards
         };
         assert!(
-            bodies.try_guard(&program).is_none(),
+            bodies.try_guard(&program, &app("a")).is_none(),
             "the 17th body of one request finds no place now"
         );
         assert!(
-            matches!(bodies.guard(&program).await, Place::Waited),
+            matches!(bodies.guard(&program, &app("a")).await, Place::Waited),
             "the 17th body of one request finds no place within the wait"
         );
         drop(guards);
         assert!(
-            bodies.try_guard(&program).is_some(),
+            bodies.try_guard(&program, &app("a")).is_some(),
             "the places are given back when the guards drop"
         );
     }
@@ -434,15 +485,16 @@ mod tests {
     async fn the_programs_places_run_out_and_each_request_still_gets_its_own() {
         // 32 requests of 16 bodies each fill the program's 512; one more
         // finds no place, whatever request it is of.
-        let program = Open::default();
+        let program = open();
         let requests: Vec<Bodies> = (0..32).map(|_| Bodies::default()).collect();
         let guards: Vec<Guard> = {
             let mut guards = Vec::new();
             for (n, bodies) in requests.iter().enumerate() {
+                let application: Arc<str> = Arc::from(format!("app-{n}"));
                 for _ in 0..PER_REQUEST {
                     guards.push(
                         bodies
-                            .try_guard(&program)
+                            .try_guard(&program, &application)
                             .unwrap_or_else(|| panic!("a place in the program, request {n}")),
                     );
                 }
@@ -451,30 +503,84 @@ mod tests {
         };
         let bodies = Bodies::default();
         assert!(
-            bodies.try_guard(&program).is_none(),
+            bodies.try_guard(&program, &app("app-32")).is_none(),
             "one more than the program holds finds no place now"
         );
         drop(guards);
         assert!(
-            bodies.try_guard(&program).is_some(),
+            bodies.try_guard(&program, &app("app-32")).is_some(),
             "the places are given back when the guards drop"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_application_at_its_share_waits_without_holding_a_place_of_the_program() {
+        let program = open();
+        let holders: Vec<Bodies> = (0..8).map(|_| Bodies::default()).collect();
+        let mut guards = Vec::new();
+        for bodies in &holders {
+            for _ in 0..PER_REQUEST {
+                guards.push(
+                    bodies
+                        .try_guard(&program, &app("a"))
+                        .expect("a place of A's 128"),
+                );
+            }
+        }
+        let bodies = Bodies::default();
+        assert!(
+            bodies.try_guard(&program, &app("a")).is_none(),
+            "A's 129th finds no place now"
+        );
+        let other = Bodies::default();
+        let held_by_holders = PER_APPLICATION;
+        let a = app("a");
+        let (place, ()) = tokio::join!(bodies.guard(&program, &a), async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert_eq!(
+                program.places.available_permits(),
+                IN_PROGRAM - held_by_holders,
+                "A's wait takes none of the program's places its holders do not hold"
+            );
+            let b = other
+                .try_guard(&program, &app("b"))
+                .expect("B's place while A waits");
+            drop(b);
+            assert_eq!(
+                program.places.available_permits(),
+                IN_PROGRAM - held_by_holders
+            );
+        });
+        assert!(
+            matches!(place, Place::Waited),
+            "A's 129th finds no place within the wait"
+        );
+        assert_eq!(
+            program.places.available_permits(),
+            IN_PROGRAM - held_by_holders,
+            "the wait took no program place of its own"
+        );
+        drop(guards);
+        assert!(
+            bodies.try_guard(&program, &app("a")).is_some(),
+            "A's places are free again"
         );
     }
 
     #[tokio::test]
     async fn a_wait_for_a_place_ends_with_the_request() {
         let bodies = Arc::new(Bodies::default());
-        let program = Open::default();
+        let program = open();
         let guards: Vec<Guard> = (0..PER_REQUEST)
-            .map(|_| bodies.try_guard(&program).expect("a place"))
+            .map(|_| bodies.try_guard(&program, &app("a")).expect("a place"))
             .collect();
         {
             // The 17th waits; the request ends under it.
             let waiting_bodies = Arc::clone(&bodies);
-            let program = Open::default();
+            let program = open();
             let waiting = tokio::spawn(async move {
                 let program = program;
-                waiting_bodies.guard(&program).await
+                waiting_bodies.guard(&program, &app("a")).await
             });
             tokio::time::sleep(Duration::from_millis(50)).await;
             bodies.end();
@@ -493,8 +599,8 @@ mod tests {
     #[tokio::test]
     async fn a_pump_that_ended_takes_its_own_entry_out() {
         let bodies = Arc::new(Bodies::default());
-        let program = Open::default();
-        let guard = Arc::new(bodies.try_guard(&program).expect("a place"));
+        let program = open();
+        let guard = Arc::new(bodies.try_guard(&program, &app("a")).expect("a place"));
         let pump = bodies_for_pump(&bodies, guard);
         bodies.hold(7, pump, Some(1024));
         assert_eq!(bodies.held.lock().expect("the lock").len(), 1);
@@ -505,7 +611,7 @@ mod tests {
         );
         // The answer takes the pump of the body it sends; a body already
         // taken is not taken again.
-        let guard = Arc::new(bodies.try_guard(&program).expect("a place"));
+        let guard = Arc::new(bodies.try_guard(&program, &app("a")).expect("a place"));
         bodies.hold(8, bodies_for_pump(&bodies, guard), Some(2));
         assert!(
             bodies.take_for_sending(8).is_some_and(|(task, length)| {
@@ -555,7 +661,7 @@ mod tests {
             "a put that starts after its request's end never starts"
         );
         assert!(
-            bodies.try_guard(&Open::default()).is_none(),
+            bodies.try_guard(&open(), &app("a")).is_none(),
             "and no body opens after it either"
         );
     }

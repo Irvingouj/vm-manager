@@ -15,8 +15,9 @@
 //!   put's body is chunks as they arrive (a stream in is what S3 offers:
 //!   a multipart upload), and a get answers the file's bytes as chunks
 //!   (a response body), so no backend is asked to hold a file whole.
-//!   [`bodies`]: the bounds on bodies open at once, 16 a request and 512
-//!   the program. [`content_type_of`] and [`is_content_type`].
+//!   [`bodies`]: the bounds on bodies open at once, 16 a request, 128 an
+//!   Application and 512 the program. [`content_type_of`] and
+//!   [`is_content_type`].
 //! - [`cursor`]: a list's cursor, sealed so that only one this program
 //!   answered for the same Resource, prefix and delimiter is taken.
 //! - [`Root`] (crate::storage::directory): the installation's storage root
@@ -263,14 +264,25 @@ pub type Op<'a, T> = Pin<Box<dyn Future<Output = Result<T, Failure>> + Send + 'a
 /// S3 backend keeps it (a put of unknown length a multipart upload, a
 /// get a response body).
 pub trait Backend: Send + Sync {
-    /// The file's metadata, or `None` when no file has the key.
-    fn head(&self, key: Key, until: Until) -> Op<'_, Option<Metadata>>;
+    /// The file's metadata, or `None` when no file has the key. `application`
+    /// is whose operation it is: its file jobs count against its share.
+    fn head<'a>(
+        &'a self,
+        key: Key,
+        until: Until,
+        application: &'a Arc<str>,
+    ) -> Op<'a, Option<Metadata>>;
 
     /// The file opened — its metadata and a [`Reader`] of its bytes, the
     /// file as it was when it was opened, ending after exactly `size`
     /// bytes — or `None`. A file larger than [`FILE_BYTES`] is not opened
     /// ([`Failure::Bytes`]); its `head` still answers.
-    fn get(&self, key: Key, until: Until) -> Op<'_, Option<Opened>>;
+    fn get<'a>(
+        &'a self,
+        key: Key,
+        until: Until,
+        application: &'a Arc<str>,
+    ) -> Op<'a, Option<Opened>>;
 
     /// Creates the file or replaces it whole, atomically; `content_type`
     /// kept when given. The body is written to the staging file as it
@@ -286,20 +298,26 @@ pub trait Backend: Send + Sync {
     /// taken). One write and the landing each have
     /// [`OPERATION_TIME`] of their own, and a source that stalls is
     /// bounded by `given_up`, not by a time of its own.
-    fn put(
-        &self,
+    fn put<'a>(
+        &'a self,
         key: Key,
         body: Source,
         content_type: Option<String>,
         given_up: GivenUp,
-    ) -> Op<'_, Metadata>;
+        application: &'a Arc<str>,
+    ) -> Op<'a, Metadata>;
 
     /// Removes the file if there is one, and every folder it leaves empty.
-    fn delete(&self, key: Key, until: Until) -> Op<'_, ()>;
+    fn delete<'a>(&'a self, key: Key, until: Until, application: &'a Arc<str>) -> Op<'a, ()>;
 
     /// A page of the keys beginning with the query's prefix, in the byte
     /// order of their UTF-8.
-    fn list(&self, query: ListQuery, until: Until) -> Op<'_, Page>;
+    fn list<'a>(
+        &'a self,
+        query: ListQuery,
+        until: Until,
+        application: &'a Arc<str>,
+    ) -> Op<'a, Page>;
 }
 
 /// A put's body, as a backend takes it: the bytes in hand (a string as

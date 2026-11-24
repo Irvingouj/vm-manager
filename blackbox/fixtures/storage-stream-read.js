@@ -45,6 +45,8 @@
 //       { ok, error, ms }; hold the request open for holdMs; then
 //       { held: <n>, after } — the bodies are open while the request is in
 //       flight
+//   /put-one { resource, key, body }
+//       one put of a small string, answered as it comes: { answer, ms }
 //   /get-one { resource, key }
 //       one get, answered at once: { answer: { ok: <metadata> | null } }
 
@@ -222,6 +224,11 @@ globalThis.default = {
         }
         await sleep(Number(b.holdMs || 0));
         return json({ held: bodies.length, after });
+      }
+      case "/put-one": {
+        const began = Date.now();
+        const answer = await call("storage.put", { resource: b.resource, key: b.key, body: b.body });
+        return json({ answer, ms: Date.now() - began });
       }
       case "/get-one": {
         const answer = await call("storage.get", { resource: b.resource, key: b.key });

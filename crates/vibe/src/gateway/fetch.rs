@@ -95,11 +95,16 @@ pub(super) struct Calls {
 }
 
 impl Calls {
-    pub(super) fn new(list: Arc<Outbound>, private: PrivateRanges, itself: Itself) -> Self {
+    pub(super) fn new(
+        list: Arc<Outbound>,
+        private: PrivateRanges,
+        itself: Itself,
+        mentions: Arc<crate::shares::Mentions>,
+    ) -> Self {
         Self {
             list,
             private,
-            program: Program::default(),
+            program: Program::new(mentions),
             tasks: Arc::new(Semaphore::new(MOST_TASKS)),
             itself,
         }
@@ -223,7 +228,7 @@ struct Work {
 /// 8, its place among the program's 256, and its count.
 struct Holding {
     _turn: OwnedSemaphorePermit,
-    _place: OwnedSemaphorePermit,
+    _place: crate::outbound::limits::Held,
     _admitted: Arc<Admitted>,
 }
 
@@ -780,7 +785,7 @@ impl Work {
         let place = tokio::select! {
             biased;
             () = bodies.ended() => return Err(ended_why(&self.in_flight)),
-            place = self.calls.program.place() => place,
+            place = self.calls.program.place(&self.in_flight.application) => place,
         };
         let Some(place) = place else {
             return Err("unavailable");

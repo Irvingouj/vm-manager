@@ -557,13 +557,15 @@ pub struct PlatformGateway {
     operations: Arc<Operations>,
     /// The bytes of the host calls not yet answered of all requests
     /// (blackbox/CONTRACT.md, "A host call's arguments are bounded"): the
-    /// program's 256 MiB.
+    /// program's 256 MiB and each Application's share.
     held: Arc<ProgramCalls>,
 }
 
 impl PlatformGateway {
     /// `runtime` is where operations run: the program's own, where the
     /// platform database's and the shared databases' connections live.
+    /// `mentions` is the program's one-a-minute `share-full` memory, shared
+    /// with the file threads and the storage bodies.
     #[expect(
         clippy::too_many_arguments,
         reason = "the parts of one gateway, each named: what it works on and what outbound calls are decided with"
@@ -576,6 +578,7 @@ impl PlatformGateway {
         outbound: Arc<crate::outbound::Outbound>,
         outbound_private: crate::outbound::PrivateRanges,
         itself: crate::outbound::Itself,
+        mentions: Arc<crate::shares::Mentions>,
         runtime: Handle,
     ) -> Self {
         Self {
@@ -583,13 +586,18 @@ impl PlatformGateway {
             storage,
             own,
             log,
-            calls: Arc::new(fetch::Calls::new(outbound, outbound_private, itself)),
+            calls: Arc::new(fetch::Calls::new(
+                outbound,
+                outbound_private,
+                itself,
+                Arc::clone(&mentions),
+            )),
             operations: Arc::new(Operations {
                 runtime,
                 tasks: Mutex::new(JoinSet::new()),
                 permits: Arc::new(Semaphore::new(OPERATIONS_AT_ONCE)),
             }),
-            held: Arc::new(ProgramCalls::default()),
+            held: Arc::new(ProgramCalls::new(mentions)),
         }
     }
 
@@ -1138,7 +1146,10 @@ impl Gateway for PlatformGateway {
         // too: code that runs while its script loads can make as many calls
         // as code in a request can, and a refusal that has an Operation log
         // entry keeps its arguments until the entry is written.
-        let held = match in_flight.calls.take(&self.held, size) {
+        let held = match in_flight
+            .calls
+            .take(&self.held, &in_flight.application, size)
+        {
             // The guard travels with the call's arguments: into the work
             // below, and so into the future that waits for a permit and
             // the task that runs the operation, which outlives a request
@@ -1147,7 +1158,10 @@ impl Gateway for PlatformGateway {
             Took::Taken(guard) => Some(guard),
             Took::Calls => return call_limit("calls"),
             Took::Bytes => return call_limit("arguments"),
-            Took::Program => return call_unavailable(),
+            // The Application's share is answered as the program's bound
+            // is; the share wrote its own `share-full` record when it
+            // refused.
+            Took::Share | Took::Program => return call_unavailable(),
         };
         if let Some(op) = storage::Op::of(operation) {
             // Owned: a put's body is moved on, never copied.

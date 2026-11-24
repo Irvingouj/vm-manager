@@ -91,6 +91,7 @@ pub mod runner;
 pub mod sent;
 pub mod server;
 pub mod setup;
+pub mod shares;
 pub mod sign_in;
 pub mod statement;
 pub mod storage;

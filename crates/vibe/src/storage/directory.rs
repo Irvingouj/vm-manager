@@ -279,12 +279,15 @@ impl Directory {
             };
             let placed = tokio::time::timeout_at(
                 deadline,
-                files.run(move || {
-                    let Opening(inner) = &opening;
-                    let opened = open(inner.root.as_deref(), &inner.path, &inner.name);
-                    inner.settle(opened);
-                    drop(opening);
-                }),
+                files.run(
+                    move || {
+                        let Opening(inner) = &opening;
+                        let opened = open(inner.root.as_deref(), &inner.path, &inner.name);
+                        inner.settle(opened);
+                        drop(opening);
+                    },
+                    None,
+                ),
             )
             .await;
             let answered = match placed {
@@ -369,16 +372,19 @@ impl Directory {
             return false;
         };
         let files = Arc::clone(&self.files);
-        let placed = files.run(move || {
-            let marker = matches!(
-                rustix::fs::unlinkat(&opened.fd, MARKER, AtFlags::empty()),
-                Ok(()) | Err(Errno::NOENT)
-            );
-            // Never a file: only the folder itself, when it is empty.
-            rustix::fs::unlinkat(&opened.fd, STAGING, AtFlags::REMOVEDIR).ok();
-            rustix::fs::fsync(&opened.fd).ok();
-            marker
-        });
+        let placed = files.run(
+            move || {
+                let marker = matches!(
+                    rustix::fs::unlinkat(&opened.fd, MARKER, AtFlags::empty()),
+                    Ok(()) | Err(Errno::NOENT)
+                );
+                // Never a file: only the folder itself, when it is empty.
+                rustix::fs::unlinkat(&opened.fd, STAGING, AtFlags::REMOVEDIR).ok();
+                rustix::fs::fsync(&opened.fd).ok();
+                marker
+            },
+            None,
+        );
         let Ok(Some(answer)) = tokio::time::timeout_at(deadline, placed).await else {
             return false;
         };
@@ -402,16 +408,19 @@ impl Directory {
             return false;
         };
         let files = Arc::clone(&self.files);
-        let placed = files.run(move || {
-            if marker {
-                rustix::fs::unlinkat(&opened.fd, MARKER, AtFlags::empty()).ok();
-            }
-            if staging {
-                rustix::fs::unlinkat(&opened.fd, STAGING, AtFlags::REMOVEDIR).ok();
-            }
-            rustix::fs::fsync(&opened.fd).ok();
-            true
-        });
+        let placed = files.run(
+            move || {
+                if marker {
+                    rustix::fs::unlinkat(&opened.fd, MARKER, AtFlags::empty()).ok();
+                }
+                if staging {
+                    rustix::fs::unlinkat(&opened.fd, STAGING, AtFlags::REMOVEDIR).ok();
+                }
+                rustix::fs::fsync(&opened.fd).ok();
+                true
+            },
+            None,
+        );
         let Ok(Some(answer)) = tokio::time::timeout_at(deadline, placed).await else {
             return false;
         };
@@ -451,23 +460,27 @@ impl Directory {
     }
 
     /// Runs `job` on a file thread with the directory opened, within
-    /// `until`.
-    async fn on_files<T: Send + 'static>(
-        &self,
+    /// `until`, as `application`'s work.
+    async fn on_files<'a, T: Send + 'static>(
+        &'a self,
         until: Until,
+        application: &'a Arc<str>,
         job: impl FnOnce(&Opened) -> Result<T, Failure> + Send + 'static,
     ) -> Result<T, Failure> {
         let inner = Arc::clone(&self.inner);
         let job_until = until.clone();
         let answer = self
             .files
-            .run(move || {
-                if job_until.over() {
-                    return Err(Failure::Time);
-                }
-                let opened = inner.opened()?;
-                job(&opened)
-            })
+            .run(
+                move || {
+                    if job_until.over() {
+                        return Err(Failure::Time);
+                    }
+                    let opened = inner.opened()?;
+                    job(&opened)
+                },
+                Some(application),
+            )
             .await
             .ok_or(Failure::Unavailable)?;
         let deadline = tokio::time::Instant::from_std(until.deadline());
@@ -868,8 +881,13 @@ fn metadata(key: String, fd: BorrowedFd<'_>, stat: &Stat) -> Metadata {
 }
 
 impl Backend for Directory {
-    fn head(&self, key: Key, until: Until) -> Op<'_, Option<Metadata>> {
-        Box::pin(self.on_files(until, move |opened| {
+    fn head<'a>(
+        &'a self,
+        key: Key,
+        until: Until,
+        application: &'a Arc<str>,
+    ) -> Op<'a, Option<Metadata>> {
+        Box::pin(self.on_files(until, application, move |opened| {
             let Some((chain, last)) = folders_of(opened, &key)? else {
                 return Ok(None);
             };
@@ -881,11 +899,16 @@ impl Backend for Directory {
         }))
     }
 
-    fn get(&self, key: Key, until: Until) -> Op<'_, Option<super::Opened>> {
+    fn get<'a>(
+        &'a self,
+        key: Key,
+        until: Until,
+        application: &'a Arc<str>,
+    ) -> Op<'a, Option<super::Opened>> {
         let files = Arc::clone(&self.files);
         Box::pin(async move {
             let found = self
-                .on_files(until, move |opened| {
+                .on_files(until, application, move |opened| {
                     let Some((chain, last)) = folders_of(opened, &key)? else {
                         return Ok(None);
                     };
@@ -914,21 +937,23 @@ impl Backend for Directory {
                     size,
                     at: Mutex::new(0),
                     files,
+                    application: Arc::clone(application),
                 }),
             }))
         })
     }
 
-    fn put(
-        &self,
+    fn put<'a>(
+        &'a self,
         key: Key,
         body: Source,
         content_type: Option<String>,
         mut given_up: GivenUp,
-    ) -> Op<'_, Metadata> {
+        application: &'a Arc<str>,
+    ) -> Op<'a, Metadata> {
         Box::pin(async move {
             // The staging file, made on a file thread.
-            let staged = self.open_staging().await?;
+            let staged = self.open_staging(application).await?;
             let answer = async {
                 let mut written = 0_u64;
                 match body {
@@ -941,7 +966,7 @@ impl Backend for Directory {
                         if *given_up.borrow_and_update() {
                             return Err(Failure::Stopped);
                         }
-                        write(&staged.file, bytes, 0, &self.files).await?;
+                        write(&staged.file, bytes, 0, &self.files, application).await?;
                     }
                     Source::Stream { chunks, length } => {
                         // A known length is checked before a byte is read;
@@ -1015,7 +1040,8 @@ impl Backend for Directory {
                                     if written > FILE_BYTES {
                                         return Err(Failure::Bytes);
                                     }
-                                    write(&staged.file, batch, at, &self.files).await?;
+                                    write(&staged.file, batch, at, &self.files, application)
+                                        .await?;
                                     // The body ended cleanly: the landing,
                                     // its own [`OPERATION_TIME`].
                                     if ended {
@@ -1047,6 +1073,7 @@ impl Backend for Directory {
                     content_type,
                     given_up.clone(),
                     &self.files,
+                    application,
                 )
                 .await
             }
@@ -1058,20 +1085,32 @@ impl Backend for Directory {
                 // what the next load of the Resource clears
                 // (blackbox/CONTRACT.md, "What is on the directory"); the
                 // put's own failure is the answer either way.
+                // Cleaning up the program's own staging file is platform
+                // work: it takes only the program's place, never the
+                // Application's share again.
                 let _removed = remove(&staged, &self.files).await;
             }
             answer
         })
     }
 
-    fn delete(&self, key: Key, until: Until) -> Op<'_, ()> {
+    fn delete<'a>(&'a self, key: Key, until: Until, application: &'a Arc<str>) -> Op<'a, ()> {
         let job_until = until.clone();
-        Box::pin(self.on_files(until, move |opened| delete(opened, &key, &job_until)))
+        Box::pin(self.on_files(until, application, move |opened| {
+            delete(opened, &key, &job_until)
+        }))
     }
 
-    fn list(&self, query: ListQuery, until: Until) -> Op<'_, Page> {
+    fn list<'a>(
+        &'a self,
+        query: ListQuery,
+        until: Until,
+        application: &'a Arc<str>,
+    ) -> Op<'a, Page> {
         let job_until = until.clone();
-        Box::pin(self.on_files(until, move |opened| list(opened, &query, &job_until)))
+        Box::pin(self.on_files(until, application, move |opened| {
+            list(opened, &query, &job_until)
+        }))
     }
 }
 
@@ -1100,39 +1139,48 @@ impl Directory {
     /// The staging file, opened on a file thread: `.vibe-staging/` (made
     /// when it is not there), a fresh name, `O_CREAT | O_EXCL`, mode
     /// `0640` whatever the program's umask.
-    async fn open_staging(&self) -> Result<Staged, Failure> {
+    async fn open_staging(&self, application: &Arc<str>) -> Result<Staged, Failure> {
         let inner = Arc::clone(&self.inner);
-        in_time(&self.files, move || {
-            let opened = inner.opened()?;
-            let staging = staging(&opened)?;
-            let name = format!("{}{}", this_run(), uuid::Uuid::new_v4().simple());
-            let fd = rustix::fs::openat(
-                &staging,
-                name.as_str(),
-                OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                Mode::from_raw_mode(FILE_MODE),
-            )
-            .map_err(failure)?;
-            // The mode whatever the program's umask.
-            rustix::fs::fchmod(&fd, Mode::from_raw_mode(FILE_MODE)).map_err(failure)?;
-            Ok(Staged {
-                staging: Arc::new(staging),
-                name,
-                file: Arc::new(fd),
-            })
-        })
+        in_time(
+            &self.files,
+            move || {
+                let opened = inner.opened()?;
+                let staging = staging(&opened)?;
+                let name = format!("{}{}", this_run(), uuid::Uuid::new_v4().simple());
+                let fd = rustix::fs::openat(
+                    &staging,
+                    name.as_str(),
+                    OFlags::WRONLY
+                        | OFlags::CREATE
+                        | OFlags::EXCL
+                        | OFlags::NOFOLLOW
+                        | OFlags::CLOEXEC,
+                    Mode::from_raw_mode(FILE_MODE),
+                )
+                .map_err(failure)?;
+                // The mode whatever the program's umask.
+                rustix::fs::fchmod(&fd, Mode::from_raw_mode(FILE_MODE)).map_err(failure)?;
+                Ok(Staged {
+                    staging: Arc::new(staging),
+                    name,
+                    file: Arc::new(fd),
+                })
+            },
+            Some(application),
+        )
         .await
     }
 }
 
-/// Runs `job` on a file thread, its answer waited for within
-/// [`OPERATION_TIME`] in all — the place among the waiting jobs included
-/// (the pool's own wait is under it).
+/// Runs `job` on a file thread as `application`'s work, its answer waited
+/// for within [`OPERATION_TIME`] in all — the place among the waiting jobs
+/// included (the pool's own wait is under it).
 async fn in_time<T: Send + 'static>(
     files: &Files,
     job: impl FnOnce() -> Result<T, Failure> + Send + 'static,
+    application: Option<&Arc<str>>,
 ) -> Result<T, Failure> {
-    let placed = tokio::time::timeout(OPERATION_TIME, files.run(job)).await;
+    let placed = tokio::time::timeout(OPERATION_TIME, files.run(job, application)).await;
     let answer = match placed {
         Err(_) => return Err(Failure::Time),
         Ok(None) => return Err(Failure::Unavailable),
@@ -1152,8 +1200,9 @@ async fn in_time_until<T: Send + 'static>(
     files: &Files,
     timed_out: &Arc<AtomicBool>,
     job: impl FnOnce() -> Result<T, Failure> + Send + 'static,
+    application: &Arc<str>,
 ) -> Result<T, Failure> {
-    let placed = tokio::time::timeout(OPERATION_TIME, files.run(job)).await;
+    let placed = tokio::time::timeout(OPERATION_TIME, files.run(job, Some(application))).await;
     let answer = match placed {
         Err(_) => return Err(Failure::Time),
         Ok(None) => return Err(Failure::Unavailable),
@@ -1171,24 +1220,34 @@ async fn in_time_until<T: Send + 'static>(
 
 /// Writes `bytes` at `at` in the staging `file`: one `pwrite` job, its
 /// own [`OPERATION_TIME`]. A disk that is full fails `full`.
-async fn write(file: &Arc<OwnedFd>, bytes: Bytes, at: u64, files: &Files) -> Result<(), Failure> {
+async fn write(
+    file: &Arc<OwnedFd>,
+    bytes: Bytes,
+    at: u64,
+    files: &Files,
+    application: &Arc<str>,
+) -> Result<(), Failure> {
     let file = Arc::clone(file);
-    in_time(files, move || {
-        let mut written = 0_usize;
-        while let Some(rest) = bytes.get(written..)
-            && !rest.is_empty()
-        {
-            let place = at + u64::try_from(written).unwrap_or(u64::MAX);
-            match pwrite(&file, rest, place) {
-                // A write of nothing on a regular file is not a write.
-                Ok(0) => return Err(Failure::Full),
-                Ok(n) => written += n,
-                Err(Errno::INTR) => {}
-                Err(e) => return Err(failure(e)),
+    in_time(
+        files,
+        move || {
+            let mut written = 0_usize;
+            while let Some(rest) = bytes.get(written..)
+                && !rest.is_empty()
+            {
+                let place = at + u64::try_from(written).unwrap_or(u64::MAX);
+                match pwrite(&file, rest, place) {
+                    // A write of nothing on a regular file is not a write.
+                    Ok(0) => return Err(Failure::Full),
+                    Ok(n) => written += n,
+                    Err(Errno::INTR) => {}
+                    Err(e) => return Err(failure(e)),
+                }
             }
-        }
-        Ok(())
-    })
+            Ok(())
+        },
+        Some(application),
+    )
     .await
 }
 
@@ -1197,10 +1256,14 @@ async fn write(file: &Arc<OwnedFd>, bytes: Bytes, at: u64, files: &Files) -> Res
 /// file ends harmlessly into the unlinked file.
 async fn remove(staged: &Staged, files: &Files) -> Result<(), Failure> {
     let staged = staged.clone();
-    in_time(files, move || {
-        rustix::fs::unlinkat(&staged.staging, staged.name.as_str(), AtFlags::empty())
-            .map_err(failure)
-    })
+    in_time(
+        files,
+        move || {
+            rustix::fs::unlinkat(&staged.staging, staged.name.as_str(), AtFlags::empty())
+                .map_err(failure)
+        },
+        None,
+    )
     .await
 }
 
@@ -1222,13 +1285,17 @@ async fn land(
     content_type: Option<String>,
     given_up: GivenUp,
     files: &Files,
+    application: &Arc<str>,
 ) -> Result<Metadata, Failure> {
     let inner = Arc::clone(inner);
     let timed_out = Arc::new(AtomicBool::new(false));
     let job_timed_out = Arc::clone(&timed_out);
-    in_time_until(files, &timed_out, move || {
-        land_now(&inner, staged, key, content_type, &given_up, &job_timed_out)
-    })
+    in_time_until(
+        files,
+        &timed_out,
+        move || land_now(&inner, staged, key, content_type, &given_up, &job_timed_out),
+        application,
+    )
     .await
 }
 
@@ -1346,6 +1413,9 @@ struct FileReader {
     size: u64,
     at: Mutex<u64>,
     files: Arc<Files>,
+    /// Whose body this is: its reads count against its Application's
+    /// share of the file jobs.
+    application: Arc<str>,
 }
 
 impl super::Reader for FileReader {
@@ -1370,24 +1440,28 @@ impl super::Reader for FileReader {
             let room = usize::try_from(room).unwrap_or(CHUNK);
             // One chunk, one job, its answer waited for within
             // [`OPERATION_TIME`].
-            let read = in_time(&files, move || {
-                let mut buffer = vec![0_u8; room];
-                let mut filled = 0_usize;
-                while let Some(rest) = buffer.get_mut(filled..)
-                    && !rest.is_empty()
-                {
-                    let place = at + u64::try_from(filled).unwrap_or(u64::MAX);
-                    match pread(&file, rest, place) {
-                        // The file was shortened while it was read: it
-                        // fails, never ended as if whole.
-                        Ok(0) => return Err(Failure::Unavailable),
-                        Ok(n) => filled += n,
-                        Err(Errno::INTR) => {}
-                        Err(e) => return Err(failure(e)),
+            let read = in_time(
+                &files,
+                move || {
+                    let mut buffer = vec![0_u8; room];
+                    let mut filled = 0_usize;
+                    while let Some(rest) = buffer.get_mut(filled..)
+                        && !rest.is_empty()
+                    {
+                        let place = at + u64::try_from(filled).unwrap_or(u64::MAX);
+                        match pread(&file, rest, place) {
+                            // The file was shortened while it was read: it
+                            // fails, never ended as if whole.
+                            Ok(0) => return Err(Failure::Unavailable),
+                            Ok(n) => filled += n,
+                            Err(Errno::INTR) => {}
+                            Err(e) => return Err(failure(e)),
+                        }
                     }
-                }
-                Ok(Bytes::from(buffer))
-            })
+                    Ok(Bytes::from(buffer))
+                },
+                Some(&self.application),
+            )
             .await;
             let step = match read {
                 Ok(bytes) => {
@@ -2267,6 +2341,7 @@ impl Root {
                         undoing.undo_now(prepared);
                     }
                 },
+                None,
             )
             .await
             .ok_or(Refused::Busy)?;
@@ -2308,7 +2383,7 @@ impl Root {
         };
         let undone = match files.hand_off(job(Arc::clone(self), Arc::clone(&slot))) {
             Some(answer) => Some(answer),
-            None => files.run(job(Arc::clone(self), slot)).await,
+            None => files.run(job(Arc::clone(self), slot), None).await,
         };
         match undone {
             Some(answer) => {

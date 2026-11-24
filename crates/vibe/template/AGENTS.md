@@ -17,6 +17,8 @@ This folder is one Application for the company's internal platform. The person y
 
 `fetch` to the outside is allowed only to the hosts the Platform administrators listed, over `https`; `vibe outbound` shows them. A call to any other host rejects with `Refused`, reason `host-not-listed`: report it to the Builder, who asks a Platform administrator to allow the host, and do not work around it. In the local run, the hosts are `outbound.hosts` in `vibe.dev.json`, which is the Builder's own list.
 
+An Application, all its requests together, has at most 128 file bodies open at once and 64 outbound calls under way at once, and at most 64 MiB in the arguments of calls not yet answered. A file operation or a `fetch` past its number waits about 5 seconds and then fails `unavailable`; a call whose arguments would pass the 64 MiB fails `unavailable` at once. When that happens while the Application is busy, the code holds too much open: read a body to its end or `cancel()` it, and do not keep bodies or answers open longer than the work needs.
+
 ## Commands
 
 Run them from this folder. Each has `--help` and `--json` (one JSON object on standard output); the exit code says how it ended: `0` done, `1` failed, `2` wrong command line, `3` refused or waiting for a person, `4` not signed in.

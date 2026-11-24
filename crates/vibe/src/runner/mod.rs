@@ -500,13 +500,14 @@ impl Engine {
         {
             let calls = Arc::clone(&host.in_flight.calls);
             let program = self.gateway.held_calls();
+            let application = Arc::clone(&host.in_flight.application);
             stream_manager.set_call_precheck(Arc::new(move |binding, size| {
                 if binding == crate::runner::host::PLATFORM_BINDING
                     || binding == crate::runner::host::FETCH_BINDING
                 {
                     return None;
                 }
-                calls.would_refuse(program.as_ref(), size)
+                calls.would_refuse(program.as_ref(), &application, size)
             }));
         }
         // The request's body is read only when the code (or the response)

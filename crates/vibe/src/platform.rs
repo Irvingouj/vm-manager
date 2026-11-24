@@ -77,7 +77,8 @@ impl Platform {
         itself: crate::outbound::Itself,
         vault: Option<Arc<crate::credentials::Vault>>,
     ) -> Result<Self, OpenError> {
-        let files = Files::start()
+        let mentions = Arc::new(crate::shares::Mentions::default());
+        let files = Files::start(Arc::clone(&mentions))
             .map_err(|e| OpenError::new(None, format!("cannot start the file threads: {e}")))?;
         let opened = Self::assemble(
             address,
@@ -85,6 +86,7 @@ impl Platform {
             storage_root,
             outbound_private,
             itself,
+            mentions,
             Arc::clone(&files),
             vault,
         )
@@ -95,12 +97,17 @@ impl Platform {
         opened
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the parts of one platform, each named: where it stores, what it limits, how it starts"
+    )]
     async fn assemble(
         address: &DatabaseAddress,
         limits: Limits,
         storage_root: Option<Root>,
         outbound_private: PrivateRanges,
         itself: crate::outbound::Itself,
+        mentions: Arc<crate::shares::Mentions>,
         files: Arc<Files>,
         vault: Option<Arc<crate::credentials::Vault>>,
     ) -> Result<Self, OpenError> {
@@ -199,7 +206,7 @@ impl Platform {
         let log = Arc::new(OperationLog::new(Arc::clone(&database)));
         let storage = Arc::new(Storage {
             files,
-            open: Arc::new(storage::Open::default()),
+            open: Arc::new(storage::Open::new(Arc::clone(&mentions))),
             cursors,
             root,
         });
@@ -211,6 +218,7 @@ impl Platform {
             Arc::clone(&outbound),
             outbound_private,
             itself,
+            mentions,
             tokio::runtime::Handle::current(),
         ));
         let as_gateway: Arc<dyn Gateway> = Arc::clone(&gateway) as Arc<dyn Gateway>;

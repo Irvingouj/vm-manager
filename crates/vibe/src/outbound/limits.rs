@@ -1,13 +1,17 @@
 //! How many calls are under way at once (blackbox/CONTRACT.md, "Outbound
 //! calls: Bounds"): 8 for one request, of which 64 more may wait their
 //! turn (a 73rd is `unavailable` at once), and 256 in the program, where a
-//! call that finds no place waits at most [`PROGRAM_WAIT`].
+//! call that finds no place waits at most [`PROGRAM_WAIT`]; and of those,
+//! 64 for one Application, waited for the same ("An Application's share of
+//! what the program holds").
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+
+use crate::shares::{Mentions, Places};
 
 /// Calls of one request under way at once.
 pub const PER_REQUEST: usize = 8;
@@ -18,6 +22,10 @@ pub const WAITING: usize = 64;
 
 /// Calls under way in the program.
 pub const IN_PROGRAM: usize = 256;
+
+/// Of them, at most this many for one Application ("An Application's share
+/// of what the program holds").
+pub const PER_APPLICATION: usize = 64;
 
 /// Names being resolved at once in the program, a lookup given up but not
 /// yet ended among them.
@@ -93,17 +101,25 @@ impl Drop for Enrolled {
     }
 }
 
-/// The program's 256 places.
+/// The program's 256 places, its 64 for one Application, and the lookups'
+/// 64 (16 for one Application).
 #[derive(Debug)]
 pub struct Program {
     places: Arc<Semaphore>,
+    share: Places,
     lookups: Lookups,
 }
 
-impl Default for Program {
-    fn default() -> Self {
+impl Program {
+    /// The program's places, sharing out `mentions` for `outbound-calls`.
+    pub fn new(mentions: Arc<Mentions>) -> Self {
         Self {
             places: Arc::new(Semaphore::new(IN_PROGRAM)),
+            share: Places::shared(
+                PER_APPLICATION,
+                mentions,
+                crate::shares::Kind::OutboundCalls,
+            ),
             lookups: Lookups::new(LOOKUPS, LOOKUPS_PER_APPLICATION),
         }
     }
@@ -120,89 +136,28 @@ fn system_resolver(
         .map_err(|_| NotResolved::Failed)
 }
 
-/// What one Application holds of the lookups: its own places, and how many
-/// lookups (waiting or under way) count on the entry, which goes when none
-/// does.
-#[derive(Debug)]
-struct Slot {
-    places: Arc<Semaphore>,
-    users: usize,
-}
-
 /// The names being resolved: at most `total` in the program and at most
 /// `per_application` for one Application, a lookup given up but not yet
 /// ended among them.
 #[derive(Debug)]
 pub struct Lookups {
     total: Arc<Semaphore>,
-    per_application: usize,
-    /// One entry for each Application with a lookup waiting or under way;
-    /// taken only for a moment, never across an await. At most as many
-    /// entries as lookups wait or run (the program's calls are bounded).
-    applications: Arc<std::sync::Mutex<std::collections::HashMap<String, Slot>>>,
-}
-
-/// An Application's count on its entry in [`Lookups`], given back when
-/// dropped (the entry goes with the last one).
-struct Counted {
-    applications: Arc<std::sync::Mutex<std::collections::HashMap<String, Slot>>>,
-    application: String,
-}
-
-impl Drop for Counted {
-    fn drop(&mut self) {
-        let mut applications = self
-            .applications
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(slot) = applications.get_mut(&self.application) {
-            slot.users = slot.users.saturating_sub(1);
-            if slot.users == 0 {
-                applications.remove(&self.application);
-            }
-        }
-    }
+    /// The Application's 16 places, taken before the program's 64.
+    places: Places,
 }
 
 impl Lookups {
     pub fn new(total: usize, per_application: usize) -> Self {
         Self {
             total: Arc::new(Semaphore::new(total)),
-            per_application,
-            applications: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            places: Places::new(per_application),
         }
     }
 
     /// How many Applications have an entry (for the tests).
     #[cfg(test)]
     fn entries(&self) -> usize {
-        self.applications
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .len()
-    }
-
-    /// Counts a lookup of `application` and returns its places' semaphore.
-    fn count(&self, application: &str) -> (Counted, Arc<Semaphore>) {
-        let mut applications = self
-            .applications
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let slot = applications
-            .entry(application.to_owned())
-            .or_insert_with(|| Slot {
-                places: Arc::new(Semaphore::new(self.per_application)),
-                users: 0,
-            });
-        slot.users += 1;
-        let places = Arc::clone(&slot.places);
-        (
-            Counted {
-                applications: Arc::clone(&self.applications),
-                application: application.to_owned(),
-            },
-            places,
-        )
+        self.places.entries()
     }
 
     /// The addresses `resolver` finds for `name`, at most `most`, before
@@ -218,7 +173,7 @@ impl Lookups {
     /// time) and owns nothing but its places and the name.
     pub async fn resolve<R>(
         &self,
-        application: &str,
+        application: &Arc<str>,
         name: &str,
         port: u16,
         most: usize,
@@ -228,13 +183,13 @@ impl Lookups {
     where
         R: FnOnce(&str, u16, usize) -> Result<Vec<std::net::IpAddr>, NotResolved> + Send + 'static,
     {
-        let (counted, places) = self.count(application);
         // The Application's own place first: one that is at its 16 does not
         // wait holding one of the program's.
-        let own = tokio::time::timeout_at(by, places.acquire_owned())
+        let own = self
+            .places
+            .place(application, by)
             .await
-            .map_err(|_| NotResolved::Time)?
-            .map_err(|_| NotResolved::Failed)?;
+            .ok_or(NotResolved::Time)?;
         let place = tokio::time::timeout_at(by, Arc::clone(&self.total).acquire_owned())
             .await
             .map_err(|_| NotResolved::Time)?
@@ -244,7 +199,6 @@ impl Lookups {
             let found = resolver(name.as_str(), port, most);
             drop(place);
             drop(own);
-            drop(counted);
             found
         });
         match tokio::time::timeout_at(by, lookup).await {
@@ -269,7 +223,7 @@ impl Program {
     /// `most`, resolved by the system before `by`; see [`Lookups::resolve`].
     pub async fn resolve(
         &self,
-        application: &str,
+        application: &Arc<str>,
         name: &str,
         port: u16,
         most: usize,
@@ -280,13 +234,33 @@ impl Program {
             .await
     }
 
-    /// A place, waiting up to [`PROGRAM_WAIT`]; `None` when there is none.
-    pub async fn place(&self) -> Option<OwnedSemaphorePermit> {
-        tokio::time::timeout(PROGRAM_WAIT, Arc::clone(&self.places).acquire_owned())
+    /// A place among the program's [`IN_PROGRAM`] and its Application's
+    /// [`PER_APPLICATION`], the Application's first, waiting up to
+    /// [`PROGRAM_WAIT`] for both in all; `None` when there is none then
+    /// (and one `share-full` record when it was the Application's share
+    /// that had none).
+    pub async fn place(&self, application: &Arc<str>) -> Option<Held> {
+        let by = tokio::time::Instant::now() + PROGRAM_WAIT;
+        // The Application's own place first: one that is at its 64 does
+        // not wait holding one of the program's.
+        let share = self.share.place(application, by).await?;
+        let place = tokio::time::timeout_at(by, Arc::clone(&self.places).acquire_owned())
             .await
             .ok()?
-            .ok()
+            .ok()?;
+        Some(Held {
+            _share: share,
+            _place: place,
+        })
     }
+}
+
+/// A call's place among its Application's 64 and the program's 256, given
+/// back when dropped.
+#[derive(Debug)]
+pub struct Held {
+    _share: crate::shares::Place,
+    _place: OwnedSemaphorePermit,
 }
 
 #[cfg(test)]
@@ -338,9 +312,13 @@ mod tests {
         tokio::time::Instant::now() + Duration::from_millis(millis)
     }
 
+    fn app(name: &str) -> Arc<str> {
+        Arc::from(name)
+    }
+
     /// Starts a lookup of `application` that hangs until released, and
     /// gives up on it at once (as a call whose time ran out does).
-    async fn hang(lookups: &Arc<Lookups>, application: &str) -> Release {
+    async fn hang(lookups: &Arc<Lookups>, application: &Arc<str>) -> Release {
         let (release, wait) = std_mpsc::sync_channel::<()>(1);
         // A resolver that hangs until released, then answers one address.
         let resolver = move |_: &str, _: u16, _: usize| {
@@ -348,7 +326,7 @@ mod tests {
             Ok(vec![IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))])
         };
         let lookups = Arc::clone(lookups);
-        let application = application.to_owned();
+        let application = Arc::clone(application);
         let call = tokio::spawn(async move {
             lookups
                 .resolve(&application, "x.example.com", 443, 16, soon(50), resolver)
@@ -364,12 +342,12 @@ mod tests {
         let lookups = Arc::new(Lookups::new(LOOKUPS, LOOKUPS_PER_APPLICATION));
         let mut held = Vec::new();
         for _ in 0..16 {
-            held.push(hang(&lookups, "a").await);
+            held.push(hang(&lookups, &app("a")).await);
         }
         // The 17th of A finds no room: `Time` after its time, not before.
         let began = Wall::now();
         let seventeenth = lookups
-            .resolve("a", "x.example.com", 443, 16, soon(300), answering)
+            .resolve(&app("a"), "x.example.com", 443, 16, soon(300), answering)
             .await;
         assert_eq!(seventeenth, Err(NotResolved::Time));
         assert!(
@@ -380,7 +358,7 @@ mod tests {
         // Meanwhile B is answered at once.
         let began = Wall::now();
         let other = lookups
-            .resolve("b", "x.example.com", 443, 16, soon(5_000), answering)
+            .resolve(&app("b"), "x.example.com", 443, 16, soon(5_000), answering)
             .await;
         assert!(other.is_ok(), "B is answered");
         assert!(began.elapsed() < Duration::from_millis(250));
@@ -392,12 +370,13 @@ mod tests {
         let lookups = Arc::new(Lookups::new(LOOKUPS, LOOKUPS_PER_APPLICATION));
         let mut held = Vec::new();
         for application in ["a", "b", "c", "d"] {
+            let application = app(application);
             for _ in 0..16 {
-                held.push(hang(&lookups, application).await);
+                held.push(hang(&lookups, &application).await);
             }
         }
         let fifth = lookups
-            .resolve("e", "x.example.com", 443, 16, soon(200), answering)
+            .resolve(&app("e"), "x.example.com", 443, 16, soon(200), answering)
             .await;
         assert_eq!(fifth, Err(NotResolved::Time), "the program's 64 are held");
         drop(held);
@@ -406,11 +385,11 @@ mod tests {
     #[tokio::test]
     async fn a_lookup_given_up_keeps_its_places_until_the_resolver_returns_and_nothing_is_left() {
         let lookups = Arc::new(Lookups::new(2, 1));
-        let release = hang(&lookups, "a").await;
+        let release = hang(&lookups, &app("a")).await;
         // Given up, still counted for A: A's next finds no room.
         assert_eq!(
             lookups
-                .resolve("a", "x", 443, 16, soon(100), answering)
+                .resolve(&app("a"), "x", 443, 16, soon(100), answering)
                 .await,
             Err(NotResolved::Time)
         );
@@ -420,7 +399,7 @@ mod tests {
         let mut freed = false;
         for _ in 0..100 {
             if lookups
-                .resolve("a", "x", 443, 16, soon(100), answering)
+                .resolve(&app("a"), "x", 443, 16, soon(100), answering)
                 .await
                 .is_ok()
             {

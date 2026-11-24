@@ -32,7 +32,8 @@
 //!    open at once held by the pump that feeds it), a `put` when it has
 //!    landed or failed.
 //!
-//! The bounds of bodies open at once (16 a request, 512 the program)
+//! The bounds of bodies open at once (16 a request, 128 an Application,
+//! 512 the program)
 //! are the request's [`Bodies`] (crate::runner::InFlight) and the
 //! program's [`Open`] (crate::storage::Storage): an operation that opens
 //! one waits up to [`WAIT`] for a place, then fails `unavailable`.
@@ -388,7 +389,9 @@ impl PlatformGateway {
         // reach the registry in their own order; one that finds none free
         // waits in its task (up to [`WAIT`], ended by the request's end).
         let pre_taken = match (refusal.is_none(), op.opens_a_body()) {
-            (true, true) => in_flight.bodies.try_guard(&self.storage.open),
+            (true, true) => in_flight
+                .bodies
+                .try_guard(&self.storage.open, &in_flight.application),
             _ => None,
         };
         // A stream the glue named is the put's from here on, inside the
@@ -648,7 +651,12 @@ impl StorageWork {
             false => None,
             true => match self.pre_taken.take() {
                 Some(guard) => Some(Arc::new(guard)),
-                None => match self.in_flight.bodies.guard(&self.storage.open).await {
+                None => match self
+                    .in_flight
+                    .bodies
+                    .guard(&self.storage.open, &self.in_flight.application)
+                    .await
+                {
                     Place::Made(guard) => Some(Arc::new(guard)),
                     Place::Ended => {
                         let error = ended_why(&self.in_flight);
@@ -934,6 +942,7 @@ impl StorageWork {
         // staging file until it has ended its body, and it counts among the
         // files open at once until then.
         let place = guard.as_ref().map(Arc::clone);
+        let application = Arc::clone(&self.in_flight.application);
         let task = tokio::spawn(async move {
             let Some(backend) = resource.storage() else {
                 return;
@@ -946,7 +955,9 @@ impl StorageWork {
                 source,
                 content_type,
             } = put;
-            let answer = backend.put(key, source, content_type, given_up).await;
+            let answer = backend
+                .put(key, source, content_type, given_up, &application)
+                .await;
             // Given back before the answer goes: the code's next operation
             // finds the place free.
             drop(place);
@@ -1054,14 +1065,18 @@ impl StorageWork {
         checked: Checked,
         until: Until,
     ) -> Result<Done, Failure> {
+        let application = &self.in_flight.application;
         match checked {
-            Checked::Head(key) => backend.head(key, until).await.map(Done::Head),
-            Checked::Get(key) => backend.get(key, until).await.map(Done::Get),
-            Checked::Delete(key) => backend.delete(key, until).await.map(|()| Done::Delete),
+            Checked::Head(key) => backend.head(key, until, application).await.map(Done::Head),
+            Checked::Get(key) => backend.get(key, until, application).await.map(Done::Get),
+            Checked::Delete(key) => backend
+                .delete(key, until, application)
+                .await
+                .map(|()| Done::Delete),
             Checked::List(query) => {
                 let prefix = query.prefix.clone();
                 let delimiter = query.delimiter;
-                let page = backend.list(query, until).await?;
+                let page = backend.list(query, until, application).await?;
                 // Sealed for this Resource, prefix and delimiter.
                 let cursor = page.next.as_ref().map(|next| {
                     self.storage.cursors.seal(

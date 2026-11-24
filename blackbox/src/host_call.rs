@@ -57,8 +57,73 @@ impl Calls {
         Self { own }
     }
 
+    /// As [`Calls::start`], and these Applications besides [`APP`], each
+    /// the same fixture with an own database of its own (the program's
+    /// shares are an Application's: a test of them needs several).
+    pub fn start_with(more: &[&str]) -> Self {
+        let h = Self::start();
+        for name in more {
+            h.own.create(name);
+            let body =
+                version_body_with_migrations(&fixture_bundle(FIXTURE), &[], &[first_tables()]);
+            let sent = h.own.send_body(name, &body);
+            if sent.status != 201 {
+                h.own.vm.fail(&format!(
+                    "expected `201` sending {FIXTURE} as a Version of {name:?}, got\n{}",
+                    sent.describe()
+                ));
+            }
+        }
+        h
+    }
+
     pub fn user() -> User {
         User::new("alice")
+    }
+
+    /// `POST <path>` on the Application `application` as `user`, whatever
+    /// the answer.
+    pub fn send_to(&self, application: &str, user: &User, path: &str, body: &Value) -> Response {
+        self.own
+            .vm
+            .request(application, path)
+            .as_user(user)
+            .method("POST")
+            .json(body)
+            .timeout(TIMEOUT)
+            .send()
+    }
+
+    /// As [`Calls::post_as`], on `application`.
+    pub fn post_to(
+        &self,
+        application: &str,
+        user: &User,
+        path: &str,
+        body: &Value,
+    ) -> (Response, Value) {
+        let response = self.send_to(application, user, path, body);
+        if response.status != 200 {
+            self.own.vm.fail(&format!(
+                "expected `200` from {application:?} {path} as {:?}, got\n{}",
+                user.id,
+                response.describe()
+            ));
+        }
+        let json = response.json();
+        (response, json)
+    }
+
+    /// As [`Calls::seq`], on `application`.
+    pub fn seq_on(&self, application: &str, calls: &[Value]) -> (Response, Vec<Value>) {
+        let (response, body) = self.post_to(
+            application,
+            &Self::user(),
+            "/seq",
+            &json!({ "calls": calls }),
+        );
+        let results = self.results(&body, "results");
+        (response, results)
     }
 
     /// `POST <path>` with this body as `user`, whatever the answer.
