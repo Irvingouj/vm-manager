@@ -5,7 +5,12 @@
 //! statement, user id and reason; a Resource's description, owner, contact
 //! and Groups; a filter's value; markup in an alias of a statement, since
 //! a statement is recorded without its values): a description of `<script>alert(1)</script>`
-//! is shown as those characters, never as markup.
+//! is shown as those characters, never as markup. On a Resource's page and
+//! the pages of its Grants ("Resources and Grants in full: The Dashboard: a
+//! Resource's page and its Grants"): the page itself, the page that confirms
+//! a revoke, the notice of `?changed=` and the field error of a form not
+//! taken, each with a Group and a description made of markup, and a Group
+//! kept in its field.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -15,8 +20,13 @@
 )]
 
 use blackbox::User;
-use blackbox::admin_pages::{APPLICATIONS, OPERATION_LOG, RESOURCES, disable_target, log_target};
-use blackbox::dashboard::{Dashboard, administrator, create, deploy, stand_in_options};
+use blackbox::admin_pages::{
+    APPLICATIONS, OPERATION_LOG, RESOURCES, changed_target, disable_target, field_errors,
+    grants_target, group_typed, log_target, resource_target, revoke_page_target, revoke_target,
+};
+use blackbox::dashboard::{
+    Dashboard, Page, administrator, create, deploy, form_body, stand_in_options,
+};
 use blackbox::scenario::{READERS, RESOURCE};
 use blackbox::sharing::{add, group, share_ok};
 use blackbox::transactions::{APP, Target, Txs, outside};
@@ -105,6 +115,23 @@ fn every_text_of_an_application_an_entry_and_a_resource_is_escaped_on_every_page
             RESOURCES.to_owned(),
             vec![RESOURCE_DESCRIPTION, OWNER, CONTACT, GROUP],
         ),
+        (
+            resource_target("hostile_res"),
+            vec![RESOURCE_DESCRIPTION, OWNER, CONTACT, GROUP],
+        ),
+        (
+            revoke_page_target("hostile_res", GROUP),
+            vec![GROUP, "hostile_res"],
+        ),
+        (
+            changed_target("hostile_res", "granted", GROUP),
+            vec![GROUP, RESOURCE_DESCRIPTION],
+        ),
+        (changed_target("hostile_res", "revoked", GROUP), vec![GROUP]),
+        (
+            revoke_page_target("hostile_res", "<i>nobody</i> & 'x'"),
+            vec!["<i>nobody</i> & 'x'"],
+        ),
     ];
     for (target, shown) in pages {
         let page = dashboard.page(&target, 200, &target);
@@ -133,4 +160,74 @@ fn every_text_of_an_application_an_entry_and_a_resource_is_escaped_on_every_page
         "the hostile Group's Grant, its attribute holding it exactly\n{}",
         page.describe()
     );
+    // The same on the Resource's page, with its link to revoke it and the
+    // confirmation's hidden field and attributes.
+    let page = dashboard.page(&resource_target("hostile_res"), 200, "the Resource's page");
+    assert_eq!(
+        page.root().with_attr_value("data-vm-grant", GROUP).len(),
+        1,
+        "the hostile Group's Grant on the Resource's page, its attribute holding it exactly\n{}",
+        page.describe()
+    );
+    let confirm = dashboard.page(
+        &revoke_page_target("hostile_res", GROUP),
+        200,
+        "the confirmation",
+    );
+    assert_eq!(
+        confirm.root().with_attr_value("data-vm-group", GROUP).len(),
+        1,
+        "`data-vm-group` holds the Group exactly\n{}",
+        confirm.describe()
+    );
+    let forms = confirm.forms_of("revoke");
+    assert_eq!(forms.len(), 1);
+    assert_eq!(
+        forms[0].hidden("group"),
+        Some(GROUP),
+        "the hidden field holds the Group exactly"
+    );
+    // A form not taken keeps what was typed, escaped, and its error is
+    // plain text.
+    let answer = dashboard.post_form(
+        &grants_target("hostile_res"),
+        &form_body(&[("group", GROUP), ("access", STATEMENT_MARK)]),
+    );
+    assert_eq!(answer.status, 400, "{}", answer.describe());
+    let refused = Page::read(
+        answer,
+        dashboard.url(&grants_target("hostile_res")),
+        "a field error",
+    );
+    let html = refused.response.text();
+    for raw in RAW.iter().chain([STATEMENT_MARK].iter()) {
+        assert!(
+            !html.contains(raw),
+            "the field error's page: expected everything typed escaped, but it holds {raw:?}\n{html}"
+        );
+    }
+    assert_eq!(
+        group_typed(&refused).as_deref(),
+        Some(GROUP),
+        "the Group in its field, exactly\n{}",
+        refused.describe()
+    );
+    assert!(
+        !field_errors(&refused).is_empty(),
+        "an error beside the field\n{}",
+        refused.describe()
+    );
+    assert!(
+        refused.body_text().contains(GROUP) || group_typed(&refused).is_some(),
+        "the Group is shown as those characters"
+    );
+    // A Group given in the body of a revoke that is not taken is not echoed
+    // as markup either.
+    let answer = dashboard.post_form(
+        &revoke_target("hostile_res"),
+        &form_body(&[("group", "<script>alert(2)</script>"), ("group", GROUP)]),
+    );
+    assert_eq!(answer.status, 400, "{}", answer.describe());
+    let html = answer.text();
+    assert!(!html.contains("<script>alert"), "{html}");
 }

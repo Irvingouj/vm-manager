@@ -21,14 +21,17 @@ use serde_json::Value;
 use url::form_urlencoded;
 
 use super::pages::{self, Person, Viewer, disabled_mark, not_deployed, thousands, when};
-use crate::api::LogQuery;
+use crate::api::{AdminResourceView, LogQuery};
 use crate::oidc::connection::Stored;
 use crate::oidc::pages::escape;
 use crate::registry::AdminApplication;
-use crate::resources::{Resource, level_name};
+use crate::resources::level_name;
 use crate::theme::{self, CHEVRON, Icon, Layout, Mark};
 
 type Answer = hyper::Response<http_body_util::Full<bytes::Bytes>>;
+
+/// The list of Resources, and every path under it.
+const RESOURCES_PATH: &str = "/admin/resources";
 
 /// The mark of a Resource of `kind`: a Storage Resource's is files', a
 /// database's a cylinder (blackbox/CONTRACT.md, "The tool and the
@@ -1143,22 +1146,54 @@ pub(crate) fn outbound(viewer: &Viewer<'_>, entries: &[crate::outbound::Kept]) -
     section_page(StatusCode::OK, viewer, Section::Outbound, "Outbound", &main)
 }
 
-/// `GET /admin/resources`: every Resource with its Grants, read only.
-pub(crate) fn resources(viewer: &Viewer<'_>, all: &[std::sync::Arc<Resource>]) -> Answer {
+/// `GET /admin/resources`: one page of every Resource as `GET
+/// /v1/admin/resources` answers it, each with the first 200 of its Grants.
+pub(crate) fn resources(
+    viewer: &Viewer<'_>,
+    read: &crate::api::AdminResourcesView,
+    after: Option<&str>,
+) -> Answer {
     let mut main = String::from("<h1 class=\"page-title\">Resources and Grants</h1>");
-    if all.is_empty() {
-        main.push_str(
-            "<div class=\"empty\"><p class=\"first\">No Resource is registered yet.</p>\
-             <p>A Platform administrator registers one on the platform's API.</p></div>",
-        );
+    if read.resources.is_empty() {
+        if after.is_some() {
+            main.push_str(
+                "<div class=\"empty\"><p class=\"first\">There is no Resource after this place in the list.</p></div>",
+            );
+        } else {
+            main.push_str(
+                "<div class=\"empty\"><p class=\"first\">No Resource is registered yet.</p>\
+                 <p>A Platform administrator registers one with <code>vibe admin resource register</code>.</p></div>",
+            );
+        }
     } else {
         main.push_str(
-            "<p class=\"lead\">Read only: Grants are given and Resources registered on the platform's API for now.</p><ul class=\"apps\">",
+            "<p class=\"lead\">A Group's access is given, changed and revoked on a Resource's page; a Resource is registered with <code>vibe admin resource register</code>.</p><ul class=\"apps\">",
         );
-        for resource in all {
-            resource_card(&mut main, resource);
+        for view in &read.resources {
+            resource_card(&mut main, view);
         }
         main.push_str("</ul>");
+    }
+    if after.is_some() || read.next.is_some() {
+        main.push_str("<nav class=\"pages\" aria-label=\"Pages\">");
+        if after.is_some() {
+            write!(
+                main,
+                "<a class=\"btn\" data-vm-first href=\"{RESOURCES_PATH}\">{}The first page</a>",
+                Icon::Back.svg()
+            )
+            .ok();
+        }
+        if let Some(next) = &read.next {
+            write!(
+                main,
+                "<a class=\"btn next\" data-vm-next href=\"{RESOURCES_PATH}?after={}\">Next page{}</a>",
+                escape(&form_urlencoded::byte_serialize(next.as_bytes()).collect::<String>()),
+                Icon::Forward.svg()
+            )
+            .ok();
+        }
+        main.push_str("</nav>");
     }
     section_page(
         StatusCode::OK,
@@ -1169,41 +1204,93 @@ pub(crate) fn resources(viewer: &Viewer<'_>, all: &[std::sync::Arc<Resource>]) -
     )
 }
 
-/// One Resource: its name, description and Grants, and one step away
-/// whose it is and its Operation log.
-fn resource_card(out: &mut String, resource: &Resource) {
-    let name = escape(&resource.name);
-    let kind = resource.kind.name();
+/// `400`: an `after` the API would refuse.
+pub(crate) fn resources_not_a_place(viewer: &Viewer<'_>) -> Answer {
+    section_page(
+        StatusCode::BAD_REQUEST,
+        viewer,
+        Section::Resources,
+        "Resources and Grants",
+        &format!(
+            "<h1 class=\"page-title\">Resources and Grants</h1>{}\
+             <nav class=\"pages\" aria-label=\"Pages\"><a class=\"btn\" data-vm-first href=\"{RESOURCES_PATH}\">{}The first page</a></nav>",
+            theme::notice(
+                Mark::Error,
+                "data-vm-error=\"malformed\" role=\"alert\"",
+                "This address does not name a place in the list: it names no Resource that could be."
+            ),
+            Icon::Back.svg()
+        ),
+    )
+}
+
+/// `404`: no Resource of that name (also a name none could have).
+pub(crate) fn no_resource(viewer: &Viewer<'_>, name: &str) -> Answer {
+    let name = escape(name);
+    section_page(
+        StatusCode::NOT_FOUND,
+        viewer,
+        Section::Resources,
+        "No such Resource",
+        &format!(
+            "<h1 class=\"page-title\">No such Resource</h1>\
+             <p data-vm-error=\"not-found\" role=\"alert\">There is no Resource named <code>{name}</code>.</p>\
+             <div class=\"actions\"><a class=\"btn primary\" data-vm-back href=\"{RESOURCES_PATH}\">{}Every Resource</a></div>",
+            Icon::Back.svg()
+        ),
+    )
+}
+
+/// One Resource of the list: its name (the link to its page), its kind, its
+/// description, whether it is usable and its first 200 Grants.
+fn resource_card(out: &mut String, view: &AdminResourceView) {
+    let name = escape(&view.name);
+    let kind = view.kind;
+    let unusable = view.problem.map_or_else(String::new, |problem| {
+        format!(" data-vm-unusable=\"{}\"", escape(problem))
+    });
+    let mark = if view.problem.is_some() {
+        format!(
+            "<span class=\"pill err\">{}Not usable</span>",
+            Icon::Cross.svg()
+        )
+    } else {
+        String::new()
+    };
     write!(
         out,
-        "<li><article class=\"card res-card\" data-vm-resource=\"{name}\" data-vm-kind=\"{kind}\"><h2>{}<code>{name}</code></h2>",
-        kind_icon(Some(kind)).svg()
+        "<li><article class=\"card res-card\" data-vm-resource=\"{name}\" data-vm-kind=\"{kind}\"{unusable}><h2>{}<a class=\"name\" data-vm-details href=\"{RESOURCES_PATH}/{}\"><code>{name}</code></a>{mark}</h2>",
+        kind_icon(Some(kind)).svg(),
+        crate::resources::encode_segment(&view.name),
     ).ok();
-    if !resource.description().is_empty() {
-        write!(
-            out,
-            "<p class=\"desc\">{}</p>",
-            escape(&resource.description())
-        )
-        .ok();
+    if !view.description.is_empty() {
+        write!(out, "<p class=\"desc\">{}</p>", escape(&view.description)).ok();
     }
-    let grants = resource.grants().unwrap_or_default();
-    if grants.is_empty() {
+    if view.grants.is_empty() {
         out.push_str(
             "<p class=\"soft\">No Group holds a Grant on it, so nobody's request reaches it.</p>",
         );
     } else {
         out.push_str("<ul class=\"grants\" aria-label=\"Grants\">");
-        for entry in &grants {
-            let group = escape(&entry.group);
-            let level = level_name(entry.level);
+        for grant in &view.grants {
             write!(
                 out,
-                "<li data-vm-grant=\"{group}\" data-vm-access=\"{level}\">{}<span class=\"g\">{group}</span> <span class=\"lv-pill\">{level}</span></li>",
-                theme::icon(Icon::Group, "The Group")
+                "<li data-vm-grant=\"{}\" data-vm-access=\"{}\">{}<span class=\"g\">{}</span> <span class=\"lv-pill\">{}</span></li>",
+                escape(&grant.group),
+                grant.access,
+                theme::icon(Icon::Group, "The Group"),
+                escape(&grant.group),
+                grant.access,
             ).ok();
         }
         out.push_str("</ul>");
+        if view.grants_more > 0 {
+            write!(
+                out,
+                "<p class=\"soft\" data-vm-grants-more=\"{}\">And {} more: the Resource's page has them all.</p>",
+                view.grants_more, view.grants_more
+            ).ok();
+        }
     }
     write!(
         out,
@@ -1211,15 +1298,426 @@ fn resource_card(out: &mut String, resource: &Resource) {
          <dt>Owner</dt><dd data-vm-owner>{}</dd><dt>Ask</dt><dd data-vm-contact>{}</dd><dt>Kind</dt><dd>{}</dd>\
          <dt>Registered</dt><dd>by <code class=\"id\">{}</code> on <time datetime=\"{}\">{}</time></dd></dl>\
          <a data-vm-operation-log href=\"/admin/operation-log?resource={}\">{}Its Operation log</a></details></article></li>",
-        escape(&resource.owner()),
-        escape(&resource.contact()),
+        escape(&view.owner),
+        escape(&view.contact),
         kind_words(Some(kind)),
-        escape(&resource.created_by),
-        escape(&resource.created_at),
-        escape(&when(&resource.created_at)),
-        escape(&form_urlencoded::byte_serialize(resource.name.as_bytes()).collect::<String>()),
+        escape(&view.created_by),
+        escape(&view.created_at),
+        escape(&when(&view.created_at)),
+        escape(&form_urlencoded::byte_serialize(view.name.as_bytes()).collect::<String>()),
         Icon::Log.svg()
     ).ok();
+}
+
+/// The fields of the form that sets a Grant, as the page shows them again
+/// after a field was not taken: what was typed, and the errors beside the
+/// fields.
+#[derive(Default)]
+pub(crate) struct GrantForm {
+    pub(crate) group: String,
+    pub(crate) access: Option<String>,
+    pub(crate) group_error: Option<String>,
+    pub(crate) access_error: Option<String>,
+}
+
+/// `GET /admin/resources/<name>`: the Resource, every Grant of it and the
+/// form that sets one.
+pub(crate) fn resource_page(
+    viewer: &Viewer<'_>,
+    read: &crate::api::AdminResourcePage,
+    status: StatusCode,
+    notice: Option<(&str, &str)>,
+    form: &GrantForm,
+) -> Answer {
+    let name = escape(&read.name);
+    let kind = read.kind;
+    let mut main = format!("<h1 class=\"page-title\">{name}</h1>");
+    if let Some((changed, group)) = notice {
+        main.push_str(&notice_html(changed, group));
+    }
+    write!(
+        main,
+        "<article class=\"card res-card\" data-vm-resource=\"{name}\" data-vm-kind=\"{kind}\">"
+    )
+    .ok();
+    write!(main, "<p class=\"over\">{}</p>", kind_words(Some(kind))).ok();
+    if !read.description.is_empty() {
+        write!(main, "<p class=\"desc\">{}</p>", escape(&read.description)).ok();
+    }
+    if let Some(problem) = read.problem {
+        main.push_str(&theme::notice(
+            Mark::Error,
+            &format!("data-vm-unusable=\"{}\"", escape(problem)),
+            &unusable_words(problem, &read.name),
+        ));
+    }
+    main.push_str("</article>");
+
+    // Its Grants.
+    main.push_str("<section class=\"section\"><h2 id=\"grants-heading\">Grants</h2>");
+    if read.grants.is_empty() {
+        main.push_str(
+            "<p data-vm-empty>No Group holds a Grant on this Resource, so nobody's request reaches it.</p>",
+        );
+    } else {
+        main.push_str("<ul class=\"rows grants-list\" aria-labelledby=\"grants-heading\">");
+        for grant in &read.grants {
+            write!(main, "{}", grant_row(&read.name, grant)).ok();
+        }
+        main.push_str("</ul>");
+    }
+    if read.grants_more > 0 {
+        write!(
+            main,
+            "<p class=\"soft\" data-vm-grants-more=\"{}\">And {} more: <code>vibe admin revoke</code> takes one by its Group's name.</p>",
+            read.grants_more, read.grants_more
+        )
+        .ok();
+    }
+    main.push_str("</section>");
+
+    // The form that sets one: no heading (the form is named for a screen
+    // reader), the same gap between groups as above.
+    main.push_str("<div class=\"section\">");
+    main.push_str(&grant_form(&read.name, read.kind, form));
+    main.push_str("</div>");
+
+    // One step away.
+    main.push_str(&resource_details(read));
+    main.push_str(&format!(
+        "<div class=\"actions\"><a class=\"btn quiet back\" data-vm-back href=\"{RESOURCES_PATH}\">{}Back to the Resources</a></div>",
+        Icon::Back.svg()
+    ));
+    section_page(status, viewer, Section::Resources, &name, &main)
+}
+
+/// One Grant of a Resource's page: the Group, its level, who set it and
+/// when (or "not recorded"), and the link that confirms its revoke.
+fn grant_row(resource_name: &str, grant: &crate::resources::GrantEntry) -> String {
+    let group = escape(&grant.group);
+    let access = level_name(grant.level);
+    let (attributes, who) = match (&grant.granted_by, &grant.granted_at) {
+        (Some(by), Some(at)) => (
+            format!(
+                " data-vm-granted-by=\"{}\" data-vm-granted-at=\"{}\"",
+                escape(by),
+                escape(at)
+            ),
+            format!(
+                "set by <code class=\"id\">{}</code> on <time datetime=\"{}\">{}</time>",
+                escape(by),
+                escape(at),
+                escape(&when(at))
+            ),
+        ),
+        _ => (String::new(), "not recorded".to_owned()),
+    };
+    format!(
+        "<li class=\"grant-row\" data-vm-grant=\"{group}\" data-vm-access=\"{access}\"{attributes}><span class=\"grant-name\">{}<span class=\"g\">{group}</span></span><span class=\"lv-pill\">{access}</span><span class=\"grant-who\">{who}</span><a class=\"btn quiet danger\" data-vm-revoke href=\"{RESOURCES_PATH}/{}/revoke?group={}\" aria-label=\"Revoke {group}\">{}<span>Revoke</span></a></li>",
+        theme::icon(Icon::Group, "The Group"),
+        crate::resources::encode_segment(resource_name),
+        crate::resources::encode_segment(&grant.group),
+        Icon::Cross.svg(),
+    )
+}
+
+/// The form that sets a Grant on a Resource.
+fn grant_form(resource_name: &str, kind: &str, form: &GrantForm) -> String {
+    let name = escape(resource_name);
+    let levels: &[(&str, &str)] = if kind == "storage" {
+        &[("read", "Read"), ("write", "Write")]
+    } else {
+        &[
+            ("structure", "Structure"),
+            ("read", "Read"),
+            ("write", "Write"),
+        ]
+    };
+    let mut options = String::new();
+    for (value, words) in levels {
+        let selected = if form.access.as_deref() == Some(*value) {
+            " selected"
+        } else {
+            ""
+        };
+        write!(
+            options,
+            "<option value=\"{value}\"{selected}>{words}</option>"
+        )
+        .ok();
+    }
+    let group_error = form
+        .group_error
+        .as_ref()
+        .map_or_else(String::new, |words| field_error("group", words));
+    let access_error = form
+        .access_error
+        .as_ref()
+        .map_or_else(String::new, |words| field_error("access", words));
+    format!(
+        "<form class=\"card\" data-vm-form=\"grant\" aria-label=\"Access for a Group\" method=\"post\" action=\"{RESOURCES_PATH}/{name}/grants\">\
+         <div class=\"field\"><label for=\"group\">Group</label>\
+         <p class=\"help\" id=\"group-help\">Written exactly as the company's directory names it.</p>\
+         <div class=\"control\"><input id=\"group\" type=\"text\" name=\"group\" value=\"{}\" autocomplete=\"off\" spellcheck=\"false\" aria-describedby=\"group-help{}\"{}></div>{group_error}</div>\
+         <div class=\"field\"><label for=\"access\">Access</label>\
+         <div class=\"control\"><select id=\"access\" name=\"access\" aria-describedby=\"access-help{}\"{}>{options}</select>{CHEVRON}</div>\
+         {access_error}</div>\
+         <p class=\"help\" id=\"access-help\">Giving a Group that holds a Grant another level changes it. A Grant holds at once in every Application.</p>\
+         <div class=\"form-actions\"><button type=\"submit\" class=\"primary\">Set access</button></div></form>",
+        escape(&form.group),
+        if form.group_error.is_some() {
+            " group-error"
+        } else {
+            ""
+        },
+        if form.group_error.is_some() {
+            " aria-invalid=\"true\""
+        } else {
+            ""
+        },
+        if form.access_error.is_some() {
+            " access-error"
+        } else {
+            ""
+        },
+        if form.access_error.is_some() {
+            " aria-invalid=\"true\""
+        } else {
+            ""
+        },
+    )
+}
+
+fn field_error(field: &str, words: &str) -> String {
+    format!(
+        "<p class=\"field-error\" id=\"{field}-error\" data-vm-field-error=\"{field}\">{}<span>{}</span></p>",
+        Icon::Cross.svg(),
+        escape(words)
+    )
+}
+
+/// What is wrong with a Resource that is not usable, in words for a person,
+/// and what puts it right.
+fn unusable_words(problem: &str, name: &str) -> String {
+    match problem {
+        "no-secret-key" => "Not usable: the program was started without its key. Start it with VIBE_SECRET_KEY and the Resource is served.".to_owned(),
+        "does-not-open" | "not-sealed" => format!(
+            "Not usable: its logins cannot be read. Supply them again with <code>vibe admin resource logins {}</code>.",
+            escape(name)
+        ),
+        other => format!(
+            "Not usable: the directory cannot be used ({}). Fix the directory beneath the storage root.",
+            escape(other)
+        ),
+    }
+}
+
+/// One step away on a Resource's page: its owner, whom to ask, its
+/// registration, its logins or its location, and its Operation log.
+fn resource_details(read: &crate::api::AdminResourcePage) -> String {
+    let mut facts = format!(
+        "<dt>Owner</dt><dd data-vm-owner>{}</dd><dt>Ask</dt><dd data-vm-contact>{}</dd>\
+         <dt>Registered</dt><dd>by <code class=\"id\">{}</code> on <time datetime=\"{}\">{}</time></dd>",
+        escape(&read.owner),
+        escape(&read.contact),
+        escape(&read.created_by),
+        escape(&read.created_at),
+        escape(&when(&read.created_at)),
+    );
+    if let Some(logins) = &read.logins {
+        let mut held = String::new();
+        for (login, has) in [
+            ("read", logins.read),
+            ("write", logins.write),
+            ("structure", logins.structure),
+        ] {
+            if has {
+                write!(
+                    held,
+                    "<span class=\"pill\" data-vm-login=\"{login}\">{login}</span> "
+                )
+                .ok();
+            }
+        }
+        write!(facts, "<dt>Logins</dt><dd>{}</dd>", held.trim_end()).ok();
+    }
+    if let Some(location) = &read.location {
+        write!(
+            facts,
+            "<dt>Location</dt><dd data-vm-location>{}</dd>",
+            escape(&location.directory)
+        )
+        .ok();
+    }
+    format!(
+        "<details class=\"more page-details\"><summary>Details</summary><dl class=\"facts big\">{facts}</dl>\
+         <a data-vm-operation-log href=\"/admin/operation-log?resource={}\">{}Its Operation log</a></details>",
+        escape(&form_urlencoded::byte_serialize(read.name.as_bytes()).collect::<String>()),
+        Icon::Log.svg()
+    )
+}
+
+/// The notice of `?changed=` on a Resource's page.
+fn notice_html(changed: &str, group: &str) -> String {
+    let group = escape(group);
+    let (attributes, words) = match changed {
+        "granted" => (
+            "data-vm-notice=\"granted\" role=\"status\"",
+            format!("The Group <code>{group}</code> was given access."),
+        ),
+        "changed" => (
+            "data-vm-notice=\"changed\" role=\"status\"",
+            format!("The Group <code>{group}</code>'s access was changed."),
+        ),
+        "revoked" => (
+            "data-vm-notice=\"revoked\" role=\"status\"",
+            format!("The Group <code>{group}</code>'s access was revoked."),
+        ),
+        _ => (
+            "data-vm-notice=\"nothing\" role=\"status\"",
+            format!("The Group <code>{group}</code> already held it: nothing changed."),
+        ),
+    };
+    theme::notice(Mark::Info, attributes, &words)
+}
+
+/// The page that confirms revoking `group`'s Grant: its level and what a
+/// revoke does; of a Group that holds none, that, with no form.
+pub(crate) fn confirm_revoke(
+    viewer: &Viewer<'_>,
+    read: &crate::api::AdminResourcePage,
+    group: &str,
+    held: Option<&crate::resources::GrantEntry>,
+) -> Answer {
+    let name = escape(&read.name);
+    let group = escape(group);
+    let title = format!("Revoke {group} on {name}");
+    let main = match held {
+        Some(grant) => {
+            let level = level_name(grant.level);
+            format!(
+                "<div class=\"confirm\" data-vm-confirm=\"{name}\" data-vm-group=\"{group}\">\
+                 {}\
+                 <p class=\"lead\">The Group <code>{group}</code> holds <b>{level}</b> on <code>{name}</code>. From the moment you confirm, every Application stops reaching the Resource for the Group's members, unless another of their Groups holds a Grant. A statement or a file being sent then finishes. Nothing of the Resource is deleted; giving the Grant again restores it.</p>\
+                 <div class=\"actions\"><form data-vm-form=\"revoke\" method=\"post\" action=\"{RESOURCES_PATH}/{name}/revoke\"><input type=\"hidden\" name=\"group\" value=\"{group}\"><button type=\"submit\" class=\"danger-fill\">{}Revoke {group}</button></form>\
+                 <a class=\"btn quiet\" data-vm-back href=\"{RESOURCES_PATH}/{name}\">Keep the Grant</a></div></div>",
+                theme::state_title(
+                    Mark::Warn,
+                    Icon::Stop,
+                    &format!("Revoke {group} on {name}?")
+                ),
+                Icon::Stop.svg()
+            )
+        }
+        None => format!(
+            "<div class=\"confirm\" data-vm-confirm=\"{name}\" data-vm-group=\"{group}\">\
+             {}\
+             <p class=\"lead\">The Group <code>{group}</code> holds no Grant on <code>{name}</code>, so there is nothing to revoke.</p>\
+             <div class=\"actions\"><a class=\"btn quiet\" data-vm-back href=\"{RESOURCES_PATH}/{name}\">Back to {name}</a></div></div>",
+            theme::state_title(
+                Mark::Info,
+                Icon::Unknown,
+                &format!("Revoke {group} on {name}?")
+            )
+        ),
+    };
+    pages::page(StatusCode::OK, viewer, &title, Layout::Card, &main)
+}
+
+/// A setting or a revoke the form did not take: the status, an error in
+/// words, the way back to the Resource's page.
+pub(crate) fn resource_not_taken(
+    viewer: &Viewer<'_>,
+    name: &str,
+    status: StatusCode,
+    reason: &str,
+    words: &str,
+) -> Answer {
+    let name = escape(name);
+    let main = format!(
+        "{}<p data-vm-error=\"{reason}\" role=\"alert\">{}</p>\
+         <div class=\"actions\"><a class=\"btn primary\" data-vm-back href=\"{RESOURCES_PATH}/{name}\">{}<span class=\"vh\">Back to </span>{name}</a></div>",
+        theme::state_title(Mark::Error, Icon::Cross, "Not changed"),
+        escape(words),
+        Icon::Back.svg()
+    );
+    pages::page(status, viewer, "Not changed", Layout::Card, &main)
+}
+
+/// A setting or a revoke that waited out another change of the Resource:
+/// nothing was sent, so nothing can have changed.
+pub(crate) fn resource_busy(viewer: &Viewer<'_>, name: &str) -> Answer {
+    let name = escape(name);
+    let main = format!(
+        "{}<p data-vm-error=\"unavailable\" role=\"alert\">Another change of this Resource is running now: nothing was changed. Try again shortly.</p>\
+         <div class=\"actions\"><a class=\"btn primary\" data-vm-back href=\"{RESOURCES_PATH}/{name}\">{}<span class=\"vh\">Back to </span>{name}</a></div>",
+        theme::state_title(Mark::Warn, Icon::Later, "Try again shortly"),
+        Icon::Back.svg()
+    );
+    pages::page(
+        StatusCode::SERVICE_UNAVAILABLE,
+        viewer,
+        "Try again shortly",
+        Layout::Card,
+        &main,
+    )
+}
+
+/// A setting or a revoke on a Resource whose Grants the program is still
+/// finding out: nothing was sent, so nothing can have changed.
+pub(crate) fn resource_finding_out(viewer: &Viewer<'_>, name: &str) -> Answer {
+    let name = escape(name);
+    let main = format!(
+        "{}<p data-vm-error=\"unavailable\" role=\"alert\">The platform is finding out the Grants on the Resource <code>{name}</code> after a change whose answer was lost: nothing was changed. Try again shortly.</p>\
+         <div class=\"actions\"><a class=\"btn primary\" data-vm-back href=\"{RESOURCES_PATH}/{name}\">{}<span class=\"vh\">Back to </span>{name}</a></div>",
+        theme::state_title(Mark::Warn, Icon::Later, "Try again shortly"),
+        Icon::Back.svg()
+    );
+    pages::page(
+        StatusCode::SERVICE_UNAVAILABLE,
+        viewer,
+        "Try again shortly",
+        Layout::Card,
+        &main,
+    )
+}
+
+/// A setting or a revoke whose answer was lost: it cannot be told whether
+/// it was made; the Resource's page says what holds once found out.
+pub(crate) fn write_unavailable(viewer: &Viewer<'_>, name: &str) -> Answer {
+    let name = escape(name);
+    let main = format!(
+        "{}<p data-vm-error=\"unavailable\" role=\"alert\">The platform cannot tell yet whether this change was made. Look at the Resource's page again shortly: it says what holds once the program has found out.</p>\
+         <div class=\"actions\"><a class=\"btn primary\" data-vm-back href=\"{RESOURCES_PATH}/{name}\">{}<span class=\"vh\">Back to </span>{name}</a></div>",
+        theme::state_title(Mark::Error, Icon::Later, "Try again shortly"),
+        Icon::Back.svg()
+    );
+    pages::page(
+        StatusCode::SERVICE_UNAVAILABLE,
+        viewer,
+        "Try again shortly",
+        Layout::Card,
+        &main,
+    )
+}
+
+/// `400` of the page that confirms a revoke: no Group, one twice, or one
+/// that is none.
+pub(crate) fn revoke_malformed(viewer: &Viewer<'_>, name: &str) -> Answer {
+    let name = escape(name);
+    let main = format!(
+        "{}<p data-vm-error=\"malformed\" role=\"alert\">This address does not name the Group whose Grant is revoked: give one Group, 1 to 256 bytes of UTF-8 without a control character.</p>\
+         <div class=\"actions\"><a class=\"btn primary\" data-vm-back href=\"{RESOURCES_PATH}/{name}\">{}<span class=\"vh\">Back to </span>{name}</a></div>",
+        theme::state_title(Mark::Error, Icon::Cross, "Not changed"),
+        Icon::Back.svg()
+    );
+    pages::page(
+        StatusCode::BAD_REQUEST,
+        viewer,
+        "Not changed",
+        Layout::Card,
+        &main,
+    )
 }
 
 /// `503` while the Grants on a Resource cannot be told: no Grant on a

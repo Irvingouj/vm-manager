@@ -7,7 +7,13 @@
 //! ` — Dashboard`; the order: sign-in first, then the origin rule, then
 //! whether the person is a Platform administrator; `503` with `retry-after`
 //! while the platform database cannot be reached (the Resources and the
-//! installation too), and the pages again once it can.
+//! installation too), and the pages again once it can. The Resources'
+//! paths of "Resources and Grants in full: The Dashboard: a Resource's page
+//! and its Grants": the page of a Resource and of a revoke's confirmation
+//! with their statuses and titles, `405` with `allow` (`GET, HEAD` for the
+//! list and a Resource's page, `POST` for `/grants`, `GET, HEAD, POST` for
+//! `/revoke`), `HEAD`, the headers and policy, and the `503` while the
+//! platform database cannot be reached.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -20,12 +26,13 @@ use std::time::Duration;
 
 use blackbox::admin_pages::{
     APPLICATIONS, INSTALLATION, OPERATION_LOG, OUTBOUND, RESOURCES, assert_title, disable_target,
-    enable_target, get_paths,
+    enable_target, get_paths, grants_target, resource_target, revoke_page_target, revoke_target,
 };
 use blackbox::dashboard::{
     Dashboard, Page, administrator, create, deploy, stand_in_options, start,
 };
 use blackbox::postgres::{Platform, PrivatePostgres};
+use blackbox::scenario::Scenario;
 use blackbox::sharing::assert_own_page_headers;
 use blackbox::{Request, Response, User, Vm};
 
@@ -144,7 +151,10 @@ fn any_other_path_under_admin_is_404_a_page() {
         "/admin/applications/board/",
         "/admin/applications/board/disable/x",
         "/admin/applications/board/delete",
-        "/admin/resources/devops",
+        "/admin/resources/devops/nope",
+        "/admin/resources/devops/grants/sre",
+        "/admin/resources/devops/revoke/x",
+        "/admin/resources/",
         "/admin/installation/x",
         "/admin/operation-log/1",
         "/admin/admin",
@@ -395,5 +405,203 @@ fn with_the_platform_database_stopped_an_administrators_page_is_503_with_retry_a
             );
             std::thread::sleep(Duration::from_millis(200));
         }
+    }
+}
+
+/// A program with the stand-in and the Resource `devops` given to `sre`.
+fn with_resource() -> Scenario {
+    let s = Scenario::start_with(&stand_in_options());
+    s.register("devops");
+    s.grant("devops", "sre", "write");
+    s
+}
+
+#[test]
+fn a_resources_page_and_the_page_that_confirms_a_revoke_answer_200_with_a_page_and_a_title() {
+    let s = with_resource();
+    let dashboard = Dashboard::new(&s.vm, &administrator());
+    for (target, status) in [
+        (resource_target("devops"), 200),
+        (
+            format!("{}?changed=granted&group=sre", resource_target("devops")),
+            200,
+        ),
+        (revoke_page_target("devops", "sre"), 200),
+        (revoke_page_target("devops", "nobody"), 200),
+        (resource_target("nope"), 404),
+        (revoke_page_target("nope", "sre"), 404),
+        (revoke_target("devops"), 400),
+    ] {
+        let page = dashboard.page(&target, status, &target);
+        assert_title(&page, &target);
+        assert_eq!(
+            page.root().named("h1").len(),
+            1,
+            "{target}: expected one `<h1>`\n{}",
+            page.describe()
+        );
+    }
+}
+
+#[test]
+fn another_method_on_the_resources_paths_is_405_with_allow() {
+    let s = with_resource();
+    let dashboard = Dashboard::new(&s.vm, &administrator());
+    let get_head = vec!["GET", "HEAD"];
+    let mut cases: Vec<(&str, String, Vec<&str>)> = Vec::new();
+    for method in ["POST", "DELETE", "PUT", "PATCH"] {
+        cases.push((method, RESOURCES.to_owned(), get_head.clone()));
+        cases.push((method, resource_target("devops"), get_head.clone()));
+    }
+    for method in ["GET", "DELETE", "PUT", "PATCH"] {
+        cases.push((method, grants_target("devops"), vec!["POST"]));
+    }
+    for method in ["DELETE", "PUT", "PATCH"] {
+        cases.push((method, revoke_target("devops"), vec!["GET", "HEAD", "POST"]));
+    }
+    for (method, target, wanted) in cases {
+        let response = if method == "POST" {
+            dashboard.post_form(&target, "group=sre&access=read")
+        } else {
+            dashboard.navigation(method, &target).send()
+        };
+        let context = format!("{method} {target}");
+        assert_eq!(
+            response.status,
+            405,
+            "{context}: expected `405`\n{}",
+            response.describe()
+        );
+        let mut wanted: Vec<String> = wanted.iter().map(|m| (*m).to_owned()).collect();
+        wanted.sort();
+        assert_eq!(
+            allowed(&response),
+            wanted,
+            "{context}: expected `allow` to name exactly these methods\n{}",
+            response.describe()
+        );
+        let page = Page::read(response, dashboard.url(&target), &context);
+        assert_eq!(
+            page.root().named("h1").len(),
+            1,
+            "{context}: a page with one `<h1>`"
+        );
+    }
+    assert_eq!(
+        blackbox::admin_pages::api_grants(&s.vm, "devops"),
+        [("sre".to_owned(), "write".to_owned())],
+        "a request with a method a path does not take changes nothing"
+    );
+}
+
+#[test]
+fn the_resources_paths_have_the_headers_and_the_policy_of_the_dashboards_pages() {
+    let s = with_resource();
+    let dashboard = Dashboard::new(&s.vm, &administrator());
+    for (target, status) in [
+        (resource_target("devops"), 200),
+        (revoke_page_target("devops", "sre"), 200),
+        (resource_target("nope"), 404),
+        (revoke_target("devops"), 400),
+    ] {
+        let page = dashboard.page(&target, status, &target);
+        let policy = page
+            .response
+            .header("content-security-policy")
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        assert!(
+            policy.contains("frame-ancestors 'none'") && policy.contains("default-src 'none'"),
+            "{target}: expected `default-src 'none'` and `frame-ancestors 'none'` in the policy, got {policy:?}"
+        );
+        let (id, _) = page.user();
+        assert_eq!(
+            id,
+            administrator().id,
+            "{target}: whom they are signed in as"
+        );
+    }
+    let refused = dashboard.post_form(&grants_target("devops"), "");
+    assert_eq!(refused.status, 400, "{}", refused.describe());
+    let page = Page::read(refused, dashboard.url("/"), "a form not taken");
+    assert!(
+        page.response
+            .header("content-security-policy")
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .contains("form-action 'self'")
+    );
+}
+
+#[test]
+fn with_the_platform_database_stopped_the_resources_paths_are_503_with_retry_after() {
+    let mut postgres = PrivatePostgres::start().unwrap();
+    let platform = Platform::on(&postgres, "vm_platform_admin_resources_stopped");
+    let s = Scenario::start_with(&stand_in_options().platform(&platform));
+    s.register("devops");
+    s.grant("devops", "sre", "write");
+    let dashboard = Dashboard::new(&s.vm, &administrator());
+    dashboard.page(&resource_target("devops"), 200, "before the stop");
+    let grant = dashboard
+        .form_request(&grants_target("devops"), "group=crew&access=read")
+        .timeout(Duration::from_secs(40));
+    let revoke = dashboard
+        .form_request(&revoke_target("devops"), "group=sre")
+        .timeout(Duration::from_secs(40));
+    blackbox::admin::platform_sql(&s.vm).batch("CHECKPOINT");
+    postgres.stop();
+    for target in [
+        resource_target("devops"),
+        revoke_page_target("devops", "sre"),
+    ] {
+        let response = dashboard
+            .navigation("GET", &target)
+            .timeout(Duration::from_secs(40))
+            .send();
+        assert!(
+            response.status == 503 && response.header("retry-after").is_some(),
+            "{target}: expected `503` with `retry-after` while the platform database cannot be reached\n{}",
+            response.describe()
+        );
+        let page = Page::read(response, dashboard.url(&target), &target);
+        assert!(
+            page.text().to_lowercase().contains("again"),
+            "{target}: expected a page saying to try again shortly\n{}",
+            page.describe()
+        );
+    }
+    for (what, request) in [("a setting", grant), ("a revoke", revoke)] {
+        let answer = request.send();
+        let page = blackbox::admin_pages::assert_error_page(
+            answer,
+            &dashboard.url("/"),
+            503,
+            "unavailable",
+            &resource_target("devops"),
+            &format!("{what} while the platform database cannot be reached"),
+        );
+        assert!(
+            blackbox::admin_pages::error_words(&page).contains("whether"),
+            "expected the words to say it cannot be told whether it was made"
+        );
+    }
+    postgres
+        .start_again()
+        .unwrap_or_else(|e| panic!("the harness could not start its Postgres again: {e}"));
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let response = dashboard
+            .navigation("GET", &resource_target("devops"))
+            .timeout(Duration::from_secs(40))
+            .send();
+        if response.status == 200 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "expected `200` again within 30 s of the platform database coming back\n{}",
+            response.describe()
+        );
+        std::thread::sleep(Duration::from_millis(200));
     }
 }

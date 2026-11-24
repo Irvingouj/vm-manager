@@ -72,12 +72,30 @@ impl Site {
     /// As [`Site::start`], with more arguments of `vibe serve`
     /// (`--session-renewal 3`, say).
     pub fn start_with(people: &[Person], more: &[&str]) -> Self {
+        Self::start_inner(people, more, false)
+    }
+
+    /// As [`Site::start_with`], the program listening on an address the
+    /// harness chose, so that [`Site::restarted`] brings it back at the
+    /// same address, behind the same front (a walk that needs what the
+    /// program holds in memory to be read again from the platform
+    /// database, after the test changed it by hand).
+    pub fn start_restartable(people: &[Person], more: &[&str]) -> Self {
+        Self::start_inner(people, more, true)
+    }
+
+    fn start_inner(people: &[Person], more: &[&str], fixed: bool) -> Self {
         let bound = Bound::new();
         let port = bound.port().to_string();
-        let options = VmOptions::new()
+        let mut options = VmOptions::new()
             .args_extra(&["--public-scheme", "https", "--public-port", &port])
             .args_extra(more)
             .env("VIBE_SECRET_KEY", SecretKey::fresh().expose());
+        if fixed {
+            let chosen = crate::postgres::free_port()
+                .unwrap_or_else(|e| panic!("cannot find a free port: {e}"));
+            options = options.listen(std::net::SocketAddr::from(([127, 0, 0, 1], chosen)));
+        }
         let at = Installation::from(Provider::start(people), &options);
         let authority = Authority::new("Harness authority of the walks");
         let identity = authority.issue(&[&api_name(), &format!("*.{DOMAIN}")]);
@@ -87,6 +105,28 @@ impl Site {
         Self {
             front: Some(front),
             at,
+            authority,
+            files,
+            ca_file,
+        }
+    }
+
+    /// Ends the program and starts it again at the address it had (a site
+    /// made with [`Site::start_restartable`]), on the same platform
+    /// database, beside the same provider and behind the same front. A
+    /// person's session and a tool credential stay as they were.
+    #[must_use]
+    pub fn restarted(self) -> Self {
+        let Self {
+            front,
+            at,
+            authority,
+            files,
+            ca_file,
+        } = self;
+        Self {
+            front,
+            at: at.restarted(),
             authority,
             files,
             ca_file,

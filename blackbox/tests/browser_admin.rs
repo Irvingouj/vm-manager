@@ -7,13 +7,22 @@
 //!   two pages, disabling one by its confirmation and enabling it by its
 //!   button while a User's own browser (Grace's) sees it stop and serve
 //!   again, the Operation log filtered with its form, paged and narrowed,
-//!   the installation, the Resources;
+//!   the installation, the Resources, and (CONTRACT.md, "Resources and
+//!   Grants in full: The Dashboard: a Resource's page and its Grants: A
+//!   browser walk") a Resource's page: a Group given `read` and then
+//!   `write` with its form while a User of that Group, in a browser of
+//!   their own, reaches the Resource through an Application; the Grant
+//!   revoked by its link and its confirmation, the User refused `no-grant`
+//!   at once with no renewal of their session; an empty Group refused
+//!   beside its field with the level kept;
 //! - as someone who is not one (Grace, a Contributor of the Application):
-//!   no way in, every address refused in words, the disable form refused;
+//!   no way in, every address refused in words, the disable form refused,
+//!   and a Resource's page, its confirmation and the two forms of Grants
+//!   refused;
 //! - the Platform administrator taken out of the Group: the confirmation
 //!   held across the renewal is refused;
 //! - from another origin: a page of an Application posting a form to the
-//!   disable is refused `403`.
+//!   disable, to the setting of a Grant and to a revoke is refused `403`.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -26,8 +35,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use blackbox::admin_pages::{
-    APPLICATIONS, INSTALLATION, OPERATION_LOG, RESOURCES, SITE_RESOURCE, disable_target,
-    prepare_site,
+    APPLICATIONS, INSTALLATION, OPERATION_LOG, RESOURCES, SITE_GROUP, SITE_RESOURCE,
+    disable_target, grants_target, prepare_site, resource_target, revoke_target,
 };
 use blackbox::api::version_body_declaring;
 use blackbox::browser::url;
@@ -38,7 +47,8 @@ use blackbox::scenario::ADMINISTRATORS;
 use blackbox::sessions::{ADA, GRACE, grace};
 use blackbox::tool::bearer;
 use blackbox::walks::{
-    Site, click_to_another_page, on_site, sign_in_to_dashboard, submit_button_of, wait_for_element,
+    Site, click_to_another_page, on_site, page_json, sign_in_to_dashboard, submit_button_of,
+    wait_for_element,
 };
 use serde_json::{Value, json};
 
@@ -99,6 +109,55 @@ fn query_of(browser: &mut Firefox) -> Vec<(String, String)> {
         .collect()
 }
 
+/// The Grants of the Resource as `GET /v1/resources/<name>/grants` answers
+/// them to this credential: (Group, level, who set it).
+fn api_grants(site: &Site, credential: &str, resource: &str) -> Vec<(String, String, String)> {
+    let answer = bearer(
+        &site.at.vm,
+        &format!("/v1/resources/{resource}/grants"),
+        credential,
+    )
+    .send();
+    answer.expect_status(200);
+    answer.json()["grants"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|g| {
+            (
+                g["group"].as_str().unwrap_or_default().to_owned(),
+                g["access"].as_str().unwrap_or_default().to_owned(),
+                g["granted_by"].as_str().unwrap_or_default().to_owned(),
+            )
+        })
+        .collect()
+}
+
+/// Fills the grant form of the Resource's page shown as a person does: the
+/// Group typed (unless empty), the level chosen, the button clicked; waits
+/// for the page that comes back.
+fn give(browser: &mut Firefox, group: &str, access: &str) {
+    const FORM: &str = "form[data-vm-form=\"grant\"]";
+    if !group.is_empty() {
+        let field = browser.the(&format!("{FORM} input[name=\"group\"]"));
+        browser.type_into(&field, group);
+    }
+    let option = browser.the(&format!(
+        "{FORM} select[name=\"access\"] option[value=\"{access}\"]"
+    ));
+    browser.click(&option);
+    let button = submit_button_of(browser, FORM);
+    click_to_another_page(browser, &button);
+}
+
+/// What Grace's browser is told by `board`'s `/query` of the Resource: the
+/// host's answer.
+fn queried(browser: &mut Firefox, site: &Site) -> Value {
+    browser.navigate(&site.application(APP, &format!("/query?resource={SITE_RESOURCE}")));
+    assert_eq!(browser.status(), Some(200), "{}", browser.describe());
+    page_json(browser)["answer"].clone()
+}
+
 /// Whether Grace's browser is served by `board` (its `/hello`).
 fn served(browser: &mut Firefox, site: &Site) -> bool {
     browser.navigate(&site.application(APP, "/hello"));
@@ -108,7 +167,9 @@ fn served(browser: &mut Firefox, site: &Site) -> bool {
 #[test]
 fn a_platform_administrator_walks_every_page_of_theirs() {
     firefox::required();
-    let site = Site::start(&[ada_admin(), grace()]);
+    // A day's renewal: nothing of a person's Groups is read again in the
+    // time of the walk, and a revoke is seen all the same.
+    let site = Site::start_with(&[ada_admin(), grace()], &["--session-renewal", "86400"]);
     let prepared = prepare_site(&site, ADA, GRACE);
     let admin = prepared.credential.as_str();
     let grace_credential = graces_board(&site);
@@ -456,12 +517,143 @@ fn a_platform_administrator_walks_every_page_of_theirs() {
             );
         }
     }
+
+    // 6b. A Resource's page: followed from the list; a Group given `read`
+    // with the form, changed to `write` with the same form; a User of that
+    // Group reaches the Resource through an Application; the Grant revoked
+    // by its link and its confirmation; the User refused at once.
+    let link = browser.the(&format!(
+        "[data-vm-resource=\"{SITE_RESOURCE}\"] a[data-vm-details]"
+    ));
+    click_to_another_page(&mut browser, &link);
+    assert_eq!(
+        url(&browser.url()).path(),
+        resource_target(SITE_RESOURCE),
+        "the Resource's name in the list leads to its page"
+    );
+    // The Grant of the walk's setup is taken away at the API, so that the
+    // form gives it.
+    bearer(
+        &site.at.vm,
+        &format!("/v1/resources/{SITE_RESOURCE}/grants/devops"),
+        admin,
+    )
+    .method("DELETE")
+    .send()
+    .expect_status(200);
+    let refused = queried(&mut grace_browser, &site);
+    assert_eq!(
+        refused["refused"]["refusal"]["reason"], "no-grant",
+        "the harness's own check: Grace holds no Grant now: {refused}"
+    );
+    browser.navigate(&site.dashboard(&resource_target(SITE_RESOURCE)));
+    give(&mut browser, "devops", "read");
+    let notice = wait_for_element(&mut browser, "[data-vm-notice=\"granted\"]");
+    assert!(
+        browser.text_of(&notice).contains("devops"),
+        "the notice names the Group"
+    );
+    let grant = browser.the("[data-vm-grant=\"devops\"]");
+    assert_eq!(
+        browser.attribute(&grant, "data-vm-access").as_deref(),
+        Some("read")
+    );
+    let set = api_grants(&site, admin, SITE_RESOURCE)
+        .into_iter()
+        .find(|(g, _, _)| g == "devops")
+        .unwrap_or_else(|| panic!("expected the Grant at the API"));
+    assert_eq!(set.1, "read");
+    assert_eq!(
+        browser.attribute(&grant, "data-vm-granted-by"),
+        Some(set.2.clone()),
+        "the Grant on the page has the administrator's id as who set it"
+    );
+    assert!(
+        set.2.contains(ADA),
+        "the Grant says Ada set it, got {:?}",
+        set.2
+    );
+    assert!(
+        queried(&mut grace_browser, &site)["ok"].is_object(),
+        "Grace, of that Group, reaches the Resource through board"
+    );
+    give(&mut browser, "devops", "write");
+    wait_for_element(&mut browser, "[data-vm-notice=\"changed\"]");
+    let grant = browser.the("[data-vm-grant=\"devops\"]");
+    assert_eq!(
+        browser.attribute(&grant, "data-vm-access").as_deref(),
+        Some("write"),
+        "changed to `write` with the same form"
+    );
+    assert!(
+        api_grants(&site, admin, SITE_RESOURCE)
+            .iter()
+            .any(|(g, a, _)| g == "devops" && a == "write"),
+        "`write` at the API"
+    );
+    // The link of the Grant, the page that names it, the confirmation.
+    let revoke = browser.the("[data-vm-grant=\"devops\"] a[data-vm-revoke]");
+    click_to_another_page(&mut browser, &revoke);
+    assert_eq!(url(&browser.url()).path(), revoke_target(SITE_RESOURCE));
+    let shown = browser.text();
+    assert!(
+        shown.contains("devops") && shown.contains(SITE_RESOURCE),
+        "the page names the Group and the Resource, got {shown:?}"
+    );
+    let button = submit_button_of(&mut browser, "form[data-vm-form=\"revoke\"]");
+    click_to_another_page(&mut browser, &button);
+    wait_for_element(&mut browser, "[data-vm-notice=\"revoked\"]");
+    assert_eq!(
+        url(&browser.url()).path(),
+        resource_target(SITE_RESOURCE),
+        "on the Resource's page"
+    );
+    assert!(
+        browser.find("[data-vm-grant=\"devops\"]").is_none(),
+        "no Grant of that Group on the page\n{}",
+        browser.describe()
+    );
+    assert!(
+        !api_grants(&site, admin, SITE_RESOURCE)
+            .iter()
+            .any(|(g, _, _)| g == "devops"),
+        "gone at the API"
+    );
+    let refused = queried(&mut grace_browser, &site);
+    assert_eq!(
+        refused["refused"]["refusal"]["reason"], "no-grant",
+        "Grace's next request is refused, with no renewal of her session in between: {refused}"
+    );
+    // A form sent with an empty Group: `400`, its error beside the field,
+    // the level chosen kept.
+    browser.navigate(&site.dashboard(&resource_target(SITE_RESOURCE)));
+    give(&mut browser, "", "structure");
+    assert_eq!(browser.status(), Some(400), "{}", browser.describe());
+    wait_for_element(&mut browser, "[data-vm-field-error=\"group\"]");
+    let chosen = browser.script(
+        "return document.querySelector('form[data-vm-form=\"grant\"] select[name=\"access\"]').value;",
+        &[],
+    );
+    assert_eq!(
+        chosen.as_str(),
+        Some("structure"),
+        "the level chosen is kept\n{}",
+        browser.describe()
+    );
+    assert!(
+        !api_grants(&site, admin, SITE_RESOURCE)
+            .iter()
+            .any(|(g, _, _)| g.is_empty()),
+        "nothing changed"
+    );
 }
 
 #[test]
 fn someone_not_a_platform_administrator_is_refused_every_page_and_the_disable() {
     firefox::required();
     let site = Site::start(&[ada_admin(), grace()]);
+    let prepared = prepare_site(&site, ADA, GRACE);
+    let grants_before = api_grants(&site, &prepared.credential, SITE_RESOURCE);
     let grace_credential = graces_board(&site);
     let mut browser = site.browser(&[APP]);
     sign_in_to_dashboard(&mut browser, &site, GRACE);
@@ -478,6 +670,8 @@ fn someone_not_a_platform_administrator_is_refused_every_page_and_the_disable() 
         INSTALLATION.to_owned(),
         RESOURCES.to_owned(),
         blackbox::admin_pages::OUTBOUND.to_owned(),
+        resource_target(SITE_RESOURCE),
+        blackbox::admin_pages::revoke_page_target(SITE_RESOURCE, SITE_GROUP),
     ] {
         browser.navigate(&site.dashboard(&path));
         if path.starts_with("/admin") {
@@ -529,6 +723,30 @@ fn someone_not_a_platform_administrator_is_refused_every_page_and_the_disable() 
     assert!(
         disabled_now(&site, &grace_credential).is_null(),
         "nothing changed"
+    );
+    // The two forms of Grants, sent as a browser sends a form of the
+    // Dashboard's.
+    for (target, body) in [
+        (
+            grants_target(SITE_RESOURCE),
+            "group=grace-group&access=write",
+        ),
+        (revoke_target(SITE_RESOURCE), "group=finance"),
+    ] {
+        let action = url(&site.dashboard(&target));
+        let request = own.submit_form(&list, &landed.response, &action, body);
+        let answer = own.send(&action, &request);
+        assert_eq!(answer.status, 403, "{target}\n{}", answer.describe());
+        assert!(
+            answer.text().contains("not-an-administrator"),
+            "{target}\n{}",
+            answer.describe()
+        );
+    }
+    assert_eq!(
+        api_grants(&site, &prepared.credential, SITE_RESOURCE),
+        grants_before,
+        "no Grant changed"
     );
     assert!(served(&mut browser, &site), "board still serves");
 }
@@ -584,25 +802,43 @@ fn a_platform_administrator_taken_out_of_the_group_is_refused_the_confirmation_h
 fn a_page_of_an_application_posting_to_the_disable_is_refused_403() {
     firefox::required();
     let site = Site::start(&[ada_admin(), grace()]);
+    let prepared = prepare_site(&site, ADA, GRACE);
+    let grants_before = api_grants(&site, &prepared.credential, SITE_RESOURCE);
     let grace_credential = graces_board(&site);
     let mut browser = site.browser(&[APP]);
     sign_in_to_dashboard(&mut browser, &site, ADA);
-    let action = site.dashboard(&disable_target(APP));
-    let mut form_page = url(&site.application(APP, "/form"));
-    form_page.query_pairs_mut().append_pair("action", &action);
-    browser.navigate(form_page.as_str());
-    assert!(
-        on_site(&browser.url(), &site, APP),
-        "the harness's own check: on board's page with the form\n{}",
-        browser.describe()
-    );
-    let send = browser.the("#send");
-    click_to_another_page(&mut browser, &send);
-    assert_eq!(browser.status(), Some(403), "{}", browser.describe());
-    assert!(
-        disabled_now(&site, &grace_credential).is_null(),
-        "nothing changed"
-    );
+    for target in [
+        disable_target(APP),
+        grants_target(SITE_RESOURCE),
+        revoke_target(SITE_RESOURCE),
+    ] {
+        let action = site.dashboard(&target);
+        let mut form_page = url(&site.application(APP, "/form"));
+        form_page.query_pairs_mut().append_pair("action", &action);
+        browser.navigate(form_page.as_str());
+        assert!(
+            on_site(&browser.url(), &site, APP),
+            "the harness's own check: on board's page with the form\n{}",
+            browser.describe()
+        );
+        let send = browser.the("#send");
+        click_to_another_page(&mut browser, &send);
+        assert_eq!(
+            browser.status(),
+            Some(403),
+            "{target}\n{}",
+            browser.describe()
+        );
+        assert!(
+            disabled_now(&site, &grace_credential).is_null(),
+            "{target}: nothing changed"
+        );
+        assert_eq!(
+            api_grants(&site, &prepared.credential, SITE_RESOURCE),
+            grants_before,
+            "{target}: the Grants are as they were"
+        );
+    }
     browser.navigate(&site.application(APP, "/hello"));
     assert_eq!(
         browser.status(),

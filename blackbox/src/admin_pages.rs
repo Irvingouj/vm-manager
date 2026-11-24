@@ -19,6 +19,7 @@ use crate::http::Response;
 use crate::page::Element;
 use crate::sql::Sql;
 use crate::vm::Vm;
+use crate::walks::Site;
 
 /// The prefix of every administrator's page.
 pub const PREFIX: &str = "/admin";
@@ -714,4 +715,370 @@ pub fn while_two_readings_run<T>(vm: &Vm, during: impl FnOnce() -> T) -> T {
         drop(second.join());
         result
     })
+}
+
+// ---------------------------------------------------------------------------
+// A Resource's page and its Grants (CONTRACT.md, "Resources and Grants in
+// full: The Dashboard: a Resource's page and its Grants")
+// ---------------------------------------------------------------------------
+
+/// A Resource's page.
+pub fn resource_target(name: &str) -> String {
+    format!("{RESOURCES}/{name}")
+}
+
+/// Where the form that sets a Grant posts.
+pub fn grants_target(name: &str) -> String {
+    format!("{RESOURCES}/{name}/grants")
+}
+
+/// The page that confirms a revoke and where the revoke is posted, without
+/// a query.
+pub fn revoke_target(name: &str) -> String {
+    format!("{RESOURCES}/{name}/revoke")
+}
+
+/// The page that confirms revoking `group`'s Grant, the Group percent-encoded.
+pub fn revoke_page_target(name: &str, group: &str) -> String {
+    format!(
+        "{}?group={}",
+        revoke_target(name),
+        crate::resources::encode_segment(group)
+    )
+}
+
+/// A Resource's page with `?changed=<changed>&group=<group>`.
+pub fn changed_target(name: &str, changed: &str, group: &str) -> String {
+    format!(
+        "{}?changed={changed}&group={}",
+        resource_target(name),
+        crate::resources::encode_segment(group)
+    )
+}
+
+/// Fails unless the answer is the `303` of a Grant set or revoked, to
+/// `/admin/resources/<resource>?changed=<changed>&group=<group>` on the
+/// Dashboard's address, the Group percent-encoded in `location` (no space,
+/// quote, angle bracket or byte beyond ASCII in it, and its value read
+/// back is the Group exactly).
+pub fn assert_changed_resource(
+    response: &crate::http::Response,
+    base: &Url,
+    resource: &str,
+    changed: &str,
+    group: &str,
+    context: &str,
+) {
+    let raw = response.header("location").unwrap_or_default();
+    let location = base.join(raw);
+    let went = match &location {
+        Ok(at) => {
+            at.host_str() == Some(host().as_str())
+                && at.path() == resource_target(resource)
+                && query_pairs(at)
+                    == vec![
+                        ("changed".to_owned(), changed.to_owned()),
+                        ("group".to_owned(), group.to_owned()),
+                    ]
+        }
+        Err(_) => false,
+    };
+    let tidy = raw.is_ascii() && !raw.contains([' ', '"', '<', '>']);
+    assert!(
+        response.status == 303 && went && tidy,
+        "{context}: expected `303` to {}?changed={changed}&group=<{group:?}, percent-encoded>, got\n{}",
+        resource_target(resource),
+        response.describe()
+    );
+}
+
+/// Fails unless the answer is a refusal page of the Dashboard: `status`, one
+/// element `data-vm-error` of `reason` with words for a person at a browser
+/// (no path of the API), `retry-after` with a `503`, and a link
+/// `a[data-vm-back]` to `back` (a path, no query). Returns the page.
+pub fn assert_error_page(
+    response: crate::http::Response,
+    base: &Url,
+    status: u16,
+    reason: &str,
+    back: &str,
+    context: &str,
+) -> Page {
+    assert!(
+        response.status == status,
+        "{context}: expected the refusal `{status}` {reason:?}, got\n{}",
+        response.describe()
+    );
+    let page = Page::read(response, base.clone(), context);
+    let errors = page.errors();
+    assert!(
+        matches!(errors.as_slice(), [(r, text)] if r == reason && !text.is_empty() && !text.contains("/v1/")),
+        "{context}: expected one element `data-vm-error={reason:?}` with words for a person at a browser, got {errors:?}\n{}",
+        page.describe()
+    );
+    if status == 503 {
+        assert!(
+            page.response.header("retry-after").is_some(),
+            "{context}: expected `retry-after` on the `503`\n{}",
+            page.describe()
+        );
+    }
+    let link = page.link("data-vm-back");
+    assert!(
+        link.as_ref()
+            .is_some_and(|b| b.host_str() == Some(host().as_str()) && b.path() == back),
+        "{context}: expected a link `a[data-vm-back]` to {back}, got {link:?}\n{}",
+        page.describe()
+    );
+    page
+}
+
+/// The words of the one `data-vm-error` of a page, lower case.
+pub fn error_words(page: &Page) -> String {
+    crate::dashboard::error_text(page).to_lowercase()
+}
+
+/// One Grant as a Resource's page shows it.
+#[derive(Clone, Debug)]
+pub struct Granted {
+    pub group: String,
+    pub access: Option<String>,
+    pub by: Option<String>,
+    pub at: Option<String>,
+    /// The element's text.
+    pub text: String,
+    /// Its links `a[data-vm-revoke]`: (`href` resolved, name as a screen
+    /// reader says it).
+    pub revoke: Vec<(Url, String)>,
+}
+
+/// Every element `data-vm-grant` of a Resource's page, in order.
+pub fn grants_shown(page: &Page) -> Vec<Granted> {
+    page.root()
+        .with_attr("data-vm-grant")
+        .iter()
+        .map(|e| Granted {
+            group: e.attr("data-vm-grant").unwrap_or_default().to_owned(),
+            access: e.attr("data-vm-access").map(str::to_owned),
+            by: e.attr("data-vm-granted-by").map(str::to_owned),
+            at: e.attr("data-vm-granted-at").map(str::to_owned),
+            text: e.text(),
+            revoke: e
+                .with_attr("data-vm-revoke")
+                .iter()
+                .filter_map(|a| Some((page.url.join(a.attr("href")?).ok()?, a.accessible_name())))
+                .collect(),
+        })
+        .collect()
+}
+
+/// The one form that sets a Grant; fails unless there is exactly one.
+pub fn grant_form(page: &Page) -> crate::dashboard::Form {
+    let forms = page.forms_of("grant");
+    match forms.as_slice() {
+        [one] => one.clone(),
+        _ => panic!(
+            "expected exactly one `form[data-vm-form=\"grant\"]` on the page at {}, found {}\n{}",
+            page.url,
+            forms.len(),
+            page.describe()
+        ),
+    }
+}
+
+/// The value the Group field of the page's grant form holds.
+pub fn group_typed(page: &Page) -> Option<String> {
+    let root = page.root();
+    let forms = root.with_attr_value("data-vm-form", "grant");
+    let form = forms.first()?;
+    form.named("input")
+        .into_iter()
+        .find(|i| i.attr("name") == Some("group"))
+        .map(|i| i.attr("value").unwrap_or_default().to_owned())
+}
+
+/// The value of the option of the grant form's `access` that is `selected`.
+pub fn access_chosen(page: &Page) -> Option<String> {
+    let root = page.root();
+    let forms = root.with_attr_value("data-vm-form", "grant");
+    let form = forms.first()?;
+    let select = form
+        .named("select")
+        .into_iter()
+        .find(|s| s.attr("name") == Some("access"))?;
+    select
+        .named("option")
+        .iter()
+        .find(|o| o.has("selected"))
+        .map(|o| o.attr("value").map_or_else(|| o.text(), str::to_owned))
+}
+
+/// The grant form of the Resource's page, filled as a person fills it and
+/// sent as a browser sends it from that page. The answer.
+pub fn set_access(
+    dashboard: &Dashboard<'_>,
+    resource: &str,
+    group: &str,
+    access: &str,
+) -> Response {
+    let page = dashboard.page(
+        &resource_target(resource),
+        200,
+        &format!("the page of {resource:?}, to give {group:?} {access:?}"),
+    );
+    let form = grant_form(&page);
+    let action = page.action_of(&form);
+    dashboard
+        .form_request_from(
+            &page.response,
+            &crate::browser::target_of(&action),
+            &form.body(&[("group", group), ("access", access)]),
+        )
+        .send()
+}
+
+/// The revoke form of the page that confirms revoking `group`'s Grant,
+/// submitted as a person submits it. The answer.
+pub fn confirm_revoke(dashboard: &Dashboard<'_>, resource: &str, group: &str) -> Response {
+    let page = dashboard.page(
+        &revoke_page_target(resource, group),
+        200,
+        &format!("the page that confirms revoking {group:?} on {resource:?}"),
+    );
+    let forms = page.forms_of("revoke");
+    let [form] = forms.as_slice() else {
+        panic!(
+            "expected one `form[data-vm-form=\"revoke\"]` on the page that confirms it, found {}\n{}",
+            forms.len(),
+            page.describe()
+        );
+    };
+    let action = page.action_of(form);
+    dashboard
+        .form_request_from(
+            &page.response,
+            &crate::browser::target_of(&action),
+            &form.body(&[]),
+        )
+        .send()
+}
+
+/// Every Grant of the Resource as `GET /v1/resources/<name>/grants` answers
+/// them, as (Group, level), by Group.
+pub fn api_grants(vm: &Vm, resource: &str) -> Vec<(String, String)> {
+    let answer = vm
+        .api_as(&crate::scenario::administrator())
+        .list_grants(resource);
+    answer.expect_status(200);
+    answer.json()["grants"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .map(|g| {
+                    (
+                        g["group"].as_str().unwrap_or_default().to_owned(),
+                        g["access"].as_str().unwrap_or_default().to_owned(),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The Resource whose Grant [`start_aged`] makes one from before stage three.
+pub const OLD_RESOURCE: &str = "oldpay";
+/// The Group of that Grant.
+pub const OLD_GROUP: &str = "payroll-readers";
+/// The Group of the Grant [`start_aged`] gives after the restart.
+pub const NEW_GROUP: &str = "finance";
+/// The Storage Resource whose directory [`start_aged`] removes.
+pub const LOST_RESOURCE: &str = "lostfiles";
+
+/// What [`start_aged`] made; it lives as long as the site's Resources.
+pub struct Aged {
+    pub db: crate::shared_database::SharedDatabase,
+    pub place: crate::storage::Place,
+}
+
+/// An installation of the walks (OIDC, over HTTPS, `--storage-root`) on
+/// which `admin`'s tool credential has, through the platform's API:
+/// [`OLD_RESOURCE`] registered over a shared database of the test's own
+/// with a Grant for [`OLD_GROUP`] that has neither who set it nor when (a
+/// Grant from before stage three: its columns set to NULL by hand), then
+/// [`LOST_RESOURCE`], a Storage Resource whose directory is removed; the
+/// program is then ended and started again at the same address, so that it
+/// holds what the platform database holds, and [`NEW_GROUP`] is given
+/// `write` on [`OLD_RESOURCE`] (a Grant that has both). The harness's own
+/// check fails unless [`LOST_RESOURCE`] is then not usable.
+pub fn start_aged(people: &[crate::oidc::Person], admin: &str) -> (Site, Aged) {
+    use crate::tool::bearer;
+    use serde_json::json;
+    let place = crate::storage::Place::new("aged");
+    let root = place.root();
+    let site = Site::start_restartable(people, &["--storage-root", &root.to_string_lossy()]);
+    let credential = site.credential_for(admin);
+    let post = |site: &Site, credential: &str, target: &str, body: &serde_json::Value| {
+        bearer(&site.at.vm, target, credential)
+            .method("POST")
+            .json(body)
+            .send()
+    };
+    let db = crate::shared_database::SharedDatabase::create();
+    let body = crate::scenario::resource_body(OLD_RESOURCE, &db, &db.reader);
+    post(&site, &credential, "/v1/resources", &body).expect_status(201);
+    post(
+        &site,
+        &credential,
+        &format!("/v1/resources/{OLD_RESOURCE}/grants"),
+        &json!({ "group": OLD_GROUP, "access": "read" }),
+    )
+    .expect_status(200);
+    let directory = root.join(LOST_RESOURCE);
+    std::fs::create_dir_all(&directory)
+        .unwrap_or_else(|e| panic!("cannot create {}: {e}", directory.display()));
+    post(
+        &site,
+        &credential,
+        "/v1/resources",
+        &crate::storage::storage_body(LOST_RESOURCE, &directory.to_string_lossy()),
+    )
+    .expect_status(201);
+    post(
+        &site,
+        &credential,
+        &format!("/v1/resources/{LOST_RESOURCE}/grants"),
+        &json!({ "group": NEW_GROUP, "access": "read" }),
+    )
+    .expect_status(200);
+    std::fs::remove_dir_all(&directory)
+        .unwrap_or_else(|e| panic!("cannot remove {}: {e}", directory.display()));
+    crate::resources::forget_who_and_when(&site.at.vm);
+    let site = site.restarted();
+    let credential = site.credential_for(admin);
+    post(
+        &site,
+        &credential,
+        &format!("/v1/resources/{OLD_RESOURCE}/grants"),
+        &json!({ "group": NEW_GROUP, "access": "write" }),
+    )
+    .expect_status(200);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let one = bearer(
+            &site.at.vm,
+            &format!("/v1/admin/resources/{LOST_RESOURCE}"),
+            &credential,
+        )
+        .send();
+        if one.status == 200 && one.json()["usable"] == serde_json::json!(false) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the harness's own check: expected {LOST_RESOURCE} not usable within 20 s of the start, got\n{}",
+            one.describe()
+        );
+        thread::sleep(Duration::from_millis(200));
+    }
+    (site, Aged { db, place })
 }

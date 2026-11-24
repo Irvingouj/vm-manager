@@ -14,18 +14,19 @@ use bytes::Bytes;
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Body;
 use hyper::http::request::Parts;
-use hyper::{Method, Response};
+use hyper::{Method, Response, StatusCode};
 use url::form_urlencoded;
 
 use super::admin_pages::{self, LogShown, Section, Typed};
 use super::pages::{self, Refusal, Viewer};
 use super::{Ingress, MAX_FORM_BYTES};
 use crate::api::{
-    AdminRead, LOG_FILTERS, LogProblem, LogQuery, MAX_ADMIN_PAGE, Which, query_parameters,
-    rfc3339_micros,
+    AdminRead, AdminResourceRead, LOG_FILTERS, LogProblem, LogQuery, MAX_ADMIN_PAGE, Which,
+    query_parameters, rfc3339_micros,
 };
 use crate::ingress::BODY_READ_TIMEOUT;
 use crate::registry::{NameProblem, check_name};
+use crate::resources::GrantWritten;
 
 type Answer = Response<Full<Bytes>>;
 
@@ -38,6 +39,12 @@ enum Route<'a> {
     Enable(&'a str),
     OperationLog,
     Resources,
+    /// `/admin/resources/<name>`
+    Resource(&'a str),
+    /// `/admin/resources/<name>/grants`
+    ResourceGrants(&'a str),
+    /// `/admin/resources/<name>/revoke`
+    ResourceRevoke(&'a str),
     Outbound,
     Installation,
 }
@@ -54,6 +61,17 @@ impl<'a> Route<'a> {
             "/admin/outbound" => return Some(Self::Outbound),
             "/admin/installation" => return Some(Self::Installation),
             _ => {}
+        }
+        if let Some(rest) = path.strip_prefix("/admin/resources/") {
+            if rest.is_empty() {
+                return None;
+            }
+            return match rest.split_once('/') {
+                None => Some(Self::Resource(rest)),
+                Some((name, "grants")) if !name.is_empty() => Some(Self::ResourceGrants(name)),
+                Some((name, "revoke")) if !name.is_empty() => Some(Self::ResourceRevoke(name)),
+                _ => None,
+            };
         }
         let rest = path.strip_prefix("/admin/applications/")?;
         match rest.split_once('/') {
@@ -91,11 +109,23 @@ impl Ingress {
                 self.switch(viewer, name, false, body).await
             }
             Some(Route::Enable(_)) => pages::method_not_allowed(viewer, "POST"),
+            Some(Route::ResourceGrants(name)) if method == Method::POST => {
+                self.set_grant(viewer, name, body).await
+            }
+            Some(Route::ResourceGrants(_)) => pages::method_not_allowed(viewer, "POST"),
+            Some(Route::ResourceRevoke(name)) if read => {
+                self.confirm_revoke(viewer, name, query).await
+            }
+            Some(Route::ResourceRevoke(name)) if method == Method::POST => {
+                self.revoke(viewer, name, body).await
+            }
+            Some(Route::ResourceRevoke(_)) => pages::method_not_allowed(viewer, "GET, HEAD, POST"),
             Some(_) if !read => pages::method_not_allowed(viewer, "GET, HEAD"),
             Some(Route::Root) => pages::see_other("/admin/applications"),
             Some(Route::Applications) => self.every_application_page(viewer, query).await,
             Some(Route::OperationLog) => self.operation_log_page(viewer, query).await,
-            Some(Route::Resources) => self.resources_page(viewer).await,
+            Some(Route::Resources) => self.resources_page(viewer, query).await,
+            Some(Route::Resource(name)) => self.resource_page(viewer, name, query).await,
             Some(Route::Outbound) => self.outbound_page(viewer).await,
             Some(Route::Installation) => self.installation_page(viewer).await,
         }
@@ -162,17 +192,23 @@ impl Ingress {
         B: Body<Data = Bytes> + Send,
         B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     {
-        let read = Limited::new(body, MAX_FORM_BYTES).collect();
-        match tokio::time::timeout(BODY_READ_TIMEOUT, read).await {
-            Ok(Ok(_)) => {}
-            Ok(Err(_)) => {
+        match read_form_body(body).await {
+            Ok(_) => {}
+            Err(FormProblem::TooLarge) => {
                 return pages::refused(
                     viewer,
                     name,
                     &Refusal::Malformed("The form is larger than 4 KiB.".to_owned()),
                 );
             }
-            Err(_) => return pages::refused(viewer, name, &Refusal::TimedOut),
+            Err(FormProblem::Unreadable) => {
+                return pages::refused(
+                    viewer,
+                    name,
+                    &Refusal::Malformed("The form could not be read: send it again.".to_owned()),
+                );
+            }
+            Err(FormProblem::TimedOut) => return pages::refused(viewer, name, &Refusal::TimedOut),
         }
         match self.api.switch(viewer.user, name, disable).await {
             Ok(Some((_, changed))) => {
@@ -234,18 +270,314 @@ impl Ingress {
         }
     }
 
-    /// `GET /admin/resources`: every Resource with its Grants, as `GET
-    /// /v1/resources` and `GET /v1/resources/<name>/grants` answer them
-    /// (memory, read back where it cannot tell), once the platform
-    /// database is seen to answer.
-    async fn resources_page(&self, viewer: &Viewer<'_>) -> Answer {
+    /// `GET /admin/resources`: one page of `GET /v1/admin/resources`, from
+    /// the same reading, once the platform database is seen to answer.
+    async fn resources_page(&self, viewer: &Viewer<'_>, query: Option<&str>) -> Answer {
+        let after = match query_parameters(query, &["after"]) {
+            Ok(mut found) => found.remove("after"),
+            Err(_) => return admin_pages::resources_not_a_place(viewer),
+        };
+        if let Some(after) = &after
+            && !crate::resources::is_resource_name(after)
+        {
+            return admin_pages::resources_not_a_place(viewer);
+        }
         if let Err(error) = self.registry.probe().await {
             return self.unavailable(viewer, &error);
         }
-        match self.api.known_resources().await {
-            Ok(all) => admin_pages::resources(viewer, &all),
-            Err(resource) => admin_pages::grants_unknown(viewer, &resource),
+        match self
+            .api
+            .read_admin_resources(after.as_deref(), usize::from(MAX_ADMIN_PAGE))
+            .await
+        {
+            Ok(read) => admin_pages::resources(viewer, &read, after.as_deref()),
+            Err(AdminResourceRead::Unknown(resource)) => {
+                admin_pages::grants_unknown(viewer, &resource)
+            }
+            Err(AdminResourceRead::Failed(error)) => self.unavailable(viewer, &error),
+            Err(AdminResourceRead::NoSuchResource | AdminResourceRead::Found(_)) => {
+                admin_pages::resources_not_a_place(viewer)
+            }
         }
+    }
+
+    /// `GET /admin/resources/<name>`: the Resource as `GET
+    /// /v1/admin/resources/<name>` answers it and its Grants as `GET
+    /// /v1/resources/<name>/grants` does, with the notice a change left.
+    async fn resource_page(&self, viewer: &Viewer<'_>, name: &str, query: Option<&str>) -> Answer {
+        if let Err(error) = self.registry.probe().await {
+            return self.unavailable(viewer, &error);
+        }
+        let read = match self.api.read_admin_resource(name).await {
+            AdminResourceRead::Found(read) => read,
+            AdminResourceRead::NoSuchResource => return admin_pages::no_resource(viewer, name),
+            AdminResourceRead::Unknown(resource) => {
+                return admin_pages::grants_unknown(viewer, &resource);
+            }
+            AdminResourceRead::Failed(error) => return self.unavailable(viewer, &error),
+        };
+        let notice = resource_notice(query);
+        admin_pages::resource_page(
+            viewer,
+            &read,
+            StatusCode::OK,
+            notice
+                .as_ref()
+                .map(|(changed, group)| (*changed, group.as_str())),
+            &admin_pages::GrantForm::default(),
+        )
+    }
+
+    /// `POST /admin/resources/<name>/grants`: the change `POST
+    /// /v1/resources/<name>/grants` makes, through the same write
+    /// ([`crate::resources::Resources::write_grant`]): its checks, records
+    /// and bounds are not written twice.
+    async fn set_grant<B>(&self, viewer: &Viewer<'_>, name: &str, body: B) -> Answer
+    where
+        B: Body<Data = Bytes> + Send,
+        B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
+        let Some(resource) = (match self.resources.find(name).await {
+            Ok(found) => found,
+            Err(error) => return self.unavailable(viewer, &error),
+        }) else {
+            return admin_pages::no_resource(viewer, name);
+        };
+        let bytes = match read_form_body(body).await {
+            Ok(bytes) => bytes,
+            Err(FormProblem::TooLarge) => {
+                return admin_pages::resource_not_taken(
+                    viewer,
+                    name,
+                    StatusCode::BAD_REQUEST,
+                    "malformed",
+                    "The form is larger than 4 KiB: send it again with less.",
+                );
+            }
+            Err(FormProblem::Unreadable) => {
+                return admin_pages::resource_not_taken(
+                    viewer,
+                    name,
+                    StatusCode::BAD_REQUEST,
+                    "malformed",
+                    "The form could not be read: send it again.",
+                );
+            }
+            Err(FormProblem::TimedOut) => {
+                return admin_pages::resource_not_taken(
+                    viewer,
+                    name,
+                    StatusCode::REQUEST_TIMEOUT,
+                    "timed-out",
+                    "The form did not arrive in time: send it again.",
+                );
+            }
+        };
+        let form = Asked::read(&bytes);
+        let group = form.group.given();
+        let level = form
+            .access
+            .given()
+            .as_deref()
+            .and_then(crate::resources::level_of);
+        let group_error = match &group {
+            Some(group) if crate::resources::is_group(group) => None,
+            Some(_) => Some(
+                "A Group is 1 to 256 bytes of UTF-8 without a control character: write it exactly as the company's directory names it."
+                    .to_owned(),
+            ),
+            None if matches!(form.group, Field::Twice) => {
+                Some("The form gives the Group twice: give it once.".to_owned())
+            }
+            None => Some(
+                "Give the Group: 1 to 256 bytes of UTF-8 without a control character, written exactly as the company's directory names it."
+                    .to_owned(),
+            ),
+        };
+        let access_error = match level {
+            Some(level) if crate::resources::level_allowed(resource.kind, level) => None,
+            _ => Some(if resource.kind == crate::registry::ResourceKind::Storage {
+                "A Storage Resource has two levels, read and write: choose one of them.".to_owned()
+            } else {
+                "Access is Structure, Read or Write: choose one of those.".to_owned()
+            }),
+        };
+        if group_error.is_some() || access_error.is_some() {
+            let read = match self.api.read_admin_resource(&resource.name).await {
+                AdminResourceRead::Found(read) => read,
+                AdminResourceRead::NoSuchResource => {
+                    return admin_pages::no_resource(viewer, name);
+                }
+                AdminResourceRead::Unknown(resource) => {
+                    return admin_pages::grants_unknown(viewer, &resource);
+                }
+                AdminResourceRead::Failed(error) => return self.unavailable(viewer, &error),
+            };
+            return admin_pages::resource_page(
+                viewer,
+                &read,
+                StatusCode::BAD_REQUEST,
+                None,
+                &admin_pages::GrantForm {
+                    group: group.unwrap_or_default(),
+                    access: form.access.given(),
+                    group_error,
+                    access_error,
+                },
+            );
+        }
+        // Both were found good above; a level is never made up here.
+        let (Some(group), Some(level)) = (group, level) else {
+            return admin_pages::resource_not_taken(
+                viewer,
+                name,
+                StatusCode::BAD_REQUEST,
+                "malformed",
+                "The form could not be read: send it again.",
+            );
+        };
+        match self
+            .resources
+            .write_grant(&resource, &group, Some(level), &viewer.user.id)
+            .await
+        {
+            Ok(GrantWritten::Written(change)) => {
+                let changed = if !change.changed {
+                    "nothing"
+                } else if change.was.is_none() {
+                    "granted"
+                } else {
+                    "changed"
+                };
+                pages::see_other(&format!(
+                    "/admin/resources/{name}?changed={changed}&group={}",
+                    crate::resources::encode_segment(&group)
+                ))
+            }
+            Ok(GrantWritten::TooMany) => admin_pages::resource_not_taken(
+                viewer,
+                name,
+                StatusCode::CONFLICT,
+                "too-many",
+                "The Resource holds the 1,000 Grants it may hold: revoke one that is no longer needed before giving another.",
+            ),
+            Ok(GrantWritten::NoSuchResource) => admin_pages::no_resource(viewer, name),
+            Ok(GrantWritten::Unknown) => admin_pages::resource_finding_out(viewer, name),
+            Ok(GrantWritten::Busy) => admin_pages::resource_busy(viewer, name),
+            Err(error) => {
+                self.database_failed(&error);
+                admin_pages::write_unavailable(viewer, name)
+            }
+        }
+    }
+
+    /// `GET /admin/resources/<name>/revoke?group=<group>`: the page that
+    /// names the Group and the Resource and asks.
+    async fn confirm_revoke(&self, viewer: &Viewer<'_>, name: &str, query: Option<&str>) -> Answer {
+        if let Err(error) = self.registry.probe().await {
+            return self.unavailable(viewer, &error);
+        }
+        let read = match self.api.read_admin_resource(name).await {
+            AdminResourceRead::Found(read) => read,
+            AdminResourceRead::NoSuchResource => return admin_pages::no_resource(viewer, name),
+            AdminResourceRead::Unknown(resource) => {
+                return admin_pages::grants_unknown(viewer, &resource);
+            }
+            AdminResourceRead::Failed(error) => return self.unavailable(viewer, &error),
+        };
+        let group = match query_parameters(query, &["group"]) {
+            Ok(mut found) => found.remove("group"),
+            Err(_) => return admin_pages::revoke_malformed(viewer, name),
+        };
+        let Some(group) = group.filter(|group| crate::resources::is_group(group)) else {
+            return admin_pages::revoke_malformed(viewer, name);
+        };
+        let held = read.grants.iter().find(|grant| grant.group == group);
+        admin_pages::confirm_revoke(viewer, &read, &group, held)
+    }
+
+    /// `POST /admin/resources/<name>/revoke`: the change `DELETE
+    /// /v1/resources/<name>/grants/<group>` makes, through the same write.
+    async fn revoke<B>(&self, viewer: &Viewer<'_>, name: &str, body: B) -> Answer
+    where
+        B: Body<Data = Bytes> + Send,
+        B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
+        let Some(resource) = (match self.resources.find(name).await {
+            Ok(found) => found,
+            Err(error) => return self.unavailable(viewer, &error),
+        }) else {
+            return admin_pages::no_resource(viewer, name);
+        };
+        let bytes = match read_form_body(body).await {
+            Ok(bytes) => bytes,
+            Err(FormProblem::TooLarge) => {
+                return admin_pages::resource_not_taken(
+                    viewer,
+                    name,
+                    StatusCode::BAD_REQUEST,
+                    "malformed",
+                    "The form is larger than 4 KiB: send it again with less.",
+                );
+            }
+            Err(FormProblem::Unreadable) => {
+                return admin_pages::resource_not_taken(
+                    viewer,
+                    name,
+                    StatusCode::BAD_REQUEST,
+                    "malformed",
+                    "The form could not be read: send it again.",
+                );
+            }
+            Err(FormProblem::TimedOut) => {
+                return admin_pages::resource_not_taken(
+                    viewer,
+                    name,
+                    StatusCode::REQUEST_TIMEOUT,
+                    "timed-out",
+                    "The form did not arrive in time: send it again.",
+                );
+            }
+        };
+        let form = Asked::read(&bytes);
+        let group = match form.group {
+            Field::Given(group) if crate::resources::is_group(&group) => group,
+            _ => return admin_pages::revoke_malformed(viewer, name),
+        };
+        match self
+            .resources
+            .write_grant(&resource, &group, None, &viewer.user.id)
+            .await
+        {
+            Ok(GrantWritten::Written(change)) => pages::see_other(&format!(
+                "/admin/resources/{name}?changed={}&group={}",
+                if change.changed { "revoked" } else { "nothing" },
+                crate::resources::encode_segment(&group)
+            )),
+            Ok(GrantWritten::NoSuchResource) => admin_pages::no_resource(viewer, name),
+            Ok(GrantWritten::Unknown) => admin_pages::resource_finding_out(viewer, name),
+            Ok(GrantWritten::Busy) => admin_pages::resource_busy(viewer, name),
+            Ok(GrantWritten::TooMany) => admin_pages::resource_not_taken(
+                viewer,
+                name,
+                StatusCode::CONFLICT,
+                "too-many",
+                "The Resource holds the 1,000 Grants it may hold: revoke one that is no longer needed.",
+            ),
+            Err(error) => {
+                self.database_failed(&error);
+                admin_pages::write_unavailable(viewer, name)
+            }
+        }
+    }
+
+    /// One record of a platform database that did not answer, as the API's
+    /// own `503` writes.
+    fn database_failed(&self, error: &crate::platform_db::DbError) {
+        crate::log::record(
+            "platform-database-failed",
+            serde_json::json!({ "error": error.to_string() }),
+        );
     }
 
     /// `GET /admin/outbound`: the list from memory, as `GET
@@ -440,6 +772,96 @@ fn field_error(problem: &LogProblem, typed: &Typed) -> (&'static str, String) {
             "This address does not name a place in the Operation log.".to_owned(),
         ),
     }
+}
+
+/// Why a form's body could not be read.
+enum FormProblem {
+    TooLarge,
+    TimedOut,
+    Unreadable,
+}
+
+/// The form's body, at most 4 KiB, whole within 10 seconds.
+async fn read_form_body<B>(body: B) -> Result<Bytes, FormProblem>
+where
+    B: Body<Data = Bytes> + Send,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    let read = Limited::new(body, MAX_FORM_BYTES).collect();
+    match tokio::time::timeout(BODY_READ_TIMEOUT, read).await {
+        Ok(Ok(collected)) => Ok(collected.to_bytes()),
+        Ok(Err(error)) => {
+            if error
+                .downcast_ref::<http_body_util::LengthLimitError>()
+                .is_some()
+            {
+                Err(FormProblem::TooLarge)
+            } else {
+                Err(FormProblem::Unreadable)
+            }
+        }
+        Err(_) => Err(FormProblem::TimedOut),
+    }
+}
+
+/// One field of a form: not given, given once, or given twice.
+#[derive(Default)]
+enum Field {
+    #[default]
+    Missing,
+    Given(String),
+    Twice,
+}
+
+impl Field {
+    fn given(&self) -> Option<String> {
+        match self {
+            Self::Given(value) => Some(value.clone()),
+            Self::Missing | Self::Twice => None,
+        }
+    }
+}
+
+/// The fields of a Grant's form as sent, `group` and `access`; another
+/// field is not looked at, and neither is white space dropped.
+#[derive(Default)]
+struct Asked {
+    group: Field,
+    access: Field,
+}
+
+impl Asked {
+    fn read(body: &[u8]) -> Self {
+        let mut form = Self::default();
+        for (name, value) in form_urlencoded::parse(body) {
+            let field = match name.as_ref() {
+                "group" => &mut form.group,
+                "access" => &mut form.access,
+                _ => continue,
+            };
+            *field = match std::mem::take(field) {
+                Field::Missing => Field::Given(value.into_owned()),
+                _ => Field::Twice,
+            };
+        }
+        form
+    }
+}
+
+/// The notice a change leads to: `?changed=` with `&group=`, both as the
+/// address gives them; any other value, a missing Group or one that is none
+/// has no notice.
+fn resource_notice(query: Option<&str>) -> Option<(&'static str, String)> {
+    let found = query_parameters(query, &["changed", "group"]).ok()?;
+    let changed = match found.get("changed").map(String::as_str) {
+        Some("granted") => "granted",
+        Some("changed") => "changed",
+        Some("revoked") => "revoked",
+        Some("nothing") => "nothing",
+        _ => return None,
+    };
+    let group = found.get("group")?;
+    crate::resources::is_group(group).then(|| (changed, group.clone()))
 }
 
 #[cfg(test)]

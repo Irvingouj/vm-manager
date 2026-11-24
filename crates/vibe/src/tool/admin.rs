@@ -502,27 +502,13 @@ fn signed_in() -> Result<Kept, Ending> {
     read_kept(&place)
 }
 
-/// `text` as a query's value: every byte but the unreserved ones written
-/// `%XX` (so `+` is `%2B`, never a space).
-fn query_value(text: &str) -> String {
-    let mut encoded = String::with_capacity(text.len());
-    for byte in text.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
-            encoded.push(char::from(byte));
-        } else {
-            put!(encoded, "%{byte:02X}");
-        }
-    }
-    encoded
-}
-
 /// A query of `pairs` given, `?a=b&c=d`, or nothing.
 fn query_of(pairs: &[(&str, Option<String>)]) -> String {
     let mut query = String::new();
     for (name, value) in pairs {
         if let Some(value) = value {
             query.push(if query.is_empty() { '?' } else { '&' });
-            put!(query, "{name}={}", query_value(value));
+            put!(query, "{name}={}", crate::resources::encode_segment(value));
         }
     }
     query
@@ -1727,7 +1713,7 @@ async fn revoke(args: &RevokeArgs) -> Result<Done, Ending> {
         &format!(
             "/v1/resources/{}/grants/{}",
             args.resource,
-            query_value(&args.group)
+            crate::resources::encode_segment(&args.group)
         ),
         Value::Null,
     )
@@ -1821,7 +1807,10 @@ async fn grants(args: &GrantsArgs) -> Result<Done, Ending> {
         Either::Group(group) => {
             let answer = get_signed_in(
                 &kept,
-                &format!("/v1/admin/grants?group={}", query_value(group)),
+                &format!(
+                    "/v1/admin/grants?group={}",
+                    crate::resources::encode_segment(group)
+                ),
             )
             .await?;
             let listed = answer

@@ -56,7 +56,7 @@ use crate::registry::{
 };
 use crate::resources::{
     self, Connection, GrantWritten, Login, NewReach, NewResource, Registered, Resources,
-    is_resource_name, level_of,
+    WRITE_ROW_WAIT, is_resource_name, level_of,
 };
 use crate::setup;
 use crate::storage::{self, Storage};
@@ -999,10 +999,6 @@ const CHECK_WHOLE: std::time::Duration = std::time::Duration::from_secs(10);
 /// to the platform database.
 const WRITE_TURN_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// The whole of a write of a Resource's row: the 10 seconds of "What
-/// Platform administrators see and stop: Bounds and costs".
-const WRITE_ROW_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
-
 /// `409 too-many`: a 1,001st Resource.
 fn too_many() -> Answer {
     Answer::error(
@@ -1060,6 +1056,16 @@ const MAX_GRANTS_SHOWN: usize = 200;
 
 /// The most Grants `GET /v1/resources/<name>/grants` answers.
 const MAX_GRANTS_LISTED: usize = resources::MAX_GRANTS;
+
+/// `503 unavailable`: another change of the Resource holds its turn; nothing
+/// was sent.
+fn busy_resource() -> Answer {
+    Answer::error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "unavailable",
+        "another change of this Resource is running now: nothing was changed; try again shortly",
+    )
+}
 
 /// `409 too-many`: a 1,001st Grant for a Group that held none.
 fn too_many_grants() -> Answer {
@@ -1290,40 +1296,103 @@ struct RemoveView<'a> {
 }
 
 #[derive(Serialize)]
-struct AdminResourcesView {
-    resources: Vec<AdminResourceView>,
-    next: Option<String>,
+pub(crate) struct AdminResourcesView {
+    pub(crate) resources: Vec<AdminResourceView>,
+    pub(crate) next: Option<String>,
+}
+
+/// One Resource's page: what `GET /v1/admin/resources/<name>` answers of
+/// it, and every Grant `GET /v1/resources/<name>/grants` answers (up to
+/// 1,000), for the Dashboard's page of it.
+pub(crate) struct AdminResourcePage {
+    pub name: String,
+    pub kind: &'static str,
+    pub description: String,
+    pub owner: String,
+    pub contact: String,
+    pub created_by: String,
+    pub created_at: String,
+    pub usable: bool,
+    pub problem: Option<&'static str>,
+    pub logins: Option<resources::Logins>,
+    pub location: Option<AdminLocation>,
+    pub grants: Vec<resources::GrantEntry>,
+    pub grants_more: usize,
+}
+
+impl AdminResourcePage {
+    /// What `GET /v1/admin/resources/<name>` answers of it: the first 200
+    /// Grants, and how many more.
+    fn view(&self) -> AdminResourceView {
+        let shown = self.grants.len().min(MAX_GRANTS_SHOWN);
+        let entries = self.grants.get(..shown).unwrap_or(self.grants.as_slice());
+        AdminResourceView {
+            name: self.name.clone(),
+            kind: self.kind,
+            description: self.description.clone(),
+            owner: self.owner.clone(),
+            contact: self.contact.clone(),
+            created_by: self.created_by.clone(),
+            created_at: self.created_at.clone(),
+            usable: self.usable,
+            problem: self.problem,
+            logins: self.logins,
+            location: self.location.as_ref().map(|location| AdminLocation {
+                backend: location.backend,
+                directory: location.directory.clone(),
+            }),
+            grants: entries
+                .iter()
+                .map(|entry| AdminGrant {
+                    group: entry.group.clone(),
+                    access: resources::level_name(entry.level),
+                    granted_by: entry.granted_by.as_deref().map(str::to_owned),
+                    granted_at: entry.granted_at.as_deref().map(str::to_owned),
+                })
+                .collect(),
+            grants_more: self.grants_more + (self.grants.len() - shown),
+        }
+    }
+}
+
+/// Why a Resource's page or the list of them answered nothing.
+pub(crate) enum AdminResourceRead {
+    Found(Box<AdminResourcePage>),
+    NoSuchResource,
+    /// The Grants on this Resource cannot be told now.
+    Unknown(String),
+    Failed(DbError),
 }
 
 #[derive(Serialize)]
-struct AdminResourceView {
-    name: String,
-    kind: &'static str,
-    description: String,
-    owner: String,
-    contact: String,
-    created_by: String,
-    created_at: String,
-    usable: bool,
-    problem: Option<&'static str>,
-    logins: Option<resources::Logins>,
-    location: Option<AdminLocation>,
-    grants: Vec<AdminGrant>,
-    grants_more: usize,
+pub(crate) struct AdminResourceView {
+    pub(crate) name: String,
+    pub(crate) kind: &'static str,
+    pub(crate) description: String,
+    pub(crate) owner: String,
+    pub(crate) contact: String,
+    pub(crate) created_by: String,
+    pub(crate) created_at: String,
+    pub(crate) usable: bool,
+    pub(crate) problem: Option<&'static str>,
+    pub(crate) logins: Option<resources::Logins>,
+    pub(crate) location: Option<AdminLocation>,
+    pub(crate) grants: Vec<AdminGrant>,
+    pub(crate) grants_more: usize,
 }
 
 #[derive(Serialize)]
-struct AdminLocation {
-    backend: &'static str,
-    directory: String,
+pub(crate) struct AdminLocation {
+    pub(crate) backend: &'static str,
+    pub(crate) directory: String,
 }
 
 #[derive(Serialize)]
-struct AdminGrant {
-    group: String,
-    access: &'static str,
-    granted_by: Option<String>,
-    granted_at: Option<String>,
+pub(crate) struct AdminGrant {
+    pub(crate) group: String,
+    pub(crate) access: &'static str,
+    pub(crate) granted_by: Option<String>,
+    pub(crate) granted_at: Option<String>,
 }
 
 /// The answer of a replacement: the administrators' view and the warnings
@@ -3323,14 +3392,32 @@ impl Api {
             Ok(query) => query,
             Err(problem) => return Answer::malformed(&problem, ADMIN_RESOURCES_FORM),
         };
+        match self.read_admin_resources(after.as_deref(), limit).await {
+            Ok(read) => Answer::json(StatusCode::OK, &read),
+            Err(AdminResourceRead::Unknown(name)) => grants_unknown(&name),
+            Err(AdminResourceRead::Failed(error)) => Answer::unavailable(&error),
+            Err(AdminResourceRead::NoSuchResource | AdminResourceRead::Found(_)) => {
+                Answer::unavailable(&DbError::unexpected(
+                    "a list of Resources is not one Resource",
+                ))
+            }
+        }
+    }
+
+    /// One page of every Resource, as `GET /v1/admin/resources` answers it,
+    /// from the same reading the Dashboard's list shows: Grants memory does
+    /// not know are read back first, within the request's bound.
+    pub(crate) async fn read_admin_resources(
+        &self,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<AdminResourcesView, AdminResourceRead> {
         let all: Vec<_> = self
             .resources
             .list()
             .into_iter()
-            .filter(|r| after.as_deref().is_none_or(|after| r.name.as_str() > after))
+            .filter(|r| after.is_none_or(|after| r.name.as_str() > after))
             .collect();
-        // Grants are never guessed; read back what memory does not know,
-        // within the bound of a request's readings.
         let deadline = tokio::time::Instant::now() + resources::READ_BACK_WAIT;
         let mut remaining = all.into_iter().peekable();
         let mut views: Vec<AdminResourceView> = Vec::new();
@@ -3345,10 +3432,12 @@ impl Api {
             match self.resources.read_back(&resource, deadline).await {
                 resources::ReadBack::Known => {}
                 resources::ReadBack::Removed => continue,
-                resources::ReadBack::Unknown => return grants_unknown(&resource.name),
+                resources::ReadBack::Unknown => {
+                    return Err(AdminResourceRead::Unknown(resource.name.clone()));
+                }
             }
             let Some(view) = self.admin_resource_view(&resource) else {
-                return grants_unknown(&resource.name);
+                return Err(AdminResourceRead::Unknown(resource.name.clone()));
             };
             // Measured once here, and dropped from the end by that size.
             let size = serde_json::to_vec(&view).map_or(0, |body| body.len()) + 1;
@@ -3364,13 +3453,10 @@ impl Api {
         } else {
             None
         };
-        Answer::json(
-            StatusCode::OK,
-            &AdminResourcesView {
-                resources: views,
-                next,
-            },
-        )
+        Ok(AdminResourcesView {
+            resources: views,
+            next,
+        })
     }
 
     /// `GET /v1/admin/resources/<name>`.
@@ -3378,8 +3464,22 @@ impl Api {
         if *method != Method::GET {
             return Ok(Answer::method_not_allowed(method, "GET"));
         }
-        let Some(resource) = self.resources.find(name).await? else {
-            return Ok(no_resource());
+        Ok(match self.read_admin_resource(name).await {
+            AdminResourceRead::Found(read) => Answer::json(StatusCode::OK, &read.view()),
+            AdminResourceRead::NoSuchResource => no_resource(),
+            AdminResourceRead::Unknown(name) => grants_unknown(&name),
+            AdminResourceRead::Failed(error) => Answer::unavailable(&error),
+        })
+    }
+
+    /// One Resource as `GET /v1/admin/resources/<name>` answers it and
+    /// every Grant `GET /v1/resources/<name>/grants` answers, from the same
+    /// readings the API makes; the Dashboard's page of it.
+    pub(crate) async fn read_admin_resource(&self, name: &str) -> AdminResourceRead {
+        let resource = match self.resources.find(name).await {
+            Ok(Some(resource)) => resource,
+            Ok(None) => return AdminResourceRead::NoSuchResource,
+            Err(error) => return AdminResourceRead::Failed(error),
         };
         match self
             .resources
@@ -3390,19 +3490,16 @@ impl Api {
             .await
         {
             resources::ReadBack::Known => {}
-            resources::ReadBack::Removed => return Ok(no_resource()),
-            resources::ReadBack::Unknown => return Ok(grants_unknown(name)),
+            resources::ReadBack::Removed => return AdminResourceRead::NoSuchResource,
+            resources::ReadBack::Unknown => {
+                return AdminResourceRead::Unknown(resource.name.clone());
+            }
         }
-        Ok(match self.admin_resource_view(&resource) {
-            Some(view) => Answer::json(StatusCode::OK, &view),
-            None => grants_unknown(name),
-        })
-    }
-
-    /// A Resource as a Platform administrator sees it; `None` while its
-    /// Grants are not known.
-    fn admin_resource_view(&self, resource: &resources::Resource) -> Option<AdminResourceView> {
-        let (grants, grants_more) = resource.grants_page(MAX_GRANTS_SHOWN)?;
+        // One reading of the Grants: the page shows the 1,000, and the
+        // API's view it (when the API asks) takes the first 200 of them.
+        let Some((grants, grants_more)) = resource.grants_page(MAX_GRANTS_LISTED) else {
+            return AdminResourceRead::Unknown(resource.name.clone());
+        };
         let (usable, problem) = match resource.kind {
             ResourceKind::Storage => {
                 let problem = resource
@@ -3417,16 +3514,7 @@ impl Api {
             backend: "directory",
             directory: directory.path().to_string_lossy().into_owned(),
         });
-        let grants = grants
-            .into_iter()
-            .map(|entry| AdminGrant {
-                group: entry.group,
-                access: resources::level_name(entry.level),
-                granted_by: entry.granted_by.map(|who| who.to_string()),
-                granted_at: entry.granted_at.map(|when| when.to_string()),
-            })
-            .collect();
-        Some(AdminResourceView {
+        AdminResourceRead::Found(Box::new(AdminResourcePage {
             name: resource.name.clone(),
             kind: resource.kind.name(),
             description: resource.description().to_string(),
@@ -3440,7 +3528,64 @@ impl Api {
             location,
             grants,
             grants_more,
-        })
+        }))
+    }
+
+    /// A Resource as a Platform administrator sees it; `None` while its
+    /// Grants are not known.
+    fn admin_resource_view(&self, resource: &resources::Resource) -> Option<AdminResourceView> {
+        let (grants, grants_more) = resource.grants_page(MAX_GRANTS_SHOWN)?;
+        Some(self.admin_resource_view_with(resource, &grants, grants_more))
+    }
+
+    /// A Resource as a Platform administrator sees it, from Grants already
+    /// read: the first 200 of `entries`, and `grants_more` beyond them.
+    fn admin_resource_view_with(
+        &self,
+        resource: &resources::Resource,
+        entries: &[resources::GrantEntry],
+        grants_more: usize,
+    ) -> AdminResourceView {
+        let (usable, problem) = match resource.kind {
+            ResourceKind::Storage => {
+                let problem = resource
+                    .storage()
+                    .and_then(|directory| directory.problem())
+                    .map(directory_problem_word);
+                (problem.is_none(), problem)
+            }
+            ResourceKind::Postgres => (resource.unserved().is_none(), resource.unserved()),
+        };
+        let location = resource.storage().map(|directory| AdminLocation {
+            backend: "directory",
+            directory: directory.path().to_string_lossy().into_owned(),
+        });
+        // Copied once per entry the view shows (at most 200): the view is
+        // owned by its answer, the page by its own.
+        let grants = entries
+            .iter()
+            .map(|entry| AdminGrant {
+                group: entry.group.clone(),
+                access: resources::level_name(entry.level),
+                granted_by: entry.granted_by.as_deref().map(str::to_owned),
+                granted_at: entry.granted_at.as_deref().map(str::to_owned),
+            })
+            .collect();
+        AdminResourceView {
+            name: resource.name.clone(),
+            kind: resource.kind.name(),
+            description: resource.description().to_string(),
+            owner: resource.owner().to_string(),
+            contact: resource.contact().to_string(),
+            created_by: resource.created_by.clone(),
+            created_at: resource.created_at.clone(),
+            usable,
+            problem,
+            logins: resource.logins(),
+            location,
+            grants,
+            grants_more,
+        }
     }
     async fn grants(
         &self,
@@ -3489,52 +3634,16 @@ impl Api {
             Ok(grant) => grant,
             Err(problem) => return Ok(Answer::malformed(&problem, GRANT_FORM)),
         };
-        if resource.kind == ResourceKind::Storage && level == authz::AccessLevel::Structure {
+        if !resources::level_allowed(resource.kind, level) {
             return Ok(Answer::malformed(
                 "access is not read or write: a Storage Resource has two levels, read and write",
                 GRANT_FORM,
             ));
         }
-        // A write of a Grant is a write of the Resource: the turn first,
-        // then the check that the program knows it, read back under the
-        // turn, and `503` when it still does not (blackbox/CONTRACT.md, "A
-        // write whose answer is lost").
-        let Some(_turn) = resource.writing(WRITE_TURN_WAIT).await else {
-            return Ok(Answer::error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "unavailable",
-                "another change of this Resource is running now: nothing was changed; try again shortly",
-            ));
-        };
-        if !resource.grants_known() {
-            match self
-                .resources
-                .read_back_locked(
-                    &resource,
-                    tokio::time::Instant::now() + resources::READ_BACK_WAIT,
-                )
-                .await
-            {
-                resources::ReadBack::Known => {}
-                resources::ReadBack::Removed => return Ok(no_resource()),
-                resources::ReadBack::Unknown => return Ok(grants_unknown(&resource.name)),
-            }
-        }
-        let granted = match tokio::time::timeout(
-            WRITE_ROW_WAIT,
-            self.resources
-                .set_grant(&resource, &group, level, Some(&user.id)),
-        )
-        .await
-        {
-            Ok(granted) => granted?,
-            Err(_) => {
-                return Ok(Answer::unavailable(&DbError::timed_out(
-                    "the write of the Grant",
-                    WRITE_ROW_WAIT,
-                )));
-            }
-        };
+        let granted = self
+            .resources
+            .write_grant(&resource, &group, Some(level), &user.id)
+            .await?;
         Ok(match granted {
             GrantWritten::Written(change) => Answer::json(
                 StatusCode::OK,
@@ -3549,6 +3658,7 @@ impl Api {
             GrantWritten::TooMany => too_many_grants(),
             GrantWritten::NoSuchResource => no_resource(),
             GrantWritten::Unknown => grants_unknown(&resource.name),
+            GrantWritten::Busy => busy_resource(),
         })
     }
 
@@ -3591,44 +3701,16 @@ impl Api {
                 );
             }
         };
-        let Some(_turn) = resource.writing(WRITE_TURN_WAIT).await else {
-            return Answer::error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "unavailable",
-                "another change of this Resource is running now: nothing was changed; try again shortly",
-            );
-        };
-        if !resource.grants_known() {
-            match self
-                .resources
-                .read_back_locked(
-                    &resource,
-                    tokio::time::Instant::now() + resources::READ_BACK_WAIT,
-                )
-                .await
-            {
-                resources::ReadBack::Known => {}
-                resources::ReadBack::Removed => return no_resource(),
-                resources::ReadBack::Unknown => return grants_unknown(&resource.name),
-            }
-        }
-        let revoked = match tokio::time::timeout(
-            WRITE_ROW_WAIT,
-            self.resources
-                .revoke_grant(&resource, &group, Some(&user.id)),
-        )
-        .await
+        let revoked = match self
+            .resources
+            .write_grant(&resource, &group, None, &user.id)
+            .await
         {
             Ok(revoked) => revoked,
-            Err(_) => {
-                return Answer::unavailable(&DbError::timed_out(
-                    "the revoke of the Grant",
-                    WRITE_ROW_WAIT,
-                ));
-            }
+            Err(error) => return Answer::unavailable(&error),
         };
         match revoked {
-            Ok(GrantWritten::Written(change)) => Answer::json(
+            GrantWritten::Written(change) => Answer::json(
                 StatusCode::OK,
                 &GrantRevoked {
                     resource: &resource.name,
@@ -3637,10 +3719,10 @@ impl Api {
                     was: change.was.map(resources::level_name),
                 },
             ),
-            Ok(GrantWritten::TooMany) => too_many_grants(),
-            Ok(GrantWritten::NoSuchResource) => no_resource(),
-            Ok(GrantWritten::Unknown) => grants_unknown(&resource.name),
-            Err(error) => Answer::unavailable(&error),
+            GrantWritten::TooMany => too_many_grants(),
+            GrantWritten::NoSuchResource => no_resource(),
+            GrantWritten::Unknown => grants_unknown(&resource.name),
+            GrantWritten::Busy => busy_resource(),
         }
     }
 

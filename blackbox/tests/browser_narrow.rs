@@ -20,8 +20,9 @@
 )]
 
 use blackbox::admin_pages::{
-    APPLICATIONS, INSTALLATION, OPERATION_LOG, RESOURCES, SECTIONS, SITE_RESOURCE, disable_target,
-    prepare_site,
+    APPLICATIONS, INSTALLATION, OLD_GROUP, OLD_RESOURCE, OPERATION_LOG, RESOURCES, SECTIONS,
+    SITE_RESOURCE, changed_target, disable_target, prepare_site, resource_target,
+    revoke_page_target, start_aged,
 };
 use blackbox::dev::Dev;
 use blackbox::firefox::{self, Firefox, Options, no_wider_than};
@@ -31,7 +32,10 @@ use blackbox::scenario::ADMINISTRATORS;
 use blackbox::sessions::{ADA, GRACE, ada, grace};
 use blackbox::tool::Machine;
 use blackbox::tool_sign_ins::{OPEN_TIMEOUT, tool_address_in};
-use blackbox::walks::{Site, choose_at_provider, on_site, share_by_form, sign_in_to_dashboard};
+use blackbox::walks::{
+    Site, choose_at_provider, click_to_another_page, on_site, share_by_form, sign_in_to_dashboard,
+    submit_button_of,
+};
 
 /// The width of a phone's window, in CSS pixels.
 const NARROW: u32 = 320;
@@ -158,10 +162,13 @@ fn the_pages_of_platform_administrators_are_no_wider_than_a_window_320_css_pixel
         .named("Ada Lovelace")
         .email("ada@example.test")
         .in_groups(&["finance", ADMINISTRATORS]);
-    let site = Site::start(&[admin, grace()]);
+    // Ended and started again, so that a Grant has neither who set it nor
+    // when and a Storage Resource's directory is gone.
+    let (site, aged) = start_aged(&[admin, grace()], ADA);
     let long = longest_name();
     let credential = site.application_of(ADA, &long, Some(&long_description()));
     let prepared = prepare_site(&site, ADA, GRACE);
+    let longest_group = "w".repeat(256);
     let post = |target: &str, body: &serde_json::Value| {
         blackbox::tool::bearer(&site.at.vm, target, &credential)
             .method("POST")
@@ -178,6 +185,16 @@ fn the_pages_of_platform_administrators_are_no_wider_than_a_window_320_css_pixel
         &serde_json::json!({ "group": long_group(), "access": "write" }),
     )
     .expect_status(200);
+    for (resource, group) in [
+        (SITE_RESOURCE, longest_group.as_str()),
+        (OLD_RESOURCE, long_group().as_str()),
+    ] {
+        post(
+            &format!("/v1/resources/{resource}/grants"),
+            &serde_json::json!({ "group": group, "access": "read" }),
+        )
+        .expect_status(200);
+    }
 
     let mut browser = site.browser(&[long.as_str()]);
     browser.narrow(NARROW);
@@ -223,6 +240,51 @@ fn the_pages_of_platform_administrators_are_no_wider_than_a_window_320_css_pixel
             format!("[data-vm-grant=\"{}\"]", long_group()),
             "the Resources with a long Group",
         ),
+        (
+            RESOURCES.to_owned(),
+            "[data-vm-resource][data-vm-unusable]".to_owned(),
+            "the Resources with one that is not usable",
+        ),
+        (
+            resource_target(SITE_RESOURCE),
+            format!("[data-vm-grant=\"{longest_group}\"]"),
+            "a Resource's page with a Group of 256 bytes and one that is long",
+        ),
+        (
+            resource_target(OLD_RESOURCE),
+            format!("[data-vm-grant=\"{OLD_GROUP}\"]"),
+            "a Resource's page with a Grant not recorded",
+        ),
+        (
+            blackbox::admin_pages::resource_target(blackbox::admin_pages::LOST_RESOURCE),
+            "[data-vm-unusable]".to_owned(),
+            "the page of a Resource that is not usable",
+        ),
+        (
+            changed_target(SITE_RESOURCE, "granted", &longest_group),
+            "[data-vm-notice=\"granted\"]".to_owned(),
+            "a Resource's page with a notice naming a Group of 256 bytes",
+        ),
+        (
+            revoke_page_target(SITE_RESOURCE, &longest_group),
+            "form[data-vm-form=\"revoke\"]".to_owned(),
+            "the page that confirms revoking a Group of 256 bytes",
+        ),
+        (
+            revoke_page_target(SITE_RESOURCE, &long_group()),
+            "form[data-vm-form=\"revoke\"]".to_owned(),
+            "the page that confirms revoking a long Group",
+        ),
+        (
+            revoke_page_target(SITE_RESOURCE, "nobody"),
+            "h1".to_owned(),
+            "the page that confirms revoking a Group that holds none",
+        ),
+        (
+            resource_target("not-there-at-all"),
+            "[data-vm-error=\"not-found\"]".to_owned(),
+            "the page of a Resource that is not registered",
+        ),
     ] {
         browser.navigate(&site.dashboard(&target));
         assert!(
@@ -232,6 +294,27 @@ fn the_pages_of_platform_administrators_are_no_wider_than_a_window_320_css_pixel
         );
         assert_narrow(&mut browser, page);
     }
+    // A form not taken: a Group of 257 bytes typed (set as the field's
+    // value at once), the form sent by its button.
+    browser.navigate(&site.dashboard(&resource_target(SITE_RESOURCE)));
+    let set = browser.script(
+        "const f = document.querySelector('form[data-vm-form=\"grant\"] input[name=\"group\"]'); f.value = arguments[0]; return f.value.length;",
+        &[serde_json::json!("g".repeat(257))],
+    );
+    assert_eq!(
+        set.as_u64(),
+        Some(257),
+        "the harness's own check: the field holds the Group typed"
+    );
+    let button = submit_button_of(&mut browser, "form[data-vm-form=\"grant\"]");
+    click_to_another_page(&mut browser, &button);
+    assert!(
+        browser.find("[data-vm-field-error=\"group\"]").is_some(),
+        "expected the Resource's page with a field error\n{}",
+        browser.describe()
+    );
+    assert_narrow(&mut browser, "a Resource's page with a field error");
+
     browser.navigate(&site.dashboard(OPERATION_LOG));
     let summaries = browser.find_all("[data-vm-entry] details summary");
     assert!(
@@ -258,6 +341,7 @@ fn the_pages_of_platform_administrators_are_no_wider_than_a_window_320_css_pixel
         "the refusal page of someone who is not a Platform administrator",
     );
     drop(prepared);
+    drop(aged);
 }
 
 /// Ada, a Platform administrator, signed in at the Dashboard of a site of

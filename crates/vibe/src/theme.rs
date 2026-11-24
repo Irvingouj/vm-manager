@@ -292,6 +292,15 @@ dl.facts dd .i{width:1rem;height:1rem;vertical-align:-.1875rem;color:var(--ink-3
 code.cmd{white-space:nowrap}
 .lone .confirm .actions{margin-top:1.5rem;display:flex;flex-wrap:wrap;align-items:center;gap:.75rem 1rem}
 .lone .confirm .actions form{margin:0}
+.grants-list>.grant-row{display:grid;grid-template-columns:minmax(0,1fr) 7rem auto;grid-template-areas:"name level revoke" "who level revoke";align-items:center;justify-content:normal;gap:.125rem 1rem}
+.grant-name{grid-area:name;display:inline-flex;align-items:flex-start;gap:.5rem;min-width:0}
+.grant-name>.i{margin-top:.125rem;color:var(--ink-3)}
+.grant-name .g{min-width:0;font-weight:600}
+.grant-who{grid-area:who;min-width:0;padding-left:1.75rem;font-size:.875rem;line-height:1.25rem;color:var(--ink-2)}
+.grant-who code.id{font-size:inherit;line-height:inherit;color:var(--ink-3)}
+.grant-row .lv-pill{grid-area:level;justify-self:start}
+.grant-row>.btn{grid-area:revoke;justify-self:end}
+.page-details{margin-top:2.5rem}
 @media (max-width:39.99rem){
 .res thead{position:absolute;width:1px;height:1px;margin:-1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
 .res tr{display:flex;flex-wrap:wrap;column-gap:1rem;border-top:1px solid var(--line);padding:.625rem 0 .625rem 1.75rem}
@@ -309,6 +318,7 @@ code.cmd{white-space:nowrap}
 .admin-link{padding-inline:.5rem}
 dl.facts.big{grid-template-columns:1fr;gap:0}
 dl.facts.big dd+dt{margin-top:.75rem}
+.grants-list>.grant-row{grid-template-columns:minmax(0,1fr) auto;grid-template-areas:"name level" "who revoke"}
 }
 @media (min-width:40rem){
 h1{font-size:1.875rem;line-height:2.25rem}

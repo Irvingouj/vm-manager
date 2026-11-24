@@ -1254,8 +1254,12 @@ enum Inserted {
 /// (blackbox/CONTRACT.md, "Resources and Grants in full: Grants in full").
 pub const MAX_GRANTS: usize = 1_000;
 
-/// The longest a write of a Grant waits for the Resource's write turn.
+/// The longest a write waits for the Resource's write turn.
 const WRITE_TURN_WAIT: Duration = Duration::from_secs(10);
+
+/// The whole of a write of a Resource's row: the 10 seconds of "What
+/// Platform administrators see and stop: Bounds and costs".
+pub const WRITE_ROW_WAIT: Duration = Duration::from_secs(10);
 
 /// What setting or revoking a Grant changed: `was` is the level the Group
 /// held just before, `None` for none.
@@ -1276,6 +1280,9 @@ pub enum GrantWritten {
     NoSuchResource,
     /// The program is still finding the Resource out: nothing was sent.
     Unknown,
+    /// Another change of the Resource held its write turn: nothing was
+    /// sent.
+    Busy,
 }
 
 /// What one write of a Grant's transaction came to.
@@ -1300,6 +1307,27 @@ enum WrittenGrant {
 /// character.
 pub fn is_group(text: &str) -> bool {
     !text.is_empty() && text.len() <= 256 && !text.chars().any(char::is_control)
+}
+
+/// `text` as one path segment or one query value: every byte but letters,
+/// digits, `-`, `.`, `_` and `~` written `%XX` (so `/` is `%2F`, a space
+/// `%20` and a plus `%2B`).
+pub fn encode_segment(text: &str) -> String {
+    let mut encoded = String::with_capacity(text.len());
+    for byte in text.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
+}
+
+/// Whether a Resource of `kind` takes `level`: a Storage Resource has
+/// read and write only (blackbox/CONTRACT.md, "Storage: Grants on it").
+pub fn level_allowed(kind: ResourceKind, level: AccessLevel) -> bool {
+    !(kind == ResourceKind::Storage && level == AccessLevel::Structure)
 }
 
 pub struct Resources {
@@ -2395,6 +2423,46 @@ impl Resources {
                 "a revoke's answer is not what a revoke writes",
             )),
             Err(error) => Err(error),
+        }
+    }
+
+    /// One write of a Grant from a Platform administrator's request: the
+    /// Resource's write turn, then the check that the program knows its
+    /// Grants (read back under the turn), then the write within the
+    /// platform database's 10 seconds. `level` `Some` sets or changes it,
+    /// `None` revokes it. The API and the Dashboard both call this, so a
+    /// check or a record is in neither alone (blackbox/CONTRACT.md, "The
+    /// Dashboard for Platform administrators": each form changes what the
+    /// API changes).
+    pub async fn write_grant(
+        &self,
+        resource: &Resource,
+        group: &str,
+        level: Option<AccessLevel>,
+        by: &str,
+    ) -> Result<GrantWritten, DbError> {
+        let Some(_turn) = resource.writing(WRITE_TURN_WAIT).await else {
+            return Ok(GrantWritten::Busy);
+        };
+        if !resource.grants_known() {
+            match self
+                .read_back_locked(resource, tokio::time::Instant::now() + READ_BACK_WAIT)
+                .await
+            {
+                ReadBack::Known => {}
+                ReadBack::Removed => return Ok(GrantWritten::NoSuchResource),
+                ReadBack::Unknown => return Ok(GrantWritten::Unknown),
+            }
+        }
+        let write = async {
+            match level {
+                Some(level) => self.set_grant(resource, group, level, Some(by)).await,
+                None => self.revoke_grant(resource, group, Some(by)).await,
+            }
+        };
+        match tokio::time::timeout(WRITE_ROW_WAIT, write).await {
+            Ok(written) => written,
+            Err(_) => Err(DbError::timed_out("the write of the Grant", WRITE_ROW_WAIT)),
         }
     }
 

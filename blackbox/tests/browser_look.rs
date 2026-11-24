@@ -24,7 +24,14 @@
 //! confirms a disable, the Operation log with entries of three outcomes
 //! (allowed, refused, failed: an unfinished entry is not made here) and a
 //! `<details>` opened, the Operation log with a malformed filter, the
-//! installation with OIDC connected, the Resources with Grants; and, in a
+//! installation with OIDC connected, the Resources with Grants and a
+//! Resource that is not usable; a Resource's page with Grants (one of them
+//! "not recorded") and its form, the same page with a field error, the page
+//! with a notice, and the page that confirms a revoke (CONTRACT.md,
+//! "Resources and Grants in full: The Dashboard: a Resource's page and its
+//! Grants": the installation is made, then ended and started again, so that
+//! a Grant has neither who set it nor when and a Storage Resource's
+//! directory is gone, [`blackbox::admin_pages::start_aged`]); and, in a
 //! browser of Grace's, the refusal page of someone who is not a Platform
 //! administrator. On each it
 //! presses Tab through the page, reads the computed styles and boxes
@@ -52,8 +59,9 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use blackbox::admin_pages::{
-    APPLICATIONS as ADMIN_APPLICATIONS, INSTALLATION, OPERATION_LOG, PreparedSite, RESOURCES,
-    SITE_DISABLED, SITE_RESOURCE, disable_target, prepare_site,
+    APPLICATIONS as ADMIN_APPLICATIONS, Aged, INSTALLATION, OLD_GROUP, OLD_RESOURCE, OPERATION_LOG,
+    PreparedSite, RESOURCES, SITE_DISABLED, SITE_RESOURCE, changed_target, disable_target,
+    grant_form, prepare_site, resource_target, revoke_page_target, start_aged,
 };
 use blackbox::browser::url;
 use blackbox::dashboard::{Page, oidc_post};
@@ -71,9 +79,10 @@ use blackbox::sessions::{ADA, GRACE, grace};
 use blackbox::tool::Machine;
 use blackbox::tool_sign_ins::{BrowserCommand, Challenge, Decision, OPEN_TIMEOUT};
 use blackbox::walks::{
-    Site, choose_at_provider, names_of, on_site, share_by_form, sign_in_to_dashboard,
+    Site, choose_at_provider, click_to_another_page, names_of, on_site, share_by_form,
+    sign_in_to_dashboard, submit_button_of,
 };
-use serde_json::Value;
+use serde_json::{Value, json};
 
 /// The width of a phone's window, in CSS pixels.
 const NARROW: u32 = 320;
@@ -103,11 +112,15 @@ const CONFIRM: &str = "the page that confirms a disable";
 const LOG: &str = "the Operation log with entries of each outcome, a <details> opened";
 const LOG_MALFORMED: &str = "the Operation log with a malformed filter";
 const INSTALLATION_PAGE: &str = "the installation with OIDC connected";
-const RESOURCES_PAGE: &str = "the Resources with Grants";
+const RESOURCES_PAGE: &str = "the Resources with Grants, one of them not usable";
+const RESOURCE_PAGE: &str = "a Resource's page with Grants, one not recorded, and its form";
+const RESOURCE_ERROR: &str = "a Resource's page with a field error";
+const RESOURCE_NOTICE: &str = "a Resource's page with a notice";
+const REVOKE_CONFIRM: &str = "the page that confirms a revoke";
 const NOT_ADMIN: &str = "the refusal page of someone who is not a Platform administrator";
 
 /// The pages, in the order each browser visits them.
-const PAGES: [&str; 14] = [
+const PAGES: [&str; 18] = [
     LIST,
     DETAILS,
     REFUSAL,
@@ -118,6 +131,10 @@ const PAGES: [&str; 14] = [
     LOG_MALFORMED,
     INSTALLATION_PAGE,
     RESOURCES_PAGE,
+    RESOURCE_PAGE,
+    RESOURCE_ERROR,
+    RESOURCE_NOTICE,
+    REVOKE_CONFIRM,
     SIGN_OUT,
     TOOL_SIGN_IN,
     TEST_USER,
@@ -208,8 +225,8 @@ fn run_walk() -> Walk {
         policies: Vec::new(),
         tool_page: Err("not read".to_owned()),
     };
-    let (site, _prepared) = match caught(|| {
-        let site = Site::start(&[ada(), grace()]);
+    let (site, _prepared, _aged) = match caught(|| {
+        let (site, aged): (Site, Aged) = start_aged(&[ada(), grace()], ADA);
         site.application_of(ADA, APPLICATIONS[0], Some("The incident board"));
         site.application_of(ADA, APPLICATIONS[1], None);
         // Grace signs in once, so that Ada can share with her by email.
@@ -221,7 +238,7 @@ fn run_walk() -> Walk {
             "expected Grace on the Dashboard"
         );
         let prepared: PreparedSite = prepare_site(&site, ADA, GRACE);
-        (site, prepared)
+        (site, prepared, aged)
     }) {
         Ok(site) => site,
         Err(e) => {
@@ -384,7 +401,51 @@ fn walk_admin_pages(browser: &mut Firefox, scheme: Scheme, site: &Site, looks: &
         &format!("[data-vm-resource=\"{SITE_RESOURCE}\"] [data-vm-grant]"),
         RESOURCES_PAGE,
     );
+    expect_on_page(
+        browser,
+        "[data-vm-resource][data-vm-unusable]",
+        RESOURCES_PAGE,
+    );
     looks.push(look(browser, scheme, RESOURCES_PAGE));
+
+    browser.navigate(&site.dashboard(&resource_target(OLD_RESOURCE)));
+    expect_on_page(browser, "form[data-vm-form=\"grant\"]", RESOURCE_PAGE);
+    expect_on_page(
+        browser,
+        &format!("[data-vm-grant=\"{OLD_GROUP}\"]"),
+        RESOURCE_PAGE,
+    );
+    assert!(
+        browser.text().to_lowercase().contains("not recorded"),
+        "expected {RESOURCE_PAGE}: a Grant that says \"not recorded\"\n{}",
+        browser.describe()
+    );
+    looks.push(look(browser, scheme, RESOURCE_PAGE));
+
+    // A field error: a Group of 257 bytes typed (the script sets the field's
+    // value at once), the form sent by its button.
+    let group_field = "form[data-vm-form=\"grant\"] input[name=\"group\"]";
+    let set = browser.script(
+        "const f = document.querySelector(arguments[0]); f.value = arguments[1]; return f.value.length;",
+        &[json!(group_field), json!("g".repeat(257))],
+    );
+    assert_eq!(
+        set.as_u64(),
+        Some(257),
+        "the harness's own check: the field holds the Group typed"
+    );
+    let button = submit_button_of(browser, "form[data-vm-form=\"grant\"]");
+    click_to_another_page(browser, &button);
+    expect_on_page(browser, "[data-vm-field-error=\"group\"]", RESOURCE_ERROR);
+    looks.push(look(browser, scheme, RESOURCE_ERROR));
+
+    browser.navigate(&site.dashboard(&changed_target(OLD_RESOURCE, "granted", OLD_GROUP)));
+    expect_on_page(browser, "[data-vm-notice=\"granted\"]", RESOURCE_NOTICE);
+    looks.push(look(browser, scheme, RESOURCE_NOTICE));
+
+    browser.navigate(&site.dashboard(&revoke_page_target(OLD_RESOURCE, OLD_GROUP)));
+    expect_on_page(browser, "form[data-vm-form=\"revoke\"]", REVOKE_CONFIRM);
+    looks.push(look(browser, scheme, REVOKE_CONFIRM));
 }
 
 /// The tool's sign-in page without a port (it asks for the check code), as
@@ -501,10 +562,37 @@ fn policies(site: &Site, dev: &Dev<'_>) -> Vec<(&'static str, Option<String>)> {
         (LOG_MALFORMED, format!("{OPERATION_LOG}?outcome=nonsense")),
         (INSTALLATION_PAGE, INSTALLATION.to_owned()),
         (RESOURCES_PAGE, RESOURCES.to_owned()),
+        (RESOURCE_PAGE, resource_target(OLD_RESOURCE)),
+        (
+            RESOURCE_NOTICE,
+            changed_target(OLD_RESOURCE, "granted", OLD_GROUP),
+        ),
+        (REVOKE_CONFIRM, revoke_page_target(OLD_RESOURCE, OLD_GROUP)),
     ] {
         let answer = browser.open(&url(&site.dashboard(&target))).response;
         found.push((page, policy_of(&answer)));
     }
+    let resource_url = url(&site.dashboard(&resource_target(OLD_RESOURCE)));
+    let resource = Page::read(
+        browser.open(&resource_url).response,
+        resource_url,
+        RESOURCE_PAGE,
+    );
+    let form = grant_form(&resource);
+    let action = resource.action_of(&form);
+    let not_taken = oidc_post(
+        &mut browser,
+        &resource,
+        &action,
+        &form.body(&[("group", &"g".repeat(257)), ("access", "read")]),
+    );
+    assert_eq!(
+        not_taken.status,
+        400,
+        "expected a field error\n{}",
+        not_taken.describe()
+    );
+    found.push((RESOURCE_ERROR, policy_of(&not_taken)));
     let mut grace_browser = site.at.browser_as(GRACE);
     let steps = grace_browser.navigate(&url(&site.dashboard(ADMIN_APPLICATIONS)));
     found.push((NOT_ADMIN, policy_of(&steps.last().unwrap().response)));
